@@ -14,6 +14,7 @@
 # ==============================================================================
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.model_overrides.ernie55 import _ernie55_overrides
 from sglang.srt.configs.ernie55 import (
@@ -146,7 +147,6 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
 
     def test_each_unsupported_feature_is_rejected(self):
         for field, value, message in (
-            ("moe_a2a_backend", "megamoe", "megamoe"),
             ("enable_eplb", True, "EPLB"),
             ("dcp_size", 2, "decode context parallelism"),
         ):
@@ -154,6 +154,37 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
                 args = SimpleNamespace(**{**self._SUPPORTED, field: value})
                 with self.assertRaisesRegex(ValueError, message):
                     _ernie55_overrides(args, None)
+
+    def test_megamoe_is_rejected_off_sm100(self):
+        """The SM90 FP8 MegaMoE kernel hardcodes SwiGLU, so ERNIE's SiTU experts
+        produced wrong output without an error on H100; megamoe must be refused
+        there and allowed on SM100."""
+        args = SimpleNamespace(**{**self._SUPPORTED, "moe_a2a_backend": "megamoe"})
+        target = "sglang.srt.arg_groups.model_overrides.ernie55.is_sm100_supported"
+        with patch(target, return_value=False):
+            with self.assertRaisesRegex(ValueError, "SM100"):
+                _ernie55_overrides(args, None)
+        with patch(target, return_value=True):
+            _ernie55_overrides(args, None)
+
+    def test_megamoe_rejects_other_situ_constants(self):
+        """The MegaMoE kernel bakes SiTU beta=4.0 / linear_beta=25.0; a checkpoint
+        with other constants ran its routed experts at the kernel's values and its
+        shared expert at its own."""
+        args = SimpleNamespace(**{**self._SUPPORTED, "moe_a2a_backend": "megamoe"})
+        target = "sglang.srt.arg_groups.model_overrides.ernie55.is_sm100_supported"
+        with patch(target, return_value=True):
+            for betas, ok in (((4.0, 25.0), True), ((2.0, 25.0), False)):
+                with self.subTest(betas=betas):
+                    hf = SimpleNamespace(
+                        activation_situ_beta=betas[0],
+                        activation_situ_linear_beta=betas[1],
+                    )
+                    if ok:
+                        _ernie55_overrides(args, hf)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "SiTU"):
+                            _ernie55_overrides(args, hf)
 
     def test_pd_rejects_pipeline_parallelism(self):
         for mode, pp, rejected in (
@@ -203,6 +234,37 @@ class TestErnie5_5ServerArgOverrides(CustomTestCase):
                 }
                 with self.assertRaisesRegex(ValueError, "eagle-topk 1 only"):
                     _ernie55_overrides(SimpleNamespace(**tree), None)
+
+
+class TestErnie5_5Fp4ExpertLayout(CustomTestCase):
+    def test_expert_dtype_marks_mxfp4_routed_experts(self):
+        """ERNIE 5.5 releases mark MXFP4 routed experts with
+        quantization_config.expert_dtype; without that key read, such a
+        checkpoint sized its experts as full-width FP8."""
+        import json
+        import os
+        import tempfile
+
+        from sglang.srt.configs.model_config import ModelConfig
+
+        config = {
+            **_CHECKPOINT_FIELDS,
+            "model_type": "ernie5_5_moe",
+            "architectures": ["Ernie5_5_MoeForCausalLM"],
+            "num_hidden_layers": len(_MAIN),
+            "compress_ratios": _MAIN,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "qk_rope_head_dim": 16,
+            "vocab_size": 128,
+        }
+        for extra, fp4 in (({"expert_dtype": "mxfp4"}, True), ({}, False)):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as path:
+                with open(os.path.join(path, "config.json"), "w") as f:
+                    quant = {"quant_method": "fp8", **extra}
+                    json.dump({**config, "quantization_config": quant}, f)
+                model_config = ModelConfig(model_path=path, trust_remote_code=False)
+                self.assertEqual(model_config.is_fp4_experts, fp4)
 
 
 if __name__ == "__main__":

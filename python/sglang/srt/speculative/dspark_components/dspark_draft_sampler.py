@@ -337,6 +337,8 @@ def _int8_markov_walk_unsupported_reason(
     if online_estimator:
         return "the online acceptance estimator reads greedy rows' step logits"
     head = draft_model.markov_head
+    if head.step_logits_activation is not None:
+        return "the walk samples base + bias, not its activation"
     if head.vocab_shard is not None:
         return "markov_w2 is vocab-sharded over the TP ranks"
     # The fused greedy step's test: the bias is exactly W2 W1[prev].

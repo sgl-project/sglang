@@ -76,6 +76,27 @@ _REQUIRED_CHECKPOINT_VALUES = {
 }
 
 
+def renders_chat_natively(tokenizer) -> bool:
+    """Whether ``tokenizer`` is ErnieChatTokenizer, whose Python renderer builds
+    the prompt; without it chat falls back to a Jinja template."""
+    return tokenizer is not None and hasattr(type(tokenizer), "render_chat")
+
+
+# The SiTU constants DeepGEMM's MegaMoE kernel computes with.
+MEGAMOE_SITU_BETAS = (4.0, 25.0)
+
+
+def check_megamoe_situ_betas(config) -> None:
+    betas = (config.activation_situ_beta, config.activation_situ_linear_beta)
+    if betas != MEGAMOE_SITU_BETAS:
+        # The routed experts would run the kernel's constants while the shared
+        # expert runs the checkpoint's.
+        raise ValueError(
+            "--moe-a2a-backend megamoe bakes SiTU beta/linear_beta "
+            f"{MEGAMOE_SITU_BETAS}; this checkpoint uses {betas}"
+        )
+
+
 def to_dspark_draft_config(hf_config) -> None:
     """Reshape a target config, in place, into the DSpark draft's it bundles."""
     from sglang.srt.speculative.dspark_components.dspark_config import (

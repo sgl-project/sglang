@@ -975,6 +975,9 @@ class DocSplitOptions(BaseModel):
 
 class ChatCompletionRequest(PDRoutingFields):
     _response_parser_prefix: str = PrivateAttr(default="")
+    # Set by an encoder that closed the final assistant turn's reasoning before
+    # the continued text, so the continuation parses as answer text.
+    _prompt_closed_reasoning: bool = PrivateAttr(default=False)
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
