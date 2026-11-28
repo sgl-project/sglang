@@ -736,6 +736,9 @@ class ForwardFlags:
         # ForwardBatch.attn_tp_sequence_sharded decision, stamped by the model
         # that slices); read by the benchmark routing override.
         "attn_tp_sequence_sharded": False,
+        # FlashInfer MegaMoE: row count last written to the shared
+        # num_valid_tokens tensor in this forward; None outside a forward scope.
+        "megamoe_valid_rows": None,
         # Physical token rows in TP rank order for the current Ascend MoE call.
         "ascend_allgather_row_sizes": None,
         # The batch of the current model forward, published by ModelRunner so
@@ -762,6 +765,7 @@ class ForwardFlags:
             "lora_batch_layout",
             "sp_active",
             "attn_tp_sequence_sharded",
+            "megamoe_valid_rows",
         }
     )
 

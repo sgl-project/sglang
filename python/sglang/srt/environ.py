@@ -1458,6 +1458,8 @@ class Envs:
     # per-rank symmetric workspace; must be >= the largest padded per-rank batch
     # (derived from cuda_graph_max_bs / chunked_prefill_size when unset).
     SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK = EnvInt(0)
+    # Persistent top-k reduce for MegaMOE (FlashInfer AUTO; CAKE is still preferred where supported).
+    SGLANG_FLASHINFER_MEGAMOE_TOPK_REDUCE_PERSISTENT = EnvBool(True)
     # Opt-in smaller MegaMOE workspace (per-call cost scales with capacity) for
     # decode-only forwards of ModelOpt NVFP4 MoE; 0 is off. Unused when startup
     # autotuning runs, whose profiles already size small batches. A forward that
