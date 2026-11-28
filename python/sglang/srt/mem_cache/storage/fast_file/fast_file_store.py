@@ -29,7 +29,9 @@ Extra-config keys (``--hicache-storage-backend-extra-config``):
   read_workers           parallel read threads (default 1)
   enable_metadata_cache  cache positive existence checks (default false)
   metadata_ttl           positive-cache lifetime in seconds, -1 = forever (5.0)
-  max_size               byte cap per namespace, SI/IEC suffixes (unbounded)
+  max_size               byte cap for this owner, SI/IEC suffixes (unbounded).
+                         Each context-parallel slice is its own owner, so the
+                         disk budget is this cap times the number of writers.
   min_free_space         free-space floor for the filesystem (0 = off)
   evict_high_watermark   start background eviction above this cap fraction (0.95)
   evict_low_watermark    stop background eviction at this cap fraction (0.85)
@@ -152,7 +154,7 @@ class HiCacheFastFile(HiCacheFile):
             self.file_path,
             self.config_suffix,
             tp_rank=storage_config.tp_rank,
-            is_mla_model=storage_config.is_mla_model,
+            is_storage_owner=storage_config.is_storage_writer,
             extra_config=extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

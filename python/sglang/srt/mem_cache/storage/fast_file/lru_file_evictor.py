@@ -95,6 +95,9 @@ class LRUFileEvictor:
     the least recently used files to stay within them. A background thread
     drains the namespace from ``evict_high_watermark`` down to
     ``evict_low_watermark`` so foreground writers rarely have to evict.
+
+    ``max_size`` applies to this owner only. Each context-parallel slice has
+    its own writer, so the cap is per slice rather than one shared budget.
     """
 
     def __init__(
@@ -103,7 +106,7 @@ class LRUFileEvictor:
         config_suffix: str,
         *,
         tp_rank: int,
-        is_mla_model: bool,
+        is_storage_owner: bool,
         extra_config: dict,
         on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -111,8 +114,9 @@ class LRUFileEvictor:
         self.config_suffix = config_suffix
         self._tp_rank = tp_rank
         self._on_evict = on_evict
-        # MLA ranks share one namespace, so rank 0 owns the bookkeeping.
-        self._is_storage_owner = (not is_mla_model) or tp_rank == 0
+        # The storage writer owns bookkeeping for this suffix. MLA
+        # tensor-parallel copies share a suffix; context-parallel slices do not.
+        self._is_storage_owner = is_storage_owner
 
         # suffixed_key -> file size in bytes; oldest at the front.
         self._lru: OrderedDict[str, int] = OrderedDict()
@@ -130,8 +134,9 @@ class LRUFileEvictor:
         self._eviction_enabled = self._eviction_configured and self._is_storage_owner
         if self._eviction_configured and not self._is_storage_owner:
             logger.info(
-                f"HiCacheFastFile rank {tp_rank} (MLA): eviction is handled by rank 0; "
-                "this rank skips LRU bookkeeping and will not create new files."
+                "HiCacheFastFile rank %s is not the storage writer; "
+                "this rank skips LRU bookkeeping and will not create new files.",
+                tp_rank,
             )
 
         if self._eviction_enabled:
@@ -235,8 +240,10 @@ class LRUFileEvictor:
             return True
         if not self._is_storage_owner:
             logger.warning(
-                f"HiCacheFastFile rank {self._tp_rank} is not the MLA storage owner; "
-                f"not caching new key {key} because file eviction is enabled."
+                "HiCacheFastFile rank %s is not the storage writer; "
+                "not caching new key %s because file eviction is enabled.",
+                self._tp_rank,
+                key,
             )
             return False
         if self.max_size_bytes > 0 and value_bytes > self.max_size_bytes:
