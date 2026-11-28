@@ -8,6 +8,9 @@ import torch
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.attention_roles import AttentionRole
+from sglang.multimodal_gen.configs.models.dits.ideogram import (
+    Ideogram4DistilledDiTConfig,
+)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
@@ -18,9 +21,13 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_conf
     ConvRotInt8Config,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentCheckpointUnsupportedError,
     OnlineQuantizationComponentLoader,
 )
 from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_iterator
+from sglang.multimodal_gen.runtime.loader.ideogram_weights import (
+    inspect_ideogram_safetensors,
+)
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     comfy_quant_key_filter,
     inspect_minimax_h3_safetensors,
@@ -365,6 +372,17 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             transformer_override_config_path=transformer_override_config_path,
             arch_config=dit_config.arch_config,
         )
+        if (
+            model_cls.__name__ == "Ideogram4Transformer2DModel"
+            and not isinstance(dit_config, Ideogram4DistilledDiTConfig)
+            and quant_spec.runtime_quant_config is None
+            and quant_spec.gguf_file is None
+        ):
+            try:
+                layout = inspect_ideogram_safetensors(safetensors_list)
+            except ValueError as error:
+                raise ComponentCheckpointUnsupportedError(str(error)) from error
+            dit_config.use_weight_only_fp8_linears = layout == "fp8"
         if quant_spec.gguf_file is not None and is_minimax_h3:
             assert quant_spec.quant_config is not None
             curve = quant_spec.quant_config.tensor_meta.get("adaln_t_table")

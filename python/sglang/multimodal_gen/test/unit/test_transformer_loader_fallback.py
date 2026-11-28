@@ -5,6 +5,7 @@ from unittest import mock
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
+    ComponentCheckpointUnsupportedError,
     NativeComponentLoaderRequired,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
@@ -146,6 +147,141 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
 
         self.assertIn("shard-00002.safetensors", str(caught.exception))
         native.assert_not_called()
+
+
+class TestIdeogramCheckpointLayout(unittest.TestCase):
+    def test_layout_selected_before_construction(self):
+        import tempfile
+        from pathlib import Path
+
+        import torch
+        from safetensors.torch import save_file
+
+        from sglang.multimodal_gen.configs.models.dits.ideogram import (
+            Ideogram4DistilledDiTConfig,
+            Ideogram4DiTConfig,
+        )
+        from sglang.multimodal_gen.runtime.loader.component_loaders import (
+            transformer_loader as module,
+        )
+        from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
+            TransformerQuantLoadSpec,
+        )
+        from sglang.multimodal_gen.runtime.models.dits.ideogram import (
+            Ideogram4Transformer2DModel,
+        )
+
+        for layout in ("fp8", "bf16", "missing_scale", "distilled", "quantized"):
+            with (
+                self.subTest(layout=layout),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                dtype = torch.float8_e4m3fn if layout != "bf16" else torch.bfloat16
+                weights = {"input_proj.weight": torch.zeros(4, 8).to(dtype)}
+                if layout == "fp8":
+                    weights["input_proj.weight_scale"] = torch.ones(4)
+                path = str(Path(directory) / "model.safetensors")
+                save_file(weights, path)
+                config = (
+                    Ideogram4DistilledDiTConfig()
+                    if layout == "distilled"
+                    else Ideogram4DiTConfig()
+                )
+                args = TestTransformerLoaderFallbackAdmission._server_args(
+                    pipeline_config=PipelineConfig(dit_config=config),
+                    model_paths={},
+                    transformer_weights_path=path if layout == "bf16" else None,
+                    revision=None,
+                    should_start_component_on_cpu=lambda name: True,
+                    minimax_h3_adaln_cache_path=None,
+                    minimax_h3_adaln_online=False,
+                    direct_gpu_weight_loading=False,
+                )
+                spec = TransformerQuantLoadSpec(
+                    safetensors_list=[path],
+                    quant_config=mock.Mock() if layout == "quantized" else None,
+                    nunchaku_config=None,
+                    param_dtype=torch.bfloat16,
+                )
+                loader = TransformerLoader()
+                with (
+                    mock.patch.object(
+                        module,
+                        "get_diffusers_component_config",
+                        return_value={"_class_name": "Ideogram4Transformer2DModel"},
+                    ),
+                    mock.patch.object(
+                        module, "resolve_transformer_gguf_to_load", return_value=None
+                    ),
+                    mock.patch.object(
+                        module, "resolve_transformer_quant_load_spec", return_value=spec
+                    ),
+                    mock.patch.object(
+                        module.ModelRegistry,
+                        "resolve_model_cls",
+                        return_value=(Ideogram4Transformer2DModel, None),
+                    ),
+                    mock.patch.object(
+                        module,
+                        "get_local_torch_device",
+                        return_value=torch.device("cpu"),
+                    ),
+                    mock.patch.object(
+                        module,
+                        "_default_quantized_attention_backend",
+                        return_value=None,
+                    ),
+                    mock.patch.object(
+                        loader,
+                        "load_state_dict_model",
+                        side_effect=RuntimeError("stop at construction"),
+                    ) as construct,
+                ):
+                    expected = (
+                        "missing scale"
+                        if layout == "missing_scale"
+                        else "stop at construction"
+                    )
+                    error_type = (
+                        ComponentCheckpointUnsupportedError
+                        if layout == "missing_scale"
+                        else RuntimeError
+                    )
+                    with self.assertRaisesRegex(error_type, expected):
+                        loader.load_customized(directory, args, "transformer")
+                if layout == "missing_scale":
+                    construct.assert_not_called()
+                else:
+                    construct.assert_called_once()
+                    self.assertEqual(
+                        config.use_weight_only_fp8_linears,
+                        layout in ("fp8", "quantized"),
+                    )
+                    self.assertEqual(
+                        construct.call_args.kwargs["dtype"], torch.bfloat16
+                    )
+
+                    if layout in ("fp8", "bf16", "distilled"):
+                        from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
+                            WeightOnlyFP8Linear,
+                        )
+
+                        with (
+                            mock.patch(
+                                "sglang.multimodal_gen.runtime.layers.attention.layer.get_ring_parallel_world_size",
+                                return_value=1,
+                            ),
+                            torch.device("meta"),
+                        ):
+                            model = Ideogram4Transformer2DModel(config, {})
+                        self.assertEqual(
+                            isinstance(model.input_proj, WeightOnlyFP8Linear),
+                            layout == "fp8",
+                        )
+                        self.assertEqual(
+                            model.input_proj.weight.dtype == torch.float8_e4m3fn,
+                            layout == "fp8",
+                        )
 
 
 if __name__ == "__main__":
