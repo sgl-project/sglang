@@ -271,8 +271,7 @@ class TestHostKVCache(CustomTestCase):
                     torch.testing.assert_close(buffer[destination], expected)
                     self.assertEqual(torch.count_nonzero(buffer[:4]).item(), 0)
 
-    def test_index_k_host_pool_joins_a_host_pool_group(self):
-        """Grouping a main KV pool with a K-only index pool raised AttributeError."""
+    def _make_index_k_pools(self, layout):
         index_pool = MHATokenToKOnlyPool(
             size=self.page_size * 2,
             page_size=self.page_size,
@@ -283,12 +282,58 @@ class TestHostKVCache(CustomTestCase):
             device="cpu",
             enable_memory_saver=False,
         )
-        index_host = MHATokenToKOnlyPoolHost(
+        host = MHATokenToKOnlyPoolHost(
             buffer_info=index_pool.get_device_pool_infos()[0].buffer_info,
             anchor_host=self.host_pool,
-            layout="layer_first",
+            layout=layout,
             pin_memory=False,
         )
+        return index_pool, host
+
+    def test_index_k_host_buffer_ownership(self):
+        for layout in ("layer_first", "page_first", "page_first_direct"):
+            with self.subTest(layout=layout):
+                _, host = self._make_index_k_pools(layout)
+                self.addCleanup(host.destroy)
+                self.assertEqual(host.size, self.host_pool.size)
+                # Keep the original allocation alive to make stale pointers observable.
+                original = host.k_buffer
+                with unittest.mock.patch(
+                    "sglang.srt.mem_cache.pool_host.mha.make_kernel_ptr_table",
+                    side_effect=RuntimeError("pointer table allocation failed"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "pointer table"):
+                        host._allocate_host_buffer()
+                self.assertIsNone(host.k_buffer)
+                self.assertIsNone(host.k_data_ptrs)
+                self.assertEqual(host.k_data_refs, [])
+
+                host._allocate_host_buffer()
+                self.assertIs(host.k_buffer, host.kv_buffer)
+                self.assertNotEqual(host.k_buffer.data_ptr(), original.data_ptr())
+                self.assertEqual(
+                    host.k_data_ptrs.tolist(),
+                    [view.data_ptr() for view in host.k_data_refs],
+                )
+                expected_layers = 0 if layout == "page_first_direct" else host.layer_num
+                self.assertEqual(len(host.k_data_refs), expected_layers)
+                for layer, view in enumerate(host.k_data_refs):
+                    view.fill_(layer + 1)
+                    expected = (
+                        host.k_buffer[layer]
+                        if layout == "layer_first"
+                        else host.k_buffer[:, layer]
+                    )
+                    self.assertTrue(torch.all(expected == layer + 1))
+
+                host.destroy()
+                self.assertIsNone(host.k_buffer)
+                self.assertIsNone(host.k_data_ptrs)
+                self.assertEqual(host.k_data_refs, [])
+
+    def test_index_k_host_pool_joins_a_host_pool_group(self):
+        """Grouping a main KV pool with a K-only index pool raised AttributeError."""
+        index_pool, index_host = self._make_index_k_pools("layer_first")
         group = HostPoolGroup(
             [
                 PoolEntry(
