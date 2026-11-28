@@ -4,7 +4,8 @@ import contextlib
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from typing import Optional
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -19,6 +20,8 @@ from sglang.kernels.ops.attention.dsa.fp4_index_hip import (
     store_fp4_index_k,
 )
 from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa import dsa_indexer_hip
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -345,6 +348,71 @@ class TestFp4IndexKHip(CustomTestCase):
             tol = dict(rtol=1e-5, atol=1e-5 * float(ref.abs().max()))
             torch.testing.assert_close(logits[r, :end], ref, **tol)
             torch.testing.assert_close(prefill[r, start : start + end], ref, **tol)
+
+
+class TestPrefillLogitsKernelChoiceHip(CustomTestCase):
+    """SGLANG_USE_GLUON_DSA_PREFILL_LOGITS picks the gfx950 prefill logits kernel."""
+
+    def _logits(self, q, kv, scale, weights, ks, ke, *, use_gluon: Optional[bool]):
+        import aiter.ops.triton.fp8_mqa_logits as triton_mod
+
+        spies = {"triton": Mock(wraps=triton_mod.fp8_mqa_logits)}
+        patches = [patch.object(triton_mod, "fp8_mqa_logits", spies["triton"])]
+        try:
+            # The same probe as production: a missing export falls back to Triton.
+            from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+        except ImportError:
+            pass
+        else:
+            import aiter.ops.flydsl as flydsl_mod
+
+            spies["flydsl"] = Mock(wraps=flydsl_fp8_mqa_logits)
+            patches.append(
+                patch.object(flydsl_mod, "flydsl_fp8_mqa_logits", spies["flydsl"])
+            )
+        dsa_indexer_hip._prefill_mqa_logits_fn.cache_clear()
+        try:
+            with contextlib.ExitStack() as stack:
+                for p in patches:
+                    stack.enter_context(p)
+                flag = envs.SGLANG_USE_GLUON_DSA_PREFILL_LOGITS
+                stack.enter_context(flag.override(bool(use_gluon)))
+                if use_gluon is None:
+                    # Unset inside the override, which restores the caller's value.
+                    flag.clear()
+                indexer = SimpleNamespace(fp4_index_k=False)
+                out = dsa_indexer_hip.ragged_mqa_logits(
+                    indexer, q, weights, (kv, scale), ks, ke
+                )
+        finally:
+            dsa_indexer_hip._prefill_mqa_logits_fn.cache_clear()
+        called = [name for name, spy in spies.items() if spy.call_count]
+        self.assertEqual(len(called), 1, called)
+        return called[0], "flydsl" in spies, out
+
+    def test_gluon_kernel_matches_flydsl_on_a_tail_block(self):
+        """For rows % 4 != 0, the opt-in backend must match FlyDSL on valid logits."""
+        if not dsa_indexer_hip._is_gfx95:
+            self.skipTest("gfx950 picks between the two kernels")
+        torch.manual_seed(0)
+        rows, seq_kv, heads, dim = 23, 4096, HEADS, HEAD_DIM
+        kv = torch.randn(seq_kv, dim, device="cuda")
+        scale = (kv.abs().amax(dim=1) / 448.0).clamp(min=1e-4)
+        kv_fp8 = (kv / scale[:, None]).to(torch.float8_e4m3fn)
+        q = torch.randn(rows, heads, dim, device="cuda").to(torch.float8_e4m3fn)
+        weights = torch.randn(rows, heads, device="cuda")
+        # Every row's window starts far from column 0, as for a later request.
+        ks = torch.full((rows,), 3000, dtype=torch.int32, device="cuda")
+        ke = 3500 + torch.arange(rows, dtype=torch.int32, device="cuda")
+        args = (q, kv_fp8, scale, weights, ks, ke)
+        fly_kernel, has_flydsl, fly = self._logits(*args, use_gluon=None)
+        tri_kernel, _, tri = self._logits(*args, use_gluon=True)
+        # Without FlyDSL the default falls back to Triton.
+        self.assertEqual(fly_kernel, "flydsl" if has_flydsl else "triton")
+        self.assertEqual(tri_kernel, "triton")
+        col = torch.arange(seq_kv, device="cuda")
+        window = (col >= ks[:, None]) & (col < ke[:, None])
+        torch.testing.assert_close(tri[window], fly[window], rtol=1e-5, atol=1e-3)
 
 
 if __name__ == "__main__":
