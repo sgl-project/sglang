@@ -55,6 +55,7 @@ def _shared_context_attention_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    WIDE_KV_OFFSETS: tl.constexpr,  # K/V offsets past 2^31: slot * stride needs 64 bits
 ):
     group = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -101,6 +102,8 @@ def _shared_context_attention_kernel(
             mask=token_mask,
             other=0,
         )
+        if WIDE_KV_OFFSETS:
+            slots = slots.to(tl.int64)
         k_offsets = (
             slots[:, None] * stride_k_slot
             + kv_head * stride_k_head
@@ -151,6 +154,8 @@ def _shared_context_attention_kernel(
             mask=beam_mask & step_valid,
             other=0,
         )
+        if WIDE_KV_OFFSETS:
+            slots = slots.to(tl.int64)
         k_offsets = (
             slots[:, None] * stride_k_slot
             + kv_head * stride_k_head
@@ -198,6 +203,13 @@ def _shared_context_attention_kernel(
         output + output_offsets,
         result,
         mask=beam_mask[:, None] & dim_mask[None, :],
+    )
+
+
+def max_element_offset(tensor: torch.Tensor) -> int:
+    """Largest element offset from the tensor's base that a kernel can address."""
+    return sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
     )
 
 
@@ -286,6 +298,8 @@ def shared_context_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=block_d,
+        # 64-bit address math costs 2-5% of the kernel; pay it only when needed.
+        WIDE_KV_OFFSETS=max(map(max_element_offset, (k_buffer, v_buffer))) >= 2**31,
         num_warps=num_warps,
         num_stages=num_stages,
     )
