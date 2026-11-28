@@ -1066,6 +1066,71 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
         quant_cache.assert_not_called()
 
 
+class TestDSparkVerifyLengths(unittest.TestCase):
+    def setUp(self):
+        self.backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        self.fm = SimpleNamespace(
+            actual_seq_lengths_kv=torch.ones(2, dtype=torch.int32),
+            seq_lens_cpu_int=None,
+            dsv41_device_verify=True,
+        )
+        self.backend.forward_metadata = self.fm
+        self.mode = MagicMock()
+        self.mode.is_target_verify.return_value = True
+
+    def refresh(self, live, *, mirrorless=True):
+        live = torch.tensor(live, dtype=torch.int32)
+        ctx = SimpleNamespace(
+            fm=self.fm,
+            device=live.device,
+            graph_mode=self.mode,
+            bs=2,
+            tokens_per_bs=5,
+            ragged_layout=None,
+            mirrorless=mirrorless,
+            live_seq_lens=live,
+            live_seq_lens_cpu=live,
+            final_seq_lens_cpu=live + 5,
+        )
+        self.backend._refresh_graph_seq_metadata(ctx)
+        return SimpleNamespace(forward_mode=self.mode, batch_size=2, seq_lens=live)
+
+    def test_target_preserves_exact_qli_bounds_across_replays(self):
+        exact = self.fm.dsv41_verify_kv_lens = torch.ones(2, dtype=torch.int32)
+        self.fm.dsv41_live_mask_buf = torch.zeros(10, dtype=torch.bool)
+        for live, expected in (
+            ([127, 0], [132, 0]),
+            ([0, 0], [0, 0]),
+            ([8, 9], [13, 14]),
+        ):
+            batch = self.refresh(live)
+            self.assertIsNone(self.fm.seq_lens_cpu_int)
+            self.assertIs(self.fm.dsv41_verify_kv_lens, exact)
+            self.assertEqual(self.backend._dsv41_qli_kv_lens(batch).tolist(), expected)
+            self.assertEqual(
+                self.fm.actual_seq_lengths_kv.tolist(), [max(n, 1) for n in expected]
+            )
+            self.assertEqual(
+                self.fm.dsv41_live_mask_buf.tolist(),
+                [n > 0 for n in live for _ in range(5)],
+            )
+
+    def test_draft_skips_only_the_mirrorless_copy(self):
+        self.refresh([7, 0])
+        self.assertIsNone(self.fm.seq_lens_cpu_int)
+        self.assertEqual(self.fm.actual_seq_lengths_kv.tolist(), [12, 1])
+        self.refresh([7, 0], mirrorless=False)
+        self.assertEqual(self.fm.seq_lens_cpu_int.tolist(), [12, 0])
+
+    def test_host_consumer_keeps_its_mirror(self):
+        self.fm.dsv41_device_verify = False
+        self.refresh([7, 0])
+        original = self.fm.seq_lens_cpu_int
+        batch = self.refresh([0, 8])
+        self.assertEqual(self.fm.seq_lens_cpu_int.data_ptr(), original.data_ptr())
+        self.assertEqual(self.backend._dsv41_qli_kv_lens(batch).tolist(), [0, 13])
+
+
 class TestMirrorlessReplayWidthHint(unittest.TestCase):
     """max_seq_len_host bounds the mirrorless replay-prep copy widths."""
 

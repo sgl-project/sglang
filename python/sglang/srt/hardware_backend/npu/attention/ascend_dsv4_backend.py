@@ -1814,13 +1814,16 @@ class LowRatioCompressAscendBackendMixin:
         The compressed K length is ``final_len // ratio`` where final_len
         counts every KV row this forward can see. Decode satisfies that with
         device ``seq_lens``; a verify window does not (device seq_lens stays at
-        the prefix length), so it reads ``seq_lens_cpu_int``, which the seq
-        refresh writes on both the eager path and graph replay.
+        the prefix length). Static DSpark verify graphs on A5 keep exact
+        lengths on device, including zero for padding rows.
         """
         mode = getattr(forward_batch, "forward_mode", None)
         if mode is None or not mode.is_target_verify():
             return forward_batch.seq_lens.to(torch.int64)
         bs = int(forward_batch.batch_size)
+        exact = getattr(self.forward_metadata, "dsv41_verify_kv_lens", None)
+        if exact is not None:
+            return exact[:bs].to(torch.int64)
         final_cpu = getattr(self.forward_metadata, "seq_lens_cpu_int", None)
         if final_cpu is not None and 0 < bs <= int(final_cpu.numel()):
             return final_cpu[:bs].to(
@@ -3462,6 +3465,19 @@ class DeepseekV4AscendAttnBackend(
             device=device,
         )
 
+        metadata.dsv41_device_verify = (
+            self._is_dspark_algorithm
+            and self._dsv4_is_v41_model
+            and not self.needs_cpu_seq_lens
+            and not (self._dsv4_has_c4 or self._dsv4_has_c128)
+            and forward_mode.is_target_verify()
+            and ragged_layout is None
+            and is_npu_arch35()
+        )
+        if metadata.dsv41_device_verify and not self.is_draft_worker:
+            # QLI needs zero for padding. The attention kernel clamps KV to one.
+            metadata.dsv41_verify_kv_lens = metadata.actual_seq_lengths_kv.clone()
+
         metadata.swa_page_table = self.graph_metadata["swa_page_table"][:bs, :]
         metadata.swa_loc = torch.zeros(n_tok, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
@@ -3864,16 +3880,22 @@ class DeepseekV4AscendAttnBackend(
             attn_seq_lens = torch.where(
                 valid_verify_rows, final_seq_lens, ctx.live_seq_lens
             )
-            fm.seq_lens_cpu_int = self._seq_lens_cpu_int_view(
-                int(ctx.final_seq_lens_cpu.numel())
-            )
-            fm.seq_lens_cpu_int.copy_(
-                torch.where(
-                    ctx.live_seq_lens_cpu > 0,
-                    ctx.final_seq_lens_cpu,
-                    ctx.live_seq_lens_cpu,
+            exact = getattr(fm, "dsv41_verify_kv_lens", None)
+            if exact is not None:
+                exact.copy_(attn_seq_lens)
+            if getattr(fm, "dsv41_device_verify", False) and ctx.mirrorless:
+                fm.seq_lens_cpu_int = None
+            else:
+                fm.seq_lens_cpu_int = self._seq_lens_cpu_int_view(
+                    int(ctx.final_seq_lens_cpu.numel())
                 )
-            )
+                fm.seq_lens_cpu_int.copy_(
+                    torch.where(
+                        ctx.live_seq_lens_cpu > 0,
+                        ctx.final_seq_lens_cpu,
+                        ctx.live_seq_lens_cpu,
+                    )
+                )
         else:
             # CPU mirror of the kv buffer written below, so the host metadata op
             # reads it instead of syncing D2H.
