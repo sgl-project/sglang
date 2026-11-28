@@ -1,0 +1,43 @@
+---
+title: LingBot-VLA 2.0
+description: Serve LingBot-VLA 2.0 on one NVIDIA GPU and return continuous robot actions.
+---
+
+LingBot-VLA 2.0 takes RGB camera frames, robot state, and a language instruction. A Qwen3-VL backbone encodes the observation once. A sparse Qwen2 action expert reuses that prefix during flow-matching denoising.
+
+## Serve a checkpoint
+
+Install SGLang with the diffusion extra on Linux with one CUDA GPU. The policy loads FP32 weights and serves one observation per request.
+
+```bash
+sglang serve lerobot/lingbot_vla_v2_robotwin \
+  --host 127.0.0.1 --port 30000 --num-gpus 1 \
+  --allow-cudnn-tf32 false
+```
+
+| Checkpoint | State dimensions | Returned chunk | Normalization |
+| --- | --- | --- | --- |
+| `lerobot/lingbot_vla_v2_robotwin` | 14 | 50 × 14 | RoboTwin quantile statistics and checkpoint slot mapping |
+| `lerobot/lingbot_vla_v2_base` | 55 | 50 × 55 | Normalized canonical state and action layout |
+
+The Base checkpoint ships without robot calibration statistics. For Base inference, set `{"inputs_normalized": true}` in your `--pipeline-config-path` and supply state in normalized canonical coordinates. Base returns the normalized action chunk.
+
+You can pass a local LeRobot checkpoint directory in place of the Hub ID. To serve offline with the backbone config and processor files in a local Qwen3-VL-4B-Instruct directory, pass `--pipeline-config-path` with a JSON file containing `{"tokenizer_path": "/path/to/qwen3-vl-4b"}`.
+
+## Request an action chunk
+
+Get the active checkpoint's camera keys, state dimensions, and output shape from `GET /v1/actions/metadata`. For RoboTwin, send at least one of `cam_high`, `cam_left_wrist`, and `cam_right_wrist`. The policy masks absent views. Send state in the checkpoint's robot units. The policy applies normalization and returns actions mapped back to those units.
+
+Use `POST /v1/actions/generations` with the [action API](/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension) or connect to the OpenPI MessagePack WebSocket at `/openpi/policy`.
+
+- On HTTP, put RGB frames and state under `input.observation` and denoising steps under `parameters.num_inference_steps`.
+- On OpenPI, send `observation.images.<camera>`, `state`, and `prompt` at the top level. Put `num_inference_steps` at the top level to override the checkpoint default of 10 steps.
+- For repeatable comparisons, supply explicit initial `noise` with shape `[50, 55]`, including for the RoboTwin checkpoint.
+
+See the [LeRobot policy documentation](https://huggingface.co/docs/lerobot/main/en/lingbot_vla_v2) for the checkpoints and robot conventions.
+
+## Enable the action CUDA Graph
+
+Set `{"enable_action_cuda_graph": true}` in your pipeline configuration to capture the denoising loop for the checkpoint's default step count. Capture runs on the first eligible request. Each replay copies the current observation's prefix KV and noise into the graph.
+
+To run an individual request eagerly, set `runtime.cuda_graph` to `false`. Requests with a different step count run eagerly.

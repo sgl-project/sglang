@@ -37,6 +37,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
     FLUX3_IMAGE_NAME_PATTERNS,
     is_flux3_image_package,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.lingbot_vla_v2 import (
+    is_lingbot_vla_v2_checkpoint,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.praxis import (
     PRAXIS_HF_PATHS,
     is_praxis_package,
@@ -744,6 +747,8 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
         return "Flux3ActionPipeline"
     if is_praxis_package(model_path):
         return "PraxisPipeline"
+    if is_lingbot_vla_v2_checkpoint(model_path):
+        return "LingBotVLAV2Pipeline"
     if is_flux3_image_package(model_path):
         return "Flux3ImagePipeline"
 
