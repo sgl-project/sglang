@@ -12,6 +12,8 @@ from typing import Any, Callable, Dict, Optional
 
 import requests
 
+from sglang.srt.utils.auth import admin_auth_headers
+
 # Server-supplied names used to build a local path for a downloaded video.
 _SAFE_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]+")
 _VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".mkv")
@@ -52,6 +54,11 @@ class SGLDiffusionServerAPI:
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+        }
+        # LoRA loading needs the server's --admin-api-key, read from SGLANG_ADMIN_API_KEY.
+        self.admin_headers = {
+            "Content-Type": "application/json",
+            **admin_auth_headers(),
         }
 
     def get_model_info(self) -> Dict[str, Any]:
@@ -252,7 +259,8 @@ class SGLDiffusionServerAPI:
 
         ``progress_callback`` gets the job's ``progress`` (0-100) on each poll.
         ``check_interrupt`` is called between polls and may raise to stop
-        waiting; the server has no abort yet, so the job itself keeps running.
+        waiting; the server job keeps running unless it is cancelled with
+        ``DELETE /v1/videos/{id}``.
 
         Args:
             prompt: Text prompt for video generation
@@ -619,7 +627,7 @@ class SGLDiffusionServerAPI:
             response = requests.post(
                 f"{self.base_url}/set_lora",
                 json=payload,
-                headers=self.headers,
+                headers=self.admin_headers,
                 timeout=30,
             )
             response.raise_for_status()
@@ -649,32 +657,10 @@ class SGLDiffusionServerAPI:
             response = requests.post(
                 f"{self.base_url}/unmerge_lora_weights",
                 json=payload,
-                headers=self.headers,
+                headers=self.admin_headers,
                 timeout=30,
             )
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
             raise RuntimeError(f"Failed to unset LoRA adapter: {str(e)}")
-
-
-if __name__ == "__main__":
-    api = SGLDiffusionServerAPI(
-        base_url="http://localhost:30010/v1", api_key="sk-proj-1234567890"
-    )
-    model_info = api.get_model_info()
-    print(api.get_model_info())
-    if model_info.get("task_type") == "T2V" or model_info.get("task_type") == "I2V":
-        print(
-            api.generate_video(
-                prompt="A calico cat playing a piano on stage",
-                num_inference_steps=1,
-                size="480x480",
-            )
-        )
-    else:
-        print(
-            api.generate_image(
-                prompt="A calico cat playing a piano on stage", size="1024x1024"
-            )
-        )

@@ -43,8 +43,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.pixtral import (
@@ -68,14 +67,6 @@ class LightOnOCRForConditionalGeneration(nn.Module):
     - VisionLanguageAdapter projection to text hidden size
     - Qwen3-based decoder (28 layers) with QK norms
     """
-
-    merge_by_field_config = True
-
-    @classmethod
-    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
-        if modality.startswith("image"):
-            return None
-        raise ValueError("Only image modality is supported")
 
     def __init__(self, *, config, prefix: str = "", **kwargs):
         super().__init__()
@@ -171,9 +162,6 @@ class LightOnOCRForConditionalGeneration(nn.Module):
         image_embeds = self.vision_language_adapter(image_features)
         return image_embeds
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -187,12 +175,6 @@ class LightOnOCRForConditionalGeneration(nn.Module):
             multimodal_model=self,
             positions=positions,
         )
-
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        return self.language_model.compute_logits(hidden_states)
 
     def get_embed_and_head(self):
         return self.language_model.get_embed_and_head()

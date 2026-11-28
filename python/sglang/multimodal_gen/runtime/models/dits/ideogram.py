@@ -292,6 +292,7 @@ class Ideogram4Attention(nn.Module):
         self.norm_k = Ideogram4RMSNorm(self.head_dim, eps=eps)
         self.attn = USPAttention(
             num_heads=self.local_num_heads,
+            global_num_heads=num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -586,6 +587,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _supported_attention_backends = {
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.AMX_ATTN,
     }
     param_names_mapping = Ideogram4DiTConfig().arch_config.param_names_mapping
     reverse_param_names_mapping = {}

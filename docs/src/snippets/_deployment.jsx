@@ -10,7 +10,7 @@
 //                      {id, label, vram, vendor}[] merged into the catalog at render
 //                      (so a model-specific GPU never needs an engine-catalog edit);
 //                      vendor picks the selector group: blackwell | hopper | amd |
-//                      npu | cpu (cpu also drops GPU passthrough from docker run).
+//                      npu | cpu | tpu (cpu and tpu drop GPU passthrough from docker run).
 //                      `multiNodeDockerFlags: string[]` (either source) adds
 //                      `docker run` flags the platform's fabric needs
 //   groupHardware      optional — set false to show one flat hardware row
@@ -41,6 +41,7 @@
 //                      builder while reusing this engine's overlay composition and
 //                      command rendering. Shape:
 //                      {defaultSelection, resource: {limits, verifiedRecipes,
+//                      recommendedRecipe?(sel),
 //                      autoTopology(sel), validateTopology(sel)},
 //                      resolveDeployment(sel)}. Recipes may use verifiedWhen(sel)
 //                      to qualify the recommendation badge by checkpoint or mode.
@@ -72,7 +73,7 @@
 //                      dockerMounts carry role-specific rendering metadata.
 //   modelNames         HF slug lookup, `hw|variant|quant`, `variant|quant`,
 //                      `hw|quant`, `quant`, `hw`, then `default`
-//   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?}
+//   placeholders       {{KEY}} → {target: 'command'|'curl', label, default?, showWhen?(sel)}
 //   curl               cURL template (uses {{MODEL_NAME}} + placeholders), or
 //                      `(selection, cell) => template` when the request payload
 //                      depends on a custom match/overlay dimension
@@ -93,7 +94,8 @@
 //                      `hw|quant|strategy` then `hw|quant` then `hw`;
 //                      falls back to `lmsysorg/sglang:dev`
 //   dockerHostNetworkWhen optional — `(selection, {flags, env}) => boolean`
-//   dockerMounts       optional — additional `-v` mount specs
+//   dockerMounts       optional — additional `-v` mount specs, as an array or
+//                      `(selection) => array`
 //   dockerRunCommand   optional — command placed after the image and before
 //                      generated server flags; string or `(selection) => string`
 //   runModes           optional — command output tabs to show (`python` and/or
@@ -101,6 +103,11 @@
 //                      defaults to both, in that order
 //   showPlaygroundLink optional — false hides the "Open the Playground" footer
 //                      for cookbooks that only expose the deployment matrix
+//   ratings            optional — false hides the per-recipe 👍/👎 row (it is
+//                      also off for commandBuilder pages and redirect cells).
+//                      A recipe is keyed by page path + hw, match-dim and applied
+//                      overlay-dim ids (ratingKey), so renaming any of them
+//                      resets that recipe's ratings
 // Component props besides `config` / `benchmarks`:
 //   agenticLink        optional — heading id of the page's agentic long-context
 //                      section; adds a footer link to it under the Playground link
@@ -118,6 +125,9 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
+
+  // ==== COMMAND ENGINE ====
+  // docs/scripts/export_commands.mjs runs this block in Node; keep it free of JSX and React.
 
   // ==== 1. Hardware catalog (shared across cookbooks) ====
   // VRAM is per-GPU on-chip memory, not per-module.
@@ -145,6 +155,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       { id: "h20-3e", label: "H20-3e", vram: "141GB" },
       { id: "h800",  label: "H800",  vram: "80GB"  },
     ],
+    rubin: [],
     // ROCm multi-node runs the RDMA NICs straight through: /dev/infiniband
     // covers rdma_cm plus the per-NIC uverbsN nodes, IPC_LOCK + an unlimited
     // memlock let the transport pin its registered buffers, and the stack /
@@ -637,6 +648,25 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     return out;
   };
   // ==== end MIRROR ====
+  // Recipe-rating key for a selection: every dim that shapes the command, i.e.
+  // the match dims plus the overlay dims whose pick applies (an overlay such
+  // as speculative decoding changes the command, so its on and off states are
+  // rated apart). Same test as overlayPick: a visible row holding a disabled
+  // pick (every option disabled on this hardware) adds nothing to the command,
+  // so it stays out of the key. These ids are the ratings' storage keys:
+  // renaming hw, a dim, or an option id (or moving the page) starts its
+  // recipes from zero. docs/scripts/export_rating_ids.mjs lists every
+  // reachable key.
+  const ratingKey = (sel) => {
+    const applied = overlayDimSpecs.filter((spec) => {
+      if (!rowVisible(spec, sel)) return false;
+      const opt = (spec.options || []).find((o) => o.id === sel[spec.id]);
+      return !!opt && !optionDisabled(opt, sel);
+    });
+    return [...DIMENSIONS, ...applied.map((d) => d.id)]
+      .map((d) => `${d}=${sel[d]}`)
+      .join("&");
+  };
   // `soft` marks an option that is plausible but outside the verified matrix:
   // it stays selectable (the status badge reports verification separately),
   // where `disabled` is reserved for combinations that cannot work at all.
@@ -939,6 +969,11 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             "docker run --privileged",
             "  --shm-size 32g",
           ]
+        : vendorOf(sel.hw) === "tpu"
+        ? [
+            "docker run --privileged",
+            "  --shm-size 64g",
+          ]
         : [
             "docker run --gpus all",
             "  --shm-size 32g",
@@ -949,11 +984,16 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
-        ...((multinode || cell.pd) ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
+        // A single-node PD role on the host network moves KV over RDMA too.
+        ...((multinode || cell.pd || (hostNetwork && PD_SERVE_PORTS[sel.pdMode] !== undefined))
+          ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
+        ...[
+          ...(typeof config.dockerMounts === "function" ? config.dockerMounts(sel) : config.dockerMounts || []),
+          ...(cell.pd ? cell.dockerMounts || [] : []),
+        ].map((mount) => `  -v ${mount}`),
         // HF token only for gated checkpoints — configs that declare an HF_TOKEN placeholder.
         ...(config.placeholders && config.placeholders.HF_TOKEN
           ? [`  --env "HF_TOKEN={{HF_TOKEN}}"`] : []),
@@ -992,6 +1032,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     }
     return cmd;
   };
+  // ==== end COMMAND ENGINE ====
 
   // Accuracy labels: [field-key, display-label, unit]. Declared per model via
   // `config.accuracyLabels` — the engine ships NO default eval set. A config
@@ -1528,6 +1569,78 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     : findCell(config.cells, sel);
   const builderMeta = (cell && cell.builder) || {};
   const verifyStatus = cellVerifyStatus(cell, sel);
+
+  // ==== Recipe ratings (👍/👎 per cell) ====
+  // Votes live in an external service (sgl-project/sglang-cookbook-ratings);
+  // the browser talks to it directly. It answers only https://docs.sglang.io
+  // (CORS and an Origin check), so local and preview builds show no row.
+  // Off when the endpoint is empty, for builder pages (no discrete cells to
+  // rate), or when a page sets `config.ratings: false`.
+  const RATINGS_ENDPOINT = "https://sglang-cookbook-ratings.vercel.app/";
+  const ratingsEnabled =
+    !!RATINGS_ENDPOINT && !commandBuilder && config.ratings !== false;
+  // Keyed by page path + ratingKey(sel) (see the engine). The path is read
+  // after mount because the static render has no window.
+  const [ratingPath, setRatingPath] = useState(null);
+  useEffect(() => {
+    setRatingPath(window.location.pathname.replace(/\/+$/, "").toLowerCase() || "/");
+  }, []);
+  const recipeId =
+    ratingsEnabled && ratingPath && cell && !cell.redirect
+      ? `${ratingPath}|${ratingKey(sel)}`
+      : null;
+  // Fingerprint of the command the reader saw, stored with each vote so votes
+  // cast before a recipe fix can be told apart from votes cast after it. It
+  // hashes the whole rendered command (env, model, image, flags, PD commands)
+  // in the first run mode, with placeholders unfilled and no calculator
+  // ratio, so it depends on the recipe alone, not on the reader's inputs.
+  const recipeFingerprint = (() => {
+    if (!recipeId) return "";
+    let h = 0x811c9dc5; // FNV-1a, 32-bit
+    const text = renderCommand(cell, sel, {}, runModes[0]);
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+  })();
+  // {id, up, down, mine}: the service's answer, tagged with the recipe it is
+  // for. Only an answer for the current recipe is shown, and a vote reply that
+  // lands after the reader moved to another recipe neither shows nor replaces
+  // the new recipe's answer.
+  const [ratingState, setRatingState] = useState(null);
+  const rating = ratingState && ratingState.id === recipeId ? ratingState : null;
+  const [ratingBusy, setRatingBusy] = useState(false);
+  useEffect(() => {
+    if (!recipeId) return;
+    const ctrl = new AbortController();
+    fetch(`${RATINGS_ENDPOINT}?id=${encodeURIComponent(recipeId)}`, { signal: ctrl.signal })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => { if (data) setRatingState({ ...data, id: recipeId }); })
+      .catch(() => {}); // A down rating service must never break the page.
+    return () => ctrl.abort();
+  }, [recipeId]);
+  const castVote = (vote) => {
+    if (!recipeId || !rating || ratingBusy) return;
+    // Clicking the active thumb again withdraws the vote.
+    const next = rating.mine === vote ? "none" : vote;
+    const votedId = recipeId;
+    setRatingBusy(true);
+    fetch(RATINGS_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: votedId, vote: next, fp: recipeFingerprint }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      // Keep an answer the page already holds for another recipe: the reader
+      // moved on while this vote was in flight.
+      .then((data) => {
+        if (data) setRatingState((prev) => (prev && prev.id !== votedId ? prev : { ...data, id: votedId }));
+      })
+      .catch(() => {})
+      .finally(() => setRatingBusy(false));
+  };
+
   // Pin the calculator-computed ratio into the rendered command (before the
   // host/port tail); cells themselves stay ratio-free. Cells sizing the pool
   // with --max-mamba-cache-size opt out.
@@ -1654,7 +1767,12 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
     return out;
   };
 
-  const recommendedBuilderRecipe = (hw) => {
+  const recommendedBuilderRecipe = (hw, selection) => {
+    // Model-specific recommendations can preserve the selected capacity and
+    // workload. Hardware switches still use the platform default below.
+    if (selection && typeof commandBuilder.resource?.recommendedRecipe === "function") {
+      return commandBuilder.resource.recommendedRecipe(selection);
+    }
     const recipes = commandBuilder.resource?.verifiedRecipes || [];
     return recipes.find((entry) => entry.hw === hw && entry.default)
       || recipes.find((entry) => entry.hw === hw);
@@ -1667,11 +1785,21 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         if (dim === "hw") {
           const currentRecipe = recommendedBuilderRecipe(prev.hw);
           const nextRecipe = recommendedBuilderRecipe(value);
-          const resourcesFollowPlatformDefault = !!currentRecipe
+          const gpuBounds = commandBuilder.resource?.limits?.gpus_per_node;
+          const fixedGpuCount = typeof gpuBounds?.disabledWhen === "function"
+            && gpuBounds.disabledWhen(next);
+          const previousFixedGpuCount = typeof gpuBounds?.disabledWhen === "function"
+            && gpuBounds.disabledWhen(prev);
+          const resourcesFollowPlatformDefault = fixedGpuCount || previousFixedGpuCount || (!!currentRecipe
             && Number(prev.nodes) === Number(currentRecipe.nodes)
-            && Number(prev.gpus_per_node) === Number(currentRecipe.gpus_per_node);
+            && Number(prev.gpus_per_node) === Number(currentRecipe.gpus_per_node));
           next = {
             ...next,
+            ...Object.fromEntries(resourcesFollowPlatformDefault && nextRecipe
+              ? overlayDimSpecs
+                .filter((spec) => spec.scope === "serve" && nextRecipe[spec.id] !== undefined)
+                .map((spec) => [spec.id, nextRecipe[spec.id]])
+              : []),
             nodes: resourcesFollowPlatformDefault
               ? (nextRecipe?.nodes ?? next.nodes)
               : next.nodes,
@@ -1824,6 +1952,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
   const placeholderGroups = (() => {
     const out = { command: [], curl: [] };
     for (const [key, meta] of Object.entries(config.placeholders || {})) {
+      if (typeof meta.showWhen === "function" && !meta.showWhen(sel)) continue;
       (out[meta.target] || (out[meta.target] = [])).push({ key, ...meta });
     }
     return out;
@@ -1930,9 +2059,13 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
       || selectedOption(dim)?.label
       || sel[dim.id]
       || "—";
-    const recommendedRecipe = recommendedBuilderRecipe(sel.hw);
+    const hardwareLabel = hwGroups.flatMap((group) => group.items)
+      .find((hardware) => hardware.id === sel.hw)?.label || sel.hw.toUpperCase();
+    const recommendedRecipe = recommendedBuilderRecipe(sel.hw, sel);
     const recommendedIsVerified = !!recommendedRecipe && !recommendedRecipe.unverified
       && (typeof recommendedRecipe.verifiedWhen !== "function" || recommendedRecipe.verifiedWhen(sel));
+    const recommendedLabel = recommendedIsVerified ? "Verified"
+      : recommendedRecipe?.unverified ? "Derived" : "Recommended";
     const recommendedInUse = !!recommendedRecipe
       && Number(sel.nodes) === recommendedRecipe.nodes
       && Number(sel.gpus_per_node) === recommendedRecipe.gpus_per_node
@@ -1941,7 +2074,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         const expected = recommendedRecipe[dim.id] ?? dim.default;
         if (dim.id === "attention") return sel.attention === "platform";
         return expected === undefined || sel[dim.id] === expected
-          || (["placement", "encoder"].includes(dim.id) && sel[dim.id] === "auto");
+          || (dim.id === "placement" && sel[dim.id] === "auto");
       });
 
     const restoreRecommendedRecipe = () => {
@@ -2055,17 +2188,18 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         {recommendedRecipe && (
           <section className="sgd-builder-recipe">
             <div>
-              {/* This is the verified operating point, not sizing advice — a
-                  hardware whose validation ran on 8 GPUs is not "recommending"
-                  8 over a smaller deployment. */}
-              <span>{recommendedIsVerified ? "Verified recipe" : "Derived recipe"} · {sel.hw.toUpperCase()}</span>
+              {/* Derived marks an estimated hardware recipe; an untested
+                  request does not turn a measured server into an estimate. */}
+              <span>{recommendedLabel} recipe · {hardwareLabel}</span>
               <strong>
                 {[
-                  `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPUs`,
+                  `${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node} GPU${recommendedRecipe.nodes * recommendedRecipe.gpus_per_node === 1 ? "" : "s"}`,
                   recommendedRecipe.tp_size > 1 && `TP ${recommendedRecipe.tp_size}`,
                   `Ulysses ${recommendedRecipe.ulysses_degree}`,
                   recommendedRecipe.ring_degree > 1 && `Ring ${recommendedRecipe.ring_degree}`,
-                  { resident: "Resident", fsdp: "FSDP", offload: "Layerwise offload" }[recommendedRecipe.placement],
+                  overlayDimSpecs.find((dim) => dim.id === "placement")?.options
+                    ?.find((option) => option.id === recommendedRecipe.placement)?.label
+                    || { resident: "Resident", fsdp: "FSDP", offload: "Offload" }[recommendedRecipe.placement],
                 ].filter(Boolean).join(" · ")}
               </strong>
             </div>
@@ -2073,7 +2207,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               {renderStatus(recommendedIsVerified ? "verified" : "unverified")}
               {recommendedInUse
                 ? <small>In use</small>
-                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>{recommendedIsVerified ? "Use verified recipe" : "Use derived recipe"}</button>}
+                : <button type="button" className="sgd-builder-text-action" onClick={restoreRecommendedRecipe}>Use {recommendedLabel.toLowerCase()} recipe</button>}
             </div>
           </section>
         )}
@@ -2114,7 +2248,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
           </div>
           {Number(sel.nodes) > 1 && (
             <p className="sgd-builder-resource-summary">
-              {sel.nodes} nodes × {sel.gpus_per_node} {sel.hw.toUpperCase()} = {totalGpus} GPUs
+              {sel.nodes} nodes × {sel.gpus_per_node} {hardwareLabel} = {totalGpus} GPUs
             </p>
           )}
           <button
@@ -2205,7 +2339,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
                   [dim.id]: Math.min(dim.max, Number(prev[dim.id]) + 1),
                 }))}
               >+</button>
-              <span>{dim.unit || "outputs"}</span>
+              <span>{dim.unit ?? "outputs"}</span>
             </div>
           ) : (
             <div className="sgd-builder-context-options">
@@ -2314,7 +2448,7 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               <strong>{serve ? "Serve" : "Request"}</strong>
               <span>
                 {serve
-                  ? `${sel.hw.toUpperCase()} · ${activeRunMode === "docker" ? "Docker" : "Python"}`
+                  ? `${hardwareLabel} · ${activeRunMode === "docker" ? "Docker" : "Python"}`
                   : "cURL"}
               </span>
             </div>
@@ -2563,6 +2697,36 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
               </div>
             )}
           </>)}
+        {recipeId && rating && (
+          <div
+            style={{
+              display: "flex", alignItems: "center", gap: "8px",
+              marginTop: "8px", fontSize: "12px",
+              color: isDark ? "#9ca3af" : "#6b7280",
+            }}
+          >
+            <span>Did this recipe work for you?</span>
+            {[["up", "👍"], ["down", "👎"]].map(([vote, icon]) => (
+              <button
+                key={vote}
+                type="button"
+                disabled={ratingBusy}
+                aria-pressed={rating.mine === vote}
+                aria-label={vote === "up" ? "This recipe worked" : "This recipe did not work"}
+                onClick={() => castVote(vote)}
+                style={{
+                  ...s.iconButton,
+                  ...(rating.mine === vote
+                    ? { borderColor: isDark ? "#FDBA74" : "#C2410C", fontWeight: 600 }
+                    : {}),
+                  opacity: ratingBusy ? 0.6 : 1,
+                }}
+              >
+                {icon} {rating[vote]}
+              </button>
+            ))}
+          </div>
+        )}
         </div>
       </div>
 

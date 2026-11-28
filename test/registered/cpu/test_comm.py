@@ -4,16 +4,18 @@ import os
 import traceback
 import unittest
 from multiprocessing import Process
+from pathlib import Path
 
 import sgl_kernel  # noqa: F401
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from sglang.srt.distributed.utils import reduce_scatter_single
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
-register_cpu_ci(est_time=43, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=43, suite="extra-test-cpu-intel")
 
 
 def run_distributed_test(
@@ -54,6 +56,18 @@ def all_reduce_fn(rank, world_size):
         torch.ops.sgl_kernel.shm_allreduce(tensor_shm, op)
 
         torch.testing.assert_close(tensor, tensor_shm)
+
+
+def shared_memory_cleanup_fn(rank, world_size):
+    dist.barrier()
+    path = Path(
+        f"/dev/shm/deepspeed_allreduce_buffer_{os.getuid()}_localhost_"
+        f"{os.environ['MASTER_PORT']}_default_{rank}"
+    )
+    exists = path.exists()
+    path.unlink(missing_ok=True)
+    assert not exists, f"Shared memory still exists: {path}"
+    all_reduce_fn(rank, world_size)
 
 
 def all_gather_fn(rank, world_size):
@@ -104,19 +118,20 @@ def reduce_scatter_tensor_fn(rank, world_size):
     op = dist.ReduceOp.SUM
 
     for dtype in [torch.float32, torch.bfloat16, torch.float16]:
-        N, D = 4, 10
-        input_size = (world_size * N, D)
-        tensor = torch.randn(input_size, dtype=dtype)
+        # (2560, 4096) makes the input exceed the 32 MiB shm buffer, ending in a partial chunk.
+        for N, D in [(4, 10), (2560, 4096)]:
+            input_size = (world_size * N, D)
+            tensor = torch.randn(input_size, dtype=dtype)
 
-        output_size = (N, D)
-        output_tensor = torch.empty(output_size, dtype=dtype)
-        output_shm = torch.empty_like(output_tensor)
+            output_size = (N, D)
+            output_tensor = torch.empty(output_size, dtype=dtype)
+            output_shm = torch.empty_like(output_tensor)
 
-        dist.reduce_scatter_tensor(output_tensor, tensor, op=op)
+            reduce_scatter_single(output_tensor, tensor, op=op)
 
-        torch.ops.sgl_kernel.shm_reduce_scatter_tensor(output_shm, tensor, op)
+            torch.ops.sgl_kernel.shm_reduce_scatter_tensor(output_shm, tensor, op)
 
-        torch.testing.assert_close(output_tensor, output_shm)
+            torch.testing.assert_close(output_tensor, output_shm)
 
 
 def init_group(rank):
@@ -236,6 +251,10 @@ class TestComm(CustomTestCase):
 
     def test_all_reduce(self):
         self._spawn_and_check(all_reduce_fn, init_legacy_shm=True)
+
+    def test_shared_memory_cleanup(self):
+        """Initialized CPU collectives must not leave named shared memory."""
+        self._spawn_and_check(shared_memory_cleanup_fn, init_legacy_shm=True)
 
     def test_all_gather(self):
         self._spawn_and_check(all_gather_fn, init_legacy_shm=True)

@@ -15,6 +15,7 @@ class EmbeddingTask(str, Enum):
     NONE = "none"
     EMBED = "embed"
     CLASSIFY = "classify"
+    TOKEN_CLASSIFY = "token_classify"
 
 
 class PoolingStrategy(str, Enum):
@@ -83,6 +84,9 @@ class EmbeddingModelSpec:
     safe_disable_radix_cache: bool = False
     safe_disable_chunked_prefill: bool = False
     safe_disable_kv_cache: bool = False
+    # Every attention layer is AttentionType.ENCODER_ONLY; with
+    # safe_disable_kv_cache, the FA prefill backend runs without a KV pool.
+    encoder_only_attention: bool = False
 
     @property
     def bcg_eligibility(self) -> BCGEligibility:
@@ -113,6 +117,7 @@ class EmbeddingModelSpec:
             "safe_disable_kv_cache": self.safe_disable_kv_cache,
             "safe_disable_radix_cache": self.safe_disable_radix_cache,
             "safe_disable_chunked_prefill": self.safe_disable_chunked_prefill,
+            "encoder_only_attention": self.encoder_only_attention,
         }
 
 
@@ -175,6 +180,12 @@ def embedding_support_matrix() -> list[dict[str, Any]]:
             **_embedding_gemma2_spec().as_dict(),
         }
     )
+    rows.append(
+        {
+            "architecture": "Ministral3Model (is_causal=false, pooling=avg)",
+            **_embedding_nemotron3_spec().as_dict(),
+        }
+    )
     return rows
 
 
@@ -223,6 +234,30 @@ def _embedding_gemma_spec() -> EmbeddingModelSpec:
     )
 
 
+def _embedding_nemotron3_spec() -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family="embedding_nemotron3",
+        task=EmbeddingTask.EMBED,
+        execution=EmbeddingExecution.ENCODER_ONLY,
+        attention=AttentionPattern.BIDIRECTIONAL,
+        pooling=PoolingStrategy.MEAN,
+        normalize=True,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=False,
+        requires_embedding_flag=False,
+        auto_enable_embedding=True,
+        bidirectional_attention=True,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+        safe_disable_radix_cache=True,
+        safe_disable_chunked_prefill=True,
+        safe_disable_kv_cache=True,
+        encoder_only_attention=True,
+    )
+
+
 def _native_embedding_spec(
     family: str, execution: EmbeddingExecution, pooling: PoolingStrategy
 ) -> EmbeddingModelSpec:
@@ -245,6 +280,28 @@ def _native_embedding_spec(
         requires_embedding_flag=False,
         auto_enable_embedding=True,
         bidirectional_attention=execution != EmbeddingExecution.DECODER_POOLING,
+        bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
+    )
+
+
+def _classification_spec(
+    *, family: str, task: EmbeddingTask, requires_embedding_flag: bool
+) -> EmbeddingModelSpec:
+    return EmbeddingModelSpec(
+        family=family,
+        task=task,
+        execution=EmbeddingExecution.CLASSIFICATION,
+        attention=AttentionPattern.NONE,
+        pooling=PoolingStrategy.MODEL_DEFINED,
+        normalize=False,
+        postprocessor="model_defined",
+        tokenizer_special_tokens="model_default",
+        supports_dimensions=False,
+        supports_token_embeddings=False,
+        supports_multimodal=False,
+        requires_embedding_flag=requires_embedding_flag,
+        auto_enable_embedding=False,
+        bidirectional_attention=False,
         bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
     )
 
@@ -311,28 +368,31 @@ def resolve_embedding_model_spec(
     if is_embedding_gemma:
         return _embedding_gemma_spec()
 
+    if "EmbeddingNemotron3Model" in architecture_set:
+        return _embedding_nemotron3_spec()
+
     if architecture_set & _CLASSIFICATION_ARCHITECTURES:
-        return EmbeddingModelSpec(
+        return _classification_spec(
             family="sequence_classification",
             task=EmbeddingTask.CLASSIFY,
-            execution=EmbeddingExecution.CLASSIFICATION,
-            attention=AttentionPattern.NONE,
-            pooling=PoolingStrategy.MODEL_DEFINED,
-            normalize=False,
-            postprocessor="model_defined",
-            tokenizer_special_tokens="model_default",
-            supports_dimensions=False,
-            supports_token_embeddings=False,
-            supports_multimodal=False,
             requires_embedding_flag=False,
-            auto_enable_embedding=False,
-            bidirectional_attention=False,
-            bcg_prefill_policy=BCGPrefillPolicy.DEFAULT,
         )
 
     for architecture, (family, execution, pooling) in _EMBEDDING_ARCHITECTURES.items():
         if architecture in architecture_set:
             return _native_embedding_spec(family, execution, pooling)
+
+    # mixed declarations keep the non-token task
+    if architecture_set and all(
+        architecture.endswith("ForTokenClassification")
+        for architecture in architecture_set
+    ):
+        return _classification_spec(
+            family="token_classification",
+            task=EmbeddingTask.TOKEN_CLASSIFY,
+            # is_generation_model does not list these, so serving needs --is-embedding.
+            requires_embedding_flag=True,
+        )
 
     if is_embedding_requested:
         return EmbeddingModelSpec(

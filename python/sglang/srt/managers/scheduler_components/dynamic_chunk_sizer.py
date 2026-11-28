@@ -21,7 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import broadcast_pyobj
-from sglang.srt.utils.common import get_device_module
+from sglang.srt.utils.device import get_device_module
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -142,10 +142,12 @@ class DynamicChunkSizer:
         input_ids_list: List[array[int]] = []
         # Each sample is a complete request. Allocating past its mapping row
         # would leave KV slots that release_kv_cache cannot address.
+        # available_size also accounts for the SWA pool on hybrid models.
         max_profile_tokens = min(
             int(self.chunked_prefill_size * 1.25),
             model_config.context_len,
-            self.req_to_token_pool.max_context_len,
+            self.req_to_token_pool.row_width,
+            self.token_to_kv_pool_allocator.available_size(),
         )
         step = max(1, max_profile_tokens // 128)
         for i in range(128):

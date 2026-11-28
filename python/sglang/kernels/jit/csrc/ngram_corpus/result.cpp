@@ -125,17 +125,6 @@ Result combineRootResults_(int last_token, int draft_token_num, const Result& pr
   return buildResultFromLeafPaths_(last_token, draft_token_num, merged_paths);
 }
 
-void Result::truncate(size_t n) {
-  if (n < token.size()) {
-    int full_n = token.size();
-    for (size_t i = 1; i < n; ++i) {
-      memcpy(&mask[i * n], &mask[i * full_n], sizeof(mask[0]) * n);
-    }
-    token.resize(n);
-    mask.resize(n * n);
-  }
-}
-
 }  // namespace ngram
 
 }  // namespace sglang

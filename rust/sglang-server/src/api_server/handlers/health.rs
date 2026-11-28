@@ -3,15 +3,31 @@
 use std::time::Duration;
 
 use crate::message::ids::Rid;
-use crate::message::request::GenerateRequest;
+use crate::message::multimodal::MmItem;
+use crate::message::request::{GenerateRequest, MmData, RenderedChat};
 use crate::message::sampling::SamplingParams;
 
 use super::handle::CoreHandle;
-use crate::api_server::core::{CoreError, CoreEvent, HealthStatus};
+use crate::api_server::core::{CoreError, CoreEvent, HealthStatus, ReceivedAs};
 
 /// Sentinel host that makes the KV connector no-op. Parity with
 /// `sglang.srt.disaggregation.utils.FAKE_BOOTSTRAP_HOST`.
 const FAKE_BOOTSTRAP_HOST: &str = "2.2.2.2";
+
+/// A VLM's startup warmup (Python `_execute_server_warmup`): its image, and
+/// the prompt of a user message with that image and "Describe the image.",
+/// rendered with the model's chat template.
+pub(crate) struct VlmWarmup {
+    pub(crate) prompt: VlmWarmupPrompt,
+    pub(crate) image: MmItem,
+}
+
+pub(crate) enum VlmWarmupPrompt {
+    /// Rendered by the launcher, for a template this server cannot render.
+    Text(String),
+    /// Rendered with the served chat template.
+    Rendered(Box<RenderedChat>),
+}
 
 impl CoreHandle {
     /// Confirm that scheduler output is moving. The response heartbeat is the
@@ -38,8 +54,24 @@ impl CoreHandle {
     async fn run_health_probe(&self, timeout: Duration) -> Result<HealthStatus, CoreError> {
         let deadline = tokio::time::Instant::now() + timeout;
         let baseline = self.response_activity();
+        let rid = Rid::new_health_check();
+        // Python's probe (`health_generate`), as its request log shows it.
+        let mut body = serde_json::json!({
+            "rid": rid.as_str(),
+            "input_ids": [0],
+            "sampling_params": {"max_new_tokens": 1, "temperature": 0.0},
+            "log_metrics": false,
+        });
+        if self.inner.is_disaggregation {
+            body["bootstrap_host"] = FAKE_BOOTSTRAP_HOST.into();
+            body["bootstrap_room"] = 0.into();
+        }
+        let received = ReceivedAs::Body {
+            snapshot: self.snapshot_body(&body, None, &http::HeaderMap::new()),
+            started_at: None,
+        };
         let probe = GenerateRequest {
-            rid: Rid::new_health_check(),
+            rid,
             input_ids: Some(vec![0]),
             sampling_params: SamplingParams {
                 max_new_tokens: Some(1),
@@ -54,19 +86,26 @@ impl CoreHandle {
             bootstrap_room: self.inner.is_disaggregation.then_some(0),
             ..Default::default()
         };
-        // The probe is intentionally not drained. Its call stays alive while
+        // The probe's own result is not awaited. Its call stays alive while
         // the heartbeat is observed, then aborts on drop to clean up a probe
         // that a busy scheduler skipped without producing a terminal frame.
         // A wedged scheduler can leave the intake full: the submission counts
         // against the same deadline, and the heartbeat still decides, as
         // Python judges only `last_receive_tstamp`.
-        let _probe =
-            match tokio::time::timeout_at(deadline, self.generate_internal(probe, false)).await {
+        let mut probe =
+            match tokio::time::timeout_at(deadline, self.generate_internal(probe, received, false))
+                .await
+            {
                 Ok(probe) => Some(probe?),
                 Err(_) => None,
             };
 
         loop {
+            // Take what already arrived, so a probe that finished in time is
+            // logged as Python logs one; the events themselves are not needed.
+            if let Some(probe) = &mut probe {
+                probe.drain_ready(&mut Vec::new());
+            }
             if self.response_activity() != baseline {
                 self.inner.drain.set_unhealthy(false);
                 return Ok(HealthStatus::Healthy);
@@ -80,13 +119,32 @@ impl CoreHandle {
         }
     }
 
-    /// One generation mirroring the Python `_execute_server_warmup` text request;
-    /// VLMs warm only the text path. The caller decides readiness.
-    pub(crate) async fn warm_up(&self, skip_tokenizer_init: bool) -> Result<(), CoreError> {
-        let (text, input_ids) = if skip_tokenizer_init {
-            (None, Some(vec![10, 11, 12]))
-        } else {
-            (Some("The capital city of France is".to_string()), None)
+    /// One generation mirroring the Python `_execute_server_warmup` request:
+    /// a VLM's image and prompt, else its text request. The caller decides
+    /// readiness.
+    pub(crate) async fn warm_up(
+        &self,
+        skip_tokenizer_init: bool,
+        vlm: Option<VlmWarmup>,
+    ) -> Result<(), CoreError> {
+        let (text, input_ids, chat_prompt, mm) = match vlm {
+            Some(VlmWarmup { prompt, image }) => {
+                let mm = Some(Box::new(MmData {
+                    image_data: vec![image],
+                    ..Default::default()
+                }));
+                match prompt {
+                    VlmWarmupPrompt::Text(text) => (Some(text), None, None, mm),
+                    VlmWarmupPrompt::Rendered(rendered) => (None, None, Some(rendered), mm),
+                }
+            }
+            None if skip_tokenizer_init => (None, Some(vec![10, 11, 12]), None, None),
+            None => (
+                Some("The capital city of France is".to_string()),
+                None,
+                None,
+                None,
+            ),
         };
         let mut call = self
             .generate_internal(
@@ -94,6 +152,10 @@ impl CoreHandle {
                     rid: Rid::new(),
                     text,
                     input_ids,
+                    chat_prompt,
+                    mm,
+                    // Python's `/generate` default.
+                    logprob_start_len: -1,
                     sampling_params: SamplingParams {
                         max_new_tokens: Some(8),
                         temperature: 0.0,
@@ -107,6 +169,7 @@ impl CoreHandle {
                     bootstrap_room: self.inner.is_disaggregation.then_some(0),
                     ..Default::default()
                 },
+                ReceivedAs::without_headers(),
                 true,
             )
             .await?;
@@ -230,11 +293,14 @@ mod tests {
             Vec::new(),
         );
         let call = handle
-            .generate(GenerateRequest {
-                rid: "client".into(),
-                input_ids: Some(vec![1]),
-                ..Default::default()
-            })
+            .generate(
+                GenerateRequest {
+                    rid: "client".into(),
+                    input_ids: Some(vec![1]),
+                    ..Default::default()
+                },
+                ReceivedAs::without_headers(),
+            )
             .await
             .unwrap();
         let _client = accept_intake(intake_rx.recv_async().await.unwrap());
@@ -280,11 +346,14 @@ mod tests {
             Vec::new(),
         );
         let _call = handle
-            .generate(GenerateRequest {
-                rid: "client".into(),
-                input_ids: Some(vec![1]),
-                ..Default::default()
-            })
+            .generate(
+                GenerateRequest {
+                    rid: "client".into(),
+                    input_ids: Some(vec![1]),
+                    ..Default::default()
+                },
+                ReceivedAs::without_headers(),
+            )
             .await
             .unwrap();
         let _client = accept_intake(intake_rx.recv_async().await.unwrap());
@@ -315,11 +384,14 @@ mod tests {
             Vec::new(),
         );
         let _call = handle
-            .generate(GenerateRequest {
-                rid: "client".into(),
-                input_ids: Some(vec![1]),
-                ..Default::default()
-            })
+            .generate(
+                GenerateRequest {
+                    rid: "client".into(),
+                    input_ids: Some(vec![1]),
+                    ..Default::default()
+                },
+                ReceivedAs::without_headers(),
+            )
             .await
             .unwrap();
         let _client = accept_intake(intake_rx.recv_async().await.unwrap());
@@ -410,7 +482,7 @@ mod tests {
     async fn warm_up_succeeds_on_finished_generation() {
         let harness = Harness::unbounded(8);
         let handle = harness.handle.clone();
-        let warm_up = tokio::spawn(async move { handle.warm_up(false).await });
+        let warm_up = tokio::spawn(async move { handle.warm_up(false, None).await });
 
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         let RequestKind::Generate(warmup) = &request.kind else {
@@ -449,7 +521,7 @@ mod tests {
             true,
             Vec::new(),
         );
-        let warm_up = tokio::spawn(async move { handle.warm_up(true).await });
+        let warm_up = tokio::spawn(async move { handle.warm_up(true, None).await });
 
         let request = accept_intake(intake_rx.recv_async().await.unwrap());
         let RequestKind::Generate(warmup) = &request.kind else {

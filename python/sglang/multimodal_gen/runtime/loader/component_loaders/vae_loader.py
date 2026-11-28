@@ -1,20 +1,31 @@
 import hashlib
 import importlib.util
 import os
+from collections.abc import Callable
+from contextlib import contextmanager
+from threading import get_ident
 
 import torch
 import torch.nn as nn
 from safetensors.torch import safe_open
 from safetensors.torch import save_file as safetensors_save_file
+from torch.nn.modules.module import register_module_parameter_registration_hook
+from torch.utils.weak import WeakTensorKeyDictionary
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.wan import WanT2V480PConfig
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    WanI2V480PConfig,
+    WanT2V480PConfig,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     NativeComponentLoaderRequired,
@@ -31,6 +42,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    mmap_safetensors_to_device,
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
@@ -142,6 +154,7 @@ def _should_use_channels_last_3d(
     ) or not (
         current_platform.is_cuda()
         or current_platform.is_rocm()
+        or current_platform.is_cpu()
         or current_platform.is_xpu()
     ):
         return False
@@ -432,6 +445,78 @@ def _direct_gpu_vae_state_slots(
     return state, slots
 
 
+@contextmanager
+def _init_vae_with_meta_parameters():
+    """Discard plain parameter storage at registration, not constructor buffer values."""
+    owner = get_ident()
+    placeholders = WeakTensorKeyDictionary()
+
+    def on_parameter(module, name, param):
+        # Registration hooks are process-wide; other loading threads are unrelated.
+        if get_ident() != owner or type(param) is not nn.Parameter or param.is_meta:
+            return None
+        # Keep tied parameters tied so the direct loader can detect and reject them.
+        if param not in placeholders:
+            placeholders[param] = nn.Parameter(
+                param.to(device="meta"), requires_grad=param.requires_grad
+            )
+        return placeholders[param]
+
+    with register_module_parameter_registration_hook(on_parameter), torch.device("cpu"):
+        yield
+
+
+def _initialize_direct_vae(vae_cls, config, dtype):
+    init_params = {"config": config}
+    rng_state = torch.get_rng_state()
+    vae = initialize_model(
+        vae_cls, init_params, dtype, _init_vae_with_meta_parameters()
+    )
+    if any(
+        buffer is not None and buffer.is_meta
+        for module in vae.modules()
+        for name, buffer in module._buffers.items()
+        if name in module._non_persistent_buffers_set
+    ):
+        # A factory like zeros_like(weight) inherits meta even in a CPU context.
+        # Replay the original CPU constructor, including any random buffer values.
+        del vae
+        torch.set_rng_state(rng_state)
+        return initialize_model(vae_cls, init_params, dtype, torch.device("cpu"))
+    return vae
+
+
+def _auto_mmap_vae(
+    args: ServerArgs,
+    component: str,
+    class_name: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> bool:
+    # Match the measured single-rank layouts, not subclasses with different VAEs.
+    if (
+        device.type != "cuda"
+        or not current_platform.is_cuda()
+        or args.num_gpus != 1
+        or dtype != torch.float32
+        or args.component_direct_gpu_weight_loading.get(component) is False
+        or component in args.component_paths
+        or component in args.component_weights_paths
+        or component in args.component_quantizations
+        or args.should_use_fsdp_for_component(component)
+        or get_bool_env_var("SGLANG_USE_RUNAI_MODEL_STREAMER")
+    ):
+        return False
+    layout = (type(args.pipeline_config), component, class_name)
+    if layout not in (
+        (MiniMaxH3PipelineConfig, "video_vae", "MiniMaxH3VideoVAE"),
+        (WanI2V480PConfig, "vae", "AutoencoderKLWan"),
+        (WanT2V480PConfig, "vae", "AutoencoderKLWan"),
+    ):
+        return False
+    return torch.cuda.get_device_name(device) == "NVIDIA B200"
+
+
 def _assign_direct_gpu_vae_state(
     vae: nn.Module,
     weight_files: list[str],
@@ -439,6 +524,9 @@ def _assign_direct_gpu_vae_state(
     component_name: str,
     device: torch.device,
     vae_config: VAEConfig,
+    key_filter: Callable[[str], bool] | None = None,
+    key_mapper: Callable[[str], str] | None = None,
+    mmap_upload: bool = False,
 ) -> tuple[int, tuple[str, ...]]:
     """Stream a complete standard VAE state directly onto its target device."""
     num_deparameterized = adopt_plain_weight_norm_state(
@@ -449,10 +537,15 @@ def _assign_direct_gpu_vae_state(
     loaded_names: set[str] = set()
     metadata: dict[str, torch.Tensor] = {}
     with torch.no_grad():
-        for raw_name, tensor in safetensors_weights_iterator(
-            weight_files, to_cpu=device.type == "cpu"
-        ):
-            name = raw_name
+        weights = (
+            mmap_safetensors_to_device(weight_files, device, key_filter=key_filter)
+            if mmap_upload
+            else safetensors_weights_iterator(
+                weight_files, to_cpu=device.type == "cpu", key_filter=key_filter
+            )
+        )
+        for raw_name, tensor in weights:
+            name = key_mapper(raw_name) if key_mapper is not None else raw_name
             if name in metadata_names:
                 metadata[name] = tensor
                 continue
@@ -483,6 +576,13 @@ def _assign_direct_gpu_vae_state(
             else:
                 module._buffers[local_name] = tensor
             loaded_names.add(name)
+
+    # Non-persistent buffers are not in the checkpoint, so move them here.
+    for module in vae.modules():
+        for local_name in module._non_persistent_buffers_set:
+            buffer = module._buffers[local_name]
+            if buffer is not None and not buffer.is_meta:
+                module._buffers[local_name] = buffer.to(device)
 
     consumed_metadata = _consume_vae_checkpoint_arch_metadata(
         metadata, vae_config, target_state
@@ -631,6 +731,11 @@ class VAELoader(WeightOverrideComponentLoader):
                 "consume a weights-only override"
             )
         if auto_model_map and not native_only:
+            if not server_args.trust_remote_code:
+                raise ComponentCheckpointUnsupportedError(
+                    f"{component_name!r} uses custom auto_map code; "
+                    "pass --trust-remote-code only after reviewing the model code"
+                )
             module_path, cls_name = auto_model_map.rsplit(".", 1)
             custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
             spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
@@ -662,17 +767,6 @@ class VAELoader(WeightOverrideComponentLoader):
             vae = current_platform.optimize_vae(vae)
             return vae
 
-        # Load from ModelRegistry (standard VAE classes)
-        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-        vae = initialize_model(
-            vae_cls,
-            {"config": vae_config},
-            vae_dtype,
-            torch.device("meta") if direct_gpu_weight_loading else None,
-        )
-        if not direct_gpu_weight_loading:
-            vae = vae.to(target_device)
-
         if os.path.isfile(component_weights_path):
             if not component_weights_path.endswith(".safetensors"):
                 raise ValueError(
@@ -700,13 +794,58 @@ class VAELoader(WeightOverrideComponentLoader):
         assert len(safetensors_list) >= 1, (
             f"Found no safetensors files in {component_weights_path}"
         )
-        if direct_gpu_weight_loading:
+        # Load from ModelRegistry (standard VAE classes)
+        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        # A model hook may validate a serialized checkpoint and return a
+        # configurator to apply on meta before streaming mixed-dtype weights.
+        prepare_checkpoint_load = getattr(vae_cls, "prepare_checkpoint_load", None)
+        configure_checkpoint = (
+            prepare_checkpoint_load(safetensors_list, vae_dtype)
+            if prepare_checkpoint_load is not None
+            else None
+        )
+        auto_mmap = configure_checkpoint is None and _auto_mmap_vae(
+            server_args, component_name, class_name, target_device, vae_dtype
+        )
+        if auto_mmap:
+            logger.info(
+                "Loading resident %s directly from CPU-mapped weights", component_name
+            )
+            direct_gpu_weight_loading = True
+        stream_checkpoint = (
+            direct_gpu_weight_loading or configure_checkpoint is not None
+        )
+        if direct_gpu_weight_loading and configure_checkpoint is None:
+            vae = _initialize_direct_vae(vae_cls, vae_config, vae_dtype)
+        else:
+            vae = initialize_model(
+                vae_cls,
+                {"config": vae_config},
+                vae_dtype,
+                torch.device("meta") if configure_checkpoint is not None else None,
+            )
+        if configure_checkpoint is not None:
+            configure_checkpoint(vae)
+        if not stream_checkpoint:
+            vae = vae.to(target_device)
+
+        checkpoint_key_filter = getattr(vae, "checkpoint_key_filter", None)
+        checkpoint_key_mapper = getattr(vae, "checkpoint_key_mapper", None)
+        if stream_checkpoint:
             adaptations = _assign_direct_gpu_vae_state(
                 vae,
                 safetensors_list,
                 component_name=component_name,
                 device=target_device,
                 vae_config=vae_config,
+                key_filter=checkpoint_key_filter,
+                key_mapper=checkpoint_key_mapper,
+                mmap_upload=auto_mmap
+                or (
+                    direct_gpu_weight_loading
+                    and target_device.type == "cuda"
+                    and not envs.SGLANG_USE_RUNAI_MODEL_STREAMER
+                ),
             )
             _log_vae_checkpoint_adaptations(*adaptations)
             if _should_use_channels_last_3d(server_args, component_name):
@@ -722,7 +861,19 @@ class VAELoader(WeightOverrideComponentLoader):
 
         loaded = {}
         for sf_path in safetensors_list:
-            loaded.update(_load_safetensors_file(sf_path))
+            state = _load_safetensors_file(sf_path)
+            if checkpoint_key_filter is not None:
+                state = {
+                    name: tensor
+                    for name, tensor in state.items()
+                    if checkpoint_key_filter(name)
+                }
+            if checkpoint_key_mapper is not None:
+                state = {
+                    checkpoint_key_mapper(name): tensor
+                    for name, tensor in state.items()
+                }
+            loaded.update(state)
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
         num_deparameterized = adopt_plain_weight_norm_state(vae, loaded)
         target_state = vae.state_dict()

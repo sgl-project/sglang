@@ -13,11 +13,25 @@ from torch import nn
 from sglang.multimodal_gen.runtime.layers.lora.linear import LinearWithLoRA
 
 
-def _make_layer(base_weight: torch.Tensor, rank: int = 2, alpha: int = 2):
+def _make_layer(
+    base_weight: torch.Tensor,
+    rank: int = 2,
+    alpha: int = 2,
+):
     base = nn.Linear(base_weight.shape[1], base_weight.shape[0], bias=False)
     with torch.no_grad():
         base.weight.copy_(base_weight)
     return LinearWithLoRA(base, lora_rank=rank, lora_alpha=alpha)
+
+
+def _offload(layer: LinearWithLoRA) -> torch.Tensor:
+    """Move the weight into a CPU view and leave a (1,) placeholder, as layerwise
+    offload does; returns the view."""
+    base = layer.base_layer
+    stored = base.weight.detach()
+    base._packed_weight_cpu = stored
+    base.weight.data = torch.empty(1, dtype=stored.dtype)
+    return stored
 
 
 def test_commit_merged_as_base_promotes_weights_and_resets_state():
@@ -39,7 +53,7 @@ def test_commit_merged_as_base_promotes_weights_and_resets_state():
     merged_w = base_w + s1 * (B @ A)
     # Merged weights become the permanent base + restore target.
     assert torch.allclose(layer.base_layer.weight, merged_w, atol=1e-5)
-    assert torch.allclose(layer.cpu_weight, merged_w, atol=1e-5)
+    assert layer.cpu_weight is None
     # Bookkeeping reset so a later dynamic set_lora adds a delta on top, and
     # deactivate (which only unmerges when merged=True) leaves the base intact.
     assert layer.merged is False
@@ -118,5 +132,52 @@ def test_negative_merge_after_commit_restores_original_base():
     layer.commit_merged_as_base()
 
     assert torch.allclose(layer.base_layer.weight, base_w, atol=1e-5)
-    assert torch.allclose(layer.cpu_weight, base_w, atol=1e-5)
+    assert layer.cpu_weight is None
     assert layer.merged is False
+
+
+@pytest.mark.parametrize("offloaded", [False, True])
+def test_next_merge_snapshots_committed_weight(offloaded):
+    """The next merge backs up the committed weight, not the layerwise placeholder.
+
+    Replays LTX-2 original mode when a request overrides the stage-1 distilled
+    strength: commit s1 into the base, subtract it again, merge the request's
+    stage-1 strength, then merge stage 2 (which unmerges stage 1 first).
+    """
+    torch.manual_seed(3)
+    out_f, in_f, rank = 6, 8, 2
+    base_w = torch.randn(out_f, in_f)
+    A = torch.randn(rank, in_f)
+    B = torch.randn(out_f, rank)
+    s1, s1_request, s2 = 0.25, 0.5, 0.75
+
+    layer = _make_layer(base_w, rank=rank, alpha=rank)
+    stored = _offload(layer) if offloaded else None
+
+    def weight():
+        return stored if offloaded else layer.base_layer.weight.detach()
+
+    def merge(strength):
+        layer.set_lora_weights(
+            A.clone(),
+            B.clone(),
+            strength=strength,
+            clear_existing=True,
+            merge_weights=True,
+        )
+
+    merge(s1)
+    layer.commit_merged_as_base()
+    torch.testing.assert_close(weight(), base_w + s1 * (B @ A))
+    assert layer.cpu_weight is None
+
+    merge(-s1)
+    layer.commit_merged_as_base()
+    torch.testing.assert_close(weight(), base_w, atol=1e-5, rtol=0)
+
+    merge(s1_request)
+    merge(s2)
+    torch.testing.assert_close(weight(), base_w + s2 * (B @ A), atol=1e-5, rtol=0)
+
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(weight(), base_w, atol=1e-5, rtol=0)

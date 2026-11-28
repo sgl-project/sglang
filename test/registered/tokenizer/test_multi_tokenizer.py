@@ -2,6 +2,7 @@ import unittest
 
 import requests
 
+from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import MMLUMixin
@@ -15,12 +16,11 @@ from sglang.test.test_utils import (
     is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
-    run_benchmark,
     write_github_step_summary,
 )
 
 register_cuda_ci(est_time=310, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=355, suite="stage-b-test-2-gpu-large-amd")
+register_amd_ci(est_time=355, suite="base-b-test-2-gpu-large-amd")
 
 
 class TestMultiTokenizer(CustomTestCase, MMLUMixin):

@@ -24,8 +24,9 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
-from sglang.srt.utils import get_bool_env_var, is_hip
-from sglang.srt.utils.common import direct_register_custom_op, is_gfx95_supported
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.custom_op import direct_register_custom_op
+from sglang.srt.utils.device import is_gfx95_supported, is_gfx1250_supported
 
 NVFP4_BLOCK_SIZE = 16
 
@@ -109,13 +110,13 @@ def _asm_fp4_prequantized_input(
 
 # On GPUs that lack the fp4-activation WMMA scale instruction
 # (V_WMMA_SCALE_F32_32X16X128_F4, e.g. gfx1250) the a4w4 (fp4 x fp4) linear GEMM
-# cannot run. The MoE path is switched to a8w4 via AITER_FORCE_A8W4=1 (handled
-# inside aiter.fused_moe); there is currently no working dense a8w4 GEMM for
-# plain nn.Linear on this arch, so under the same flag the (few) MXFP4-quantized
-# linear layers dequantize their FP4 weights to bf16 once at load and run a
-# plain bf16 GEMM. This trades a little memory for correctness on hardware that
-# cannot execute the fp4 kernel at all.
-_dequant_linear_to_bf16 = _is_hip and get_bool_env_var("AITER_FORCE_A8W4", "false")
+# cannot run. aiter.fused_moe runs the MoE as a8w4 there (AITER_FORCE_A8W4, which
+# startup sets on gfx1250); there is currently no working dense a8w4 GEMM for
+# plain nn.Linear on this arch, so the (few) MXFP4-quantized linear layers
+# dequantize their FP4 weights to bf16 once at load and run a plain bf16 GEMM.
+# This trades a little memory for correctness on hardware that cannot execute
+# the fp4 kernel at all.
+_dequant_linear_to_bf16 = is_gfx1250_supported()
 
 # MXFP4 (OCP MX FP4 / e2m1) decode table, indexed by the 4-bit code.
 _MXFP4_VALUES = [
@@ -237,9 +238,10 @@ if _is_hip:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         M, N = x.shape
         x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+        # Match aiter's column-major scale (a transposed (N/32, M) buffer).
         blockscale = torch.empty(
-            (M, (N + 31) // 32), dtype=torch.uint8, device=x.device
-        )
+            ((N + 31) // 32, M), dtype=torch.uint8, device=x.device
+        ).T
         return x_fp4, blockscale
 
     direct_register_custom_op(

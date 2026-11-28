@@ -44,7 +44,7 @@ from sglang.srt.mem_cache.pool_host._kvcacheio import require_kvcacheio_ops
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
-    host_memory_budget_bytes,
+    host_memory_preflight,
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
@@ -55,13 +55,12 @@ from sglang.srt.mem_cache.pool_host.common import (
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-_is_mps = is_mps()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
@@ -93,7 +92,10 @@ elif _is_xpu:
         transfer_kv_per_layer_ph_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+    from sgl_kernel_npu.operators.mem_cache import (
+        transfer_kv_all_layer_kv_split_lf_pf,
+        transfer_kv_per_layer_kv_split_pf_lf,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -167,9 +169,9 @@ class MHATokenToKVPoolHost(HostKVCache):
             )
         infos = (buffer_info, *draft_buffer_infos)
         for info in infos:
-            if (
-                info.scales is not None
-                and info.scales.layout != KVScaleLayout.MXFP8_INTERLEAVED
+            if info.scales is not None and info.scales.layout not in (
+                KVScaleLayout.MXFP8_INTERLEAVED,
+                KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL,
             ):
                 raise ValueError(
                     f"{pool_label}: MHA host transfers do not support "
@@ -565,24 +567,25 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
-                # Ascend-specific: transfer KV data for all layers when layer_id == 0
-                if host_layer_id == 0:
-                    for (
-                        device_k,
-                        device_v,
-                        host_k,
-                        host_v,
-                    ) in self._npu_transfer_buffers():
-                        transfer_kv_dim_exchange(
-                            device_indices=device_indices,
-                            host_indices=host_indices,
-                            device_k=device_k,
-                            host_k=host_k,
-                            device_v=device_v,
-                            host_v=host_v,
-                            page_size=self.page_size,
-                            direction=TransferDirection.H2D,
-                        )
+                layer_start = 0
+                for device_k, device_v, host_k, host_v in self._npu_transfer_buffers():
+                    local_layer = host_layer_id - layer_start
+                    if not 0 <= local_layer < device_k.shape[0]:
+                        layer_start += device_k.shape[0]
+                        continue
+                    transfer_kv_per_layer_kv_split_pf_lf(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=device_k,
+                        host_k=host_k,
+                        device_v=device_v,
+                        host_v=host_v,
+                        page_size=self.page_size,
+                        device_layer_id=local_layer,
+                        host_layer_id=local_layer,
+                        impl="auto",
+                    )
+                    break
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
@@ -729,7 +732,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
                 for device_k, device_v, host_k, host_v in self._npu_transfer_buffers():
-                    transfer_kv_dim_exchange(
+                    transfer_kv_all_layer_kv_split_lf_pf(
                         device_indices=device_indices,
                         host_indices=host_indices,
                         device_k=device_k,
@@ -737,7 +740,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         device_v=device_v,
                         host_v=host_v,
                         page_size=self.page_size,
-                        direction=TransferDirection.D2H,
+                        impl="auto",
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
@@ -860,6 +863,8 @@ class MHATokenToKVPoolHost(HostKVCache):
         """
         meta data for zero copy
         """
+        if self.layout == "page_unified":
+            return self._page_unified_buffer_meta(indices)
         assert len(indices) % self.page_size == 0
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
@@ -1004,17 +1009,18 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.page_num = anchor_host.page_num
         self.size_per_token = self.get_size_per_token()
 
-        requested_bytes = self.size * self.size_per_token
-        available_bytes = host_memory_budget_bytes(requested_bytes)
-        if requested_bytes > available_bytes:
+        allocation_bytes, available_bytes = host_memory_preflight(
+            self.get_mapping_lengths(), self.allocator, self._transfer_device
+        )
+        if allocation_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory for MiniMax index-K hierarchical cache. "
-                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         logger.info(
             "Allocating %.2f GB host memory for MiniMax sparse index-K (layout=%s).",
-            requested_bytes / 1e9,
+            allocation_bytes / 1e9,
             layout,
         )
 
@@ -1416,6 +1422,11 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
     def get_ksize_per_token(self):
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize
 
+    def get_mapping_lengths(self) -> list[int]:
+        kv_bytes = self.size * self.size_per_token
+        k_bytes = self.size * self.get_ksize_per_token()
+        return [k_bytes, kv_bytes - k_bytes]
+
     def init_kv_buffer(self):
         if self.layout == "page_first":
             k_dims = (self.size, self.layer_num, self.head_num, self.head_dim)
@@ -1743,17 +1754,22 @@ class AsymmetricMHATokenToKVPoolHost(MHATokenToKVPoolHost):
 
 
 def get_mha_host_pool_cls(buffer_info: MHABufferInfo) -> type:
-    is_mxfp8 = (
-        buffer_info.scales is not None
-        and buffer_info.scales.layout == KVScaleLayout.MXFP8_INTERLEAVED
-    )
-    if is_mxfp8:
+    scale_layout = buffer_info.scales.layout if buffer_info.scales is not None else None
+    if scale_layout in (
+        KVScaleLayout.MXFP8_INTERLEAVED,
+        KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL,
+    ):
         if buffer_info.head_dim != buffer_info.v_head_dim:
             raise NotImplementedError(
                 "MXFP8 HiCache does not support asymmetric K/V head dimensions yet."
             )
-        from sglang.srt.mem_cache.pool_host.mha_mxfp8 import MHATokenToKVPoolMXFP8Host
+        from sglang.srt.mem_cache.pool_host.mha_mxfp8 import (
+            MHATokenToKVPoolMXFP8Host,
+            NPUModelSlimMXFP8KDynamicVPerChannelHost,
+        )
 
+        if scale_layout == KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL:
+            return NPUModelSlimMXFP8KDynamicVPerChannelHost
         return MHATokenToKVPoolMXFP8Host
     if buffer_info.head_dim != buffer_info.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost

@@ -28,6 +28,7 @@ from sglang.srt.configs.unlimited_ocr_v2 import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
+    CompletionTokensDetails,
     PromptTokensDetails,
     UsageInfo,
 )
@@ -53,7 +54,6 @@ def _is_context_error_message(message: str) -> bool:
     return any(
         marker in message
         for marker in (
-            "longer than the model's context length",
             "exceeds the model's maximum context length",
             "Multimodal prompt is too long after expanding multimodal tokens",
             "exceeds the maximum allowed length",
@@ -442,6 +442,7 @@ def _merged_usage(batches) -> UsageInfo:
         if detail_rows
         else None
     )
+    reasoning_tokens = sum(batch.get("reasoning_tokens", 0) for batch in batches)
     return UsageInfo(
         prompt_tokens=sum(batch["prompt_tokens"] for batch in batches),
         completion_tokens=sum(batch["completion_tokens"] for batch in batches),
@@ -449,7 +450,10 @@ def _merged_usage(batches) -> UsageInfo:
             batch["prompt_tokens"] + batch["completion_tokens"] for batch in batches
         ),
         prompt_tokens_details=prompt_details,
-        reasoning_tokens=sum(batch.get("reasoning_tokens", 0) for batch in batches),
+        reasoning_tokens=reasoning_tokens,
+        completion_tokens_details=CompletionTokensDetails(
+            reasoning_tokens=reasoning_tokens
+        ),
     )
 
 

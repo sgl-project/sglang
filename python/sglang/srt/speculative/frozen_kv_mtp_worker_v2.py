@@ -72,7 +72,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_topk,
     get_plan_stream,
     select_top_k_tokens,
     spec_stage_span,
@@ -83,6 +82,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
+from sglang.srt.utils.common import fast_topk
 
 logger = logging.getLogger(__name__)
 
@@ -462,8 +462,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
 
-        # NOTE: per-iter bookkeeping (penalty cumulation, maybe_evict_swa,
-        # decode_batch_idx tick) is done by the scheduler-driven
+        # NOTE: per-iter bookkeeping (maybe_evict_swa, decode_batch_idx
+        # tick) is done by the scheduler-driven
         # eagle_utils.eagle_prepare_for_decode (see
         # ScheduleBatch.prepare_for_decode), not here -- matching EAGLE v2.
         # Repeating evict/tick here would double-run them: the idx clock
@@ -740,12 +740,6 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             "Frozen-KV MTP does not support adaptive speculative decoding yet."
         )
         self.adaptive_controller = None
-
-        # Some dummy tensors (parity with EAGLEWorkerV2 init).
-        self.num_new_pages_per_topk = torch.empty(
-            (), dtype=torch.int64, device=self.device
-        )
-        self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 

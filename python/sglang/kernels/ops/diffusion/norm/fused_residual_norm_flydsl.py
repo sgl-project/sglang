@@ -36,16 +36,27 @@ def _detect_warp_size() -> int:
 
 WARP_SIZE = _detect_warp_size()
 _VEC = 8
-_BLOCK = 640
-# Deriving the wave count from the fixed block size keeps BLOCK and the public
-# FLYDSL_NORM_MIN_ALIGNED_DIM guard identical on wave32 and wave64, so callers
-# do not have to care which one they are on.
-_NUM_WAVES = _BLOCK // WARP_SIZE
-FLYDSL_NORM_MIN_ALIGNED_DIM = WARP_SIZE * _NUM_WAVES * _VEC  # 5120
 
-# Kernel-side epsilon. The public `eps` argument is intentionally ignored, as it
-# was before the stable-API migration; changing that is a separate correctness fix.
-_EPS = 1e-6
+# Block sizes tried in preference order: a larger workgroup keeps more of the
+# row in flight, but the tile (BLOCK * VEC) has to divide D so the inner loop
+# never runs a partial iteration.  Restricted to the sizes a real model needs,
+# and keyed on the block rather than the wave count so that which dims are
+# eligible, and the tile each one gets, stay identical on wave32 and wave64.
+_BLOCK_CHOICES = (640, 512, 384, 128)
+
+
+def _pick_num_waves(dim: int) -> int | None:
+    """Waves for the largest block whose tile divides ``dim``, or ``None``."""
+    for block in _BLOCK_CHOICES:
+        if dim % (block * _VEC) == 0:
+            return block // WARP_SIZE
+    return None
+
+
+def flydsl_norm_supports(dim: int) -> bool:
+    """Whether a FlyDSL norm kernel can serve this hidden size."""
+    return _pick_num_waves(dim) is not None
+
 
 # 128-bit vector copies over bf16 elements.
 _ELEM_BITS = 16
@@ -167,13 +178,15 @@ def _bcast_row(row, stride):
     return (stride != 0).select(row, 0)
 
 
-def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: bool):
+def _build_fused_norm_module(
+    D: int, is_rms: bool, has_gate: bool, has_weight: bool, eps: float
+):
     VEC = _VEC
-    NUM_WAVES = _NUM_WAVES
-    BLOCK = NUM_WAVES * WARP_SIZE
-    assert D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0, (
-        f"FlyDSL fused_residual_norm requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    NUM_WAVES = _pick_num_waves(D)
+    assert NUM_WAVES is not None, (
+        f"FlyDSL fused_residual_norm found no block size whose tile divides D={D}"
     )
+    BLOCK = NUM_WAVES * WARP_SIZE
     NUM_ITERS = D // (BLOCK * VEC)
     SharedStorage = _make_reduction_storage(NUM_WAVES)
 
@@ -281,11 +294,11 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
         total_sq = fx.memref_load(s_final, 1)
 
         if const_expr(is_rms):
-            rstd = fx.math.rsqrt(total_sq / n_float + _EPS)
+            rstd = fx.math.rsqrt(total_sq / n_float + eps)
         else:
             mean = fx.memref_load(s_final, 0) / n_float
             var = total_sq / n_float - mean * mean
-            rstd = fx.math.rsqrt(var + _EPS)
+            rstd = fx.math.rsqrt(var + eps)
 
         # Phase 2: normalize from the register cache (no HBM re-read).
         for it in range_constexpr(NUM_ITERS):
@@ -347,10 +360,10 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
 _COMPILE_CACHE = {}
 
 
-def _get_or_compile(D, is_rms, has_gate, has_weight, args):
-    key = (D, is_rms, has_gate, has_weight)
+def _get_or_compile(D, is_rms, has_gate, has_weight, eps, args):
+    key = (D, is_rms, has_gate, has_weight, eps)
     if key not in _COMPILE_CACHE:
-        launcher = _build_fused_norm_module(D, is_rms, has_gate, has_weight)
+        launcher = _build_fused_norm_module(D, is_rms, has_gate, has_weight, eps)
         cf = flyc.compile(launcher, *args)
         _COMPILE_CACHE[key] = cf
     return _COMPILE_CACHE[key]
@@ -471,7 +484,7 @@ def flydsl_fused_residual_norm_scale_shift(
         sh_stride,
         stream,
     )
-    cf = _get_or_compile(C, is_rms, has_gate, has_weight, dummy_args)
+    cf = _get_or_compile(C, is_rms, has_gate, has_weight, float(eps), dummy_args)
 
     for b in range(B):
         s, e = b * L, (b + 1) * L
@@ -519,13 +532,13 @@ def _fake_flydsl_fused_residual_norm(
 ###############################################################################
 
 
-def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
+def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool, eps: float):
     VEC = _VEC
-    NUM_WAVES = _NUM_WAVES
-    BLOCK = NUM_WAVES * WARP_SIZE
-    assert D % FLYDSL_NORM_MIN_ALIGNED_DIM == 0, (
-        f"FlyDSL norm_scale_shift requires D % {FLYDSL_NORM_MIN_ALIGNED_DIM} == 0, got D={D}"
+    NUM_WAVES = _pick_num_waves(D)
+    assert NUM_WAVES is not None, (
+        f"FlyDSL norm_scale_shift found no block size whose tile divides D={D}"
     )
+    BLOCK = NUM_WAVES * WARP_SIZE
     NUM_ITERS = D // (BLOCK * VEC)
     SharedStorage = _make_reduction_storage(NUM_WAVES)
 
@@ -615,11 +628,11 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
         total_sq = fx.memref_load(s_final, 1)
 
         if const_expr(is_rms):
-            rstd = fx.math.rsqrt(total_sq / n_float + _EPS)
+            rstd = fx.math.rsqrt(total_sq / n_float + eps)
         else:
             mean = fx.memref_load(s_final, 0) / n_float
             var = total_sq / n_float - mean * mean
-            rstd = fx.math.rsqrt(var + _EPS)
+            rstd = fx.math.rsqrt(var + eps)
 
         # Phase 2: normalize from the register cache + scale_shift.
         for it in range_constexpr(NUM_ITERS):
@@ -673,10 +686,10 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
 _NSS_COMPILE_CACHE = {}
 
 
-def _get_or_compile_nss(D, is_rms, has_weight, args):
-    key = ("nss", D, is_rms, has_weight)
+def _get_or_compile_nss(D, is_rms, has_weight, eps, args):
+    key = ("nss", D, is_rms, has_weight, eps)
     if key not in _NSS_COMPILE_CACHE:
-        launcher = _build_norm_scale_shift_module(D, is_rms, has_weight)
+        launcher = _build_norm_scale_shift_module(D, is_rms, has_weight, eps)
         cf = flyc.compile(launcher, *args)
         _NSS_COMPILE_CACHE[key] = cf
     return _NSS_COMPILE_CACHE[key]
@@ -729,7 +742,7 @@ def flydsl_norm_scale_shift(
         sh_stride,
         stream,
     )
-    cf = _get_or_compile_nss(C, is_rms, has_weight, dummy_args)
+    cf = _get_or_compile_nss(C, is_rms, has_weight, float(eps), dummy_args)
 
     for b in range(B):
         s, e = b * L, (b + 1) * L

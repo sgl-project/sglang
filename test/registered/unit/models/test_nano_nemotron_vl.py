@@ -9,8 +9,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.nemotron_h import MOE, NemotronHConfig
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.models.nano_nemotron_vl import (
     NemotronH_Nano_VL_V2,
     NemotronH_Omni_Reasoning_V3,

@@ -9,6 +9,7 @@ import msgspec
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.utils import optional_positive_finite_float
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE,
     MINIMAX_H3_REFERENCE_RESIZE_MODES,
 )
 
@@ -54,7 +55,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
         default=None,
         metadata={"batch_sig_exclude": True},
     )
-    reference_resize_mode: str = field(default="diffusers")
+    reference_resize_mode: str = MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -97,7 +98,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
     def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any]:
         """Use the same independent-seed grouped path in serve and generate."""
 
-        from sglang.multimodal_gen.runtime.entrypoints.utils import (
+        from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
             expand_request_outputs,
         )
 
@@ -186,6 +187,9 @@ class MiniMaxH3SamplingParams(SamplingParams):
 
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         return self._video_hooks().project_queued_job_fields(req)
+
+    def request_task(self) -> str | None:
+        return self.task
 
     def validate_video_final_outputs(
         self,
@@ -393,6 +397,8 @@ class FastH3OmniSamplingParams(MiniMaxH3SamplingParams):
     num_inference_steps: int = 8
     task: str | None = "ref2va"
     quality: str = "lossless"
+    # the native H3 resize change is not validated for this checkpoint
+    reference_resize_mode: str = "diffusers"
     # Trained with target-only flow: references stay clean.
     imgvid_cond_noise_aug_for_inference: float | None = 1.0
     audio_cond_noise_aug_for_inference: float | None = 1.0
@@ -416,6 +422,9 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
 
     num_inference_steps: int = 6
     quality: str = "lossless"
+    # the released pipeline encodes image references at a 2048 px short edge
+    # from the 768 tier upwards, upscaling smaller ones
+    reference_resize_mode: str = "diffusers"
 
     def _validate(self) -> None:
         super()._validate()
@@ -436,9 +445,57 @@ class PikaH3FlexSamplingParams(MiniMaxH3SamplingParams):
                 )
 
 
+@dataclass
+class PiH3SamplingParams(MiniMaxH3SamplingParams):
+    """pi-H3: two or four Euler steps on the adapters' trained knots."""
+
+    num_inference_steps: int = 4
+    quality: str = "lossless"
+
+    @staticmethod
+    def trained_steps(model_variant: str | None) -> int:
+        """The 2step variants take two DiT forwards, the root and 4step four."""
+        variant = (model_variant or "4step").strip().lower()
+        return 2 if variant.startswith("2step") else 4
+
+    def _adjust(self, server_args) -> None:
+        # the step count is a property of the served variant
+        if "num_inference_steps" not in getattr(self, "_explicit_fields", set()):
+            variant = getattr(server_args, "model_variant", None)
+            subfolder = getattr(server_args, "model_subfolder", None)
+            if variant is None and subfolder:
+                # a variant picked by directory: 2step, 2step_vae, ...
+                variant = os.path.basename(os.path.normpath(subfolder))
+            self.num_inference_steps = self.trained_steps(variant)
+        super()._adjust(server_args)
+
+    def _validate(self) -> None:
+        super()._validate()
+        if self.num_inference_steps not in (2, 4):
+            raise ValueError(
+                "pi-H3 adapters are distilled for 2 or 4 steps (the 2step and "
+                f"4step variants); got num_inference_steps={self.num_inference_steps}"
+            )
+        if self.task is not None and self.task.strip().lower() not in (
+            "t2va",
+            "fl2va",
+        ):
+            raise ValueError(
+                f"pi-H3 serves t2va and fl2va only (got task={self.task!r})"
+            )
+        # the adapters were trained at video shift 12 / audio shift 3
+        for name, trained in (("flow_shift", 12.0), ("audio_flow_shift", 3.0)):
+            value = getattr(self, name)
+            if value is not None and float(value) != trained:
+                raise ValueError(
+                    f"pi-H3 adapters were trained at {name}={trained:g}; got {value}"
+                )
+
+
 __all__ = [
     "FastH3OmniSamplingParams",
     "FastH3SamplingParams",
     "MiniMaxH3SamplingParams",
+    "PiH3SamplingParams",
     "PikaH3FlexSamplingParams",
 ]

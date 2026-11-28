@@ -31,7 +31,6 @@ def _request(req_pool_idx=None, *, reused=False):
             kv_allocated_len=1 if reused else 0,
             holds_kv=reused,
         ),
-        inflight_middle_chunks=1 if reused else 0,
     )
 
 
@@ -39,7 +38,6 @@ def _mark_reused(req):
     req.kv.kv_committed_len = 1
     req.kv.kv_allocated_len = 1
     req.kv.holds_kv = True
-    req.inflight_middle_chunks = 1
 
 
 def _c4_pool(rows: int, width: int, ring_size: int):

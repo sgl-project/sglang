@@ -16,6 +16,8 @@ import torch
 from sglang.kernels.ops.gemm.fp8_gfx1250 import (
     gfx1250_fp8_scaled_mm,
     gfx1250_fp8_scaled_mm_supported,
+)
+from sglang.kernels.ops.quantization.per_token_quant_fp8_gfx1250 import (
     per_token_quant_fp8_gfx1250,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
@@ -23,11 +25,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8LinearMethod,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd")
 
 _FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 

@@ -27,8 +27,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
@@ -373,9 +372,6 @@ class VoxtralForConditionalGeneration(nn.Module):
             positions=positions,
         )
         return hidden_states
-
-    def get_language_model(self) -> nn.Module:
-        return self.language_model
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         encoder_stacked = [

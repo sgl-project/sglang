@@ -28,9 +28,10 @@ from sglang.srt.mem_cache.pool_host import HostPoolGroup
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=40, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -164,8 +165,6 @@ def test_hicache_restores_all_mtp_kv_and_conv_state(
         full_layer_mapping={layer: i for i, layer in enumerate(full_layers)},
         swa_layer_mapping={layer: i for i, layer in enumerate(swa_layers)},
         start_layer=0,
-        page_size=16,
-        tp_group=None,
         load_cache_event=None,
         storage_backend=None,
     )

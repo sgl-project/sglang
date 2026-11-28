@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
     normalize_output_seeds,
 )
@@ -237,6 +237,21 @@ class TestMultiOutputGrouping(unittest.TestCase):
             reqs[1].extra["shared"]["tensor"],
         )
         self.assertIsNot(reqs[0].extra["mu"], reqs[1].extra["mu"])
+
+    def test_freeze_for_dedup_separates_large_tensors_with_different_content(self):
+        """Two same-shape tensors above the inline-content limit must not share a
+        fingerprint, or the second request receives the first one's stage output."""
+        first = torch.zeros(300)
+        second = torch.ones(300)
+
+        self.assertNotEqual(
+            PipelineStage.freeze_for_dedup(first),
+            PipelineStage.freeze_for_dedup(second),
+        )
+        self.assertEqual(
+            PipelineStage.freeze_for_dedup(first),
+            PipelineStage.freeze_for_dedup(first),
+        )
 
     def test_declarative_stage_dedup_runs_distinct_fingerprints_separately(self):
         stage = CountingDedupStage()

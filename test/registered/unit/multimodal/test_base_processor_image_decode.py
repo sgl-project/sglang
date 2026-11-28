@@ -27,9 +27,12 @@ import requests
 import torch
 from PIL import Image
 
+from sglang.srt.multimodal import media_io
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import common
+from sglang.srt.multimodal.processors.transformers_auto import (
+    TransformersAutoMultimodalProcessor,
+)
 from sglang.srt.utils.nvjpeg_decoder import _NvJpegDecoderPool
 from sglang.test.test_utils import CustomTestCase
 
@@ -108,7 +111,7 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
 
     def test_unreachable_image_url_is_a_client_error(self):
         with patch(
-            "sglang.srt.multimodal.processors.base_processor.load_image",
+            "sglang.srt.multimodal.multimodal_processor_mixin.load_image",
             side_effect=requests.ConnectionError("connection refused"),
         ):
             with self.assertRaisesRegex(ValueError, "connection refused"):
@@ -122,38 +125,70 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
 
     def test_unexpected_loader_bug_remains_a_server_error(self):
         with patch(
-            "sglang.srt.multimodal.processors.base_processor.load_image",
+            "sglang.srt.multimodal.multimodal_processor_mixin.load_image",
             side_effect=TypeError("unexpected loader bug"),
         ):
             with self.assertRaisesRegex(RuntimeError, "unexpected loader bug"):
                 _StubProcessor._load_single_item(b"image", Modality.IMAGE)
 
+    def test_gpu_jpeg_path_returns_rgb_for_mixed_grayscale_and_rgb(self):
+        """#26751: a mixed JPEG batch must reach the processor as 3 channels.
+
+        Execute torchvision's real decoder on CPU at the CUDA boundary, so
+        CPU CI checks the selected color mode and resulting pixels together.
+        """
+        from torchvision.io import ImageReadMode, decode_jpeg
+
+        def decode_on_cpu(data, **kwargs):
+            self.assertEqual(kwargs.pop("device"), "cuda")
+            return decode_jpeg(data, **kwargs)
+
+        outputs = []
+        for mode in ("L", "RGB"):
+            image = Image.open(io.BytesIO(_jpeg_bytes())).convert(mode)
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG")
+            data = buf.getvalue()
+            expected = decode_jpeg(
+                torch.frombuffer(bytearray(data), dtype=torch.uint8),
+                mode=ImageReadMode.RGB,
+            )
+            with (
+                patch.object(media_io, "is_jpeg_with_cuda", return_value=True),
+                patch("torchvision.io.decode_jpeg", side_effect=decode_on_cpu),
+            ):
+                actual = media_io._load_image(data, gpu_image_decode=True)
+            self.assertIsInstance(actual, torch.Tensor)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            outputs.append(actual)
+        self.assertEqual(torch.stack(outputs).shape, (2, 3, 8, 8))
+
     def test_high_fidelity_gpu_jpeg_decoder_is_selected(self):
         data = _jpeg_bytes()
         expected = torch.zeros((3, 8, 8), dtype=torch.uint8)
         with (
-            patch.object(common, "is_cuda", return_value=True),
+            patch.object(media_io, "is_cuda", return_value=True),
             patch(
                 "sglang.srt.utils.nvjpeg_decoder.decode_jpeg_with_fancy_upsampling",
                 return_value=expected,
             ) as decode,
         ):
-            image, _ = common.load_image(data, gpu_image_decode="nvjpeg_fancy")
+            image, _ = media_io.load_image(data, gpu_image_decode="nvjpeg_fancy")
 
         self.assertIs(image, expected)
         decode.assert_called_once_with(data)
 
     def test_high_fidelity_gpu_jpeg_decoder_falls_back_to_pil(self):
         data = _jpeg_bytes()
-        common._warn_fancy_jpeg_fallback.cache_clear()
+        media_io._warn_fancy_jpeg_fallback.cache_clear()
         with (
-            patch.object(common, "is_cuda", return_value=True),
+            patch.object(media_io, "is_cuda", return_value=True),
             patch(
                 "sglang.srt.utils.nvjpeg_decoder.decode_jpeg_with_fancy_upsampling",
                 side_effect=ImportError("nvImageCodec is unavailable"),
             ),
         ):
-            image, _ = common.load_image(data, gpu_image_decode="nvjpeg_fancy")
+            image, _ = media_io.load_image(data, gpu_image_decode="nvjpeg_fancy")
 
         self.assertIsInstance(image, Image.Image)
         reference = Image.open(io.BytesIO(data))
@@ -212,6 +247,26 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         self.assertIn(":fancy_upsampling=1", decoder.kwargs["options"])
         self.assertIs(pool._decode_params.sample_format, fake_format)
         self.assertFalse(pool._decode_params.apply_exif_orientation)
+
+
+class TestTransformersAutoImageLoad(CustomTestCase):
+    def test_jpeg_on_cuda_host_is_loaded_as_rgb_pil(self):
+        """The generic Transformers-backend processor feeds PIL images to the
+        HF processor: a JPEG on a CUDA host must not come back as a device
+        tensor from the nvJPEG path."""
+        processor = object.__new__(TransformersAutoMultimodalProcessor)
+        with (
+            patch.object(media_io, "is_cuda", return_value=True),
+            patch(
+                "torchvision.io.decode_jpeg",
+                return_value=torch.zeros((3, 8, 8), dtype=torch.uint8),
+            ),
+        ):
+            images = processor._load_images([_jpeg_bytes()])
+
+        self.assertEqual(len(images), 1)
+        self.assertIsInstance(images[0], Image.Image)
+        self.assertEqual(images[0].mode, "RGB")
 
 
 if __name__ == "__main__":

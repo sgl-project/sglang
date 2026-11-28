@@ -45,6 +45,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -52,7 +54,6 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +410,7 @@ class MixtralForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
+            # GraniteMoeForCausalLM reuses this loader; its model has no start_layer.
             if (
                 layer_id is not None
                 and hasattr(self.model, "start_layer")
@@ -465,8 +467,6 @@ class MixtralForCausalLM(nn.Module):
                         continue
                     # Skip loading kv_scale from ckpts towards new design.
                     if name.endswith(".kv_scale") and name not in params_dict:
-                        continue
-                    if name is None:
                         continue
 
                     if name in params_dict.keys():

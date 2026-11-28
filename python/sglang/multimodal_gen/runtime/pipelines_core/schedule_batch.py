@@ -14,19 +14,16 @@ from __future__ import annotations
 import logging
 import math
 import os
-import pprint
 from collections import Counter
 from copy import deepcopy
-from dataclasses import MISSING, asdict, dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, Optional, Sequence, Union
 
 import PIL.Image
 import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     FlowRolloutController,
 )
@@ -37,10 +34,7 @@ from sglang.multimodal_gen.runtime.realtime.session import (
     RealtimeSession,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import (
-    _sanitize_for_logging,
-    init_logger,
-)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
@@ -71,7 +65,7 @@ class BatchMetricsWindow:
     reject_reasons: Counter[str] = field(default_factory=Counter)
 
 
-@dataclass(init=False)
+@dataclass(init=False, repr=False)
 class Req:
     """
     Complete state passed through the pipeline execution.
@@ -99,7 +93,6 @@ class Req:
     preprocessed_image: torch.Tensor | None = None
     preprocessed_video: torch.Tensor | None = None
 
-    output_file_ext: str | None = None
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None
@@ -145,7 +138,6 @@ class Req:
 
     # Audio Latents
     audio_latents: torch.Tensor | None = None
-    audio_noise: torch.Tensor | None = None
     raw_audio_latent_shape: tuple[int, ...] | None = None
     did_sp_shard_audio_latents: bool = False
     sp_audio_start_frame: int = 0
@@ -168,10 +160,6 @@ class Req:
     condition_image_latent_ids: torch.Tensor | list[torch.Tensor] | None = None
     vae_image_sizes: list[tuple[int, int]] | None = None
     c2ws_plucker_emb: torch.Tensor | None = None
-
-    # Latent dimensions
-    height_latents: list[int] | int | None = None
-    width_latents: list[int] | int | None = None
 
     # Timesteps
     timesteps: torch.Tensor | None = None
@@ -391,8 +379,8 @@ class Req:
 
         self.metrics = RequestMetrics(request_id=self.request_id)
 
-    def __str__(self):
-        return pprint.pformat(asdict(self), indent=2, width=120)
+    def __repr__(self):
+        return f"Req(is_warmup={self.is_warmup})"
 
     def log(self, server_args: ServerArgs):
         if self.is_warmup or self.suppress_logs:
@@ -401,10 +389,7 @@ class Req:
             if not logger.isEnabledFor(logging.DEBUG):
                 return
             logger.debug(
-                "VLA request: prompt=%s seed=%s steps=%s outputs=%s action=%sx%s "
-                "save_output=%s",
-                _sanitize_for_logging(self.prompt, key_hint="prompt"),
-                self.seed,
+                "VLA request: steps=%s outputs=%s action=%sx%s save_output=%s",
                 self.num_inference_steps,
                 self.num_outputs_per_prompt,
                 getattr(self, "action_horizon", None),
@@ -423,15 +408,6 @@ class Req:
         else:
             target_width = -1
 
-        if logger.isEnabledFor(logging.DEBUG):
-            display_prompt = self.prompt
-            display_neg_prompt = self.negative_prompt
-        else:
-            display_prompt = _sanitize_for_logging(self.prompt, key_hint="prompt")
-            display_neg_prompt = _sanitize_for_logging(
-                self.negative_prompt, key_hint="negative_prompt"
-            )
-
         effective_flow_shift = (
             self.flow_shift
             if self.flow_shift is not None
@@ -443,26 +419,14 @@ class Req:
                       height: {target_height}
                   num_frames: {self.num_frames}
                          fps: {self.fps}
-                      prompt: {display_prompt}
-                  neg_prompt: {display_neg_prompt}
-                        seed: {self.seed}
                  infer_steps: {self.num_inference_steps}
       num_outputs_per_prompt: {self.num_outputs_per_prompt}
               guidance_scale: {self.guidance_scale}
      embedded_guidance_scale: {server_args.pipeline_config.embedded_cfg_scale}
                     n_tokens: {self.n_tokens}
                   flow_shift: {effective_flow_shift}
-                  image_path: {_sanitize_for_logging(self.image_path)}
                  save_output: {self.save_output}
-            output_file_path: {self.output_file_path()}
         """  # type: ignore[attr-defined]
-        # Add model-specific fields if present
-        bot_task = getattr(self, "bot_task", None)
-        system_prompt = getattr(self, "system_prompt", None)
-        if bot_task is not None:
-            debug_str += f"            bot_task: {bot_task}\n"
-        if system_prompt is not None:
-            debug_str += f"               system_prompt: {system_prompt}\n"
         logger.info(debug_str)
 
 
@@ -496,6 +460,9 @@ class OutputBatch:
     error: str | None = None
     # the client cancelled the request; error tells which one
     cancelled: bool = False
+    # the workers cannot serve another request after this error: the HTTP
+    # server turns unhealthy with it until the server is restarted
+    fatal_error: str | None = None
     output_file_paths: list[str] | None = None
     # encoded image per output when the request sets return_image_bytes
     output_image_bytes: list[bytes | None] | None = None

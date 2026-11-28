@@ -14,7 +14,7 @@
 
 import logging
 from array import array
-from functools import lru_cache, partial
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
 import numpy as np
@@ -36,18 +36,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeModel
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +197,6 @@ class VariableResolutionResamplerModel(nn.Module):
             self.spatial_dim,
             bias=True,
             gather_output=True,
-            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.spatial_linear1",
         )
 
@@ -210,7 +207,6 @@ class VariableResolutionResamplerModel(nn.Module):
             self.spatial_dim,
             bias=True,
             gather_output=True,
-            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.spatial_linear2",
         )
 
@@ -222,7 +218,6 @@ class VariableResolutionResamplerModel(nn.Module):
                 self.spatial_dim,
                 bias=True,
                 gather_output=True,
-                quant_config=getattr(config, "quant_config", None),
                 prefix=f"{prefix}.temporal_linear1",
             )
 
@@ -233,7 +228,6 @@ class VariableResolutionResamplerModel(nn.Module):
                 self.spatial_dim,
                 bias=True,
                 gather_output=True,
-                quant_config=getattr(config, "quant_config", None),
                 prefix=f"{prefix}.temporal_linear2",
             )
 
@@ -244,7 +238,6 @@ class VariableResolutionResamplerModel(nn.Module):
             self.out_dim,
             bias=True,
             gather_output=True,
-            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.mlp",
         )
 
@@ -335,34 +328,6 @@ class VariableResolutionResamplerModel(nn.Module):
             x = fwd_temporal(x)
         x = fwd_mlp(x)
         return x
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            if name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
-
-
-class Ernie4_5_VisionRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, theta: float = 10000.0) -> None:
-        super().__init__()
-        self.inv_freq = 1.0 / theta ** (
-            torch.arange(start=0, end=dim, step=2, dtype=torch.float32) / dim
-        )
-
-    def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(
-            seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-        )
-        freqs = torch.outer(input=seq, vec2=self.inv_freq)
-        return freqs
 
 
 class Ernie4_5_VisionTransformer(nn.Module):
@@ -505,9 +470,6 @@ class Ernie4_5_VisionTransformer(nn.Module):
             final_output = final_output.squeeze(dim=1)
 
         return final_output
-
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
@@ -684,18 +646,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
     ):
-        """Run forward pass for Ernie45-VL.
-
-        Args:
-            input_ids: Flattened (concatenated) input_ids corresponding to a
-                batch.
-            positions: Flattened (concatenated) position ids corresponding to a
-                batch.
-                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
-                opensource models), the shape will be `(3, seq_len)`,
-                otherwise it will be `(seq_len,).
-                (Use input_metadata.mrope_positions to replace it)
-        """
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 

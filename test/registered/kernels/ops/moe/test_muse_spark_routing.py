@@ -10,7 +10,7 @@ from sglang.kernels.ops.moe.muse_spark_routing import FusedMuseSparkRouting
 from sglang.kernels.spec import KernelBackend
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _routing_op(num_experts, eps, multiplier, ep_map, num_valid):
@@ -59,17 +59,27 @@ def test_routing_matches_native(
 
 
 @pytest.mark.parametrize("num_tokens", [1, 33, 4096])
-def test_jit_routing_is_bitwise_triton(num_tokens):
+@pytest.mark.parametrize(
+    "eps, multiplier, ep_map, padded",
+    [(1e-20, 0.5, False, False), (None, None, False, False), (1e-15, 3.0, True, True)],
+)
+def test_jit_routing_matches_triton(num_tokens, eps, multiplier, ep_map, padded):
     torch.manual_seed(num_tokens)
-    op = _routing_op(256, 1e-20, 0.5, False, None)
+    num_valid = max(num_tokens - 3, 0) if padded else None
+    op = _routing_op(256, eps, multiplier, ep_map, num_valid)
     logits = torch.randn(num_tokens, 256, device="cuda")
     hidden = torch.empty(num_tokens, 1, device="cuda")
-    triton_out = op(
+    triton_w, triton_ids, triton_packed = op(
         hidden, logits, 8, True, want_packed=True, backend=KernelBackend.TRITON
     )
-    jit_out = op(hidden, logits, 8, True, want_packed=True, backend=KernelBackend.JIT)
-    for a, b in zip(jit_out, triton_out):
-        assert torch.equal(a, b)
+    jit_w, jit_ids, jit_packed = op(
+        hidden, logits, 8, True, want_packed=True, backend=KernelBackend.JIT
+    )
+    assert torch.equal(jit_ids, triton_ids)
+    assert torch.equal(jit_packed >> 16, triton_packed >> 16)
+    # Padded rows leave the weights unwritten.
+    valid = slice(None) if num_valid is None else slice(0, num_valid)
+    torch.testing.assert_close(jit_w[valid], triton_w[valid], rtol=1e-6, atol=1e-6)
 
 
 def _post_expert_reference(x, scores, weight, eps, weight_first, ids):

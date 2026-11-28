@@ -21,12 +21,8 @@ from sglang.srt.managers.incremental_detokenize import (
     DetokenizeState,
     build_detokenize_header,
 )
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_LENGTH,
-    ReqKvInfo,
-    ScheduleBatch,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -386,6 +382,19 @@ class TestCoordRowPin(CustomTestCase):
         self.assertEqual(int(cs.stamp[rows[7]]), 3)
 
 
+class _FakeRowStorage:
+    """The storage surface document reuse moves a holder's row through."""
+
+    def __init__(self, cache):
+        self._cache = cache
+
+    def hold_row(self, holder):
+        self._cache.held_req_slots.append(holder)
+
+    def release_row(self, holder):
+        self._cache.freed_req_slots.append(holder)
+
+
 class _FakeAllocator:
     def __init__(self):
         self.freed = []
@@ -425,7 +434,9 @@ def _backend_stub(**extra):
 class _FakeCache:
     def __init__(self, backend=None):
         self.token_to_kv_pool_allocator = _FakeAllocator()
+        self.token_to_kv_pool_allocator.storage = _FakeRowStorage(self)
         self.freed_rows = []
+        self.held_req_slots = []
         self.freed_req_slots = []
         self.page_size = 32
         self.finished = []
@@ -438,8 +449,7 @@ class _FakeCache:
 
     @property
     def req_to_token_pool(self):
-        cache = self
-        return SimpleNamespace(free=lambda holder: cache.freed_req_slots.append(holder))
+        return SimpleNamespace()
 
 
 class TestRetainedWindowAccounting(CustomTestCase):
@@ -455,6 +465,7 @@ class TestRetainedWindowAccounting(CustomTestCase):
         owner = object.__new__(UnifiedRadixCache)
         owner.tree_core = SimpleNamespace(page_size=32)
         owner.session = SimpleNamespace(slots={})
+        owner._window_slots = ()
         owner.uocr_doc_reuse = cache.reuse
         observer = SchedulerPoolStatsObserver(
             tree_cache=owner,
@@ -470,7 +481,7 @@ class TestRetainedWindowAccounting(CustomTestCase):
                     entry = cache.reuse.docs.pop("doc")
                     cache.reuse.sources[id(entry)] = entry
                 self.assertEqual(observer.session_held_tokens(), 96)
-                self.assertEqual(observer.session_held_swa_tokens(), 96)
+                self.assertEqual(observer.session_held_window_tokens("swa"), 96)
                 self.assertEqual(observer.session_held_req_count(), 1)
         cache.reuse.reset()
         self.assertEqual(observer.session_held_tokens(), 0)
@@ -1291,6 +1302,7 @@ class _MatchCache(_FakeCache):
     def __init__(self, backend=None):
         super().__init__(backend=backend)
         self.token_to_kv_pool_allocator = _AllocatingAllocator()
+        self.token_to_kv_pool_allocator.storage = _FakeRowStorage(self)
         self.req_to_token = torch.arange(4 * 2048, dtype=torch.int64).reshape(4, 2048)
         self.unlocked = []
         self.aligned_frees = []
@@ -1310,10 +1322,7 @@ class _MatchCache(_FakeCache):
     @property
     def req_to_token_pool(self):
         cache = self
-        return SimpleNamespace(
-            req_to_token=cache.req_to_token,
-            free=lambda holder: cache.freed_req_slots.append(holder),
-        )
+        return SimpleNamespace(req_to_token=cache.req_to_token)
 
 
 class TestPrefixHandOff(CustomTestCase):
@@ -1583,7 +1592,7 @@ class TestRetainedWindowClaim(CustomTestCase):
     PROMPT = prompt([(0, 200), (1, 200)])
 
     def _finished(self, origin):
-        from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+        from sglang.srt.managers.req_types import FINISH_MATCHED_TOKEN
 
         out = [PAGE] + list(range(30, 60)) + [EOS]
         committed = len(origin) + len(out) - 1
@@ -1625,6 +1634,8 @@ class TestRetainedWindowClaim(CustomTestCase):
         self.assertIsNone(req.lock)
         entry = cache.reuse.docs["doc"]
         self.assertEqual(entry.holder.kv.req_pool_idx, 2)
+        # The window, no request, holds the row now.
+        self.assertEqual(cache.held_req_slots, [entry.holder])
         # The uncommitted tail goes back now; the holder keeps the rest.
         self.assertEqual(cache.aligned_frees, [(2, committed, committed + 5)])
         self.assertEqual(entry.holder.kv.kv_allocated_len, committed)

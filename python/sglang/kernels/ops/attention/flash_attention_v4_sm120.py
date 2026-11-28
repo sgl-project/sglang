@@ -12,7 +12,7 @@ from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
     get_forward_arch,
     resolve_runtime_policy,
-    try_cached_paged_decode,
+    try_cached_paged,
 )
 from sglang.kernels.ops.attention.flash_attention_v4 import (
     _flash_attn_import_error,
@@ -96,9 +96,8 @@ def flash_attn_varlen_func(
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
-            "FlashAttention-4 CUTE is not available. Install flash-attn-4 with "
-            "its CUDA/CUTE dependencies, or run from a source tree where the "
-            "vendored FA4 package is importable."
+            "The vendored FlashAttention-4 CuTe kernels failed to import; check "
+            "that nvidia-cutlass-dsl and its CUDA dependencies are installed."
         ) from _flash_attn_import_error
 
     _validate_out_contract(out)
@@ -266,7 +265,7 @@ def flash_attn_with_kvcache(
         cu_seqlens_q, cache_seqlens, page_table = [
             _maybe_contiguous(t) for t in (cu_seqlens_q, cache_seqlens, page_table)
         ]
-        fast_result = try_cached_paged_decode(
+        fast_result = try_cached_paged(
             arch=forward_arch,
             q=q,
             k=k_cache,

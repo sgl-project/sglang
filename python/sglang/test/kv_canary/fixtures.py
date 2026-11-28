@@ -19,8 +19,11 @@ from sglang.srt.mem_cache.unified_cache.components import (
     BASE_COMPONENT_TYPE,
     ComponentType,
 )
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedTreeCore,
+    UnifiedTreeNode,
+)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import get_device
 from sglang.test.tree_slots import index_slots, tree_slots_of
@@ -166,7 +169,7 @@ def make_req_to_token_pool(
 ) -> SimpleNamespace:
     req_to_token = torch.zeros(max_reqs, max_seq_len, dtype=torch.int32, device=device)
     return SimpleNamespace(
-        req_to_token=req_to_token, size=max_reqs, max_context_len=max_seq_len
+        req_to_token=req_to_token, size=max_reqs, row_width=max_seq_len
     )
 
 

@@ -154,9 +154,8 @@ class TestNPoolValidation(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "unique"):
             _make_pool([_mha("x", "down"), _mamba("x", "up")])
 
-    def test_fewer_than_two_specs_rejected(self):
-        with self.assertRaisesRegex(AssertionError, ">= 2 bands"):
-            _make_pool([_mha("full", "down")])
+    def test_a_lone_down_end_is_an_arena(self):
+        self.assertEqual(_chain_names(_make_pool([_mha("full", "down")])), ["full"])
 
     def test_end_direction_counts_rejected(self):
         """Exactly one grow-up END and one grow-down END, no more, no less."""

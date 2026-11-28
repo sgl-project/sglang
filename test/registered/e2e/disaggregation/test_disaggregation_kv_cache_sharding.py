@@ -13,7 +13,7 @@ import unittest
 
 import requests
 
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -75,8 +75,6 @@ class TestDisaggregationKVCacheSharding(PDDisaggregationServerBase, GSM8KMixin):
     prefill_tp_size = 2
     decode_tp_size = 2
     decode_base_gpu_id = 2
-    # KV sharding with the radix cache on requires the Python tree core.
-    extra_prefill_env = {"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "python"}
     # 256-token chunks split each 5-shot prompt, so later chunks read a
     # sharded prefix and every rank sends pages from several chunks.
     extra_prefill_args = COMMON_ARGS + [
