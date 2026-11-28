@@ -711,8 +711,12 @@ class TestBuildDecodeRegistry(unittest.TestCase):
 
     def setUp(self):
         from sglang.srt.model_executor import input_buffers
+        from sglang.srt.runtime_context import get_parallel
 
         input_buffers._forward_input_buffer_pool.clear()
+        # Nothing is published here. The gathered slots size through dp_capacity_for
+        # (None: no elastic ceiling) and fill only the live num_dp_ranks prefix.
+        self.enterContext(get_parallel().override(max_ep_size=None, num_dp_ranks=1))
 
     def test_factory_slot_set_and_padding(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -872,9 +876,16 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             reg.fill_from(
                 fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
             )
-        # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
-        # local = clamp(global(100) - rank*4, 0, 4) = 4.
-        self.assertEqual(int(src.num_token_non_padded.item()), 4)
+            # tokens_per_rank = padded_num_tokens(8) // attn_tp_size(2) = 4;
+            # local = clamp(global(100) - rank*4, 0, 4) = 4.
+            self.assertEqual(int(src.num_token_non_padded.item()), 4)
+            # With the host count present it is the source (the device scalar
+            # is not read), localized against the padded bucket: min(3, 4) = 3.
+            fb.global_num_token_non_padded_cpu = 3
+            reg.fill_from(
+                fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
+            )
+        self.assertEqual(int(src.num_token_non_padded.item()), 3)
 
     def test_num_token_non_padded_bypass_carries_local_count(self):
         # Regression: the dense SBD draft and TBO sub-batches bypass
@@ -1489,6 +1500,11 @@ class TestFillOncePolicy(unittest.TestCase):
 class TestComputedSlots(unittest.TestCase):
     """num_token_non_padded and global_num_tokens are both computed slots
     (copy_from_fb=False + post_fill fill)."""
+
+    def setUp(self):
+        from sglang.srt.runtime_context import get_parallel
+
+        self.enterContext(get_parallel().override(max_ep_size=None, num_dp_ranks=1))
 
     def test_num_token_non_padded_passthrough_path(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (

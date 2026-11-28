@@ -29,10 +29,11 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=15, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 def _ref_strided_adler32(tensors, indices, strides) -> int:
@@ -348,6 +349,7 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.metrics_collector = Mock()
         self.streamed_aborts = []
         self.ngram_embedding_manager = Mock()
+        self.spec_algorithm = SimpleNamespace(is_ngram=lambda: False)
         self.chunked_req = None
         self.future_map = None
         self.attn_tp_cpu_group = None

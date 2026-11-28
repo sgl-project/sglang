@@ -226,7 +226,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         cls.req_to_token_pool = ReqToTokenPool(
             size=MAX_NUM_REQS,
-            max_context_len=MAX_CONTEXT_LEN,
+            row_width=MAX_CONTEXT_LEN,
             device=DEVICE,
             enable_memory_saver=False,
         )
