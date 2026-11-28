@@ -22,14 +22,16 @@ registration to have happened.
 from __future__ import annotations
 
 import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 import torch
 
-from sglang.multimodal_gen.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+from sglang.multimodal_gen.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    run_logged_command,
+)
 from sglang.test.test_utils import CustomTestCase
 
 IMAGE_SIZE = "512x512"
@@ -111,56 +113,29 @@ class TestDiffusionBCGTP2ZImageTurbo(CustomTestCase):
         # symmetric workspace and does not emit the registration marker
         env["SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"] = "0"
 
-        try:
-            result = subprocess.run(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=GENERATE_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as exc:
-            # An unregistered graph buffer can also hang the worker instead of
-            # returning, so a timeout is a failure of this guard, not flakiness.
-            output = exc.output or b""
-            if isinstance(output, bytes):
-                output = output.decode("utf-8", errors="replace")
-            log_path.write_text(output, encoding="utf-8")
-            self.fail(
-                f"TP={TP_SIZE} BCG generate hung after "
-                f"{GENERATE_TIMEOUT_SECONDS}s. Log: {log_path}\n{output[-4000:]}"
-            )
-
-        log_path.write_text(result.stdout, encoding="utf-8")
-        tail = result.stdout[-4000:]
-
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"TP={TP_SIZE} BCG generate failed. Log: {log_path}\n{tail}",
+        output = run_logged_command(
+            cmd, log_path, timeout=GENERATE_TIMEOUT_SECONDS, env=env
         )
         self.assertNotIn(
             ILLEGAL_MEMORY_MARKER,
-            result.stdout,
-            f"replay hit an unregistered peer address. Log: {log_path}\n{tail}",
+            output,
+            f"replay hit an unregistered peer address. Log: {log_path}",
         )
-        self.assertNotIn("[Diffusion BCG] capture failed", result.stdout)
+        self.assertNotIn("[Diffusion BCG] capture failed", output)
         self.assertIn(
             BCG_CAPTURE_MARKER,
-            result.stdout,
-            f"BCG never captured, so this run did not exercise TP+BCG. "
-            f"Log: {log_path}\n{tail}",
+            output,
+            f"BCG never captured, so this run did not exercise TP+BCG. Log: {log_path}",
         )
-        if CUSTOM_ALL_REDUCE_V2_MARKER not in result.stdout:
+        if CUSTOM_ALL_REDUCE_V2_MARKER not in output:
             self.assertIn(
                 GRAPH_BUFFER_REGISTRATION_MARKER,
-                result.stdout,
+                output,
                 f"custom all-reduce graph buffers were never registered, so capture "
                 f"did not go through the TP group's graph_capture(). "
-                f"Log: {log_path}\n{tail}",
+                f"Log: {log_path}",
             )
-        self.assertIn("Pixel data generated successfully", result.stdout)
+        self.assertIn("Pixel data generated successfully", output)
 
 
 if __name__ == "__main__":

@@ -310,6 +310,36 @@ def wait_for_server_health(
     )
 
 
+def run_logged_command(
+    command: list[str],
+    log_path: Path,
+    *,
+    timeout: int,
+    env: dict[str, str] | None = None,
+) -> str:
+    # Write as the child runs so an interrupted test also leaves an artifact.
+    with log_path.open("wb") as stream:
+        try:
+            result = subprocess.run(
+                command,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = log_path.read_text(encoding="utf-8", errors="replace")
+            raise AssertionError(
+                f"Command timed out after {timeout}s. Log: {log_path}\n{output}"
+            ) from exc
+    output = log_path.read_text(encoding="utf-8", errors="replace")
+    if result.returncode:
+        raise AssertionError(
+            f"Command exited {result.returncode}. Log: {log_path}\n{output}"
+        )
+    return output
+
+
 def run_command(command: list[str]) -> bool:
     """Run a CLI command and return whether it succeeded."""
     print(f"Running command: {' '.join(command)}", flush=True)
