@@ -183,11 +183,7 @@ def _request_filter(
 ) -> Optional[FilterProbs]:
     """The watermarked rows' request top-k, top-p, and min-p, each repeated
     ``width`` times, as the stock sampler applies them."""
-    if not (
-        sampling_info.need_top_k_sampling
-        or sampling_info.need_top_p_sampling
-        or sampling_info.need_min_p_sampling
-    ):
+    if not sampling_info.facts.truncates:
         return None
 
     # lazy: sampling_batch_info imports this module, and the stock sampler it.
@@ -204,7 +200,7 @@ def _request_filter(
     def filter_probs(probs: torch.Tensor) -> torch.Tensor:
         probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
         top_k_top_p_min_p_filter_sorted_probs_torch(
-            probs_sort, top_ks, top_ps, min_ps, sampling_info.need_min_p_sampling
+            probs_sort, top_ks, top_ps, min_ps, sampling_info.facts.need_min_p
         )
         filtered = torch.zeros_like(probs).scatter_(1, probs_idx, probs_sort)
         return filtered / filtered.sum(dim=-1, keepdim=True)
@@ -288,9 +284,7 @@ class SynthIDSample:
             self.allow_fused_sample
             and self.rows.all_on
             and not keep_logits
-            and not sampling_info.need_top_k_sampling
-            and not sampling_info.need_top_p_sampling
-            and not sampling_info.need_min_p_sampling
+            and not sampling_info.facts.truncates
             and sampling_info.sampling_seed is None
             and sampling_info.sampling_mask_batch_indices is None
             # The fused sample skips the stages after the watermark.

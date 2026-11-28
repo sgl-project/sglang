@@ -11,6 +11,7 @@ from sglang.srt.models.dflash import (
     _grouped_conv,
     candidate_topk,
 )
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -489,7 +490,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     sampling_info = SimpleNamespace(
         temperatures=torch.tensor([[0.7]]),
         top_ks=torch.tensor([[8]]),
-        is_all_greedy=False,
+        facts=SamplingFacts(),
     )
     observed = {}
 
@@ -601,7 +602,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         worker,
         candidates=torch.tensor([[9, 1]]),
         next_token_logits=torch.tensor([[[0.0, 1.0], [1.0, 0.0]]]),
-        sampling_info=SimpleNamespace(is_all_greedy=False),
+        sampling_info=SimpleNamespace(facts=SamplingFacts()),
         draft_input=object(),
         prefix_lens=torch.tensor([3]),
         bs=1,
@@ -659,7 +660,7 @@ def test_accept_commits_the_block_in_one_launch_into_the_accept_ring(
     inputs = dict(
         candidates=candidates,
         next_token_logits=None,
-        sampling_info=SimpleNamespace(is_all_greedy=False),
+        sampling_info=SimpleNamespace(facts=SamplingFacts()),
         draft_input=SimpleNamespace(max_top_k=4, uniform_top_k_value=None),
         prefix_lens=torch.tensor([100, 200, 300]),
         bs=3,

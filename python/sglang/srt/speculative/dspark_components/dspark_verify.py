@@ -45,7 +45,6 @@ from sglang.srt.managers.overlap_utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
-from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -215,7 +214,7 @@ class TargetVerifyExecutor:
             rejection_noise=self._rejection_noise,
         )
         greedy_bonus = simulate_bonus_sampling_info is None and (
-            sampling_info is None or sampling_info.is_all_greedy
+            sampling_info is None or sampling_info.facts.all_greedy
         )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
@@ -1237,7 +1236,7 @@ def sample_simulated_bonus(
 ) -> torch.Tensor:
     """The bonus token at the (simulated) correct_len row, drawn from the target
     distribution the sampling accept uses: temperature, then top-k / top-p / min-p."""
-    if need_truncated_sampling(sampling_info):
+    if sampling_info.facts.truncates:
         probs = build_speculative_verify_target_probs(
             next_token_logits=target_logits.index_select(
                 0, _simulated_rows(correct_len, verify_num_draft_tokens)
@@ -1352,7 +1351,7 @@ def accept_draft_tokens(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
-    all_greedy = sampling_info is None or sampling_info.is_all_greedy
+    all_greedy = sampling_info is None or sampling_info.facts.all_greedy
     if all_greedy:
         return AcceptGreedy.execute(
             candidates=candidates,
@@ -1407,7 +1406,7 @@ def accept_draft_tokens(
             cutoff_verify_lens=cutoff_verify_lens,
             block_verification=block_verification,
         )
-    if not sampling_info.is_any_greedy:
+    if not sampling_info.facts.any_greedy:
         return sampled
     greedy_len, greedy_bonus, greedy_trim = AcceptGreedy.execute(
         candidates=candidates,

@@ -217,11 +217,7 @@ def _build_sparse_target_support(
     max_top_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return compact target token IDs/probabilities without a dense scatter."""
-    top_ps = (
-        sampling_info.top_ps
-        if bool(getattr(sampling_info, "need_top_p_sampling", False))
-        else None
-    )
+    top_ps = sampling_info.top_ps if sampling_info.facts.need_top_p else None
 
     return _build_sparse_target_support_tensors(
         next_token_logits,

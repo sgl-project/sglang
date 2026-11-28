@@ -130,12 +130,12 @@ class TestSamplerParams(_PoolTestCase):
 
         self.assertAlmostEqual(params.temperatures.item(), 1.1, places=6)
         self.assertEqual(params.top_ks.tolist(), [TOP_K_ALL])
-        self.assertFalse(params.need_top_p_sampling)
-        self.assertFalse(params.need_min_p_sampling)
-        self.assertFalse(params.is_any_greedy)
+        self.assertFalse(params.facts.need_top_p)
+        self.assertFalse(params.facts.need_min_p)
+        self.assertFalse(params.facts.any_greedy)
 
     def test_flags_follow_the_gathered_rows(self):
-        # (top_ks, is_all_greedy, is_any_greedy, need_top_k, npu eligible, max_top_k)
+        # (top_ks, all_greedy, any_greedy, need_top_k, npu eligible, max_top_k)
         cases = (
             ((), True, False, False, True, None),
             ((1,), True, True, True, True, 1),
@@ -155,30 +155,30 @@ class TestSamplerParams(_PoolTestCase):
 
                 self.assertEqual(
                     (
-                        params.is_all_greedy,
-                        params.is_any_greedy,
-                        params.need_top_k_sampling,
-                        params.npu_top_k_top_p_eligible,
-                        params.max_top_k,
+                        params.facts.all_greedy,
+                        params.facts.any_greedy,
+                        params.facts.need_top_k,
+                        params.facts.npu_top_k_top_p_eligible,
+                        params.facts.max_top_k,
                     ),
                     (all_greedy, any_greedy, need_top_k, npu, max_top_k),
                 )
 
     def test_flags_drop_when_the_last_row_using_them_leaves(self):
-        """Each gather derives need_top_p_sampling and need_min_p_sampling from
+        """Each gather derives need_top_p and need_min_p from
         its own rows, so they go off once the last top-p or min-p row leaves."""
         pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write([_req(1, top_p=0.9, min_p=0.1, top_k=1), _req(2, top_k=20)])
 
         both = _gather(pool, [1, 2])
-        self.assertTrue(both.need_top_p_sampling)
-        self.assertTrue(both.need_min_p_sampling)
+        self.assertTrue(both.facts.need_top_p)
+        self.assertTrue(both.facts.need_min_p)
 
         rest = _gather(pool, [2])
-        self.assertFalse(rest.need_top_p_sampling)
-        self.assertFalse(rest.need_min_p_sampling)
-        self.assertFalse(rest.is_any_greedy)
-        self.assertEqual(rest.max_top_k, 20)
+        self.assertFalse(rest.facts.need_top_p)
+        self.assertFalse(rest.facts.need_min_p)
+        self.assertFalse(rest.facts.any_greedy)
+        self.assertEqual(rest.facts.max_top_k, 20)
 
     def test_rows_fields_are_sampling_batch_info_fields(self):
         """set_rows sets the rows by name and copy_for_forward copies only

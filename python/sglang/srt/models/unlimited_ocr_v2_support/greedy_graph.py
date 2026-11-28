@@ -85,7 +85,7 @@ class UocrGreedyGraph:
             return None
         if (
             not forward_batch.forward_mode.is_decode()
-            or not sampling_info.is_all_greedy
+            or not sampling_info.facts.all_greedy
             or forward_batch.return_logprob
         ):
             return None

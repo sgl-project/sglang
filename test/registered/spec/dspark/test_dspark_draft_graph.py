@@ -13,6 +13,7 @@ from sglang.srt.models.dspark import (
     VanillaMarkov,
 )
 from sglang.srt.sampling import sampling_params_pool as sp_pool
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
@@ -163,7 +164,7 @@ class TestDraftMarkovBlockGraph(CustomTestCase):
         hidden = torch.randn(BS * GAMMA, 64, device=DEVICE).to(torch.bfloat16)
         input_ids = torch.randint(0, VOCAB, (BS * GAMMA,), device=DEVICE)
         sampling_info = SimpleNamespace(
-            is_all_greedy=False,
+            facts=SamplingFacts(),
             temperatures=(torch.rand(BS, 1, device=DEVICE) + 0.3),
             top_ks=torch.tensor([1, 40] * (BS // 2), device=DEVICE),
         )

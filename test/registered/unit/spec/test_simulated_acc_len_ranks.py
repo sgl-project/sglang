@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative import dflash_worker_v2 as dflash_mod
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
@@ -45,7 +46,7 @@ def _dflash_draw(monkeypatch):
             worker,
             candidates=torch.tensor([[9, 1, 2, 3]]),
             next_token_logits=torch.zeros(1, 4, 8),
-            sampling_info=SimpleNamespace(is_all_greedy=True),
+            sampling_info=SimpleNamespace(facts=SamplingFacts(all_greedy=True)),
             draft_input=object(),
             prefix_lens=torch.tensor([3]),
             bs=1,

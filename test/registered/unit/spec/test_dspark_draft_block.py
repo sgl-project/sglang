@@ -12,6 +12,7 @@ from sglang.srt.models.dspark import (
     VanillaMarkov,
 )
 from sglang.srt.sampling import sampling_params_pool as sp_pool
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_params_pool import (
     SamplingParamsPool,
     SamplingParamsTable,
@@ -73,7 +74,7 @@ class TestSampleDraftBlock(CustomTestCase):
             head = head.to(torch.bfloat16)
             # top_k <= 1 marks a greedy request; rows 0 and 2 are greedy.
             sampling_info = SimpleNamespace(
-                is_all_greedy=False,
+                facts=SamplingFacts(),
                 temperatures=torch.tensor([[0.7], [1.0], [1.0], [1.3]]),
                 top_ks=torch.tensor([1, 50, 1, 50]),
             )
@@ -101,7 +102,7 @@ class TestSampleDraftBlock(CustomTestCase):
         head = VanillaMarkov(vocab_size=VOCAB, markov_rank=RANK).to(torch.bfloat16)
         # Sampling requests too: a greedy draft ignores their temperatures.
         sampling_info = SimpleNamespace(
-            is_all_greedy=False,
+            facts=SamplingFacts(),
             temperatures=torch.tensor([[0.7], [1.0], [1.0], [1.3]]),
             top_ks=torch.tensor([50, 50, 1, 50]),
         )

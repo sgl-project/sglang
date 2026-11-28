@@ -402,7 +402,7 @@ class WatermarkState:
             keys=keys,
             keys_b=keys_b,
             mixing_thresholds=mixing_thresholds,
-            max_top_k=sampling_info.max_top_k,
+            max_top_k=sampling_info.facts.max_top_k,
             partial_scores=partial_scores,
             partial_token_ids=partial_token_ids,
             output_token_ids=output_token_ids,
@@ -430,7 +430,9 @@ class WatermarkState:
             prepare_speculative_watermark_contexts_triton,
         )
 
-        if not can_use_finite_topk_watermark(sampling_info.max_top_k, logits.shape[1]):
+        if not can_use_finite_topk_watermark(
+            sampling_info.facts.max_top_k, logits.shape[1]
+        ):
             contexts, context_lengths = self.speculative_contexts(
                 req_pool_indices=req_pool_indices,
                 draft_tokens=draft_tokens,
@@ -490,7 +492,7 @@ class WatermarkState:
             keys_b=keys_b,
             mixing_thresholds=mixing_thresholds,
             draft_token_num=draft_token_num,
-            max_top_k=sampling_info.max_top_k,
+            max_top_k=sampling_info.facts.max_top_k,
             output_token_ids=output_token_ids,
             max_probability=self.max_probability,
         )
@@ -577,7 +579,7 @@ class WatermarkState:
         context_windows: torch.Tensor,
         watermark_enabled: torch.Tensor,
     ) -> None:
-        max_top_k = sampling_info.max_top_k
+        max_top_k = sampling_info.facts.max_top_k
         if max_top_k == 1:
             return
         partial_scores, partial_token_ids, output_token_ids = (

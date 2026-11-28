@@ -19,6 +19,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 )
 from sglang.srt.model_executor.runner_utils import pool
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import dflash_utils, dflash_worker_v2, eagle_utils
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -178,11 +179,8 @@ class TestGraphPoolBorrow(CustomTestCase):
             step_penalties=None,
             logit_bias=None,
             has_custom_logit_processor=False,
-            is_all_greedy=False,
+            facts=SamplingFacts(),
             temperatures=torch.ones((1, 1)),
-            need_top_k_sampling=False,
-            need_top_p_sampling=False,
-            need_min_p_sampling=False,
             sampling_seed=None,
         )
         batch = SimpleNamespace(
@@ -797,9 +795,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             temperatures=torch.ones((1, 1)),
             top_ks=torch.ones(1, dtype=torch.int32),
             top_ps=torch.ones(1),
-            need_top_k_sampling=False,
-            need_top_p_sampling=False,
-            need_min_p_sampling=False,
+            facts=SamplingFacts(),
         )
         with (
             patch.object(dflash_utils, "borrow_graph_pool", recording_borrow),

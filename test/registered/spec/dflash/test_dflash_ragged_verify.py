@@ -8,6 +8,7 @@ import unittest
 import torch
 
 from sglang.srt.managers import overlap_utils
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -47,9 +48,7 @@ def _selector_accept(candidates, target_tokens, cutoff_verify_lens):
         next_token_logits=target_logits,
         sampling_info=types.SimpleNamespace(
             temperatures=torch.ones(bs, 1, device=DEVICE),
-            need_top_k_sampling=False,
-            need_top_p_sampling=False,
-            need_min_p_sampling=False,
+            facts=SamplingFacts(),
         ),
         draft_input=None,
         prefix_lens=torch.zeros(bs, dtype=torch.int64, device=DEVICE),

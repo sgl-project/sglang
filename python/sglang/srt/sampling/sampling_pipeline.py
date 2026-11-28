@@ -35,7 +35,6 @@ from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.sampling.custom_logit_processor import apply_custom_logit_processor
 from sglang.srt.sampling.grammar_mask import apply_grammar_mask
 from sglang.srt.sampling.logit_bias import apply_logit_bias
-from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.utils.async_probe import maybe_detect_nan, sanitize_nan_logits
 
 if TYPE_CHECKING:
@@ -284,7 +283,7 @@ class VerifyRoute(msgspec.Struct, frozen=True):
                 or info.logit_bias is not None
                 or info.has_custom_logit_processor
             ),
-            need_truncated_sampling=need_truncated_sampling(info),
+            need_truncated_sampling=info.facts.truncates,
         )
 
 

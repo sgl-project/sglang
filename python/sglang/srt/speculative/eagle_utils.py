@@ -677,7 +677,7 @@ def _can_use_sparse_uno_tree_target_sampling(
         _is_cuda
         and max_top_k <= _SPARSE_TOP_K_LIMIT
         and sampling_info.sampling_seed is None
-        and not sampling_info.need_min_p_sampling
+        and not sampling_info.facts.need_min_p
         and not get_spec().speculative_use_rejection_sampling
     )
 
@@ -690,13 +690,13 @@ def _apply_joint_top_k_top_p(
     top_p_renorm_prob,
 ) -> torch.Tensor:
     """Apply top-p to the original distribution before top-k renormalization."""
-    if sampling_info.need_top_p_sampling:
+    if sampling_info.facts.need_top_p:
         probs = top_p_renorm_prob(
             probs,
             torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
         )
         maybe_detect_nan(probs, "verify: target_probs after top_p_renorm")
-    if sampling_info.need_top_k_sampling:
+    if sampling_info.facts.need_top_k:
         probs = top_k_renorm_prob(
             probs,
             torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
@@ -898,7 +898,7 @@ def _tree_accept(
     predict_shape = list(next_token_logits.shape)[:-1]
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     greedy = _verify_uses_greedy(
-        is_all_greedy=sampling_info.is_all_greedy,
+        is_all_greedy=sampling_info.facts.all_greedy,
         is_cpu=_is_cpu,
         is_hip=_is_hip,
         is_xpu=_is_xpu,
@@ -1099,7 +1099,7 @@ def _tree_accept(
             top_k_renorm_prob,
             top_p_renorm_prob,
         )
-        if sampling_info.need_min_p_sampling:
+        if sampling_info.facts.need_min_p:
             target_probs = min_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(

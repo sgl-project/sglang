@@ -13,6 +13,7 @@ from sglang.srt.layers.sampler import Sampler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -229,8 +230,7 @@ class TestAscendSamplingMaskCapture(unittest.TestCase):
             top_ks=torch.tensor([2], dtype=torch.int32),
             top_ps=torch.ones(1),
             min_ps=torch.zeros(1),
-            need_min_p_sampling=False,
-            npu_top_k_top_p_eligible=False,
+            facts=SamplingFacts(),
             sampling_mask_batch_indices=None,
         )
         with patch.object(

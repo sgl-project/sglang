@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.speculative.dspark import blockwise_rejection as bwr
-from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components import dspark_verify
 from sglang.test.ci.ci_register import (
@@ -29,11 +29,7 @@ needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUD
 def _info(temps, **overrides):
     fields = dict(
         temperatures=temps,
-        is_all_greedy=False,
-        is_any_greedy=False,
-        need_top_k_sampling=False,
-        need_top_p_sampling=False,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(),
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)
@@ -221,7 +217,7 @@ def test_routes_to_blockwise_only_with_noise(monkeypatch):
             sampling_info=info,
             route=VerifyRoute(
                 adjusts_logits=False,
-                need_truncated_sampling=need_truncated_sampling(info),
+                need_truncated_sampling=info.facts.truncates,
             ),
             draft_input=None,
             gamma=2,
@@ -234,15 +230,21 @@ def test_routes_to_blockwise_only_with_noise(monkeypatch):
     assert accept(_info(temps)) == "classic"
     assert accept(_info(temps), rejection_noise=noise) == "blockwise"
     assert (
-        accept(_info(temps, need_top_p_sampling=True), rejection_noise=noise)
+        accept(
+            _info(temps, facts=SamplingFacts(need_top_p=True)), rejection_noise=noise
+        )
         == "classic"
     )
     assert (
-        accept(_info(temps, need_top_k_sampling=True), rejection_noise=noise)
+        accept(
+            _info(temps, facts=SamplingFacts(need_top_k=True)), rejection_noise=noise
+        )
         == "classic"
     )
     assert (
-        accept(_info(temps, need_min_p_sampling=True), rejection_noise=noise)
+        accept(
+            _info(temps, facts=SamplingFacts(need_min_p=True)), rejection_noise=noise
+        )
         == "classic"
     )
     assert (

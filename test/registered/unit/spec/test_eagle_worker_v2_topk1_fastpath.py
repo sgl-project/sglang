@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
@@ -322,7 +323,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.index_share_for_mtp_iteration = True
                 forward_batch = SimpleNamespace(
                     forward_mode=ForwardMode.DECODE,
-                    sampling_info=SimpleNamespace(is_all_greedy=False),
+                    sampling_info=SimpleNamespace(
+                        facts=SamplingFacts(all_greedy=False)
+                    ),
                 )
                 worker.draft_forward = MagicMock(return_value=graph_result)
                 attn_backend = SimpleNamespace(verify_mask=None)

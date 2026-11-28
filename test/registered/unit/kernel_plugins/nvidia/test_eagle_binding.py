@@ -14,7 +14,7 @@ import msgspec
 import torch
 
 from sglang.kernels.plugin_kernels.nvidia import spec
-from sglang.kernels.plugin_kernels.nvidia.spec import Step
+from sglang.kernels.plugin_kernels.nvidia.spec import Step, VerifySamplingView
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding as runtime
 from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
@@ -939,13 +939,25 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             torch.tensor([0]),
         )
         # The route is derived from the view: logit_bias adjusts, top-p truncates.
-        sampling = SimpleNamespace(
+        sampling = VerifySamplingView(
+            sequence_lengths=torch.tensor([3]),
+            temperatures=torch.ones(1, 1),
+            top_ks=torch.ones(1, dtype=torch.int32),
+            top_ps=torch.full((1,), 0.9),
+            min_ps=torch.zeros(1),
             step_penalties=None,
             logit_bias=torch.zeros(1, 4),
-            has_custom_logit_processor=False,
+            sampling_seed=None,
+            is_all_greedy=False,
             need_top_k_sampling=False,
             need_top_p_sampling=True,
             need_min_p_sampling=False,
+            watermark_keys=None,
+            watermark_context_windows=None,
+            watermark_enabled=None,
+            has_watermark_candidates=False,
+            max_top_k=None,
+            device=torch.device("cpu"),
         )
         io = SimpleNamespace(
             device=torch.device("cpu"),

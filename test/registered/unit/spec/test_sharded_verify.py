@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils, sharded_verify
 from sglang.srt.speculative.sharded_verify import (
@@ -50,12 +51,8 @@ def _sampling_info(*, greedy: bool):
         logit_bias=None,
         has_custom_logit_processor=False,
         sampling_seed=None,
-        is_all_greedy=greedy,
-        need_top_k_sampling=False,
-        need_top_p_sampling=False,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(all_greedy=greedy),
         watermark=None,
-        max_top_k=None,
     )
 
 
@@ -241,10 +238,8 @@ class TestGatherFullLogits(CustomTestCase):
                 self.assertTrue(torch.equal(got, full.float()))
 
 
-_TEMPERATURE_ONLY = dict(is_all_greedy=False)
-_AGENTX_SAMPLING = dict(
-    is_all_greedy=False, need_top_k_sampling=True, need_top_p_sampling=True
-)
+_TEMPERATURE_ONLY = dict(facts=SamplingFacts())
+_AGENTX_SAMPLING = dict(facts=SamplingFacts(need_top_k=True, need_top_p=True))
 
 
 if __name__ == "__main__":

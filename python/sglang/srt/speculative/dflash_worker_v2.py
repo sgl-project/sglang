@@ -68,7 +68,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.sampling.verify_accept import VerifyAccept
@@ -296,7 +296,7 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
 
 
 def _is_all_greedy(sampling_info) -> bool:
-    return sampling_info is None or sampling_info.is_all_greedy
+    return sampling_info is None or sampling_info.facts.all_greedy
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
@@ -912,7 +912,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # A sampling mask is captured from the full target distribution.
         if sampling_info.sampling_mask_batch_indices is not None:
             return False
-        if sampling_info.is_all_greedy:
+        if sampling_info.facts.all_greedy:
             return self._selector_sample is None
         if not self._sharded_greedy_logits:
             return False
@@ -1147,13 +1147,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             top_ps=torch.full((bs,), 0.95, dtype=torch.float32, device=device),
             top_ks=torch.zeros(bs, dtype=torch.int32, device=device),
             min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
-            is_all_greedy=False,
-            is_any_greedy=False,
-            need_top_p_sampling=True,
             # Top-k off: the sparse path is cheaper, so the dense full-vocab
             # renormalization is the peak this rehearsal has to reproduce.
-            need_top_k_sampling=False,
-            need_min_p_sampling=False,
+            facts=SamplingFacts(need_top_k=False, need_top_p=True),
             vocab_size=vocab_size,
         )
         candidates = torch.zeros((bs, block_size), dtype=torch.int64, device=device)
@@ -2937,7 +2933,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
-        if sampling_info is None or sampling_info.is_all_greedy:
+        if sampling_info is None or sampling_info.facts.all_greedy:
             return
 
         if self.selector is not None:

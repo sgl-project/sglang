@@ -9,6 +9,7 @@ import msgspec
 import pytest
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components import dspark_sampling_accept_graph as sag
 from sglang.srt.speculative.dspark_components import (
@@ -39,11 +40,7 @@ def _tp_sync():
 
 def _sampling_info(**overrides):
     fields = dict(
-        is_any_greedy=False,
-        is_all_greedy=False,
-        need_top_k_sampling=False,
-        need_top_p_sampling=False,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(),
         has_custom_logit_processor=False,
         step_penalties=None,
         logit_bias=None,
@@ -78,10 +75,10 @@ def test_routes_only_all_sampled_static_steps():
     assert _eligible(worker, _sampling_info())
     # Greedy and mixed batches keep the greedy fold / the eager mixed accept.
     assert not _eligible(worker, None)
-    assert not _eligible(worker, _sampling_info(is_any_greedy=True))
-    assert not _eligible(worker, _sampling_info(need_top_k_sampling=True))
-    assert not _eligible(worker, _sampling_info(need_top_p_sampling=True))
-    assert not _eligible(worker, _sampling_info(need_min_p_sampling=True))
+    assert not _eligible(worker, _sampling_info(facts=SamplingFacts(any_greedy=True)))
+    assert not _eligible(worker, _sampling_info(facts=SamplingFacts(need_top_k=True)))
+    assert not _eligible(worker, _sampling_info(facts=SamplingFacts(need_top_p=True)))
+    assert not _eligible(worker, _sampling_info(facts=SamplingFacts(need_min_p=True)))
     assert not _eligible(worker, _sampling_info(watermark=object()))
     assert not _eligible(worker, _sampling_info(logit_bias=torch.zeros(1)))
     assert not _eligible(worker, _sampling_info(), folded=False)

@@ -25,6 +25,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGr
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -39,7 +40,7 @@ ROWS = 8
 def _decode_batch():
     """An all-greedy overlap decode batch the graph can feed itself."""
     sampling = Mock()
-    sampling.is_all_greedy = True
+    sampling.facts = SamplingFacts(all_greedy=True)
     sampling.logit_bias = None
     sampling.grammars = None
     sampling.has_custom_logit_processor = False
@@ -97,9 +98,9 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
         sampling = batch.sampling_info
         self.assertTrue(graph_io.can_defer(batch))
 
-        sampling.is_all_greedy = False
+        sampling.facts = SamplingFacts(all_greedy=False)
         self.assertFalse(graph_io.can_defer(batch))
-        sampling.is_all_greedy = True
+        sampling.facts = SamplingFacts(all_greedy=True)
         sampling.logit_bias = torch.ones(1)
         self.assertFalse(graph_io.can_defer(batch))
         sampling.logit_bias = None
@@ -125,13 +126,13 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
         self.assertEqual(graph_io.relay[indices].tolist(), [41, 43])
 
         result.can_run_cuda_graph = True
-        batch.sampling_info.is_all_greedy = False
+        batch.sampling_info.facts = SamplingFacts(all_greedy=False)
         result.next_token_ids = torch.tensor([47, 53])
         graph_io.relay_result(batch, result, indices)
         self.assertEqual(graph_io.relay[indices].tolist(), [47, 53])
 
         # watermarking samples after graph argmax; relay the actual sampled ids
-        batch.sampling_info.is_all_greedy = True
+        batch.sampling_info.facts = SamplingFacts(all_greedy=True)
         batch.sampling_info.watermark = object()
         result.next_token_ids = torch.tensor([59, 61])
         graph_io.relay_result(batch, result, indices)

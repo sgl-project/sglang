@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.sampling.watermarking.config import (
     normalize_watermark_request,
@@ -71,7 +72,7 @@ def test_repeated_context_and_greedy_bypass():
         top_ks=torch.tensor([64, 1], device=device, dtype=torch.int32),
         top_ps=torch.ones(2, device=device),
         min_ps=torch.zeros(2, device=device),
-        max_top_k=64,
+        facts=SamplingFacts(max_top_k=64),
         watermark=_server_rows(2, 2),
     )
 
@@ -119,7 +120,7 @@ def test_low_entropy_bypass_does_not_consume_context():
         top_ks=torch.tensor([2], device="cuda", dtype=torch.int32),
         top_ps=torch.ones(1, device="cuda"),
         min_ps=torch.zeros(1, device="cuda"),
-        max_top_k=2,
+        facts=SamplingFacts(max_top_k=2),
     )
 
     low_entropy_logits = torch.full((1, 64), -torch.inf, device="cuda")
@@ -185,7 +186,7 @@ def test_retracted_request_restores_context_history():
         top_ks=torch.tensor([64], device=device, dtype=torch.int32),
         top_ps=torch.ones(1, device=device),
         min_ps=torch.zeros(1, device=device),
-        max_top_k=64,
+        facts=SamplingFacts(max_top_k=64),
     )
     logits = torch.zeros((1, 64), device=device)
     _force(state, logits, req_pool_indices, sampling_info, _server_rows(1, 2))
@@ -263,7 +264,7 @@ def test_speculative_tree_paths_match_tensor_reference():
         top_ks=torch.tensor([20, 31], dtype=torch.int32, device="cuda"),
         top_ps=torch.tensor([0.95, 0.8], device="cuda"),
         min_ps=torch.tensor([0.0, 0.05], device="cuda"),
-        max_top_k=31,
+        facts=SamplingFacts(max_top_k=31),
     )
     keys = torch.tensor(
         [0x0123456789ABCDEF, 0x1111222233334444],
@@ -376,10 +377,7 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
         top_ks=torch.tensor([vocab_size], dtype=torch.int32, device="cuda"),
         top_ps=torch.ones(1, device="cuda"),
         min_ps=torch.zeros(1, device="cuda"),
-        max_top_k=vocab_size,
-        need_top_k_sampling=False,
-        need_top_p_sampling=False,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(max_top_k=vocab_size),
     )
     states = [
         WatermarkState(
@@ -474,7 +472,7 @@ def test_chain_commit_matches_explicit_accept_index():
         top_ks=torch.tensor([64, 64], dtype=torch.int32, device="cuda"),
         top_ps=torch.ones(2, device="cuda"),
         min_ps=torch.zeros(2, device="cuda"),
-        max_top_k=64,
+        facts=SamplingFacts(max_top_k=64),
     )
     draft_tokens = torch.tensor(
         [[30, 31, 32, 33], [40, 41, 42, 43]], dtype=torch.int64, device="cuda"

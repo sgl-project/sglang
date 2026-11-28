@@ -39,6 +39,7 @@ import torch
 
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionNoise
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
@@ -58,11 +59,7 @@ class GraphSamplingInfo(msgspec.Struct, frozen=True):
     batch without top-k / top-p / min-p."""
 
     temperatures: torch.Tensor
-    is_all_greedy: bool = False
-    is_any_greedy: bool = False
-    need_top_k_sampling: bool = False
-    need_top_p_sampling: bool = False
-    need_min_p_sampling: bool = False
+    facts: SamplingFacts = SamplingFacts()
 
 
 def sampling_accept_commit_lens(

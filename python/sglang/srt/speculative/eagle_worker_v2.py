@@ -820,7 +820,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.draft_forward(
                         forward_batch,
-                        greedy=forward_batch.sampling_info.is_all_greedy,
+                        greedy=forward_batch.sampling_info.facts.all_greedy,
                     )
                 )
 

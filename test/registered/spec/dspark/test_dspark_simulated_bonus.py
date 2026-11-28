@@ -3,6 +3,7 @@ import unittest
 
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     sample_simulated_bonus,
 )
@@ -15,9 +16,7 @@ register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
 def _info(temps):
     return types.SimpleNamespace(
         temperatures=torch.tensor(temps, device="cuda"),
-        need_top_k_sampling=False,
-        need_top_p_sampling=False,
-        need_min_p_sampling=False,
+        facts=SamplingFacts(),
     )
 
 

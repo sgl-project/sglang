@@ -19,6 +19,7 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     make_post_verify_io,
@@ -139,7 +140,7 @@ class EaglePostVerifyGraphs:
             or route.adjusts_logits
             # the replayed sampling view carries no seeds and no min-p
             or info.sampling_seed is not None
-            or info.need_min_p_sampling
+            or info.facts.need_min_p
             # compute_spec_logprobs reads the gathered logits off logits_output
             or (
                 batch.return_logprob
@@ -149,9 +150,9 @@ class EaglePostVerifyGraphs:
             return None
         return (
             len(batch.seq_lens),
-            bool(info.is_all_greedy),
-            bool(info.need_top_k_sampling),
-            bool(info.need_top_p_sampling),
+            bool(info.facts.all_greedy),
+            bool(info.facts.need_top_k),
+            bool(info.facts.need_top_p),
             max_top_k,
             SIMULATE_ACC_LEN > 0,
             batch.mamba_track_indices is not None,
@@ -178,9 +179,14 @@ class EaglePostVerifyGraphs:
             num_requests=len(batch.seq_lens),
             tokens_per_request=verify_input.draft_token_num,
             max_tree_depth=verify_input.max_tree_depth,
-            is_all_greedy=bool(info.is_all_greedy),
-            need_top_k=bool(info.need_top_k_sampling),
-            need_top_p=bool(info.need_top_p_sampling),
+            # Only the facts the key holds: a replay never reads the capture
+            # round's any_greedy, npu eligibility, or max_top_k (the slot's own
+            # max_top_k below is the compact target support's bound).
+            facts=SamplingFacts(
+                all_greedy=info.facts.all_greedy,
+                need_top_k=info.facts.need_top_k,
+                need_top_p=info.facts.need_top_p,
+            ),
             max_top_k=max_top_k,
             unused_sampling_tensor=torch.empty(0, device=batch.device),
             return_logprob=bool(batch.return_logprob),
@@ -264,21 +270,17 @@ def _sample(slot: SimpleNamespace, speculative_runtime_hooks: Any) -> tuple:
     # watermark and seeded rounds, and greedy keys read no sampling tensor, so the
     # remaining fields are empty or None: a reader fails rather than seeing the
     # capture round's values.
-    assert slot.is_all_greedy or "temperatures" in staged
+    assert slot.facts.all_greedy or "temperatures" in staged
     sampling_info = SimpleNamespace(
         step_penalties=None,
         logit_bias=None,
         sampling_seed=None,
         watermark=None,
-        is_all_greedy=slot.is_all_greedy,
-        need_top_k_sampling=slot.need_top_k,
-        need_top_p_sampling=slot.need_top_p,
-        need_min_p_sampling=False,
+        facts=slot.facts,
         temperatures=staged.get("temperatures", unused),
         top_ks=staged.get("top_ks", unused),
         top_ps=staged.get("top_ps", unused),
         min_ps=unused,
-        max_top_k=None,
     )
     verify_view = SimpleNamespace(
         draft_token=staged["draft_tokens"],
@@ -499,7 +501,7 @@ def _post_verify_inputs(
         "seq_lens": batch.seq_lens,
         "req_pool_indices": batch.req_pool_indices,
     }
-    if not info.is_all_greedy:
+    if not info.facts.all_greedy:
         inputs.update(
             temperatures=info.temperatures, top_ks=info.top_ks, top_ps=info.top_ps
         )

@@ -21,6 +21,7 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
+    from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 
 # bumped on any breaking change to the contracts in this module
 MEGAKERNEL_API_VERSION = 3
@@ -272,11 +273,25 @@ class VerifySamplingView(msgspec.Struct, frozen=True):
     max_top_k: Optional[int]
     device: torch.device
 
-    # A compatibility name read by the stock verifier, a property so the view's
-    # fields stay exact: the view carries no custom logit processors.
+    # Compatibility names read by the stock verifier, properties so the view's
+    # fields stay exact: the view carries no custom logit processors, and its
+    # flags are the batch's sampling facts.
     @property
     def has_custom_logit_processor(self) -> bool:
         return False
+
+    @property
+    def facts(self) -> SamplingFacts:
+        # lazy: the provider ABI does not import the runtime at module load.
+        from sglang.srt.sampling.sampling_batch_info import SamplingFacts
+
+        return SamplingFacts(
+            all_greedy=self.is_all_greedy,
+            need_top_k=self.need_top_k_sampling,
+            need_top_p=self.need_top_p_sampling,
+            need_min_p=self.need_min_p_sampling,
+            max_top_k=self.max_top_k,
+        )
 
 
 class WatermarkStateView(Protocol):

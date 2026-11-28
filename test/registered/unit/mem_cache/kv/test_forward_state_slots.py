@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.qwen4_exp import _commit_ple_batch, _prepare_ple_batch
 from sglang.srt.runtime_context import reset_context
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative import eagle_post_verify_graphs, spec_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -460,7 +461,7 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
                 simulated_acc_len_rng=torch.Generator(),
             )
             batch = self._verify_batch(f)
-            batch.sampling_info = SimpleNamespace(is_all_greedy=True)
+            batch.sampling_info = SimpleNamespace(facts=SamplingFacts(all_greedy=True))
             verify_input = SimpleNamespace(
                 draft_token=torch.zeros(4, dtype=torch.int64),
                 retrieve_index=torch.zeros((2, 2), dtype=torch.int64),
