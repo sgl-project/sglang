@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW8A8Int8DynamicMoE,
     XPUCompressedTensorsW8A8Int8,
     XPUCompressedTensorsWNA16,
+    XPUCompressedTensorsWNA16MoE,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -754,6 +755,17 @@ class CompressedTensorsConfig(QuantizationConfig):
             and not weight_quant.actorder
         )
 
+    def _is_xpu_native_wna16_moe_supported(self, weight_quant: BaseModel) -> bool:
+        # Zero-points and actorder are not wired into XPUCompressedTensorsWNA16MoE yet.
+        return (
+            weight_quant.num_bits == 4
+            and weight_quant.type == QuantizationType.INT
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size in (32, 64, 128, 256)
+            and weight_quant.symmetric
+            and not weight_quant.actorder
+        )
+
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
         is_symmetric = weight_quant.symmetric
@@ -1054,6 +1066,32 @@ class CompressedTensorsConfig(QuantizationConfig):
                             "group quantization; this checkpoint has zero points."
                         )
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
+                    return CompressedTensorsWNA16TritonMoE(
+                        self, weight_quant=weight_quant
+                    )
+                elif _is_xpu:
+                    if (
+                        not get_moe_runner_backend().is_triton()
+                        and XPUCompressedTensorsWNA16MoE.is_device_supported()
+                    ):
+                        if not self._is_xpu_native_wna16_moe_supported(weight_quant):
+                            raise ValueError(
+                                "WNA16 MoE on XPU supports only symmetric INT4 group "
+                                "quantization with group_size=32, 64, 128 or 256 and "
+                                "no actorder."
+                            )
+                        logger.info_once("Using XPUCompressedTensorsWNA16MoE")
+                        return XPUCompressedTensorsWNA16MoE(
+                            self, weight_quant=weight_quant
+                        )
+                    if not self._is_wna16_triton_moe_supported(weight_quant):
+                        raise ValueError(
+                            "WNA16 MoE on XPU uses the Triton scheme with "
+                            "moe_runner_backend=triton or off Xe2, which supports "
+                            "only symmetric INT4 group quantization with "
+                            "group_size=32 or 128 and no actorder."
+                        )
+                    logger.info_once("Using CompressedTensorsWNA16TritonMoE (XPU)")
                     return CompressedTensorsWNA16TritonMoE(
                         self, weight_quant=weight_quant
                     )
