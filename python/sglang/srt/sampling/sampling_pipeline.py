@@ -326,9 +326,8 @@ class VerifyStep(msgspec.Struct):
         """Build the stages' per-row inputs from `tree`, the verify tree's host
         copy, which the worker builds when `needs_verify_tree`: the grammar mask,
         the custom logit processors' row prefixes, and `first_row_only_reqs`.
-        Each verify worker calls it once after the target verify launches, so
-        the host work overlaps the forward. `logits_output` gives the grammar
-        mask its device."""
+        Call it after the target verify launches, so the host work overlaps the
+        forward."""
         if tree is None:
             return
         # Lazy: spec_utils imports the scheduler stack.
