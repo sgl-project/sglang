@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 from typing import cast
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptNvFp4FusedMoEMethod,
     _compute_gemm1_alphas,
@@ -79,6 +81,96 @@ def _align_fp4_moe_weights_for_flashinfer_trtllm(layer) -> None:
         g1_alphas = cast(torch.Tensor, layer.g1_alphas)
         g1_scale_c = (w2_input_scale_quant * g1_alphas).to(torch.float32)
     copy_or_rebind_param(layer, "g1_scale_c", g1_scale_c.contiguous())
+
+
+@functools.cache
+def _localized_moe_streams(device_index: int):
+    """One green-context stream per locality domain and its SM count, or None.
+
+    Only SM107 with two locality domains.
+    """
+    from flashinfer.green_ctx import (
+        get_locality_domain_count,
+        split_device_green_ctx_by_locality_domain,
+    )
+
+    device = torch.device("cuda", device_index)
+    if torch.cuda.get_device_capability(device) != (10, 7):
+        return None
+    if get_locality_domain_count(device) != 2:
+        return None
+    streams, resources = split_device_green_ctx_by_locality_domain(device)
+    return streams, min(int(r.sm.smCount) for r in resources)
+
+
+# TODO: map the block scales like the weights (no copy).
+def _copy_scale_halves(scale, parts) -> None:
+    halves = scale.data.view(torch.uint8).view(scale.shape[0], 2, -1)
+    for d in range(2):
+        parts[d].view(torch.uint8).view(scale.shape[0], -1).copy_(halves[:, d])
+
+
+def _localize_fp4_moe_weights(layer, max_tokens: int) -> None:
+    """Give each locality domain half the N rows of every expert, in its own memory.
+
+    Calls of up to ``max_tokens`` tokens then run localized.
+
+    Row half ``d`` of a shuffled expert is FlashInfer's localized shard ``d``. The
+    weights get one copy that FlashInfer maps twice: as per-domain shards and as the
+    full tensor every other path (prefill, MegaMoE) reads. Block scales are copied:
+    their halves are below the mapping granularity.
+
+    A weight reload keeps every address, so captured CUDA graphs stay valid: the
+    weights are rewritten in place in the mapped memory, and only the scale copies
+    are refreshed here.
+    """
+    from flashinfer.green_ctx import (
+        empty_per_locality_domain,
+        empty_split_by_locality_domain,
+    )
+
+    scales = (layer.gate_up_proj_weight_scale, layer.down_proj_weight_scale)
+    shards = getattr(layer, "localized_moe_weights", None)
+    if shards is not None:  # Reload.
+        for scale, key in zip(scales, ("gemm1_weights_scale", "gemm2_weights_scale")):
+            _copy_scale_halves(scale, [shard[key] for shard in shards])
+        return
+
+    device = layer.gate_up_proj.device
+    w13, w2 = layer.gate_up_proj, layer.down_proj
+    try:
+        (w13_parts, w13_full), (w2_parts, w2_full) = (
+            empty_split_by_locality_domain(w.shape, dim=1, dtype=w.dtype, dev=device)
+            for w in (w13, w2)
+        )
+    except ValueError:  # A row half is not a whole number of mapping units.
+        return
+    for param, full in ((w13, w13_full), (w2, w2_full)):
+        full.copy_(param.data)
+        param.data = full
+
+    sf13_parts, sf2_parts = (
+        empty_per_locality_domain(
+            (s.shape[0], s.shape[1] // 2, s.shape[2]), s.dtype, device
+        )
+        for s in scales
+    )
+    for scale, parts in zip(scales, (sf13_parts, sf2_parts)):
+        _copy_scale_halves(scale, parts)
+    layer.localized_moe_weights = [
+        dict(
+            gemm1_weights=w13_parts[d],
+            gemm1_weights_scale=sf13_parts[d],
+            gemm2_weights=w2_parts[d],
+            gemm2_weights_scale=sf2_parts[d],
+        )
+        for d in range(2)
+    ]
+    layer.localized_moe_max_tokens = max_tokens
+    layer.localized_moe_streams, layer.localized_moe_sm_count = _localized_moe_streams(
+        device.index
+    )
+    torch.cuda.empty_cache()
 
 
 class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
@@ -180,6 +272,14 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             # Capture scale metadata while gate/up order is still canonical.
             build_nvfp4_megamoe_weights(layer)
         _align_fp4_moe_weights_for_flashinfer_trtllm(layer)
+        if (
+            envs.SGLANG_OPT_MUSE_SPARK_LOCALIZED_MOE.get()
+            and not self.quant_config.use_per_token_activation
+            and _localized_moe_streams(layer.gate_up_proj.device.index) is not None
+        ):
+            _localize_fp4_moe_weights(
+                layer, envs.SGLANG_OPT_MUSE_SPARK_LOCALIZED_MOE_MAX_TOKENS.get()
+            )
         if getattr(layer, "use_megamoe", False):
             from sglang.srt.layers.muse_spark.muse_spark_megamoe import (
                 bind_megamoe_shared_weights,

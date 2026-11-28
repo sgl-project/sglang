@@ -53,6 +53,9 @@ _NVFP4_PER_TOKEN_SCALE_INV = 1.0 / (448.0 * 6.0)
 
 _MARLIN_SHAPE_ALIGNMENT = 64
 _MARLIN_BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
+# Below this many tokens the localized MoE's domain fork/join cancels the local
+# weight reads.
+_LOCALIZED_MOE_MIN_TOKENS = 16
 
 
 def _resolve_moe_runner_backend():
@@ -637,6 +640,19 @@ class MuseSpark1xFp4Experts(nn.Module):
         )
         return hs_fp4, hs_scale, per_token_scale
 
+    def _localized_moe_kwargs(self, num_tokens: int) -> dict:
+        """FlashInfer's localized-MoE arguments when this call runs localized."""
+        shards = getattr(self, "localized_moe_weights", None)
+        if shards is None or not (
+            _LOCALIZED_MOE_MIN_TOKENS <= num_tokens <= self.localized_moe_max_tokens
+        ):
+            return {}
+        return dict(
+            localized_weights=shards,
+            localized_streams=self.localized_moe_streams,
+            localized_sm_count=self.localized_moe_sm_count,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -713,6 +729,7 @@ class MuseSpark1xFp4Experts(nn.Module):
                 routing_method_type=1,  # unused on this path, must be 1
                 do_finalize=False,  # we need the per-expert outputs
                 activation_type=3,  # SwiGLU
+                **self._localized_moe_kwargs(num_tokens),
             )[:3]
         )
 
