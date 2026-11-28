@@ -81,6 +81,7 @@ __device__ __forceinline__ float to_f(bf16 v) {
 
 struct Params {
   void const* x;
+  int64_t x_rows;
   int64_t sx;
   void const* weight;
   int64_t sw0, sw1;
@@ -110,8 +111,13 @@ struct Gather {
   Vec<TX> rows[TOP_K];
   __device__ __forceinline__ void load(Params const& p, int r, int col) {
 #pragma unroll
-    for (int k = 0; k < TOP_K; ++k)
-      rows[k].load(static_cast<TX const*>(p.x) + int64_t(p.src2dst[r * TOP_K + k]) * p.sx + col);
+    for (int k = 0; k < TOP_K; ++k) {
+      int32_t const dst = p.src2dst[int64_t(r) * TOP_K + k];
+      if (dst >= 0 && int64_t(dst) < p.x_rows)
+        rows[k].load(static_cast<TX const*>(p.x) + int64_t(dst) * p.sx + col);
+      else
+        rows[k].zero();
+    }
   }
   // bf16(sum of the rows in top-k order), as post_reorder rounds it (FP32 rows:
   // the Triton kernel's ROUND_BF16).
@@ -344,6 +350,7 @@ void run(
   host::RuntimeCheck(d % kVec == 0 && sx % kVec == 0, "sconv rows must be 8-element aligned");
   Params p{
       x.data_ptr(),
+      x.size(0),
       sx,
       reinterpret_cast<void const*>(weight),
       sw0,

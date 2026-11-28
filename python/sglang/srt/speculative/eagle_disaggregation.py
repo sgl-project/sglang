@@ -87,7 +87,7 @@ def build_eagle_disagg_draft_input(
         no_seed = torch.all(dsa_topk_indices_cpu < 0, dim=1)
         remap = should_remap_pd_dsa_seed_to_local_slots()
         if remap:
-            req_to_token_row_width = batch.req_to_token_pool.req_to_token.shape[1]
+            req_to_token_row_width = batch.req_to_token_pool.row_width
             no_seed |= torch.any(
                 (dsa_topk_indices_cpu < -1)
                 | (dsa_topk_indices_cpu >= batch.seq_lens_cpu[:, None])
@@ -100,7 +100,6 @@ def build_eagle_disagg_draft_input(
             # PD sends request-relative positions; fused TopK consumes
             # decode-local physical slots. Remap once before the draft loop/graph.
             req_to_token = batch.req_to_token_pool.req_to_token
-            req_to_token_row_width = req_to_token.shape[1]
             valid_positions = dsa_topk_indices >= 0
             gather_positions = dsa_topk_indices.clamp(
                 min=0, max=req_to_token_row_width - 1
