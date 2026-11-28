@@ -133,6 +133,7 @@ def _kernels_take_flashinfer_tactics(
         "flashinfer_mxfp4",
         "flashinfer_cutedsl",
         "flashinfer_cutlass",
+        "flashinfer_cutlass_sm120_swiglu",
         "flashinfer_megamoe",
     ]
 

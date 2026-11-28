@@ -276,16 +276,50 @@ def _prepare_input(
     return x, x_sf, output_dtype, output_col
 
 
-def _sm120_mtp_mma_supported() -> bool:
+def _flashinfer_default_fp4_quant() -> bool:
     import os
 
+    return (
+        not envs.FLASHINFER_NVFP4_4OVER6.get()
+        and os.environ.get("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
+        and os.environ.get("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
+    )
+
+
+def _use_sm120_nvfp4_swiglu(
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    x_sf: Optional[torch.Tensor],
+    enable_alltoall: bool,
+) -> bool:
+    """Whether the fused SM120 NVFP4 SwiGLU MoE kernel can serve this call."""
+    return (
+        quant_info.quant_type == "fp4"
+        and runner_config.is_gated
+        and runner_config.activation == "silu"
+        and quant_info.swiglu_alpha is None
+        and quant_info.swiglu_beta is None
+        and quant_info.swiglu_limit is None
+        and quant_info.pair_w2_weight is None
+        and runner_config.moe_ep_size == runner_config.moe_tp_size == 1
+        and x_sf is None
+        and not enable_alltoall
+        # The fused kernel reproduces FlashInfer's default FP4 quantizer and the
+        # unfused CUTLASS finalize bit for bit.
+        and not envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
+        and _flashinfer_default_fp4_quant()
+        and is_sm120()
+        # Keep FlashInfer's tactic discovery identical to the CUTLASS-only path.
+        and not _flashinfer_autotune_active()
+    )
+
+
+def _sm120_mtp_mma_supported() -> bool:
     # Matches only FlashInfer's default FP4 quantizer with the fused FC2 epilogue.
     return (
         is_sm120()
         and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
-        and not envs.FLASHINFER_NVFP4_4OVER6.get()
-        and os.environ.get("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
-        and os.environ.get("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0") == "0"
+        and _flashinfer_default_fp4_quant()
     )
 
 
@@ -302,6 +336,7 @@ def _run_flashinfer_cutlass(
     runner_config: MoeRunnerConfig,
     output: Optional[torch.Tensor] = None,
     enable_alltoall: bool = False,
+    sm120_swiglu: bool = False,
 ) -> torch.Tensor:
     flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
@@ -336,6 +371,23 @@ def _run_flashinfer_cutlass(
             pair_w2_weight=quant_info.pair_w2_weight,
             # Preserve FlashInfer target/draft tactic discovery during autotuning.
             use_mtp=_sm120_mtp_mma_supported() and not _flashinfer_autotune_active(),
+        )
+        if result is not None:
+            return _maybe_apply_routed_scaling_factor(result, quant_info, runner_config)
+    if sm120_swiglu and _use_sm120_nvfp4_swiglu(
+        quant_info, runner_config, x_sf, enable_alltoall
+    ):
+        from sglang.kernels.ops.gemm.sm120_nvfp4_moe import try_nvfp4_moe_swiglu
+
+        result = try_nvfp4_moe_swiglu(
+            x,
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            quant_info.quant_scales,
+            topk_ids,
+            topk_weights,
+            output_dtype=output_dtype,
+            out=output,
         )
         if result is not None:
             return _maybe_apply_routed_scaling_factor(result, quant_info, runner_config)
@@ -402,6 +454,7 @@ def fused_experts_none_to_flashinfer_cutlass(
     dispatch_output: StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
+    sm120_swiglu: bool = False,
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
@@ -413,8 +466,21 @@ def fused_experts_none_to_flashinfer_cutlass(
         dispatch_output=dispatch_output,
         quant_info=quant_info,
         runner_config=runner_config,
+        sm120_swiglu=sm120_swiglu,
     )
     return StandardCombineInput(hidden_states=output)
+
+
+@register_fused_func("none", "flashinfer_cutlass_sm120_swiglu")
+def fused_experts_none_to_flashinfer_cutlass_sm120_swiglu(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    """flashinfer_cutlass, with the fused SM120 NVFP4 SwiGLU kernel where it applies."""
+    return fused_experts_none_to_flashinfer_cutlass(
+        dispatch_output, quant_info, runner_config, sm120_swiglu=True
+    )
 
 
 @register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_cutlass")

@@ -219,7 +219,15 @@ class _MoeRunnerBackendPredicates:
         return self.value == MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED.value
 
     def is_flashinfer_cutlass(self):
-        return self.value == MoeRunnerBackend.FLASHINFER_CUTLASS.value
+        # flashinfer_cutlass_sm120_swiglu keeps the CUTLASS weight layout and falls
+        # back to CUTLASS, so it inherits every flashinfer_cutlass site.
+        return self.value in (
+            MoeRunnerBackend.FLASHINFER_CUTLASS.value,
+            MoeRunnerBackend.FLASHINFER_CUTLASS_SM120_SWIGLU.value,
+        )
+
+    def is_flashinfer_cutlass_sm120_swiglu(self):
+        return self.value == MoeRunnerBackend.FLASHINFER_CUTLASS_SM120_SWIGLU.value
 
     def is_flashinfer_cutedsl(self):
         return self.value == MoeRunnerBackend.FLASHINFER_CUTEDSL.value
@@ -277,6 +285,7 @@ class MoeRunnerBackend(_MoeRunnerBackendPredicates, Enum):
     EXPERIMENTAL_SGL_TRTLLM = "experimental_sgl_trtllm"
     FLASHINFER_TRTLLM_ROUTED = "flashinfer_trtllm_routed"
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
+    FLASHINFER_CUTLASS_SM120_SWIGLU = "flashinfer_cutlass_sm120_swiglu"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_MEGAMOE = "flashinfer_megamoe"
