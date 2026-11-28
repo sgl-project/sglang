@@ -39,5 +39,27 @@ def test_hunyuan_reasoning_effort_normalization(effort, normalized):
     assert request.reasoning_effort == normalized
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "effort", "expected"),
+    [
+        ({"enable_thinking": False}, None, "no_think"),
+        ({"enable_thinking": True}, None, "high"),
+        ({"enable_thinking": False}, "high", "high"),
+        ({"enable_thinking": False, "reasoning_effort": "high"}, None, "high"),
+    ],
+)
+def test_hunyuan_enable_thinking_alias(kwargs, effort, expected):
+    request = ChatCompletionRequest(
+        model="x",
+        messages=[{"role": "user", "content": "hi"}],
+        chat_template_kwargs=kwargs,
+        reasoning_effort=effort,
+    )
+    normalize_hunyuan_reasoning_effort(
+        request, "hunyuan", ReasoningToggleConfig(special_case="hunyuan_effort")
+    )
+    assert request.reasoning_effort == expected
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

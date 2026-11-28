@@ -25,6 +25,11 @@ def normalize_hunyuan_reasoning_effort(
     effort = request.reasoning_effort
     if effort is None and request.chat_template_kwargs is not None:
         effort = request.chat_template_kwargs.get("reasoning_effort")
+        if (
+            effort is None
+            and request.chat_template_kwargs.get("enable_thinking") is False
+        ):
+            effort = "no_think"
     if effort is None:
         normalized_effort = "high"
     elif effort in ("none", "no_think"):
