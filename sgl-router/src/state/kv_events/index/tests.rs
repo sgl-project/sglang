@@ -995,3 +995,30 @@ async fn snapshot_client_refuses_to_follow_a_redirecting_peer() {
     );
     index.shutdown().await;
 }
+
+#[tokio::test]
+async fn pump_duplicate_batch_leaves_tree_and_tally_unchanged() {
+    let id = worker_id("http://w1", 0);
+    let h = spawn_pump(std::slice::from_ref(&id));
+    for _ in 0..2 {
+        h.tx.send(WorkerEvent::Batch {
+            worker: id.clone(),
+            seq: 7,
+            batch: batch(vec![stored(None, vec![10, 20])]),
+        })
+        .await
+        .unwrap();
+    }
+    drop(h.tx);
+    h.pump.await.unwrap();
+
+    assert_eq!(h.tree.node_count(), 2);
+    assert_eq!(h.tree.match_prefix(None, &[10, 20]).matched_blocks, 2);
+    assert!(h.tree.match_prefix(None, &[10, 20]).holds(&id));
+    assert_eq!(h.cursors.lock().get(&id).copied(), Some(7));
+    let row = h.tally.snapshot().into_iter().find(|row| {
+        row.event == "block_stored" && row.medium == "untagged"
+    }).expect("untagged store row");
+    assert_eq!(row.events, 1);
+    assert_eq!(row.blocks, 2);
+}
