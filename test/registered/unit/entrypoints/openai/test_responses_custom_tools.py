@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import unittest
+import zlib
 from unittest.mock import Mock
 
 from utils import (
@@ -13,6 +15,7 @@ from utils import (
 
 from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
 from sglang.srt.entrypoints.openai.responses_adapters import (
+    _REASONING_STATE_PREFIX,
     decode_custom_tool_input,
     decode_custom_tool_input_prefix,
     decode_reasoning_state,
@@ -300,6 +303,34 @@ class ReasoningEncryptedContentTestCase(CustomTestCase):
             self.assertEqual(decode_reasoning_state(encode_reasoning_state(text)), text)
         self.assertIsNone(decode_reasoning_state("not-ours"))
         self.assertIsNone(decode_reasoning_state(None))
+
+    def test_decode_rejects_oversized_payload(self):
+        oversized = b"A" * 2048
+        blob = _REASONING_STATE_PREFIX + base64.urlsafe_b64encode(
+            zlib.compress(oversized, 9)
+        ).decode("ascii")
+        self.assertIsNone(decode_reasoning_state(blob, max_bytes=1024))
+
+    def test_decode_allows_exact_limit(self):
+        exact = b"A" * 1024
+        blob = _REASONING_STATE_PREFIX + base64.urlsafe_b64encode(
+            zlib.compress(exact, 9)
+        ).decode("ascii")
+        self.assertEqual(decode_reasoning_state(blob, max_bytes=1024), "A" * 1024)
+
+    def test_decode_rejects_truncated_stream(self):
+        truncated = zlib.compress(b"hello world")[:-4]
+        blob = _REASONING_STATE_PREFIX + base64.urlsafe_b64encode(truncated).decode(
+            "ascii"
+        )
+        self.assertIsNone(decode_reasoning_state(blob))
+
+    def test_decode_rejects_decompression_bomb(self):
+        bomb = _REASONING_STATE_PREFIX + base64.urlsafe_b64encode(
+            zlib.compress(b"\0" * (8 * 1024 * 1024), 9)
+        ).decode("ascii")
+        self.assertLess(len(bomb), 64 * 1024)
+        self.assertIsNone(decode_reasoning_state(bomb))
 
     def test_reasoning_item_carries_the_blob_only_when_included(self):
         without = OpenAIServingResponses._make_reasoning_item(
