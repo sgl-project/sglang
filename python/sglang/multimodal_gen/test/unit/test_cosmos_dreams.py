@@ -1507,93 +1507,154 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
         runner.reset.assert_called_once()
 
     def test_the_denoise_runner_path_matches_the_layer_loop(self):
-        """Running the GEN blocks through a denoise runner gives the velocity
-        and the chunk K/V of the plain layer loop."""
-        generator = torch.Generator().manual_seed(0)
+        """Running the GEN blocks through a denoise runner across two committed
+        chunks matches the plain layer loop, including real breakable CUDA graph
+        capture and replay when CUDA is available."""
 
-        def randn(*shape):
-            return torch.randn(*shape, generator=generator, dtype=torch.float64)
+        def build_model(device, dtype):
+            generator = torch.Generator().manual_seed(0)
 
-        def attend(q, k, v):
-            return torch.nn.functional.scaled_dot_product_attention(
-                q.transpose(1, 2),
-                k.transpose(1, 2),
-                v.transpose(1, 2),
-                enable_gqa=True,
-            ).transpose(1, 2)
+            def randn(*shape):
+                return torch.randn(*shape, generator=generator, dtype=dtype).to(device)
 
-        layers = []
-        for index in range(2):
-            layer = cosmos_dreams.CosmosDreamsGenDecoderLayer.__new__(
-                cosmos_dreams.CosmosDreamsGenDecoderLayer
+            def attend(q, k, v):
+                return torch.nn.functional.scaled_dot_product_attention(
+                    q.transpose(1, 2),
+                    k.transpose(1, 2),
+                    v.transpose(1, 2),
+                    enable_gqa=True,
+                ).transpose(1, 2)
+
+            layers = []
+            for index in range(2):
+                layer = cosmos_dreams.CosmosDreamsGenDecoderLayer.__new__(
+                    cosmos_dreams.CosmosDreamsGenDecoderLayer
+                )
+                torch.nn.Module.__init__(layer)
+                qkv, output = randn(8, 16) * 0.2, randn(8, 8) * 0.2
+                layer.layer_idx = index
+                layer.input_layernorm = torch.nn.Identity()
+                layer.post_attention_layernorm = torch.nn.Identity()
+                layer.mlp = torch.tanh
+                norm_stub = SimpleNamespace(
+                    weight=torch.ones(4, device=device, dtype=dtype),
+                    variance_epsilon=1e-6,
+                )
+                layer.cross_attention = SimpleNamespace(
+                    local_num_attention_heads=2,
+                    local_num_key_value_heads=1,
+                    head_dim=4,
+                    norm_q=norm_stub,
+                    norm_k=norm_stub,
+                    to_qkv=lambda x, w=qkv: (x @ w, None),
+                    to_out=lambda x, w=output: (x @ w, None),
+                    attn=attend,
+                )
+                layers.append(layer)
+
+            model = CosmosDreamsTransformer.__new__(CosmosDreamsTransformer)
+            torch.nn.Module.__init__(model)
+            model.gen_layers = layers
+            model.norm_moe_gen = torch.nn.Identity()
+            model.action_tokens_per_frame = 0
+            model._patch_count = lambda latent_h, latent_w: 3
+            model.proj_out = lambda hidden: (hidden, None)
+            model.unpatchify = lambda video, *shape: video
+            layer_kwargs = {
+                "cos_sin_cache": torch.ones(1, 4, device=device, dtype=dtype),
+                "rope_positions": None,
+                "null_token_slices": [],
+            }
+            model._prepare_chunk = lambda latent, *args, **kwargs: (
+                latent.permute(0, 2, 3, 4, 1).flatten(1, 3),
+                layer_kwargs,
             )
-            torch.nn.Module.__init__(layer)
-            qkv, output = randn(8, 16) * 0.2, randn(8, 8) * 0.2
-            layer.layer_idx = index
-            layer.input_layernorm = torch.nn.Identity()
-            layer.post_attention_layernorm = torch.nn.Identity()
-            layer.mlp = torch.tanh
-            layer.cross_attention = SimpleNamespace(
-                local_num_attention_heads=2,
-                local_num_key_value_heads=1,
-                head_dim=4,
-                norm_q=None,
-                norm_k=None,
-                to_qkv=lambda x, w=qkv: (x @ w, None),
-                to_out=lambda x, w=output: (x @ w, None),
-                attn=attend,
+            chunks = [randn(1, 8, 2, 1, 3), randn(1, 8, 2, 1, 3)]
+            text_kv = [(randn(1, 2, 1, 4), randn(1, 2, 1, 4)) for _ in layers]
+            return model, chunks, text_kv
+
+        def run_two_chunks(model, chunks, text_kv, denoise_runner, *, with_ctx=False):
+            from contextlib import nullcontext
+
+            from sglang.multimodal_gen.runtime.managers.forward_context import (
+                set_forward_context,
             )
-            layers.append(layer)
 
-        model = CosmosDreamsTransformer.__new__(CosmosDreamsTransformer)
-        torch.nn.Module.__init__(model)
-        model.gen_layers = layers
-        model.norm_moe_gen = torch.nn.Identity()
-        model.action_tokens_per_frame = 0
-        model._patch_count = lambda latent_h, latent_w: 3
-        model.proj_out = lambda hidden: (hidden, None)
-        model.unpatchify = lambda video, *shape: video
-        layer_kwargs = {
-            "cos_sin_cache": None,
-            "rope_positions": None,
-            "null_token_slices": [],
-        }
-        model._prepare_chunk = lambda latent, *args, **kwargs: (
-            latent.permute(0, 2, 3, 4, 1).flatten(1, 3),
-            layer_kwargs,
-        )
-        latent = randn(1, 8, 2, 1, 3)
-        text_kv = [(randn(1, 2, 1, 4), randn(1, 2, 1, 4)) for _ in layers]
-
-        def run(denoise_runner):
             history = new_kv_history(
                 text_kv,
                 tokens_per_frame=3,
                 sink_frames=1,
                 window_frames=None,
                 chunk_frames=2,
-                rollout_frames=2,
+                rollout_frames=4,
             )
-            slots = history.slots(6)
+            videos = []
+            kvs = []
             with mock.patch.object(
                 cosmos_dreams, "_apply_qwen3_qk_norm_rope", lambda q, k, *args: (q, k)
             ):
-                output = model.forward(
-                    latent,
-                    torch.tensor([0.5]),
-                    text_length=2,
-                    kv_slots=slots,
-                    frame_start=0,
-                    fps=30.0,
-                    denoise_runner=denoise_runner,
-                )
-            return output.video, torch.stack([slot.chunk_kv for slot in slots])
+                for idx, chunk in enumerate(chunks):
+                    slots = history.slots(6)
+                    ctx = (
+                        set_forward_context(
+                            current_timestep=0,
+                            attn_metadata=None,
+                            forward_batch=SimpleNamespace(is_warmup=(idx == 0)),
+                        )
+                        if with_ctx
+                        else nullcontext()
+                    )
+                    with ctx:
+                        output = model.forward(
+                            chunk,
+                            torch.tensor([0.5], device=chunk.device),
+                            text_length=2,
+                            kv_slots=slots,
+                            frame_start=idx * 2,
+                            fps=30.0,
+                            denoise_runner=denoise_runner,
+                        )
+                    videos.append(output.video.clone())
+                    kvs.append(torch.stack([slot.chunk_kv.clone() for slot in slots]))
+                    history.commit(6)
+            return videos, kvs
 
-        video, chunk_kv = run(None)
-        replayed, replayed_kv = run(lambda hidden: model.denoise_blocks(hidden))
-        self.assertTrue(torch.equal(replayed, video))
-        self.assertTrue(torch.equal(replayed_kv, chunk_kv))
-        self.assertGreater(float(chunk_kv.abs().sum()), 0.0)
+        model, chunks, text_kv = build_model(torch.device("cpu"), torch.float64)
+        videos, kvs = run_two_chunks(model, chunks, text_kv, None)
+        replayed, replayed_kvs = run_two_chunks(
+            model, chunks, text_kv, lambda hidden: model.denoise_blocks(hidden)
+        )
+        for video, rep, kv, rep_kv in zip(videos, replayed, kvs, replayed_kvs):
+            self.assertTrue(torch.equal(rep, video))
+            self.assertTrue(torch.equal(rep_kv, kv))
+            self.assertGreater(float(kv.abs().sum()), 0.0)
+        self.assertFalse(torch.equal(videos[0], videos[1]))
+
+        if torch.cuda.is_available():
+            from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+                DiffusionBreakableCudaGraphRunner,
+            )
+
+            device = torch.device("cuda")
+            cuda_model, cuda_chunks, cuda_text_kv = build_model(device, torch.float32)
+            runner = DiffusionBreakableCudaGraphRunner(
+                cuda_model.denoise_blocks, device
+            )
+            before_captures = runner.num_captures
+            try:
+                eager_videos, eager_kvs = run_two_chunks(
+                    cuda_model, cuda_chunks, cuda_text_kv, None
+                )
+                graph_videos, graph_kvs = run_two_chunks(
+                    cuda_model, cuda_chunks, cuda_text_kv, runner, with_ctx=True
+                )
+                self.assertEqual(len(runner.entries), 1)
+                self.assertEqual(runner.num_captures, before_captures + 1)
+            finally:
+                runner.reset(disabled_reason="unit test cleanup")
+            for ev, gv, ek, gk in zip(eager_videos, graph_videos, eager_kvs, graph_kvs):
+                torch.testing.assert_close(gv, ev, rtol=1e-5, atol=1e-5)
+                torch.testing.assert_close(gk, ek, rtol=1e-5, atol=1e-5)
 
     def test_scalar_domain_tensor_is_reused_across_chunks(self):
         domains = torch.tensor([2], dtype=torch.long)
