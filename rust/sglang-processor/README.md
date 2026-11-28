@@ -156,9 +156,20 @@ template override with the same checkpoint tokenizer.
 ## mm
 
 ```rust
-MmProcessor::from_spec(ProcessorSpec) -> Result<MmProcessor, ProcessorError>
+MmProcessor::from_spec(ProcessorSpec, Option<VideoSampling>) -> Result<MmProcessor, ProcessorError>
 MmProcessor::process(input_ids, images: &[&[u8]]) -> Result<MmOutput, ProcessorError>
+MmProcessor::process_media(input_ids, images, videos: &[MmVideo], text: &dyn TextEncoder) -> Result<MmOutput, ProcessorError>
+MmProcessor::process_decoded(input_ids, items: Vec<MmDecoded>, text: &dyn TextEncoder) -> Result<MmOutput, ProcessorError>
 ```
+
+`process_media` adds videos (`mm/video.rs`, the frame rules of Python's
+`qwen_vl_media_processing.py`) and returns images, then videos, as Python's `mm_items`.
+
+`process_decoded` is the same request path after decode, for media a caller
+already holds decoded (`DecodedMedia` plus a source hash). `process_media`
+decodes into it, so both share the model's processing, prompt expansion and
+positions. Video frames are used as given: SGLang's frame sampling and
+pre-resize run only on encoded video.
 
 `from_spec` builds Dynamo's family processor from a spec SGLang resolved from
 the model's loaded HF processor (`rust_server/multimodal.py::RustMmProcessor.resolve_spec`,
