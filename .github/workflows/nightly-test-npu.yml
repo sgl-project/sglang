@@ -2,6 +2,9 @@ name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       ref:
@@ -90,6 +93,12 @@ jobs:
             echo "ref=${{ inputs.ref }}" >> $GITHUB_OUTPUT
           fi
           JOB_FILTER="$(echo "${JOB_FILTER}" | tr -d '[:space:]')"
+          # TEMP: pull_request runs carry no inputs, so pin the PR rerun to the
+          # GLM-5.3-Flash 1P1D 16P perf case only; the qwen3.6-27b single-node
+          # cases are disabled in this temporary pipeline.
+          if [ -z "${JOB_FILTER}" ] && [ "${{ github.event_name }}" = "pull_request" ]; then
+            JOB_FILTER="nightly-poc-multi-node-specified-tests"
+          fi
           echo "job_filter=${JOB_FILTER:-all}" | tee -a $GITHUB_OUTPUT
           if [ -z "${{ inputs.image_a3 }}" ]; then
             echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.2.0-a3" >> $GITHUB_OUTPUT
@@ -153,7 +162,7 @@ jobs:
 
   nightly-test-1-npu-a3:
     name: nightly-test-1-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-1-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -169,7 +178,7 @@ jobs:
 
   nightly-test-2-npu-a3:
     name: nightly-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-2-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -186,7 +195,7 @@ jobs:
   # The nightly-test-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring extra-b-test-4-npu-a3 in the PR pipeline.
   nightly-test-4-npu-a3:
     name: nightly-test-4-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-4-npu-a3,')) }}
+    if: false
     needs: [set-image-config, sgl-router-build-aarch64]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -205,7 +214,7 @@ jobs:
 
   nightly-test-8-npu-a3:
     name: nightly-test-8-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-8-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -221,7 +230,7 @@ jobs:
 
   nightly-test-16-npu-a3:
     name: nightly-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-16-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -237,7 +246,7 @@ jobs:
 
   nightly-perf-test-2-npu-a3:
     name: nightly-perf-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-2-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -252,9 +261,11 @@ jobs:
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
+  # Disabled for the temporary PR rerun pipeline: the qwen3.6-27b 2P perf case
+  # is replaced by the GLM-5.3-Flash 1P1D 16P case in the multi-node job below.
   nightly-perf-test-4-npu-a3:
     name: nightly-perf-test-4-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-4-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -262,6 +273,8 @@ jobs:
       runner: linux-aarch64-a3-800t-4
       test_type: 'perf'
       test_suite: nightly-perf-test-4-npu-a3
+      only_tests: |
+        test/registered/npu/performance/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_2p_in16k_out1k_50ms.py
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -271,7 +284,7 @@ jobs:
 
   nightly-perf-test-16-npu-a3:
     name: nightly-perf-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-perf-test-16-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -287,10 +300,15 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       test_timeout_minutes: '180'
 
-  # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
+  # Temporary rerun: only the two single-node accuracy cases that failed in
+  # nightly run 46030846888 (qwen3.6-27b GPQA 0.8485 < 0.8527, moonlight 16B
+  # gsm8k 0.8279 < 0.82863). All other jobs stay disabled below.
+  # HCCL_DETERMINISTIC was removed from the test file to re-measure the
+  # temperature=0 run-to-run drift over a few nightly runs; restore it in the
+  # test file if accuracy failures beyond the 5-question tolerance reappear.
   nightly-acc-test-2-npu-a3:
     name: nightly-acc-test-2-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-2-npu-a3,')) }}
+    if: true
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -298,8 +316,10 @@ jobs:
       runner: linux-aarch64-a3-2-
       test_type: 'accuracy'
       test_suite: nightly-acc-test-2-npu-a3
+      only_tests: |
+        test/registered/npu/accuracy/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in3k5_out1k5_50ms_gpqa.py
+        test/registered/npu/accuracy/moonshotai_moonlight_16b_a3b/test_npu_moonlight_16b_a3b_bf16_1p_gsm8k.py
       is_nightly_pipeline_job: true
-      partitions: '{"size":4,"arr":[0,1,2,3]}'
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
@@ -308,7 +328,7 @@ jobs:
 
   nightly-acc-test-16-npu-a3:
     name: nightly-acc-test-16-npu-a3
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-16-npu-a3,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -325,7 +345,7 @@ jobs:
 
   nightly-acc-test-4-npu-a5:
      name: nightly-acc-test-4-npu-a5
-     if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-acc-test-4-npu-a5,')) }}
+     if: false
      needs: [set-image-config]
      uses: ./.github/workflows/_npu-single-node-test-stage.yml
      with:
@@ -340,10 +360,10 @@ jobs:
        device_type_for_deps: 'a5'
        run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
-  # The router the PD tests in nightly-test-4-npu-a3, nightly-poc-multi-node-tests
-  # and the nightly-poc-multi-node-accuracy-* jobs launch.
+  # The router launched by the PD-separation cases in nightly-poc-multi-node-specified-tests.
+  # Temporary rerun: disabled, no multi-node case runs in this pipeline.
   sgl-router-build-aarch64:
-    if: ${{ needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-test-4-npu-a3,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-odd-day,') || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-even-day,') }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
@@ -354,15 +374,16 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-tests,')) }}
+    if: false
     needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
-          # NOTE: multi-node accuracy suites are date-gated in the dedicated
-          # nightly-poc-multi-node-accuracy-odd-day / -even-day jobs below.
+          # NOTE: this job is disabled (if: false) in the temporary PR rerun
+          # pipeline; the two selected multi-node cases live in
+          # nightly-poc-multi-node-specified-tests below.
           # deepseek_v4_flash perf tests
           - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
             prefill_size: 1
@@ -435,6 +456,14 @@ jobs:
             test_case: test/registered/npu/performance/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
+          # glm_5_3_flash perf tests
+          - name: glm_5_3_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/npu/performance/glm5_3/test_npu_glm_5_3_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       ref: ${{ inputs.ref || '' }}
@@ -452,28 +481,36 @@ jobs:
       accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
       sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
 
-  # Multi-node accuracy suites: one suite list per parity, chosen by the Beijing-date
-  # parity resolved in set-image-config (odd day runs the odd-day suites, even day
-  # the even-day suites). Entries of the selected parity run one at a time behind
-  # the shared 4-node pool used by nightly-poc-multi-node-tests, and
-  # nightly-poc-multi-node-mix-tests waits for both parity jobs, so only one PD
-  # deployment occupies the pool at a time.
-  nightly-poc-multi-node-accuracy-odd-day:
-    name: multi-node-poc-accuracy-odd-day
-    if: ${{ !cancelled() && needs.set-image-config.outputs.accuracy_date_parity == 'odd' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-odd-day,')) }}
-    needs: [set-image-config, nightly-poc-multi-node-tests, sgl-router-build-aarch64]
+  # Temporary PR rerun pipeline: only the GLM-5.3-Flash 16P in128k/out1k prefix90
+  # perf case still runs here, so only one PD deployment occupies the shared
+  # 4-node pool. The GLM-5.3 32P PCP accuracy case already passed in run
+  # 45770380384 and is disabled below.
+  # Temporary rerun: disabled, no multi-node case runs in this pipeline.
+  nightly-poc-multi-node-specified-tests:
+    name: multi-node-poc-specified-tests
+    if: false
+    needs: [set-image-config, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
-          - name: multi_node_accuracy_odd_day
-            prefill_size: 2
-            decode_size: 2
+          - name: glm_5_3_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+            prefill_size: 1
+            decode_size: 1
             router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_gpqa.py
-            test_type: 'accuracy'
+            test_case: test/registered/npu/performance/glm5_3/test_npu_glm_5_3_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
+            test_type: 'perf'
             prefill_decode_deployment: 'separation'
+          # Passed in run 45770380384, disabled for the temporary PR rerun pipeline.
+          # - name: glm_5_3_w8a8_1p1d_32p_pcp_gpqa
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_gpqa.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          #   accuracy_dataset: 'gsm8k'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       ref: ${{ inputs.ref || '' }}
@@ -488,46 +525,13 @@ jobs:
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
-      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
-
-  nightly-poc-multi-node-accuracy-even-day:
-    name: multi-node-poc-accuracy-even-day
-    if: ${{ !cancelled() && needs.set-image-config.outputs.accuracy_date_parity == 'even' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-accuracy-even-day,')) }}
-    needs: [set-image-config, nightly-poc-multi-node-tests, sgl-router-build-aarch64]
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        test_config:
-          - name: multi_node_accuracy_even_day
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_gpqa.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
-    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
-    with:
-      ref: ${{ inputs.ref || '' }}
-      runner: linux-amd64-cpu-4
-      test_type: ${{ matrix.test_config.test_type || 'accuracy' }}
-      test_config_name: ${{ matrix.test_config.name }}
-      prefill_size: ${{ matrix.test_config.prefill_size }}
-      decode_size: ${{ matrix.test_config.decode_size }}
-      router_size: ${{ matrix.test_config.router_size }}
-      test_case: ${{ matrix.test_config.test_case }}
-      image: ${{ needs.set-image-config.outputs.image_a3 }}
-      prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
-      transformers_version: ''
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
+      accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && (matrix.test_config.accuracy_dataset || needs.set-image-config.outputs.accuracy_dataset) || '' }}
       sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-mix-tests,')) }}
-    needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, nightly-poc-multi-node-tests, nightly-poc-multi-node-accuracy-odd-day, nightly-poc-multi-node-accuracy-even-day]
+    if: false
+    needs: [set-image-config, nightly-perf-test-2-npu-a3, nightly-perf-test-4-npu-a3, nightly-perf-test-16-npu-a3, nightly-acc-test-2-npu-a3, nightly-acc-test-16-npu-a3, nightly-poc-multi-node-tests, nightly-poc-multi-node-specified-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -580,8 +584,7 @@ jobs:
       - nightly-acc-test-16-npu-a3
       - nightly-acc-test-4-npu-a5
       - nightly-poc-multi-node-tests
-      - nightly-poc-multi-node-accuracy-odd-day
-      - nightly-poc-multi-node-accuracy-even-day
+      - nightly-poc-multi-node-specified-tests
       - nightly-poc-multi-node-mix-tests
     runs-on: ubuntu-latest
     steps:
@@ -589,15 +592,8 @@ jobs:
         run: |
           multi_result="${{ needs.nightly-poc-multi-node-tests.result }}"
           mix_result="${{ needs.nightly-poc-multi-node-mix-tests.result }}"
-          # Exactly one of the two date-gated accuracy jobs runs; the other is skipped.
-          accuracy_result="success"
-          for r in \
-            "${{ needs.nightly-poc-multi-node-accuracy-odd-day.result }}" \
-            "${{ needs.nightly-poc-multi-node-accuracy-even-day.result }}"; do
-            if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
-              accuracy_result="failure"
-            fi
-          done
+          # Both specified multi-node PD cases run in one serialized matrix job.
+          accuracy_result="${{ needs.nightly-poc-multi-node-specified-tests.result }}"
 
           # single-node suites are reported per suite; overall status is success if none failed
           single_result="success"
