@@ -1848,6 +1848,84 @@ class UnifiedLRUListBoundedRefreshTest(
         self.assertEqual(self._lru_order(lru), before)
 
 
+class TestHybridPromptWindow(UnifiedRadixCacheCoreFixtures, CustomTestCase):
+    cfg = CacheConfig(
+        page_size=64,
+        components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+        sliding_window_size=128,
+        enable_mamba_extra_buffer=True,
+        hybrid_cache_checkpoints_level=2,
+        kv_size=1024,
+    )
+
+    def _checkpoint(self, cache, req, end):
+        req.kv.mamba_last_track_seqlen = end
+        cache.checkpoint(req, up_to=end)
+        return req.last_node
+
+    def test_finished_request_keeps_cross_node_prompt_window(self):
+        for output_len in (5, 256):
+            with self.subTest(output_len=output_len):
+                self._check_finished_prompt_window(output_len)
+
+    def _check_finished_prompt_window(self, output_len):
+        cache, allocator, pool = build_fixture(self.cfg)
+
+        # The final 64-token chunk needs the preceding node for its 128-token window.
+        prompt = list(range(192))
+        output = list(range(2000, 2000 + output_len))
+        req, _ = self._make_inflight_req(
+            cache, allocator, pool, prompt, output, allocated=True
+        )
+        self._checkpoint(cache, req, 128)
+        self._checkpoint(cache, req, len(prompt))
+
+        other, _ = self._make_inflight_req(
+            cache, allocator, pool, range(1000, 1384), allocated=True
+        )
+        stale = self._checkpoint(cache, other, 128)
+        self._checkpoint(cache, other, 256)
+        self._checkpoint(cache, other, 384)
+        self.assertIsNone(node_device_value(cache, stale, ComponentType.MAMBA))
+        self.assertIsNotNone(node_device_value(cache, stale, ComponentType.SWA))
+
+        # Only the long reply reaches a new checkpoint after prefill.
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+        if output_len >= self.cfg.page_size:
+            req.kv.mamba_last_track_seqlen = len(prompt) + output_len
+        req.finished_reason = FINISH_LENGTH(length=len(output))
+        release_kv_cache(req, cache, checkpoint=True)
+
+        cache.evict(
+            EvictParams(
+                window_num_tokens={cache.window_sub_pool_of_slot(ComponentType.SWA): 64}
+            )
+        )
+        hit = match_prefix(cache, prompt + [3000])
+        self.assertEqual(hit.full_kv_hit_length, len(prompt))
+        self.assertEqual(hit.device_prefix_len, len(prompt))
+        cache.sanity_check()
+
+    def test_finish_after_reprefill_keeps_existing_node_boundaries(self):
+        cache, allocator, pool = build_fixture(self.cfg, mamba_cache_chunk_size=128)
+        prompt = list(range(192))
+        output = list(range(1000, 1192))
+        req, _ = self._make_inflight_req(
+            cache, allocator, pool, prompt, output, allocated=True
+        )
+        # Re-prefill includes output tokens. The original prompt ends inside
+        # the edge between the two published checkpoints.
+        self._checkpoint(cache, req, 128)
+        self._checkpoint(cache, req, 256)
+        req.kv.mamba_last_track_seqlen = len(prompt) + len(output)
+        req.finished_reason = FINISH_LENGTH(length=len(output))
+        release_kv_cache(req, cache, checkpoint=True)
+
+        (path,) = cache.tree_core.collect_path_info([req.last_node])
+        self.assertNotIn(len(prompt), [node.path_end for node in path])
+        cache.sanity_check()
+
+
 class TestUnifiedMambaLRUMatchRefresh(
     UnifiedMambaLRUMatchRefreshFixtures, CustomTestCase
 ):
