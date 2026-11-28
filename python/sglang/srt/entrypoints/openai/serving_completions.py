@@ -6,7 +6,7 @@ from collections.abc import AsyncGenerator
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -363,6 +363,11 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     finish_reason.get("status_code"), HTTPStatus
                 ):
                     code = finish_reason["status_code"]
+                    if not stream_started and code < 500:
+                        raise HTTPException(
+                            status_code=code.value,
+                            detail=finish_reason.get("message", "Generation aborted."),
+                        )
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),
                         code.name,

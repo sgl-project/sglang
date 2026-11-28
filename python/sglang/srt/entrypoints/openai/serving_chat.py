@@ -30,7 +30,7 @@ class ThinkingMode(str, Enum):
 
 import jinja2
 import orjson
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 try:
     from mistral_common.exceptions import MistralCommonException
@@ -2433,7 +2433,11 @@ class OpenAIServingChat(OpenAIServingBase):
         """Handle streaming chat completion request"""
         wire_response = self.chat_wire.new_response(request, created=int(time.time()))
         generator = self._generate_chat_stream(
-            adapted_request, request, raw_request, wire=wire_response
+            adapted_request,
+            request,
+            raw_request,
+            wire=wire_response,
+            http_abort_before_stream=True,
         )
 
         # Kick-start the generator to trigger validation before HTTP 200 is sent.
@@ -2468,6 +2472,7 @@ class OpenAIServingChat(OpenAIServingBase):
         wire: chat_encoding_adapters.ChatWireResponse = (
             chat_encoding_adapters.OPENAI_CHAT_WIRE
         ),
+        http_abort_before_stream: bool = False,
     ) -> AsyncGenerator[str, None]:
         """Generate streaming chat completion response"""
         created = int(time.time())
@@ -2634,11 +2639,25 @@ class OpenAIServingChat(OpenAIServingBase):
                         finish_reason.get("status_code"), HTTPStatus
                     ):
                         wire.check_abort(finish_reason, stream_started=stream_started)
+                        code = finish_reason["status_code"]
+                        if (
+                            http_abort_before_stream
+                            and wire is chat_encoding_adapters.OPENAI_CHAT_WIRE
+                            and not stream_started
+                            and code < 500
+                        ):
+                            # Other consumers of this generator, notably /v1/messages,
+                            # keep their existing streaming error representation.
+                            raise HTTPException(
+                                status_code=code.value,
+                                detail=finish_reason.get(
+                                    "message", "Generation aborted."
+                                ),
+                            )
                         if wire.errors_end_choices:
                             finish_reasons[index] = finish_reason
                             interrupted = True
                             break
-                        code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
                             code.name,

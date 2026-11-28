@@ -14,7 +14,7 @@ from http import HTTPStatus
 from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -265,6 +265,74 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(len(response.choices[0].logprobs.top_logprobs), 0)
         self.assertEqual(response.choices[0].token_ids, [3, 4])
         self.assertEqual(response.choices[0].prompt_token_ids, [1, 2])
+
+    @staticmethod
+    def _completion_stream_event(*, text, status_code=None):
+        finish_reason = None
+        if status_code is not None:
+            finish_reason = {
+                "type": "abort",
+                "status_code": status_code,
+                "message": "grammar failed",
+            }
+        return {
+            "text": text,
+            "index": 0,
+            "meta_info": {
+                "id": "cmpl-abort-test",
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "finish_reason": finish_reason,
+            },
+        }
+
+    def _handle_completion_stream(self, events):
+        async def _generate(*args, **kwargs):
+            for event in events:
+                yield event
+
+        self.sc.tokenizer_manager.generate_request = _generate
+        self.sc.tokenizer_manager.create_abort_task = Mock(return_value=None)
+        request = CompletionRequest(
+            model="x", prompt="Hello world", max_tokens=100, stream=True
+        )
+        return get_or_create_event_loop().run_until_complete(
+            self.sc._handle_streaming_request(Mock(), request, self.fastapi_request)
+        )
+
+    def test_client_abort_before_first_token_is_an_http_error(self):
+        with self.assertRaises(HTTPException) as ctx:
+            self._handle_completion_stream(
+                [
+                    self._completion_stream_event(
+                        text="", status_code=HTTPStatus.BAD_REQUEST
+                    )
+                ]
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.detail, "grammar failed")
+
+    def test_client_abort_after_first_chunk_remains_sse_error(self):
+        response = self._handle_completion_stream(
+            [
+                self._completion_stream_event(text="partial"),
+                self._completion_stream_event(
+                    text="", status_code=HTTPStatus.BAD_REQUEST
+                ),
+            ]
+        )
+        self.assertEqual(response.status_code, 200)
+
+        async def _collect():
+            return [chunk async for chunk in response.body_iterator]
+
+        chunks = get_or_create_event_loop().run_until_complete(_collect())
+        error = json.loads(
+            next(chunk for chunk in chunks if '"error"' in chunk)[len("data: ") :]
+        )["error"]
+        self.assertEqual(error["message"], "grammar failed")
+        self.assertEqual(error["code"], 400)
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
