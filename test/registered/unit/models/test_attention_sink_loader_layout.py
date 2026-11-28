@@ -10,6 +10,7 @@ import torch
 from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
 from sglang.srt.models import gpt_oss
 from sglang.srt.models.gpt_oss import GptOssAttention, GptOssForCausalLM
+from sglang.srt.models.hunyuan_v4 import HYV4Attention
 from sglang.srt.models.mimo_v2 import MiMoV2Attention, MiMoV2ForCausalLM
 from sglang.srt.models.mimo_v2_nextn import MiMoV2MTP
 from sglang.srt.runtime_context import SpawnRanks, reset_context
@@ -173,6 +174,66 @@ class TestAttentionSinkLoaderLayout(CustomTestCase):
                                     changed=changed,
                                     offset=offset,
                                 )
+
+    def test_hunyuan_sink_uses_gate_partition_after_scope_exit(self):
+        config = SimpleNamespace(
+            hidden_size=32,
+            num_attention_heads=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=8,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            rms_norm_eps=1e-6,
+            max_position_embeddings=16,
+            rope_parameters={"rope_theta": 10000, "rope_type": "default"},
+            gating_type="elementwise",
+        )
+        for dp in (1, 2):
+            for rank in range(4):
+                for dtype in (torch.float32, torch.bfloat16):
+                    reset_context()
+                    publish(
+                        ServerArgs(
+                            model_path="dummy",
+                            device="cuda",
+                            tp_size=4,
+                            attn_dp_size=dp,
+                        ),
+                        role="test",
+                        ranks=SpawnRanks(world_rank=rank),
+                    )
+                    torch.set_default_dtype(dtype)
+                    with torch.device("cuda"):
+                        attention = HYV4Attention(config, layer_id=0)
+                    param = attention.learnable_sink_param
+                    owner_rank, owner_size = rank_size(attention.linear_gate)
+                    heads = config.num_attention_heads // owner_size
+                    storage = param.data_ptr()
+                    for wrapped in (False, True):
+                        if wrapped:
+                            attention.linear_gate = BaseLayerWithLoRA(
+                                attention.linear_gate, Mock()
+                            )
+                        for changed in (False, True):
+                            for offset in (0, 11):
+                                source = (
+                                    torch.arange(
+                                        config.num_attention_heads,
+                                        device="cuda",
+                                        dtype=dtype,
+                                    )
+                                    + offset
+                                )
+                                expected = source[
+                                    owner_rank * heads : (owner_rank + 1) * heads
+                                ].float()
+                                with loading_scope(changed):
+                                    param.weight_loader(param, source)
+                                torch.testing.assert_close(
+                                    param, expected, rtol=0, atol=0
+                                )
+                                self.assertEqual(param.data_ptr(), storage)
 
     def test_native_model_loaders_after_scope_exit(self):
         self.check_loads(True)
