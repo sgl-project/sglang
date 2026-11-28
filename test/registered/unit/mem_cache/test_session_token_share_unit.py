@@ -66,6 +66,7 @@ def _recv(rid, input_ids, max_new_tokens=8, parent=None):
         bootstrap_room=None,
         routed_dp_rank=None,
         disagg_prefill_dp_rank=None,
+        disagg_local_prefill=False,
         priority=None,
         routing_key=None,
         extra_key=None,

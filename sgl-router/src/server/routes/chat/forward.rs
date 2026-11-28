@@ -45,6 +45,9 @@ type LoadGuards = (LoadGuard, RouterInflightLoadGuard, Option<DpRankGuard>);
 pub(super) struct SelectedWorkers {
     pub(super) prefill: Arc<Worker>,
     pub(super) decode: Option<Arc<Worker>>,
+    /// `prefill` is a decode worker that prefills the request itself; the
+    /// request carries `disagg_local_prefill` and no bootstrap fields.
+    pub(super) local_prefill: bool,
     pub(super) track_dispatch_timestamps: bool,
 }
 
@@ -117,7 +120,8 @@ pub(super) async fn forward_request_grpc(
             }
         }
         let workers = match routing
-            .select_workers(ctx, request, &headers, &excluded)
+            // The marker has no gRPC field yet, so every gRPC request goes through prefill.
+            .select_workers(ctx, request, &headers, &excluded, false)
             .await
         {
             Ok(workers) => workers,
@@ -172,11 +176,13 @@ async fn dispatch<T: Transport>(
     let SelectedWorkers {
         prefill,
         decode,
+        local_prefill,
         track_dispatch_timestamps,
     } = workers;
     let decode = decode.filter(|_| !prefill_answers_alone(ctx, request, &prefill));
     let decode_url_header = decode
-        .as_ref()
+        .as_deref()
+        .or(local_prefill.then_some(&*prefill))
         .and_then(|worker| parse_decode_url_header(&worker.url));
     if let Some(hint) = &decode_url_header {
         headers.insert(X_SGL_DECODE_URL, hint.clone());
@@ -238,6 +244,7 @@ async fn dispatch<T: Transport>(
         &ctx.metrics,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
+        local_prefill,
     )?;
     let prefill_leg = Leg::new(
         dp_aware,

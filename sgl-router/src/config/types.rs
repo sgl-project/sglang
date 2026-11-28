@@ -37,6 +37,10 @@ pub struct ProxyConfig {
     /// PD: send a request for at most one token to prefill alone, skipping
     /// decode, when the prefill engine reports it can answer one.
     pub one_token_on_prefill_only: bool,
+    /// PD: send a request only to a decode worker that holds its prefix,
+    /// marked `disagg_local_prefill`, when the uncached suffix is at most this
+    /// many tokens. `None` sends every request through prefill.
+    pub local_prefill_max_uncached_tokens: Option<u64>,
 }
 
 impl ProxyConfig {
@@ -71,6 +75,7 @@ impl Default for ProxyConfig {
             decode_dispatch_limit: None,
             stream_after_prefill: false,
             one_token_on_prefill_only: false,
+            local_prefill_max_uncached_tokens: None,
         }
     }
 }

@@ -980,6 +980,9 @@ class _FakeResolvedArgs:
     ] = False
     modelexpress_config: A[str | None, Arg(help="mx"), NS("model")] = None
     disaggregation_mode: A[str, Arg(help="dm"), NS("disagg")] = "null"
+    disaggregation_decode_enable_local_prefill: A[
+        bool, Arg(help="dlp"), NS("disagg")
+    ] = False
     max_running_requests: A[int | None, Arg(help="mrr"), NS("schedule")] = None
     chunked_prefill_size: A[int, Arg(help="cps"), NS("schedule")] = -1
     max_prefill_tokens: A[int, Arg(help="mpt"), NS("schedule")] = 16384

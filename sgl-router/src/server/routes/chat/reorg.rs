@@ -95,6 +95,7 @@ pub(super) async fn select_workers(
                 return Ok(SelectedWorkers {
                     prefill: picks.prefill.engine,
                     decode: picks.decode.map(|pick| pick.engine),
+                    local_prefill: false,
                     track_dispatch_timestamps: false,
                 });
             }

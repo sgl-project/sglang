@@ -33,6 +33,8 @@ class ListKind(enum.Enum):
     PD_RETRACTED = enum.auto()
     PD_HELD = enum.auto()
     PD_RECEIVING = enum.auto()
+    # Transferred requests of a decode server that also prefills locally.
+    PD_PREBUILT = enum.auto()
     PD_RELEASING = enum.auto()
     PD_OFFLOADING = enum.auto()
     HISPARSE_STAGING = enum.auto()
@@ -51,6 +53,7 @@ PD_KINDS = frozenset(
         ListKind.PD_RETRACTED,
         ListKind.PD_HELD,
         ListKind.PD_RECEIVING,
+        ListKind.PD_PREBUILT,
         ListKind.PD_RELEASING,
         ListKind.PD_OFFLOADING,
     }

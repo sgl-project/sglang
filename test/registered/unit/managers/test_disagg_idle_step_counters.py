@@ -480,6 +480,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         clock = PrefillBusyClock()
         scheduler = SimpleNamespace(
             disaggregation_mode=mode,
+            disagg_decode_prebuilt_queue=None,
             server_args=None,
             max_total_num_tokens=1000,
             kv_shard_widening=1,

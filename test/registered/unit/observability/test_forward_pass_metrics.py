@@ -610,6 +610,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
     def test_disagg_decode_queued_metrics(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        self.scheduler.disagg_decode_prebuilt_queue = None
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
             queue=[_FakeReq(10, output_len=5), _FakeReq(20, output_len=10)],
         )
