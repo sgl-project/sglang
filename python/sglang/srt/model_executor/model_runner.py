@@ -41,6 +41,9 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed import bootstrap
+from sglang.srt.distributed.pp_partition_auto import (
+    maybe_apply as maybe_apply_pp_partition_auto,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
@@ -819,6 +822,12 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        maybe_apply_pp_partition_auto(
+            model_config=self.model_config,
+            is_draft_worker=self.is_draft_worker,
+            mem_fraction_static=self.mem_fraction_static,
+            pre_model_load_memory=self.pre_model_load_memory,
+        )
         self.load_model()
         if self.model_config.is_layer_types_hybrid_swa:
             check_layer_types_hybrid_swa_split(
