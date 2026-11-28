@@ -72,6 +72,7 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -263,6 +264,9 @@ class KvPoolView:
 
     def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
         return self.pool.get_swa_key_buffer_radix(layer_id)
+
+    def get_swa_key_layout(self) -> KVLayout:
+        return self.pool.get_swa_key_layout()
 
     def get_swa_key_page_size(self) -> int:
         return self.pool.get_swa_key_page_size()
