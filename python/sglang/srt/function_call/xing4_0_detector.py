@@ -188,7 +188,12 @@ class Xing4_0Detector(BaseFormatDetector):
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
-        tool_indices = self._get_tool_indices(tools)
+        # Cache tool indices on the instance: tools are fixed per request, and
+        # streaming calls detect_and_parse once per completed tool block, so
+        # rebuilding this dict each time is wasted work.
+        if not hasattr(self, "_tool_indices"):
+            self._tool_indices = self._get_tool_indices(tools)
+        tool_indices = self._tool_indices
         calls: List[ToolCallItem] = []
 
         try:
