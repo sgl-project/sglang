@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Seed given to rows without an explicit ``sampling_seed`` when
 # --enable-deterministic-inference is on.  Mirrors the literal in
-# ``SamplingBatchInfo.set_seeds_and_mask_rows``.
+# ``sampling_params_pool._seed``.
 DEFAULT_SAMPLING_SEED = 42
 
 # Largest ``top_k`` that still takes the bounded candidate path in

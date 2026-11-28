@@ -220,9 +220,16 @@ class MoeWNA16Config(QuantizationConfig):
             if self.linear_quant_method == "gptq":
                 return self._get_gptq_config().get_quant_method(layer, prefix)
             elif self.linear_quant_method == "awq":
-                return AWQConfig.from_config(self.full_config).get_quant_method(
-                    layer, prefix
-                )
+                awq_config = AWQConfig.from_config(self.full_config)
+                # Keep the mapping models update at init (Gemma 4 K=V layers).
+                if self.packed_modules_mapping:
+                    awq_config.update_packed_modules_mapping(
+                        {
+                            **awq_config.packed_modules_mapping,
+                            **self.packed_modules_mapping,
+                        }
+                    )
+                return awq_config.get_quant_method(layer, prefix)
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
         elif isinstance(layer, FusedMoE):

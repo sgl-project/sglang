@@ -114,6 +114,7 @@ class TokenSpaceSGLangProcessor:
             media_url_max_file_size_mb=mm.media_url_max_file_size_mb,
             media_url_timeout=mm.media_url_timeout,
             allow_local_media_files=mm.allow_local_media_files,
+            allow_private_media_hosts=mm.allow_private_media_hosts,
             keep_mm_features_on_device=self._feature_transport.keep_mm_features_on_device,
         )
         self._core = TokenSpaceProcessor.for_strategy(strategy_class)(
@@ -162,7 +163,6 @@ class TokenSpaceSGLangProcessor:
         input_ids=None,
         audio_data=None,
         video_data=None,
-        max_req_input_len=None,
         **kwargs,
     ) -> MultimodalProcessorOutput:
         """The processor entry; `input_text` holds the request's input_ids when it has them."""

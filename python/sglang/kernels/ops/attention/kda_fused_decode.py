@@ -64,6 +64,10 @@ def covered(
     packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
     [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
     kernel reads the real slot stride), one token per request."""
+    # JIT-compiled CUDA kernel: reject anything the launch cannot run. The
+    # shape/dtype/stride checks below say nothing about the device.
+    if not mixed_qkv.is_cuda:
+        return False
     if ssm_states.ndim < 4:
         return False
     H, V, K = ssm_states.shape[-3:]
@@ -105,6 +109,8 @@ def covered(
         and ssm_states.stride(-1) == 1
         and ssm_states.stride(-2) == K
         and ssm_states.stride(-3) == V * K
+        # The state is staged with 16B copies, so the slot pitch must be 16B-aligned.
+        and ssm_states.stride(-4) % 4 == 0
         and cache_indices.is_contiguous()
     )
 

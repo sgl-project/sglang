@@ -1,4 +1,4 @@
-"""gfx950 BF16/FP16 GEMM from fbtriton ``tlx.ops.mm``, vendored in ``sglang.kernels.tlx_ops``.
+"""gfx950 BF16/FP16 GEMM from upstream ``tlx.ops.mm``, vendored as ``tlx_mm``.
 
 ``linear`` runs ``x @ weight.T`` for an ``[N, K]`` weight and ``x`` of any leading
 dims and strides, any M/N/K. Rejected (see ``mm_supported``): other or mixed dtypes,
@@ -27,7 +27,7 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         add_missing_triton_knobs,
         inline_intra_wave_pipeline_stages,
     )
-    from sglang.kernels.tlx_ops.kernels.mm.gfx950 import mm
+    from sglang.kernels.ops.gemm.tlx_mm import mm
 
     add_missing_triton_knobs()
     add_missing_hip_options()

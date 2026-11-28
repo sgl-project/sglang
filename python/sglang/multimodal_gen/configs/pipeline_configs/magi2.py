@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config impo
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
+    LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -90,6 +93,18 @@ class Magi2PipelineConfig(PipelineConfig):
     def supports_disaggregation(self) -> bool:
         return False
 
+    @staticmethod
+    def _stream_text_encoder_by_default(server_args) -> None:
+        """Resident, the 27B encoder would hold ~48 GB on every rank for one call per request."""
+        if server_args.explicit_residency_mode("text_encoder") is not None:
+            return
+        components = list(server_args.layerwise_offload_components or ())
+        if LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP not in components:
+            server_args.layerwise_offload_components = [
+                *components,
+                LAYERWISE_OFFLOAD_TEXT_ENCODER_GROUP,
+            ]
+
     def _warn_about_allocator(self) -> None:
         """Warn at startup when the allocator will fail the 1080p decode."""
         if not self.enable_refiner:
@@ -110,6 +125,7 @@ class Magi2PipelineConfig(PipelineConfig):
     def validate_server_args(self, server_args) -> None:
         super().validate_server_args(server_args)
         self._warn_about_allocator()
+        self._stream_text_encoder_by_default(server_args)
 
         if server_args.enable_cfg_parallel:
             raise ValueError(
