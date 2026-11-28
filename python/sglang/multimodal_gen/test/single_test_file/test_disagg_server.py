@@ -45,6 +45,9 @@ from sglang.test.test_utils import CustomTestCase, terminate_and_kill_process_tr
 
 HOST = "127.0.0.1"
 _LOG_DIR = Path(os.environ.get("SGLANG_TEST_LOG_DIR", "/tmp"))
+if artifact_dir := os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR"):
+    _LOG_DIR = Path(artifact_dir) / "disagg"
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Env knob: bump if a cold HF download is needed on a fresh CI runner.
 _STARTUP_TIMEOUT_S = float(os.environ.get("SGLANG_DISAGG_STARTUP_TIMEOUT", "600"))

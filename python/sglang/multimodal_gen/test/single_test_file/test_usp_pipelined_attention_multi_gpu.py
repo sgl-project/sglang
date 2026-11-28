@@ -315,9 +315,9 @@ class TestUspPipelinedAttentionMultiGpu(CustomTestCase):
             text=True,
             timeout=1200,
         )
-        print(proc.stdout[-4000:])
+        print(proc.stdout if proc.returncode else proc.stdout[-4000:])
         if proc.returncode != 0:
-            print(proc.stderr[-4000:], file=sys.stderr)
+            print(proc.stderr, file=sys.stderr)
         self.assertEqual(proc.returncode, 0, "pipelined USPAttention diverged")
         if "SKIP" not in proc.stdout:
             self.assertIn(f"USP_PIPELINE_PARITY PASS world={world}", proc.stdout)

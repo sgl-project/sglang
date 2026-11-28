@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB: float | None = None
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_TEST_NUM_INFERENCE_STEPS: int | None = None
+    SGLANG_DIFFUSION_CI_DIAGNOSTICS: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
@@ -337,6 +338,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_TEST_NUM_INFERENCE_STEPS": _lazy_int("SGLANG_TEST_NUM_INFERENCE_STEPS"),
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
+    "SGLANG_DIFFUSION_CI_DIAGNOSTICS": _lazy_bool("SGLANG_DIFFUSION_CI_DIAGNOSTICS"),
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
     # Kill-switch for the warmup-calibrated auto residency promotion that runs
     # under `--performance-mode auto` with server warmup. Set to disable the

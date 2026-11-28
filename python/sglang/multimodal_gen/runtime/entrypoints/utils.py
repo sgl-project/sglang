@@ -35,7 +35,10 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    log_saved_output,
+)
 from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
 from sglang.srt.observability.trace import TraceReqContext
@@ -1299,6 +1302,10 @@ def save_materialized_output(
                 indexed_path = f"{save_file_path}_{i}"
             with open(indexed_path, "wb") as f:
                 f.write(_encode_image_frame(image, indexed_path, output_compression))
+            log_saved_output(
+                logger, indexed_path, last=i == len(materialized.frames) - 1
+            )
+        return image_bytes
     else:
         if image_bytes is None:
             image_bytes = _encode_image_frame(
@@ -1306,7 +1313,7 @@ def save_materialized_output(
             )
         with open(save_file_path, "wb") as f:
             f.write(image_bytes)
-    logger.info("Output saved")
+    log_saved_output(logger, save_file_path)
     return image_bytes
 
 
@@ -1444,7 +1451,7 @@ def save_outputs(
                 os.makedirs(os.path.dirname(save_file_path) or ".", exist_ok=True)
                 with open(save_file_path, "w", encoding="utf-8") as f:
                     json.dump(sample, f, ensure_ascii=False)
-                logger.info("Output saved")
+                log_saved_output(logger, save_file_path)
             output_paths.append(save_file_path)
             continue
 
@@ -1473,7 +1480,7 @@ def save_outputs(
                     if audios_out is not None:
                         audios_out.append(select_output_audio(audio, idx, len(outputs)))
                     output_paths.append(save_file_path)
-                    logger.info("Output saved")
+                    log_saved_output(logger, save_file_path)
                     continue
 
         frames = post_process_sample(

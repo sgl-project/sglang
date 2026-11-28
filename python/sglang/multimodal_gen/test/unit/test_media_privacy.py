@@ -374,3 +374,26 @@ def test_ephemeral_mesh_upload_lives_exactly_as_long_as_job(
             assert job["status"] == ("completed" if success else "failed")
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("diagnostics", [False, True])
+def test_saved_layer_paths_are_only_logged_for_fixture_diagnostics(
+    tmp_path, monkeypatch, caplog, diagnostics
+):
+    import numpy as np
+
+    from sglang.multimodal_gen.configs.task_type import DataType
+    from sglang.multimodal_gen.runtime.entrypoints import utils
+
+    monkeypatch.setenv("SGLANG_DIFFUSION_CI_DIAGNOSTICS", "1" if diagnostics else "0")
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    output = utils.MaterializedOutput(sample=None, frames=[frame, frame])
+    with caplog.at_level(logging.INFO, logger=utils.logger.name):
+        utils.save_materialized_output(
+            output, DataType.IMAGE, str(tmp_path / "fixture.png")
+        )
+    for i in range(2):
+        path = tmp_path / f"fixture_{i}.png"
+        assert path.is_file()
+        assert (str(path) in caplog.text) is diagnostics
+    assert str(tmp_path / "fixture.png") not in caplog.text
