@@ -5,9 +5,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import contextlib
+import copy
+import pickle
 import random
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -30,6 +33,12 @@ SAME_RANK_REPLICAS = [[0, 1, 2, 3, 3, 0]] * 3
 # rank 2, so rank 1 (no replica, node 0) narrows to a same-node replica.
 SAME_NODE_NARROWING = [[0, 0, 1, 2, 3, 0, 1, 3]] * 2
 
+# EP 2, 4 slots per rank. Negative entries (here -1 and -2) hold no logical expert.
+NEGATIVE_ENTRIES = [[0, -1, 2, 3, -2, 1, 2, 3]]
+
+# EP 2, 4 layers. Square: its transpose keeps the shape, storage and version count.
+LATIN_SQUARE = [[0, 1, 2, 3], [3, 0, 1, 2], [2, 3, 0, 1], [1, 2, 3, 0]]
+
 
 def _metadata(
     layout,
@@ -39,9 +48,10 @@ def _metadata(
     moe_ep_rank,
     moe_a2a_backend="deepep",
     ep_join_mode=None,
+    dtype=torch.int64,
 ):
     """What ExpertLocationMetadata.init_by_mapping builds on one EP rank."""
-    physical_to_logical_map = torch.tensor(layout)
+    physical_to_logical_map = torch.tensor(layout, dtype=dtype)
     num_logical_experts = int(physical_to_logical_map.max()) + 1
     with get_context().override_server_args(
         ep_size=ep_size,
@@ -169,11 +179,14 @@ class TestExpertLocationWeightLoading(CustomTestCase):
     def test_lookup_returns_exactly_the_slots_of_each_expert(self):
         rng = random.Random(0)
         cases = [
-            ("same_rank_replicas", SAME_RANK_REPLICAS, 2, 1),
-            ("same_node_narrowing", SAME_NODE_NARROWING, 4, 2),
-            ("random_ep4", _random_layout(rng, 4, 8, 16), 4, 1),
+            ("same_rank_replicas", SAME_RANK_REPLICAS, 2, 1, torch.int64),
+            ("same_node_narrowing", SAME_NODE_NARROWING, 4, 2, torch.int64),
+            ("random_ep4", _random_layout(rng, 4, 8, 16), 4, 1, torch.int64),
+            ("negative_entries", NEGATIVE_ENTRIES, 2, 1, torch.int64),
+            # The deepseek_vec EPLB algorithm builds int32 maps.
+            ("same_rank_replicas_int32", SAME_RANK_REPLICAS, 2, 1, torch.int32),
         ]
-        for name, layout, ep_size, nnodes in cases:
+        for name, layout, ep_size, nnodes, dtype in cases:
             for moe_a2a_backend in ["deepep", "none"]:
                 for rank in range(ep_size):
                     with self.subTest(name, backend=moe_a2a_backend, rank=rank):
@@ -183,6 +196,7 @@ class TestExpertLocationWeightLoading(CustomTestCase):
                             nnodes=nnodes,
                             moe_ep_rank=rank,
                             moe_a2a_backend=moe_a2a_backend,
+                            dtype=dtype,
                         )
                         for layer_id, row in enumerate(layout):
                             for logical_expert_id in range(
@@ -198,6 +212,152 @@ class TestExpertLocationWeightLoading(CustomTestCase):
                                         if expert == logical_expert_id
                                     ],
                                 )
+        # With dynamic dispatch the map may give an expert no slot at all.
+        metadata = _metadata(
+            [[0, 1, 3, 3]], ep_size=2, nnodes=1, moe_ep_rank=0, moe_a2a_backend="none"
+        )
+        self.assertEqual(metadata.logical_to_all_physical(0, 2), [])
+
+    def test_lookup_returns_a_new_list(self):
+        metadata = _metadata(SAME_RANK_REPLICAS, ep_size=2, nnodes=1, moe_ep_rank=0)
+        metadata.logical_to_all_physical(0, 3).clear()
+        self.assertEqual(metadata.logical_to_all_physical(0, 3), [3, 4])
+
+    def test_lookup_follows_update_of_some_layers(self):
+        """Updated layers use the new slots; the other layers keep the old ones."""
+        old_layout = _random_layout(random.Random(2), 3, 8, 16)
+        # Rotating a row moves every expert: each lookup in an updated layer changes.
+        new_layout = [row[1:] + row[:1] for row in old_layout]
+        update_layer_ids = [0, 2]
+        expected_layout = [
+            new_layout[layer_id] if layer_id in update_layer_ids else row
+            for layer_id, row in enumerate(old_layout)
+        ]
+        metadata = _metadata(old_layout, ep_size=4, nnodes=1, moe_ep_rank=0)
+
+        def assert_lookups_match(layout):
+            for layer_id, row in enumerate(layout):
+                for logical_expert_id in range(metadata.num_logical_experts):
+                    self.assertEqual(
+                        metadata.logical_to_all_physical(layer_id, logical_expert_id),
+                        [
+                            slot
+                            for slot, expert in enumerate(row)
+                            if expert == logical_expert_id
+                        ],
+                        f"{layer_id=} {logical_expert_id=}",
+                    )
+
+        # Look up before update() too, so that a stale table would show.
+        assert_lookups_match(old_layout)
+        metadata.update(
+            _metadata(new_layout, ep_size=4, nnodes=1, moe_ep_rank=0),
+            update_layer_ids=update_layer_ids,
+        )
+        self.assertEqual(metadata.physical_to_logical_map_cpu.tolist(), expected_layout)
+        assert_lookups_match(expected_layout)
+
+    def test_lookup_follows_writes_that_bypass_update(self):
+        for inference in (False, True):
+            with self.subTest(inference=inference):
+                # Inference tensors are written in inference mode, looked up outside it.
+                with torch.inference_mode(inference):
+                    metadata = _metadata(
+                        LATIN_SQUARE, ep_size=2, nnodes=1, moe_ep_rank=0
+                    )
+                self.assertEqual(metadata.logical_to_all_physical(0, 3), [3])
+                with torch.inference_mode(inference):
+                    metadata.physical_to_logical_map_cpu[0][0] = 3
+                self.assertEqual(metadata.logical_to_all_physical(0, 3), [0, 3])
+                with torch.inference_mode(inference):
+                    metadata.physical_to_logical_map_cpu[0, 1] = 4
+                self.assertEqual(metadata.logical_to_all_physical(0, 3), [0, 3])
+
+    def test_lookup_follows_a_new_map_or_expert_count(self):
+        """A new map storage, map tensor or expert count shows in the next lookup."""
+        metadata = _metadata(LATIN_SQUARE, ep_size=2, nnodes=1, moe_ep_rank=0)
+        self.assertEqual(metadata.logical_to_all_physical(0, 3), [3])
+        # New storage under the same tensor object; its version count stays.
+        metadata.physical_to_logical_map_cpu.data = torch.tensor([[3, 1, 2, 0]] * 4)
+        self.assertEqual(metadata.logical_to_all_physical(0, 3), [0])
+        # Another tensor over the same storage, at the same version count.
+        metadata.physical_to_logical_map_cpu = metadata.physical_to_logical_map_cpu.t()
+        self.assertEqual(metadata.logical_to_all_physical(0, 3), [0, 1, 2, 3])
+        metadata.logical_to_all_physical_map = torch.full((4, 5, 4), -1)
+        self.assertEqual(metadata.logical_to_all_physical(0, 4), [])
+        # The map turns into an inference tensor, whose writes leave _version as it is.
+        with torch.inference_mode():
+            metadata.physical_to_logical_map_cpu.data = torch.tensor(LATIN_SQUARE)
+        self.assertEqual(metadata.logical_to_all_physical(0, 3), [3])
+        with torch.inference_mode():
+            metadata.physical_to_logical_map_cpu[0, 0] = 3
+        self.assertEqual(metadata.logical_to_all_physical(0, 3), [0, 3])
+
+    def test_lookup_follows_swapped_tensors(self):
+        """Lookups follow a swapped map, including swaps that overlap a lookup."""
+        metadata = _metadata(LATIN_SQUARE, ep_size=2, nnodes=1, moe_ep_rank=0)
+        cpu_map = metadata.physical_to_logical_map_cpu
+        for _ in range(3):
+            cpu_map[0, 1] = 1  # same values, a higher version count
+        self.assertEqual(metadata.logical_to_all_physical(0, 3), [3])
+        # The alias shares the storage but has an independent version counter.
+        alias = copy.copy(cpu_map.t())
+        self.assertLess(alias._version, cpu_map._version)
+        torch.utils.swap_tensors(cpu_map, alias)
+        self.assertEqual(metadata.logical_to_all_physical(0, 3), [1])
+        # Simulate a swap to an inference tensor right after the inference check.
+        with torch.inference_mode():
+            torch.utils.swap_tensors(cpu_map, torch.tensor(LATIN_SQUARE))
+        checks = iter([False])
+        with mock.patch.object(cpu_map, "is_inference", lambda: next(checks, True)):
+            self.assertEqual(metadata.logical_to_all_physical(0, 3), [3])
+
+    def test_write_during_a_build_shows_in_the_next_lookup(self):
+        """A write that overlaps one lookup shows in the next lookup."""
+        metadata = _metadata(SAME_RANK_REPLICAS, ep_size=2, nnodes=1, moe_ep_rank=0)
+        cpu_map = metadata.physical_to_logical_map_cpu
+        writes = []
+
+        def write_once():
+            if not writes:
+                writes.append(3)
+                cpu_map[0, 0] = 3
+
+        def snapshot_then_write():
+            rows = torch.Tensor.tolist(cpu_map)
+            write_once()
+            return rows
+
+        with mock.patch.object(cpu_map, "tolist", snapshot_then_write):
+            # A lookup that overlaps the write may see either map.
+            self.assertIn(metadata.logical_to_all_physical(0, 3), ([3, 4], [0, 3, 4]))
+        write_once()
+        self.assertEqual(metadata.logical_to_all_physical(0, 3), [0, 3, 4])
+
+    def test_lookup_on_a_copy_follows_the_copy(self):
+        """A copied or unpickled object's lookups follow its own map."""
+        copiers = {
+            "deepcopy": copy.deepcopy,
+            "pickle": lambda metadata: pickle.loads(pickle.dumps(metadata)),
+        }
+        for name, copier in copiers.items():
+            with self.subTest(name):
+                metadata = _metadata(
+                    SAME_RANK_REPLICAS, ep_size=2, nnodes=1, moe_ep_rank=0
+                )
+                for _ in range(2):  # the copy below reaches the same version count
+                    metadata.physical_to_logical_map_cpu[0, 5] = 0
+                # Force an address collision between the original and the copied map.
+                with mock.patch.object(
+                    metadata.physical_to_logical_map_cpu, "data_ptr", return_value=1
+                ):
+                    self.assertEqual(metadata.logical_to_all_physical(0, 3), [3, 4])
+                copied = copier(metadata)
+                copied.physical_to_logical_map_cpu[0, 0] = 3
+                with mock.patch.object(
+                    copied.physical_to_logical_map_cpu, "data_ptr", return_value=1
+                ):
+                    self.assertEqual(copied.logical_to_all_physical(0, 3), [0, 3, 4])
 
     def test_loader_fills_every_local_slot_with_its_expert(self):
         """Every slot a rank stores gets the expert the layout puts there,
@@ -355,17 +515,37 @@ class TestExpertLocationWeightLoading(CustomTestCase):
         self.assertEqual(int(metadata.logical_to_all_physical_map[0, 3, 0]), 3)
 
     def test_fallbacks_and_bounds(self):
-        metadata = _metadata(SAME_RANK_REPLICAS, ep_size=2, nnodes=1, moe_ep_rank=0)
-        num_layers = len(SAME_RANK_REPLICAS)
-        # A draft layer beyond the expert map loads the identity slot.
-        self.assertEqual(metadata.logical_to_all_physical(num_layers, 3), [3])
-        self.assertEqual(
-            metadata.logical_to_all_physical(0, 1, require_global_experts=True),
-            [1, 5],
-        )
-        for bad_id in (metadata.num_logical_experts, -1):
-            with self.subTest(bad_id=bad_id), self.assertRaises(IndexError):
-                metadata.logical_to_all_physical(0, bad_id)
+        for inference in (False, True):
+            with self.subTest(inference=inference):
+                with torch.inference_mode(inference):
+                    metadata = _metadata(
+                        SAME_RANK_REPLICAS, ep_size=2, nnodes=1, moe_ep_rank=0
+                    )
+                num_layers = len(SAME_RANK_REPLICAS)
+                # Draft layers beyond the expert map load the identity slot.
+                for layer_id in (num_layers, num_layers + 1):
+                    self.assertEqual(metadata.logical_to_all_physical(layer_id, 3), [3])
+                self.assertEqual(
+                    metadata.logical_to_all_physical(
+                        num_layers, 0, require_global_experts=True
+                    ),
+                    [0, 4],
+                )
+                self.assertEqual(
+                    metadata.logical_to_all_physical(0, 1, require_global_experts=True),
+                    [1, 5],
+                )
+                self.assertEqual(
+                    metadata.logical_to_all_physical(0, 4, require_global_experts=True),
+                    [4],
+                )
+                for bad_id in (metadata.num_logical_experts, -1, -2):
+                    with self.subTest(bad_id=bad_id), self.assertRaises(IndexError):
+                        metadata.logical_to_all_physical(0, bad_id)
+                # Negative layer ids count from the end, as rows of the map do.
+                self.assertEqual(metadata.logical_to_all_physical(-1, 3), [3, 4])
+                with self.assertRaises(IndexError):
+                    metadata.logical_to_all_physical(-num_layers - 1, 3)
 
 
 if __name__ == "__main__":
