@@ -32,7 +32,8 @@
 
 # Adapted from OpenMOSS-Team/MOSS-Image-Base, revision 355120bd6b44ff67b8df18f57e40b928fc886cd3.
 
-import msgspec
+from dataclasses import dataclass
+
 import torch
 from torch import nn
 
@@ -96,13 +97,15 @@ def validate_skip_layers(skip_layers, num_layers):
     return skip_layers
 
 
-class _ConditioningGroup(msgspec.Struct, frozen=True):
+@dataclass(frozen=True, slots=True)
+class _ConditioningGroup:
     indices: torch.Tensor | None
     text: torch.Tensor
     rope: tuple[torch.Tensor, torch.Tensor]
 
 
-class MOSSImageConditioning(msgspec.Struct, frozen=True):
+@dataclass(frozen=True, slots=True)
+class MOSSImageConditioning:
     """Refined text and RoPE owned by one request and one CFG branch."""
 
     spatial_shape: tuple[int, int]
