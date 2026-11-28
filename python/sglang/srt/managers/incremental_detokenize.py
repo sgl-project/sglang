@@ -68,6 +68,35 @@ def find_printable_text(text: str):
         return text[: text.rfind(" ") + 1]
 
 
+def _new_text_start(surr_text: str, read_text: str) -> int:
+    # Byte-fallback decoders (e.g. Gemma) emit one U+FFFD per dangling byte;
+    # skip the chars those bytes form and the straddling one, as byte-level BPE does.
+    end = len(surr_text)
+    if not surr_text.endswith("�"):
+        return end
+    pos = len(surr_text.rstrip("�"))
+    if read_text[:pos] != surr_text[:pos]:
+        return end
+    # U+FFFDs that the new ids left in place stay invalid; keep skipping them.
+    while pos < end and pos < len(read_text) and read_text[pos] == "�":
+        pos += 1
+    if pos == end or pos == len(read_text):
+        return end
+    # Each remaining U+FFFD stands for at least one dangling byte.
+    dangling = end - pos
+    while pos < len(read_text) and dangling > 0:
+        num_bytes = len(read_text[pos].encode("utf-8"))
+        if num_bytes > dangling:
+            return pos + 1
+        dangling -= num_bytes
+        pos += 1
+    return pos
+
+
+def _completes_split_char(surr_text: str, read_text: str) -> bool:
+    return surr_text.endswith("�") and not read_text.startswith(surr_text)
+
+
 class DetokenizeHeader(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):
@@ -213,7 +242,9 @@ class DetokenizeState(msgspec.Struct):
         trim_matched_stop: Callable,
     ) -> str:
         """Advance by one row's decoded texts; return the text to send."""
-        new_text = read_text[len(surr_text) :]
+        new_text = read_text[
+            _new_text_start(surr_text=surr_text, read_text=read_text) :
+        ]
         if finished_reason is None:
             # Streaming. Invariant: sent_offset >= decoded_text_len. The
             # gap (`pending`) is "printable but uncommitted" text emitted
@@ -223,7 +254,10 @@ class DetokenizeState(msgspec.Struct):
             if new_text and not new_text.endswith("�"):
                 # Clean text: commit to decoded_text and advance offsets.
                 self.append_decoded_text(new_text)
-                self.surr_offset = self.read_offset
+                # If this step completed a character that read_offset splits, a
+                # window starting there decodes a byte-fallback run as U+FFFD.
+                if not _completes_split_char(surr_text=surr_text, read_text=read_text):
+                    self.surr_offset = self.read_offset
                 self.read_offset = len(self.decode_ids)
                 self.sent_offset = self.decoded_text_len
                 return new_text[pending:] if pending else new_text
