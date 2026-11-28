@@ -2,6 +2,7 @@
 import asyncio
 import json
 import math
+import sys
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -340,6 +341,43 @@ def test_sensenova_u1_right_aligns_bnsd_prefix_for_npu_fia():
         [3, 4, 5, 6, 7],
     ]
     assert destination[:, :, 5:].eq(0).all()
+
+
+def test_sensenova_u1_npu_rotary_mul_uses_half_layout(monkeypatch):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+        modeling_qwen3,
+    )
+
+    q = torch.arange(24, dtype=torch.float16).reshape(1, 2, 3, 4)
+    k = q + 1
+    cos = torch.full((1, 3, 4), 0.5, dtype=torch.float16)
+    sin = torch.full((1, 3, 4), 0.25, dtype=torch.float16)
+    calls = []
+
+    def fake_rotary_mul(x, cos_arg, sin_arg, rotary_mode):
+        assert rotary_mode == "half"
+        assert cos_arg.shape == sin_arg.shape == (1, 1, 3, 4)
+        calls.append(x)
+        return x * cos_arg + modeling_qwen3.rotate_half(x) * sin_arg
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch_npu",
+        SimpleNamespace(npu_rotary_mul=fake_rotary_mul),
+    )
+    monkeypatch.setattr(modeling_qwen3, "_SENSENOVA_NPU_ROTARY_MUL_DISABLED", False)
+    monkeypatch.setattr(
+        modeling_qwen3, "_can_use_sensenova_npu_fused_rope", lambda *_: True
+    )
+    actual = modeling_qwen3.apply_rotary_pos_emb(q, k, cos, sin)
+    expected = (
+        q * cos.unsqueeze(1) + modeling_qwen3.rotate_half(q) * sin.unsqueeze(1),
+        k * cos.unsqueeze(1) + modeling_qwen3.rotate_half(k) * sin.unsqueeze(1),
+    )
+
+    assert len(calls) == 2
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
 
 
 @torch.no_grad()
