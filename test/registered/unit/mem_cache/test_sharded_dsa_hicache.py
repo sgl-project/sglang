@@ -43,7 +43,9 @@ class TestShardedDSAHiCache(CustomTestCase):
         events = []
         start = Mock()
         start.record.side_effect = lambda: events.append("fence")
-        producer = SimpleNamespace(start_event=start, complete=Mock())
+        producer = SimpleNamespace(
+            start_event=start, complete=Mock(), attach_submission=Mock()
+        )
         indices = torch.arange(64)
         transfers = [object()]
         completion = SimpleNamespace(
@@ -63,7 +65,7 @@ class TestShardedDSAHiCache(CustomTestCase):
             events.append("submit")
             self.assertIs(actual, transfers)
             self.assertIs(kwargs["start_event"], start)
-            return completion
+            return SimpleNamespace(completion=completion)
 
         cc = SimpleNamespace(
             load_queue=[CacheOperation(indices, indices, node_id=7)],
@@ -74,7 +76,7 @@ class TestShardedDSAHiCache(CustomTestCase):
             _move_op_indices=prepare,
             _l2_load_transfers=describe,
             load_fence_stream=None,
-            l2_transfer_engine=SimpleNamespace(submit_host_to_device=submit),
+            l2_transfer_engine=SimpleNamespace(begin_host_to_device=submit),
             transfer_layer_id_max=3,
             mem_pool_device_allocator=Mock(),
             kv_storage=None,

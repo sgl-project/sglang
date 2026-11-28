@@ -43,7 +43,8 @@ class TestHiCacheGraphEvents(unittest.TestCase):
                 SimpleNamespace(
                     load_events=[
                         SimpleNamespace(cuda_event=1000 + s * 10 + i) for i in range(6)
-                    ]
+                    ],
+                    finish_submission=lambda: None,
                 )
                 for s in range(3)
             ],

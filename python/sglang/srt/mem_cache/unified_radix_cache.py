@@ -4346,6 +4346,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Async Event Management ----
 
+    def _count_ready_load_acks(self, cc) -> int:
+        # A load's finish event is recorded only once all its layers are enqueued.
+        cc.finish_load_submissions()
+        return self._count_ready_acks(cc.ack_load_queue)
+
     def _count_ready_acks(self, ack_queue) -> int:
         ready_count = 0
         for ack in ack_queue:
@@ -4371,7 +4376,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         else:
             write_acks = self._count_ready_acks(cc.ack_write_queue)
-            load_acks = self._count_ready_acks(cc.ack_load_queue)
+            load_acks = self._count_ready_load_acks(cc)
             storage_queue_sizes = (
                 (
                     cc.prefetch_hit_queue.qsize(),
@@ -4566,7 +4571,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # diverge across ranks.
             finish_count = 0
             if self.pp_rank == 0:
-                finish_count = self._count_ready_acks(cc.ack_load_queue)
+                finish_count = self._count_ready_load_acks(cc)
             # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
             # equal iff reclaim victim order matched on every rank.
             digest = self.tree_core.write_back_duplicate_reclaim_digest
@@ -4825,10 +4830,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if consumer_index < 0 or self.cache_controller is None:
             return True
 
-        finish_event = self.cache_controller.layer_done_counter.events[
-            consumer_index
-        ].finish_event
-        return finish_event.query()
+        event = self.cache_controller.layer_done_counter.events[consumer_index]
+        event.finish_submission()
+        return event.finish_event.query()
 
     def has_free_load_back_slot(self) -> bool:
         """Acks are reaped in lockstep, so every rank agrees on this."""

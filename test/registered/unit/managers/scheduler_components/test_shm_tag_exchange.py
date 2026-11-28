@@ -58,6 +58,7 @@ def _hicache_tp_rank(rank: int, extra_pools: int) -> UnifiedRadixCache:
     cache.cache_controller = SimpleNamespace(
         ack_write_queue=[ready] * counts[0],
         ack_load_queue=[ready] * counts[1],
+        finish_load_submissions=lambda: None,
         prefetch_hit_queue=queues[0],
         ack_prefetch_queue=queues[1],
         ack_backup_queue=queues[2],

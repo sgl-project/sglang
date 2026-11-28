@@ -50,7 +50,11 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     plan_unified_kv,
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
-from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.l2_transfer import (
+    L2Transfer,
+    L2TransferEngine,
+    LayerwiseHostToDevice,
+)
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
@@ -80,17 +84,38 @@ def storage_model_name(
     return "-".join(part for part in parts if part)
 
 
+# Layers a load-back keeps enqueued ahead of the forward's reads.
+_LOAD_LAYER_WINDOW = 2
+
+
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
         self.load_events = [device_module.Event() for _ in range(num_layers)]
         self.start_event = device_module.Event()  # start event on controller stream
+        self._submission: Optional[LayerwiseHostToDevice] = None
 
     def complete(self, layer_index: int):
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
 
+    def attach_submission(self, submission: LayerwiseHostToDevice):
+        submission.advance(_LOAD_LAYER_WINDOW)
+        self._submission = None if submission.finished else submission
+
+    def finish_submission(self):
+        """Enqueue all remaining layers; call before reading the events directly."""
+        if self._submission is not None:
+            self._submission.finish()
+            self._submission = None
+
     def wait(self, layer_index: int):
+        if self._submission is not None:
+            # A wait on an event not yet recorded this round passes on its
+            # previous record and reads stale KV: enqueue the layer first.
+            self._submission.advance(layer_index + 1 + _LOAD_LAYER_WINDOW)
+            if self._submission.finished:
+                self._submission = None
         device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property
@@ -107,7 +132,12 @@ class LayerDoneCounter:
         self.producer_index = -1
         self.consumer_index = -1
 
+    def finish_submissions(self):
+        for event in self.events:
+            event.finish_submission()
+
     def update_producer(self):
+        self.finish_submissions()
         self.producer_index = (self.producer_index + 1) % self.num_counters
         assert self.events[self.producer_index].finish_event.query(), (
             "Producer finish event should be ready before being reused."
@@ -1060,6 +1090,7 @@ class HiCacheController:
         # Reuse detach's queue wakeups and bounded joins, and fail if any
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
+        self.finish_load_submissions()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -1245,6 +1276,10 @@ class HiCacheController:
     ) -> list[L2Transfer]:
         return self._l2_transfers(host_indices, device_indices, pool_transfers)
 
+    def finish_load_submissions(self) -> None:
+        """Enqueue all pending load-back layers before reading load events."""
+        self.layer_done_counter.finish_submissions()
+
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:
             return -1
@@ -1267,12 +1302,18 @@ class HiCacheController:
         transfers = self._l2_load_transfers(
             host_indices, device_indices, pool_transfers
         )
-        completion = self.l2_transfer_engine.submit_host_to_device(
+        submission = self.l2_transfer_engine.begin_host_to_device(
             transfers,
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             transfer_layer_id_max=self.transfer_layer_id_max,
         )
+        if self.kv_storage is None:
+            producer_event.attach_submission(submission)
+        else:
+            # Page moves order on the finish event, so it must be recorded now.
+            submission.finish()
+        completion = submission.completion
 
         if self.kv_storage is not None:
             self.kv_storage.record_host_transfer(
