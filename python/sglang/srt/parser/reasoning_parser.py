@@ -138,6 +138,48 @@ class BaseReasoningFormatDetector:
             ret.normal_text, ret.reasoning_text = ret.reasoning_text, ret.normal_text
         return ret
 
+    def _is_inline_code_think_end(
+        self, text: str, idx: int, preceded_by: str = ""
+    ) -> bool:
+        """True when think_end_token at idx is wrapped in matching backticks.
+
+        Models quoting the closer mid-CoT (e.g. `` `</think>` ``) produce a
+        mention, not a delimiter — same idea as tool_start_at_line_start
+        ignoring mid-sentence tool tags (#48791). `preceded_by` is the
+        character already streamed just before `text`, so a backtick emitted
+        on the previous chunk still counts.
+        """
+        end = idx + len(self.think_end_token)
+        prev = text[idx - 1] if idx > 0 else preceded_by
+        return prev == "`" and end < len(text) and text[end] == "`"
+
+    def _find_structural_think_end(
+        self,
+        text: str,
+        *,
+        preceded_by: str = "",
+        undecided_at_eof: bool = False,
+    ) -> int:
+        """Index of the first structural think_end_token, or -1.
+
+        Skips inline-code mentions. With undecided_at_eof (streaming), also
+        skips a backtick-prefixed token that sits at EOF so the next chunk
+        can still supply the closing backtick.
+        """
+        token = self.think_end_token
+        idx = text.find(token)
+        while idx != -1:
+            end = idx + len(token)
+            if self._is_inline_code_think_end(text, idx, preceded_by):
+                idx = text.find(token, end)
+                continue
+            prev = text[idx - 1] if idx > 0 else preceded_by
+            if undecided_at_eof and prev == "`" and end == len(text):
+                # Opening backtick present; wait for the next character.
+                break
+            return idx
+        return -1
+
     def _find_tool_start(self, text: str, preceded_by: str = "") -> int:
         """Index of the first tool_start_token that interrupts reasoning, or -1.
 
@@ -176,7 +218,9 @@ class BaseReasoningFormatDetector:
         while processed_text.startswith(think_start_text):
             processed_text = processed_text[len(think_start_text) :]
 
-        end_idx = processed_text.find(self.think_end_token)
+        # First structural closer ends reasoning; later tags (quoted or not)
+        # stay in content. Inline-code mentions are skipped (#48791).
+        end_idx = self._find_structural_think_end(processed_text)
         if self.think_end_token not in self.previous_content:
             # Check for tool_start_token interruption. A marker before the think end
             # still ends the block: streaming and the grammar cannot see that end yet.
@@ -196,12 +240,9 @@ class BaseReasoningFormatDetector:
 
         # Extract reasoning content
         if end_idx != -1:
-            splits = processed_text.split(self.think_end_token, maxsplit=1)
-            reasoning_text = splits[0]
-            normal_text = splits[1]
-
             return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text
+                normal_text=processed_text[end_idx + len(self.think_end_token) :],
+                reasoning_text=processed_text[:end_idx],
             )
         else:
             # think_end_token is in self.previous_content for continue_final_message=True case
@@ -249,7 +290,16 @@ class BaseReasoningFormatDetector:
             self.stripped_think_start = True
             self._in_reasoning = True
 
-        end_idx = current_text.find(self.think_end_token) if self._in_reasoning else -1
+        # Same structural rule as non-streaming: inline-code mentions are skipped.
+        end_idx = (
+            self._find_structural_think_end(
+                current_text,
+                preceded_by=self._streamed_reasoning_tail,
+                undecided_at_eof=True,
+            )
+            if self._in_reasoning
+            else -1
+        )
         tool_idx = (
             self._find_tool_start(current_text, self._streamed_reasoning_tail)
             if self._in_reasoning
@@ -271,7 +321,8 @@ class BaseReasoningFormatDetector:
 
         # Continue with reasoning content
         if self._in_reasoning:
-            # Check for tool_start_token interruption
+            # Check for tool_start_token interruption. Streaming cannot see a
+            # think_end_token that has not arrived yet; see the chunk_dependent test.
             if tool_idx != -1:
                 reasoning_text = current_text[:tool_idx]
                 # Preserve tool_start_token in normal text
@@ -293,6 +344,19 @@ class BaseReasoningFormatDetector:
                     self._ends_with_partial_token(current_text, token)
                     for token in holdback_tokens
                 )
+                # Backtick + full end token at EOF may still become an inline-code
+                # mention once the closing backtick arrives; keep that suffix.
+                quote_suffix = "`" + self.think_end_token
+                if current_text.endswith(quote_suffix):
+                    holdback = max(holdback, len(quote_suffix))
+                # Opening backtick was already streamed: hold a leading end token
+                # until one more character arrives to accept or reject a mention.
+                if (
+                    self._streamed_reasoning_tail == "`"
+                    and current_text.startswith(self.think_end_token)
+                    and len(current_text) == len(self.think_end_token)
+                ):
+                    holdback = max(holdback, len(current_text))
                 self._buffer = current_text[len(current_text) - holdback :]
                 reasoning_text = current_text[: len(current_text) - holdback]
                 if reasoning_text:
