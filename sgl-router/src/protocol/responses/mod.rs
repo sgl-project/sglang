@@ -206,6 +206,39 @@ pub(crate) fn message_item(id: &str, text: &str, status: &str) -> Value {
     })
 }
 
+/// Allocate a response-scoped identifier for matching tool results on replay.
+#[derive(Default)]
+pub(crate) struct CallIds(std::collections::HashSet<String>);
+
+impl CallIds {
+    pub(crate) fn allocate(&mut self, upstream: Option<&str>) -> String {
+        if let Some(id) = upstream {
+            if self.0.insert(id.to_owned()) {
+                return id.to_owned();
+            }
+            // Some templates replay numbered call IDs. Keep the prefix and use
+            // the next free number when a worker repeats one.
+            if let Some((prefix, suffix)) = id.rsplit_once(':') {
+                if let Ok(mut n) = suffix.parse::<u64>() {
+                    while let Some(next) = n.checked_add(1) {
+                        let candidate = format!("{prefix}:{next}");
+                        if self.0.insert(candidate.clone()) {
+                            return candidate;
+                        }
+                        n = next;
+                    }
+                }
+            }
+        }
+        loop {
+            let id = new_id("call");
+            if self.0.insert(id.clone()) {
+                return id;
+            }
+        }
+    }
+}
+
 /// A tool call output item; `name` is the chat function name, mapped back to
 /// the declared tool.
 pub(crate) fn call_item(
