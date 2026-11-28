@@ -1,3 +1,4 @@
+import functools
 import heapq
 import logging
 import math
@@ -135,6 +136,12 @@ def _get_jinja_env():
     )
 
 
+@functools.lru_cache(maxsize=32)
+def _get_compiled_jinja_template(chat_template: str):
+    env = _get_jinja_env()
+    return env.from_string(chat_template)
+
+
 def _render_jinja_chat_template(
     chat_template: str,
     *,
@@ -143,8 +150,7 @@ def _render_jinja_chat_template(
     instruct: Optional[str],
 ) -> str:
     """Render a loaded Jinja chat template for Qwen3 reranker prompts (text-only)."""
-    env = _get_jinja_env()
-    template = env.from_string(chat_template)
+    template = _get_compiled_jinja_template(chat_template)
 
     # For text-only template, extract text content
     query_text = query if isinstance(query, str) else _extract_text_from_content(query)
@@ -177,8 +183,7 @@ def _render_vl_jinja_template(
     The template expects `query` and `document` as lists of content parts,
     where each part has a `type` field (text, image, video) and corresponding data.
     """
-    env = _get_jinja_env()
-    template = env.from_string(chat_template)
+    template = _get_compiled_jinja_template(chat_template)
 
     render_kwargs = {
         "query": query,
@@ -187,6 +192,36 @@ def _render_vl_jinja_template(
     if instruct:
         render_kwargs["instruct"] = instruct
     return template.render(**render_kwargs)
+
+
+def _has_valid_multimodal_content(content: RerankContent) -> bool:
+    """Return True if a multimodal content list contains at least one non-empty part."""
+    if isinstance(content, str):
+        return bool(content.strip())
+    for part in content:
+        if isinstance(part, ChatCompletionMessageContentTextPart):
+            if part.text and part.text.strip():
+                return True
+        elif isinstance(part, ChatCompletionMessageContentImagePart):
+            if part.image_url and part.image_url.url and part.image_url.url.strip():
+                return True
+        elif isinstance(part, ChatCompletionMessageContentVideoPart):
+            if part.video_url and part.video_url.url and part.video_url.url.strip():
+                return True
+        elif isinstance(part, dict):
+            part_type = part.get("type")
+            if part_type == "text":
+                text = part.get("text", "")
+                if isinstance(text, str) and text.strip():
+                    return True
+            elif part_type in ("image_url", "video_url"):
+                media_obj = part.get(part_type, {})
+                url = (
+                    media_obj.get("url") if isinstance(media_obj, dict) else media_obj
+                )
+                if isinstance(url, str) and url.strip():
+                    return True
+    return False
 
 
 def _extract_text_from_content(content: RerankContent) -> str:
@@ -227,9 +262,8 @@ class OpenAIServingRerank(OpenAIServingBase):
         if not request.query:
             return "Query cannot be empty"
 
-        if isinstance(request.query, str):
-            if not request.query.strip():
-                return "Query cannot be empty or whitespace only"
+        if not _has_valid_multimodal_content(request.query):
+            return "Query cannot be empty or whitespace only"
 
         if not request.documents:
             return "Documents cannot be empty"
@@ -237,7 +271,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         for doc in request.documents:
             if not doc:
                 return "Each document must be a non-empty string"
-            if isinstance(doc, str) and not doc.strip():
+            if not _has_valid_multimodal_content(doc):
                 return "Each document cannot be empty or whitespace only"
 
         return None
@@ -535,11 +569,15 @@ class OpenAIServingRerank(OpenAIServingBase):
     def _extract_score_from_logprobs(self, ret: Dict[str, Any]) -> float:
         """Extract reranking score from generation response with logprobs."""
         # Get logprobs from the response
-        meta_info = ret.get("meta_info", {})
-        output_top_logprobs = meta_info.get("output_top_logprobs", [])
+        meta_info = ret.get("meta_info") or {}
+        output_top_logprobs = meta_info.get("output_top_logprobs") or []
 
         # Use output_top_logprobs[0] - the model's prediction for the first generated token
-        top_logprobs = output_top_logprobs[0] if output_top_logprobs else []
+        top_logprobs = (
+            output_top_logprobs[0]
+            if output_top_logprobs and output_top_logprobs[0] is not None
+            else []
+        )
 
         # Find yes and no token probabilities
         # Format: list of tuples (logprob, token_id, token_text)
