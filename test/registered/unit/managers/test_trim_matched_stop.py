@@ -71,6 +71,13 @@ class TestTrimMatchedStop(unittest.TestCase):
             [1, 2, GPT_OSS_CALL_TOKEN],
         )
 
+    def test_regex_span_trims_and_no_stop_trim_keeps_it(self):
+        # The scheduler stores the matched span ("42"), not the pattern "[0-9]+".
+        self.assertEqual(_trim("answer 42", "42", False), "answer ")
+        self.assertEqual(_trim("answer 42", "42", True), "answer 42")
+        # A literal search for the pattern itself cannot trim the number.
+        self.assertEqual(_trim("answer 42", "[0-9]+", False), "answer 42")
+
     def test_token_tool_close_kept(self):
         self.assertEqual(_trim([1, 2, 3], 3, False, tool_close=[3]), [1, 2, 3])
         self.assertEqual(_trim([1, 2, 4], 4, False, tool_close=[3]), [1, 2])
