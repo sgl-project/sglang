@@ -649,3 +649,75 @@ async fn decode_group_and_invalid_configuration_are_rejected() {
     ));
     assert!(BucketResolver::new(vec![pd(policy, load)]).is_ok());
 }
+
+#[tokio::test]
+async fn remembered_media_placement_is_a_hit_below_the_token_floor() {
+    const IMAGE: u32 = 9_999;
+    let prompt: Vec<u32> = vec![
+        1,
+        2,
+        3,
+        IMAGE,
+        sgl_router::tokenizer::MEDIA_TAG_MARK,
+        50,
+        51,
+        60,
+        61,
+        62,
+    ];
+    // The owner is busier, so load alone would pick the other engine.
+    let owner = engine("owner", 5);
+    let other = engine("other", 0);
+    let provider = |remember: bool| {
+        let tree = Arc::new(HashTree::new());
+        tree.media().enable(Duration::from_secs(1_800));
+        tree.media_ranks().enable(Duration::from_secs(1_800));
+        tree.set_media_tokens(vec![IMAGE]);
+        let hashes = compute_block_hashes(&prompt, 1);
+        for (worker, depth) in [(&owner, 3), (&other, 2)] {
+            tree.insert(
+                &KvWorkerId::new(worker.url.clone(), 0),
+                None,
+                &hashes[..depth],
+            );
+        }
+        let provider = RadixTreePrefixProvider::new(tree, oracle());
+        if remember {
+            // Turn 1 went to the owner.
+            let first = provider
+                .match_request_tokens(&prompt, &Default::default())
+                .expect("lookup");
+            provider.record_route(&first, &owner.url);
+        }
+        Arc::new(CacheSource::Local(provider))
+    };
+    let model = ModelId("m".into());
+    let engines = [Arc::clone(&owner), Arc::clone(&other)];
+    let request = PickRequest {
+        token_ids: Some(&prompt),
+        ..PickRequest::new(&model, Stage::Plain, 300)
+    };
+    let policy = |source| {
+        CacheAwarePolicy::new(
+            source,
+            EngineReportedLoadTable::new(),
+            AffinityConfig {
+                cache_affinity_min_matched_tokens: Some(1_024),
+                ..config()
+            },
+        )
+        .unwrap()
+    };
+
+    let pick = policy(provider(true))
+        .pick(&engines, &request)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&pick.engine, &owner), "{}", pick.engine.id.0);
+    // No placement remembered: the shared text alone is under the floor.
+    let pick = policy(provider(false))
+        .pick(&engines, &request)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&pick.engine, &other), "{}", pick.engine.id.0);
+}
