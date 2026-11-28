@@ -608,7 +608,9 @@ class Llama4ForConditionalGeneration(nn.Module):
 
         def permute(w: torch.Tensor, n_heads: int):
             attn_in = self.language_model.config.head_dim * n_heads
-            attn_out = self.language_model.config.hidden_size
+            # Columns are hidden_size for BF16 weights, hidden_size / 2 for packed
+            # FP4 weights and hidden_size / 16 for their block scales.
+            attn_out = w.shape[-1]
 
             return (
                 w.view(n_heads, attn_in // n_heads // 2, 2, attn_out)
@@ -619,13 +621,17 @@ class Llama4ForConditionalGeneration(nn.Module):
         modules = name.split(".")
 
         # rotary embeds should be sliced
-        if ("wk" in modules or "k_proj" in modules) and modules[-1] == "weight":
+        # Block scales are per output row, so they take the weight's row order.
+        permuted = modules[-1] == "weight" or (
+            modules[-1] == "weight_scale" and loaded_weight.dim() == 2
+        )
+        if ("wk" in modules or "k_proj" in modules) and permuted:
             if _is_cpu:
                 dim = self.language_model.config.original_total_num_kv_heads
             else:
                 dim = self.language_model.config.num_key_value_heads
             loaded_weight = permute(loaded_weight, dim)
-        elif ("wq" in modules or "q_proj" in modules) and modules[-1] == "weight":
+        elif ("wq" in modules or "q_proj" in modules) and permuted:
             if _is_cpu:
                 dim = self.language_model.config.original_num_attention_heads
             else:
@@ -872,6 +878,18 @@ class Llama4ForConditionalGeneration(nn.Module):
         if transformed_name not in params_dict:
             return True
 
+        if expert_match is None and loaded_weight.dim() == 3:
+            # Fused per-expert block scales ([experts, in/16, out]) share the fused
+            # weights' layout, so they load through the same path.
+            return self._handle_expert_weight_params(
+                name,
+                loaded_weight,
+                params_dict,
+                num_experts,
+                loaded_params,
+                is_weight=False,
+            )
+
         param = params_dict[transformed_name]
 
         # Handle scale parameters
@@ -896,6 +914,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         params_dict: dict,
         num_experts: int,
         loaded_params: set,
+        is_weight: bool = True,
     ) -> bool:
         """Handle actual weight tensors for expert layers (gate_up_proj and down_proj).
 
@@ -911,7 +930,7 @@ class Llama4ForConditionalGeneration(nn.Module):
         """
         # Transform name and get shard info
         transformed_name, _, shard_id_list = self._transform_expert_name(
-            name, is_weight=True
+            name, is_weight=is_weight
         )
 
         if ".gate_up_proj" in name:
