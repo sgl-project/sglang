@@ -947,9 +947,10 @@ class QuarkConfig(QuantizationConfig):
     ) -> dict[str, Any]:
 
         proj_name = layer_name.split(".")[-1]
-        if proj_name in self.packed_modules_mapping:
-            shard_proj_names = self.packed_modules_mapping[proj_name]
-
+        shard_proj_names = self.packed_modules_mapping.get(proj_name)
+        # A projection mapped only to itself (Phi-3's qkv_proj) is one
+        # checkpoint tensor, so it is matched as a leaf instead of recursing.
+        if shard_proj_names and shard_proj_names != [proj_name]:
             # Convert fused_name --> [shard_names]
             shard_names = [
                 layer_name.replace(proj_name, shard_proj_name)
