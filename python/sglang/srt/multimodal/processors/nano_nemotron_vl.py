@@ -19,6 +19,7 @@ from math import sqrt
 import numpy as np
 import torch
 from PIL import Image
+from transformers import ProcessorMixin
 
 from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3_Config,
@@ -55,6 +56,22 @@ DEFAULT_NUM_TILES = 12
 NUM_VIDEO_TILES = 1
 DESIRED_FPS = 2  # TODO: allow desired fps/num frames to be configurable
 MAX_FRAMES = 128
+
+
+def _resolve_video_sizing(*, hf_config, hf_processor) -> tuple[int, bool]:
+    if hf_config.video_target_num_patches > 0 or not isinstance(
+        hf_processor, ProcessorMixin
+    ):
+        return (
+            hf_config.video_target_num_patches,
+            hf_config.video_maintain_aspect_ratio,
+        )
+    # Some checkpoints set the video size only in preprocessor_config.json.
+    preprocessor = hf_processor.image_processor.to_dict()
+    return (
+        preprocessor.get("video_target_num_patches", 0),
+        preprocessor.get("video_maintain_aspect_ratio", True),
+    )
 
 
 def _create_visual_items(
@@ -182,11 +199,8 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         self.video_temporal_patch_size = getattr(
             hf_config, "video_temporal_patch_size", 1
         )
-        self.video_target_num_patches = getattr(
-            hf_config, "video_target_num_patches", 0
-        )
-        self.video_maintain_aspect_ratio = getattr(
-            hf_config, "video_maintain_aspect_ratio", True
+        self.video_target_num_patches, self.video_maintain_aspect_ratio = (
+            _resolve_video_sizing(hf_config=hf_config, hf_processor=self._processor)
         )
 
         self.max_model_len = get_model().context_length or 8192
@@ -347,17 +361,23 @@ class NanoNemotronVLImageProcessor(BaseMultimodalProcessor):
         if T > 1:
             tubelets_per_video = [math.ceil(len(frames) / T) for frames, _ in videos]
             if self.video_target_num_patches > 0 and videos:
-                frame_h, frame_w = videos[0][0][0].shape[:2]
-                target_w, target_h, tokens_per_tubelet = (
+                video_sizes = {
                     get_video_target_size_and_feature_size(
-                        frame_w,
-                        frame_h,
-                        self.video_target_num_patches,
-                        self.video_maintain_aspect_ratio,
-                        self.patch_size,
-                        self.downsample_ratio,
+                        orig_w=frames[0].shape[1],
+                        orig_h=frames[0].shape[0],
+                        target_num_patches=self.video_target_num_patches,
+                        maintain_aspect_ratio=self.video_maintain_aspect_ratio,
+                        patch_size=self.patch_size,
+                        downsample_ratio=self.downsample_ratio,
                     )
-                )
+                    for frames, _ in videos
+                }
+                if len(video_sizes) > 1:
+                    # All videos of a request share one feature tensor and one EVS grid.
+                    raise ValueError(
+                        "Videos in one request must resize to the same frame size"
+                    )
+                target_w, target_h, tokens_per_tubelet = video_sizes.pop()
                 ds = int(1 / self.downsample_ratio)
                 rows = target_h // self.patch_size // ds
                 cols = target_w // self.patch_size // ds
