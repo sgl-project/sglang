@@ -8,6 +8,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.batch_overlap.operations import _StageExecutor
+from sglang.srt.configs.model_config import get_moe_topk_size
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
@@ -213,6 +214,108 @@ class TestCaptureRoutedIdsOnly(CustomTestCase):
         ids = torch.zeros((4, self.TOPK_SIZE - 1), dtype=torch.int32)
         with self.assertRaises(ValueError):
             self._capture(self._capturer(), ids, "none")
+
+
+class TestGetMoeTopkSize(CustomTestCase):
+    def test_known_spellings(self):
+        """Every spelling the scheduler knows must resolve to its value."""
+        self.assertEqual(get_moe_topk_size(SimpleNamespace(num_experts_per_tok=8)), 8)
+        self.assertEqual(get_moe_topk_size(SimpleNamespace(num_experts_per_token=6)), 6)
+        # Gemma 4 calls it top_k_experts.
+        self.assertEqual(get_moe_topk_size(SimpleNamespace(top_k_experts=8)), 8)
+        self.assertEqual(get_moe_topk_size(SimpleNamespace(moe_top_k=4)), 4)
+        # LongCat-2.0 calls it moe_topk.
+        self.assertEqual(get_moe_topk_size(SimpleNamespace(moe_topk=2)), 2)
+
+    def test_first_spelling_wins(self):
+        """Precedence follows MOE_TOPK_ATTRS order, matching the scheduler."""
+        self.assertEqual(
+            get_moe_topk_size(SimpleNamespace(num_experts_per_tok=8, top_k_experts=2)),
+            8,
+        )
+
+    def test_none_spelling_is_skipped(self):
+        """A spelling present but set to None (default-constructed config)
+        is treated as absent, not as a top-k of None."""
+        self.assertEqual(
+            get_moe_topk_size(SimpleNamespace(top_k_experts=None, moe_topk=4)),
+            4,
+        )
+
+    def test_unknown_config_raises_clear_error(self):
+        """No known spelling must fail loudly, not silently default."""
+        with self.assertRaisesRegex(AttributeError, "no per-token routed-expert count"):
+            get_moe_topk_size(SimpleNamespace())
+        with self.assertRaisesRegex(AttributeError, "no per-token routed-expert count"):
+            get_moe_topk_size(SimpleNamespace(top_k_experts=None))
+
+
+class TestCapturerTopkSpelling(CustomTestCase):
+    """The capturer must size its buffers from any known top-k spelling.
+
+    Regression test for #50834: Gemma 4 exposes only ``top_k_experts``,
+    so the old direct ``num_experts_per_tok`` read crashed the server at
+    startup with --enable-return-routed-experts.
+    """
+
+    NUM_LAYERS = 2
+
+    def _capturer(self, hf_text_config):
+        with (
+            get_parallel().override(
+                num_dp_ranks=1,
+                pp_rank=0,
+                pp_size=1,
+                attn_tp_rank=0,
+                attn_tp_size=1,
+                attn_cp_rank=0,
+            ),
+            mock.patch.object(
+                re_mod,
+                "get_schedule",
+                return_value=SimpleNamespace(chunked_prefill_size=8),
+            ),
+            mock.patch.object(
+                re_mod, "get_moe_a2a_backend", return_value=MoeA2ABackend("none")
+            ),
+            mock.patch.object(re_mod, "is_dp_attention_enabled", return_value=True),
+            mock.patch.dict(
+                base_mod.ALLOC_MEMORY_FUNCS,
+                {"cpu": lambda dims, dtype, **_: torch.empty(dims, dtype=dtype)},
+            ),
+        ):
+            return re_mod.RoutedExpertsCapturer(
+                SimpleNamespace(hf_text_config=hf_text_config),
+                num_tokens=8,
+                max_running_requests=2,
+                num_fused_shared_experts=0,
+                stage_start_layer=0,
+                stage_end_layer=self.NUM_LAYERS,
+                device="cpu",
+            )
+
+    def test_gemma4_top_k_experts(self):
+        cap = self._capturer(
+            SimpleNamespace(num_hidden_layers=self.NUM_LAYERS, top_k_experts=8)
+        )
+        self.assertEqual(cap.topk_size, 8)
+        self.assertEqual(cap.device_topk_size, 8)
+
+    def test_moe_topk(self):
+        cap = self._capturer(
+            SimpleNamespace(num_hidden_layers=self.NUM_LAYERS, moe_topk=2)
+        )
+        self.assertEqual(cap.topk_size, 2)
+
+    def test_num_experts_per_tok_unchanged(self):
+        cap = self._capturer(
+            SimpleNamespace(num_hidden_layers=self.NUM_LAYERS, num_experts_per_tok=4)
+        )
+        self.assertEqual(cap.topk_size, 4)
+
+    def test_unknown_spelling_raises(self):
+        with self.assertRaisesRegex(AttributeError, "no per-token routed-expert count"):
+            self._capturer(SimpleNamespace(num_hidden_layers=self.NUM_LAYERS))
 
 
 class TestCapturerWidthFollowsTheInstalledCount(CustomTestCase):
