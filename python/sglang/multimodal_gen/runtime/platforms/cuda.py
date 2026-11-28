@@ -998,7 +998,18 @@ class NvmlCudaPlatform(CudaPlatformBase):
     def log_warnings(cls) -> None:
         device_ids: int = pynvml.nvmlDeviceGetCount()
         if device_ids > 1:
-            device_names = [cls._get_physical_device_name(i) for i in range(device_ids)]
+            # This walks every physical GPU, not only the visible ones, and runs
+            # at import time, so a GPU that cannot be queried (for example one
+            # that has fallen off the bus) must not fail the import over a
+            # diagnostic warning.
+            device_names = []
+            for i in range(device_ids):
+                try:
+                    device_names.append(cls._get_physical_device_name(i))
+                except pynvml.NVMLError as e:
+                    logger.warning(
+                        "Skipping GPU %d in the device consistency check: %s", i, e
+                    )
             if (
                 len(set(device_names)) > 1
                 and os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID"
