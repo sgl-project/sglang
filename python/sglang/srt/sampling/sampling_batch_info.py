@@ -37,10 +37,10 @@ class ProcessorEntry:
 
 
 class SamplingFacts(msgspec.Struct, frozen=True):
-    """Facts over one launch's sampling, derived once; the fast-path gates read
-    them here. The param facts come from the host side of `SamplingParamsPool`
-    (`gather`), the stage facts from the step state (`set_step_state`). The
-    defaults describe a sampled batch with no truncation and no stage."""
+    """Facts over one launch's sampling, derived once. The param facts come from
+    the host side of `SamplingParamsPool` in `gather`, the stage facts from the
+    step state (`set_step_state`). The defaults describe a sampled batch with no
+    truncation and no stage."""
 
     # Every row is greedy (top_k 1); `SamplingRows.empty` sets it for no rows.
     all_greedy: bool = False
@@ -65,7 +65,6 @@ class SamplingFacts(msgspec.Struct, frozen=True):
 
     @property
     def truncates(self) -> bool:
-        """Whether some row truncates its distribution with top-k, top-p, or min-p."""
         return self.need_top_k or self.need_top_p or self.need_min_p
 
     @property
@@ -129,8 +128,7 @@ class SamplingBatchInfo:
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
 
     def set_rows(self, rows: SamplingRows) -> None:
-        """Set the step's state read from its rows of `SamplingParamsPool`: the
-        sampler params, the per-row seeds, the penalties, and the watermark rows."""
+        """Set the step's state from its rows of `SamplingParamsPool`."""
         for name, value in zip(rows._fields, rows):
             setattr(self, name, value)
 

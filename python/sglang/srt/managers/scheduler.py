@@ -1403,7 +1403,6 @@ class Scheduler(
         )
 
     def init_sampling_params_pool(self) -> None:
-        # Built by the model runner before graph capture: draft graphs read its table.
         self.sampling_params_pool = self.tp_worker.model_runner.sampling_params_pool
 
     def init_running_status(self):
