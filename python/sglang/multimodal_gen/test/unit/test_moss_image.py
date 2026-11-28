@@ -14,6 +14,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.moss_image import (
     MOSSImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.moss_image import MOSSImageSamplingParams
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    _flatten_kwargs,
+    _map_tensors,
+    _signature_kwargs,
+)
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.moss_image import (
@@ -513,6 +518,42 @@ def test_prepared_conditioning_matches_steps_and_requests(
                 for tensor in (group.text, *group.rope)
             ]
             assert all(torch.equal(a, b) for a, b in zip(saved, current))
+
+
+def test_graph_inputs_refresh_prepared_conditioning(small_model):
+    def prepare(mask, height=2, width=3):
+        with torch.no_grad(), set_forward_context(0, None):
+            conditioning = small_model.prepare_conditioning(
+                torch.randn(4, 3, 32),
+                torch.tensor(mask),
+                height,
+                width,
+                torch.float32,
+                batch_samples=True,
+            )
+        return {"prepared_conditioning": conditioning}
+
+    mask = [[1, 1, 0], [1, 0, 0], [1, 1, 0], [1, 0, 0]]
+    first = prepare(mask)
+    second = prepare([mask[0], mask[1], mask[3], mask[2]])
+    assert _signature_kwargs(first) == _signature_kwargs(second)
+    assert _signature_kwargs(first) != _signature_kwargs(prepare(mask, 3, 2))
+
+    buffers = _map_tensors(first, torch.clone)
+    leaves = _flatten_kwargs(buffers)
+    # Both groups carry sample indices, refined text and two RoPE tensors.
+    assert len(leaves) == 8
+    for buf, live in zip(leaves, _flatten_kwargs(second), strict=True):
+        assert buf.data_ptr() != live.data_ptr()
+        buf.copy_(live)
+    groups = buffers["prepared_conditioning"].groups
+    for group, expected in zip(
+        groups, second["prepared_conditioning"].groups, strict=True
+    ):
+        assert torch.equal(group.indices, expected.indices)
+        assert torch.equal(group.text, expected.text)
+        for lhs, rhs in zip(group.rope, expected.rope, strict=True):
+            assert torch.equal(lhs, rhs)
 
 
 @pytest.mark.parametrize("skip", [(), (1,)])
