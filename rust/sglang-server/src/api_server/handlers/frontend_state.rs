@@ -4,10 +4,9 @@
 //! scheduler; the peer relay (`forward_control_req`) applies the same
 //! transition here on the other listeners, so the effect is deployment-wide.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
-use tokio::sync::{RwLock, watch};
+use tokio::sync::watch;
 
 use super::handle::CoreMetadata;
 use crate::message::config::DisaggregationMode;
@@ -40,6 +39,17 @@ impl ModelFacts {
     }
 }
 
+pub(super) enum ModelFactsRead {
+    Cached(Arc<ModelFacts>),
+    Refresh(u64),
+}
+
+struct ModelFactsCache {
+    facts: Arc<ModelFacts>,
+    revision: u64,
+    cached_revision: u64,
+}
+
 pub(crate) struct FrontendState {
     /// Python's `is_pause`: generates wait here before admission.
     paused: watch::Sender<bool>,
@@ -50,10 +60,9 @@ pub(crate) struct FrontendState {
     /// Python's `session_futures`: the session ids an `/open_session` is in
     /// flight for, so a second open of the same id is refused meanwhile.
     opening_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// The last facts read, always available; `stale` says a control call
-    /// has run since and the next read should refresh first.
-    facts: RwLock<Arc<ModelFacts>>,
-    stale: AtomicBool,
+    /// Keep the last known facts and their revisions under one lock so
+    /// invalidation and publication are ordered. Never held across an await.
+    model_facts: RwLock<ModelFactsCache>,
 }
 
 impl FrontendState {
@@ -62,8 +71,11 @@ impl FrontendState {
             paused: watch::Sender::new(false),
             update_lock: tokio::sync::Mutex::new(()),
             opening_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
-            facts: RwLock::new(Arc::new(ModelFacts::from_launch(metadata))),
-            stale: AtomicBool::new(false),
+            model_facts: RwLock::new(ModelFactsCache {
+                facts: Arc::new(ModelFacts::from_launch(metadata)),
+                revision: 0,
+                cached_revision: 0,
+            }),
         }
     }
 
@@ -104,29 +116,36 @@ impl FrontendState {
 
     /// Mark the cached facts as possibly changed by a control call.
     pub(super) fn invalidate(&self) {
-        self.stale.store(true, Ordering::Release);
+        self.model_facts.write().unwrap().revision += 1;
     }
 
+    #[cfg(test)]
     pub(super) fn is_stale(&self) -> bool {
-        self.stale.load(Ordering::Acquire)
+        matches!(self.read_facts(), ModelFactsRead::Refresh(_))
     }
 
-    pub(super) async fn cached(&self) -> Arc<ModelFacts> {
-        self.facts.read().await.clone()
-    }
-
-    /// Store freshly read facts and clear `stale`, unless another control
-    /// call invalidated again while the read was in flight.
-    pub(super) async fn store(&self, facts: ModelFacts, read_when_stale: bool) -> Arc<ModelFacts> {
-        let facts = Arc::new(facts);
-        *self.facts.write().await = facts.clone();
-        if read_when_stale {
-            // Cleared only if nobody invalidated between the read and now.
-            let _ = self
-                .stale
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire);
+    pub(super) fn read_facts(&self) -> ModelFactsRead {
+        let cache = self.model_facts.read().unwrap();
+        if cache.revision == cache.cached_revision {
+            ModelFactsRead::Cached(cache.facts.clone())
+        } else {
+            ModelFactsRead::Refresh(cache.revision)
         }
-        facts
+    }
+
+    pub(super) fn cached(&self) -> Arc<ModelFacts> {
+        self.model_facts.read().unwrap().facts.clone()
+    }
+
+    /// Publish only the first successful refresh of the current revision.
+    /// Superseded refreshes return the last known facts.
+    pub(super) fn store(&self, revision: u64, facts: ModelFacts) -> Arc<ModelFacts> {
+        let mut cache = self.model_facts.write().unwrap();
+        if cache.revision == revision && cache.cached_revision != revision {
+            cache.facts = Arc::new(facts);
+            cache.cached_revision = revision;
+        }
+        cache.facts.clone()
     }
 }
 
@@ -231,18 +250,12 @@ mod tests {
         let state = FrontendState::new(&CoreMetadata::default());
         assert!(!state.is_stale());
         state.invalidate();
-        let read_when_stale = state.is_stale();
+        let ModelFactsRead::Refresh(revision) = state.read_facts() else {
+            panic!("invalidated cache must refresh");
+        };
         state.invalidate(); // a second control call lands mid-refresh
-        state
-            .store(
-                ModelFacts::from_launch(&CoreMetadata::default()),
-                read_when_stale,
-            )
-            .await;
-        // `compare_exchange(true -> false)` succeeds here because both calls
-        // left the flag true; a design that counted invalidations would keep
-        // it stale. Pin the actual contract: one refresh clears it.
-        assert!(!state.is_stale());
+        state.store(revision, ModelFacts::from_launch(&CoreMetadata::default()));
+        assert!(state.is_stale());
     }
 
     #[test]
