@@ -3,50 +3,28 @@
 # SPDX-License-Identifier: Apache-2.0
 import argparse
 import dataclasses
-import hashlib
 import json
 import math
 import os
 import os.path
 import re
-import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
-
-
-def _json_safe(obj: Any):
-    """
-    Recursively convert objects to JSON-serializable forms.
-    - Enums -> their name
-    - Callables -> stable module-qualified name
-    - Sets/Tuples -> lists
-    - Dicts/Lists -> recursively processed
-    """
-    if isinstance(obj, Enum):
-        return obj.name
-    if callable(obj):
-        module = getattr(obj, "__module__", None)
-        qualname = getattr(obj, "__qualname__", getattr(obj, "__name__", repr(obj)))
-        return f"{module}.{qualname}" if module else qualname
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_json_safe(v) for v in obj]
-    return obj
 
 
 def generate_request_id() -> str:
@@ -235,6 +213,23 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
+def _floor_to_multiple(size: int, multiple: int) -> int:
+    return max(multiple, size // multiple * multiple)
+
+
+def _round_down_request_size(
+    *, width: int | None, height: int | None, multiple: int
+) -> tuple[int, int] | None:
+    """Round a request size down to ``multiple``; None leaves it unchanged.
+
+    A missing or non-positive side is never rounded up, so request validation still
+    rejects it.
+    """
+    if width is None or height is None or width <= 0 or height <= 0:
+        return None
+    return _floor_to_multiple(width, multiple), _floor_to_multiple(height, multiple)
+
+
 # Arbitrary upper bounds; upscaling_scale squares the pixel count.
 _FRAME_INTERPOLATION_SCALE_RANGE = (0.25, 4.0)
 _MAX_UPSCALING_SCALE = 8
@@ -371,6 +366,13 @@ class SamplingParams:
     # A prompt-free pipeline (e.g. a text-free SR / video-to-video DiT) sets this to
     # ``True`` so the multipart video-generation route does not require ``prompt``.
     prompt_optional: ClassVar[bool] = False
+    # False when a smaller frame count or resolution fails this type's validation,
+    # so warmup probes keep their shape instead of being halved.
+    supports_warmup_lightening: ClassVar[bool] = True
+
+    # A model whose pipeline rejects sizes off its grid names itself here (for the
+    # warning) and overrides _request_size_multiple; None means no alignment rule.
+    _request_size_model_name: ClassVar[str | None] = None
 
     height: int | None = None
     width: int | None = None
@@ -485,36 +487,9 @@ class SamplingParams:
             )
 
     def _set_output_file_name(self):
-        # settle output_file_name
-        if (
-            self.output_file_name is None
-            and self.prompt
-            and isinstance(self.prompt, str)
-        ):
-            # generate a random filename
-            # get a hash of current params
-            params_dict = dataclasses.asdict(self)
-            # Avoid recursion
-            params_dict["output_file_name"] = ""
-
-            # Convert to a stable JSON string
-            params_str = json.dumps(_json_safe(params_dict), sort_keys=True)
-            # Create a hash
-            hasher = hashlib.sha256()
-            hasher.update(params_str.encode("utf-8"))
-            param_hash = hasher.hexdigest()[:8]
-
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            base = f"{self.prompt[:100]}_{timestamp}_{param_hash}"
-            self.output_file_name = base
-
         if self.output_file_name is None:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            self.output_file_name = f"output_{timestamp}"
-
+            self.output_file_name = f"output_{uuid.uuid4().hex}"
         self.output_file_name = _sanitize_filename(self.output_file_name)
-
-        # Ensure a proper extension is present
         self._set_output_file_ext()
 
     def __post_init__(self) -> None:
@@ -534,9 +509,9 @@ class SamplingParams:
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
-        env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
+        env_steps = envs.SGLANG_TEST_NUM_INFERENCE_STEPS
         if env_steps is not None and self.num_inference_steps is not None:
-            self.num_inference_steps = int(env_steps)
+            self.num_inference_steps = env_steps
 
         if self.enable_spectrum and isinstance(self.spectrum_params, dict):
             from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
@@ -646,7 +621,41 @@ class SamplingParams:
         self, req: Any, server_args: Any
     ) -> None:
         """Resolve model-specific facts for one synthetic warmup request."""
-        del req, server_args
+        del req
+        if self._request_size_model_name is not None:
+            # Warmup overwrites the dimensions after _adjust has run.
+            self._align_request_size(server_args.pipeline_config)
+
+    def _request_size_multiple(self, pipeline_config: Any) -> int | None:
+        """The grid request sizes round down to, or None to leave them as is."""
+        del pipeline_config
+        return None
+
+    def _align_request_size(self, pipeline_config: Any) -> None:
+        multiple = self._request_size_multiple(pipeline_config)
+        if multiple is None:
+            return
+        requested_size = (self.width, self.height)
+        aligned_size = _round_down_request_size(
+            width=self.width, height=self.height, multiple=multiple
+        )
+        if aligned_size is None:
+            return
+        self.width, self.height = aligned_size
+        if aligned_size != requested_size:
+            logger.warning(
+                "%s requires dimensions divisible by %s; adjusted requested "
+                "resolution from %sx%s to %sx%s",
+                self._request_size_model_name,
+                multiple,
+                *requested_size,
+                *aligned_size,
+            )
+
+    def request_task(self) -> str | None:
+        """Task name that ``--request-time-limit TASK=SECONDS`` matches, or None
+        for models without named tasks."""
+        return None
 
     def project_video_queued_job_fields(self, req: Any) -> dict[str, str]:
         """Return model-resolved fields to publish with the queued video job."""
@@ -729,7 +738,7 @@ class SamplingParams:
                 f"got {self.x264_preset!r}"
             )
 
-        # Used by seconds() and video writer; fps <= 0 is always invalid.
+        # Used by the video writer; fps <= 0 is always invalid.
         if not isinstance(self.fps, int) or self.fps <= 0:
             raise ValueError(f"fps must be a positive int, got {self.fps!r}")
 
@@ -1064,6 +1073,9 @@ class SamplingParams:
         if not server_args.comfyui_mode:
             self._set_output_file_name()
 
+        # After the output name, which hashes the requested size.
+        self._align_request_size(pipeline_config)
+
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":
         from sglang.multimodal_gen.registry import get_model_info
@@ -1142,16 +1154,26 @@ class SamplingParams:
         if diffusers_kwargs is not None:
             sampling_params.diffusers_kwargs = diffusers_kwargs
         sampling_params._adjust(server_args)
+        # __post_init__ maps the default output_quality before _adjust knows the
+        # data type, so an image got the video default and its PNG the slow
+        # compressed encode instead of the stored one. Only image requests are
+        # touched: action sampling params carry no output quality at all.
+        if (
+            sampling_params.data_type == DataType.IMAGE
+            and user_kwargs.get("output_compression") is None
+            and sampling_params.output_quality is not None
+            and sampling_params.output_compression
+            == sampling_params._adjust_output_quality(
+                sampling_params.output_quality, DataType.VIDEO
+            )
+        ):
+            sampling_params.output_compression = sampling_params._adjust_output_quality(
+                sampling_params.output_quality, DataType.IMAGE
+            )
 
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
 
         return sampling_params
-
-    def output_size_str(self) -> str:
-        return f"{self.width}x{self.height}"
-
-    def seconds(self) -> float:
-        return self.num_frames / self.fps
 
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
@@ -1173,8 +1195,8 @@ class SamplingParams:
             type=str,
             help="Request task (for example t2i, i2i, t2v, i2v, v2v, f2v); must be supported by the pipeline.",
         )
-        # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--use-diffusion-decoder", action="store_true")
+        # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--auto-duration", action="store_true")
         add_argument("--auto-duration-min-seconds", type=float)
         add_argument("--auto-duration-max-seconds", type=float)
@@ -1572,9 +1594,10 @@ class SamplingParams:
         )
         add_argument(
             "--sr-num-steps",
+            action=DeprecatedAction,
+            nargs=None,
             type=int,
-            help="Kandinsky6 SR Euler grid points (>= 2, default: 5); ignored by "
-            "pi-Flow checkpoints.",
+            help="(Deprecated) No effect: Kandinsky6 SR reads --num-inference-steps.",
         )
         add_argument(
             "--sr-tiles-batch-size",
@@ -1658,8 +1681,10 @@ class SamplingParams:
         )
         add_argument(
             "--moba-config-path",
+            action=DeprecatedAction,
+            nargs=None,
             type=str,
-            help="Path to a JSON file containing V-MoBA specific configurations.",
+            help="(Deprecated) No effect: no sampling parameter reads this path.",
         )
         add_argument(
             "--return-trajectory-latents",
@@ -1879,20 +1904,6 @@ class SamplingParams:
         if explicit_fields is not None:
             self._explicit_fields = set(explicit_fields)
         self.__post_init__()
-
-    @property
-    def n_tokens(self) -> int:
-        # Calculate latent sizes
-        if self.height and self.width:
-            latents_size = [
-                (self.num_frames - 1) // 4 + 1,
-                self.height // 8,
-                self.width // 8,
-            ]
-            n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
-        else:
-            n_tokens = -1
-        return n_tokens
 
 
 @dataclass

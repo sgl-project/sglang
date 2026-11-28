@@ -17,8 +17,9 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_gfx95 = is_gfx95_supported()
-# The narrow-tile PTX add below has no AMDGCN form.
-_PTX_NARROW_KDA_ADD = tl.constexpr(not _is_hip)
+# The narrow-tile PTX add below has no AMDGCN form and is CUDA-only;
+# other backends (e.g. Ascend NPU) must keep the generic add.
+_PTX_NARROW_KDA_ADD = tl.constexpr(is_cuda() and not _is_hip)
 _is_sm90 = is_sm90_supported()
 _is_sm103 = is_cuda() and get_device_sm() == 103
 _is_sm107 = is_cuda() and get_device_sm() == 107
@@ -71,6 +72,20 @@ def _select_recurrent_launch_config(
         # Kimi-K3 TP8 (12 heads) gets 48 CTAs at BV=32; tuned on MI355X at n=1 and n=4,
         # where BV=8 is 15.2 vs 19.9 us at n=1, T=8. One warp matches BV=32 bit for bit.
         return 8, 1
+    if (
+        _is_hip
+        and _is_gfx95
+        and is_kda
+        and target_verify
+        and 0 < n <= 16
+        and hv == 16
+        and k == 128
+        and v == 128
+    ):
+        # One wave per program; narrower V tiles widen the grid past the 64
+        # programs of BV=32 at TP4 small batch. Bit-identical across BV. Only
+        # measured at 16 heads per GPU (GLM-5.3-Flash TP4).
+        return (4 if n <= 2 else 8 if n <= 8 else 16), 1
     if (
         target_verify
         and not _is_hip
@@ -252,6 +267,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     USE_GDC: tl.constexpr = False,
     MATCH_CUTEDSL_DECODE: tl.constexpr = False,
     ROUND_STATE_TO_BF16: tl.constexpr = False,
+    ROUND_BETA_TO_INPUT_DTYPE: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -422,6 +438,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             b_beta = b_b
         else:
             b_beta = 1.0 / (1.0 + tl.exp(-b_b))
+            if ROUND_BETA_TO_INPUT_DTYPE:
+                b_beta = b_beta.to(b.dtype.element_ty).to(tl.float32)
 
         # fused ring-write: stash this step's raw inputs + in-kernel gate/beta
         # into the per-slot ring for the commit fold to replay. Must sit here --
@@ -531,7 +549,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         # Update hidden state: h += k[:, None] * v[None, :]
         if MATCH_CUTEDSL_DECODE:
             b_h = tl.fma(b_k[:, None], b_v[None, :], b_h)
-        elif IS_KDA and V == 128 and BV == 4 and _PTX_NARROW_KDA_ADD:
+        elif (IS_KDA and V == 128) and (BV == 4 and _PTX_NARROW_KDA_ADD):
             # The narrow KDA tile keeps the separate FP32 multiply/add rounding.
             b_h = tl.inline_asm_elementwise(
                 "add.rn.f32 $0, $1, $2;",
@@ -633,6 +651,8 @@ def fused_sigmoid_gating_delta_rule_update(
     # decays and updates through FMA, and a BF16 state pool is rounded after
     # every token.
     match_cutedsl_decode: bool = False,
+    # Match the input-dtype sigmoid materialized by packed GDN decode.
+    round_beta_to_input_dtype: bool = False,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -824,6 +844,7 @@ def fused_sigmoid_gating_delta_rule_update(
         SPLIT_N_HV_GRID=split_n_hv_grid,
         MATCH_CUTEDSL_DECODE=match_cutedsl_decode,
         ROUND_STATE_TO_BF16=round_state_to_bf16,
+        ROUND_BETA_TO_INPUT_DTYPE=round_beta_to_input_dtype,
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,

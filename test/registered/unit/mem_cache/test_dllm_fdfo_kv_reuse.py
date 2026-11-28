@@ -144,7 +144,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
     def setUp(self):
         self.block_size = 4
         self.pool = ReqToTokenPool(
-            size=8, max_context_len=64, device="cpu", enable_memory_saver=False
+            size=8, row_width=64, device="cpu", enable_memory_saver=False
         )
         override = get_context().override_server_args(
             attention_backend="torch_native", dcp_size=1
@@ -271,7 +271,7 @@ class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
         release_kv_cache (it only runs for row holders), leaking the request's
         tree lock and any KV the tree does not own."""
         pool = ReqToTokenPool(
-            size=4, max_context_len=16, device="cpu", enable_memory_saver=False
+            size=4, row_width=16, device="cpu", enable_memory_saver=False
         )
         req = SimpleNamespace(
             dllm_incomplete_ids=array("q"),
@@ -362,7 +362,7 @@ class TestDllmCommittedTokens(unittest.TestCase):
             features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
             mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
         )
-        # Allocation and sampling are collaborators; exercise the scheduler's
+        # Allocation is a collaborator; exercise the scheduler's
         # real cache accounting on two revisits of the same fixed-size block.
         with (
             patch(
@@ -371,9 +371,6 @@ class TestDllmCommittedTokens(unittest.TestCase):
             patch(
                 "sglang.srt.managers.schedule_batch.alloc_for_extend",
                 return_value=(torch.arange(4), torch.tensor([0]), torch.tensor([0])),
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch"
             ),
         ):
             for _ in range(2):

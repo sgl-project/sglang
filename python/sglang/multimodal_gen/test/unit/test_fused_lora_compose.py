@@ -5,15 +5,20 @@ import os
 import tempfile
 from collections import defaultdict
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-import torch.nn.functional as F
+import torch.distributed as dist
 from safetensors.torch import save_file
 
+from sglang.multimodal_gen.runtime.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
+    QKVParallelLinearWithLoRA,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import (
     LoRAPipeline,
@@ -41,6 +46,16 @@ def _make_ab_lists(ranks: list[int]):
         a_list.append(torch.randn(rank, IN_DIM))
         b_list.append(torch.randn(OUTPUT_SIZES[index], rank))
     return a_list, b_list
+
+
+def _make_mock_process_group() -> dist.ProcessGroup:
+    # Create a mock object that mimics a ProcessGroup
+    mock_process_group = MagicMock(spec=dist.ProcessGroup)
+
+    mock_process_group.rank.return_value = 0
+    mock_process_group.size.return_value = 1
+
+    return mock_process_group
 
 
 def _reference_delta(x, a_list, b_list, adapter_alpha):
@@ -106,7 +121,7 @@ def test_stack_kept_for_equal_sections():
     torch.testing.assert_close(b[1], b_list[1])
 
 
-class _FakeMergedLinear(torch.nn.Module):
+class _FakeMergedLinear(MergedColumnParallelLinear):
     def __init__(
         self,
         output_sizes: list[int],
@@ -114,25 +129,23 @@ class _FakeMergedLinear(torch.nn.Module):
         weight: torch.Tensor | None = None,
         output_partition_sizes: list[int] | None = None,
     ):
-        super().__init__()
+
+        super().__init__(
+            in_dim, output_sizes, False, tp_group=_make_mock_process_group()
+        )
         self.output_sizes = output_sizes
         self.output_partition_sizes = (
             output_partition_sizes
             if output_partition_sizes is not None
             else output_sizes
         )
+
         if weight is None:
             weight = torch.randn(sum(output_sizes), in_dim)
         self.weight = torch.nn.Parameter(weight)
-        self.bias = None
-        self.skip_bias_add = False
-        self.gather_output = False
-        self.quant_method = SimpleNamespace(
-            apply=lambda layer, x, bias=None: F.linear(x, layer.weight, bias)
-        )
 
 
-def _make_layer() -> MergedColumnParallelLinearWithLoRA:
+def _make_layer() -> MergedColumnParallelLinear:
     torch.manual_seed(0)
     return MergedColumnParallelLinearWithLoRA(_FakeMergedLinear(OUTPUT_SIZES, IN_DIM))
 
@@ -238,6 +251,57 @@ def test_mis_sized_fused_lora_b_is_rejected():
         pytest.raises(ValueError, match="fused LoRA B"),
     ):
         layer.slice_lora_b_weights(torch.zeros(sum(OUTPUT_SIZES) + 1, 2))
+
+
+def _make_qkv_layer(tp_size, tp_rank, num_heads, num_kv_heads):
+    return QKVParallelLinear(
+        hidden_size=IN_DIM,
+        head_size=2,
+        total_num_heads=num_heads,
+        total_num_kv_heads=num_kv_heads,
+        bias=False,
+        tp_group=SimpleNamespace(world_size=tp_size, rank_in_group=tp_rank),
+    )
+
+
+@pytest.mark.parametrize(
+    "tp_size,num_heads,num_kv_heads", [(1, 4, 2), (2, 4, 2), (4, 4, 2), (2, 4, 4)]
+)
+def test_qkv_lora_b_is_sharded_like_the_base_weight(tp_size, num_heads, num_kv_heads):
+    """A fused LoRA B must give each TP rank the rows its base weight holds,
+    including a key/value head replicated across ranks; the base layer's own
+    weight loader is the reference."""
+    torch.manual_seed(0)
+    full = torch.randn((num_heads + 2 * num_kv_heads) * 2, IN_DIM)
+    for tp_rank in range(tp_size):
+        base = _make_qkv_layer(tp_size, tp_rank, num_heads, num_kv_heads)
+        base.weight.weight_loader(base.weight, full)
+        layer = QKVParallelLinearWithLoRA(base)
+        with patch(_TP_RANK_PATCH, return_value=tp_rank):
+            sliced = layer.slice_lora_b_weights(full)
+            if num_heads == num_kv_heads:
+                # Equal sections may also arrive stacked as [3, rows, rank].
+                stacked = layer.slice_lora_b_weights(full.reshape(3, -1, IN_DIM))
+                assert torch.equal(stacked.reshape(-1, IN_DIM), base.weight)
+        assert torch.equal(sliced, base.weight)
+
+
+def test_qkv_unmerged_forward_applies_fused_lora():
+    torch.manual_seed(0)
+    base = _make_qkv_layer(1, 0, 4, 2)
+    full = torch.randn(base.weight.shape)
+    base.weight.weight_loader(base.weight, full)
+    layer = QKVParallelLinearWithLoRA(base, lora_rank=3, lora_alpha=3)
+    lora_a = torch.randn(3, IN_DIM)
+    lora_b = torch.randn(full.shape[0], 3)
+    layer.set_lora_weights(lora_a, lora_b, merge_weights=False)
+
+    x = torch.randn(5, IN_DIM)
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer.forward(x)
+    torch.testing.assert_close(
+        out, x @ full.T + x @ lora_a.T @ lora_b.T, rtol=1e-5, atol=1e-5
+    )
 
 
 def test_ipc_key_resolution_returns_fused_merge_index():
@@ -363,13 +427,13 @@ def test_alpha_override_reloads_fused_sections(tmp_path):
         "cur_adapter_path",
         "cur_adapter_strength",
         "cur_adapter_config",
-        "lora_layers",
         "lora_layers_critic",
         "lora_layers_transformer_2",
         "is_lora_merged",
         "auto_merge_rounding_loss",
     ):
         setattr(pipeline, attr, {})
+    pipeline.lora_layers = {"attn.to_qkv": _make_layer()}
     loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
     with (
         patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
@@ -529,3 +593,120 @@ def test_loader_folds_distinct_section_alphas(prefix, fused, sections, rows):
         dim=-1,
     )
     torch.testing.assert_close(delta * scale, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_kohya_lora_on_part_of_fused_qkv_keeps_other_sections(tmp_path):
+    # Z-Image fuses q/k/v; a Kohya LoRA trained only on to_q must leave K and V at
+    # their base weights, and the metadata alpha must not rescale the alpha that
+    # the Kohya conversion already folded into A/B.
+    from sglang.multimodal_gen.configs.models.dits.zimage import ZImageArchConfig
+
+    layer = _make_layer()
+    base_weight = layer.base_layer.weight.detach().clone()
+    transformer = torch.nn.Module()
+    transformer.layers = torch.nn.ModuleList([torch.nn.Module()])
+    transformer.layers[0].attention = torch.nn.Module()
+    transformer.layers[0].attention.to_qkv = layer
+    transformer.lora_param_names_mapping = {}
+
+    pipeline = _make_loader_pipeline()
+    pipeline.modules = {"transformer": transformer}
+    pipeline.server_args.pipeline_config.dit_config.arch_config = ZImageArchConfig()
+
+    rank, alpha = 2, 8
+    torch.manual_seed(7)
+    down = torch.randn(rank, IN_DIM)
+    up = torch.randn(OUTPUT_SIZES[0], rank)
+    adapter_file = str(tmp_path / "kohya_zimage.safetensors")
+    save_file(
+        {
+            "lora_unet_layers_0_attention_to_q.lora_down.weight": down,
+            "lora_unet_layers_0_attention_to_q.lora_up.weight": up,
+            "lora_unet_layers_0_attention_to_q.alpha": torch.tensor(float(alpha)),
+        },
+        adapter_file,
+        metadata={"alpha": str(alpha)},
+    )
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    with (
+        patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        patch(f"{loader_mod}.dist.get_rank", return_value=0),
+    ):
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0)
+        applied = pipeline._apply_lora_to_layers(
+            {"layers.0.attention.to_qkv": layer},
+            ["adapter"],
+            [adapter_file],
+            rank=0,
+            strengths=[1.0],
+            merge_weights=False,
+        )
+
+    assert applied == 1
+    x = torch.randn(3, IN_DIM)
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer.forward(x)
+    q_delta = (alpha / rank) * (x @ down.T @ up.T)
+    expected = x @ base_weight.T + torch.cat(
+        [q_delta, torch.zeros(3, sum(OUTPUT_SIZES[1:]))], dim=-1
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_section_alpha_of_partial_fused_qkv_is_applied(tmp_path):
+    # A V-only Z-Image PEFT LoRA whose `to_v.alpha` (8) differs from the file's
+    # global alpha (4): the V update must use its own alpha, 8 / rank.
+    from sglang.multimodal_gen.configs.models.dits.zimage import ZImageArchConfig
+
+    layer = _make_layer()
+    base_weight = layer.base_layer.weight.detach().clone()
+    transformer = torch.nn.Module()
+    transformer.layers = torch.nn.ModuleList([torch.nn.Module()])
+    transformer.layers[0].attention = torch.nn.Module()
+    transformer.layers[0].attention.to_qkv = layer
+    transformer.lora_param_names_mapping = {}
+
+    pipeline = _make_loader_pipeline()
+    pipeline.modules = {"transformer": transformer}
+    pipeline.server_args.pipeline_config.dit_config.arch_config = ZImageArchConfig()
+
+    rank = 4
+    torch.manual_seed(11)
+    lora_a = torch.randn(rank, IN_DIM)
+    lora_b = torch.randn(OUTPUT_SIZES[2], rank)
+    adapter_file = str(tmp_path / "zimage_v_only.safetensors")
+    save_file(
+        {
+            "layers.0.attention.to_v.lora_A.weight": lora_a,
+            "layers.0.attention.to_v.lora_B.weight": lora_b,
+            "layers.0.attention.to_v.alpha": torch.tensor(8.0),
+        },
+        adapter_file,
+        metadata={"alpha": "4"},
+    )
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    with (
+        patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        patch(f"{loader_mod}.dist.get_rank", return_value=0),
+    ):
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0)
+        applied = pipeline._apply_lora_to_layers(
+            {"layers.0.attention.to_qkv": layer},
+            ["adapter"],
+            [adapter_file],
+            rank=0,
+            strengths=[1.0],
+            merge_weights=False,
+        )
+
+    assert applied == 1
+    x = torch.randn(3, IN_DIM)
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer.forward(x)
+    v_delta = (8 / rank) * (x @ lora_a.T @ lora_b.T)
+    expected = x @ base_weight.T + torch.cat(
+        [torch.zeros(3, sum(OUTPUT_SIZES[:2])), v_delta], dim=-1
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)

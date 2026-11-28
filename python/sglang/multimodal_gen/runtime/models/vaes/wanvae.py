@@ -17,6 +17,7 @@
 # limitations under the License.
 
 import contextvars
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from functools import partial
 
@@ -911,8 +912,6 @@ class WanMidBlock(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
-        self.gradient_checkpointing = False
-
     def forward(self, x):
         return mid_block_forward(self, x)
 
@@ -1164,7 +1163,6 @@ class WanEncoder3d(nn.Module):
         self.norm_out = WanRMS_norm(out_dim, images=False)
         self.conv_out = CausalConv3d(out_dim, z_dim, 3, padding=1)
 
-        self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
@@ -1282,8 +1280,6 @@ class WanResidualUpBlock(nn.Module):
         else:
             self.upsampler = None
 
-        self.gradient_checkpointing = False
-
     def forward(self, x):
         return residual_up_block_forward(self, x)
 
@@ -1333,8 +1329,6 @@ class WanUpBlock(nn.Module):
         self.upsamplers = None
         if upsample_mode is not None:
             self.upsamplers = nn.ModuleList([resample_cls(out_dim, mode=upsample_mode)])
-
-        self.gradient_checkpointing = False
 
     def forward(self, x):
         return up_block_forward(self, x)
@@ -1498,7 +1492,6 @@ class WanDecoder3d(nn.Module):
         self.norm_out = WanRMS_norm(out_dim, images=False)
         self.conv_out = CausalConv3d(out_dim, out_channels, 3, padding=1)
 
-        self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
@@ -1592,7 +1585,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
     Introduced in [Wan 2.1].
     """
 
-    _supports_gradient_checkpointing = False
     supports_decode_on_frames = True
 
     # Official Wan2.1_VAE.pth key -> module key. No caller here; the Wan2.2-S2V
@@ -1761,6 +1753,19 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return should_run_spatial_shard_parallel_decode(self.config, z)
+
+    @property
+    def checkpoint_key_filter(self) -> Callable[[str], bool] | None:
+        # Both quant convolutions are constructed even for a partial VAE.
+        skipped = tuple(
+            prefix
+            for prefix, enabled in (
+                ("encoder.", self.config.load_encoder),
+                ("decoder.", self.config.load_decoder),
+            )
+            if not enabled
+        )
+        return (lambda name: not name.startswith(skipped)) if skipped else None
 
     def clear_cache(self) -> None:
 
@@ -1984,27 +1989,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
         dec = ParallelTiledVAE.parallel_tiled_decode(self, z)
         start_frame_idx = self.temporal_compression_ratio - 1
         dec = dec[:, :, start_frame_idx:]
-        return dec
-
-    def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            sample (`torch.Tensor`): Input sample.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
-        """
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z)
         return dec
 
 

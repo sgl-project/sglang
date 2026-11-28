@@ -34,6 +34,9 @@ pub struct ProxyConfig {
     pub decode_dispatch_limit: Option<NonZeroU32>,
     /// PD: return decode's response only once prefill completes.
     pub stream_after_prefill: bool,
+    /// PD: send a request for at most one token to prefill alone, skipping
+    /// decode, when the prefill engine reports it can answer one.
+    pub one_token_on_prefill_only: bool,
 }
 
 impl ProxyConfig {
@@ -67,6 +70,7 @@ impl Default for ProxyConfig {
             max_backoff_ms: 2000,
             decode_dispatch_limit: None,
             stream_after_prefill: false,
+            one_token_on_prefill_only: false,
         }
     }
 }
@@ -319,6 +323,8 @@ pub struct ServerConfig {
     pub termination_grace_secs: Option<u64>,
     /// `Authorization` for the router's own requests to workers, from `--worker-api-key`.
     pub worker_auth: Option<HeaderValue>,
+    /// `Authorization` required by Worker management mutation endpoints.
+    pub worker_management_auth: Option<HeaderValue>,
 }
 
 impl ServerConfig {
@@ -350,6 +356,7 @@ impl Default for ServerConfig {
             shutdown_drain_secs: default_shutdown_drain_secs(),
             termination_grace_secs: None,
             worker_auth: None,
+            worker_management_auth: None,
         }
     }
 }

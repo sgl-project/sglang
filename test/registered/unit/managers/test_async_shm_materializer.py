@@ -252,7 +252,6 @@ class AsyncShmMaterializerTest(CustomTestCase):
             recv_skipper=None,
             input_blocker=None,
             mm_receiver=None,
-            server_args=None,
             model_config=None,
             max_recv_per_poll=-1,
             request_retirer=Mock(),

@@ -1,17 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Central request router for disaggregated diffusion pipelines."""
 
-import base64
 import json
 import logging
-import os
 import pickle
 import threading
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -54,6 +51,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     Req,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
+from sglang.multimodal_gen.runtime.utils.image_io import inline_local_image_paths
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
     RequestMetrics,
@@ -125,9 +123,6 @@ class _EncoderTTAEntry:
 class _TransferRequestState:
     sender_role: RoleType = RoleType.ENCODER
     receiver_role: RoleType = RoleType.DENOISER
-    sender_session_id: str = ""
-    sender_pool_ptr: int = 0
-    sender_slot_offset: int = 0
     data_size: int = 0
     manifest: dict = None
     scalar_fields: dict = None
@@ -184,7 +179,6 @@ class DiffusionServer:
         encoder_capacity: int = 4,
         denoiser_capacity_per_worker: int = 2,
         decoder_capacity: int = 4,
-        p2p_mode: bool = True,
         server_args=None,
         glm_distributed_mode_enabled: bool = False,
         prompt_encoder_work_endpoints: list[str] | None = None,
@@ -253,7 +247,6 @@ class DiffusionServer:
         self._denoiser_tta: deque[_RoleTTAEntry] = deque()
         self._decoder_tta: deque[_RoleTTAEntry] = deque()
 
-        self._transfer_mode = p2p_mode
         self._glm_distributed_state: _GlmDistributedModeState | None = None
 
         if glm_distributed_mode_enabled:
@@ -612,19 +605,8 @@ class DiffusionServer:
 
         if self._input_role == RoleType.PROMPT_ENCODER and req.image_path:
             # HTTP uploads belong to the head's filesystem, not the GPU workers'.
-            paths = (
-                req.image_path
-                if isinstance(req.image_path, (list, tuple))
-                else [req.image_path]
-            )
             try:
-                req.image_path = [
-                    "data:application/octet-stream;base64,"
-                    + base64.b64encode(Path(path).read_bytes()).decode("ascii")
-                    if isinstance(path, str) and os.path.isfile(path)
-                    else path
-                    for path in paths
-                ]
+                req.image_path = inline_local_image_paths(req.image_path)
                 payload = pickle.dumps(reqs)
             except OSError as error:
                 self._complete_with_error(
@@ -1115,7 +1097,7 @@ class DiffusionServer:
     def _handle_transfer_result(self, frames: list, role: RoleType) -> None:
         try:
             msg = decode_transfer_msg(frames)
-        except (ValueError, Exception) as e:
+        except Exception as e:
             logger.error("DiffusionServer: failed to decode transfer message: %s", e)
             return
 
@@ -1214,9 +1196,6 @@ class DiffusionServer:
         p2p = _TransferRequestState(
             sender_role=role,
             receiver_role=next_role,
-            sender_session_id=msg.get("session_id", ""),
-            sender_pool_ptr=msg.get("pool_ptr", 0),
-            sender_slot_offset=msg.get("slot_offset", 0),
             data_size=msg.get("data_size", 0),
             manifest=msg.get("manifest", {}),
             scalar_fields=msg.get("scalar_fields", {}),
@@ -1442,9 +1421,6 @@ class DiffusionServer:
 
             if p2p is not None and msg.get("staged_for_decoder"):
                 # Denoiser slot freed later in _handle_transfer_pushed
-                p2p.sender_session_id = msg.get("session_id", "")
-                p2p.sender_pool_ptr = msg.get("pool_ptr", 0)
-                p2p.sender_slot_offset = msg.get("slot_offset", 0)
                 p2p.data_size = msg.get("data_size", 0)
                 p2p.manifest = msg.get("manifest", {})
                 p2p.scalar_fields = msg.get("scalar_fields", {})
@@ -1509,7 +1485,6 @@ class DiffusionServer:
             pending_count = len(self._pending)
         stats = {
             "role": "diffusion_server",
-            "transfer_mode": self._transfer_mode,
             "num_encoders": self._num_encoders,
             "num_denoisers": self._num_denoisers,
             "num_decoders": self._num_decoders,

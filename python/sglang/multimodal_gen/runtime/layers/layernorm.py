@@ -476,8 +476,8 @@ class LayerNorm(CustomOp):
         return F.layer_norm(x, (self.hidden_size,), self.weight, self.bias, self.eps)
 
     def extra_repr(self) -> str:
-        s = f"hidden_size={self.weight.data.size(0)}"
-        s += f", eps={self.variance_epsilon}"
+        s = f"hidden_size={self.hidden_size}"
+        s += f", eps={self.eps}"
         return s
 
 
@@ -722,13 +722,13 @@ class _ScaleResidualNormScaleShift(CustomOp):
 
         try:
             from sglang.kernels.ops.diffusion import (
-                FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_fused_residual_norm_scale_shift,
+                flydsl_norm_supports,
             )
         except ImportError:
             return self.forward_native(residual, x, gate, shift, scale)
 
-        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
+        if not flydsl_norm_supports(x.shape[-1]):
             return self.forward_native(residual, x, gate, shift, scale)
 
         return flydsl_fused_residual_norm_scale_shift(
@@ -974,13 +974,13 @@ class _NormScaleShift(CustomOp):
 
         try:
             from sglang.kernels.ops.diffusion import (
-                FLYDSL_NORM_MIN_ALIGNED_DIM,
                 flydsl_norm_scale_shift,
+                flydsl_norm_supports,
             )
         except ImportError:
             return self.forward_native(x, shift, scale)
 
-        if x.shape[-1] % FLYDSL_NORM_MIN_ALIGNED_DIM != 0:
+        if not flydsl_norm_supports(x.shape[-1]):
             return self.forward_native(x, shift, scale)
 
         result = flydsl_norm_scale_shift(

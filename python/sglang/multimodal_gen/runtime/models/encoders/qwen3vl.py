@@ -537,7 +537,6 @@ class Qwen3VLTextModel(nn.Module):
             ]
         )
         self.norm = _make_text_rms_norm(config.hidden_size, config.rms_norm_eps)
-        self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
 
@@ -693,6 +692,7 @@ class Qwen3VLModel(QwenVLModelBase):
         quant_config: QuantizationConfig | None = None,
         use_tensor_parallel: bool = False,
         prefix: str = "",
+        vision_replicated: bool = False,
     ):
         super().__init__()
         vision_quant_config = (
@@ -704,6 +704,7 @@ class Qwen3VLModel(QwenVLModelBase):
             config.vision_config,
             quant_config=vision_quant_config,
             prefix=add_prefix("visual", prefix),
+            replicated=vision_replicated,
         )
         self.language_model = Qwen3VLTextModel(
             config.text_config,
@@ -1100,22 +1101,6 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         "model.visual.blocks",
         "model.visual.deepstack_merger_list",
     ]
-    default_bitsandbytes_target_modules = [
-        ".gate_up_proj.",
-        ".down_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
     _checkpoint_conversion_mapping = {}
     _tied_weights_keys = ["lm_head.weight"]
     # Reference: fix gemma3 grad acc #37208

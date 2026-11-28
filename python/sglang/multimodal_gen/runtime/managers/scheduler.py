@@ -65,6 +65,10 @@ from sglang.multimodal_gen.runtime.managers.request_cancel import (
     poll_cancellations,
 )
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    init_execution_reporter,
+    install_stack_dump_handler,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import DiffusionMetrics
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
@@ -83,6 +87,7 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin i
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
+    configure_media_url_policy,
     set_global_server_args,
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -156,6 +161,7 @@ class Scheduler(
             local_rank = gpu_id
 
         set_global_server_args(server_args=server_args)
+        configure_media_url_policy(server_args)
 
         # Each DP replica is a contiguous rank block (dp is the outermost
         # layout axis); its first rank binds the replica's ingress, and the
@@ -179,8 +185,18 @@ class Scheduler(
                 init_progress_reporter(
                     context=self.context, endpoint=server_args.progress_endpoint
                 )
+            reporter = init_execution_reporter(
+                self.context, server_args, self.dp_replica
+            )
+            if reporter is not None:
+                self._dispatch_items = reporter.watch_dispatch(self._dispatch_items)
+                # grouped requests may execute lazily while the results are returned
+                self._return_results_sequentially = reporter.watch_dispatch(
+                    self._return_results_sequentially
+                )
         else:
             self.receiver = None
+        install_stack_dump_handler(server_args)
         if server_args.cancel_endpoint is not None:
             # every rank takes part in each stop decision; only the driver
             # receives the cancelled request ids
@@ -1545,6 +1561,13 @@ class Scheduler(
         The main event loop that listens for ZMQ requests.
         Handles abortion
         """
+        if self.server_args.stage_role:
+            from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
+                run_stage_worker,
+            )
+
+            return run_stage_worker(self)
+
         # Pool mode: all roles use the pool event loop
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_event_loop()

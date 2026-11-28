@@ -7,13 +7,15 @@ The only place that decides which algorithm runs: each entry point dispatches on
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
+import numpy as np
 import torch
 
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.watermarking.gumbel import adapter as gumbel_adapter
 from sglang.srt.sampling.watermarking.interface import NO_WATERMARK_VIEW_FIELDS
+from sglang.srt.sampling.watermarking.synthid import adapter as synthid_adapter
 
 if TYPE_CHECKING:
     from sglang.srt.arg_groups.model_override_base import ResolvingConfig
@@ -25,7 +27,10 @@ if TYPE_CHECKING:
         WatermarkRows,
     )
 
-_ADAPTERS: dict[str, WatermarkAdapter] = {"gumbel": gumbel_adapter}
+_ADAPTERS: dict[str, WatermarkAdapter] = {
+    "gumbel": gumbel_adapter,
+    "synthid": synthid_adapter,
+}
 
 
 def make_watermark_engine(
@@ -47,14 +52,27 @@ def make_watermark_engine(
     )
 
 
-def build_watermark_rows(
-    reqs: list[Req], device: torch.device | str
-) -> Optional[WatermarkRows]:
+def num_watermark_fields() -> int:
     features = get_exec().features
     if not features.enable_watermark:
+        return 0
+    return _ADAPTERS[features.watermark_algorithm].NUM_POOL_FIELDS
+
+
+def watermark_pool_values(req: Req) -> tuple[bool, Sequence[int]]:
+    features = get_exec().features
+    return _ADAPTERS[features.watermark_algorithm].pool_values(req, features=features)
+
+
+def build_watermark_rows(
+    values: torch.Tensor, candidates_host: np.ndarray
+) -> Optional[WatermarkRows]:
+    """The step's rows from its gathered pool values, or None without a candidate
+    (always without watermarking: no row is a candidate)."""
+    if not candidates_host.any():
         return None
-    return _ADAPTERS[features.watermark_algorithm].build_rows(
-        reqs, features=features, device=device
+    return _ADAPTERS[get_exec().features.watermark_algorithm].build_rows(
+        values, candidates_host.tolist()
     )
 
 

@@ -577,6 +577,8 @@ def get_quant_config(
 
         if model_config.quantization == "bitsandbytes":
             config["adapter_name_or_path"] = model_name_or_path
+        elif model_config.quantization == "modelslim":
+            config["hf_config"] = model_config.hf_config
         elif model_config.quantization.startswith("modelopt") and (
             config.get("producer", {}).get("name", "").startswith("modelopt")
         ):
@@ -1194,8 +1196,12 @@ def _prefetch_all_checkpoints(
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
         world_group = get_parallel().world_group
-        local_rank = world_group.local_rank
-        local_world_size = world_group.local_size or get_parallel().launch_world_size
+        # Only the CPU backend sets LOCAL_SIZE; otherwise use ranks per node.
+        local_world_size = world_group.local_size or (
+            get_parallel().launch_world_size // get_parallel().nnodes
+        )
+        # Ranks are numbered node by node, so this is the rank's index on its node.
+        local_rank = world_group.rank % local_world_size
     else:
         local_rank = 0
         local_world_size = 1

@@ -2566,6 +2566,29 @@ class TestDiskTierGuards(CustomTestCase):
             self.assertEqual(rows, E)
             self.assertEqual(budget.called, measured)
 
+    def test_auto_size_caps_a_tiered_layer_at_max_tier_slots(self):
+        """Under ``auto``, a tiered layer's ``max_resident`` is bounded by both its host rows
+        and ``_MAX_TIER_SLOTS`` (the plan kernel's block thread limit); an untiered layer is
+        bounded only by ``num_experts``."""
+        method, _, _ = _paged_layer(num_resident=TOP_K, top_k=TOP_K, auto_size=True)
+        with patch.object(disk_tier, "_MAX_TIER_SLOTS", 6):
+            method.host_rows = (
+                10  # tiered (10 < E = 16), with more host rows than the kernel cap
+            )
+            self.assertTrue(method.tiered)
+            self.assertEqual(disk_tier.max_slots(10), 6)
+            self.assertEqual(disk_tier.max_slots(4), 4)
+            self.assertEqual(method.max_resident, 6)
+            self.assertEqual(
+                sizing.ExpertSlotSizing._grow(
+                    [TOP_K], [method.max_resident], [100], 10_000
+                ),
+                [6],
+            )
+            method.host_rows = E  # untiered: not capped by _MAX_TIER_SLOTS
+            self.assertFalse(method.tiered)
+            self.assertEqual(method.max_resident, E)
+
 
 class TestHostMemoryFlag(CustomTestCase):
     def test_host_memory_needs_paged_experts_and_a_positive_size(self):
@@ -3468,6 +3491,18 @@ class TestSaveRecurrentState(CustomTestCase):
         with patch.object(replay_hooks, "_HOOKS", [lambda: False]):
             with self.assertRaisesRegex(RuntimeError, "ReplaySSM"):
                 replay_hooks.save_recurrent_state(pool, torch.tensor([1]))
+
+
+class TestPrecopyGrid(CustomTestCase):
+    def test_half_the_sms_at_most_32(self):
+        """The pre-copy's grid is half the GPU's SMs, capped at the 32 blocks measured on a 70-SM
+        RTX 5070 Ti, so a smaller GPU never gives the side copy a larger share of its SMs."""
+        from sglang.srt.layers.moe.paged_experts.precopy import copy_blocks
+
+        cases = {70: 32, 132: 32, 36: 18, 20: 10, 1: 1, 0: 1}
+        for sms, blocks in cases.items():
+            with self.subTest(sms=sms):
+                self.assertEqual(copy_blocks(sms), blocks)
 
 
 if __name__ == "__main__":

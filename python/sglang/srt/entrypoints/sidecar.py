@@ -12,10 +12,8 @@
 # limitations under the License.
 """Lifecycle management for an optional local native gRPC sidecar.
 
-The Python server runs the sidecar against its native gRPC server. In
-Rust-server mode the launcher on every node that hosts a Rust listener runs
-one sidecar against the node's first listener, which serves gRPC on
---grpc-port.
+The launcher on every node that hosts a Rust listener runs one sidecar
+against the node's first listener, which serves gRPC on --grpc-port.
 """
 
 import argparse

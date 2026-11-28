@@ -30,6 +30,7 @@ class SyncExecutor(PipelineExecutor):
     ) -> Any:
         """Execute all pipeline stages sequentially and step the profiler."""
 
+        run_stage = self.stage_runner(server_args, run_stage)
         use_nvtx = self._should_use_stage_nvtx(payload, server_args)
         requests = payload if isinstance(payload, list) else [payload]
         with self._component_residency_request(stages, payload, server_args):
@@ -43,6 +44,7 @@ class SyncExecutor(PipelineExecutor):
                     run_stage,
                     use_nvtx,
                 )
+                self._check_peer_waits(stage)
                 self._step_stage_profiler()
             raise_if_cancelled(requests)
         return payload

@@ -23,7 +23,9 @@ Run directly:
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import os
 import subprocess
 import time
@@ -34,11 +36,13 @@ from pathlib import Path
 import requests
 import torch
 
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     find_free_port,
     wait_for_server_health,
 )
+from sglang.srt.utils.network import get_free_port_below_ephemeral, is_port_available
 from sglang.test.test_utils import CustomTestCase, terminate_and_kill_process_tree
 
 HOST = "127.0.0.1"
@@ -101,6 +105,9 @@ class DisaggCluster:
         extra_role_args: dict[str, list[str]] | None = None,
         startup_timeout: float = _STARTUP_TIMEOUT_S,
         warmup_kwargs: dict | None = None,
+        stage_groups: dict[str, list[str | int]] | None = None,
+        stage_outputs: tuple[str, ...] | None = None,
+        stage_contracts: list[dict] | None = None,
     ) -> None:
         self.model = model
         self.name = name
@@ -108,23 +115,60 @@ class DisaggCluster:
         self.extra_role_args = extra_role_args or {}
         self.startup_timeout = startup_timeout
         self.warmup_kwargs = warmup_kwargs or {}
+        self.stage_groups = stage_groups
+        self.stage_outputs = stage_outputs
+        self.stage_contracts = stage_contracts
         self._procs: list[subprocess.Popen] = []
         self._fhs: list = []
         self._logs: dict[str, Path] = {}
         self._alloc_ports()
 
     def _alloc_ports(self) -> None:
-        self.base_port = find_free_port(HOST)
-        self.api_port = find_free_port(HOST)
-        self._role_ports = {role: find_free_port(HOST) for role in self.gpu_layout}
+        # The head binds its result sockets at fixed offsets from its frontend.
+        first_work_offset = max(ServerArgs.DISAGG_RESULT_PORT_OFFSETS.values()) + 1
+        api_offset = first_work_offset + len(self.gpu_layout)
+        # give every process its own rendezvous port after the service endpoints
+        last_offset = api_offset + 1 + len(self.gpu_layout)
+        for _ in range(64):
+            base = get_free_port_below_ephemeral()
+            if all(is_port_available(base + i) for i in range(last_offset + 1)):
+                self.base_port = base
+                self.api_port = base + api_offset
+                self._role_ports = {
+                    role: base + i
+                    for i, role in enumerate(self.gpu_layout, start=first_work_offset)
+                }
+                self._master_ports = {
+                    role: self.api_port + i
+                    for i, role in enumerate(("server", *self.gpu_layout), start=1)
+                }
+                break
+        else:
+            raise RuntimeError(f"No free port block for {self.name}")
+
+        if self.stage_groups:
+            self.deployment_path = _LOG_DIR / f"disagg_{self.name}.json"
+            deployment = {
+                "roles": {
+                    role: {
+                        "stages": self.stage_groups[role],
+                        "endpoints": [f"tcp://{HOST}:{port}"],
+                    }
+                    for role, port in self._role_ports.items()
+                }
+            }
+            if self.stage_outputs is not None:
+                deployment["outputs"] = self.stage_outputs
+            if self.stage_contracts is not None:
+                deployment["stages"] = self.stage_contracts
+            self.deployment_path.write_text(json.dumps(deployment))
 
     # -- context manager -----------------------------------------------------
 
     def __enter__(self) -> DisaggCluster:
         for attempt in range(3):
             try:
-                self._launch_roles()
-                self._launch_server_head()
+                self._launch_servers()
                 self._warmup()
                 return self
             except Exception as e:
@@ -134,9 +178,9 @@ class DisaggCluster:
                     flush=True,
                 )
                 self.stop()
-                self._alloc_ports()
                 if attempt == 2:
                     raise
+                self._alloc_ports()
         return self  # unreachable
 
     def __exit__(self, *exc) -> None:
@@ -157,54 +201,96 @@ class DisaggCluster:
         self._fhs.append(fh)
         return proc
 
-    def _launch_roles(self) -> None:
+    def _launch_servers(self) -> None:
+        if self.stage_groups:
+            self._launch_roles()
+            self._launch_server_head()
+            return
+        # preset workers send their transfer registration once, at startup
+        head = self._launch_server_head()
+        self._launch_roles(head)
+
+    def _launch_roles(self, head: subprocess.Popen | None = None) -> None:
         for role in self.gpu_layout:
             port = self._role_ports[role]
             gpus = self.gpu_layout[role]
             log = _LOG_DIR / f"disagg_{self.name}_{role}.log"
             self._logs[role] = log
 
+            mode_args = [
+                "--disagg-role",
+                role,
+                "--strict-ports",
+                "--disagg-server-addr",
+                f"tcp://{HOST}:{self.base_port}",
+            ]
+            if self.stage_groups:
+                mode_args = [
+                    "--stage-deployment",
+                    str(self.deployment_path),
+                    "--stage-role",
+                    role,
+                    "--stage-endpoint",
+                    f"tcp://{HOST}:{port}",
+                ]
             cmd = [
                 "sglang",
                 "serve",
                 "--model-path",
                 self.model,
-                "--disagg-role",
-                role,
-                "--disagg-server-addr",
-                f"tcp://{HOST}:{self.base_port}",
+                *mode_args,
                 "--scheduler-port",
-                str(port),
+                str(find_free_port(HOST) if self.stage_groups else port),
                 "--num-gpus",
                 str(len(gpus)),
                 "--base-gpu-id",
                 str(gpus[0]),
                 "--master-port",
-                str(find_free_port(HOST)),
+                str(self._master_ports[role]),
                 "--log-level",
                 "info",
                 *self.extra_role_args.get(role, []),
             ]
             proc = self._start_proc(cmd, log)
 
-            ready_msg = f"Role {role.upper()} ready"
+            ready_msg = (
+                f"Stage role {role} ready"
+                if self.stage_groups
+                else f"Role {role.upper()} ready"
+            )
             if not _wait_for_log(log, ready_msg, self.startup_timeout, proc):
                 raise RuntimeError(
                     f"{role} failed to start for {self.name}. Log tail:\n"
                     f"{_tail_log(log)}"
                 )
+            if head is None:
+                continue
+            head_log = self._logs["server"]
+            registration = f"work_endpoint=tcp://{HOST}:{port} session="
+            if not _wait_for_log(head_log, registration, self.startup_timeout, head):
+                raise RuntimeError(
+                    f"Head did not receive {role} registration. Head log:\n"
+                    f"{_tail_log(head_log)}\nWorker log:\n{_tail_log(log)}"
+                )
 
-    def _launch_server_head(self) -> None:
+    def _launch_server_head(self) -> subprocess.Popen:
         log = _LOG_DIR / f"disagg_{self.name}_server.log"
         self._logs["server"] = log
         # Match the literal hostname advertised by the workers.
+        mode_args = (
+            ["--stage-deployment", str(self.deployment_path)]
+            if self.stage_groups
+            else ["--disagg-role", "server"]
+        )
         cmd = [
             "sglang",
             "serve",
             "--model-path",
             self.model,
-            "--disagg-role",
-            "server",
+            *mode_args,
+            "--strict-ports",
+            "--master-port",
+            str(self._master_ports["server"]),
             "--scheduler-port",
             str(self.base_port),
             "--port",
@@ -217,20 +303,23 @@ class DisaggCluster:
             "info",
             *self.extra_role_args.get("server", []),
         ]
-        for role, port in self._role_ports.items():
-            cmd.extend([f"--{role.replace('_', '-')}-urls", f"tcp://{HOST}:{port}"])
-        self._start_proc(cmd, log)
+        if not self.stage_groups:
+            for role, port in self._role_ports.items():
+                cmd.extend([f"--{role.replace('_', '-')}-urls", f"tcp://{HOST}:{port}"])
+        head = self._start_proc(cmd, log)
         try:
             wait_for_server_health(
                 f"http://{HOST}:{self.api_port}",
                 path="/v1/models",
                 timeout=self.startup_timeout,
+                process=head,
             )
         except Exception as e:
             raise RuntimeError(
                 f"server head failed to become healthy for {self.name}: {e}\n"
                 f"Server log tail:\n{_tail_log(log)}"
             ) from e
+        return head
 
     def _warmup(self) -> None:
         """Send a warmup request to establish RDMA connections."""
@@ -243,7 +332,7 @@ class DisaggCluster:
             ) from e
 
     def stop(self) -> None:
-        for proc in self._procs:
+        for proc in reversed(self._procs):
             terminate_and_kill_process_tree(proc)
         for fh in self._fhs:
             try:
@@ -305,6 +394,8 @@ class _DisaggTestBase(CustomTestCase):
     gpu_layout: dict[str, list[int]] = {}
     extra_role_args: dict[str, list[str]] = {}
     warmup_kwargs: dict = {}
+    stage_groups: dict[str, list[str | int]] | None = None
+    stage_outputs: tuple[str, ...] | None = None
 
     cluster: DisaggCluster | None = None
 
@@ -318,6 +409,8 @@ class _DisaggTestBase(CustomTestCase):
             gpu_layout=cls.gpu_layout,
             extra_role_args=cls.extra_role_args,
             warmup_kwargs=cls.warmup_kwargs,
+            stage_groups=cls.stage_groups,
+            stage_outputs=cls.stage_outputs,
         )
         cls.cluster.__enter__()
 
@@ -475,6 +568,265 @@ class TestDisaggFlux3Image(_DisaggTestBase):
                 np.asarray(Image.open(BytesIO(actual))),
                 np.asarray(Image.open(BytesIO(expected))),
             )
+
+
+class TestStageDeploymentFlux3(TestDisaggFlux3Image):
+    """Arbitrary role names, parallel encoding, tensor return, and full generation."""
+
+    cluster_name = "flux3_stages"
+    stage_groups = {
+        "text": ["flux3_text_encode"],
+        "reference": ["flux3_condition_encode"],
+        "sample": ["flux3_denoise"],
+        "render": ["flux3_decode", "flux3_postprocess"],
+    }
+    gpu_layout = {"text": [0], "reference": [0], "sample": [1], "render": [0]}
+    stage_outputs = ("result.output", "extra.flux3_text", "extra.flux3_condition")
+    extra_role_args = {
+        role: ["--warmup-mode", "off"] for role in (*gpu_layout, "server")
+    }
+
+    def test_encoder_tensor_return(self):
+        from io import BytesIO
+
+        from PIL import Image
+        from torch.utils._pytree import tree_leaves
+
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.client import (
+            EncodingClient,
+        )
+
+        reference = BytesIO()
+        Image.new("RGB", (64, 64), "teal").save(reference, format="PNG")
+        uri = "data:image/png;base64," + base64.b64encode(reference.getvalue()).decode()
+        fields = ["extra.flux3_text", "extra.flux3_condition"]
+        request = {
+            "prompt": "A mountain landscape",
+            "image_path": [uri],
+            "quality": "exact",
+        }
+
+        async def check():
+            async with EncodingClient(
+                f"tcp://{HOST}:{self.cluster.base_port}", device="cuda:0"
+            ) as client:
+                first, second = await asyncio.gather(
+                    client.encode(request, fields),
+                    client.encode(
+                        {**request, "prompt": "A watercolor landscape"}, fields
+                    ),
+                )
+                tensors = [
+                    value
+                    for value in tree_leaves(first)
+                    if isinstance(value, torch.Tensor)
+                ]
+                self.assertTrue(tensors)
+                self.assertTrue(
+                    all(value.device == torch.device("cuda:0") for value in tensors)
+                )
+                with self.assertRaises(RuntimeError):
+                    await client.encode(
+                        {
+                            **request,
+                            "image_path": ["/nonexistent/encoding-reference.png"],
+                        },
+                        fields,
+                    )
+                third = await client.encode(request, fields)
+                torch.testing.assert_close(first, third, rtol=0, atol=0)
+                fourth = await client.encode(
+                    {**request, "prompt": "A watercolor landscape"}, fields
+                )
+                torch.testing.assert_close(second, fourth, rtol=0, atol=0)
+
+        asyncio.run(check())
+
+
+class TestStageEncoderPools(CustomTestCase):
+    """Public checkpoints, 2:1 replicas, targeted tensor returns, and bounded prefetch.
+
+    Shares one GPU for this functional test; use separate GPUs for throughput tests.
+    """
+
+    def test_targeted_encoders_and_prefetch(self):
+        from io import BytesIO
+        from tempfile import TemporaryDirectory
+
+        from PIL import Image
+        from torch.utils._pytree import tree_leaves
+
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.client import (
+            EncodingClient,
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
+            DeploymentServer,
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
+            Deployment,
+            ExecutionPlan,
+        )
+
+        _require_gpus(1)
+        model = "Tongyi-MAI/Z-Image-Turbo"
+        cluster = DisaggCluster(model, "encoder_pools", {})
+        text_endpoints = [f"tcp://{HOST}:{find_free_port(HOST)}" for _ in range(2)]
+        deployment = {
+            "stages": [
+                {"name": "InputValidationStage", "after": []},
+                {
+                    "name": "TextEncodingStage",
+                    "outputs": ["prompt_embeds"],
+                    "components": ["text_encoder", "tokenizer"],
+                    "after": [],
+                },
+                {
+                    "name": "ImageVAEEncodingStage",
+                    "outputs": ["image_latent"],
+                    "components": ["vae"],
+                    "after": ["InputValidationStage"],
+                },
+            ],
+            "roles": {
+                "text": {
+                    "stages": ["TextEncodingStage"],
+                    "node": "text",
+                    "endpoints": text_endpoints,
+                },
+                "image": {
+                    "stages": ["InputValidationStage", "ImageVAEEncodingStage"],
+                    "node": "image",
+                    "endpoints": [f"tcp://{HOST}:{find_free_port(HOST)}"],
+                    "server_args": {
+                        "model_path": "black-forest-labs/FLUX.2-klein-4B",
+                        "num_gpus": 1,
+                        "disable_conditioning_cache": True,
+                    },
+                },
+            },
+            "outputs": ["prompt_embeds", "image_latent"],
+        }
+        samples = []
+        for index, width in enumerate((256, 320)):
+            reference = BytesIO()
+            Image.new("RGB", (width, 256), "teal").save(reference, format="PNG")
+            samples.append(
+                {
+                    "prompt": "A red teapot"
+                    + " on a wooden table in the morning" * index,
+                    "width": width,
+                    "height": 256,
+                    "seed": 42 + index,
+                    "image_path": [
+                        "data:image/png;base64,"
+                        + base64.b64encode(reference.getvalue()).decode()
+                    ],
+                }
+            )
+        endpoint = f"tcp://{HOST}:{cluster.base_port}"
+
+        async def check():
+            async with EncodingClient(endpoint, max_in_flight=2) as client:
+                references = []
+                for request in samples:
+                    text, image = await asyncio.gather(
+                        client.encode(request, role="text"),
+                        client.encode(request, role="image"),
+                    )
+                    expected = {**text, **image}
+                    self.assertTrue(
+                        all(
+                            t.is_cuda and torch.isfinite(t).all()
+                            for t in tree_leaves(expected)
+                        )
+                    )
+                    torch.testing.assert_close(
+                        await client.encode(request), expected, rtol=0, atol=0
+                    )
+                    references.append(text)
+                self.assertNotEqual(
+                    tree_leaves(references[0])[0].shape,
+                    tree_leaves(references[1])[0].shape,
+                )
+                async with client.prefetch(
+                    samples * 3, role="text", depth=3
+                ) as batches:
+                    count = 0
+                    async for result in batches:
+                        torch.testing.assert_close(
+                            result, references[count % 2], rtol=0, atol=0
+                        )
+                        count += 1
+                    self.assertEqual(count, 6)
+                async with client.prefetch(
+                    samples * 10, role="image", depth=3
+                ) as batches:
+                    await anext(batches)
+                self.assertFalse(client.pending)
+                with self.assertRaises(RuntimeError):
+                    await client.encode(samples[0], role="missing")
+                torch.testing.assert_close(
+                    await client.encode(samples[0], role="text"),
+                    references[0],
+                    rtol=0,
+                    atol=0,
+                )
+
+        with TemporaryDirectory(prefix="encoder-pools-") as directory:
+            path = Path(directory) / "deployment.json"
+            path.write_text(json.dumps(deployment))
+            server = DeploymentServer(
+                ExecutionPlan.compile(Deployment.load(path)), timeout=120, capacity=4
+            )
+            try:
+                # Exercise both node-level model overrides and independently launched replicas.
+                for index, (role, address) in enumerate(
+                    [("image", None), *[("text", e) for e in text_endpoints]]
+                ):
+                    mode = (
+                        ["--stage-node", "image"]
+                        if role == "image"
+                        else ["--stage-role", role, "--stage-endpoint", address]
+                    )
+                    log = _LOG_DIR / f"disagg_encoder_pools_{index}.log"
+                    proc = cluster._start_proc(
+                        [
+                            "sglang",
+                            "serve",
+                            "--model-path",
+                            model,
+                            "--stage-deployment",
+                            str(path),
+                            *mode,
+                            "--num-gpus",
+                            "1",
+                            "--warmup-mode",
+                            "off",
+                            "--disable-conditioning-cache",
+                            "--master-port",
+                            str(find_free_port(HOST)),
+                            "--scheduler-port",
+                            str(find_free_port(HOST)),
+                        ],
+                        log,
+                    )
+                    self.assertTrue(
+                        _wait_for_log(
+                            log,
+                            f"Stage role {role} ready",
+                            cluster.startup_timeout,
+                            proc,
+                        ),
+                        _tail_log(log),
+                    )
+                server.start(endpoint)
+                asyncio.run(check())
+                self.assertFalse(server.leases)
+                self.assertFalse(server.jobs)
+            finally:
+                if server.thread is not None:
+                    server.stop()
+                cluster.stop()
 
 
 # ---------------------------------------------------------------------------

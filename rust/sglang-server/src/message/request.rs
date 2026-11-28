@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -130,6 +130,7 @@ pub fn into_requests(
         session_params,
         custom_logit_processor,
         return_sampling_mask,
+        return_prompt_token_ids,
         ..
     } = req;
     // Python's `SessionParams(**obj.session_params)`: an object with these
@@ -530,6 +531,7 @@ pub fn into_requests(
                 routing_key: routing_key.clone(),
                 priority,
                 require_reasoning: require_reasoning.unwrap_or(false),
+                prompt_token_ids: return_prompt_token_ids.then(PromptTokenIdsSlot::default),
                 kv_hints,
                 mm: pack_mm(image_data, video_data, audio_data),
                 mm_buffers: Vec::new(),
@@ -748,6 +750,10 @@ pub struct GenerateRequest {
     pub routing_key: Option<String>,
     pub priority: Option<i64>,
     pub require_reasoning: bool,
+    /// Set when the request asked for its prompt ids
+    /// (`return_prompt_token_ids`): where intake leaves the final ids, which
+    /// its core call reports on every frame.
+    pub prompt_token_ids: Option<PromptTokenIdsSlot>,
     pub kv_hints: Option<KvHintsEnvelope>,
     /// Multimodal inputs. Consumed by the Encoding stage, which ships them to
     /// the MM worker pool; never read by the tokenizer or serialized onto the
@@ -941,6 +947,65 @@ pub struct MmData {
     pub mm_hashes: Vec<String>,
     /// How admission handled the media, for the processor's own timing.
     pub admission: MediaAdmission,
+    /// Cancelled by intake when the request is aborted while the MM pool
+    /// holds it, so the processor can stop work nobody will read.
+    pub cancellation: MmCancellation,
+}
+
+/// A request's cancellation, shared by its clones. Callbacks registered with
+/// [`Self::on_cancel`] run once, on the thread that cancels (at once if it
+/// already has), so they must not block. A default one is cancelled only by
+/// a holder of a clone calling [`Self::cancel`].
+#[derive(Clone, Default)]
+pub struct MmCancellation(Arc<Mutex<CancellationState>>);
+
+#[derive(Default)]
+struct CancellationState {
+    cancelled: bool,
+    callbacks: Vec<Box<dyn FnOnce() + Send>>,
+}
+
+impl MmCancellation {
+    /// Idempotent: the first call runs the callbacks.
+    pub fn cancel(&self) {
+        let callbacks = {
+            let mut state = self.lock();
+            if state.cancelled {
+                return;
+            }
+            state.cancelled = true;
+            std::mem::take(&mut state.callbacks)
+        };
+        for callback in callbacks {
+            callback();
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.lock().cancelled
+    }
+
+    pub fn on_cancel(&self, callback: impl FnOnce() + Send + 'static) {
+        let mut state = self.lock();
+        if state.cancelled {
+            drop(state);
+            callback();
+        } else {
+            state.callbacks.push(Box::new(callback));
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, CancellationState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl std::fmt::Debug for MmCancellation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MmCancellation")
+            .field("cancelled", &self.is_cancelled())
+            .finish_non_exhaustive()
+    }
 }
 
 /// How admission handled one request's media before the MM processor runs:
@@ -966,7 +1031,20 @@ pub struct ProcessorFetch {
     pub bytes: usize,
 }
 
+/// A request's final prompt ids (tokenized, multimodal-expanded, truncated),
+/// written once by intake and read by the request's core call.
+pub type PromptTokenIdsSlot = Arc<OnceLock<Arc<[i64]>>>;
+
 impl GenerateRequest {
+    /// Leave the prompt ids for the request's frames, if it asked for them.
+    /// Python captures them once tokenized, before the scheduler sees the
+    /// request.
+    pub(crate) fn report_prompt_token_ids(&self) {
+        if let (Some(slot), Some(ids)) = (&self.prompt_token_ids, &self.input_ids) {
+            slot.get_or_init(|| ids.as_slice().into());
+        }
+    }
+
     /// True when the client already supplied token ids → skip tokenization.
     pub fn already_tokenized(&self) -> bool {
         self.input_ids.as_ref().is_some_and(|v| !v.is_empty())

@@ -191,7 +191,7 @@ ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
 
-# Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
+# Rust toolchain for setuptools-rust extensions (sglang-mm, sglang-server).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
@@ -212,9 +212,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Split from the pip install so changes to these build inputs invalidate the
 # dependency layer, while unrelated Python source changes do not.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
-COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY rust/sglang-runtime-v1-types /tmp/sglang_deps/rust/sglang-runtime-v1-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
@@ -620,6 +618,17 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 
 WORKDIR /sgl-workspace
+
+# torch 2.14 pins cuBLAS 13.1, which has no SM120 GEMM kernels; SM120 images can opt into
+# 13.4 (--build-arg SGL_CUBLAS_VERSION=13.4.3.11). Keep after every torch dependency install.
+ARG SGL_CUBLAS_VERSION=
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "${SGL_CUBLAS_VERSION}" ]; then \
+        if [ "${CUDA_VERSION%%.*}" != "13" ]; then \
+            echo "SGL_CUBLAS_VERSION installs the CUDA 13 cuBLAS wheel, not for CUDA ${CUDA_VERSION}" && exit 1; \
+        fi; \
+        uv pip install --reinstall --no-deps "nvidia-cublas==${SGL_CUBLAS_VERSION}"; \
+    fi
 
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \
