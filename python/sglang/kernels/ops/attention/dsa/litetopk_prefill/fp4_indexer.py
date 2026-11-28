@@ -29,6 +29,14 @@ DEFAULT_KV_STAGES = {64: 8, 32: 6}
 # Staging-ring depth in 256-key tiles (BLOCK_Q x 512 B each); the sample tiles of a block stay in the ring until its
 # threshold is selected, so the sample cap is the ring minus 8.
 DEFAULT_DRAIN_SLOTS = {64: 40, 32: 28}
+# A block whose rows all see at most this many keys keeps every score and takes no sample (kDenseLen, fp4_indexer.cuh).
+FP4_INDEXER_DENSE_LEN = 6144
+# Widest block key span the strided sample covers, by head count (kSampleTilesMax in fp4_indexer.cuh);
+# it is min(drain slots - 8, 32) tiles of 256 samples at the widest stride, 257. Rows past it get T = -inf.
+FP4_INDEXER_MAX_SPAN = {
+    heads: min(slots - 8, 32) * 256 * 257
+    for heads, slots in DEFAULT_DRAIN_SLOTS.items()
+}
 
 
 class Fp4IndexerCandidates(NamedTuple):
@@ -96,9 +104,11 @@ def fp4_indexer_candidates(
     reduce), rounds the scores to nearest-even bf16 and stores every ``(score,
     j - ks[r])`` with ``score >= thresholds[r]`` into the slab, unordered.
     ``thresholds[r]`` is ``-inf`` (every key) when the row sees at most
-    ``topk`` keys or its block's rows all see at most 6144, otherwise exactly
-    a bf16 sample score at or below its ``topk``-th score, so the slab holds
-    the exact bf16 top-k; ``counts[r]`` keys reach it, the first
+    ``topk`` keys or its block's rows all see at most ``FP4_INDEXER_DENSE_LEN``,
+    otherwise exactly a bf16 sample score at or below its ``topk``-th score, so
+    the slab holds the exact bf16 top-k while every block spans at most
+    ``FP4_INDEXER_MAX_SPAN[heads]`` keys (``kv_fp4.shape[0]`` bounds the span;
+    rows past the sample get ``-inf``); ``counts[r]`` keys reach it, the first
     ``min(count, cap)`` are stored, ``overflow[r]`` flags the rest. A
     ``-inf`` row holds every key in key order (slot ``s`` is key ``s``), and
     rows of dense blocks leave ``indices`` unwritten.

@@ -28,10 +28,18 @@ _KERNELS = {
 }
 
 
+def is_topk_candidates_supported(topk: int, dtype: torch.dtype) -> bool:
+    """fp32 slabs take any ``k`` that is a multiple of 4 up to 2048 (forced-token callers select ``k`` minus
+    the forced keys); the bf16 kernel's bin layout is set per ``k`` in ``SUPPORTED_TOPK``."""
+    if dtype == torch.float32:
+        return topk % 4 == 0 and 4 <= topk <= 2048
+    return topk in SUPPORTED_TOPK
+
+
 @cache_once
 def _jit_topk_candidates_module(topk: int, dtype: torch.dtype) -> Module:
-    if topk not in SUPPORTED_TOPK:
-        raise RuntimeError(f"topk must be one of {SUPPORTED_TOPK}, got {topk}")
+    if not is_topk_candidates_supported(topk, dtype):
+        raise RuntimeError(f"unsupported topk {topk} for {dtype} candidates")
     if dtype not in _KERNELS:
         raise RuntimeError(f"scores must be fp32 or bf16, got {dtype}")
     name, kernel = _KERNELS[dtype]
@@ -56,7 +64,8 @@ def topk_candidates(
     """``scores`` fp32 or bf16 ``[rows, cap]`` and ``indices`` int32
     ``[rows, cap]`` (only the first ``min(count[row], cap)`` entries are read: an overflowing row is clipped), ``thr``
     fp32 ``[rows]`` (a per-row threshold <= every candidate, ``-inf`` keeps
-    every key), ``out`` int32 ``[rows, k]``, ``k`` in {512, 1024, 2048};
+    every key), ``out`` int32 ``[rows, k]`` (row stride a multiple of 4), ``k`` per
+    :func:`is_topk_candidates_supported`;
     a bf16 slab's ``-inf`` row holds every key in key order and its
     ``indices`` are not read (the index of slot ``s`` is ``s``);
     ``out_offsets[row]`` is added to every emitted index. bf16 slabs need

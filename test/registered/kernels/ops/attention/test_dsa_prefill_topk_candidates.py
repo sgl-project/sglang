@@ -176,6 +176,17 @@ def test_edges(k):
     run_bf16(scores, indices, count, thr, k)
 
 
+@pytest.mark.parametrize("k", [4, 1008, 2044])
+def test_fp32_any_k(k):
+    """fp32 slabs take any k that is a multiple of 4 (forced-token callers select k minus the forced keys)."""
+    _requires_sm100()
+    gen = torch.Generator(device="cuda").manual_seed(k + 3)
+    cap = TOPK_CANDIDATES_CAP
+    counts = [0, 1, k - 1, k, k + 1, 2 * k + 5, 4096, 8193, cap]
+    run_all(*make_rows(len(counts), k, counts, gen), k)
+    run_all(*make_rows(3, k, [k + 5, 5000, cap], gen, thr_mode="neg_inf"), k)
+
+
 @pytest.mark.parametrize("k", [512, 2048])
 def test_ties(k):
     """Copies of the k-th value straddling the boundary, within the 256-slot tie buffer: the warp
