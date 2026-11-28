@@ -1714,6 +1714,15 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
+        cleanup_params = insert_params
+        effective_cache_len, insert_params = self._bidir_state_block_fallback(
+            req=req,
+            token_ids_len=len(token_ids),
+            is_finished=is_finished,
+            effective_cache_len=effective_cache_len,
+            insert_params=insert_params,
+        )
+
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
             req.extra_key,
@@ -1776,10 +1785,23 @@ class UnifiedRadixCache(BasePrefixCache):
             # prefix.
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
-                    req, is_finished=is_finished, insert_params=insert_params
+                    req, is_finished=is_finished, insert_params=cleanup_params
                 )
             return
         req.kv.record_insert(page_aligned_len)
+        last_node = result.last_device_node
+
+        if is_finished and page_aligned_len < req.bidir_prefix_len <= len(token_ids):
+            # A bidir request reuses a state block only when all of it matched,
+            # so keep the state KV past the component checkpoint.
+            page_aligned_len, last_node = self._keep_bidir_state_block(
+                req=req,
+                token_ids=token_ids,
+                kv_indices=kv_indices_orig,
+                insert_params=insert_params,
+                page_aligned_len=page_aligned_len,
+                last_node=last_node,
+            )
 
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
@@ -1810,7 +1832,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # With PD decode radix caching, SWA matching can stop short of the inserted path.
         # Repoint from that path to protect all tree-owned KV.
-        new_last_node = result.last_device_node
+        new_last_node = last_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
         assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
@@ -1851,7 +1873,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 req,
                 is_finished=is_finished,
                 insert_result=result,
-                insert_params=insert_params,
+                insert_params=cleanup_params,
             )
 
         if (
@@ -1867,9 +1889,7 @@ class UnifiedRadixCache(BasePrefixCache):
             from sglang.srt.managers.req_types import FINISH_ABORT
 
             if not isinstance(req.finished_reason, FINISH_ABORT):
-                self.session_refs.register_session_ref(
-                    req, leaf=result.last_device_node
-                )
+                self.session_refs.register_session_ref(req, leaf=last_node)
 
         # After the last prefill chunk, decode retires the request's own window, so
         # the rest of the forward must enter the tree now to keep a window at its end.
@@ -1880,6 +1900,67 @@ class UnifiedRadixCache(BasePrefixCache):
             and up_to >= len(req.origin_input_ids)
         ):
             self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+
+    def _bidir_state_block_fallback(
+        self,
+        *,
+        req: Req,
+        token_ids_len: int,
+        is_finished: bool,
+        effective_cache_len: int,
+        insert_params: InsertParams,
+    ) -> tuple[int, InsertParams]:
+        if not (
+            is_finished
+            and effective_cache_len <= 0 < req.bidir_prefix_len <= token_ids_len
+            and req.kv.cache_protected_len < req.bidir_prefix_len
+        ):
+            return effective_cache_len, insert_params
+        # No component checkpoint, as the state ran past the key while decoding;
+        # keep the state block via a copy, so cleanup still frees the staged state.
+        state_params = replace(
+            insert_params,
+            mamba_value=None,
+            mamba_host_value=None,
+            mamba_host_src=None,
+            allow_missing_mamba=True,
+        )
+        return req.bidir_prefix_len, state_params
+
+    def _keep_bidir_state_block(
+        self,
+        *,
+        req: Req,
+        token_ids,
+        kv_indices: torch.Tensor,
+        insert_params: InsertParams,
+        page_aligned_len: int,
+        last_node: Any,
+    ) -> tuple[int, Any]:
+        state_key = RadixKey(
+            token_ids=token_ids[: req.bidir_prefix_len],
+            extra_key=req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        ).page_aligned(self.page_size)
+        with self._linker_offload_skip_prefix(req=req, token_ids=token_ids):
+            state_result = self.insert(
+                replace(
+                    insert_params,
+                    key=state_key,
+                    value=kv_indices[: len(state_key)].to(dtype=torch.int64, copy=True),
+                    mamba_value=None,
+                    mamba_host_value=None,
+                    mamba_host_src=None,
+                    allow_missing_mamba=True,
+                    prev_prefix_len=page_aligned_len,
+                    inserted_len=page_aligned_len,
+                )
+            )
+        if state_result.rotation_tail_declined:
+            return page_aligned_len, last_node
+        req.kv.record_insert(len(state_key))
+        return len(state_key), state_result.last_device_node
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:

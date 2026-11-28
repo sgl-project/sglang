@@ -1373,6 +1373,12 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    @staticmethod
+    def _cuts_bidir_prompt(req: Req, cut: int) -> bool:
+        # Only the prompt is indivisible;
+        # replayed output attends causally, so a later chunk may continue it.
+        return req.bidir_prefix_len >= 0 and cut < len(req.origin_input_ids)
+
     def floor_chunked_tokens(self, trunc_len: int, remaining: int) -> int:
         """Round a *truncated* chunk down to the mamba kernel chunk grid.
 
@@ -1959,6 +1965,18 @@ class PrefillAdder:
             )
             if not can_admit:
                 return self._refused()
+        if (
+            chunk_limit is not None
+            and cand_extend_input_len > chunk_limit
+            and self._cuts_bidir_prompt(
+                req=req,
+                cut=req.prefix_len
+                + self.floor_chunked_tokens(
+                    trunc_len=chunk_limit, remaining=cand_extend_input_len
+                ),
+            )
+        ):
+            return AddReqResult.OTHER
         fits = self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
             request_rows=self._request_rows_for_req(req),
@@ -2424,7 +2442,9 @@ class PrefillAdder:
                     )
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
                 extend_len = end - prefix_len
-            if extend_len <= 0:
+            if extend_len <= 0 or self._cuts_bidir_prompt(
+                req=req, cut=prefix_len + extend_len
+            ):
                 return AddReqResult.OTHER
             is_chunked = True
             max_new_tokens = 0

@@ -1193,6 +1193,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             max_prefix_len = fill_len - max(
                 self._window_tails(fill_len).values(), default=fill_len
             )
+        if req.bidir_prefix_len >= 0:
+            # Question tokens attend to each other; only the state block is reusable.
+            max_prefix_len = (
+                req.bidir_prefix_len
+                if max_prefix_len is None
+                else min(max_prefix_len, req.bidir_prefix_len)
+            )
         # Match and lock only reusable FULL KV. The entire SWA tail must be
         # freshly allocated, including when the prefix comes from L2/L3.
         result = match_kv_cache(

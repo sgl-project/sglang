@@ -49,6 +49,7 @@ ScheduleBatch -> ForwardBatch
 
 import copy
 import dataclasses
+import hashlib
 import logging
 import operator
 import re
@@ -440,6 +441,21 @@ class ReqKvInfo:
         self.kv_committed_len = 0
 
 
+def _causal_extra_key(extra_key: Optional[str]) -> Optional[str]:
+    # A bidir namespace is "bidir" plus a hex digest;
+    # a causal key with that prefix moves behind a non-hex "-", one-to-one.
+    if extra_key is not None and extra_key.startswith("bidir"):
+        return f"bidir-{extra_key}"
+    return extra_key
+
+
+def _raw_causal_extra_key(extra_key: Optional[str]) -> Optional[str]:
+    # Invert _causal_extra_key to recover the caller's causal key.
+    if extra_key is not None and extra_key.startswith("bidir-bidir"):
+        return extra_key[len("bidir-") :]
+    return extra_key
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -498,6 +514,8 @@ class Req(ReqDllmMixin):
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
         filler_seed: Optional[int] = None,
+        *,
+        bidir_prefix_len: int = -1,
     ):
         # Input and output info
         self.rid = rid
@@ -531,6 +549,7 @@ class Req(ReqDllmMixin):
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.token_indices_to_pool = token_indices_to_pool
+        self.bidir_prefix_len = bidir_prefix_len
         self.decision_layout = decision_layout
 
         # For req-level memory management
@@ -592,6 +611,16 @@ class Req(ReqDllmMixin):
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
+
+        if bidir_prefix_len >= 0:
+            # State KV depends on the whole state block: states never share radix nodes.
+            state_hash = hashlib.sha256(
+                array("q", origin_input_ids[:bidir_prefix_len]).tobytes()
+            ).hexdigest()
+            caller_key = extra_key or ""
+            extra_key = f"bidir{state_hash}|{len(caller_key)}|{caller_key}"
+        else:
+            extra_key = _causal_extra_key(extra_key)
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
@@ -934,6 +963,8 @@ class Req(ReqDllmMixin):
             self.multimodal_inputs is None
             and self.input_embeds is None
             and self.positional_embed_overrides is None
+            # The replayed payload has no block boundaries, so its KV would be causal.
+            and self.bidir_prefix_len < 0
         )
 
     @property
@@ -1258,6 +1289,9 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.bidir_prefix_len >= 0:
+            # Question tokens attend to each other; only the state block is reusable.
+            max_prefix_len = min(max_prefix_len, self.bidir_prefix_len)
         if self.is_dllm():
             # Appended masks and a partial prompt/output block are not reusable
             # KV: bidirectional attention depends on the rest of that block.
@@ -1669,7 +1703,7 @@ class Req(ReqDllmMixin):
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
             "priority": self.priority,
-            "extra_key": self.extra_key,
+            "extra_key": _raw_causal_extra_key(self.extra_key),
             "cache_salt": self.cache_salt,
             "routing_key": self.routing_key,
             "routed_dp_rank": self.disagg_prefill_dp_rank,
@@ -1713,6 +1747,11 @@ class Req(ReqDllmMixin):
         self.origin_input_ids = array(
             "q", [0]
         )  # set it to one token to skip the long prefill
+        # The boundary indexed the dropped prompt; the one-token stub runs causal,
+        # under the key a causal request with the same caller key gets.
+        if self.bidir_prefix_len >= 0:
+            self.extra_key = _causal_extra_key(self.extra_key.split("|", 2)[2] or None)
+        self.bidir_prefix_len = -1
         self.return_logprob = False
         self.logprob_start_len = -1
         self.routed_experts_start_len = 0
@@ -1835,7 +1874,8 @@ def unresumable_abort_message() -> str:
     if get_disagg().disaggregation_mode == "decode":
         return (
             "Retracted request aborted: the rebootstrap recomputes the KV from "
-            "token ids, which cannot rebuild multimodal inputs or embeds. Retry later."
+            "token ids, which cannot rebuild multimodal inputs, embeds or "
+            "bidir_prefix_len attention. Retry later."
         )
     return (
         "Retracted request aborted: an input_embeds request that has sent output "

@@ -2018,6 +2018,33 @@ class Scheduler(
             f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also helps."
         )
 
+    def _validate_bidir_prompt_cut(self, req: Req) -> Optional[str]:
+        if req.bidir_prefix_len < 0:
+            return None
+        # Window pools (a speculative draft's too) price a re-prefill by its chunk,
+        # so the largest cut that fits after a retraction can split the prompt.
+        if self.token_to_kv_pool_allocator.window_pool_names():
+            return (
+                "bidir_prefix_len cannot run with sliding-window KV pools "
+                "(the model's or a speculative draft's)."
+            )
+        align = self.truncation_align_size
+        if align is None:
+            return None
+        chunk = self.chunked_prefill_size
+        if chunk is None:
+            return None
+        # A retracted request re-prefills in chunks cut on the alignment,
+        # and admission waits rather than cut inside a block-bidirectional prompt.
+        max_len = chunk // align * align
+        if len(req.origin_input_ids) <= max_len:
+            return None
+        return (
+            f"A bidir_prefix_len prompt may have at most {max_len} tokens on this "
+            f"server, the chunked prefill size {chunk} rounded down to its "
+            f"{align}-token chunk alignment; got {len(req.origin_input_ids)}."
+        )
+
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -3136,24 +3163,29 @@ class Scheduler(
         )
 
     def init_req_max_new_tokens(self, req):
-        # PD prefill never decodes: budget the single handoff token and return
-        # before the clamps, which could only lower it to a dummy prefill-only
-        # 0. Constant output: every PP rank must derive the same
-        # sampling_params (rank consensus hashes them).
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # No decode takes a handoff from a request prefill answers alone,
-            # so it keeps the budget it asked for.
-            if self._lacks_decode_peer(req) and req.sampling_params.max_new_tokens in (
-                0,
-                1,
-            ):
-                return
+        # PD prefill never decodes: budget the single handoff token and, for a
+        # causal prompt, return before the clamps, which could only lower it to a
+        # dummy prefill-only 0. Constant output: every PP rank must derive the
+        # same sampling_params (rank consensus hashes them).
+        prefill_server = self.disaggregation_mode == DisaggregationMode.PREFILL
+        # No decode takes a handoff from a request prefill answers alone,
+        # so it keeps the budget it asked for.
+        answered_alone = (
+            prefill_server
+            and self._lacks_decode_peer(req)
+            and req.sampling_params.max_new_tokens in (0, 1)
+        )
+        prefill_handoff = prefill_server and not answered_alone
+        if prefill_handoff:
             req.sampling_params.max_new_tokens = 1
             # min <= max invariant; EOS stays legal as the handoff token
             # unless the user set min_new_tokens.
             req.sampling_params.min_new_tokens = min(
                 req.sampling_params.min_new_tokens, 1
             )
+        # A block-bidirectional prompt is never split,
+        # so it must fit the empty pool whole (priced below).
+        if prefill_server and req.bidir_prefix_len < 0:
             return
         input_len = len(req.origin_input_ids)
         max_new_tokens = (
@@ -3198,11 +3230,12 @@ class Scheduler(
             shares_prefixes=self.tree_cache.supports_prefix_sharing()
         )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
-            input_len,
-            max_new_tokens,
+            input_tokens=input_len,
+            max_new_tokens=1 if prefill_handoff else max_new_tokens,
             token_capacity=token_capacity,
             sliding_window_size=self.sliding_window_size,
-            chunk_size=self.chunked_prefill_size,
+            # Admission never splits a block-bidirectional prompt: price it whole.
+            chunk_size=None if req.bidir_prefix_len >= 0 else self.chunked_prefill_size,
             prefill_retire_lag=retirement.prefill_retire_lag,
             decode_retire_lag=retirement.decode_retire_lag,
             eviction_interval=retirement.eviction_interval,
@@ -3210,7 +3243,7 @@ class Scheduler(
             # Admission cuts a chunk on this alignment, so no smaller chunk runs.
             chunk_align=self.truncation_align_size,
         )
-        if max_new_tokens is None:
+        if max_new_tokens is None or (prefill_handoff and max_new_tokens < 1):
             req.set_finish_with_abort(
                 f"Request prompt exceeds the KV memory budget: input_len={input_len}."
             )
@@ -3492,6 +3525,7 @@ class Scheduler(
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
                 custom_logit_processor=recv_req.custom_logit_processor,
+                bidir_prefix_len=recv_req.bidir_prefix_len,
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
@@ -3775,6 +3809,10 @@ class Scheduler(
             is_multimodal=recv_req.mm_inputs is not None,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
+            self._add_request_to_queue(req)
+            return
+        if error_msg := self._validate_bidir_prompt_cut(req):
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return

@@ -50,7 +50,7 @@ import numpy as np
 import torch
 import zmq
 import zmq.asyncio
-from pydantic import PlainValidator
+from pydantic import PlainValidator, StrictInt
 
 from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.environ import envs
@@ -433,6 +433,11 @@ class GenerateReqInput:
     kv_hints: Optional[
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
+    # Block-bidirectional attention boundary for decision models; None/-1 = causal.
+    # Strict, so a JSON false or a null entry is refused, not read as 0 or causal.
+    bidir_prefix_len: Optional[Union[List[StrictInt], StrictInt]] = field(
+        default=None, kw_only=True
+    )
 
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
@@ -703,6 +708,7 @@ class GenerateReqInput:
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
         self._normalize_custom_logit_processor(num)
+        self._normalize_bidir_prefix_len(num)
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
         self._normalize_kv_hints(num)
@@ -971,6 +977,21 @@ class GenerateReqInput:
             get_return_hidden_states_mode(self.return_hidden_states)
             self.return_hidden_states = [self.return_hidden_states] * num
 
+    def _normalize_bidir_prefix_len(self, num):
+        if self.bidir_prefix_len is None:
+            self.bidir_prefix_len = [-1] * num
+        elif not isinstance(self.bidir_prefix_len, list):
+            self.bidir_prefix_len = [self.bidir_prefix_len] * num
+        elif self.parallel_sample_num > 1:
+            raise ValueError(
+                "Cannot use list bidir_prefix_len with parallel_sample_num > 1"
+            )
+        elif len(self.bidir_prefix_len) != num:
+            raise ValueError(
+                f"bidir_prefix_len has {len(self.bidir_prefix_len)} entries "
+                f"for a batch of {num} prompts"
+            )
+
     def _normalize_custom_logit_processor(self, num):
         """Normalize custom logit processor for batch processing."""
         if self.custom_logit_processor is None:
@@ -1153,6 +1174,9 @@ class GenerateReqInput:
                 else None
             ),
             mm_processor_kwargs=self.mm_processor_kwargs,
+            bidir_prefix_len=(
+                self.bidir_prefix_len[i] if self.bidir_prefix_len is not None else None
+            ),
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(
@@ -1328,6 +1352,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob_rows: Optional[List[List[int]]] = None
     # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
     filler_seed: Optional[int] = None
+    # Block-bidirectional attention boundary; -1 = causal.
+    bidir_prefix_len: int = -1
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

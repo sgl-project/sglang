@@ -1424,6 +1424,7 @@ class _GraftReq:
         self.output_ids = array("q", [])
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
+        self.bidir_prefix_len = -1
         self.cache_salt = None
         self.prefix_len = 0
         self.last_node = None

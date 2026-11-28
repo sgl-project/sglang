@@ -105,6 +105,7 @@ class MockReq:
         self.last_node = last_node
         self.lock = lock
         self.extra_key = None
+        self.bidir_prefix_len = -1
         self.cache_salt = None
         self.prefix_len = 0
         self.priority = 0

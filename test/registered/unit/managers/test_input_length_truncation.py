@@ -18,7 +18,7 @@ MAX_LEN = 8
 
 
 def _truncate(input_ids, preserve_last_token_id):
-    req = SimpleNamespace(origin_input_ids=list(input_ids))
+    req = SimpleNamespace(origin_input_ids=list(input_ids), bidir_prefix_len=-1)
     error = validate_input_length(
         req, MAX_LEN, True, preserve_last_token_id, is_multimodal=False
     )

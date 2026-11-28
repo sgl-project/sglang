@@ -409,6 +409,7 @@ def _fwd_kernel(
     mask_indptr,
     sink_ptr,
     window_kv_offset_ptr,
+    block_boundary_ptr,
     sm_scale,
     k_scale,
     v_scale,
@@ -446,6 +447,7 @@ def _fwd_kernel(
     BLOCK_N_PREFIX: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
+    USE_BLOCK_MASK: tl.constexpr,
     SKIP_PREFIX_CUSTOM_MASK: tl.constexpr,
     STORE_LSE: tl.constexpr,
     SKIP_PREFIX: tl.constexpr,
@@ -510,6 +512,11 @@ def _fwd_kernel(
 
     if USE_CUSTOM_MASK:
         cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
+    block_boundary = -1
+    block_end = -1
+    if USE_BLOCK_MASK:
+        block_boundary = tl.load(block_boundary_ptr + 2 * cur_seq)
+        block_end = tl.load(block_boundary_ptr + 2 * cur_seq + 1)
 
     # For SWA, we should only load the mask in the sliding window
     window_kv_offset = 0
@@ -750,6 +757,10 @@ def _fwd_kernel(
         if not IS_CAUSAL
         else tl.minimum(cur_seq_len_extend, (cur_block_m + 1) * BLOCK_M)
     )
+    if USE_BLOCK_MASK:
+        cur_block_m_end = tl.where(
+            block_boundary >= 0, cur_seq_len_extend, cur_block_m_end
+        )
     extend_end = 0 if SKIP_EXTEND else cur_block_m_end
     # Causal or not, the mask below keeps (q, kv) only if q <= kv + SLIDING_WINDOW_SIZE,
     # so no tile under this floor holds an unmasked element -- tight for any
@@ -785,6 +796,15 @@ def _fwd_kernel(
             mask_causual = (cur_block_m * BLOCK_M + offs_m[:, None]) >= (
                 start_n + offs_n[None, :]
             )
+            if USE_BLOCK_MASK:
+                # state keys are visible to every row;
+                # question rows see every key of the prompt, never a generated one
+                q_abs = cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
+                k_abs = cur_seq_len_prefix + start_n + offs_n[None, :]
+                mask_causual |= (block_boundary >= 0) & (
+                    (k_abs < block_boundary)
+                    | ((q_abs >= block_boundary) & (k_abs < block_end))
+                )
             mask_causual &= mask_m[:, None] & mask_n[None, :]
             final_mask &= mask_causual
         else:
@@ -807,7 +827,7 @@ def _fwd_kernel(
             final_mask &= window_mask
 
         SKIP_TILE = False
-        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+        if USE_CUSTOM_MASK or USE_BLOCK_MASK or SLIDING_WINDOW_SIZE > 0:
             SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
         if not SKIP_TILE:
@@ -974,6 +994,7 @@ def extend_attention_fwd(
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
     bf16_dot: bool = False,
+    block_boundaries=None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -991,6 +1012,8 @@ def extend_attention_fwd(
     ``bf16_dot``: with an FP8 cache and BF16 q, upcast the cached K/V and run the
     prefix dots in BF16 instead of casting q and the probabilities to FP8 (no FP8
     prefix or zero-prefix kernel). No effect on a BF16 cache.
+    ``block_boundaries``: [num_seqs, 2] int32, absolute (state end, question end),
+    (-1, -1) = causal; ignored with a custom mask or ``is_causal=False``.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -1207,6 +1230,7 @@ def extend_attention_fwd(
         mask_indptr,
         sinks,
         window_kv_offsets,
+        block_boundaries,
         sm_scale,
         k_scale,
         v_scale,
@@ -1243,6 +1267,7 @@ def extend_attention_fwd(
         Lv=Lv,
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
+        USE_BLOCK_MASK=block_boundaries is not None,
         SKIP_PREFIX_CUSTOM_MASK=SKIP_PREFIX_CUSTOM_MASK,
         STORE_LSE=STORE_LSE,
         SKIP_PREFIX=skip_prefix,

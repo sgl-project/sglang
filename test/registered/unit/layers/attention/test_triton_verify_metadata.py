@@ -103,6 +103,7 @@ def _make_forward_batch(batch_size, spec_info):
         out_cache_loc=torch.zeros(batch_size * 7, dtype=torch.int64),
         # A static pool's reads never touch the plan.
         iteration_ids=None,
+        bidir_blocks=None,
     )
 
 

@@ -706,6 +706,17 @@ fn sampling_logprobs_mode_set(mode: &serde_json::Value, batch: Option<usize>) ->
     }
 }
 
+// A top-level `null` or `-1` is unset; anything else is set,
+// including a batch's list unless it holds `n` entries that are all `-1`.
+fn bidir_prefix_len_set(len: &serde_json::Value, batch: Option<usize>) -> bool {
+    match (len, batch) {
+        (serde_json::Value::Array(lens), Some(n)) => {
+            lens.len() != n || lens.iter().any(|len| len.as_i64() != Some(-1))
+        }
+        _ => !len.is_null() && len.as_i64() != Some(-1),
+    }
+}
+
 /// Batch item `item`'s share of the `sampling_params` the client sent: the
 /// object itself, or the item's entry of a list.
 fn item_sampling_params(
@@ -852,8 +863,9 @@ pub(super) fn generate_requests(
     if let Err(error) = merge_preferred_sampling(&mut body, &default_max_new_tokens) {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, error, false));
     }
-    // Outside the schema, so decoding drops it; checked below.
+    // Outside the schema, so decoding drops them; checked below.
     let sampling_logprobs_mode = body.get("sampling_logprobs_mode").cloned();
+    let bidir_prefix_len = body.get("bidir_prefix_len").cloned();
     // The schema (sglang_api_types) is the contract: decode errors carry
     // serde's field-level text, as Python's 400s do.
     let body: api::GenerateRequest = match serde_json::from_value(body) {
@@ -873,6 +885,12 @@ pub(super) fn generate_requests(
     let batch = is_batch.then_some(requests.len());
     if sampling_logprobs_mode.is_some_and(|mode| sampling_logprobs_mode_set(&mode, batch)) {
         let message = "sampling_logprobs_mode can only be set when return_sampling_mask=true.";
+        tracing::warn!(error = %message, "rejected request");
+        return Err((StatusCode::BAD_REQUEST, message.into(), stream));
+    }
+    // Python acts on the boundary; dropped, the request would be served causally.
+    if bidir_prefix_len.is_some_and(|len| bidir_prefix_len_set(&len, batch)) {
+        let message = "bidir_prefix_len is not supported by the Rust server";
         tracing::warn!(error = %message, "rejected request");
         return Err((StatusCode::BAD_REQUEST, message.into(), stream));
     }

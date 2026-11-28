@@ -25,7 +25,9 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _req(num_tokens):
-    return SimpleNamespace(origin_input_ids=array("q", range(num_tokens)))
+    return SimpleNamespace(
+        origin_input_ids=array("q", range(num_tokens)), bidir_prefix_len=-1
+    )
 
 
 class TestValidateInputLength(CustomTestCase):

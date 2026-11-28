@@ -362,11 +362,16 @@ def get_context_length_sentence(max_tokens: int) -> str:
 
 
 def get_input_length_error(
-    input_len: int, max_req_input_len: int, *, is_multimodal: bool
+    input_len: int,
+    max_req_input_len: int,
+    *,
+    is_multimodal: bool,
+    is_bidir: bool = False,
 ) -> Optional[str]:
     """The rejection of a prompt over max_req_input_len, or None.
 
-    A multimodal prompt is never truncated (a cut can split placeholder tokens).
+    A multimodal prompt is never truncated (a cut can split placeholder tokens),
+    nor is a block-bidirectional one (its boundary indexes the whole prompt).
     """
     if input_len <= max_req_input_len:
         return None
@@ -379,6 +384,11 @@ def get_input_length_error(
         return (
             "Multimodal prompt is too long after expanding multimodal tokens. "
             f"{error_msg}Use a shorter input."
+        )
+    if is_bidir:
+        return (
+            f"{error_msg}Use a shorter input; "
+            "a bidir_prefix_len prompt is never truncated."
         )
     return f"{error_msg}Use a shorter input or enable --allow-auto-truncate."
 
@@ -403,10 +413,14 @@ def validate_input_length(
     Returns:
         Error message if validation fails, None if successful
     """
+    is_bidir = req.bidir_prefix_len >= 0
     error_msg = get_input_length_error(
-        len(req.origin_input_ids), max_req_input_len, is_multimodal=is_multimodal
+        len(req.origin_input_ids),
+        max_req_input_len,
+        is_multimodal=is_multimodal,
+        is_bidir=is_bidir,
     )
-    if error_msg is None or is_multimodal or not allow_auto_truncate:
+    if error_msg is None or is_multimodal or is_bidir or not allow_auto_truncate:
         return error_msg
     logger.warning(
         "Request length is longer than the KV cache pool size or "

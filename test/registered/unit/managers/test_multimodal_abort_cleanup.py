@@ -334,6 +334,7 @@ def test_request_abort_releases_multimodal_features():
     req.grammar = object()
     req.return_logprob = True
     req.logprob_start_len = 0
+    req.bidir_prefix_len = -1
 
     with patch(
         "sglang.srt.managers.schedule_batch.get_parallel",
@@ -355,6 +356,7 @@ def test_session_abort_preserves_shared_multimodal_features():
     req.grammar = object()
     req.return_logprob = True
     req.logprob_start_len = 0
+    req.bidir_prefix_len = -1
 
     with patch(
         "sglang.srt.managers.schedule_batch.get_parallel",
