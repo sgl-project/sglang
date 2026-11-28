@@ -1126,6 +1126,9 @@ class Envs:
     # AMD, ROCm, and AITER
     # ===================================================================
     SGLANG_USE_AITER = EnvBool(False)
+    # gfx950, ROCM_QUICK_REDUCE_QUANTIZATION=INT4: run QuickReduce through aiter's
+    # QuickAllReduce dispatcher (FlyDSL INT4) instead of SGLang's HIP INT4 kernel.
+    SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE = EnvBool(False)
     # gfx950: BF16/FP16 unquantized linears without bias run the vendored tlx.ops.mm
     # (sglang.kernels.ops.gemm.tlx) ahead of every other dense GEMM path. Needs TLX (uTLX or fbtriton).
     SGLANG_USE_TLX_GEMM = EnvBool(False)
