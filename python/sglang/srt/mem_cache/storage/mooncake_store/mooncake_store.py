@@ -96,6 +96,39 @@ def _parse_global_segment_size(value) -> int:
     return int(value)
 
 
+def _resolve_store_protocol(config: Mapping[str, Any], from_env: bool = False) -> str:
+    # Fall back to MOONCAKE_PROTOCOL (not its default) so an image or deployment
+    # that sets it, e.g. MOONCAKE_PROTOCOL=efa, is honored when "protocol" is omitted.
+    if "protocol" in config:
+        return config["protocol"]
+    protocol = envs.MOONCAKE_PROTOCOL.get()
+    if protocol == "nvlink":
+        # PD disaggregation commonly sets MOONCAKE_PROTOCOL=nvlink for its KV
+        # transfer, which moves GPU memory; the store moves host pool pages.
+        if from_env:
+            # Env-only setup has no store config: the store and the PD KV
+            # transfer engine both read MOONCAKE_PROTOCOL.
+            logger.warning(
+                "Mooncake store is configured from environment variables, so it "
+                "uses MOONCAKE_PROTOCOL=nvlink, which the PD KV transfer also "
+                "reads. Host KV pool pages are not GPU memory; to give the store "
+                "its own protocol (e.g. 'rdma'), configure the store in "
+                "--hicache-storage-backend-extra-config or in the "
+                "SGLANG_HICACHE_MOONCAKE_CONFIG_PATH file with 'protocol' "
+                "together with 'master_server_address' (or "
+                "'client_server_address'). A store config replaces the "
+                "environment setup, so 'protocol' alone is ignored."
+            )
+        else:
+            logger.warning(
+                "Mooncake store config omits 'protocol', so it inherits "
+                "MOONCAKE_PROTOCOL=nvlink, which is usually set for the PD KV "
+                "transfer. Host KV pool pages are not GPU memory; set 'protocol' "
+                "(e.g. 'rdma') explicitly in the store config."
+            )
+    return protocol
+
+
 def _normalize_tenant_id(value) -> str:
     if value is None:
         return DEFAULT_TENANT_ID
@@ -228,10 +261,7 @@ class MooncakeStoreConfig:
                     "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
                 )
             ),
-            # Fall back to MOONCAKE_PROTOCOL (not its default) so an image or
-            # deployment that sets it, e.g. MOONCAKE_PROTOCOL=efa, is honored
-            # when the config file omits "protocol".
-            protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.get()),
+            protocol=_resolve_store_protocol(config),
             device_name=config.get("device_name", envs.MOONCAKE_DEVICE.default),
             master_server_address=config.get(
                 "master_server_address", envs.MOONCAKE_MASTER.default
@@ -292,7 +322,7 @@ class MooncakeStoreConfig:
             global_segment_size=_parse_global_segment_size(
                 envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()
             ),
-            protocol=envs.MOONCAKE_PROTOCOL.get(),
+            protocol=_resolve_store_protocol({}, from_env=True),
             device_name=envs.MOONCAKE_DEVICE.get(),
             master_server_address=envs.MOONCAKE_MASTER.get(),
             master_metrics_port=envs.MOONCAKE_MASTER_METRICS_PORT.get(),
@@ -329,8 +359,7 @@ class MooncakeStoreConfig:
                     "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
                 )
             ),
-            # See from_file(): honor MOONCAKE_PROTOCOL when "protocol" is omitted.
-            protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.get()),
+            protocol=_resolve_store_protocol(extra_config),
             device_name=extra_config.get("device_name", envs.MOONCAKE_DEVICE.default),
             master_server_address=extra_config.get(
                 "master_server_address", envs.MOONCAKE_MASTER.default
@@ -1027,8 +1056,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 "Transfer Engine might not be ready"
             )
 
-        assert self.store.is_exist(warmup_key) == 1
-        assert self.store.get(warmup_key) == warmup_value
+        if self.store.is_exist(warmup_key) != 1:
+            raise RuntimeError(
+                f"[TP{self.local_rank}] Warmup put succeeded but the master does "
+                f"not list key {warmup_key}; check master_server_address "
+                f"({self.config.master_server_address})."
+            )
+        if self.store.get(warmup_key) != warmup_value:
+            raise RuntimeError(
+                f"[TP{self.local_rank}] Warmup get did not return the value just put "
+                f"(protocol={self.config.protocol!r}, "
+                f"device_name={self.config.device_name!r}). The read is a transfer "
+                "from the store segment that holds the key; check the Mooncake log "
+                "above for transfer errors and that the listed devices reach the "
+                "store nodes. On RDMA fabrics whose NICs only reach the same-named "
+                "NIC on the peer, set MC_ENABLE_DEST_DEVICE_AFFINITY=1."
+            )
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
