@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
     own_quant_config = staticmethod(npu_draft_quant_config)
 
+    def is_unused_checkpoint_weight(self, name: str) -> bool:
+        return self._is_unused_checkpoint_weight(name, is_mtp=True)
+
     def __init__(
         self,
         config: PretrainedConfig,

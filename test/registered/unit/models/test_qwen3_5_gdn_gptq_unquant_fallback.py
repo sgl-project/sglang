@@ -83,6 +83,14 @@ def _make_dummy_loader_module(
     proj_module, prefix="model.layers.0.linear_attn.in_proj_ba"
 ):
     class _DummyModel(torch.nn.Module):
+        # Reuse the production predicates called by the unbound loaders below.
+        is_unused_checkpoint_weight = staticmethod(
+            Qwen3_5ForCausalLM.is_unused_checkpoint_weight
+        )
+        _is_unused_checkpoint_weight = staticmethod(
+            Qwen3NextForCausalLM._is_unused_checkpoint_weight
+        )
+
         def __init__(self):
             super().__init__()
             parts = prefix.split(".")
