@@ -97,8 +97,8 @@ class HiCacheStorageConfig:
 
 @dataclass
 class HiCacheStorageExtraInfo:
-    # Page hashes preceding the call's keys, from the sequence start;
-    # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
+    # Page hashes preceding the call's keys (`prefix_keys + keys` is contiguous);
+    # extended in place across batches, so it is only valid during the backend call.
     prefix_keys: Optional[List[str]] = None
     # Free-form per-call metadata. If the backend's consumes_kv_hints() is True,
     # lookups (batch_exists, batch_exists_v2) and reads (batch_get_v1,
