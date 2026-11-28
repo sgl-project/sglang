@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+
+from sglang.multimodal_gen import envs
 
 # gate * sigmoid(alpha * gate) * (up + 1), gate clamped above and up both ways;
 # swiglu_no_interleaved_with_alpha_and_limit in the Triton runner.
@@ -19,6 +23,62 @@ ROUTE_NORM_EPS = 1e-12
 # moe_align_block_size runs 1024 threads and writes prefix[num_experts], so more
 # than this takes an illegal memory access. Experts run in head chunks that fit.
 MAX_KERNEL_EXPERTS = 1023
+
+
+@functools.lru_cache(maxsize=None)
+def _exchange_group_is_nvlink(group: dist.ProcessGroup) -> bool:
+    """Whether every pair in ``group`` is NVLink-connected; identical on every rank.
+
+    Peers, not the node: a repeated device id means the group crosses hosts, so
+    its exchange is not an NVLink one.
+    """
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
+    if not current_platform.is_cuda():
+        return False
+    from sglang.multimodal_gen.runtime.platforms.cuda import (
+        device_id_to_physical_device_id,
+    )
+
+    own = torch.tensor(
+        [device_id_to_physical_device_id(torch.cuda.current_device())],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    peers = [torch.zeros_like(own) for _ in range(dist.get_world_size(group=group))]
+    dist.all_gather(peers, own, group=group)
+    devices = [int(peer.item()) for peer in peers]
+    if len(set(devices)) != len(devices):
+        return False
+    return current_platform.is_full_nvlink(sorted(devices))
+
+
+def resolve_pipeline_groups(
+    *, local_heads: int, preferred: int, group: dist.ProcessGroup | None
+) -> int:
+    """Head groups an exchange over ``local_heads`` is split into; 1 keeps it sequential.
+
+    0 or 1 is off, N >= 2 is forced, and -1 picks ``preferred`` unless the
+    exchange's own peers are fully NVLink-connected.
+    """
+    requested = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
+    # The exchanges are not traceable, so a compiling block keeps the
+    # sequential path, as every other consumer of this knob does.
+    if torch.compiler.is_compiling():
+        return 1
+    if requested in (0, 1) or local_heads < 2:
+        return 1
+    if requested < 0:
+        # Measured on the 896x512 preview: 4x5090 over PCIe 19.98 -> 17.82 s,
+        # 4xH20 over NVLink 24.14 -> 25.31 s; an NVLink exchange is too cheap to hide.
+        if group is None or _exchange_group_is_nvlink(group):
+            return 1
+        groups = preferred
+    else:
+        groups = min(requested, local_heads)
+    while groups > 1 and local_heads % groups:
+        groups -= 1
+    return groups
 
 
 class Magi2MultiHeadRouter(nn.Module):
@@ -124,6 +184,9 @@ class Magi2MultiHeadExperts(nn.Module):
             torch.empty(self.num_local_experts, head_dim, intermediate_size)
         )
 
+    # Opaque to dynamo: autotuning these GEMMs asks more shared memory than sm90
+    # has, so a compiled region containing them fails to build.
+    @torch._dynamo.disable()
     def _run_heads(
         self,
         tokens: torch.Tensor,
@@ -172,8 +235,26 @@ class Magi2MultiHeadExperts(nn.Module):
             fuse_swiglu_interleaved=True,
         ).type_as(tokens)
 
-    # Opaque to dynamo: autotuning these GEMMs asks more shared memory than sm90
-    # has, so a compiled region containing them fails to build.
+    def _run_head_range(
+        self,
+        tokens: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        *,
+        start: int,
+        stop: int,
+    ) -> torch.Tensor:
+        """Run heads ``[start, stop)``; ids carry the head offset, so rebase them."""
+        per_head = self.num_experts_per_head
+        return self._run_heads(
+            tokens,
+            topk_ids - start * per_head,
+            topk_weights,
+            self.w13_weight[start * per_head : stop * per_head],
+            self.w2[start * per_head : stop * per_head],
+            (stop - start) * per_head,
+        )
+
     @torch._dynamo.disable()
     def forward(
         self,
@@ -199,17 +280,14 @@ class Magi2MultiHeadExperts(nn.Module):
         weights_3d = topk_weights.view(num_tokens, self.num_heads, -1)
         out = torch.empty_like(tokens_3d)
 
-        per_head = self.num_experts_per_head
         for start in range(0, self.num_heads, self.heads_per_call):
             stop = min(start + self.heads_per_call, self.num_heads)
-            chunk = self._run_heads(
+            chunk = self._run_head_range(
                 tokens_3d[:, start:stop].reshape(-1, self.head_dim),
-                # Ids carry the head offset, so rebase them onto the weight slice.
-                ids_3d[:, start:stop].reshape(-1, ids_3d.shape[-1]) - start * per_head,
+                ids_3d[:, start:stop].reshape(-1, ids_3d.shape[-1]),
                 weights_3d[:, start:stop].reshape(-1, weights_3d.shape[-1]),
-                self.w13_weight[start * per_head : stop * per_head],
-                self.w2[start * per_head : stop * per_head],
-                (stop - start) * per_head,
+                start=start,
+                stop=stop,
             )
             out[:, start:stop] = chunk.view(num_tokens, stop - start, self.head_dim)
         return out.reshape(-1, self.head_dim)
