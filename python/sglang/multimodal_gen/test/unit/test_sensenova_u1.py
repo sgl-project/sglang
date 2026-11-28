@@ -462,6 +462,71 @@ def test_sensenova_u1_prefix_and_denoise_attention_match_singletons():
             )
 
 
+class _StopAfterPrepare(Exception):
+    pass
+
+
+def test_sensenova_u1_think_mode_prefix_lengths_cover_think_tokens(monkeypatch):
+    from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+        modeling_neo_chat,
+    )
+
+    prompt_len, total_len = 5, 12  # 7 think/appended tokens added to the cache
+
+    class _Layer:
+        keys = values = torch.zeros(1, 1, total_len, 2)
+
+    class _Cache:
+        layers = [_Layer()]
+
+        def get_seq_length(self):
+            return total_len
+
+    class _Stub:
+        patch_size = 16
+        downsample_ratio = 0.5
+        concat_time_token_num = 0
+        config = SimpleNamespace(t_eps=0.02)
+        device = torch.device("cpu")
+        _build_t2i_image_indexes = NEOChatModel._build_t2i_image_indexes
+
+        def _notify_layer_offload_phase(self, *_):
+            pass
+
+        def _build_t2i_query(self, *_, **__):
+            return "q"
+
+        def _build_t2i_text_inputs(self, *_):
+            return (
+                torch.zeros(1, prompt_len, dtype=torch.long),
+                torch.zeros(1, 3, prompt_len, dtype=torch.long),
+                None,
+                None,
+                torch.tensor([prompt_len]),
+            )
+
+        def _think_prefix_forward(self, **_):
+            return SimpleNamespace(
+                past_key_values=_Cache(), logits=torch.zeros(1, 1, 2)
+            )
+
+        def _generate_think(self, _tok, _out, cache, t_idx, _img):
+            return cache, t_idx + 7, "thought"
+
+    captured = {}
+
+    def _spy(cache, current_len, batch_size, prefix_lengths):
+        captured["prefix_lengths"] = prefix_lengths
+        raise _StopAfterPrepare
+
+    monkeypatch.setattr(modeling_neo_chat, "prepare_flash_kv_cache", _spy)
+    with pytest.raises(_StopAfterPrepare):
+        NEOChatModel.t2i_generate(
+            _Stub(), None, "a cat", image_size=(32, 32), think_mode=True
+        )
+    assert captured["prefix_lengths"].tolist() == [total_len]
+
+
 def test_sensenova_u1_randn_fallback_preserves_device_rng(monkeypatch):
     device_type = current_platform.device_type
     if not device_type or device_type == "cpu":

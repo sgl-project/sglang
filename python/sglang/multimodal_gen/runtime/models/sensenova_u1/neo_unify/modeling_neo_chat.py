@@ -269,7 +269,7 @@ class NEOChatModel(PreTrainedModel):
             self.vision_model = vision_model
         else:
             self.vision_model = NEOVisionModel(config.vision_config)
-            vision_model_mot_gen = NEOVisionModel(config.vision_config)
+        vision_model_mot_gen = NEOVisionModel(config.vision_config)
         if language_model is not None:
             self.language_model = language_model
         else:
@@ -802,6 +802,13 @@ class NEOChatModel(PreTrainedModel):
                     t_index_condition,
                     IMG_START_TOKEN,
                 )
+            )
+            # _generate_think appended think tokens to the KV cache, so the
+            # prefix length must cover them or they are dropped from attention.
+            condition_prefix_lengths = torch.tensor(
+                [past_key_values_condition.get_seq_length()],
+                dtype=torch.long,
+                device=device,
             )
             indexes_image_condition = self._build_t2i_image_indexes(
                 token_h,
