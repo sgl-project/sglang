@@ -32,9 +32,14 @@ pub(crate) fn own_peer_token(deployment_info: &DeploymentInfo) -> Option<&str> {
         .as_deref()
 }
 
+/// The route DP rank 0's listener coordinates a cross-rank weight update on
+/// for another listener; every other listener refuses it with 421.
+pub(crate) const WEIGHT_UPDATE_COORDINATOR_PATH: &str = "/internal/weight_update";
+
 /// Peers only need a connection to come up; the scheduler-side wait (a
 /// flush's own `timeout_s`, a weight check) has no bound on the local path
-/// either, so a response is waited for as long as it takes.
+/// either, so a response is waited for as long as it takes, unless the
+/// caller bounds it (a weight update's `fanout::fan_out_within`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One DP rank's listener, reached over HTTP.
@@ -43,6 +48,7 @@ pub(crate) struct Peer {
     url: String,
     /// The listener's [`PEER_TOKEN_HEADER`] value.
     token: Option<http::HeaderValue>,
+    coordinator_url: String,
     client: reqwest::Client,
 }
 
@@ -62,11 +68,38 @@ impl Peer {
                 Ok::<_, String>(value)
             })
             .transpose()?;
+        let base_url = base_url.trim_end_matches('/');
         Ok(Self {
             ranks: [dp_rank],
-            url: format!("{}{FORWARD_PEER_PATH}", base_url.trim_end_matches('/')),
+            url: format!("{base_url}{FORWARD_PEER_PATH}"),
+            coordinator_url: format!("{base_url}{WEIGHT_UPDATE_COORDINATOR_PATH}"),
             token,
             client,
+        })
+    }
+
+    async fn coordinate(&self, body: Bytes) -> Result<Bytes, CoreError> {
+        let mut post = self
+            .client
+            .post(&self.coordinator_url)
+            .header(http::header::CONTENT_TYPE, "application/json");
+        if let Some(token) = &self.token {
+            post = post.header(PEER_TOKEN_HEADER, token.clone());
+        }
+        let response = post.body(body).send().await.map_err(transport_error)?;
+        let status = response.status();
+        let body = response.bytes().await.map_err(transport_error)?;
+        if status.is_success() {
+            return Ok(body);
+        }
+        let message = String::from_utf8_lossy(&body).into_owned();
+        Err(match status {
+            // The endpoint table names a listener that is not DP rank 0's.
+            StatusCode::MISDIRECTED_REQUEST => CoreError::Internal(format!(
+                "{} is not the weight-update coordinator: {message}",
+                self.coordinator_url
+            )),
+            status => reply_error(status, message),
         })
     }
 
@@ -88,14 +121,17 @@ impl Peer {
             return Ok(body);
         }
         let message = String::from_utf8_lossy(&body).into_owned();
-        Err(match status {
-            // The exact variants the handlers match for their own 503/504.
-            StatusCode::SERVICE_UNAVAILABLE => CoreError::Unavailable,
-            StatusCode::GATEWAY_TIMEOUT => CoreError::DeadlineExceeded(message),
-            status => {
-                CoreError::from_runtime_rejection(message, status.as_u16(), Default::default())
-            }
-        })
+        Err(reply_error(status, message))
+    }
+}
+
+/// A peer listener's error reply, back in the category it was sent as.
+fn reply_error(status: StatusCode, message: String) -> CoreError {
+    match status {
+        // The exact variants the handlers match for their own 503/504.
+        StatusCode::SERVICE_UNAVAILABLE => CoreError::Unavailable,
+        StatusCode::GATEWAY_TIMEOUT => CoreError::DeadlineExceeded(message),
+        status => CoreError::from_runtime_rejection(message, status.as_u16(), Default::default()),
     }
 }
 
@@ -121,6 +157,10 @@ impl ControlTarget for Peer {
                 outcome: self.forward(build).await,
             }]
         })
+    }
+
+    fn coordinate_weight_update(&self, body: Bytes) -> BoxFuture<'_, Result<Bytes, CoreError>> {
+        Box::pin(self.coordinate(body))
     }
 }
 
