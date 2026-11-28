@@ -104,6 +104,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _is_cuda,
     _use_aiter_gfx95,
+    quant_blocks_shared_experts_fusion,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
@@ -1387,10 +1388,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
             "model.visual": "visual",
+            # HF transformers / compressed-tensors and ModelSlim checkpoints
+            # may nest f_a_proj / f_b_proj under a `.forget_gate.` submodule.
+            ".forget_gate.": ".",
             **(
                 {
                     # ModelSlim W8A8 checkpoint naming variants.
-                    ".forget_gate.": ".",
                     ".attn_hc.": ".hc_attn_",
                     ".ffn_hc.": ".hc_ffn_",
                 }
@@ -1554,6 +1557,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
 
         if _is_cuda:
+            if quant_blocks_shared_experts_fusion(quant_config):
+                return (
+                    "Quantization keeps shared experts at a higher precision than "
+                    "the routed experts, so they cannot be fused into the quantized "
+                    "routed-expert path."
+                )
             if _device_sm is not None and _device_sm < 80:
                 return "Shared experts fusion requires SM80 or newer GPUs."
             if get_moe_a2a_backend().is_deepep():
