@@ -5,6 +5,7 @@
 //! chat completions, completions, the native `/generate` endpoint, embeddings,
 //! classify and rerank.
 
+use super::pd_metadata::PrefillMetadata;
 use crate::config::{ConflictPolicy, ModelConfig, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
 pub(super) use crate::proxy::grpc::BootstrapFields;
@@ -283,10 +284,7 @@ pub(super) struct PreparedRequest {
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
     pub(super) responder: Option<Responder>,
-    /// A non-streaming, single-sample native `/generate` asking for logprobs:
-    /// under PD only prefill computes the prompt, so its input logprobs go into
-    /// decode's response.
-    pub(super) merges_input_logprobs: bool,
+    pub(super) prefill_metadata: PrefillMetadata,
 }
 
 impl Preprocessor {
@@ -387,7 +385,7 @@ impl Preprocessor {
             parsed_body,
             sampling_defaults,
             responder: None,
-            merges_input_logprobs: false,
+            prefill_metadata: PrefillMetadata::default(),
         })
     }
 
@@ -399,9 +397,16 @@ impl Preprocessor {
         body: Bytes,
     ) -> Result<PreparedRequest, ApiError> {
         let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
-        let return_logprob = value["return_logprob"] == true;
+        let input_logprobs = value["return_logprob"] == true;
+        let routed_experts_start = (value["return_routed_experts"] == true)
+            .then(|| value["routed_experts_start_len"].as_u64().unwrap_or(0));
         let mut request = self.generate_value(model, value, Some(body))?;
-        request.merges_input_logprobs = return_logprob && !request.streaming && !request.fans_out;
+        if !request.streaming {
+            request.prefill_metadata = PrefillMetadata {
+                input_logprobs: input_logprobs && !request.fans_out,
+                routed_experts_start,
+            };
+        }
         Ok(request)
     }
 
@@ -485,7 +490,7 @@ impl Preprocessor {
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
             responder: None,
-            merges_input_logprobs: false,
+            prefill_metadata: PrefillMetadata::default(),
         })
     }
 
@@ -612,7 +617,7 @@ impl Preprocessor {
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
-            merges_input_logprobs: false,
+            prefill_metadata: PrefillMetadata::default(),
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
             sampling_defaults,
@@ -669,7 +674,7 @@ impl PreparedRequest {
             parsed_body: None,
             sampling_defaults: Vec::new(),
             responder: None,
-            merges_input_logprobs: false,
+            prefill_metadata: PrefillMetadata::default(),
         }
     }
 

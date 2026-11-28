@@ -3,6 +3,7 @@
 
 mod forward;
 mod openai;
+mod pd_metadata;
 mod preparation;
 mod reorg;
 
