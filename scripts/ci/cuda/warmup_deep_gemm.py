@@ -507,7 +507,7 @@ def main():
         model, tp_str = arg.rsplit(":", 1)
         model_tp_pairs.append((model, int(tp_str)))
 
-    fast_warmup = os.environ.get("SGLANG_JIT_DEEPGEMM_FAST_WARMUP", "0").lower() in (
+    fast_warmup = os.environ.get("SGLANG_JIT_DEEPGEMM_FAST_WARMUP", "1").lower() in (
         "1",
         "true",
     )

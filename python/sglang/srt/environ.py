@@ -1620,7 +1620,8 @@ class Envs:
     # OOM at saturation.  Capture-safe (reads only global_num_tokens_gpu).
     SGLANG_OPT_MASK_DP_PAD_MOE = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
-    SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
+    # The sampled M list compiles the same kernels as the dense one; see #47397.
+    SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(True)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
     # Resolved lazily so it tracks SGLANG_CACHE_DIR, which is defined below.
     SGLANG_DG_CACHE_DIR = EnvStr(lambda: _default_cache_subdir("deep_gemm"))
