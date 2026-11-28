@@ -257,6 +257,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.post_init()
 
     @property
+    def start_layer(self) -> int:
+        return self.language_model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.language_model.end_layer
+
+    @property
     def model(self):
         # Alias .model to .language_model so this class satisfies the piecewise
         # CUDA graph gate (which checks `hasattr(model, "model")`). Implemented

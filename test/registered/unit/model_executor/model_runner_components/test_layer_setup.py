@@ -14,6 +14,8 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
     resolve_layer_indices,
 )
+from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM
+from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -193,6 +195,54 @@ class TestCheckLayerTypesHybridSWASplit(CustomTestCase):
         check_layer_types_hybrid_swa_split(
             model=model, model_config=_hybrid_swa_model_config()
         )
+
+
+PP_LAYERS = 30
+PP_START, PP_END = 13, 27
+
+
+def _pp_model_config():
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["Hybrid"]),
+        num_hidden_layers=PP_LAYERS,
+        num_attention_layers=PP_LAYERS,
+        num_nextn_predict_layers=None,
+        is_hybrid_swa=True,
+        full_attention_layer_ids=list(range(1, PP_LAYERS, 2)),
+        swa_attention_layer_ids=list(range(0, PP_LAYERS, 2)),
+    )
+
+
+class TestPPWrappersReportTheirStackRange(CustomTestCase):
+    """A PP wrapper reports the layer range its inner stack owns."""
+
+    def _stack(self):
+        return SimpleNamespace(start_layer=PP_START, end_layer=PP_END)
+
+    def _check(self, model):
+        layer_info = resolve_layer_indices(
+            model=model, model_config=_pp_model_config(), is_draft_worker=False
+        )
+        self.assertEqual(
+            (layer_info.start_layer, layer_info.end_layer), (PP_START, PP_END)
+        )
+        self.assertEqual(layer_info.num_effective_layers, PP_END - PP_START)
+        self.assertEqual(
+            sorted(
+                layer_info.full_attention_layer_ids + layer_info.swa_attention_layer_ids
+            ),
+            list(range(PP_START, PP_END)),
+        )
+
+    def test_causal_lm_forwards_its_stack(self):
+        model = Gemma4ForCausalLM.__new__(Gemma4ForCausalLM)
+        model.model = self._stack()
+        self._check(model)
+
+    def test_multimodal_forwards_its_language_model(self):
+        model = Gemma4ForConditionalGeneration.__new__(Gemma4ForConditionalGeneration)
+        model.language_model = self._stack()
+        self._check(model)
 
 
 if __name__ == "__main__":

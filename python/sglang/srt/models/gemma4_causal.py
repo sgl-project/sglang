@@ -1387,6 +1387,14 @@ class Gemma4ForCausalLM(PreTrainedModel):
         self.capture_aux_hidden_states = False
         self.post_init()
 
+    @property
+    def start_layer(self) -> int:
+        return self.model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        return self.model.end_layer
+
     def tie_weights(self, *args, **kwargs):
         # HF's PreTrainedModel.tie_weights uses ``_tied_weights_keys`` to bind
         # ``lm_head.weight`` to ``model.embed_tokens.weight``.  Under PP those
