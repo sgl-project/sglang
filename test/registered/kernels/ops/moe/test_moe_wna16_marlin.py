@@ -510,23 +510,27 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
 )
-def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
+@pytest.mark.parametrize("is_gated", [False, True], ids=["relu2", "swiglu"])
+def test_fused_marlin_moe_nvfp4_matches_dequant_reference(is_gated):
     torch.manual_seed(0)
 
     m = 17
-    intermediate_size = 192
+    intermediate_size = 256 if is_gated else 192
     hidden_size = 256
     e = 4
     topk = 2
     dtype = torch.bfloat16
     group_size = 16
-    routed_scaling_factor = 1.0
+    routed_scaling_factor = 2.5 if is_gated else 1.0
 
     w13_packed_l, w13_scales_l, w13_gscale_l, w13_ref_l = [], [], [], []
     w2_packed_l, w2_scales_l, w2_gscale_l, w2_ref_l = [], [], [], []
     for _ in range(e):
         packed, scales, gscale, ref = make_nvfp4_weight_and_ref(
-            intermediate_size, hidden_size, dtype, group_size=group_size
+            2 * intermediate_size if is_gated else intermediate_size,
+            hidden_size,
+            dtype,
+            group_size=group_size,
         )
         w13_packed_l.append(packed)
         w13_scales_l.append(scales)
@@ -543,7 +547,7 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
 
     layer = torch.nn.Module()
     layer.quant_config = SimpleNamespace(group_size=group_size)
-    layer.moe_runner_config = SimpleNamespace(is_gated=False)
+    layer.moe_runner_config = SimpleNamespace(is_gated=is_gated)
     layer.params_dtype = dtype
     layer.intermediate_size_per_partition = intermediate_size
     layer.w13_weight = torch.nn.Parameter(
@@ -586,8 +590,8 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
         num_bits=4,
         is_k_full=True,
         routed_scaling_factor=routed_scaling_factor,
-        activation="relu2",
-        is_gated=False,
+        activation="silu" if is_gated else "relu2",
+        is_gated=is_gated,
     )
 
     w13_ref = torch.stack(w13_ref_l)
@@ -597,7 +601,11 @@ def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
         for route_idx in range(topk):
             expert_id = topk_ids[token_idx, route_idx]
             intermediate = hidden_states[token_idx] @ w13_ref[expert_id].T
-            intermediate = torch.square(torch.relu(intermediate))
+            if is_gated:
+                gate, up = intermediate.chunk(2)
+                intermediate = torch.nn.functional.silu(gate) * up
+            else:
+                intermediate = torch.square(torch.relu(intermediate))
             routed = intermediate @ w2_ref[expert_id].T
             output_ref[token_idx] += routed * topk_weights[token_idx, route_idx]
     output_ref *= routed_scaling_factor

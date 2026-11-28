@@ -310,7 +310,7 @@ class BeamMoE(nn.Module):
         ):
             raise ValueError(
                 "Beam supports the auto or triton MoE runner for BF16/FP8 "
-                "and flashinfer_trtllm for NVFP4, with no MoE all-to-all; "
+                "and flashinfer_trtllm or marlin for NVFP4, with no MoE all-to-all; "
                 "NVFP4 also supports the flashinfer_megamoe all-to-all"
             )
         self.gate = ReplicatedLinear(
@@ -1271,7 +1271,7 @@ def get_beam_supported_moe_runners(quant_scheme: Optional[str]) -> Tuple[str, ..
     return {
         "bf16": ("auto", "triton"),
         "fp8": ("auto", "triton"),
-        "nvfp4": ("flashinfer_trtllm",),
+        "nvfp4": ("flashinfer_trtllm", "marlin"),
     }.get(quant_scheme, ())
 
 

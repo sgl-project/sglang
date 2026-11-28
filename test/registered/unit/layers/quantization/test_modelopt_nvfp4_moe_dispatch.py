@@ -133,6 +133,16 @@ def _method_set_up_for(backend: MoeRunnerBackend) -> ModelOptNvFp4FusedMoEMethod
 
 
 class TestNvFp4MoeDispatch(CustomTestCase):
+    def test_beam_allows_explicit_marlin_for_serialized_nvfp4(self):
+        from sglang.srt.models.beam import (
+            get_beam_quantization,
+            get_beam_supported_moe_runners,
+        )
+
+        config = modelopt_quant.ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True)
+        runners = get_beam_supported_moe_runners(get_beam_quantization(config))
+        self.assertIn(MoeRunnerBackend.MARLIN.value, runners)
+
     def test_routed_trtllm_takes_the_trtllm_path(self):
         for backend in (
             MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
