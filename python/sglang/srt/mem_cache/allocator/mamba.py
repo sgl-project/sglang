@@ -80,7 +80,7 @@ class MambaSlotAllocator:
     def _do_alloc(self, need_size: int) -> Optional[torch.Tensor]:
         if need_size > len(self.free_slots):
             return None
-        select_index = self.free_slots[:need_size]
+        select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
         return select_index
 

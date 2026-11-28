@@ -58,7 +58,7 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if need_size > len(self.free_pages):
             return None
 
-        select_index = self.free_pages[:need_size]
+        select_index = self.free_pages[:need_size].clone()
         self.free_pages = self.free_pages[need_size:]
         return select_index
 

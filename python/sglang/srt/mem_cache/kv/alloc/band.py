@@ -1640,6 +1640,8 @@ class Band:
             if num_pages > len(self.free_virtual_ids):
                 return None
             v_pages = self.free_virtual_ids[:num_pages]
+            if self.page_size == 1:
+                v_pages = v_pages.clone()
             self.free_virtual_ids = self.free_virtual_ids[num_pages:]
             phys_pages = self.place_pages(v_pages, num_pages, consumer)
             if phys_pages is None:
