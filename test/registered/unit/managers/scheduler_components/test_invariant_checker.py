@@ -178,6 +178,39 @@ class TestEndedRequests(CustomTestCase):
         dropped.exit_via = "release"
         checker._check_ended_requests()
 
+    def test_cancelled_output_still_requires_resource_exit(self):
+        req = self._req("cancelled", sent=False, exited=False)
+        checker = _checker_over({})
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            checker.expect_output(req)
+            checker.cancel_output(req)
+            checker.cancel_output(req)
+        with self.assertRaisesRegex(StateCheckError, "never exited"):
+            checker._check_ended_requests()
+        self.assertIsNone(req.send_via)
+        req.exit_via = "release"
+        checker._check_ended_requests()
+        self.assertFalse(checker.unended)
+        self.assertFalse(checker.cancelled_outputs)
+
+    def test_uncancelled_request_still_requires_output(self):
+        req = self._req("dropped", sent=False, exited=True)
+        checker = _checker_over({})
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            checker.expect_output(req)
+        with self.assertRaisesRegex(StateCheckError, "never sent"):
+            checker._check_ended_requests()
+
+    def test_late_cancel_does_not_replace_a_real_send(self):
+        req = self._req("sent", sent=True, exited=True)
+        checker = _checker_over({})
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            checker.expect_output(req)
+            checker.cancel_output(req)
+        checker._check_ended_requests()
+        self.assertEqual(req.send_via, "stream")
+        self.assertFalse(checker.cancelled_outputs)
+
 
 class TestListedRequestsUnfinished(CustomTestCase):
     def test_only_the_deferred_list_holds_a_finished_request_at_idle(self):

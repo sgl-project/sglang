@@ -85,6 +85,7 @@ class SchedulerInvariantChecker:
     # Requests that have not both exited and sent their final output; an ended
     # one leaves at the next idle check.
     unended: Set[Req] = field(default_factory=set)
+    cancelled_outputs: Set[Req] = field(default_factory=set)
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
@@ -711,18 +712,35 @@ class SchedulerInvariantChecker:
         deferred, offloading) or has sent its final output and exited through
         the retirer."""
         self.unended = {
-            req for req in self.unended if req.send_via is None or req.exit_via is None
+            req
+            for req in self.unended
+            if req.exit_via is None
+            or (req.send_via is None and req not in self.cancelled_outputs)
         }
+        self.cancelled_outputs.intersection_update(self.unended)
         listed = {req for reqs in self.get_request_lists().values() for req in reqs}
         unlisted = self.unended - listed
         self._raise_if_any(
-            {req for req in unlisted if req.send_via is None},
+            {
+                req
+                for req in unlisted
+                if req.send_via is None and req not in self.cancelled_outputs
+            },
             "Requests in no list that never sent their final output",
         )
         self._raise_if_any(
             {req for req in unlisted if req.exit_via is None},
             "Requests in no list that never exited through the retirer",
         )
+
+    def cancel_output(self, req: Req) -> None:
+        """A client cancelled its output; the request must still release resources.
+
+        Embedders whose cancellation protocol sends no terminal reply call this
+        when accepting that cancellation, not on internal execution failures.
+        """
+        if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get() and req.send_via is None:
+            self.cancelled_outputs.add(req)
 
     def _check_listed_requests_unfinished(self) -> None:
         """At idle, no list but DEFERRED holds a finished request; a nonempty
