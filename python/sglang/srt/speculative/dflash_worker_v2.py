@@ -147,10 +147,11 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     SIMULATE_ACC_METHOD,
     SIMULATE_ACC_TOKEN_MODE,
-    GrammarTree,
+    HostVerifyTree,
     check_simulate_acc_token_mode,
     draft_pp_context,
     draft_tp_context,
+    needs_verify_tree,
     simulated_acc_len_generator,
 )
 from sglang.srt.utils import (
@@ -3516,8 +3517,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tokens[:, 1:].copy_(draft_next)
 
         # Must stay ahead of the target verify launch below.
-        grammar_tree = (
-            GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
+        host_tree = (
+            HostVerifyTree.from_linear_chain(draft_tokens)
+            if needs_verify_tree(batch)
+            else None
         )
 
         # --- 2) Target verify.
@@ -3618,9 +3621,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits
                 )
 
-        verify.build_grammar_mask(
-            grammar_tree, logits_output=logits_output, barrier=grammar_barrier
-        )
+        verify.build_row_inputs(logits_output, tree=host_tree, barrier=grammar_barrier)
         if sampling_info is not None and target_predict is None:
             # In place: DFlash refuses the watermark, the one stage that returns
             # new logits.
@@ -3643,6 +3644,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
+        )
+        commit_lens, bonus, new_seq_lens = verify.cap_chain_accept(
+            out_tokens=out_tokens,
+            commit_lens=commit_lens,
+            bonus=bonus,
+            prefix_lens=prefix_lens,
+            new_seq_lens=new_seq_lens,
         )
         verify.commit(
             VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),

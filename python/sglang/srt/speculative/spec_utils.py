@@ -871,8 +871,16 @@ def generate_token_bitmask(
     return allocate_token_bitmask, grammar
 
 
-class GrammarTree:
-    """The verify tree the grammar bitmask is built over, on the host.
+def needs_verify_tree(batch: ScheduleBatch) -> bool:
+    """Whether a verify of ``batch`` needs its draft tree on the host: for the
+    grammar bitmask or the custom logit processors' row prefixes."""
+    info = batch.sampling_info
+    return batch.has_grammar or (info is not None and info.has_custom_logit_processor)
+
+
+class HostVerifyTree:
+    """The verify tree on the host, for the grammar bitmask and the custom logit
+    processors' row prefixes (``VerifyStep.build_row_inputs``).
 
     ``from_device`` starts an async copy, so build it before the target verify
     launch; ``from_host`` is for algorithms that build the tree there (NGRAM).
@@ -888,7 +896,7 @@ class GrammarTree:
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
         draft_token: torch.Tensor,
-    ) -> GrammarTree:
+    ) -> HostVerifyTree:
         tensors = (retrieve_next_token, retrieve_next_sibling, draft_token)
         host = tuple(_async_d2h(t) for t in tensors)
         # Sources may be mixed -- an algorithm can synthesize part of the tree on
@@ -906,11 +914,11 @@ class GrammarTree:
         retrieve_next_token: torch.Tensor,
         retrieve_next_sibling: torch.Tensor,
         draft_token: torch.Tensor,
-    ) -> GrammarTree:
+    ) -> HostVerifyTree:
         return cls((retrieve_next_token, retrieve_next_sibling, draft_token), None)
 
     @classmethod
-    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> GrammarTree:
+    def from_linear_chain(cls, verify_ids_2d: torch.Tensor) -> HostVerifyTree:
         """Degenerate tree for chain-verify algorithms: node i's only child is i + 1.
 
         ``verify_ids_2d`` is (bs, chain_len) with column 0 the already-committed
@@ -929,10 +937,38 @@ class GrammarTree:
         return self._host
 
 
+def verify_row_prefixes(
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    draft_tokens: torch.Tensor,
+) -> List[List[int]]:
+    """Per verify row, the draft tokens on the path from the root to the row's
+    node, the root excluded: it is the request's last committed token. A chain's
+    row j gets drafts 1..j. The arguments are the (bs, num_draft_tokens) host tree.
+    """
+    row_prefixes = []
+    for next_token, next_sibling, tokens in zip(
+        retrieve_next_token.tolist(),
+        retrieve_next_sibling.tolist(),
+        draft_tokens.tolist(),
+    ):
+        prefixes = [[] for _ in tokens]
+        stack = [0]
+        while stack:
+            node = stack.pop()
+            child = next_token[node]
+            while child != -1:
+                prefixes[child] = [*prefixes[node], tokens[child]]
+                stack.append(child)
+                child = next_sibling[child]
+        row_prefixes.extend(prefixes)
+    return row_prefixes
+
+
 def build_grammar_vocab_mask(
     *,
     reqs: List[Req],
-    tree: GrammarTree,
+    tree: HostVerifyTree,
     sampling_info: SamplingBatchInfo,
     device,
     barrier: Optional[Callable[[], None]],
