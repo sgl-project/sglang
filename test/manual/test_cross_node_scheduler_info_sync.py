@@ -36,6 +36,8 @@ from typing import List
 import requests
 
 from sglang.test.test_utils import (
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
 )
 
@@ -129,6 +131,7 @@ def launch_node(
                 str(node_rank * test_case.gpus_per_node),
             ]
         )
+    cmd.extend(ADMIN_LAUNCH_ARGS_FOR_TEST)
     cmd.extend(test_case.extra_args)
     print(f"[Node {node_rank}] {' '.join(cmd)}")
     subprocess.run(cmd)
@@ -155,6 +158,7 @@ def test_api(test_case: TestCase) -> bool:
             resp = requests.get(
                 f"{base_url}/remote_instance_transfer_engine_info",
                 params={"rank": rank},
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=5,
             )
             status = "✓" if resp.status_code == 200 else "✗"

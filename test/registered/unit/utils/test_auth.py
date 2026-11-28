@@ -453,6 +453,32 @@ class TestApiKeyMiddleware(CustomTestCase):
             self.assertEqual(self.client.post(path, headers=user).status_code, 401)
             self.assertEqual(self.client.post(path, headers=admin).status_code, 200)
 
+    def test_root_path_does_not_bypass_auth(self):
+        self.app.add_api_route("/health", lambda: {})
+        for root_path in ("/api", "/health-api", "/ready-api", "/metrics-api"):
+            self.app.root_path = root_path
+            for key, status in ((None, 403), ("admin", 401)):
+                self.keys = ("user", key)
+                with self.subTest(root_path=root_path, admin_configured=bool(key)):
+                    self.assertEqual(
+                        self.client.post(f"{root_path}/start_profile").status_code,
+                        status,
+                    )
+                    self.assertEqual(
+                        self.client.get(f"{root_path}/generate").status_code, 401
+                    )
+                    self.assertEqual(
+                        self.client.get(f"{root_path}/health").status_code, 200
+                    )
+                    if key:
+                        self.assertEqual(
+                            self.client.post(
+                                f"{root_path}/start_profile",
+                                headers={"Authorization": "Bearer admin"},
+                            ).status_code,
+                            200,
+                        )
+
     def test_a_wrong_method_is_checked_at_the_routes_level(self):
         self.assertEqual(self.client.get("/start_profile").status_code, 403)
         self.keys = ("user", "admin")

@@ -15,7 +15,9 @@ To address these challenges, we introduce Encoder–Prefill–Decode (EPD) Disag
 ### Usage
 
 You can launch a language-only model using `--language-only`, or an encoder-only model using `--encoder-only`.
-When launching a language-only model, you must additionally specify the encoder service endpoints via `--encoder-urls`.
+When launching a language-only model, specify encoder service endpoints via `--encoder-urls`, or start encoder-only servers with `--encoder-register-urls` pointing to the language-only bootstrap service.
+
+For dynamic registration, set the same `SGLANG_ADMIN_API_KEY` (or `--admin-api-key`) on the language-only server and each registering encoder. Bootstrap registration, unregistration, and URL listing require the admin key; without one, these endpoints return HTTP 403. Static `--encoder-urls` continues to work without an admin key.
 
 We support multiple encoder transfer backends, including zmq_to_scheduler, zmq_to_tokenizer, and mooncake (the default is zmq_to_scheduler). The backend can be selected using `--encoder-transfer-backend`.
 

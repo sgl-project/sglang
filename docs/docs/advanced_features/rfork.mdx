@@ -75,13 +75,17 @@ python -m sglang.launch_server [args] \
 
 ### TransferEngine as backend
 
+Configure the same `SGLANG_ADMIN_API_KEY` (or `--admin-api-key`) on the seed and weight-loading SGLang instances, including all nodes of a multi-node seed. SGLang sends this key with its HTTP metadata registration and discovery requests; it does not authenticate the TransferEngine data transfer itself. External HTTP clients must explicitly send `Authorization: Bearer <admin_api_key>`; setting the environment variable alone does not authenticate their requests.
+
 seed instance:
 ```shell Command
+export SGLANG_ADMIN_API_KEY=[admin_api_key]
 python -m sglang.launch_server [args] \
   --remote-instance-weight-loader-start-seed-via-transfer-engine
 ```
 
 ```shell Command
+export SGLANG_ADMIN_API_KEY=[admin_api_key]
 python -m sglang.launch_server [args] \
   --load-format remote_instance \
   --remote-instance-weight-loader-seed-instance-ip [seed_instance_ip] \

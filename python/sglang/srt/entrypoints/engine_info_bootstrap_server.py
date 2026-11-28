@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
+from sglang.srt.utils.auth import add_api_key_middleware
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +37,7 @@ class EngineInfoBootstrapServer:
     Currently supports transfer engine memory registration info.
     """
 
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, *, admin_api_key: Optional[str] = None):
         self.host = host
         self.port = port
 
@@ -45,6 +46,7 @@ class EngineInfoBootstrapServer:
         self.lock = threading.Lock()
 
         app = FastAPI(**fastapi_telemetry_disabled_kwargs())
+        add_api_key_middleware(app, get_keys=lambda: (None, admin_api_key))
 
         @app.get("/health")
         def health():
