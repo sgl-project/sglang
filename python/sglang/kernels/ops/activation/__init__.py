@@ -156,6 +156,16 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="activation.xielu",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.activation.xielu:xielu",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
         op="activation.multimax",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.activation.multimax:multimax",
