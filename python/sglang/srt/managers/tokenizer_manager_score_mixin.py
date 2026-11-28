@@ -1,5 +1,6 @@
 import logging
 import math
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, TypeAlias, Union
 
@@ -820,7 +821,7 @@ class TokenizerManagerScoreMixin:
         an anchor falls outside every item block.
         """
         counts = [
-            sum(1 for p in anchor_positions if lo < p < hi)
+            bisect_left(anchor_positions, hi) - bisect_right(anchor_positions, lo)
             for lo, hi in zip(delimiter_indices, delimiter_indices[1:])
         ]
         # An anchor in the shared query prefix is not attributable to any item and
