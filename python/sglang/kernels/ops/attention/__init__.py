@@ -15,12 +15,29 @@ from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
     CapabilityRequirement,
+    DeviceType,
     KernelBackend,
     KernelSpec,
 )
 
 if TYPE_CHECKING:
     import torch
+
+for _fn in (
+    "causal_conv1d_update_mps",
+    "causal_conv1d_varlen_mps",
+    "gated_delta_rule_mps",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.attention.linear.gdn_mps:{_fn}",
+            capabilities=frozenset({CapabilityRequirement(device=DeviceType.MPS)}),
+        )
+    )
+del _fn
+
 
 # (module, public_fn) migrated from layers/attention/triton_ops + model_executor.
 _TRITON_KERNELS = [
