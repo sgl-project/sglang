@@ -1,28 +1,28 @@
 import json
 import logging
-import re
 from typing import Dict, List, Optional, Set, Tuple
+
+import regex
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
-from sglang.srt.function_call.utils import get_schema_properties, safe_literal_eval
+from sglang.srt.function_call.utils import (
+    get_schema_properties,
+    infer_type_from_json_schema,
+    safe_literal_eval,
+)
 
 logger = logging.getLogger(__name__)
 
-_FUNC_OPEN_RE = re.compile(r"<function\s+name=['\"]([^'\"]+)['\"][^>]*>")
-_PARAM_OPEN_RE = re.compile(r"<param\s+name=['\"]([^'\"]+)['\"][^>]*>")
+_FUNC_OPEN_RE = regex.compile(r"<function\s+name=['\"]([^'\"]+)['\"][^>]*>")
+_PARAM_OPEN_RE = regex.compile(r"<param\s+name=['\"]([^'\"]+)['\"][^>]*>")
 
 CDATA_START = "<![CDATA["
 CDATA_END = "]]>"
 PARAM_CLOSE = "</param>"
 FUNCTION_CLOSE = "</function>"
 PARAM_OPEN = "<param"
-
-_FUNCTION_TRANSITION_RE = re.compile(
-    re.escape(FUNCTION_CLOSE) + r"\s*" + _FUNC_OPEN_RE.pattern
-)
-_CDATA_PARAM_OPEN_RE = re.compile(_PARAM_OPEN_RE.pattern + re.escape(CDATA_START))
 
 
 def parse_arguments(json_value):
@@ -37,7 +37,7 @@ def parse_arguments(json_value):
 
 
 def _convert_param_value(key: str, val_text: str, props: dict) -> object:
-    arg_type = props[key].get("type") if key in props else None
+    arg_type = infer_type_from_json_schema(props.get(key, {}))
     if arg_type is None or arg_type == "string":
         return val_text
     parsed_val, _ = parse_arguments(val_text)
@@ -97,15 +97,6 @@ def _find_function_close(
 
         if cdata_end < idx:
             return idx
-
-        # Treat a direct transition to a function with its own CDATA parameter
-        # as a missing CDATA terminator in the preceding function.
-        for transition in _FUNCTION_TRANSITION_RE.finditer(text, idx, cdata_end):
-            body_start = transition.end()
-            next_close = text.find(FUNCTION_CLOSE, body_start, cdata_end)
-            next_body_end = cdata_end if next_close == -1 else next_close
-            if _CDATA_PARAM_OPEN_RE.search(text, body_start, next_body_end):
-                return transition.start()
 
         pos = cdata_end + len(CDATA_END)
 
@@ -277,19 +268,12 @@ class MiniCPM5Detector(BaseFormatDetector):
         calls = []
         while self._buffer:
             text = self._buffer
-            opening = _FUNC_OPEN_RE.search(text)
-            if opening is None:
-                if not finished:
-                    start = text.find(self.bot_token)
-                    if start != -1:
-                        normal_parts.append(text[:start])
-                        self._buffer = text[start:]
-                        break
-                    if self._ends_with_partial_token(text, self.bot_token):
-                        break
-                self._buffer = ""
-                if self.current_tool_id <= 0:
-                    normal_parts.append(text)
+            opening = _FUNC_OPEN_RE.search(text, partial=not finished)
+            if opening is None or opening.partial:
+                # Only a suffix that can still become an opener needs more input.
+                start = len(text) if opening is None else opening.start()
+                normal_parts.append(text[:start])
+                self._buffer = text[start:]
                 break
 
             start = opening.start()

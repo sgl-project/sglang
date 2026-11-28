@@ -357,6 +357,38 @@ def test_untyped_and_string_params_not_json_parsed():
     assert json.loads(str_res.calls[0].parameters) == {"items": "[1,2,3]"}
 
 
+@pytest.mark.parametrize(
+    ("schema", "raw", "expected"),
+    [
+        ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, "5", 5),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, "5", "5"),
+        ({"type": ["string", "null"]}, "5", "5"),
+        ({"oneOf": [{"type": "boolean"}, {"type": "null"}]}, "true", True),
+        ({"allOf": [{"type": "integer"}, {"minimum": 0}]}, "5", 5),
+        ({"items": {"type": "integer"}}, "[1,2]", [1, 2]),
+    ],
+)
+def test_parameter_schema_types(schema, raw, expected):
+    tools = [
+        Tool(
+            function=Function(
+                name="lookup",
+                parameters={"type": "object", "properties": {"value": schema}},
+            )
+        )
+    ]
+    opening = '<function name="lookup"><param name="value">'
+    closing = "</param></function>"
+    full = MiniCPM5Detector().detect_and_parse(opening + raw + closing, tools)
+    detector = MiniCPM5Detector()
+    assert detector.parse_streaming_increment(opening + raw, tools).calls == []
+    stream = detector.parse_streaming_increment(closing, tools)
+    for result in (full, stream):
+        assert [json.loads(call.parameters) for call in result.calls] == [
+            {"value": expected}
+        ]
+
+
 def test_missing_param_close_stops_at_next_param():
     tools = make_tools_weather()
     text = (
@@ -419,12 +451,12 @@ def test_streaming_partial_function_token_buffered():
     detector = MiniCPM5Detector()
     tools = make_tools_exec()
     r1 = detector.parse_streaming_increment("Hello <func", tools)
-    assert r1.normal_text == ""
+    assert r1.normal_text == "Hello "
     assert r1.calls == []
     r2 = detector.parse_streaming_increment(
         'tion name="exec"><param name="command">echo hi</param></function>', tools
     )
-    assert r2.normal_text == "Hello "
+    assert r2.normal_text == ""
     assert len(r2.calls) == 1
 
 
@@ -454,6 +486,31 @@ def test_final_delta_drains_multiple_complete_calls():
         {"city": "Shanghai"},
     ]
     assert detector.finish(tools).calls == []
+
+
+def test_streaming_text_between_and_after_calls():
+    tools = make_tools_weather()
+    detector = MiniCPM5Detector()
+    block = '<function name="get_weather"><param name="city">Beijing</param></function>'
+    first = detector.parse_streaming_increment(block, tools)
+    between = detector.parse_streaming_increment(" Between. <func", tools)
+    second = detector.parse_streaming_increment(
+        block[len("<func") :].replace("Beijing", "Shanghai"), tools
+    )
+    trailing = detector.parse_streaming_increment(" After. <fun", tools)
+    end = detector.finish(tools)
+    assert [
+        first.normal_text,
+        between.normal_text,
+        second.normal_text,
+        trailing.normal_text,
+        end.normal_text,
+    ] == ["", " Between. ", "", " After. ", "<fun"]
+    calls = first.calls + between.calls + second.calls + trailing.calls + end.calls
+    assert [(c.tool_index, json.loads(c.parameters)) for c in calls] == [
+        (0, {"city": "Beijing"}),
+        (1, {"city": "Shanghai"}),
+    ]
 
 
 def test_cdata_literal_function_close_does_not_emit_early():
@@ -519,7 +576,7 @@ def test_finish_preserves_unclosed_function_text():
     assert detector.finish(tools).normal_text == ""
 
 
-def test_missing_cdata_end_does_not_consume_next_call():
+def test_complete_cdata_owns_all_text_through_its_terminator():
     tools = make_tools_weather()
     first = (
         '<function name="get_weather"><param name="city"><![CDATA[Beijing'
@@ -529,7 +586,12 @@ def test_missing_cdata_end_does_not_consume_next_call():
         '\n<function name="get_weather">'
         '<param name="city"><![CDATA[Shanghai]]></param></function>'
     )
-    expected = [{"city": "Beijing"}, {"city": "Shanghai"}]
+    expected = [
+        {
+            "city": 'Beijing</param></function>\n<function name="get_weather">'
+            '<param name="city"><![CDATA[Shanghai'
+        }
+    ]
     non_stream = MiniCPM5Detector().detect_and_parse(first + second, tools)
     detector = MiniCPM5Detector()
     first_result = detector.parse_streaming_increment(first, tools)
@@ -537,7 +599,7 @@ def test_missing_cdata_end_does_not_consume_next_call():
     second_result = detector.parse_streaming_increment(second, tools)
     calls = second_result.calls + detector.finish(tools).calls
     assert [json.loads(call.parameters) for call in calls] == expected
-    assert [call.tool_index for call in calls] == [0, 1]
+    assert [call.tool_index for call in calls] == [0]
     assert [json.loads(call.parameters) for call in non_stream.calls] == expected
 
 
