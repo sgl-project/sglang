@@ -25,7 +25,11 @@ from typing import Dict, List, Optional
 import torch
 from torch import nn
 
-from sglang.srt.configs.inkling2 import INKLING2_ARCHS, INKLING2_QKVR_PROJECTIONS
+from sglang.srt.configs.inkling2 import (
+    INKLING2_ARCHS,
+    INKLING2_QKVR_PROJECTIONS,
+    Inkling2ModelConfig,
+)
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.layers.utils import get_layer_id
@@ -335,7 +339,9 @@ class LoRAAdapter(nn.Module):
             weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
 
     def _is_inkling2(self) -> bool:
-        # Unit tests pass bare config stubs; real HF configs always carry architectures.
+        # LoRAManager passes the text config, which carries no architectures.
+        if isinstance(self.base_hf_config, Inkling2ModelConfig):
+            return True
         architectures = getattr(self.base_hf_config, "architectures", None) or []
         return any(arch in INKLING2_ARCHS for arch in architectures)
 

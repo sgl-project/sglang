@@ -235,3 +235,38 @@ def test_lora_qkvr_projects_each_source_separately():
     sources = AttentionSources(*(torch.randn(tokens, _D) for _ in range(3)))
     attn._project_sources(sources)
     assert attn.qkvr.rows == [tokens, tokens, tokens]
+
+
+def test_qkvr_fuses_all_six_slices_under_the_served_text_config():
+    """LoRAManager hands adapters the text config, which has no architectures; Inkling2 adapters loaded
+    on a server must still fuse all six attention members (gate_attn used to be left unfused)."""
+    from sglang.srt.configs.inkling2 import Inkling2ModelConfig
+
+    text = Inkling2ModelConfig(
+        hidden_size=_D,
+        num_hidden_layers=1,
+        num_attention_heads=_HEADS,
+        num_key_value_heads=_KV_HEADS,
+        head_dim=_HEAD_DIM,
+        swa_num_attention_heads=_HEADS,
+        swa_num_key_value_heads=_KV_HEADS,
+        swa_head_dim=_HEAD_DIM,
+        d_rel=_D_REL,
+        local_layer_ids=[],
+        n_layers_per_attn_res_block=1,
+    )
+    adapter = LoRAAdapter(
+        uid="inkling2",
+        config=LoRAConfig.from_dict(
+            dict(peft_type="LORA", r=_RANK, lora_alpha=32, target_modules=_TARGETS)
+        ),
+        base_hf_config=text,
+        load_config=None,
+        lora_backend=None,
+    )
+    adapter.initialize_weights_from_tensors(_member_tensors(0))
+    prefix = _LAYER.format(0)
+    assert set(adapter.layers[0].weights) == {
+        f"{prefix}.qkvr.lora_A.weight",
+        f"{prefix}.qkvr.lora_B.weight",
+    }
