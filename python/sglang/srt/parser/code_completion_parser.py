@@ -77,7 +77,9 @@ def set_completion_template(template_name: str) -> None:
 
 def generate_completion_prompt_from_request(request: CompletionRequest) -> str:
     global completion_template_name
-    if request.suffix == "":
+    # suffix defaults to None; without this check it would be formatted
+    # into the FIM template as the literal text "None".
+    if not request.suffix:
         return request.prompt
 
     return generate_completion_prompt(
