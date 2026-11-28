@@ -292,9 +292,9 @@ class TestFusedLowRatioCompress(CustomTestCase):
         override.install()
         cls.addClassCleanup(override.restore)
 
-    def _check_step(self, t, ratio: int):
+    def _check_step(self, t, ratio: int, **kwargs):
         DeepseekV4AttnBackend._low_ratio_compress_fused(
-            t.backend, t.layer, t.x, t.req, t.pos
+            t.backend, t.layer, t.x, t.req, t.pos, **kwargs
         )
         ref_kv, ref_index = _reference(t, ratio)
         torch.cuda.synchronize()
@@ -370,6 +370,27 @@ class TestFusedLowRatioCompress(CustomTestCase):
                     self.assertFalse(scale[0, 0, :, 0].any())
                 else:
                     self.assertFalse(t.index_cache[0][0, : INDEX_HEAD_DIM // 2].any())
+
+    def test_out_loc_metadata_padded_past_the_live_rows(self):
+        """A prefill CUDA graph break hands over only the live rows, while the
+        out-loc metadata keeps the captured bucket's padded length. Both the
+        decode and the extend (prefill) kernels must see one row count."""
+        n, pad = 8, 5
+        for ratio, extend in ((1, False), (2, False), (2, True)):
+            with self.subTest(ratio=ratio, extend=extend):
+                t = _build(n, ratio, seed=400 + ratio + extend)
+                core = t.backend.forward_metadata.core_metadata
+                for name in ("raw_out_loc", "c1_out_loc", "c2_out_loc"):
+                    live = getattr(core, name)
+                    setattr(core, name, torch.cat([live, live.new_zeros(pad)]))
+                kwargs = {}
+                if extend:
+                    # one single-row request per row: every partner comes from the ring
+                    kwargs["extend_offsets"] = (
+                        torch.arange(n, device="cuda", dtype=torch.int32),
+                        torch.ones(n, device="cuda", dtype=torch.int32),
+                    )
+                self._check_step(t, ratio, **kwargs)
 
     def test_open_group_rows_publish_nothing(self):
         """A live ratio-2 token at an even position completes no group, so the metadata
