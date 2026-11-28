@@ -279,6 +279,26 @@ at::Tensor fused_experts_cpu(
   CHECK_EQ(inplace, false);
   at::Tensor out = at::empty_like(hidden_states);
 
+  // x_per_expert keys the per-expert weight and scale pointer arithmetic below
+  // (w13 + eid * 2 * N * K, w13_scale + eid * 2 * N, w2 + eid * K * N and
+  // w2_scale + eid * K), so any id outside [0, E) reads and writes outside the
+  // expert tensors. Validate before x_per_expert is populated.
+  {
+    const int* ids = topk_ids.data_ptr<int>();
+    const int64_t numel = M * topk;
+    for (int64_t i = 0; i < numel; ++i) {
+      TORCH_CHECK(
+          ids[i] >= 0 && ids[i] < E,
+          "fused_experts_cpu: topk_ids[",
+          i,
+          "] = ",
+          ids[i],
+          " is out of range [0, ",
+          E,
+          ")");
+    }
+  }
+
   // expert id -> related input rows and weights
   expert_to_rows_t x_per_expert;  // std::map<int, std::vector<std::tuple<int, float>>>
   {
