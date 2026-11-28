@@ -137,16 +137,19 @@ def _layer_norm_fwd_1pass_kernel(
     Q=None,
     S=None,
     QUANT: tl.constexpr = False,
+    QUANT_HEADS: tl.constexpr = 0,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
 
-    # Map the program id to the starting row of X and Y it should compute.
-    row_start = tl.program_id(0) * ROWS_PER_BLOCK
+    # Map the program id to the starting row of X and Y it should compute. A QUANT
+    # program owns the QUANT_HEADS rows of one token; the tile pads them to a power of two.
+    row_start = tl.program_id(0) * (QUANT_HEADS if QUANT else ROWS_PER_BLOCK)
     group = tl.program_id(1)
 
     # Create 2D tile: [ROWS_PER_BLOCK, BLOCK_N]
-    rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+    tile_rows = tl.arange(0, ROWS_PER_BLOCK)
+    rows = row_start + tile_rows
     cols = tl.arange(0, BLOCK_N)
 
     # Compute offsets for 2D tile
@@ -158,7 +161,10 @@ def _layer_norm_fwd_1pass_kernel(
     Y_base = Y + rows[:, None] * stride_y_row + col_offsets
 
     # Create mask for valid rows and columns
-    row_mask = rows[:, None] < M
+    row_valid = rows < M
+    if QUANT and QUANT_HEADS < ROWS_PER_BLOCK:
+        row_valid = row_valid & (tile_rows < QUANT_HEADS)
+    row_mask = row_valid[:, None]
     col_mask = cols[None, :] < N
     mask = row_mask & col_mask
 
@@ -184,8 +190,7 @@ def _layer_norm_fwd_1pass_kernel(
         mean = tl.sum(x, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
         # Store mean for each row
         mean_offsets = group * M + rows
-        mean_mask = rows < M
-        tl.store(Mean + mean_offsets, mean, mask=mean_mask)
+        tl.store(Mean + mean_offsets, mean, mask=row_valid)
         # Broadcast mean back to 2D for subtraction
         xbar = tl.where(mask, x - mean[:, None], 0.0)
         var = tl.sum(xbar * xbar, axis=1) / N  # Shape: [ROWS_PER_BLOCK]
@@ -198,8 +203,7 @@ def _layer_norm_fwd_1pass_kernel(
 
     # Store rstd for each row
     rstd_offsets = group * M + rows
-    rstd_mask = rows < M
-    tl.store(Rstd + rstd_offsets, rstd, mask=rstd_mask)
+    tl.store(Rstd + rstd_offsets, rstd, mask=row_valid)
 
     # Load weights and biases (broadcast across rows)
     w_offsets = cols + group * N
@@ -267,6 +271,21 @@ def calc_rows_per_block(M: int, device: torch.device) -> int:
     return rows_per_block
 
 
+def quant_heads_num_warps(
+    M: int, N: int, quant_heads: int, device: torch.device
+) -> int | None:
+    """num_warps of a ``_layer_norm_fwd(quant_heads=...)`` launch whose rows round as the unfused launch's,
+    or None where there is none. A row's bits depend on the tile its warp holds, so the power-of-two row
+    tile has to split into warps of ``calc_rows_per_block(M)`` rows: at most 16 warps, and rows of 128
+    columns, the only width checked."""
+    tile_rows = triton.next_power_of_2(quant_heads)
+    rows_per_block = calc_rows_per_block(M, device)
+    if N != 128 or tile_rows < rows_per_block:
+        return None
+    num_warps = tile_rows // rows_per_block
+    return num_warps if num_warps <= 16 else None
+
+
 def _layer_norm_fwd(
     x,
     weight,
@@ -324,18 +343,23 @@ def _layer_norm_fwd(
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:
         assert ngroups == 1 and M % quant_heads == 0
+        tile_rows = triton.next_power_of_2(quant_heads)
         # at most 1024 threads (16 wave64s) per block; each row still reduces inside one warp
-        num_warps = min(num_warps * quant_heads // rows_per_block, 16)
-        rows_per_block = quant_heads
+        num_warps = min(num_warps * tile_rows // rows_per_block, 16)
+        if tile_rows != quant_heads:
+            assert num_warps == quant_heads_num_warps(
+                M, group_size, quant_heads, x.device
+            ), "quant_heads: no launch rounds as the unfused one does"
+        rows_per_block = tile_rows
         q = torch.empty(
             (M // quant_heads, quant_heads * N),
             dtype=torch.float8_e4m3fn,
             device=x.device,
         )
         s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
-        quant = {"Q": q, "S": s, "QUANT": True}
+        quant = {"Q": q, "S": s, "QUANT": True, "QUANT_HEADS": quant_heads}
     # Update grid to use rows_per_block
-    grid = (cdiv(M, rows_per_block), ngroups)
+    grid = (M // quant_heads if quant_heads else cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     # Workaround for PyTorch <= 2.12: torch.xpu.device is not Dynamo-compatible
     # in that release — it creates a DynamoConfigPatchProxy that

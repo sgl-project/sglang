@@ -1,5 +1,7 @@
-"""gfx950 small-M W8A8 FP8 GEMM and fused output-side FP8 quant, Qwen3.5 AttnFP8 TP4 and TP2 shapes."""
+"""gfx950 small-M W8A8 FP8 GEMM and fused output-side FP8 quant, Qwen3.5 AttnFP8 TP4 and TP2 shapes,
+and the same quant fusion for Qwen3.8-Flash-Next's 48-head GDN and 24-head attention at TP1 and TP2."""
 
+import contextlib
 import itertools
 import os
 import types
@@ -30,6 +32,47 @@ def _per_token_scheme():
     return QuarkW8A8Fp8(
         {"qscheme": "per_channel"}, {"qscheme": "per_channel", "is_dynamic": True}
     )
+
+
+@contextlib.contextmanager
+def _single_rank():
+    from sglang.srt.runtime_context import get_context, get_parallel
+    from sglang.test.layer_ut_utils import init_single_process_dist
+
+    init_single_process_dist()
+    with (
+        get_parallel().override(tp_size=1, tp_rank=0),
+        get_context().override_server_args(),
+    ):
+        yield
+
+
+def _quark_row_linear(in_features, out_features):
+    """A RowParallelLinear of the Quark per-token FP8 scheme, loaded the way Quark checkpoints are (in _single_rank)."""
+    from sglang.srt.layers.linear import RowParallelLinear
+    from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+
+    class _QuarkPerToken:
+        def get_quant_method(self, layer, prefix):
+            layer.scheme = _per_token_scheme()
+            return QuarkLinearMethod(self)
+
+    proj = RowParallelLinear(
+        in_features,
+        out_features,
+        bias=False,
+        reduce_results=False,
+        params_dtype=torch.bfloat16,
+        quant_config=_QuarkPerToken(),
+    ).cuda()
+    proj.weight.data.copy_(
+        (torch.randn(out_features, in_features, device="cuda") * 0.05).to(
+            torch.float8_e4m3fn
+        )
+    )
+    proj.weight_scale.data.copy_(torch.rand(out_features, device="cuda") * 0.01 + 1e-3)
+    proj.quant_method.process_weights_after_loading(proj)
+    return proj
 
 
 @unittest.skipUnless(is_gfx95_supported(), "gfx950 (MI35x) only")
@@ -117,27 +160,37 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
 
         scheme = _per_token_scheme()
         fwd = types.SimpleNamespace(sp_active=False)
-        # weight is [K, N] after Quark loading; TP4 o_proj (N, K) = (4096, 2048)
-        o_proj = types.SimpleNamespace(scheme=scheme, weight=torch.empty(2048, 4096))
-        other = types.SimpleNamespace(scheme=scheme, weight=torch.empty(2048, 1024))
+        # weight is [K, N] after Quark loading; Qwen3.8 TP1 o_proj (N, K) = (2560, 6144), outside SHAPES
+        o_proj = types.SimpleNamespace(
+            scheme=scheme, weight=torch.empty(6144, 2560), weight_scale=torch.empty(1)
+        )
+        dequantized = types.SimpleNamespace(
+            scheme=scheme, weight=torch.empty(6144, 12), weight_scale=None
+        )
         with patch.object(qwen3_5, "get_forward", return_value=fwd):
-            fp8_in = qwen3_5._fp8_tuple_input
-            self.assertTrue(fp8_in(o_proj, 36))
-            self.assertFalse(fp8_in(o_proj, 37))
-            self.assertFalse(fp8_in(other, 4))  # shape outside SHAPES
-            self.assertFalse(fp8_in(torch.nn.Linear(8, 8), 4))  # BF16 MTP layer
+            fp8_in, bf16 = qwen3_5._fp8_tuple_input, torch.bfloat16
+            self.assertTrue(fp8_in(o_proj, 1, bf16))
+            self.assertTrue(fp8_in(o_proj, 256, bf16))
+            self.assertFalse(fp8_in(o_proj, 257, bf16))  # past the token cap
+            self.assertFalse(fp8_in(o_proj, 4, torch.float16))  # the GEMM returns BF16
+            self.assertFalse(fp8_in(dequantized, 4, bf16))  # served dequantized
+            self.assertFalse(fp8_in(torch.nn.Linear(8, 8), 4, bf16))  # BF16 MTP layer
             with _off():
-                self.assertFalse(fp8_in(o_proj, 4))
+                self.assertTrue(fp8_in(o_proj, 4, bf16))  # no small-M kernel needed
+            with patch.object(qwen3_5, "_is_gfx95", False):
+                self.assertFalse(
+                    fp8_in(o_proj, 4, bf16)
+                )  # the launches are checked on gfx950
 
-    def producers(self, t, trial=0, tp=4):
+    def producers(self, t, trial=0, tp=4, heads=(64, 32), activation="swish"):
         from sglang.kernels.ops.attention.fla.layernorm_gated import (
             _layer_norm_fwd,
             rms_norm_gated,
         )
         from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
-        # per rank: GDN RMSNormGated over 64 / tp heads x 128; attention gate over 32 / tp heads x 256
-        nv, na = 64 // tp, 32 // tp
+        # per rank: GDN RMSNormGated over heads[0] / tp heads x 128; attention gate over heads[1] / tp heads x 256
+        nv, na = heads[0] // tp, heads[1] // tp
         x = torch.randn(t * nv, 128, device="cuda", dtype=torch.bfloat16) * (1 + trial)
         z = torch.randn_like(x) * 3
         w = torch.randn(128, device="cuda", dtype=torch.bfloat16) * 0.5 + 1
@@ -145,56 +198,61 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
         g = torch.randn(t, na, 512, device="cuda", dtype=torch.bfloat16)[:, :, 256:]
         fused = (
             lambda: _layer_norm_fwd(
-                x, w, None, 1e-6, z=z, is_rms_norm=True, quant_heads=nv
+                x,
+                w,
+                None,
+                1e-6,
+                z=z,
+                is_rms_norm=True,
+                activation=activation,
+                quant_heads=nv,
             )[0],
             lambda: fused_sigmoid_mul(a, g, quant=True),
         )
-        norm = rms_norm_gated(x=x, weight=w, bias=None, z=z, eps=1e-6, is_rms_norm=True)
+        norm = rms_norm_gated(
+            x=x,
+            weight=w,
+            bias=None,
+            z=z,
+            eps=1e-6,
+            is_rms_norm=True,
+            activation=activation,
+        )
         plain = (norm.view(t, nv * 128), fused_sigmoid_mul(a.clone(), g))
         unfused = tuple(self.quant(p, group_size=p.shape[1]) for p in plain)
         return fused, unfused, plain
 
     def test_fused_quant_bit_exact(self):
-        for tp, t in itertools.product((4, 2), (1, 4, 16, 33, 40)):
-            for trial in range(5):
-                fused, unfused, _ = self.producers(t, trial, tp)
-                for f, (rq, rs) in zip(fused, unfused):
-                    q, s = f()
-                    self.assertTrue(
-                        torch.equal(q.view(torch.uint8), rq.view(torch.uint8))
-                    )
-                    self.assertTrue(torch.equal(s, rs))
+        """The codes and scales the producers hand the GEMM are the separate quant's, for Qwen3.5-397B (swish
+        gate, 8 to 32 GDN heads a rank) and Qwen3.8-Flash-Next (sigmoid gate, 6 to 48 heads a rank: 48 in a
+        64-row tile, 12 in a 16-row one), up to the served 176 tokens. The norm is fused from the token counts
+        of norm_floor, for 256 CUs."""
+        # (value heads, attention heads), the TP sizes, the GDN norm's gate
+        models = (((64, 32), (8, 4, 2), "swish"), ((48, 24), (8, 4, 2, 1), "sigmoid"))
+        # value heads per rank: the first token count at which the norm fuses
+        norm_floor = {6: 1, 8: 1, 12: 1, 16: 1, 24: 22, 32: 17, 48: 22}
+        for (heads, tps, activation), t in itertools.product(
+            models, (1, 4, 16, 21, 22, 33, 40, 48, 176)
+        ):
+            for tp in tps:
+                nv = heads[0] // tp
+                norm_fuses = t >= norm_floor[nv]
+                for trial in range(5):
+                    fused, unfused, _ = self.producers(t, trial, tp, heads, activation)
+                    for i, (f, (rq, rs)) in enumerate(zip(fused, unfused)):
+                        if i == 0 and not norm_fuses:
+                            continue
+                        with self.subTest(heads=heads, tp=tp, t=t, trial=trial, i=i):
+                            q, s = f()
+                            self.assertTrue(
+                                torch.equal(q.view(torch.uint8), rq.view(torch.uint8))
+                            )
+                            self.assertTrue(torch.equal(s, rs))
 
     def test_quark_row_linear_takes_producer_tuple(self):
-        from sglang.srt.layers.linear import RowParallelLinear
-        from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
-        from sglang.srt.runtime_context import get_context, get_parallel
-        from sglang.test.layer_ut_utils import init_single_process_dist
-
-        class _QuarkPerToken:
-            def get_quant_method(self, layer, prefix):
-                layer.scheme = _per_token_scheme()
-                return QuarkLinearMethod(self)
-
-        init_single_process_dist()
-        with (
-            get_parallel().override(tp_size=1, tp_rank=0),
-            get_context().override_server_args(),
-        ):
-            # TP4 GDN out_proj / attention o_proj, loaded the way Quark checkpoints are
-            proj = RowParallelLinear(
-                2048,
-                4096,
-                bias=False,
-                reduce_results=False,
-                params_dtype=torch.bfloat16,
-                quant_config=_QuarkPerToken(),
-            ).cuda()
-            proj.weight.data.copy_(
-                (torch.randn(4096, 2048, device="cuda") * 0.05).to(torch.float8_e4m3fn)
-            )
-            proj.weight_scale.data.copy_(torch.rand(4096, device="cuda") * 0.01 + 1e-3)
-            proj.quant_method.process_weights_after_loading(proj)
+        with _single_rank():
+            # TP4 GDN out_proj / attention o_proj
+            proj = _quark_row_linear(2048, 4096)
             for t in (1, 4, 36):
                 fused, _, plain = self.producers(t)
                 for f, p in zip(fused, plain):
@@ -204,8 +262,164 @@ class TestSmallMFp8ProjGfx950(CustomTestCase):
                         )
                         self.assertEqual(n, 2)
                         self.assertTrue(torch.equal(got, ref))
-            with _off(), self.assertRaises(AssertionError):
-                proj(fused[0]())
+            # without the small-M kernel the tuple goes to the aiter GEMM the BF16 input takes
+            with _off():
+                (got, ref), n = self.run_counted(
+                    lambda: proj(fused[0]())[0], lambda: proj(plain[0])[0]
+                )
+                self.assertEqual(n, 0)
+                self.assertTrue(torch.equal(got, ref))
+
+    def quant_launches(self, thunk):
+        """thunk's result and how many per-token quants apply_fp8_linear ran for it."""
+        calls, real = [], self.fp8_utils.per_token_group_quant_fp8
+        with patch.object(
+            self.fp8_utils,
+            "per_token_group_quant_fp8",
+            lambda *a, **k: calls.append(1) or real(*a, **k),
+        ):
+            return thunk(), len(calls)
+
+    def test_qwen4_attention_gate_hands_o_proj_the_fp8_pair(self):
+        """Qwen4ExpAttentionDecoderLayer.self_attention: o_proj takes the gate's (fp8, scale), not a BF16 tensor
+        it quantizes itself, and its output is the BF16 path's; past decode sizes it is the BF16 path."""
+        from sglang.srt.models import qwen3_5, qwen4_exp
+
+        n_heads, head_dim, hidden = 24, 256, 2560  # Qwen3.8-Flash-Next TP1
+        no_sp = types.SimpleNamespace(sp_active=False)
+        with _single_rank(), patch.object(qwen3_5, "get_forward", return_value=no_sp):
+            layer = types.SimpleNamespace(
+                is_qsa=False,
+                alt_stream=None,
+                o_proj=_quark_row_linear(n_heads * head_dim, hidden),
+            )
+            layer.self_attention = types.MethodType(
+                qwen4_exp.Qwen4ExpAttentionDecoderLayer.self_attention, layer
+            )
+            for t in (1, 48, 176, 256, 257):
+                attn = (
+                    torch.randn(t, n_heads * head_dim, device="cuda") * 0.5
+                ).bfloat16()
+                gate = torch.randn(t, n_heads, 2 * head_dim, device="cuda").bfloat16()
+                layer._prepare_qkv_gate = lambda **_: (
+                    None,
+                    None,
+                    None,
+                    gate[..., head_dim:],
+                )
+                layer.attn = lambda *_: attn.clone()
+                run = lambda: layer.self_attention(None, None, None)
+                # _fp8_tuple_input, which qwen4_exp calls, says no without aiter
+                with patch.object(qwen3_5, "_use_aiter", False):
+                    ref, ref_quants = self.quant_launches(run)
+                got, got_quants = self.quant_launches(run)
+                with self.subTest(t=t):
+                    self.assertEqual((ref_quants, got_quants), (1, int(t > 256)))
+                    self.assertTrue(torch.equal(got, ref))
+
+    def test_gdn_forward_fuses_the_norm_quant_above_the_floor(self):
+        """Qwen3_5GatedDeltaNet.forward: out_proj takes the norm's (fp8, scale) where the norm's launch rounds
+        as the unfused one does (at 48 heads from 22 tokens, rows_per_block 4), or where the small-M GEMM takes
+        the shape (32 heads, Qwen3.5-397B TP2, up to 40 tokens); otherwise the norm and the quant stay two
+        launches. The output is the BF16 path's wherever the launch rounds as the unfused one does."""
+        from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.models import qwen3_5
+
+        n_k, head_dim = 16, 128
+        # value heads a rank, hidden, the norm's gate, the first token count where the norm's launch rounds as
+        # the unfused one does, the first token count where the norm is fused
+        configs = ((48, 2560, "sigmoid", 22, 22), (32, 4096, "swish", 17, 1))
+        no_sp = types.SimpleNamespace(sp_active=False)
+        decode = types.SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, logical_forward_mode=ForwardMode.DECODE
+        )
+        for n_v, hidden, activation, exact_from, fused_from in configs:
+            with (
+                _single_rank(),
+                patch.object(qwen3_5, "get_forward", return_value=no_sp),
+            ):
+                norm = RMSNorm(
+                    head_dim,
+                    eps=1e-6,
+                    activation=activation,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                )
+                norm.weight.data.normal_(1.0, 0.3)
+                gdn = types.SimpleNamespace(
+                    num_k_heads=n_k,
+                    num_v_heads=n_v,
+                    attn_tp_size=1,
+                    head_k_dim=head_dim,
+                    head_v_dim=head_dim,
+                    norm=norm,
+                    out_proj=_quark_row_linear(n_v * head_dim, hidden),
+                )
+                gdn.forward = types.MethodType(
+                    qwen3_5.Qwen3_5GatedDeltaNet.forward, gdn
+                )
+                for t in (1, 16, 21, 22, 48, 176):
+                    qkvz = torch.randn(
+                        t, 2 * (n_k + n_v) * head_dim, device="cuda"
+                    ).bfloat16()
+                    ba = torch.randn(t, 2 * n_v, device="cuda").bfloat16()
+                    core = (
+                        torch.randn(t, n_v, head_dim, device="cuda") * 0.5
+                    ).bfloat16()
+                    gdn._forward_input_proj = lambda _: (qkvz, ba)
+                    gdn.attn = lambda forward_batch, mixed_qkv, a, b: core
+                    run = lambda: gdn.forward(None, decode)
+                    with patch.object(qwen3_5, "_fp8_tuple_input", return_value=False):
+                        ref, ref_quants = self.quant_launches(run)
+                    got, got_quants = self.quant_launches(run)
+                    with self.subTest(heads=n_v, t=t):
+                        self.assertEqual(
+                            (ref_quants, got_quants), (1, int(t < fused_from))
+                        )
+                        if t >= exact_from:
+                            self.assertTrue(torch.equal(got, ref))
+
+    def test_power_of_two_heads_keep_the_capped_launch(self):
+        """_layer_norm_fwd(quant_heads=n) for a power-of-two n runs one program of n rows and
+        min(n // rows_per_block, 16) warps per token at every token count: 32 heads below 17 tokens (Qwen3.5-397B
+        TP2 decode) take 16 warps for 32 rows, as they always did."""
+        from sglang.kernels.ops.attention.fla import layernorm_gated
+
+        launches, kernel = [], layernorm_gated._layer_norm_fwd_1pass_kernel
+
+        class Recorder:
+            def __getitem__(self, grid):
+                def launch(*args, **kwargs):
+                    launches.append(
+                        (grid, kwargs["num_warps"], kwargs["ROWS_PER_BLOCK"])
+                    )
+                    return kernel[grid](*args, **kwargs)
+
+                return launch
+
+        device = torch.empty(0, device="cuda").device
+        with patch.object(layernorm_gated, "_layer_norm_fwd_1pass_kernel", Recorder()):
+            for nv, t in ((16, 1), (16, 36), (32, 1), (32, 16), (32, 40), (64, 8)):
+                x = torch.randn(t * nv, 128, device="cuda", dtype=torch.bfloat16)
+                w = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+                rows_per_block = layernorm_gated.calc_rows_per_block(t * nv, device)
+                with self.subTest(heads=nv, t=t):
+                    first = len(launches)
+                    (q, s), _, _ = layernorm_gated._layer_norm_fwd(
+                        x,
+                        w,
+                        None,
+                        1e-6,
+                        z=torch.randn_like(x),
+                        is_rms_norm=True,
+                        quant_heads=nv,
+                    )
+                    self.assertEqual(
+                        launches[first:],
+                        [((t, 1), min(nv // rows_per_block, 16), nv)],
+                    )
+                    self.assertEqual((q.shape, s.shape), ((t, nv * 128), (t, 1)))
 
     def test_graph_replay_matches_eager(self):
         (w_in, s_in, _), _, (w_out, s_out, _) = self.shapes[:3]
