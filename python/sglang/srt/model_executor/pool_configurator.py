@@ -11,7 +11,6 @@ from __future__ import annotations
 import logging
 from bisect import bisect_right
 from dataclasses import dataclass
-from math import lcm
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -1896,10 +1895,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         else:
             state_pool_size = num_req_slots * ring_size
             state_rows = state_pool_size + ring_size + 1
-            if _is_npu:
-                state_rows = ceil_align(state_rows, lcm(128, ring_size))
-            else:
-                state_rows = ceil_div(state_rows, 128) * 128
+            state_rows = ceil_div(state_rows, 128) * 128
             state_last_dim = 2 * self.attn_head_dim
 
         return state_rows * state_last_dim * c128_state_dtype_size * num_layers
@@ -1913,14 +1909,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[2]
+        row_alignment = 2
         if self._npu_low_ratio_bf16:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
                 get_a3_c2_state_bank_count,
             )
 
             num_req_slots = get_a3_c2_state_bank_count(num_req_slots)
-        # NPU requests a 3-D view with state_cache_page_size=ring_size.
-        row_alignment = ring_size if _is_npu else 2
+            # A3 requests a 3-D view with state_cache_page_size=ring_size.
+            row_alignment = ring_size
         state_rows = num_req_slots * ring_size + ring_size + 1
         state_rows = ceil_align(state_rows, row_alignment)
         state_last_dim = 2 * self.attn_head_dim
