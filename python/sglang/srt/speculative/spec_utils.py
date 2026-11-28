@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import logging
 import os
 import time
@@ -324,6 +325,58 @@ def scatter_draft_probs_to_target_vocab(
     # index_copy_ accepts the 1-D vocabulary map directly.
     out.index_copy_(-1, hot_token_id, draft_probs.to(torch.float32))
     return out
+
+
+def prune_quantized_lm_head(
+    lm_head: torch.nn.Module, *, hot_token_id: torch.Tensor, hidden_size: int
+) -> torch.nn.Module:
+    """Copy of a quantized ``lm_head`` restricted to the ``hot_token_id`` vocab rows.
+
+    Selects the rows on the vocab dim of both the weight and a per-row
+    ``weight_scale``, keeping the target's quant method and weight layout.
+    The target module is not modified.
+    """
+    weight = lm_head.weight
+    scale = lm_head._parameters.get("weight_scale")
+    if scale is None or not (
+        scale.numel() == 1
+        or scale.dim() == 1
+        or (scale.dim() == 2 and scale.shape[1] == 1)
+    ):
+        raise NotImplementedError(
+            "--speculative-token-map supports quantized lm_heads with a per-tensor "
+            f"or per-channel weight_scale only, got {type(lm_head.quant_method).__name__}"
+            f" with weight_scale {None if scale is None else tuple(scale.shape)}."
+        )
+    per_channel = scale.numel() > 1
+    # Per-channel FP8 stores the weight as [hidden, vocab] column-major.
+    vocab_dims = [d for d in range(weight.dim()) if weight.shape[d] != hidden_size]
+    if (
+        weight.dim() != 2
+        or len(vocab_dims) != 1
+        or (per_channel and scale.shape[0] != weight.shape[vocab_dims[0]])
+    ):
+        raise NotImplementedError(
+            "--speculative-token-map cannot locate the vocab dim of the quantized "
+            f"lm_head weight {tuple(weight.shape)} (hidden_size={hidden_size})."
+        )
+
+    hot_token_id = hot_token_id.to(weight.device)
+    pruned_weight = weight.index_select(vocab_dims[0], hot_token_id)
+    if not weight.is_contiguous() and weight.t().is_contiguous():
+        pruned_weight = pruned_weight.t().contiguous().t()
+
+    pruned = copy.copy(lm_head)
+    # A shallow copy shares the parameter dict; rebind it so the target keeps its own.
+    pruned._parameters = dict(lm_head._parameters)
+    pruned.weight = torch.nn.Parameter(pruned_weight, requires_grad=False)
+    if per_channel:
+        pruned.weight_scale = torch.nn.Parameter(
+            scale.index_select(0, hot_token_id), requires_grad=False
+        )
+    if "logical_widths" in vars(pruned):
+        pruned.logical_widths = [hot_token_id.numel()]
+    return pruned
 
 
 # Simulate acceptance length for benchmarking purposes
