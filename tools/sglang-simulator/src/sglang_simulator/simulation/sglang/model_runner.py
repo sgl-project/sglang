@@ -1,3 +1,8 @@
+import functools
+import json
+import os
+from contextvars import ContextVar
+
 import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager
@@ -13,6 +18,64 @@ class _MockModel(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         return None
+
+
+def _cpu_payload_metadata(device):
+    return (
+        os.getenv("SGLANG_SIMULATOR_BOOTSTRAP") == "1"
+        and os.getenv("SGLANG_USE_CPU_ENGINE") == "1"
+        and device is not None
+        and torch.device(device).type == "cpu"
+    )
+
+
+class C_DSV4PayloadHook(BaseHook):
+    """Keep packed payload geometry without allocating unused model values.
+
+    Only payload allocation methods run on meta. Native integer allocators,
+    request/window state, pool device and logical capacities remain unchanged.
+    """
+
+    HOOK_CLASS_NAME = (
+        r"^DeepSeekV4(SingleKVPool|UniformFP8KVPool|IndexerPool|UnifiedKVPool)$"
+    )
+    HOOK_MODULE_NAME = r"^sglang\.srt\.mem_cache\.deepseek_v4_memory_pool$"
+    REGEX = True
+    REQUIRED = False
+
+    @classmethod
+    def hook(cls, target):
+        if target.__name__ == "DeepSeekV4UnifiedKVPool":
+            original = target.__init__
+
+            @functools.wraps(original)
+            def initialize(self, *args, **kwargs):
+                if "device" in kwargs and _cpu_payload_metadata(kwargs["device"]):
+                    kwargs = {**kwargs, "device": "meta"}
+                return original(self, *args, **kwargs)
+
+            target.__init__ = initialize
+            return
+
+        name = (
+            "_create_buffer"
+            if target.__name__ == "DeepSeekV4IndexerPool"
+            else "create_buffer"
+        )
+        original = getattr(target, name)
+
+        @functools.wraps(original)
+        def allocate(self, *args, **kwargs):
+            device = self.device
+            if not _cpu_payload_metadata(device):
+                return original(self, *args, **kwargs)
+            self.device = "meta"
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                self.device = device
+
+        setattr(target, name, allocate)
 
 
 class _MockModelLoader:
@@ -33,6 +96,98 @@ def _resolve_kv_page_size(configurator):
         or getattr(configurator.server_args, "page_size", None)
         or 1
     )
+
+
+def _native_pool_budget(configurator, target_tokens, page_size, *, require_exact=False):
+    """Translate logical capacity to the CPU runner's native pool byte budget."""
+    if require_exact and (
+        type(page_size) is not int
+        or page_size <= 0
+        or type(target_tokens) is not int
+        or target_tokens < 2
+        or target_tokens % page_size
+    ):
+        raise ValueError("SimOpus KV capacity must be >=2 and page-aligned")
+
+    def resolved_tokens(budget_bytes):
+        try:
+            config = configurator.calculate_pool_sizes(budget_bytes, page_size)
+        except RuntimeError as error:
+            if require_exact and "Not enough memory" not in str(error):
+                raise
+            return 0
+        except ValueError as error:
+            if "cannot hold even one request" not in str(error):
+                raise
+            return 0
+        return config.max_total_num_tokens
+
+    lower, upper = 0, 1
+    for _ in range(64):
+        if resolved_tokens(upper) >= target_tokens:
+            break
+        lower, upper = upper, upper * 2
+    else:
+        raise ValueError("Native KV pool cannot represent the requested capacity")
+    while lower + 1 < upper:
+        middle = (lower + upper) // 2
+        if resolved_tokens(middle) < target_tokens:
+            lower = middle
+        else:
+            upper = middle
+    if require_exact and resolved_tokens(upper) != target_tokens:
+        raise ValueError("Native KV pool cannot represent the exact SimOpus capacity")
+    return upper
+
+
+def _validate_resource_pool(configurator):
+    """Limit the optional budget to native layouts represented by the SDK."""
+    args = configurator.server_args
+    unsupported = [
+        name
+        for name in (
+            "speculative_algorithm",
+            "enable_hisparse",
+            "enable_unified_memory",
+            "enable_kv_cache_sharding",
+            "enable_lora",
+        )
+        if getattr(args, name, None)
+    ]
+    kv_dtype = getattr(configurator, "kv_cache_dtype_str", None)
+    if kv_dtype not in (
+        None,
+        "auto",
+        "bf16",
+        "bfloat16",
+        "fp16",
+        "float16",
+        "fp32",
+        "float32",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_e5m2",
+    ):
+        unsupported.append(f"packed KV dtype {kv_dtype!r}")
+    if (
+        getattr(configurator, "is_draft_worker", False)
+        or getattr(configurator, "mambaish_config", None) is not None
+        or getattr(configurator, "is_hybrid_swa", False)
+        or getattr(configurator, "sliding_window_size", None) not in (None, -1, 0)
+    ):
+        unsupported.append("nonstandard KV layout")
+    overrides = getattr(args, "json_model_override_args", "{}")
+    if json.loads(overrides or "{}"):
+        unsupported.append("json_model_override_args")
+    model_config = configurator.model_config
+    quant_config = getattr(model_config.hf_text_config, "quantization_config", None)
+    declared_quant = quant_config.get("quant_method") if quant_config else None
+    if getattr(model_config, "quantization", None) != declared_quant:
+        unsupported.append("runtime quantization override")
+    if unsupported:
+        raise ValueError(
+            "SimOpus memory budget does not model: " + ", ".join(unsupported)
+        )
 
 
 class C_ModelRunnerHook(BaseHook):
@@ -60,7 +215,18 @@ class C_ModelRunnerHook(BaseHook):
                 ConfigManager.set_model_info(resolve_model_info(self.model_config))
 
         def wrapped_forward(self, *args, **kwargs):
-            batch = args[0]
+            batch = args[0] if args else kwargs["forward_batch"]
+            from sglang_simulator.simulation.sglang.prepared_batch import (
+                SNAPSHOT_ATTRIBUTE,
+                capture_prepared_batch,
+            )
+            from sglang_simulator.simulation.sglang.scheduler import C_SchedulerHook
+
+            snapshot = None
+            if getattr(
+                C_SchedulerHook.INFERENCE_PREDICTOR, "requires_prepared_batch", False
+            ):
+                snapshot = capture_prepared_batch(batch)
             from sglang.srt.layers.logits_processor import LogitsProcessorOutput
             from sglang.srt.model_executor.model_runner import ModelRunnerOutput
 
@@ -70,6 +236,8 @@ class C_ModelRunnerHook(BaseHook):
                     device=self.device,
                 )
             )
+            if snapshot is not None:
+                setattr(output, SNAPSHOT_ATTRIBUTE, snapshot)
             return ModelRunnerOutput(
                 logits_output=output,
                 can_run_graph=False,
@@ -132,7 +300,29 @@ class C_KVCacheConfiguratorHook(BaseHook):
     def hook(cls, target):
         original_configure = target.configure
         original_init_pools = target._init_pools
+        original_build_dsv4_pool = getattr(target, "_build_dsv4_kv_pool", None)
         supports_cpu_fp8_quant_method = hasattr(target, "_build_mha_quant_method")
+        logical_geometry = ContextVar("simulator_logical_pool_geometry", default=())
+
+        def packed_geometry_for(configurator):
+            for owner, attributes in reversed(logical_geometry.get()):
+                if owner is configurator:
+                    return attributes
+            return None
+
+        def wrapped_build_dsv4_pool(self, *args, **kwargs):
+            attributes = packed_geometry_for(self)
+            if attributes is None:
+                return original_build_dsv4_pool(self, *args, **kwargs)
+
+            compacted = {name: getattr(self.model_config, name) for name in attributes}
+            try:
+                for name, value in attributes.items():
+                    setattr(self.model_config, name, value)
+                return original_build_dsv4_pool(self, *args, **kwargs)
+            finally:
+                for name, value in compacted.items():
+                    setattr(self.model_config, name, value)
 
         def wrapped_configure(self, *args, **kwargs):
             if not (
@@ -157,40 +347,17 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 current_platform.is_cpu = original_is_cpu
 
         def override_profile_available_bytes(self, pre_model_load_memory):
+            ConfigManager.set_memory_budget_metrics(None)
             if self.server_args.max_total_tokens is not None:
                 from sglang.srt.model_executor.pool_configurator import (
                     create_memory_pool_configurator,
                 )
 
-                configurator = create_memory_pool_configurator(self)
-                target_tokens = self.server_args.max_total_tokens
-
-                page_size = _resolve_kv_page_size(self)
-
-                def resolved_tokens(budget_bytes):
-                    try:
-                        config = configurator.calculate_pool_sizes(
-                            budget_bytes, page_size
-                        )
-                    except RuntimeError:
-                        return 0
-                    except ValueError as error:
-                        # New runtimes reject deliberately undersized SWA probes.
-                        if "cannot hold even one request" not in str(error):
-                            raise
-                        return 0
-                    return config.max_total_num_tokens
-
-                lower, upper = 0, 1
-                while resolved_tokens(upper) < target_tokens:
-                    lower, upper = upper, upper * 2
-                while lower + 1 < upper:
-                    middle = (lower + upper) // 2
-                    if resolved_tokens(middle) < target_tokens:
-                        lower = middle
-                    else:
-                        upper = middle
-                return upper
+                return _native_pool_budget(
+                    create_memory_pool_configurator(self),
+                    self.server_args.max_total_tokens,
+                    _resolve_kv_page_size(self),
+                )
 
             model = ConfigManager.get_model_info()
             if model is None:
@@ -207,6 +374,37 @@ class C_KVCacheConfiguratorHook(BaseHook):
                     "must be resolved before KV-cache pool sizing."
                 )
 
+            budget_config = ConfigManager.get_memory_budget_config()
+            if budget_config is not None:
+                from sglang_simulator.simulation.resource_budget import (
+                    estimate_simopus_budget,
+                )
+
+                from sglang.srt.model_executor.pool_configurator import (
+                    create_memory_pool_configurator,
+                )
+
+                _validate_resource_pool(self)
+                target_config = ConfigManager.get_target_scheduler_config(
+                    scheduler_config
+                )
+                target_config.page_size = _resolve_kv_page_size(self)
+                if target_config.kv_bytes_per_token_per_gpu is not None:
+                    raise ValueError(
+                        "SimOpus memory budget does not accept KV byte overrides"
+                    )
+                max_tokens, metrics = estimate_simopus_budget(
+                    model, hardware, target_config, budget_config
+                )
+                native_bytes = _native_pool_budget(
+                    create_memory_pool_configurator(self),
+                    max_tokens,
+                    target_config.page_size,
+                    require_exact=True,
+                )
+                ConfigManager.set_memory_budget_metrics(metrics)
+                return native_bytes
+
             available_bytes = profile_device_available_bytes(
                 model=model,
                 device=hardware,
@@ -220,9 +418,9 @@ class C_KVCacheConfiguratorHook(BaseHook):
             return available_bytes
 
         def wrapped_init_pools(self, *args, **kwargs):
-            # Pool payload is never read during simulation. Preserve the native
-            # pool classes and allocator wiring, but allocate minimal payload
-            # dimensions and restore their logical metadata afterwards.
+            # Keep legacy payload compaction for ordinary pools. Packed native
+            # factories need their original dimensions throughout construction,
+            # including nested pools and native layout validation.
             compact_attrs = (
                 "qk_nope_head_dim",
                 "qk_rope_head_dim",
@@ -234,18 +432,27 @@ class C_KVCacheConfiguratorHook(BaseHook):
                 "linear_key_head_dim",
                 "linear_conv_kernel_dim",
             )
-            original_attrs = {
+            entry_attrs = {
                 name: getattr(self.model_config, name)
                 for name in compact_attrs
                 if hasattr(self.model_config, name)
             }
+            original_attrs = packed_geometry_for(self)
+            if original_attrs is None:
+                original_attrs = entry_attrs
+            token = logical_geometry.set(
+                (*logical_geometry.get(), (self, original_attrs))
+            )
             try:
-                for name in original_attrs:
+                for name in entry_attrs:
                     setattr(self.model_config, name, 1)
                 pools = original_init_pools(self, *args, **kwargs)
             finally:
-                for name, value in original_attrs.items():
-                    setattr(self.model_config, name, value)
+                try:
+                    for name, value in entry_attrs.items():
+                        setattr(self.model_config, name, value)
+                finally:
+                    logical_geometry.reset(token)
 
             token_pool = pools.token_to_kv_pool
             for name, value in original_attrs.items():
@@ -280,3 +487,5 @@ class C_KVCacheConfiguratorHook(BaseHook):
         target.configure = wrapped_configure
         target._profile_available_bytes = override_profile_available_bytes
         target._init_pools = wrapped_init_pools
+        if callable(original_build_dsv4_pool):
+            target._build_dsv4_kv_pool = wrapped_build_dsv4_pool

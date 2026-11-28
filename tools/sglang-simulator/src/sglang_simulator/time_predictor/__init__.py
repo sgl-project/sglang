@@ -1,26 +1,37 @@
+from importlib import import_module
+
 from sglang_simulator.time_predictor.base import (
     InferTimePredictor,
+    PredictorError,
     ScheduleBatch,
     ScheduleRequest,
 )
-from sglang_simulator.time_predictor.ml import MLTimePredictor
-from sglang_simulator.time_predictor.replay import ReplayTimePredictor
+
+_LAZY_CLASSES = {
+    "AISimulateTimePredictor": "aisimulate",
+    "MLTimePredictor": "ml",
+    "ReplayTimePredictor": "replay",
+    "SimOpusTimePredictor": "simopus",
+}
+
+
+def __getattr__(name: str):
+    module = _LAZY_CLASSES.get(name)
+    if module is None:
+        raise AttributeError(name)
+    return getattr(
+        import_module(f"sglang_simulator.time_predictor.{module}"),
+        name,
+    )
+
 
 __all__ = (
-    "ScheduleRequest",
-    "ScheduleBatch",
-    "InferTimePredictor",
     "AISimulateTimePredictor",
+    "SimOpusTimePredictor",
+    "InferTimePredictor",
     "MLTimePredictor",
+    "PredictorError",
     "ReplayTimePredictor",
+    "ScheduleBatch",
+    "ScheduleRequest",
 )
-
-
-def __getattr__(name):
-    if name == "AISimulateTimePredictor":
-        from sglang_simulator.time_predictor.aisimulate import (
-            AISimulateTimePredictor,
-        )
-
-        return AISimulateTimePredictor
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

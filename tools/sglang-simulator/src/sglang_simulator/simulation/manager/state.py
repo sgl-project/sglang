@@ -39,6 +39,10 @@ class StateManager:
         cls._hicache_l2_load_dur += dur
 
     @classmethod
+    def get_hicache_l2_load_dur(cls) -> float:
+        return cls._hicache_l2_load_dur
+
+    @classmethod
     def inc_hicache_l2_load_stats(
         cls,
         call_count: int = 0,
