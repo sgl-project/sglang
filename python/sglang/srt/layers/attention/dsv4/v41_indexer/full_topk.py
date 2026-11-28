@@ -15,7 +15,6 @@ from sglang.kernels.ops.attention.dsa.litetopk_prefill import fp4_indexer_topk
 from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
-from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
 
 from .scoring import (
     decode_scores,
@@ -36,6 +35,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     from .scoring import DeepGEMMPrefillData
+    from .selector import TopKSelector
 
 
 def _lite_topk_wins(num_rows: int, max_len: int) -> bool:
@@ -53,6 +53,7 @@ class FullTopKIndexer:
         req_to_token: torch.Tensor,
         use_deep_gemm_prefill: bool,
         use_deep_gemm_decode: bool,
+        selector: TopKSelector,
         use_prefill_lite_topk: bool = False,
     ):
         self.token_to_kv_pool = token_to_kv_pool
@@ -60,8 +61,12 @@ class FullTopKIndexer:
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
         self.use_prefill_lite_topk = use_prefill_lite_topk
         self.use_deep_gemm_decode = use_deep_gemm_decode
+        self.selector = selector
+        # DeepSelect's paged decode fuses its own selection, so FlashInfer skips it.
         self.use_deep_select_decode = (
-            not use_deep_gemm_decode and is_deep_select_supported()
+            selector.backend.is_sgl_kernel()
+            and not use_deep_gemm_decode
+            and is_deep_select_supported()
         )
 
     def topk_prefill(self, inputs: PrefillInputs) -> None:
@@ -104,9 +109,11 @@ class FullTopKIndexer:
             inputs.layer_id, data.k_slots
         )
         if shard is None:
-            dense_prefill_topk(data, kv, out=out)
+            dense_prefill_topk(data, kv, out=out, selector=self.selector)
         else:
-            sharded_dense_prefill_topk(data, kv, out=out, shard=shard)
+            sharded_dense_prefill_topk(
+                data, kv, out=out, shard=shard, selector=self.selector
+            )
         data.write_page_indices(inputs)
 
     def _prefill_lite_topk(
@@ -143,7 +150,7 @@ class FullTopKIndexer:
         )
         for request, chunks in requests:
             for chunk in chunks:
-                idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
+                _, idx = self.selector.dense(chunk.scores, request.k)
                 write_prefill(inputs, request, chunk, idx)
 
     def _deep_gemm_decode(self, inputs: DecodeInputs) -> None:
@@ -165,14 +172,12 @@ class FullTopKIndexer:
                     indices=indices,
                 )
                 # TODO(dark): add bf16 topk
-                topk_transform_paged_from_metadata(
+                self.selector.paged_from_metadata(
                     logits,
                     metadata,
                     inputs.out_page_indices,
                     rows=rows,
-                    topk_metadata=(
-                        topk_plans[chunk_idx] if topk_plans is not None else None
-                    ),
+                    plan=topk_plans[chunk_idx] if topk_plans is not None else None,
                 )
             return
         q, lens, table, indices = data.paged_logits_args(metadata)
@@ -187,16 +192,17 @@ class FullTopKIndexer:
             indices=indices,
         )
         # TODO(dark): add bf16 topk
-        topk_transform_paged_from_metadata(
-            logits, metadata, inputs.out_page_indices, None
-        )
+        self.selector.paged_from_metadata(logits, metadata, inputs.out_page_indices)
 
     def _torch_decode(self, inputs: DecodeInputs) -> None:
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
-            compute_topk_plan=not self.use_deep_select_decode,
+            compute_topk_plan=(
+                self.selector.backend.is_sgl_kernel()
+                and not self.use_deep_select_decode
+            ),
         )
         if d is None:
             return
@@ -212,4 +218,4 @@ class FullTopKIndexer:
                 output_idx=inputs.out_page_indices[: d.bs],
             )
             return
-        select_decode(inputs, d, inputs.indexer.index_topk)
+        select_decode(inputs, d, inputs.indexer.index_topk, selector=self.selector)

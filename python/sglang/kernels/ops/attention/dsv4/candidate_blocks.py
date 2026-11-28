@@ -3,7 +3,7 @@
 selects among them. Block counts, block keys, the block top-k (JIT / torch), and
 the torch top-k among chosen blocks."""
 
-from typing import Optional, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -119,6 +119,25 @@ def amax8_varlen(
     return out
 
 
+def amax_block_keys(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: Optional[int] = None,
+) -> torch.Tensor:
+    """fp32 block keys of :func:`amax8_varlen` for the first ``ceil(seq_lens[b] / 8)``
+    columns of each row; a top-k must read no further, as nothing past them is
+    initialised. The row stride is a multiple of 4, as top-k v2 needs."""
+    if max_seq_len is None:
+        max_seq_len = logits.shape[1]
+    keys = logits.new_empty(
+        logits.shape[0],
+        -(-max_seq_len // (4 * CANDIDATE_BLOCK_SIZE)) * 4,
+        dtype=torch.float32,
+    )
+    amax8_varlen(logits, seq_lens, out=keys)
+    return keys
+
+
 def amax_topk_blocks(
     logits: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -130,19 +149,12 @@ def amax_topk_blocks(
     maximum among its first ``seq_lens[b]`` positions, the newest block always
     included: block ids in no particular order, ``-1`` past the row's count.
     ``nblocks`` is ``ceil(seq_lens / 8)`` as int32."""
-    rows = logits.shape[0]
-    block = CANDIDATE_BLOCK_SIZE
-    if max_seq_len is None:
-        max_seq_len = logits.shape[1]
     # NOTE: plan cannot be the previous kernel of topk_transform_paged_v2
     plan = plan_topk_v2(nblocks)
-    # block maxima, the newest block +inf; the top-k reads each row up to nblocks
-    # only, so nothing past a row's keys is initialised (v2 needs stride % 4 == 0)
-    keys = logits.new_empty(
-        rows, -(-max_seq_len // (4 * block)) * 4, dtype=torch.float32
+    keys = amax_block_keys(logits, seq_lens, max_seq_len)
+    blocks = torch.empty(
+        logits.shape[0], topk_blocks, dtype=torch.int32, device=logits.device
     )
-    amax8_varlen(logits, seq_lens, out=keys)
-    blocks = torch.empty(rows, topk_blocks, dtype=torch.int32, device=logits.device)
     topk_transform_paged_v2(keys, nblocks, None, blocks, 1, plan)
     return blocks
 
@@ -159,11 +171,22 @@ def candidate_block_mask(
     return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
 
 
+TopKOp = Callable[..., Tuple[torch.Tensor, torch.Tensor]]
+
+
+def torch_topk(
+    scores: torch.Tensor, k: int, *, sorted: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The default ``topk_op`` below: ``(values, indices)`` over the last dim."""
+    return scores.topk(k, dim=-1, sorted=sorted)
+
+
 def select_candidate_block_ids(
     logits: torch.Tensor,
     compress_lens: Union[torch.Tensor, int],
     topk_blocks: int,
     block_size: int,
+    topk_op: TopKOp = torch_topk,
 ) -> torch.Tensor:
     """Per row the ids of the ``topk_blocks`` blocks with the largest score, the
     block of position ``compress_lens - 1`` always kept: int32
@@ -178,8 +201,8 @@ def select_candidate_block_ids(
     scores = scores.masked_fill(
         torch.arange(num_blocks, device=logits.device) == last, torch.inf
     )
-    top = scores.topk(min(topk_blocks, num_blocks), dim=-1)
-    return top.indices.to(torch.int32).masked_fill_(~(top.values > -torch.inf), -1)
+    values, indices = topk_op(scores, min(topk_blocks, num_blocks), sorted=True)
+    return indices.to(torch.int32).masked_fill_(~(values > -torch.inf), -1)
 
 
 @triton.jit
@@ -403,6 +426,7 @@ def topk_among_blocks(
     blocks: torch.Tensor,
     k: int,
     block_size: int,
+    topk_op: TopKOp = torch_topk,
 ) -> torch.Tensor:
     """Top-``k`` of each row of ``scores`` ``[rows, width]`` within its ``blocks``
     ``[rows, n]`` (``-1`` padded) and its causal ``lens``: int64 ``[rows, k]``
@@ -425,7 +449,9 @@ def topk_among_blocks(
     room = lens[:, None] - blocks64 * block_size
     drop = (offsets[None, None, :] >= room[:, :, None]) | (blocks64 < 0)[:, :, None]
     candidates.masked_fill_(drop, -torch.inf)
-    return candidate_topk(candidates.flatten(1), blocks64, k, block_size)
+    return candidate_topk(
+        candidates.flatten(1), blocks64, k, block_size, topk_op=topk_op
+    )
 
 
 def candidate_topk(
@@ -433,18 +459,19 @@ def candidate_topk(
     blocks: torch.Tensor,
     k: int,
     block_size: int = CANDIDATE_BLOCK_SIZE,
+    topk_op: TopKOp = torch_topk,
 ) -> torch.Tensor:
     """Top-k masked candidate-column scores as request-local positions, -1 padded."""
     if scores.shape[1] == 0:
         return torch.full(
             (scores.shape[0], k), -1, dtype=torch.int64, device=scores.device
         )
-    top = scores.topk(min(k, scores.shape[1]), dim=-1, sorted=False)
-    block_of_pick = top.indices // block_size
+    values, indices = topk_op(scores, min(k, scores.shape[1]), sorted=False)
+    block_of_pick = indices // block_size
     picked = blocks.to(torch.int64).gather(1, block_of_pick) * block_size + (
-        top.indices - block_of_pick * block_size
+        indices - block_of_pick * block_size
     )
-    picked = picked.masked_fill(top.values == -torch.inf, -1)
+    picked = picked.masked_fill(values == -torch.inf, -1)
     if picked.shape[1] < k:
         picked = F.pad(picked, (0, k - picked.shape[1]), value=-1)
     return picked
