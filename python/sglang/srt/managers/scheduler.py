@@ -6855,7 +6855,7 @@ class Scheduler(
         self.metrics_reporter.prefill_busy_clock.resume()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
-        assert recv_req.mode in ("in_place", "retract")
+        assert recv_req.mode in ("in_place", "retract", "abort")
         self.pause_state.pause()
 
         if recv_req.mode == "in_place":
@@ -6869,6 +6869,9 @@ class Scheduler(
             self._start_pause_window()
             return
 
+        # An abort pause retracts too: an aborted running request frees its KV only
+        # at its next step, which a paused loop never runs. The abort_all after it
+        # drops the requeued requests.
         if get_parallel().pp_size > 1:
             # The PP loops hold this pause until no micro-batch is in flight.
             self._start_pause_window()
