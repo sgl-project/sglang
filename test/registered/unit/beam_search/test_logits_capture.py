@@ -30,7 +30,6 @@ def _decode_batch(reqs, members=2):
 
 class TestLogitsCapture(CustomTestCase):
     def test_mixed_decode_capture_survives_in_place_sampling(self):
-        """A batch that still samples must capture a copy of its leader rows."""
         batch, num_tail = _decode_batch([_req(False), _req(True)])
         logits = torch.randn((2 + num_tail, 4))
         leader_row = logits[1].clone()

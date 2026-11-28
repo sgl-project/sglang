@@ -1375,7 +1375,6 @@ def test_sm120_low_hd_paged_decode_reuses_cached_host_plan(
 
 
 def _paged_prefill_batch(lengths, page_size, num_q_heads, num_kv_heads, head_dim):
-    """Q, a paged KV cache and the metadata of a prefill over `lengths`."""
     pages = [-(-length // page_size) for length in lengths]
     page_ids = torch.randperm(sum(pages), device="cuda").to(torch.int32)
     page_table = torch.zeros(len(lengths), max(pages), device="cuda", dtype=torch.int32)
@@ -1427,8 +1426,6 @@ def test_sm120_paged_prefill_reuses_cached_host_plan(
     page_size,
     num_kv_heads,
 ):
-    """Every layer of a paged prefill after the first reuses its TVM-FFI plan, and
-    that launch matches the generic path bit for bit."""
     sm120_forward_host.clear_launch_plans()
     cache_hits = _record_paged_cache_hits(monkeypatch)
     torch.manual_seed(20261102 + page_size + num_kv_heads)
@@ -1471,8 +1468,6 @@ def test_sm120_paged_prefill_reuses_cached_host_plan(
 
 
 def test_sm120_paged_prefill_full_and_swa_layers_keep_separate_plans(monkeypatch):
-    """Layers that differ only in causal/window settings must not share a launch
-    plan, and each must still reuse its own."""
     sm120_forward_host.clear_launch_plans()
     cache_hits = _record_paged_cache_hits(monkeypatch)
     torch.manual_seed(20261105)

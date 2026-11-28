@@ -138,7 +138,6 @@ def _run_request_steps(coordinator, reqs):
     for pos, req in enumerate(reqs):
         coordinator.select_leader_prefill(req, pos, output, tick=0)
 
-    # Two decode steps, the second final.
     for tick in (1, 2):
         for req in reqs:
             req.kv.kv_committed_len = PROMPT_LEN + tick
@@ -165,8 +164,7 @@ def _run_request_steps(coordinator, reqs):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestBeamLaunchHalf(CustomTestCase):
     def test_beam_launch_half_never_syncs_the_host(self):
-        """From the forward's logits to the relayed tokens, the launch half
-        (capture, selection, spawn, KV remap, relay) issues no host sync."""
+        """Capture, selection, spawn, KV remap and relay issue no host sync."""
         _run_request_steps(*_setup())
         torch.cuda.synchronize()
         coordinator, reqs = _setup()

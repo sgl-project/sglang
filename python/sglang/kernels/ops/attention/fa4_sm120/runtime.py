@@ -1027,9 +1027,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     def __init__(self) -> None:
         self._varlen_plans: OrderedDict[tuple, _VarlenLaunchPlan] = OrderedDict()
-        # Keyed on KV blocks: shapes in _keys_on_kv_blocks.
         self._paged_block_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
-        # Keyed on the exact max_seqlen_k: shapes not in _keys_on_kv_blocks.
         self._paged_exact_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
         self._paged_plan_tiles: OrderedDict[tuple, tuple[int, int]] = OrderedDict()
         self._paged_workspaces: OrderedDict[

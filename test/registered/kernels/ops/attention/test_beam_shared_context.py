@@ -62,7 +62,6 @@ def _bucket(context_lens, decode_lens, *, beam_width, rows, slots, decode_capaci
 
 
 def _reference(q, k_buffer, v_buffer, bucket, softmax_scale, output):
-    """FP32 attention of every beam of `bucket`, written to its rows of `output`."""
     q_per_kv = q.shape[1] // k_buffer.shape[1]
     bounds = itertools.pairwise(bucket.context_cu_seqlens.tolist())
     for group, (start, end) in enumerate(bounds):
@@ -255,7 +254,6 @@ class TestBeamSharedContextAttention(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_kernels_write_only_their_buckets_rows(self):
-        """Width buckets share one output: each call writes only its row_indices rows."""
         case = _case(
             {
                 256: ([700, 2048], [3, 1]),
@@ -276,7 +274,6 @@ class TestBeamSharedContextAttention(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_graph_replay_refreshes_mixed_depths_and_row_mapping(self):
-        """A captured graph replays any staged lengths and row mapping."""
         torch.manual_seed(17)
         width, max_context, max_decode = 8, 80, 3
         with torch.device("cuda"):
@@ -337,7 +334,6 @@ class TestBeamSharedContextAttention(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_plans_follow_the_strides(self):
-        """A cached launch plan must not be reused for the same shapes at other strides."""
         case = _case({8: ([33, 70], [2, 1])})
         bucket = case.buckets[0]
         tail = (
@@ -375,7 +371,6 @@ class TestBeamSharedContextAttention(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_partial_buffers_are_kept_per_thread_and_stream(self):
-        """One pair is reused per thread and stream; other threads, streams and graphs get their own."""
         device = torch.device("cuda", torch.cuda.current_device())
         eager = partial_buffers(device, 4096, 64)
         self.assertEqual(

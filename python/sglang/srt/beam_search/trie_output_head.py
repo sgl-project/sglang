@@ -211,7 +211,6 @@ def build_trie_row_levels(
             level = min(entry.group.num_generated, max_level)
             row_levels.extend([level] * (entry.end - entry.start))
         assert len(row_levels) == len(batch.seq_lens)
-        # Pinned and non-blocking, so the host never waits on the running forward.
         return async_h2d(row_levels, dtype=torch.int64, device=batch.device)
     return None
 

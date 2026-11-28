@@ -77,7 +77,6 @@ class TestQuackSwigluGemm(CustomTestCase):
         return x, out, fused.called
 
     def test_mlp_takes_fused_path(self):
-        """With the flag on, the MLP takes the fused GEMM and matches fp32."""
         mlp = self._mlp()
         for m in (1, 2048):
             with self.subTest(m=m):

@@ -613,7 +613,7 @@ def shared_context_attention_split_kv(
     *,
     output: torch.Tensor | None = None,
     softmax_scale: float,
-    num_splits: Optional[int] = None,  # None picks pick_num_splits
+    num_splits: Optional[int] = None,  # None: from the GPU's wave size
 ) -> torch.Tensor:
     """`shared_context_attention` with the prompt split across programs; same contract."""
     if output is None:
