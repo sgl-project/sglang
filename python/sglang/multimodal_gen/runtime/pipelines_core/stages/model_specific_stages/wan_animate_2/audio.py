@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import BinaryIO
 
 import torch
 
+from sglang.multimodal_gen.runtime.utils.vision import open_video_source
 from sglang.srt.multimodal.audio_from_video import decode_audio_container
 
 # Logger callables with the ``PipelineStage.log_*`` signature: ``(msg, *args)``.
@@ -28,18 +30,18 @@ def extract_reference_video_audio(
     to ``log_no_audio_track`` (``log_warning`` when None); a track that cannot be decoded goes
     to ``log_warning`` with the reader's message."""
     try:
-        sample_rate = _audio_track_sample_rate(reference_video_path)
-        if sample_rate is None:
-            (log_no_audio_track or log_warning)(
-                "Wan-Animate-2: reference video %s has no audio track; the output is silent.",
-                reference_video_path,
-            )
-            return None, None
-        # [L, C] fp32 in [-1, 1]; the reader needs a target rate, so the native one keeps the
-        # track unresampled.
-        samples = decode_audio_container(
-            reference_video_path, target_sr=sample_rate, mono=False
-        )
+        with open_video_source(reference_video_path) as video:
+            sample_rate = _audio_track_sample_rate(video)
+            if sample_rate is None:
+                (log_no_audio_track or log_warning)(
+                    "Wan-Animate-2: reference video %s has no audio track; the output is silent.",
+                    reference_video_path,
+                )
+                return None, None
+            video.seek(0)
+            # [L, C] fp32 in [-1, 1]; the reader needs a target rate, so the native one keeps
+            # the track unresampled.
+            samples = decode_audio_container(video, target_sr=sample_rate, mono=False)
     except Exception as e:  # audio is best-effort: a failure never fails the request
         log_warning(
             "Wan-Animate-2: cannot decode the audio track of reference video %s (%s); "
@@ -58,11 +60,11 @@ def extract_reference_video_audio(
     return audio, sample_rate
 
 
-def _audio_track_sample_rate(path: str) -> int | None:
+def _audio_track_sample_rate(video: BinaryIO) -> int | None:
     """Native sample rate of the video's first audio stream; None when it has none."""
     import av
 
-    with av.open(path) as container:
+    with av.open(video, options={"protocol_whitelist": "data"}) as container:
         if not container.streams.audio:
             return None
         return int(container.streams.audio[0].rate)
