@@ -555,7 +555,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ]
 
     def register_buffer_to_engine(self):
-        self.transport.register_all(self._kv_args_registrations())
+        self.transport.register_all(
+            self._kv_args_registrations(),
+            register_allocation_spans=(
+                envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get()
+                and envs.SGLANG_MOONCAKE_ASCEND_REGISTER_ALLOCATION.get()
+            ),
+        )
 
     def deregister_buffer_to_engine(self):
         self.transport.deregister([r.key for r in self._kv_args_registrations()])
