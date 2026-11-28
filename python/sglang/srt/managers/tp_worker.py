@@ -49,6 +49,10 @@ from sglang.srt.managers.utils import (
     compute_num_reserved_tokens,
     get_request_length_limits,
 )
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_page_size,
+    get_max_decode_ahead,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -577,9 +581,25 @@ class TpModelWorker(BaseTpWorker):
                 kv_capacity,
                 self.model_config.context_len,
             )
+        effective_kv_capacity = kv_capacity
+        spec = get_spec()
+        if spec.speculative_algorithm == "UBTREE":
+            # Reserve the double-buffered speculative decode write-ahead on the
+            # physical KV pool so admitted requests fit decode_alloc_targets.
+            reserve = get_max_decode_ahead(get_alloc_page_size())
+            min_kv_capacity = reserve + 8
+            if kv_capacity < min_kv_capacity:
+                raise ValueError(
+                    f"UBTREE requires a KV pool of at least {min_kv_capacity} "
+                    f"tokens (decode reserve {reserve} plus prompt headroom), "
+                    f"got {kv_capacity}. Increase --max-total-tokens or "
+                    "--mem-fraction-static, or lower "
+                    "--speculative-num-draft-tokens."
+                )
+            effective_kv_capacity = kv_capacity - reserve
         max_req_len, max_req_input_len = get_request_length_limits(
             self.model_config.context_len,
-            kv_capacity,
+            effective_kv_capacity,
             dllm_block_size=(
                 self.dllm_algorithm.block_size if self.dllm_algorithm is not None else 0
             ),

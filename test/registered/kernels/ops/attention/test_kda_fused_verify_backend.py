@@ -169,6 +169,9 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             retrieve_next_token=None,
             retrieve_next_sibling=None,
             retrieve_parent_token=None,
+            has_direct_parent=False,
+            tree_depths=None,
+            tree_max_depth=0,
             replayssm_ring_indices=None,
         )
         backend.verify_intermediate_state_indices = torch.arange(
@@ -400,6 +403,205 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             ) as run_eager:
                 self._verify(cute, layers, batch, rounds[1])
             self.assertEqual(run_eager.call_count, 0)
+
+    def test_ubtree_factorized_verify_fused_conv_and_fallback(self):
+        from sglang.kernels.ops.attention.linear import (
+            fused_kda_conv_tree_transform as fused_conv_mod,
+        )
+        from sglang.kernels.ops.attention.linear.kda_replayssm_tree_commit import (
+            commit_kda_tree_after_verify,
+        )
+
+        width = 8
+        parents = torch.tensor(
+            [[-1, 0, 0, 1, 1, 2, 3, 6]], device="cuda", dtype=torch.int32
+        )
+        depths = torch.tensor(
+            [[0, 1, 1, 2, 2, 2, 3, 4]], device="cuda", dtype=torch.int32
+        )
+        unused_links = torch.full_like(parents, -1)
+        for heads, v_heads, expect_fused in ((2, 2, True), (2, 4, False)):
+            with self.subTest(heads=heads, v_heads=v_heads, expect_fused=expect_fused):
+                layers, initial, slots, _, _ = self._make_case(
+                    batch_size=1, heads=heads, v_heads=v_heads, lower_bound=-5.0
+                )
+                for layer in layers:
+                    layer.conv_weights = layer.conv_weights.float()
+                num_layers = len(layers)
+                head_dim = 128
+                dim = (2 * heads + v_heads) * head_dim
+                inputs = [
+                    (
+                        torch.randn(width, dim, device="cuda", dtype=torch.bfloat16)
+                        * 0.2,
+                        torch.randn(
+                            1,
+                            width,
+                            v_heads * head_dim,
+                            device="cuda",
+                            dtype=torch.bfloat16,
+                        )
+                        * 0.2,
+                        torch.randn(
+                            1, width, v_heads, device="cuda", dtype=torch.bfloat16
+                        )
+                        * 0.2,
+                    )
+                    for _ in layers
+                ]
+                batch = SimpleNamespace(
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    ragged_verify_layout=None,
+                    req_pool_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+                    spec_info=SimpleNamespace(draft_token_num=width),
+                )
+                tree_state = MambaPool.UBTreeSpeculativeState(
+                    conv=[initial.conv[0].clone()],
+                    temporal=initial.temporal.clone(),
+                    intermediate_ssm=None,
+                    intermediate_conv_window=[
+                        torch.empty(
+                            num_layers,
+                            1,
+                            width,
+                            3,
+                            dim,
+                            device="cuda",
+                            dtype=torch.bfloat16,
+                        )
+                    ],
+                    tree_rawv=torch.empty(
+                        num_layers,
+                        1,
+                        v_heads,
+                        width,
+                        head_dim,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    ),
+                    tree_rawk=torch.empty(
+                        num_layers,
+                        1,
+                        heads,
+                        width,
+                        head_dim,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    ),
+                    tree_g=torch.empty(
+                        num_layers,
+                        1,
+                        v_heads,
+                        width,
+                        head_dim,
+                        device="cuda",
+                        dtype=torch.float32,
+                    ),
+                    tree_beta=torch.empty(
+                        num_layers,
+                        1,
+                        v_heads,
+                        width,
+                        device="cuda",
+                        dtype=torch.float32,
+                    ),
+                )
+                snap_state = MambaPool.SpeculativeState(
+                    conv=[initial.conv[0].clone()],
+                    temporal=initial.temporal.clone(),
+                    intermediate_ssm=initial.temporal.new_zeros(
+                        num_layers, 1, width, *initial.temporal.shape[2:]
+                    ),
+                    intermediate_conv_window=[
+                        torch.empty(
+                            num_layers,
+                            1,
+                            width,
+                            3,
+                            dim,
+                            device="cuda",
+                            dtype=torch.bfloat16,
+                        )
+                    ],
+                )
+                backends = []
+                for state in (tree_state, snap_state):
+                    backend = KDAAttnBackend.__new__(KDAAttnBackend)
+                    backend.state_layer_cache = state.at_layer_idx
+                    backend.state_pool = SimpleNamespace(
+                        replayssm_is_kda=False,
+                        replayssm_request_ring=False,
+                        enable_linear_replayssm=False,
+                        get_speculative_mamba2_params_all_layers=lambda s=state: s,
+                    )
+                    backend.req_to_token_pool = SimpleNamespace(
+                        size=state.temporal.shape[1]
+                    )
+                    backend.forward_metadata = SimpleNamespace(
+                        query_start_loc=torch.tensor(
+                            [0, width], device="cuda", dtype=torch.int32
+                        ),
+                        mamba_cache_indices=slots,
+                        retrieve_next_token=unused_links,
+                        retrieve_next_sibling=unused_links,
+                        retrieve_parent_token=parents,
+                        has_direct_parent=True,
+                        tree_depths=depths,
+                        tree_max_depth=5,
+                        replayssm_ring_indices=None,
+                    )
+                    backend.verify_intermediate_state_indices = torch.zeros(
+                        1, device="cuda", dtype=torch.int32
+                    )
+                    backend.accept_lens_pool = None
+                    backend.kernel_dispatcher = KDAKernelDispatcher(
+                        LinearAttnKernelBackend.TRITON,
+                        LinearAttnKernelBackend.TRITON,
+                        LinearAttnKernelBackend.TRITON,
+                    )
+                    backend._fused_chain_verify_fn = None
+                    backend._hip_chain_verify_fn = None
+                    backends.append(backend)
+                tree_backend, snap_backend = backends
+                with patch.object(
+                    fused_conv_mod,
+                    "fused_kda_conv_tree_transform",
+                    wraps=fused_conv_mod.fused_kda_conv_tree_transform,
+                ) as fused_mock:
+                    out_tree = self._verify(tree_backend, layers, batch, inputs)
+                self.assertEqual(
+                    fused_mock.call_count, len(layers) if expect_fused else 0
+                )
+                out_snap = self._verify(snap_backend, layers, batch, inputs)
+                for actual, expected in zip(out_tree, out_snap):
+                    torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+                accept_index = torch.tensor([[0, 1, 3, 6]], device="cuda", dtype=torch.int32)
+                accept_lens = torch.tensor([4], device="cuda", dtype=torch.int32)
+                commit_kda_tree_after_verify(
+                    spec_state=tree_state,
+                    state_batch_indices=slots,
+                    factor_cache_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+                    accept_index=accept_index,
+                    accept_lens=accept_lens,
+                    tree_width=width,
+                )
+                torch.testing.assert_close(
+                    tree_state.temporal[:, slots[0]],
+                    snap_state.intermediate_ssm[:, 0, 6],
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
+                torch.testing.assert_close(
+                    tree_state.conv[0][:, slots[0]],
+                    snap_state.intermediate_conv_window[0][:, 0, 6],
+                    rtol=0,
+                    atol=0,
+                )
+                tree_backend.forward_metadata.query_start_loc = torch.tensor(
+                    [0, width, 2 * width], device="cuda", dtype=torch.int32
+                )
+                with self.assertRaisesRegex(RuntimeError, "supports only BS=1"):
+                    tree_backend.forward_extend(layers[0], batch, *inputs[0])
 
 
 if __name__ == "__main__":

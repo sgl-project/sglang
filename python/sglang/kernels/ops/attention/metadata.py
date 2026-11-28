@@ -19,6 +19,7 @@ def _prepare_tree_spec_metadata_kernel(
     num_actual_tokens,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
+    QLEN_ONLY: tl.constexpr,
 ):
     row = tl.program_id(0)
     batch, token = row // WIDTH, row % WIDTH
@@ -26,9 +27,15 @@ def _prepare_tree_spec_metadata_kernel(
     seq_len = tl.load(seq_lens + batch).to(tl.int64)
     seq_start = tl.load(cu_seqlens + batch).to(tl.int64)
     req = tl.load(req_indices + batch)
-    mask_offset = (
-        (seq_start + batch * WIDTH) * WIDTH + token * (seq_len + WIDTH) + seq_len + cols
-    )
+    if QLEN_ONLY:
+        mask_offset = row * WIDTH + cols
+    else:
+        mask_offset = (
+            (seq_start + batch * WIDTH) * WIDTH
+            + token * (seq_len + WIDTH)
+            + seq_len
+            + cols
+        )
     # Graph padding has no corresponding rows in the input mask.
     mask_offset = tl.where(row < num_actual_tokens, mask_offset, 0)
     valid = tl.load(custom_mask + mask_offset, cols < WIDTH, 0).to(tl.int32)
@@ -50,8 +57,9 @@ def prepare_tree_spec_metadata(
     page_table: torch.Tensor,
     cache_seqlens: torch.Tensor,
     num_actual_tokens: int,
+    qlen_only_mask: bool = False,
 ):
-    """Build per-query suffix slots and lengths from a full verify mask."""
+    """Build per-query suffix slots and lengths from a FULL_MASK or QLEN_ONLY mask."""
     width = page_table.shape[1]
     _prepare_tree_spec_metadata_kernel[(page_table.shape[0],)](
         req_to_token,
@@ -66,6 +74,7 @@ def prepare_tree_spec_metadata(
         num_actual_tokens,
         WIDTH=width,
         BLOCK=triton.next_power_of_2(width),
+        QLEN_ONLY=qlen_only_mask,
         num_warps=4,
     )
 
