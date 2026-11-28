@@ -73,6 +73,7 @@ def bind_eagle_runtime_hooks(
     target_worker: Any,
     *,
     supports_sharded_verify: bool,
+    sharded_draft_model: Optional[torch.nn.Module] = None,
 ) -> Any:
     """Bind once after target initialization and before any EAGLE graph capture."""
     # Without a target model there is nothing to bind; the stock hooks apply.
@@ -103,6 +104,10 @@ def bind_eagle_runtime_hooks(
             temperature_keys=hooks.post_verify.local_keys
             is not STOCK_SPECULATIVE_RUNTIME_HOOKS.post_verify.local_keys
         )
+        if sharded_draft_model is not None:
+            for module in sharded_draft_model.modules():
+                if isinstance(module, LogitsProcessor):
+                    module.enable_sharded_draft()
     return hooks
 
 

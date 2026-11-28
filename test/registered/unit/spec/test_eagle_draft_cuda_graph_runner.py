@@ -289,16 +289,19 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
             with self.subTest(offered=offered, seq_lens=seq_lens, bound=bound):
                 runner, forward_batch, select_index = _extend_runner(len(seq_lens))
                 keys = []
+                shard = object()
                 out = SimpleNamespace(
                     next_token_logits=torch.zeros((2, 4)),
+                    next_token_logits_vocab_shard=shard,
                     hidden_states=torch.zeros((2, 2)),
                 )
                 runner._replay_graph = lambda key, fb: keys.append(key) or out
                 if offered:
                     _offer_variants(runner, served=[1])
                 forward_batch.attention_kv_len_lower_bound = bound
-                runner.execute(forward_batch, select_index)
+                ret = runner.execute(forward_batch, select_index)
                 self.assertEqual(keys[0].attention_variant, label)
+                self.assertIs(ret.next_token_logits_vocab_shard, shard)
 
     def test_draft_extend_shared_read_fence_and_kv_reuse(self):
         cases = (
@@ -337,6 +340,7 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 )
                 out = SimpleNamespace(
                     next_token_logits=torch.zeros((2, 4)),
+                    next_token_logits_vocab_shard=None,
                     hidden_states=torch.zeros((2, 2)),
                 )
                 runner._replay_graph = lambda key, fb: order.append("replay") or out
