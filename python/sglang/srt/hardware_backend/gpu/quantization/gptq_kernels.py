@@ -285,7 +285,13 @@ class GPTQMarlinMoEKernel:
         # Repack scales
         marlin_w13_scales = marlin_moe_permute_scales(
             s=layer.w13_scales,
-            size_k=layer.intermediate_size_per_partition,
+            # w13's K is hidden_size, not the per-rank intermediate size.
+            size_k=layer.w13_scales.shape[1]
+            * (
+                self.quant_config.group_size
+                if self.quant_config.group_size != -1
+                else self.quant_config.pack_factor
+            ),
             size_n=layer.w13_scales.shape[2],
             group_size=self.quant_config.group_size,
         )
