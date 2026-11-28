@@ -11,11 +11,16 @@ from unittest.mock import patch
 import torch
 from PIL import Image
 
+from sglang.srt.multimodal.media_artifacts.base import MediaArtifactInput
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors import qwen_vl
 from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImageProcessor,
     _chunk_by_byte_budget,
     _estimate_preprocess_bytes,
+)
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -129,6 +134,64 @@ class TestChunkedRun(CustomTestCase):
         )
         self.assertEqual([d for _, d in calls], ["cuda:0", "cpu"])
         self.assertEqual(g.shape, (2, 3))
+
+
+class TestArtifactStorage(TestChunkedRun):
+    def _artifacts(self, count, *, cache_enabled):
+        proc, _ = self._make()
+        proc.image_config = {}
+        proc.disable_fast_image_processor = True
+        proc.mm_preprocess_cache = SimpleNamespace(enabled=cache_enabled)
+        # With the cache off, offloading consults the transport instead.
+        proc._feature_transport = MultimodalFeatureTransport(
+            "cpu", base_gpu_id=0, skip_mm_pool=True
+        )
+        entries = [
+            MediaArtifactInput(
+                content_digest=f"sha256:{index:064d}",
+                artifact_key=f"sha256:{index:064d}",
+                modality=Modality.IMAGE,
+                media=media.media,
+            )
+            for index, media in enumerate(self._entries(count))
+        ]
+        return proc.prepare_artifact_batch(entries, processor=self._processor())
+
+    def test_each_cached_artifact_is_charged_only_its_own_patches(self):
+        """An image of a multi-image request costs the cache its own patches.
+
+        The processor returns the whole batch as one tensor, and the cache
+        charges an entry for its tensor's whole storage, so retaining a slice
+        charges every image of the request for all of them -- and past the
+        budget `put` keeps none of them.
+        """
+        artifacts = self._artifacts(2, cache_enabled=True)
+
+        self.assertEqual(len(artifacts), 2)
+        for artifact in artifacts:
+            feature = artifact.feature
+            # The bytes estimate_cache_size_bytes charges for this entry.
+            self.assertEqual(
+                feature.untyped_storage().nbytes(),
+                feature.numel() * feature.element_size(),
+            )
+
+    def test_nothing_is_copied_for_a_request_that_retains_no_artifact(self):
+        """With the cache off there is no entry to charge, so no copy to make.
+
+        qwen3_vl keeps this path for its prompt and M-RoPE reuse even when
+        artifact retention is disabled, and copying each image out of the batch
+        there buys nothing while the batch is still alive.
+        """
+        artifacts = self._artifacts(2, cache_enabled=False)
+
+        batch_bytes = max(
+            artifact.feature.untyped_storage().nbytes() for artifact in artifacts
+        )
+        for artifact in artifacts:
+            feature = artifact.feature
+            self.assertEqual(feature.untyped_storage().nbytes(), batch_bytes)
+            self.assertGreater(batch_bytes, feature.numel() * feature.element_size())
 
 
 if __name__ == "__main__":
