@@ -2806,8 +2806,12 @@ class TestStagingScatterLifecycle(CustomTestCase):
     @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
     def test_deferred_fanin_uses_forward_stream_and_waits_before_free(self, make_event):
         handler, request, receiver = self.make_deferred_handler()
-        self.assertFalse(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-0"))
-        self.assertTrue(handler.handle_chunk_arrived(7, 0, 0, 3, "writer-1"))
+        self.assertFalse(
+            handler.handle_chunk_arrived(7, 0, 0, 3, "writer-0", writer_rank=0)
+        )
+        self.assertTrue(
+            handler.handle_chunk_arrived(7, 0, 0, 3, "writer-1", writer_rank=1)
+        )
         handler._scatter_region.assert_not_called()
         stream = Mock()
         handler.flush_pending_scatters(stream)
@@ -2832,12 +2836,40 @@ class TestStagingScatterLifecycle(CustomTestCase):
     def test_disabled_scatter_submits_on_background_stream(self, make_event):
         handler, _, _ = self.make_deferred_handler(defer=False)
         handler.num_writers_for.return_value = 1
-        self.assertTrue(handler.handle_chunk_arrived(7, 0, 0, 3, "writer"))
+        self.assertTrue(
+            handler.handle_chunk_arrived(7, 0, 0, 3, "writer", writer_rank=0)
+        )
         handler._scatter_region.assert_called_once()
         make_event.return_value.record.assert_called_once_with(
             handler.staging_allocator._scatter_stream
         )
         self.assertFalse(handler._pending_scatters)
+
+    @patch("sglang.srt.disaggregation.common.staging_handler.create_device_event")
+    def test_repeated_chunk_ready_counts_its_writer_once(self, _make_event):
+        """A prefill rank's repeated CHUNK_READY must not complete the fan-in.
+
+        Counted as another writer, it scatters a two-writer chunk before the other
+        rank's layers land; after the scatter it opens a fan-in that never completes.
+        """
+        handler, _, _ = self.make_deferred_handler(defer=False)
+        manager = SimpleNamespace(
+            request_status={7: KVPoll.WaitingForInput}, _staging_handler=handler
+        )
+
+        def chunk_ready(writer_rank):
+            frames = [b"CHUNK_READY", b"7", b"0", b"0", b"3", b"peer"]
+            frames.append(str(writer_rank).encode("ascii"))
+            CommonKVManager.handle_chunk_ready(manager, frames)
+
+        chunk_ready(0)
+        chunk_ready(0)
+        handler._scatter_region.assert_not_called()
+        chunk_ready(1)
+        handler._scatter_region.assert_called_once()
+        chunk_ready(1)
+        self.assertEqual(handler._writer_counts[7], {})
+        handler._scatter_region.assert_called_once()
 
 
 class TestMooncakeHiSparseSpecIndices(CustomTestCase):

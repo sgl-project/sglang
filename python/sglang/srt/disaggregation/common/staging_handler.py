@@ -140,8 +140,8 @@ class DecodeStagingHandler:
         # before unregister runs, but release_room still needs it.
         self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
-        # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
-        # arrivals; handler-owned so room teardown can purge them.
+        # room -> chunk_idx -> [(page_start, num_pages, writer_id, writer_rank)]
+        # fan-in arrivals; handler-owned so room teardown can purge them.
         self._writer_counts: dict = {}
         self._staging_lifecycle = threading.Condition()
         self._room_tokens: dict[int, object] = {}
@@ -427,8 +427,15 @@ class DecodeStagingHandler:
         page_start: int,
         num_pages: int,
         writer_id: str,
+        writer_rank: int,
     ) -> bool:
-        """Fan in all writers, then submit or queue a complete chunk."""
+        """Fan in all writers, then submit or queue a complete chunk.
+
+        Each prefill rank (``writer_rank``) counts once: a repeated CHUNK_READY
+        must not stand in for a writer whose layers have not landed.
+        """
+        from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
+
         submit_now = False
         with self._staging_lifecycle:
             # Read from the stash, not decode_req.kv_receiver: a concurrent
@@ -442,9 +449,32 @@ class DecodeStagingHandler:
                     chunk_idx,
                 )
                 return False
+            infos = receiver.chunk_staging_infos
+            if (
+                chunk_idx < len(infos)
+                and infos[chunk_idx][1] == StagingAllocator.CHUNK_SCATTERED
+            ):
+                # Every writer was counted; a fresh fan-in entry could never complete.
+                logger.warning(
+                    "[STAGING] dropping CHUNK_READY for scattered room=%s chunk=%s "
+                    "writer_rank=%s",
+                    room,
+                    chunk_idx,
+                    writer_rank,
+                )
+                return False
             room_counts = self._writer_counts.setdefault(room, {})
             arrivals = room_counts.setdefault(chunk_idx, [])
-            arrivals.append((page_start, num_pages, writer_id))
+            if any(arrival[3] == writer_rank for arrival in arrivals):
+                logger.warning(
+                    "[STAGING] dropping duplicate CHUNK_READY room=%s chunk=%s "
+                    "writer_rank=%s",
+                    room,
+                    chunk_idx,
+                    writer_rank,
+                )
+                return False
+            arrivals.append((page_start, num_pages, writer_id, writer_rank))
             num_writers = self.num_writers_for(receiver)
             if len(arrivals) < num_writers:
                 return False
