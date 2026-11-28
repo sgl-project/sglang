@@ -43,6 +43,8 @@ on:
         value: ${{ jobs.run.outputs.partitions }}
       partition_model_sha:
         value: ${{ jobs.run.outputs.partition_model_sha }}
+      prefetch_repos:
+        value: ${{ jobs.run.outputs.prefetch_repos }}
       runs_on_map:
         value: ${{ jobs.run.outputs.runs_on_map }}
       enable_retry:
@@ -75,6 +77,7 @@ jobs:
       server_args_docs: ${{ steps.changes.outputs.server_args_docs }}
       partitions: ${{ steps.partitions.outputs.partitions }}
       partition_model_sha: ${{ steps.partition-model-sha.outputs.sha }}
+      prefetch_repos: ${{ steps.prefetch-repos.outputs.prefetch_repos }}
       runs_on_map: ${{ steps.runner-map.outputs.runs_on_map }}
       enable_retry: ${{ steps.set-retry.outputs.enable_retry }}
       continue_on_error: ${{ steps.set-continue-on-error.outputs.continue_on_error }}
@@ -163,6 +166,16 @@ jobs:
             --full-parallel ${{ steps.parallel-mode.outputs.full }} \
             --partition-model-file /tmp/partition-model.json \
             --pr-test-yml ${{ inputs.pr_test_yml }} \
+            >> "$GITHUB_OUTPUT"
+
+      - name: List the Hugging Face repos of each partition
+        id: prefetch-repos
+        env:
+          PARTITIONS: ${{ steps.partitions.outputs.partitions }}
+        run: |
+          # `prefetch_repos={suite: [[repo ids of partition i], ...]}` for the stages.
+          python3 scripts/ci/hf_repo_scan.py --partitions "$PARTITIONS" \
+            --partition-model-file /tmp/partition-model.json \
             >> "$GITHUB_OUTPUT"
 
       - name: Set B200 runner tag

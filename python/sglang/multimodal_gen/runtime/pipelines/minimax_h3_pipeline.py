@@ -98,7 +98,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
         self.dual_variant_lora_adapters: list[tuple[str, str, str]] = []
         super().__init__(*args, **kwargs)
         if self.dual_variant_lora_adapters:
-            self.convert_to_lora_layers(snapshot_base=False)
+            self.convert_to_lora_layers()
             for nickname, target, path in self.dual_variant_lora_adapters:
                 self.set_lora(
                     nickname,
@@ -128,6 +128,11 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 f"unsupported MiniMax H3 model variant {variant!r}; "
                 f"supported: {sorted(subfolders)!r}"
             ) from exc
+
+    @classmethod
+    def partition_for_variant(cls, variant: str) -> str:
+        """The release partition a --model-variant must load."""
+        return cls.model_subfolder_for_variant(variant).lower()
 
     def _load_config(self):
         model_variant = self.server_args.model_variant
@@ -162,7 +167,8 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
         if (
             model_variant is not None
-            and self.release_metadata.partition != semantic_subfolder.lower()
+            and self.release_metadata.partition
+            != self.partition_for_variant(model_variant)
         ):
             raise ValueError(
                 "MiniMax H3 loaded checkpoint partition does not match "
@@ -281,6 +287,17 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         self.pdd_heads = self._resolve_pdd_heads()
         transformer = self.get_module("transformer")
+        release_metadata = getattr(self, "release_metadata", None)
+        if (
+            release_metadata is not None
+            and release_metadata.video_output == "dwd"
+            and getattr(transformer, "dwd_pixel_refiner", None) is None
+        ):
+            raise ValueError(
+                f"{self.pipeline_name}: the release decodes its video with the DiT's "
+                "DWD pixel head, but transformer/config.json declares none "
+                "(dwd_head_config)"
+            )
         if (
             self.pdd_heads
             and transformer is not None
@@ -357,6 +374,11 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     else None
                 ),
                 pdd_heads=getattr(self, "pdd_heads", None),
+                raw_sigmas=(
+                    release_metadata.raw_sigmas
+                    if release_metadata is not None
+                    else None
+                ),
             )
         )
         self.add_stage(
@@ -367,6 +389,10 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 stochastic_sampling=(
                     release_metadata is not None
                     and release_metadata.stochastic_sampling
+                ),
+                dwd_output=(
+                    release_metadata is not None
+                    and release_metadata.video_output == "dwd"
                 ),
             )
         )
@@ -437,6 +463,47 @@ class PikaH3FlexPipeline(MiniMaxH3Pipeline):
         }
 
 
+class PiH3Pipeline(MiniMaxH3Pipeline):
+    """pi-H3: 2- and 4-step pi-Flow adapters of the AdaLN-pruned MiniMax-H3.
+
+    The release's model overlay links the pruned DiT and the MiniMax-H3
+    FL2VA components into one directory per variant: ``2step`` and ``4step``
+    predict the frames with the DiT's pixel head (DWD, no VAE decode);
+    ``2step_vae`` and ``4step_vae`` decode the latents. The root serves
+    ``4step``. Each ``_minimax_h3`` block carries the sampling contract (the
+    unshifted Euler knots, video shift 12, audio shift 3) and the LoRA factors,
+    which load at startup; the adapters' replaced tensors are part of the
+    variant's DiT checkpoint.
+    """
+
+    pipeline_name = "PiH3Pipeline"
+    default_model_subfolder = None
+    VARIANT_SUBFOLDERS = {
+        "2step": "2step",
+        "4step": "4step",
+        "2step-vae": "2step_vae",
+        "4step-vae": "4step_vae",
+    }
+
+    @staticmethod
+    def model_subfolder_for_variant(variant: str) -> str:
+        if not isinstance(variant, str) or not variant.strip():
+            raise ValueError("pi-H3 model variant must be a non-empty string")
+        normalized = variant.strip().lower().replace("_", "-")
+        try:
+            return PiH3Pipeline.VARIANT_SUBFOLDERS[normalized]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported pi-H3 model variant {variant!r}; "
+                f"supported: {sorted(PiH3Pipeline.VARIANT_SUBFOLDERS)!r}"
+            ) from exc
+
+    @classmethod
+    def partition_for_variant(cls, variant: str) -> str:
+        cls.model_subfolder_for_variant(variant)
+        return "fl2va"
+
+
 class MiniMaxH3ImagePipeline(MiniMaxH3Pipeline):
     """One image checkpoint for its declared t2i/edit tasks: H3 stages without audio."""
 
@@ -480,5 +547,6 @@ EntryClass = [
     MiniMaxH3Pipeline,
     FastH3Pipeline,
     PikaH3FlexPipeline,
+    PiH3Pipeline,
     MiniMaxH3ImagePipeline,
 ]

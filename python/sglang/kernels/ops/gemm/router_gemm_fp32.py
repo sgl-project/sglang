@@ -15,7 +15,7 @@ order, so they differ from the eager path only in the K summation order.
   IEEE kernel). On gfx1250 the three terms are N-major rows of one bf16 weight [3N, K]
   (``_router_split_bf16x3_nk``) under aiter's Gluon a16w16 GEMM with an fp32 output, and the three fp32 partial
   logits are summed (``_router_sum3``).
-* ``router_gemm_tlx``: any M, fbtriton's ``tlx.ops.router_gemm`` (vendored in ``sglang.kernels.tlx_ops``, plain
+* ``router_gemm_tlx``: any M, upstream ``tlx.ops.router_gemm`` (vendored as ``tlx_router_gemm``, plain
   Triton) on an ``[N, K]`` contiguous weight copy; BF16x3-split FP32 weight MFMA, deterministic split order.
   MI355X, K=8192, N=256, HIP graphs: 2.3 us vs 6.1 us gemv at M=1, 125 us vs 337 us torch at M=8192.
 """
@@ -32,9 +32,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.tlx_ops.kernels.router_gemm.gfx950 import (
-    router_gemm as tlx_router_gemm,
-)
+from sglang.kernels.ops.gemm.tlx_router_gemm import router_gemm as tlx_router_gemm
 from sglang.srt.utils import get_device_name, log_info_on_rank0
 
 logger = logging.getLogger(__name__)

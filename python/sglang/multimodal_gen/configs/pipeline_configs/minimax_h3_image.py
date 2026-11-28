@@ -4,12 +4,15 @@
 import json
 import os
 import posixpath
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import ClassVar
 
 import torch
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+    MiniMaxH3Qwen3VLConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
@@ -55,6 +58,9 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
     supported_task_types: ClassVar[tuple[ModelTaskType, ...]] = (
         ModelTaskType.T2I,
         ModelTaskType.I2I,
+    )
+    text_encoder_configs: tuple[MiniMaxH3Qwen3VLConfig, ...] = field(
+        default_factory=lambda: (MiniMaxH3Qwen3VLConfig(vision_replicated=False),)
     )
     # The image decoder runs with BF16 weights under BF16 autocast.
     vae_decode_precision: str = "bf16"

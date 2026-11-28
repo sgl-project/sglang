@@ -13,9 +13,9 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_npu_ci(est_time=9, suite="extra-a-test-npu")
 
 
 def _make_glm51_model_config():
@@ -217,7 +217,7 @@ class TestSparseKVRequestAllocHook(unittest.TestCase):
         slot map of each fresh row and keep the map of a request that keeps its row."""
         manager_module = _import_manager_module()
         pool = ReqToTokenPool(
-            size=3, max_context_len=8, device="cpu", enable_memory_saver=False
+            size=3, row_width=8, device="cpu", enable_memory_saver=False
         )
         manager = manager_module.SparseKVCacheManager.__new__(
             manager_module.SparseKVCacheManager

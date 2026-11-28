@@ -4,6 +4,7 @@ import os
 import traceback
 import unittest
 from multiprocessing import Process
+from pathlib import Path
 
 import sgl_kernel  # noqa: F401
 import torch
@@ -55,6 +56,18 @@ def all_reduce_fn(rank, world_size):
         torch.ops.sgl_kernel.shm_allreduce(tensor_shm, op)
 
         torch.testing.assert_close(tensor, tensor_shm)
+
+
+def shared_memory_cleanup_fn(rank, world_size):
+    dist.barrier()
+    path = Path(
+        f"/dev/shm/deepspeed_allreduce_buffer_{os.getuid()}_localhost_"
+        f"{os.environ['MASTER_PORT']}_default_{rank}"
+    )
+    exists = path.exists()
+    path.unlink(missing_ok=True)
+    assert not exists, f"Shared memory still exists: {path}"
+    all_reduce_fn(rank, world_size)
 
 
 def all_gather_fn(rank, world_size):
@@ -238,6 +251,10 @@ class TestComm(CustomTestCase):
 
     def test_all_reduce(self):
         self._spawn_and_check(all_reduce_fn, init_legacy_shm=True)
+
+    def test_shared_memory_cleanup(self):
+        """Initialized CPU collectives must not leave named shared memory."""
+        self._spawn_and_check(shared_memory_cleanup_fn, init_legacy_shm=True)
 
     def test_all_gather(self):
         self._spawn_and_check(all_gather_fn, init_legacy_shm=True)

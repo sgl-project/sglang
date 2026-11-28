@@ -82,11 +82,12 @@ class TestMamba(unittest.TestCase):
             for group_count in (2, 3):
                 with self.subTest(group_count=group_count):
                     pool.full_kv_pool = SimpleNamespace(
+                        get_kv_layer_ids=lambda count=group_count: [0, 1] * count,
                         get_contiguous_buf_infos=lambda: (
                             list(range(2 * group_count)),
                             [],
                             [],
-                        )
+                        ),
                     )
                     self.assertEqual(pool.get_kv_layer_ids(), [3, 7] * group_count)
 
@@ -120,7 +121,7 @@ class TestMamba(unittest.TestCase):
             size=max_num_reqs,
             mamba_size=mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
@@ -188,7 +189,7 @@ class TestMamba(unittest.TestCase):
             cache_params = Mamba2CacheParams(shape=shape, layers=[0, 1])
         common = dict(
             size=4,
-            max_context_len=128,
+            row_width=128,
             device=get_device(),
             enable_memory_saver=False,
             cache_params=cache_params,
@@ -312,7 +313,7 @@ class TestMamba(unittest.TestCase):
             size=max_num_reqs,
             mamba_size=mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
@@ -379,7 +380,7 @@ class TestMamba(unittest.TestCase):
             size=10,
             mamba_size=20,
             mamba_spec_state_size=10,
-            max_context_len=128,
+            row_width=128,
             device=get_device(),
             enable_memory_saver=False,
             cache_params=cache_params,

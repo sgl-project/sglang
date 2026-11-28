@@ -5,7 +5,9 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
+import dataclasses
 import unittest
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, patch
 
@@ -17,12 +19,15 @@ from sglang.srt.sampling.custom_logit_processor import (
     DisallowedTokensLogitsProcessor,
 )
 from sglang.srt.sampling.grammar_mask import build_grammar_mask
+from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
+    VerifyRoute,
+    VerifyStep,
     _adjust_before_watermark,
 )
-from sglang.srt.sampling.watermarking.interface import SampleStep
+from sglang.srt.sampling.watermarking.interface import SampleWatermarkOutput
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -32,7 +37,9 @@ DEVICE = "cpu"
 # Helper: construct a minimal SamplingBatchInfo
 def _tables_step(additive, scaling=None):
     """A step whose penalty tables are given."""
-    return SimpleNamespace(logit_penalties=lambda: (additive, scaling))
+    step = SimpleNamespace(logit_penalties=lambda: (additive, scaling))
+    step.apply = partial(StepPenalties.apply, step)
+    return step
 
 
 def _make_info(**overrides):
@@ -69,7 +76,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
             )
         ]
         info.step_penalties = SimpleNamespace(
-            logit_penalties=lambda: events.append("penalty") or (None, None),
+            apply=lambda logits: events.append("penalty"),
             commit=lambda token_ids: events.append("penalty commit"),
         )
         logits_output = LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4))
@@ -81,7 +88,9 @@ class TestSamplingPipelineOrder(CustomTestCase):
         class Watermark:
             def apply(self, logits, *, keep_logits):
                 events.append("watermark")
-                return SampleStep(sampling_info=info, logprob_logits=logprob_logits)
+                return SampleWatermarkOutput(
+                    sampling_info=info, logprob_logits=logprob_logits
+                )
 
             def commit(self, token_ids):
                 events.append("watermark commit")
@@ -111,7 +120,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
             ),
             patch(
                 f"{module}.apply_custom_logit_processor",
-                side_effect=lambda logits, info: events.append(
+                side_effect=lambda logits, info, **kwargs: events.append(
                     f"custom {named(logits)}"
                 ),
             ),
@@ -134,13 +143,55 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 "logit_bias",
                 "watermark",
                 "custom logits",
-                "sanitize logits",
                 "custom logprob",
+                "sanitize logits",
                 "sanitize logprob",
                 "sampler",
                 "watermark commit",
                 "penalty commit",
             ],
+        )
+
+    def test_verify_runs_the_watermark_before_the_custom_processor(self):
+        """Verify runs sampling's order; the custom processor also processes the
+        unwatermarked logits the watermark keeps for the logprobs."""
+        events = []
+        logits = torch.zeros(2, 4)
+        watermarked = torch.zeros(2, 4)
+
+        def apply_watermark(logits, *, sampling_info, **kwargs):
+            events.append("watermark")
+            return watermarked, sampling_info
+
+        step = VerifyStep(
+            batch=SimpleNamespace(
+                sampling_info=_make_info(has_custom_logit_processor=True),
+                req_pool_indices=None,
+                return_logprob=False,
+            ),
+            route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+            watermark=SimpleNamespace(apply=apply_watermark),
+            watermark_full_mask=True,
+        )
+
+        module = "sglang.srt.sampling.sampling_pipeline"
+        with (
+            patch(
+                f"{module}.apply_logit_bias",
+                side_effect=lambda *args, **kwargs: events.append("logit_bias"),
+            ),
+            patch(
+                f"{module}.apply_custom_logit_processor",
+                side_effect=lambda t, info, **kwargs: events.append(
+                    "custom " + ("logits" if t is logits else "watermarked")
+                ),
+            ),
+        ):
+            verify_logits, _ = step.adjust(logits, torch.zeros(1, 2, dtype=torch.long))
+
+        self.assertIs(verify_logits, watermarked)
+        self.assertEqual(
+            events, ["logit_bias", "watermark", "custom watermarked", "custom logits"]
         )
 
     def test_observer_sees_production_constraint_boundary(self):
@@ -273,35 +324,33 @@ class TestBuildGrammarMask(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-    def test_returns_copy(self):
-        """Both copy implementations preserve every field, including fields
-        declared with init=False, and leave the step's tables to sampling."""
-        for fast_path in (False, True):
-            info = _make_info()
-            step = MagicMock()
-            info.step_penalties = step
-            with (
-                self.subTest(fast_path=fast_path),
-                patch(
-                    "sglang.srt.sampling.sampling_batch_info._fast_copy_enabled",
-                    return_value=fast_path,
-                ),
-            ):
-                copied = info.copy_for_forward()
-            step.logit_penalties.assert_not_called()
-            for name, value in info.__dict__.items():
-                self.assertIs(copied.__dict__[name], value, name)
+    def test_copy_matches_dataclasses_replace(self):
+        """The one-dict-update copy holds exactly what dataclasses.replace holds,
+        and leaves the step's penalty tables to sampling."""
+        info = _make_info()
+        step = MagicMock()
+        info.step_penalties = step
+        copied = info.copy_for_forward()
+        replaced = dataclasses.replace(info)
+        step.logit_penalties.assert_not_called()
+        self.assertIs(type(copied), SamplingBatchInfo)
+        self.assertIsNot(copied, info)
+        self.assertEqual(copied.__dict__.keys(), replaced.__dict__.keys())
+        for name, value in replaced.__dict__.items():
+            self.assertIs(copied.__dict__[name], value, name)
+        # The copy skips __init__: a __post_init__ or an init=False field would
+        # make it differ from dataclasses.replace.
+        self.assertNotIn("__post_init__", dir(SamplingBatchInfo))
+        self.assertTrue(all(f.init for f in dataclasses.fields(SamplingBatchInfo)))
 
 
-# set_plugin_state and set_seeds_and_mask_rows
 class TestStepBuilds(CustomTestCase):
     def setUp(self):
         super().setUp()
-        # These read two flags from the exec bag; give
-        # each test a mutable stand-in so it does not depend on a published
-        # (or leaked) process context.
+        # These read a flag from the exec bag; give each test a mutable
+        # stand-in so it does not depend on a published (or leaked) process
+        # context.
         self._exec_ns = SimpleNamespace(
-            deterministic=SimpleNamespace(enable_deterministic_inference=False),
             features=SimpleNamespace(enable_custom_logit_processor=False),
         )
         exec_patch = patch(
@@ -310,13 +359,6 @@ class TestStepBuilds(CustomTestCase):
         )
         exec_patch.start()
         self.addCleanup(exec_patch.stop)
-        self._spec_ns = SimpleNamespace(speculative_algorithm=None)
-        spec_patch = patch(
-            "sglang.srt.sampling.sampling_batch_info.get_spec",
-            return_value=self._spec_ns,
-        )
-        spec_patch.start()
-        self.addCleanup(spec_patch.stop)
 
     def _make_req(
         self,
@@ -324,97 +366,47 @@ class TestStepBuilds(CustomTestCase):
         freq=0.0,
         presence=0.0,
         min_tokens=0,
-        seed=None,
         stop_ids=None,
         eos_id=2,
         mask_mode=None,
-        filler_seed=0,
     ):
         req = MagicMock()
         req.sampling_params.top_k = top_k
         req.sampling_params.frequency_penalty = freq
         req.sampling_params.presence_penalty = presence
         req.sampling_params.min_new_tokens = min_tokens
-        req.sampling_params.sampling_seed = seed
         req.sampling_params.logit_bias = None
         req.sampling_params.stop_token_ids = stop_ids
         req.sampling_params.custom_params = None
         req.custom_logit_processor = None
         req.grammar = None
-        req.filler_seed = filler_seed
         req.return_sampling_mask = mask_mode is not None
         req.sampling_logprobs_mode = mask_mode
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
         return req
 
-    def test_deterministic_seed(self):
-        """Test that explicit seed=123 is kept and missing seed defaults to 42."""
-        self._exec_ns.deterministic.enable_deterministic_inference = True
-
-        info = _make_info()
-        info.set_seeds_and_mask_rows([self._make_req(seed=123), self._make_req()])
-        self.assertEqual(info.sampling_seed.tolist(), [123, 42])
-
-        # An idle batch still seeds, with no rows.
-        info.set_seeds_and_mask_rows([])
-        self.assertEqual(info.sampling_seed.tolist(), [])
-
-    def test_seed_without_deterministic_inference(self):
-        """A non-greedy request's seed applies; a greedy seed, or speculative
-        decoding, leaves the batch unseeded."""
-        info = _make_info()
-        info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=50)])
-        self.assertEqual(info.sampling_seed.tolist(), [123])
-
-        info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=1)])
-        self.assertIsNone(info.sampling_seed)
-
-        self._spec_ns.speculative_algorithm = "EAGLE"
-        info.set_seeds_and_mask_rows([self._make_req(seed=123, top_k=50)])
-        self.assertIsNone(info.sampling_seed)
-
-    def test_unseeded_row_samples_with_its_filler_seed(self):
-        """An unseeded request samples with its own filler seed in every seeded
-        step, wherever its row is, and unseeded once no seeded row is left."""
-        seeded, a, b = (
-            self._make_req(seed=123, top_k=50),
-            self._make_req(filler_seed=456),
-            self._make_req(filler_seed=789),
-        )
-        info = _make_info()
-        info.set_seeds_and_mask_rows([seeded, a])
-        self.assertEqual(info.sampling_seed.tolist(), [123, 456])
-
-        info.set_seeds_and_mask_rows([b, a, seeded])
-        self.assertEqual(info.sampling_seed.tolist(), [789, 456, 123])
-
-        info.set_seeds_and_mask_rows([b, a])
-        self.assertIsNone(info.sampling_seed)
-
     def test_mask_rows(self):
         """Mask rows index the batch; support rows index the mask rows."""
         reqs = [
             self._make_req(top_k=5),
             self._make_req(top_k=7, mask_mode="full"),
-            self._make_req(top_k=50, mask_mode="support", seed=9),
+            self._make_req(top_k=50, mask_mode="support"),
             self._make_req(top_k=3, mask_mode="support"),
         ]
         info = _make_info()
-        info.set_seeds_and_mask_rows(reqs)
+        info.set_step_state(reqs)
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1, 2, 3])
         self.assertEqual(
             info.sampling_support_logprobs_capture_indices.tolist(), [1, 2]
         )
         self.assertEqual(info.sampling_mask_top_ks, [1, 7, 50, 3])
-        self.assertEqual(info.sampling_seed[2].item(), 9)
 
-        info.set_seeds_and_mask_rows(reqs[:2])
+        info.set_step_state(reqs[:2])
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
         self.assertIsNone(info.sampling_support_logprobs_capture_indices)
-        self.assertIsNone(info.sampling_seed)
 
-        info.set_seeds_and_mask_rows(reqs[:1])
+        info.set_step_state(reqs[:1])
         self.assertIsNone(info.sampling_mask_batch_indices)
         self.assertIsNone(info.sampling_mask_top_ks)
 
@@ -438,7 +430,7 @@ class TestStepBuilds(CustomTestCase):
             max_page_tokens=3,
         )
         info = _make_info()
-        info.set_plugin_state([req])
+        info.set_step_state([req])
         self.assertTrue(info.has_custom_logit_processor)
         logits = torch.zeros(1, VOCAB_SIZE)
         apply_custom_logit_processor(logits, info)
@@ -448,19 +440,19 @@ class TestStepBuilds(CustomTestCase):
     def test_grammars_are_set_only_when_a_request_has_one(self):
         reqs = [self._make_req(), self._make_req()]
         info = _make_info()
-        info.set_plugin_state(reqs)
+        info.set_step_state(reqs)
         self.assertIsNone(info.grammars)
 
         grammar = object()
         reqs[1].grammar = grammar
-        info.set_plugin_state(reqs)
+        info.set_step_state(reqs)
         self.assertEqual(info.grammars, [None, grammar])
 
     def test_external_processor_still_requires_the_enable_flag(self):
         req = self._make_req()
         req.custom_logit_processor = DisallowedTokensLogitsProcessor.to_str()
         info = _make_info()
-        info.set_plugin_state([req])
+        info.set_step_state([req])
         self.assertFalse(info.has_custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
 
@@ -477,7 +469,7 @@ class TestStepBuilds(CustomTestCase):
         req2.sampling_params.custom_params = None
 
         info = _make_info()
-        info.set_plugin_state([req1, req2])
+        info.set_step_state([req1, req2])
 
         self.assertTrue(info.has_custom_logit_processor)
         self.assertIsNotNone(info.custom_logit_processor)
