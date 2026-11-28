@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
+    configure_media_url_policy,
     prepare_server_args,
     set_global_server_args,
 )
@@ -470,6 +471,7 @@ def launch_http_server_only(
 
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
+    configure_media_url_policy(server_args)
     app = create_app(server_args, worker_pids=worker_pids, disagg_server=disagg_server)
     uvicorn.run(
         app,

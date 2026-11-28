@@ -25,6 +25,7 @@ from PIL import Image
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3 import (
     material_io,
     prequeue,
+    video_adapter,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.material_io import (
     MINIMAX_H3_MATERIAL_CACHE_EXTRA_KEY,
@@ -119,7 +120,14 @@ class _Origin:
 @pytest.fixture
 def origin(monkeypatch, media) -> _Origin:
     origin = _Origin(media)
-    monkeypatch.setattr(urllib.request, "urlopen", origin.urlopen)
+    from contextlib import contextmanager
+
+    @contextmanager
+    def open_material(uri, timeout):
+        with origin.urlopen(uri, timeout) as response:
+            yield {}, iter(lambda: response.read(65536), b"")
+
+    monkeypatch.setattr(material_io, "open_remote_media", open_material)
     monkeypatch.setattr(
         material_io, "_ffprobe_media", lambda path: json.loads(Path(path).read_bytes())
     )
@@ -379,3 +387,40 @@ def test_failures_raise_the_first_failing_condition_and_leave_no_files(
     sequential, concurrent = errors
     assert type(concurrent) is type(sequential)
     assert str(concurrent) == str(sequential)
+
+
+def test_a_playlist_url_is_staged_as_the_condition_type_and_read_as_a_file(
+    monkeypatch, media
+) -> None:
+    @contextlib.contextmanager
+    def open_playlist(uri, timeout):
+        headers = {"Content-Type": "application/vnd.apple.mpegurl"}
+        yield headers, iter([media["video.mp4"].read_bytes()])
+
+    monkeypatch.setattr(material_io, "open_remote_media", open_playlist)
+    monkeypatch.setattr(
+        material_io, "_ffprobe_media", lambda path: json.loads(Path(path).read_bytes())
+    )
+    path = material_io.minimax_h3_localize_material_uri(
+        SimpleNamespace(extra={}),
+        "https://media.test/clip.m3u8",
+        condition_type="video",
+        condition_index=0,
+    )
+    assert Path(path).name == "condition_0000.mp4"
+
+    opened = []
+
+    def av_open(target, **kwargs):
+        opened.append(kwargs)
+        return contextlib.nullcontext(
+            SimpleNamespace(streams=[], format=SimpleNamespace(name="mp4"), duration=0)
+        )
+
+    monkeypatch.setattr(
+        video_adapter,
+        "av",
+        SimpleNamespace(open=av_open, error=SimpleNamespace(FFmpegError=OSError)),
+    )
+    video_adapter._read_output_media(path)
+    assert opened == [{"options": {"protocol_whitelist": "file"}}]
