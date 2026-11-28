@@ -340,3 +340,22 @@ def test_rank_below_16_is_rejected():
             torch.zeros(1, _E, rank, _F),
             torch.zeros(1, 1, _D, rank),
         )
+
+
+def test_graph_routing_buffers_need_no_fused_moe_quant_info():
+    """Server startup sizes the MoE LoRA CUDA-graph buffers for every expert LoRA layer; Inkling2's layer
+    has no FusedMoE ``_quant_info``, and startup used to fail reading it."""
+    from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+
+    experts = nn.Module()
+    experts.top_k, experts.num_experts = _TOP_K, _E
+    experts.w13_weight = nn.Parameter(torch.empty(_E, 2 * _F, _D))
+    backend = SimpleNamespace()
+    BaseLoRABackend.init_cuda_graph_moe_buffers(
+        backend,
+        max_bs=8,
+        max_loras=1,
+        compute_dtype=torch.bfloat16,
+        moe_layer=SimpleNamespace(base_layer=experts),
+    )
+    assert backend.moe_cg_buffers["token_lora_mapping"].shape == (8,)

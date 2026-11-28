@@ -281,12 +281,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         base = moe_layer.base_layer
         top_k = base.top_k
-        quant_info = moe_layer._quant_info
-        # Marlin quant info exposes packed weights as w13_qweight.
-        weight = getattr(quant_info, "w13_weight", None)
-        if weight is None:
-            weight = quant_info.w13_qweight
-        device = weight.device
+        # Every MoE LoRA layer type has its experts' weights on the serving device.
+        device = next(base.parameters()).device
         num_experts = base.num_experts
 
         block_size_m = 64
