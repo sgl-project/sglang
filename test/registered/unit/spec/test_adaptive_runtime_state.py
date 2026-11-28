@@ -1,8 +1,12 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
+    get_batch_context_length,
+    get_batch_context_length_for_controller,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -67,6 +71,30 @@ class _FakePolicy:
         return [batch_size for batch_size in self.cuda_graph_bs if batch_size <= step]
 
 
+class _FakeContextPolicy(_FakePolicy):
+    def __init__(self, *, uses_context: bool | None = None):
+        super().__init__()
+        if uses_context is not None:
+            self.uses_context = uses_context
+        self.context_route_calls = []
+        self.context_feedback_calls = []
+
+    def get_steps_for_context(self, batch_size: int, ctx_repr: int) -> int:
+        self.context_route_calls.append((batch_size, ctx_repr))
+        return 1 if ctx_repr >= 2048 else 3
+
+    def on_verify_complete_for_context(
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int,
+        ctx_repr: int,
+    ) -> int | None:
+        self.context_feedback_calls.append(
+            (num_correct_drafts_per_req, batch_size, ctx_repr)
+        )
+        return self.feedback_step
+
+
 class TestAdaptiveController(unittest.TestCase):
     def test_injected_policy_builds_pruned_states_and_applies_initial_state(self):
         worker = _FakeWorker(initial_steps=3)
@@ -105,6 +133,63 @@ class TestAdaptiveController(unittest.TestCase):
         controller.activate_step_by_batch(batch_size=8)
         self.assertEqual(worker.applied_steps, [3, 1])
 
+    def test_batch_only_custom_policy_ignores_optional_context(self):
+        worker = _FakeWorker(initial_steps=3)
+        controller = AdaptiveController(worker, _FakePolicy())
+        controller.init_states()
+
+        controller.activate_step_by_batch(batch_size=8, ctx_repr=8192)
+
+        self.assertEqual(worker.applied_steps, [3, 1])
+
+    def test_context_capability_receives_route_and_feedback_context(self):
+        worker = _FakeWorker(initial_steps=3)
+        policy = _FakeContextPolicy()
+        controller = AdaptiveController(worker, policy)
+        controller.init_states()
+
+        controller.activate_step_by_batch(batch_size=1, ctx_repr=8192)
+        policy.feedback_step = 3
+        controller.on_verify_complete([1, 2], batch_size=1, ctx_repr=8192)
+
+        self.assertEqual(policy.context_route_calls, [(1, 8192)])
+        self.assertEqual(policy.context_feedback_calls, [([1, 2], 1, 8192)])
+        self.assertEqual(worker.applied_steps, [3, 1, 3])
+
+    def test_context_helper_is_lazy_for_disabled_and_legacy_policies(self):
+        reqs = [SimpleNamespace(seqlen=4096)]
+        batch_only = AdaptiveController(_FakeWorker(), _FakePolicy())
+        legacy_1d = AdaptiveController(
+            _FakeWorker(), _FakeContextPolicy(uses_context=False)
+        )
+
+        with patch(
+            "sglang.srt.speculative.adaptive_runtime_state.get_batch_context_length"
+        ) as context_length:
+            self.assertEqual(get_batch_context_length_for_controller(None, reqs), 0)
+            self.assertEqual(
+                get_batch_context_length_for_controller(batch_only, reqs), 0
+            )
+            self.assertEqual(
+                get_batch_context_length_for_controller(legacy_1d, reqs), 0
+            )
+
+        context_length.assert_not_called()
+
+    def test_context_helper_runs_for_opted_in_policy(self):
+        reqs = [SimpleNamespace(seqlen=4096)]
+        controller = AdaptiveController(_FakeWorker(), _FakeContextPolicy())
+
+        with patch(
+            "sglang.srt.speculative.adaptive_runtime_state.get_batch_context_length",
+            wraps=get_batch_context_length,
+        ) as context_length:
+            self.assertEqual(
+                get_batch_context_length_for_controller(controller, reqs), 4096
+            )
+
+        context_length.assert_called_once_with(reqs)
+
     def test_verify_feedback_can_activate_a_state(self):
         worker = _FakeWorker(initial_steps=3)
         policy = _FakePolicy()
@@ -126,6 +211,15 @@ class TestAdaptiveController(unittest.TestCase):
             ValueError, "Missing adaptive runtime state for steps=1"
         ):
             controller.activate_step_by_batch(batch_size=8)
+
+
+class TestBatchContextLength(unittest.TestCase):
+    def test_empty_batch_uses_legacy_context(self):
+        self.assertEqual(get_batch_context_length([]), 0)
+
+    def test_uses_upper_median_of_cpu_request_lengths(self):
+        reqs = [SimpleNamespace(seqlen=value) for value in (8192, 256, 4096, 1024)]
+        self.assertEqual(get_batch_context_length(reqs), 4096)
 
 
 if __name__ == "__main__":

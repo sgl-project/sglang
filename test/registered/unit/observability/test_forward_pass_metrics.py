@@ -329,7 +329,10 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
 
                 processor = types.SimpleNamespace(
                     metrics_reporter=reporter,
-                    model_worker=types.SimpleNamespace(on_verify_complete_cpu=Mock()),
+                    model_worker=types.SimpleNamespace(
+                        get_adaptive_context=Mock(return_value=0),
+                        on_verify_complete_cpu=Mock(),
+                    ),
                     advance_grammar_fsm=settle_grammar,
                 )
                 tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
