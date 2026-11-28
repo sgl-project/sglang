@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import unittest
+from collections import deque
 
 import torch
 
@@ -86,6 +87,44 @@ class TestSpectrumForecaster(unittest.TestCase):
         t = torch.tensor([10.0])
         self.assertAlmostEqual(f50._taus(t).item(), -0.6, places=5)
         self.assertAlmostEqual(f20._taus(t).item(), 0.0, places=5)
+
+    def test_history_memory_scales_with_updates_not_history_size(self) -> None:
+        """History must not preallocate history_size fp32 copies of the feature;
+        at video resolution that buffer alone exceeded device memory.
+        """
+        forecaster = ChebyshevForecaster(M=4, K=100, feature_shape=(4, 8))
+        for step in range(3):
+            forecaster.update(float(step), torch.randn(4, 8, dtype=torch.bfloat16))
+        tensors = list(forecaster.buffers())
+        for value in vars(forecaster).values():
+            if isinstance(value, torch.Tensor):
+                tensors.append(value)
+            elif isinstance(value, (list, tuple, deque)):
+                tensors.extend(v for v in value if isinstance(v, torch.Tensor))
+        held = sum(t.numel() * t.element_size() for t in tensors)
+        self.assertLessEqual(held, 3 * 4 * 8 * 2)
+
+    def test_history_is_a_sliding_window_of_size_k(self) -> None:
+        """With more updates than K, only the last K pairs drive the fit."""
+        feats = [torch.randn(4, 8) for _ in range(5)]
+        windowed = ChebyshevForecaster(M=2, K=3, feature_shape=(4, 8))
+        last_k = ChebyshevForecaster(M=2, K=3, feature_shape=(4, 8))
+        for step, h in enumerate(feats):
+            windowed.update(float(step), h)
+        for step, h in list(enumerate(feats))[-3:]:
+            last_k.update(float(step), h)
+        torch.testing.assert_close(windowed.predict(6.0), last_k.predict(6.0))
+
+    def test_history_is_not_aliased_to_caller_feature(self) -> None:
+        """The DiT keeps using its block output after recording it; in-place
+        writes to that tensor must not change the forecast.
+        """
+        h = torch.randn(4, 8)
+        forecaster = ChebyshevForecaster(M=0, K=4, feature_shape=(4, 8))
+        forecaster.update(0.0, h)
+        expected = forecaster.predict(1.0).clone()
+        h.zero_()
+        torch.testing.assert_close(forecaster.predict(1.0), expected)
 
 
 if __name__ == "__main__":

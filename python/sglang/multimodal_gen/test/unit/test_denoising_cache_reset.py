@@ -124,6 +124,66 @@ class TestDenoisingCacheReset(CustomTestCase):
             self._teacache_request(fresh, batch, offset=5.0),
         )
 
+    def test_first_expert_spectrum_history_is_freed_after_handoff(self):
+        """The first expert's forecast history (a full feature copy per real step
+        and CFG branch) must not stay allocated while the second expert runs.
+        """
+        boundary = 500.0
+        for enabled in (False, True):
+            high, low = _Expert(), _Expert()
+            stage = DenoisingStage.__new__(DenoisingStage)
+            stage.transformer, stage.transformer_2 = high, low
+            stage._manage_dit_use_site = MagicMock()
+            batch = self._batch(spectrum=True)
+            for step in range(FIRST_LOW_NOISE_STEP):
+                with set_forward_context(step, None, forward_batch=batch):
+                    high.begin_spectrum_step()
+                    high.spectrum_record_features(torch.ones(2, 3))
+            batch.enable_spectrum = enabled
+            batch.guidance_scale = batch.guidance_scale_2 = 1.0
+            stage._select_and_manage_model(900, boundary, None, batch)
+            self.assertIsNotNone(high.spectrum_forecaster)
+            model, _ = stage._select_and_manage_model(100, boundary, None, batch)
+            self.assertIs(model, low)
+            if enabled:
+                self.assertIsNone(high.spectrum_forecaster)
+                # Later low-noise steps find nothing to free and do not reset again.
+                high.reset_spectrum_state = MagicMock()
+                stage._select_and_manage_model(50, boundary, None, batch)
+                high.reset_spectrum_state.assert_not_called()
+            else:
+                self.assertIsNotNone(high.spectrum_forecaster)
+
+    def test_spectrum_history_is_freed_before_post_processing(self):
+        """No expert's forecast history may survive the denoising loop into
+        post-processing and decode.
+        """
+        for enabled in (False, True):
+            high, low = _Expert(), _Expert()
+            stage = DenoisingStage.__new__(DenoisingStage)
+            stage.transformer, stage.transformer_2 = high, low
+            batch = self._batch(spectrum=True)
+            batch.rollout = False
+
+            def run_loop(ctx, batch, server_args):
+                for expert in (high, low):
+                    with set_forward_context(0, None, forward_batch=batch):
+                        expert.begin_spectrum_step()
+                        expert.spectrum_record_features(torch.ones(2, 3))
+                batch.enable_spectrum = enabled
+                return torch.arange(STEPS)
+
+            seen = {}
+
+            def finalize(ctx, batch, server_args):
+                seen["kept"] = [e.spectrum_forecaster is not None for e in (high, low)]
+
+            stage._prepare_denoising_loop = MagicMock()
+            stage._run_denoising_loop = run_loop
+            stage._finalize_denoising_loop = finalize
+            stage._denoise(batch, None)
+            self.assertEqual(seen["kept"], [not enabled, not enabled])
+
     def test_disabled_caches_and_plain_modules_are_left_alone(self):
         """Only enabled caches reset, and modules without cache state are skipped."""
         expert = MagicMock()
