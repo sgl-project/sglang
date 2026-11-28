@@ -149,6 +149,124 @@ class TestNorm:
         assert mid.data_ptr() != residual.data_ptr()
         assert output.data_ptr() != x.data_ptr()
 
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("shape", [(0, 33), (1, 7), (5, 65)])
+    def test_gemma_rmsnorm_residual_scalar(self, shape, dtype):
+        generator = torch.Generator().manual_seed(1234)
+        rows, hidden_size = shape
+        x, residual = (
+            torch.randn(
+                (rows, hidden_size + padding), dtype=dtype, generator=generator
+            )[:, :hidden_size]
+            for padding in (3, 5)
+        )
+        weight = torch.randn(hidden_size, dtype=dtype, generator=generator)
+        scalar = torch.tensor([0.625], dtype=dtype)
+        epsilon = 0.125
+        norm = self._norm(x.float(), epsilon) * weight.float()
+        expected = ((norm + residual.float()) * scalar.float()).to(dtype)
+
+        actual = torch.ops.sgl_kernel.gemma_rmsnorm_residual_scalar_cpu(
+            x, weight, residual, scalar, epsilon
+        )
+        torch.testing.assert_close(
+            actual, expected, atol=precision[dtype], rtol=precision[dtype]
+        )
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize(
+        "rows, head_dim, has_kv", [(1, 7, True), (5, 65, True), (5, 64, False)]
+    )
+    def test_gemma_qkv_rmsnorm(self, rows, head_dim, has_kv, dtype):
+        generator = torch.Generator().manual_seed(1234)
+        num_q_heads, num_kv_heads = 3, 2
+        q_size = num_q_heads * head_dim
+        kv_size = num_kv_heads * head_dim
+        widths = (q_size, kv_size, kv_size, 3)
+        packed = torch.randn(rows, sum(widths), dtype=dtype, generator=generator)
+        q, k, v, _ = packed.split(widths, dim=-1)
+        q_ref, k_ref, v_ref, padding_ref = packed.clone().split(widths, dim=-1)
+        q_weight = torch.randn(head_dim, dtype=dtype, generator=generator)
+        k_weight = torch.randn(head_dim, dtype=dtype, generator=generator)
+        epsilon = 0.125
+
+        q_ref.copy_(
+            (
+                self._norm(q_ref.reshape(rows, num_q_heads, head_dim).float(), epsilon)
+                * q_weight.float()
+            ).reshape_as(q_ref)
+        )
+        if has_kv:
+            k_ref.copy_(
+                (
+                    self._norm(
+                        k_ref.reshape(rows, num_kv_heads, head_dim).float(), epsilon
+                    )
+                    * k_weight.float()
+                ).reshape_as(k_ref)
+            )
+            v_ref.copy_(
+                self._norm(
+                    v_ref.reshape(rows, num_kv_heads, head_dim).float(), epsilon
+                ).reshape_as(v_ref)
+            )
+
+        torch.ops.sgl_kernel.gemma_qkv_rmsnorm_cpu(
+            q,
+            k if has_kv else None,
+            v if has_kv else None,
+            q_weight,
+            k_weight if has_kv else None,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            epsilon,
+        )
+
+        torch.testing.assert_close(
+            q, q_ref, atol=precision[dtype], rtol=precision[dtype]
+        )
+        if has_kv:
+            torch.testing.assert_close(
+                k, k_ref, atol=precision[dtype], rtol=precision[dtype]
+            )
+            torch.testing.assert_close(
+                v, v_ref, atol=precision[dtype], rtol=precision[dtype]
+            )
+        else:
+            torch.testing.assert_close(k, k_ref, atol=0, rtol=0)
+            torch.testing.assert_close(v, v_ref, atol=0, rtol=0)
+        torch.testing.assert_close(packed[:, -3:], padding_ref, atol=0, rtol=0)
+
+    @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
+    @pytest.mark.parametrize("shape", [(0, 33), (1, 33), (5, 2048)])
+    def test_gemma_dual_rmsnorm_residual_scalar(self, shape, dtype):
+        generator = torch.Generator().manual_seed(1234)
+        rows, hidden_size = shape
+        x1, x2, residual = (
+            torch.randn(
+                (rows, hidden_size + padding), dtype=dtype, generator=generator
+            )[:, :hidden_size]
+            for padding in (3, 5, 7)
+        )
+        w1, w2, w3 = (
+            torch.randn(hidden_size, dtype=dtype, generator=generator) for _ in range(3)
+        )
+        scalar = torch.tensor([0.625], dtype=dtype)
+        eps1, eps2, eps3 = 0.125, 0.25, 0.375
+        dense = self._norm(x1.float(), eps1) * w1.float()
+        moe = self._norm(x2.float(), eps2) * w2.float()
+        merged = dense + moe
+        post_norm = self._norm(merged, eps3) * w3.float()
+        expected = ((post_norm + residual.float()) * scalar.float()).to(dtype)
+
+        actual = torch.ops.sgl_kernel.gemma_dual_rmsnorm_residual_scalar_cpu(
+            x1, w1, x2, w2, w3, residual, scalar, eps1, eps2, eps3
+        )
+        torch.testing.assert_close(
+            actual, expected, atol=precision[dtype], rtol=precision[dtype]
+        )
+
     @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bfloat16"])
     @pytest.mark.parametrize("hidden_size", [2048, 256, 33])
     @pytest.mark.parametrize("batch_size", [32, 121])

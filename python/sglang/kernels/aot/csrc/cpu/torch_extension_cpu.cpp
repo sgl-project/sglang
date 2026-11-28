@@ -617,6 +617,42 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
 std::tuple<at::Tensor, at::Tensor>
 fused_input_proj_cpu(at::Tensor& hidden_states, at::Tensor& qkvz_weight, at::Tensor& ba_weight, bool is_vnni);
 
+std::tuple<at::Tensor, at::Tensor>
+gemma4_fused_routing_cpu(const at::Tensor& gating_output, const at::Tensor& per_expert_scale, int64_t topk);
+
+std::tuple<at::Tensor, at::Tensor> gemma_routing_post_topk_cpu(
+    const at::Tensor& topk_logits, const at::Tensor& topk_ids, const at::Tensor& per_expert_scale);
+
+void gemma_qkv_rmsnorm_cpu(
+    at::Tensor q,
+    const std::optional<at::Tensor>& k,
+    const std::optional<at::Tensor>& v,
+    const at::Tensor& q_weight,
+    const std::optional<at::Tensor>& k_weight,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_dim,
+    double eps);
+
+at::Tensor gemma_rmsnorm_residual_scalar_cpu(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& residual,
+    const at::Tensor& scalar,
+    double eps);
+
+at::Tensor gemma_dual_rmsnorm_residual_scalar_cpu(
+    const at::Tensor& x1,
+    const at::Tensor& weight1,
+    const at::Tensor& x2,
+    const at::Tensor& weight2,
+    const at::Tensor& weight3,
+    const at::Tensor& residual,
+    const at::Tensor& scalar,
+    double eps1,
+    double eps2,
+    double eps3);
+
 // image preprocessor
 std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     at::TensorList images,
@@ -1069,6 +1105,28 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_input_proj_cpu(Tensor hidden_states, Tensor qkvz_weight, Tensor ba_weight, bool is_vnni) -> (Tensor, "
       "Tensor)");
   m.impl("fused_input_proj_cpu", torch::kCPU, &fused_input_proj_cpu);
+
+  m.def("gemma4_fused_routing_cpu(Tensor gating_output, Tensor per_expert_scale, int topk) -> (Tensor, Tensor)");
+  m.impl("gemma4_fused_routing_cpu", torch::kCPU, &gemma4_fused_routing_cpu);
+
+  m.def(
+      "gemma_routing_post_topk_cpu(Tensor topk_logits, Tensor topk_ids, Tensor per_expert_scale) -> (Tensor, Tensor)");
+  m.impl("gemma_routing_post_topk_cpu", torch::kCPU, &gemma_routing_post_topk_cpu);
+
+  m.def(
+      "gemma_qkv_rmsnorm_cpu(Tensor(a!) q, Tensor(b!)? k, Tensor(c!)? v, Tensor q_weight, Tensor? k_weight, "
+      "int num_q_heads, int num_kv_heads, int head_dim, float eps) -> ()");
+  m.impl("gemma_qkv_rmsnorm_cpu", torch::kCPU, &gemma_qkv_rmsnorm_cpu);
+
+  m.def(
+      "gemma_rmsnorm_residual_scalar_cpu(Tensor input, Tensor weight, Tensor residual, Tensor scalar, float eps) -> "
+      "Tensor");
+  m.impl("gemma_rmsnorm_residual_scalar_cpu", torch::kCPU, &gemma_rmsnorm_residual_scalar_cpu);
+
+  m.def(
+      "gemma_dual_rmsnorm_residual_scalar_cpu(Tensor x1, Tensor weight1, Tensor x2, Tensor weight2, "
+      "Tensor weight3, Tensor residual, Tensor scalar, float eps1, float eps2, float eps3) -> Tensor");
+  m.impl("gemma_dual_rmsnorm_residual_scalar_cpu", torch::kCPU, &gemma_dual_rmsnorm_residual_scalar_cpu);
 
   // image preprocessor
   m.def(
