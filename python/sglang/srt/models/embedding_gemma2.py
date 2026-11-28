@@ -948,10 +948,11 @@ class EmbeddingGemma2Model(nn.Module):
         if name in params_dict:
             return (
                 params_dict[name]
-                .data.cpu()
+                .data[:truncate_size]
+                .cpu()
                 .to(torch.float32)
                 .numpy()
-                .tolist()[:truncate_size]
+                .tolist()
             )
         return None
 
