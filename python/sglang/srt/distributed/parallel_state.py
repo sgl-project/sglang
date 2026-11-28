@@ -1208,7 +1208,7 @@ class GroupCoordinator:
         return (
             ca_comm is not None
             and not getattr(ca_comm, "disabled", True)
-            and hasattr(ca_comm, "should_custom_ar")
+            and hasattr(ca_comm, "should_custom_rs")
             and hasattr(ca_comm, "reduce_scatter")
         )
 
@@ -1231,8 +1231,8 @@ class GroupCoordinator:
         ):
             return False
         ca_comm = self.ca_comm
-        # input is the full (pre-reduce) buffer; should_custom_ar bounds its size.
-        if not ca_comm.should_custom_ar(input):
+        # aiter's reduce-scatter cutoff and first-dim alignment, not the all-reduce one
+        if not ca_comm.should_custom_rs(input, 0):
             return False
         # Equal-chunk only: input rows must split evenly into world_size chunks
         # matching the per-rank output rows.

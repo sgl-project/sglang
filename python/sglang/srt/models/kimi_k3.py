@@ -137,6 +137,8 @@ from sglang.srt.models.kimi_k3_amd.moe import (
     link_hip_paths,
     prepare_hip_paths,
     row_shard_bank_hooks_hip,
+    sp_o_proj_full_weight_hip,
+    sp_o_proj_rows_hip,
 )
 from sglang.srt.models.kimi_k3_vl import (
     KimiK3MultiModalProjector,
@@ -1906,6 +1908,14 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     prefix_sum=prefix_sum,
                     valid_token_count=valid_token_count,
                 )
+            if _is_gfx95:
+                out = self.forward_sp_rows_hip(
+                    rows=hidden_states,
+                    prefix_sum=prefix_sum,
+                    num_tokens=layernorm_sp.sp_num_tokens(),
+                )
+                if out is not None:
+                    return out
             full = k3_sp_collective.sp_all_gather(
                 hidden_states, layernorm_sp.sp_num_tokens()
             )
@@ -3227,6 +3237,8 @@ class KimiK3DecoderLayer(nn.Module):
         # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
         # this rank's attention-TP shard of the rows.
         self._sp_moe = self._is_moe_layer and _shards_moe_rows()
+        # gfx950 SP: o_proj over every rank's heads; None keeps the reduce-scatter
+        self._sp_o_proj_full: Optional[torch.Tensor] = None
 
         self.all_reduce_fusion = not self._sp_moe and _fuses_attn_all_reduce(config)
 
@@ -3376,6 +3388,15 @@ class KimiK3DecoderLayer(nn.Module):
             hidden_states, layernorm_sp.sp_num_tokens()
         )
         with get_forward().scoped(sp_active=False):
+            if self._sp_o_proj_full is not None:
+                heads = self._attend(
+                    rows, positions, forward_batch, zero_allocator, pre_o_proj=True
+                )
+                return sp_o_proj_rows_hip(
+                    heads=heads,
+                    full_weight=self._sp_o_proj_full,
+                    shard_rows=hidden_states.shape[0],
+                )
             partial = self._attend(rows, positions, forward_batch, zero_allocator)
         return k3_sp_collective.sp_reduce_scatter(partial)
 
@@ -3385,6 +3406,7 @@ class KimiK3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        pre_o_proj: bool = False,
     ) -> torch.Tensor:
         # DP attention: idle ranks (padded to the global shape) have no
         # attention metadata; pass hidden_states through shape-preserving
@@ -3404,7 +3426,8 @@ class KimiK3DecoderLayer(nn.Module):
             attn_inputs = AttentionInputs(hidden_states, forward_batch, qkv_latent_func)
             get_attn_tp_context().set_attn_inputs(attn_inputs)
 
-        result = self.self_attn(
+        attend = self.self_attn.forward_pre_o_proj if pre_o_proj else self.self_attn
+        result = attend(
             hidden_states=hidden_states,
             positions=positions,
             forward_batch=forward_batch,
@@ -4316,6 +4339,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):
                 continue
+            if _is_gfx95:
+                # before the KV pool is sized: the copies count against it
+                layer._sp_o_proj_full = sp_o_proj_full_weight_hip(layer.self_attn)
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
                 if layer.mlp._use_mega_moe and get_parallel().attn_cp_size > 1:

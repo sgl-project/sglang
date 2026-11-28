@@ -596,6 +596,7 @@ class TestNpuMc2FusedPaths(CustomTestCase):
         )
         with (
             patch.object(layernorm_sp, "is_npu", return_value=False),
+            patch.object(layernorm_sp, "is_hip", return_value=False),
             patch.object(layernorm_sp, "_HAS_TORCH_SYMM_MEM_FUSED", True),
         ):
             self.assertTrue(layernorm_sp.sp_fused_matmul_eligible(linear))
