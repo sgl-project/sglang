@@ -171,10 +171,11 @@ def handle_model_specific_adjustments(server_args: Any):
     if (
         get_platform().is_npu
         and cfg.dcp_size > 1
+        and use_mla_backend(server_args)
         and not (is_deepseek_dsa(hf_config) or is_kimi_k3(hf_config))
     ):
         raise ValueError(
-            "NPU decode context parallelism is currently implemented only for "
+            "NPU MLA decode context parallelism is currently implemented only for "
             "DeepSeek DSA and Kimi-K3 models; got "
             f"{model_arch}. Set --decode-context-parallel-size=1 or use a supported model."
         )

@@ -111,6 +111,43 @@ def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
         )
 
 
+def _check_ascend_gqa_dcp(server_args: Any, model_config: Any) -> None:
+    view = resolved_view(server_args)
+    if set(attention_backends_of(view)) != {"ascend"}:
+        raise ValueError("Ascend GQA DCP requires the ascend attention backend.")
+    if (
+        view.nnodes != 1
+        or view.pp_size != 1
+        or view.attn_dp_size != 1
+        or view.attn_cp_size != 1
+    ):
+        raise ValueError(
+            "Ascend GQA DCP requires one node, PP=1, attention DP=1 and prefill CP=1."
+        )
+    kv_heads = model_config.get_total_num_kv_heads()
+    if view.tp_size % (kv_heads * view.dcp_size) != 0:
+        raise ValueError("Each Ascend GQA DCP group must share a replicated KV head.")
+    if (
+        model_config.head_dim != model_config.v_head_dim
+        or model_config.head_dim not in (128, 192, 256)
+    ):
+        raise ValueError(
+            "Ascend GQA DCP requires equal K and V head dims of 128, 192 or 256."
+        )
+    if (
+        view.speculative_algorithm is not None
+        or view.disaggregation_mode != "null"
+        or view.enable_hierarchical_cache
+        or view.enable_unified_memory
+        or model_config.is_encoder_decoder
+        or model_config.sliding_window_size is not None
+        or model_config.attention_chunk_size is not None
+    ):
+        raise ValueError(
+            "Ascend GQA DCP requires ordinary causal attention with a local KV pool."
+        )
+
+
 def handle_attention_backend_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
@@ -284,6 +321,8 @@ def handle_attention_backend_compatibility(server_args: Any):
     # XPU platforms backends
     if cfg.dcp_size > 1 and get_platform().is_xpu:
         _check_xpu_dcp(server_args, model_config)
+    if cfg.dcp_size > 1 and get_platform().is_npu and not use_mla_backend(server_args):
+        _check_ascend_gqa_dcp(server_args, model_config)
 
     run_post_process_pass(server_args, _intel_xpu_page_constraint)
 

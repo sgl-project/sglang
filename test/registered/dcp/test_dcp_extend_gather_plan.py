@@ -28,6 +28,10 @@ import torch
 
 from sglang.srt import runtime_context as rc
 from sglang.srt.hardware_backend.npu import dcp_extend_gather
+from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
+    build_gqa_dcp_extend_layout,
+)
+from sglang.srt.hardware_backend.npu.attention.gqa_dcp import prepare_gqa_dcp_metadata
 from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     DCP_EXTEND_QUERY_GATHER_MAX_TOKENS,
     build_dcp_extend_gather_plan,
@@ -45,6 +49,49 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+
+
+class TestGQAPagedExtendLayout(CustomTestCase):
+    def test_uneven_request_lengths_round_trip_through_page_table(self):
+        page_size = 128
+        lengths = [127, 0, 129, 257]
+        table, rows, capacity = build_gqa_dcp_extend_layout(lengths, page_size)
+        self.assertEqual(table.dtype, torch.int32)
+        self.assertEqual(capacity, 6 * page_size)
+        original = torch.arange(sum(lengths))
+        packed = torch.full((capacity,), -1).index_copy_(0, rows, original)
+        for request, (length, tokens) in enumerate(
+            zip(lengths, original.split(lengths))
+        ):
+            page_count = (length + page_size - 1) // page_size
+            pages = table[request, :page_count]
+            physical = (pages[:, None] * page_size + torch.arange(page_size)).flatten()
+            torch.testing.assert_close(packed[physical[:length]], tokens)
+        self.assertEqual(int((packed < 0).sum()), capacity - sum(lengths))
+
+    def test_cache_writes_ignore_mlp_sync_padding_and_non_owners(self):
+        for extend_lens, real_owned_rows in (
+            ([127], torch.arange(127)),
+            ([129, 124], torch.cat((torch.arange(128), torch.arange(129, 253)))),
+        ):
+            with self.subTest(extend_lens=extend_lens):
+                num_tokens = sum(extend_lens)
+                cache_locs = torch.zeros((num_tokens + 7) // 8 * 8, dtype=torch.long)
+                cache_locs[:num_tokens] = -1
+                cache_locs[real_owned_rows] = real_owned_rows + 1
+                batch = SimpleNamespace(
+                    forward_mode=SimpleNamespace(
+                        is_decode=lambda: False, is_extend=lambda: True
+                    ),
+                    out_cache_loc=cache_locs,
+                    extend_prefix_lens_cpu=[0] * len(extend_lens),
+                    extend_seq_lens_cpu=extend_lens,
+                    req_pool_indices=torch.arange(len(extend_lens)),
+                )
+                meta = prepare_gqa_dcp_metadata(SimpleNamespace(page_size=128), batch)
+                torch.testing.assert_close(meta.write_rows, real_owned_rows)
+                torch.testing.assert_close(meta.write_locs, real_owned_rows + 1)
+
 
 DCP_SIZES = [1, 2, 3, 4, 16]
 # 1 is the round-robin rule; NPU serves at its page size.
