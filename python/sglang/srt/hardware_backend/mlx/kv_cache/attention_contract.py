@@ -45,12 +45,11 @@ def get_head_dim(module: Any) -> int | None:
     if head_dim is not None:
         return head_dim
 
+    n_heads = get_num_heads(module)
+    if hasattr(module, "hidden_size") and n_heads:
+        return module.hidden_size // n_heads
     n_kv_heads = get_num_kv_heads(module)
-    if n_kv_heads is None:
-        return None
-    if hasattr(module, "hidden_size") and hasattr(module, "num_k_heads"):
-        return module.hidden_size // module.num_k_heads
-    if hasattr(module, "k_proj") and hasattr(module.k_proj, "weight"):
+    if n_kv_heads and hasattr(module, "k_proj") and hasattr(module.k_proj, "weight"):
         return module.k_proj.weight.shape[0] // n_kv_heads
     return None
 
