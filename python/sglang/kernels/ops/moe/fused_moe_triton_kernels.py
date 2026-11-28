@@ -11,6 +11,11 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.numerics import silu_approx_f32
+from sglang.kernels.ops.moe.fused_moe_triton_host_copy import (
+    matmul_with_host_expert,
+    paged_expert_kernel_kwargs,
+    spread_missing_expert_blocks,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -379,6 +384,11 @@ def fused_moe_kernel(
     SWIGLU_ALPHA: tl.constexpr = 0.0,
     SWIGLU_LIMIT: tl.constexpr = 0.0,
     HAS_SWIGLU_ALPHA: tl.constexpr = False,
+    # Paged experts, fused host copy (fused_moe_triton_host_copy.py); off without b_host_ptr.
+    HOST_IDS_START: tl.constexpr = 0,
+    b_host_ptr=None,
+    expert_slot_ptr=None,
+    missing_expert_count_ptr=None,
 ):
     """
     Implements the fused computation for a Mixture of Experts (MOE) using
@@ -439,6 +449,10 @@ def fused_moe_kernel(
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if b_host_ptr is not None:
+        pid_m = spread_missing_expert_blocks(
+            pid_m, num_tokens_post_padded, missing_expert_count_ptr, BLOCK_SIZE_M
+        )
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
@@ -548,6 +562,26 @@ def fused_moe_kernel(
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
+    if b_host_ptr is not None:
+        accumulator, K = matmul_with_host_expert(
+            accumulator,
+            a_ptrs,
+            token_mask,
+            K,
+            stride_ak,
+            b_ptr,
+            b_host_ptr,
+            expert_slot_ptr,
+            off_experts,
+            offs_k,
+            offs_bn,
+            stride_be,
+            stride_bk,
+            stride_bn,
+            HOST_IDS_START,
+            BLOCK_SIZE_K,
+            even_Ks,
+        )
     for k_start in range(0, K, BLOCK_SIZE_K):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -834,6 +868,9 @@ def invoke_fused_moe_kernel(
     a_output_slices: int = 1,
     swiglu_alpha: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
+    # Paged experts, fused host copy (fused_moe_triton_host_copy.py): for B, its experts in
+    # pinned host memory, the layer's expert -> slot table and its count of missing experts.
+    paged_expert_info: Optional[dict] = None,
 ) -> None:
     """Skip inactive experts, including with filter_expert=False.
 
@@ -990,6 +1027,9 @@ def invoke_fused_moe_kernel(
         assert B_scale is not None and B_scale.ndim == 3
         assert B_zp is None or B_zp.ndim == 3
         assert bias is None
+        assert paged_expert_info is None, (
+            "Paged experts: fused host copy is not supported for GPTQ/AWQ kernels"
+        )
         group_size = block_shape[1]
         num_groups = triton.cdiv(A.shape[1], group_size)
         if B_scale.shape[2] != num_groups:
@@ -1066,6 +1106,15 @@ def invoke_fused_moe_kernel(
             if is_arch_support_pdl()
             else {}
         )
+        paged_expert_kwargs = {}
+        if paged_expert_info is not None:
+            assert not b_use_tma and bias is None and B_scale is None and not swap_ab, (
+                "Paged experts: fused host copy supports only unquantized weights, "
+                "without bias, TMA or swapped operands"
+            )
+            paged_expert_kwargs = paged_expert_kernel_kwargs(
+                B=B, paged_expert_info=paged_expert_info
+            )
         fused_moe_kernel[grid](
             A,
             a_desc,
@@ -1121,6 +1170,7 @@ def invoke_fused_moe_kernel(
             SWIGLU_ALPHA=float(swiglu_alpha or 0.0),
             SWIGLU_LIMIT=float(swiglu_limit or 0.0),
             HAS_SWIGLU_ALPHA=swiglu_alpha is not None,
+            **paged_expert_kwargs,
             **pdl_kwargs,
             **config,
         )

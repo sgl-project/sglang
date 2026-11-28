@@ -178,6 +178,7 @@ def fused_marlin_moe(
     is_gated: bool = True,
     no_combine: bool = False,
     no_combine_keep_router_weight: bool = True,
+    paged_expert_info: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -270,6 +271,13 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
+    # Paged experts, fused host copy: ids past w1's slots are experts in host memory.
+    w1_info, w2_info = (
+        paged_expert_info.info if paged_expert_info is not None else (None, None)
+    )
+    host_ids = w1_info["expert_slot"].numel() if w1_info else 0
+    if host_ids:
+        global_num_experts = max(global_num_experts, E + host_ids)
     if (
         M == 1
         and topk <= 32
@@ -360,6 +368,7 @@ def fused_marlin_moe(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
+        paged_expert_info=w1_info,
     )
 
     if activation == "silu" and is_gated and gemm1_alpha is not None:
@@ -429,6 +438,7 @@ def fused_marlin_moe(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
+        paged_expert_info=w2_info,
     ).view(-1, topk, K)
 
     if no_combine:

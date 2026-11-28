@@ -47,7 +47,11 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
-from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
+from .fused_moe_triton_config import (
+    get_config_dtype_str,
+    get_moe_configs,
+    try_get_optimal_moe_config,
+)
 from .moe_align_block_size import moe_align_block_size
 
 if TYPE_CHECKING:
@@ -200,6 +204,7 @@ def inplace_fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     w2_block_shape: Optional[List[int]] = None,
+    paged_expert_info: Optional[torch.Tensor] = None,
 ) -> None:
     fused_experts_impl(
         hidden_states,
@@ -235,6 +240,7 @@ def inplace_fused_experts(
         a1_q=a1_q,
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         w2_block_shape=w2_block_shape,
+        paged_expert_info=paged_expert_info,
     )
 
 
@@ -273,6 +279,7 @@ def outplace_fused_experts(
     fuse_swiglu_interleaved: bool = False,
     no_combine_keep_router_weight: bool = False,
     w2_block_shape: Optional[List[int]] = None,
+    paged_expert_info: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return fused_experts_impl(
         hidden_states,
@@ -309,6 +316,7 @@ def outplace_fused_experts(
         fuse_swiglu_interleaved=fuse_swiglu_interleaved,
         no_combine_keep_router_weight=no_combine_keep_router_weight,
         w2_block_shape=w2_block_shape,
+        paged_expert_info=paged_expert_info,
     )
 
 
@@ -335,6 +343,7 @@ def fused_experts(
     a1_q: Optional[torch.Tensor] = None,
     fuse_swiglu_interleaved: bool = False,
     w2_block_shape: Optional[List[int]] = None,
+    paged_expert_info: Optional[torch.Tensor] = None,
 ):
     topk_weights, topk_ids, _ = topk_output
     filter_expert = (
@@ -375,6 +384,7 @@ def fused_experts(
             a1_q=a1_q,
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
             w2_block_shape=w2_block_shape,
+            paged_expert_info=paged_expert_info,
         )
         return hidden_states
     else:
@@ -412,6 +422,7 @@ def fused_experts(
             fuse_swiglu_interleaved=fuse_swiglu_interleaved,
             no_combine_keep_router_weight=moe_runner_config.no_combine_keep_router_weight,
             w2_block_shape=w2_block_shape,
+            paged_expert_info=paged_expert_info,
         )
 
 
@@ -453,6 +464,22 @@ def _moe_support_tma():
     return support_tensor_descriptor()
 
 
+def tuned_moe_configs_use_tma(w2: torch.Tensor) -> bool:
+    """Whether a launch on the unquantized experts ``w2`` can use TMA: the device supports it and
+    a tuned config of the up or the down kernel sets USE_TMA at some batch size."""
+    if not _moe_support_tma():
+        return False
+    E, _, N = w2.shape
+    dtype = get_config_dtype_str(dtype=w2.dtype)
+    for down_moe in (False, True):
+        configs = get_moe_configs(
+            E, N, dtype, 0, 0, per_channel_quant=False, down_moe=down_moe
+        )
+        if any(config.get("USE_TMA", False) for config in (configs or {}).values()):
+            return True
+    return False
+
+
 def _prepare_fused_moe_run(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -466,6 +493,7 @@ def _prepare_fused_moe_run(
     per_channel_quant: bool,
     block_shape: Optional[List[int]],
     w2_block_shape: Optional[List[int]] = None,
+    paged_expert_info: Optional[torch.Tensor] = None,
 ):
     """Resolve config, down_config, TMA flag, and aligned expert routing ids.
 
@@ -478,6 +506,10 @@ def _prepare_fused_moe_run(
 
     num_tokens = hidden_states.shape[0]
     E = w1.shape[0]
+    # Paged experts, fused host copy: ids past w1's slots are experts in host memory.
+    w1_info = paged_expert_info.info[0] if paged_expert_info is not None else None
+    host_ids = w1_info["expert_slot"].numel() if w1_info else 0
+    E += host_ids
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
@@ -589,6 +621,7 @@ def _fused_moe_kernel_sequence(
     defer_sum: bool = False,
     no_combine_keep_router_weight: bool = False,
     w2_block_shape: Optional[List[int]] = None,
+    paged_expert_info: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -700,6 +733,9 @@ def _fused_moe_kernel_sequence(
             dtype=hidden_states.dtype,
         )
 
+    w1_info, w2_info = (
+        paged_expert_info.info if paged_expert_info is not None else (None, None)
+    )
     invoke_fused_moe_kernel(
         a1_q if a1_q is not None else hidden_states,
         w1,
@@ -729,6 +765,7 @@ def _fused_moe_kernel_sequence(
         fuse_swiglu=fuse_swiglu_interleaved,
         swiglu_alpha=gemm1_alpha,
         swiglu_limit=gemm1_limit,
+        paged_expert_info=w1_info,
     )
 
     if hooks and hooks.after_gate_up:
@@ -1014,6 +1051,7 @@ def _fused_moe_kernel_sequence(
         filter_expert=filter_expert,
         fuse_sum_all_reduce=use_fused_moe_sum_all_reduce,
         router_topk=topk,
+        paged_expert_info=w2_info,
     )
 
     if hooks and hooks.after_down:
@@ -1177,6 +1215,7 @@ def fused_experts_impl(
     defer_sum: bool = False,
     no_combine_keep_router_weight: bool = False,
     w2_block_shape: Optional[List[int]] = None,
+    paged_expert_info: Optional[torch.Tensor] = None,
 ):
     padded_size = padding_size
     if not (use_fp8_w8a8 or use_int8_w8a8) or block_shape is not None or _use_aiter:
@@ -1215,6 +1254,7 @@ def fused_experts_impl(
         per_channel_quant=per_channel_quant,
         block_shape=block_shape,
         w2_block_shape=w2_block_shape,
+        paged_expert_info=paged_expert_info,
     )
 
     return _fused_moe_kernel_sequence(
@@ -1261,6 +1301,7 @@ def fused_experts_impl(
         defer_sum=defer_sum,
         no_combine_keep_router_weight=no_combine_keep_router_weight,
         w2_block_shape=w2_block_shape,
+        paged_expert_info=paged_expert_info,
     )
 
 

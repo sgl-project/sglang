@@ -46,6 +46,55 @@ def _jit_moe_wna16_marlin_module(
     )
 
 
+def _paged_expert_kernel_args(
+    b_q_weight: torch.Tensor, b_scales: torch.Tensor, paged_expert_info: dict
+) -> tuple:
+    """The fused-host-copy kernel's extra arguments: the host tables as offsets from the slot
+    tables in 16-byte units, then addresses and the first host id (the number of slots)."""
+    return (
+        (paged_expert_info["host_weight_address"] - b_q_weight.data_ptr()) // 16,
+        (paged_expert_info["host_scales_address"] - b_scales.data_ptr()) // 16,
+        paged_expert_info["host_global_scale_address"],
+        paged_expert_info["expert_slot"].data_ptr(),
+        b_q_weight.shape[0],
+        paged_expert_info["missing_expert_count"].data_ptr(),
+    )
+
+
+@cache_once
+def _jit_moe_wna16_marlin_host_copy_module(
+    dtype: torch.dtype,
+    is_ep: bool,
+    has_bias: bool,
+    expert_ids_are_sorted: bool = False,
+    zero_inactive_output: bool = False,
+    has_inactive_prefix_count: bool = False,
+) -> Module:
+    """The kernel with the fused host copy: the same source built with SGL_MARLIN_MOE_HOST_COPY.
+    It is compiled as a separate module, so that the module above, used without the host copy, is
+    built only from the original code."""
+    args = make_cpp_args(
+        dtype,
+        is_ep,
+        has_bias,
+        expert_ids_are_sorted,
+        zero_inactive_output,
+        has_inactive_prefix_count,
+    )
+    return load_jit(
+        "moe_wna16_marlin_host_copy",
+        *args,
+        cuda_files=["gemm/marlin_moe/moe_wna16_marlin.cuh"],
+        cuda_wrappers=[
+            (
+                "moe_wna16_marlin_gemm",
+                f"moe_wna16_marlin_gemm<{args}>",
+            )
+        ],
+        extra_cuda_cflags=["-DSGL_MARLIN_MOE_HOST_COPY"],
+    )
+
+
 def _or_empty(
     t: Optional[torch.Tensor], device: torch.device, dtype: torch.dtype
 ) -> torch.Tensor:
@@ -83,6 +132,10 @@ def moe_wna16_marlin_gemm(
     expert_ids_are_sorted: bool = False,
     zero_inactive_output: bool = False,
     has_inactive_prefix_count: bool = False,
+    # Paged experts, fused host copy (marlin_template.h): the device addresses of the pinned
+    # host tables of b_q_weight, b_scales and global_scale (0 without one), the layer's
+    # expert -> slot table and its count of missing experts.
+    paged_expert_info: Optional[dict] = None,
 ) -> torch.Tensor:
     """Project routes, preserving inactive rows in a caller-provided output.
 
@@ -179,7 +232,12 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    module = _jit_moe_wna16_marlin_module(
+    load_module = (
+        _jit_moe_wna16_marlin_module
+        if paged_expert_info is None
+        else _jit_moe_wna16_marlin_host_copy_module
+    )
+    module = load_module(
         a.dtype,
         is_ep,
         has_bias,
@@ -221,6 +279,15 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        *(
+            _paged_expert_kernel_args(
+                b_q_weight=b_q_weight,
+                b_scales=b_scales,
+                paged_expert_info=paged_expert_info,
+            )
+            if paged_expert_info is not None
+            else ()
+        ),
     )
 
     return c
