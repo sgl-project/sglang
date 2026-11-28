@@ -948,6 +948,8 @@ class FlashEngram(nn.Module):
 
 
 class HYV4FlashAttention(HYV4Attention):
+    _build_default_dsa_indexer = False
+
     def __init__(
         self,
         config: HYV4FlashTextConfig,

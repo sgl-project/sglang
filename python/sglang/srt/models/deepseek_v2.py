@@ -2081,6 +2081,10 @@ class DeepseekV2AttentionMLA(
     DeepseekMLAFusedRopeRocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
+    # Subclasses that supply their own indexer should not initialize the
+    # generic DSA indexer or its backend-specific scheduling kernels.
+    _build_default_dsa_indexer = True
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2187,7 +2191,7 @@ class DeepseekV2AttentionMLA(
                 self.skip_topk = dsa_layer_skips_topk(config, layer_id)
                 self.next_skip_topk = dsa_layer_skips_topk(config, layer_id + 1)
 
-            if not self.skip_topk or is_nextn:
+            if self._build_default_dsa_indexer and (not self.skip_topk or is_nextn):
                 is_neox_style = not getattr(config, "indexer_rope_interleave", False)
                 indexer_cls = (
                     IndexerKPool

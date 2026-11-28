@@ -57,6 +57,7 @@ def _sparse_mla_prefill_kernel(
     kv_ptr,
     idx_ptr,
     len_ptr,
+    sink_ptr,
     o_ptr,
     sm_scale,
     topk,
@@ -66,6 +67,7 @@ def _sparse_mla_prefill_kernel(
     D_V: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IDX64: tl.constexpr,
+    HAS_SINK: tl.constexpr,
 ):
     t = tl.program_id(0)
     # Token offsets in int64: at h=128 the q offset t*H*D_QK passes 2^31 from
@@ -86,12 +88,20 @@ def _sparse_mla_prefill_kernel(
         qb + h[:, None] * D_QK + (D_V + dt)[None, :], mask=hmask[:, None], other=0.0
     )
 
-    m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
-    l_i = tl.zeros([BLOCK_H], tl.float32)
+    if HAS_SINK:
+        # The sink has a zero value. Include its logit in the denominator
+        # by seeding the online softmax, without gathering a dummy KV row.
+        m_i = tl.load(sink_ptr + h, mask=hmask, other=0.0)
+        l_i = tl.full([BLOCK_H], 1.0, tl.float32)
+    else:
+        m_i = tl.full([BLOCK_H], -float("inf"), tl.float32)
+        l_i = tl.zeros([BLOCK_H], tl.float32)
     acc = tl.zeros([BLOCK_H, D_V], tl.float32)
 
     n = tl.arange(0, BLOCK_N)
-    k_len = tl.load(len_ptr + t)
+    # Model-level length metadata can use the IndexPool width even on an SWA
+    # layer. Do not read past this layer's narrower slot table.
+    k_len = tl.minimum(tl.load(len_ptr + t), topk)
     for k0 in tl.range(0, k_len, BLOCK_N):
         idx = tl.load(idx_ptr + t64 * topk + k0 + n, mask=(k0 + n) < k_len, other=-1)
         valid = idx >= 0
@@ -355,9 +365,8 @@ def _config():
         return _PINNED[cap]
     if cap not in _UNTUNED_ARCH_WARNED:
         _UNTUNED_ARCH_WARNED.add(cap)
-        # The kernel is correct on any SM90+ device, but the tile was only swept
-        # on the architectures in _PINNED. Say so rather than quietly running a
-        # config nobody has measured; add an entry there once swept.
+        # A working tile is not necessarily a tuned one. Say so rather than
+        # silently claiming performance on an architecture outside _PINNED.
         logger.warning(
             "triton_sparse_mla: no tuned tile for sm_%d%d; falling back to %s. "
             "Sweep and add it to _PINNED for best throughput.",
@@ -412,6 +421,7 @@ def sparse_mla_prefill(
     d_v=512,
     *,
     topk_length=None,
+    attn_sink=None,
     out=None,
     union=0,
     config=None,
@@ -431,6 +441,8 @@ def sparse_mla_prefill(
         d_v: value head dim (512 for DSA).
         topk_length: optional ``[T]`` int32 per-row valid count. Computed from
             ``indices`` when omitted; pass it to skip that reduction.
+        attn_sink: optional ``[H]`` fp32 logits for a zero-value sink. Only
+            supported by the per-token path (union disabled).
         out: optional preallocated ``[T, H, d_v]`` bf16 output.
         union: 0 (off), 2 or 4: share one gathered union index set across ``G``
             adjacent query tokens. Exact, not an approximation: an ownership
@@ -458,6 +470,16 @@ def sparse_mla_prefill(
         )
     if out is None:
         out = torch.empty(T, h, d_v, dtype=torch.bfloat16, device=q.device)
+    if attn_sink is not None:
+        if union:
+            raise ValueError("sparse_mla_prefill does not support sinks with union.")
+        if (
+            attn_sink.shape != (h,)
+            or attn_sink.dtype != torch.float32
+            or attn_sink.device != q.device
+        ):
+            raise ValueError("attn_sink must be [H] fp32 on the query device.")
+        attn_sink = attn_sink.contiguous()
 
     if union in (2, 4) and _union_path(
         q=q,
@@ -491,6 +513,7 @@ def sparse_mla_prefill(
                 kv,
                 indices,
                 topk_length,
+                attn_sink if attn_sink is not None else topk_length,
                 out,
                 sm_scale,
                 topk,
@@ -502,6 +525,7 @@ def sparse_mla_prefill(
                 num_warps=warps,
                 num_stages=ns_try,
                 IDX64=idx64,
+                HAS_SINK=attn_sink is not None,
             )
         except triton.runtime.errors.OutOfResources:
             # A larger head count (BLOCK_H) or a smaller smem budget can push the

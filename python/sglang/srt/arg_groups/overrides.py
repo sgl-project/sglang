@@ -707,7 +707,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     import torch
 
-    major, _ = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability()
     if kimi_k31:
         return _kimi_k31_dsa_backends(view)
 
@@ -725,6 +725,23 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     if getattr(hf_config, "learnable_sink", False):
         backend = "flashmla_sparse"
+        if (
+            model_arch == "HYV4FlashForConditionalGeneration"
+            and get_platform().is_cuda
+            and (major, minor) == (8, 9)
+            and view.dsa_prefill_backend == "triton_sparse_mla"
+        ):
+            if kv_cache_dtype not in ("bf16", "bfloat16"):
+                raise ValueError("Hy4-Flash Ada sparse MLA requires BF16 KV.")
+            if view.dsa_triton_union:
+                raise ValueError("Hy4-Flash Ada sparse MLA does not support union.")
+            if view.speculative_algorithm is not None:
+                raise ValueError(
+                    "Hy4-Flash Ada sparse MLA does not support speculative decoding."
+                )
+            # Use the same sink-aware per-token kernel as a compatibility
+            # decode path. This does not enable the optimized Triton decoder.
+            backend = "triton_sparse_mla"
         declared = _pin_dsa_backends(
             view,
             backend,
