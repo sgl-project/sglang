@@ -1608,15 +1608,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         nxt_kv_lens_cpu: Optional[torch.Tensor],
         out: torch.Tensor,
     ) -> None:
-        """Fill the seq_lens_cpu planning bound, sync-free when a host-side
-        length source is available; backends consume it as a safe upper bound
-        (same contract as the non-compact path in forward_batch_generation)."""
+        """Fill the seq_lens_cpu planning bound (compact prefix + verify block),
+        sync-free when a host-side length source is available; matches the
+        non-compact contract where seq_lens_cpu covers the full device KV
+        length consumed by attention backends such as FlashInfer's fast plan."""
         if batch_seq_lens_cpu is not None:
             self._compute_compact_draft_seq_lens_host(batch_seq_lens_cpu, out=out)
         elif nxt_kv_lens_cpu is not None:
             self._compute_compact_draft_seq_lens_host(nxt_kv_lens_cpu, out=out)
         else:
-            # Compact device lengths never exceed the window plus one page.
+            # Compact prefix lengths never exceed the window plus one page.
             out.fill_(
                 int(self.draft_window_size)
                 + (
@@ -1625,6 +1626,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     else 0
                 )
             )
+        # Add the verify block after clamping; folding it into the clamp bound
+        # would still fall block_size short whenever the prefix is shorter than
+        # the window.
+        out.add_(int(self.block_size))
 
     def _rebuild_compact_draft_cache(
         self,
