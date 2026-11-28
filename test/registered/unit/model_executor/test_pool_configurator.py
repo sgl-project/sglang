@@ -2253,6 +2253,30 @@ class TestDSV4LowRatioBudget(CustomTestCase):
     exercise allocation and sizing, not whether a CPU can run the GPU readers.
     """
 
+    def test_a3_int8_budget_prices_mixed_swa_and_only_compressed_owners(self):
+        from sglang.srt.model_executor import pool_configurator
+
+        planner = object.__new__(pool_configurator.DSV4PoolConfigurator)
+        planner._unified = False
+        planner._npu_low_ratio_bf16 = True
+        planner._npu_dsv41_int8 = True
+        planner._npu_dspark_draft_layers = 1
+        planner.qk_nope_head_dim, planner.qk_rope_head_dim = 448, 64
+        planner.stage_compress_ratios = [0, 2, 2, 1]
+        planner.stage_owner_layers = {1: [3], 2: [1]}
+        planner.num_layers_total = 4
+        planner.low_ratio_index_bytes = 256
+        planner.page_size = 128
+        with patch.object(pool_configurator, "_is_npu", True):
+            self.assertEqual(planner._paged_swa_row_bytes(), 2 * 1024 + 3 * 608)
+            self.assertEqual(
+                planner._compressed_bytes_per_full_token(2), (608 + 256) / 2
+            )
+            packed_padding = planner._get_low_ratio_kv_padding_bytes(256)
+            planner._npu_dsv41_int8 = False
+            bf16_padding = planner._get_low_ratio_kv_padding_bytes(256)
+        self.assertEqual(bf16_padding - packed_padding, (3 * 128 + 128 + 64) * 416)
+
     @contextlib.contextmanager
     def _planner(
         self, layout, option, page_size, index_page_size, ratios, sources, stage=None

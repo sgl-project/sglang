@@ -241,6 +241,13 @@ class TestRowLayout(unittest.TestCase):
         self.assertEqual(NPUDSV4KVLayout.V41_SWA_FP8.quant, ("mxfp8_bf16", 32))
         self.assertEqual(NPUDSV4KVLayout.V41_CMP_FP4.quant, ("mxfp4_bf16", 16))
 
+    def test_int8_csa_preserves_bf16_index_rows(self):
+        layout = NPUDSV4KVLayout.V41_INT8
+        self.assertEqual(layout.kv_info(448, 64), (608, torch.int8))
+        self.assertEqual(
+            layout.indexer_kv_info(128), (128, 0, torch.bfloat16, torch.float32)
+        )
+
     def test_index_row_is_fp4_packed_pairs(self):
         # 64 payload bytes + 4 scale bytes per 128-dim row == 68.
         self.assertEqual(get_dsv4_indexer_bytes_per_token(128, True), 68)
@@ -311,6 +318,52 @@ class TestPoolFactory(unittest.TestCase):
         )
         # One row per slot: the window page is the global page.
         self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 128)
+
+    def test_a3_int8_window_allocates_each_pp_local_layer_in_its_physical_dtype(self):
+        parent = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+        parent.dsv41_int8_kv = True
+        parent.compression_ratios = (0, 2, 0, 1, 2)
+        parent.stage_layer_ids = (2, 3, 4)
+        parent.qk_nope_head_dim, parent.qk_rope_head_dim = (448, 64)
+        pool = parent._make_paged_swa_pool(
+            size=128,
+            page_size=128,
+            dtype=torch.bfloat16,
+            layer_num=3,
+            device="cpu",
+            enable_memory_saver=False,
+            global_page_size=128,
+            kv_layout=NPUDSV4KVLayout.V41_BF16,
+        )
+        self.assertEqual(
+            [row.shape for row in pool.kv_buffer],
+            [(2, 128, 1, 512), (2, 128, 1, 608), (2, 128, 1, 608)],
+        )
+        self.assertEqual(
+            [row.dtype for row in pool.kv_buffer],
+            [torch.bfloat16, torch.int8, torch.int8],
+        )
+
+    def test_a3_int8_cache_writes_vllm_record_and_preserves_page_zero(self):
+        cache = torch.full((3, 4, 1, 608), 19, dtype=torch.int8)
+        before = cache.clone().flatten(0, 1)
+        rows = torch.zeros((5, 1, 512), dtype=torch.bfloat16)
+        rows[..., 0], rows[..., 1], rows[..., 2] = 100, 13, -13
+        rows[..., 448:] = torch.arange(64, dtype=torch.bfloat16)
+        slots = torch.tensor([-1, 0, 3, 6, 12], dtype=torch.int32)
+
+        dsv4_memory_pool._write_dsv41_a3_rows(cache, slots, rows)
+
+        flat = cache.flatten(0, 1)
+        packed = flat[6, 0]
+        bf16 = packed.view(torch.bfloat16)
+        # Retaining the BF16 scale before division makes +/-13 quantize to +/-16.
+        self.assertEqual(packed[128:131].tolist(), [127, 16, -16])
+        torch.testing.assert_close(bf16[:64], rows[3, 0, 448:])
+        self.assertEqual(bf16[288], torch.tensor(100 / 127, dtype=torch.bfloat16))
+        self.assertTrue(torch.all(packed[590:] == 0))
+        torch.testing.assert_close(flat[:6], before[:6])
+        torch.testing.assert_close(flat[7:], before[7:])
 
     def test_compressed_pools_are_fp4(self):
         # A ratio-1 compressed page keeps the global page; a ratio-2 page holds
@@ -1265,6 +1318,70 @@ class TestLowRatioAttentionBody(unittest.TestCase):
         # buffer.
         with self.assertRaises(RuntimeError):
             self._run(ratio=2, seq_lens=[7], topk_indices=False)
+
+    def test_a3_int8_reuses_lengths_but_dispatches_native_csa(self):
+        kernel_attention = dsv4_backend.npu_attention_ops
+        backend = _low_ratio_backend()
+        backend._dsv41_int8_kv = True
+        full_length = torch.tensor([7], dtype=torch.int32)
+        metadata = torch.zeros(1024, dtype=torch.int32)
+        ori = torch.zeros((2, 128, 1, 608), dtype=torch.int8)
+        cmp = torch.zeros((2, 64, 1, 608), dtype=torch.int8)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_swa_buffer=lambda layer: ori,
+            get_compress_buffer=lambda layer, from_indexer: cmp,
+        )
+        backend.forward_metadata = SimpleNamespace(
+            actual_seq_lengths_q_pa=torch.tensor([0, 1], dtype=torch.int32),
+            kernel_metadata={"c2a_metadata": metadata},
+            swa_page_table=torch.tensor([[1]], dtype=torch.int32),
+            c2_page_table=torch.tensor([[1]], dtype=torch.int32),
+            c2_topk_indices=torch.full((2, 512), -1, dtype=torch.int32),
+        )
+        batch = SimpleNamespace(
+            batch_size=1, seq_lens=full_length, out_cache_loc=torch.tensor([134])
+        )
+        layer = SimpleNamespace(layer_id=2, scaling=512**-0.5)
+        q = torch.zeros((1, 64, 512), dtype=torch.bfloat16)
+        with (
+            patch.object(dsv4_backend, "is_npu_arch35", return_value=False),
+            patch.object(dsv4_backend, "_dsv41_a3_ops") as bf16,
+            patch.object(
+                kernel_attention,
+                "mixed_quant_sparse_flash_mla_metadata",
+                return_value=metadata,
+            ) as meta,
+            patch.object(
+                kernel_attention,
+                "mixed_quant_sparse_flash_mla",
+                return_value=(q, None),
+            ) as attn,
+        ):
+            bf16.return_value.metadata.return_value = torch.zeros(
+                2048, dtype=torch.int32
+            )
+            self.assertIs(
+                backend._dsv41_attention_kernel_metadata(batch)["c2a_metadata"],
+                metadata,
+            )
+            backend._forward_low_ratio_attention(q, layer, batch, None, 2)
+        bf16.return_value.attention.assert_not_called()
+        bf16.return_value.metadata.assert_called_once()
+        self.assertEqual(meta.call_count, 2)
+        meta_kwargs = meta.call_args.kwargs
+        self.assertEqual(meta_kwargs["impl"], "cann_ops_transformer_a3_int8")
+        self.assertEqual(meta_kwargs["quant_mode"], 1)
+        self.assertEqual(meta_kwargs["num_heads_q"], 64)
+        self.assertEqual(meta_kwargs["cmp_residual_kv"].tolist(), [1])
+        kw = attn.call_args.kwargs
+        self.assertEqual(kw["impl"], "cann_ops_transformer_a3_int8")
+        self.assertEqual(kw["quant_mode"], 1)
+        self.assertIs(kw["ori_kv"], ori)
+        self.assertIs(kw["cmp_kv"], cmp)
+        self.assertEqual(kw["cmp_residual_kv"].tolist(), [1])
+        self.assertEqual(kw["seqused_cmp_kv"].tolist(), [3])
+        self.assertEqual(kw["cmp_sparse_indices"].shape, (1, 1, 512))
+        self.assertIsNone(kw["sinks"])
 
 
 class TestCompressedRowIdentity(unittest.TestCase):

@@ -1295,6 +1295,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
     _npu_low_ratio_bf16 = False
+    _npu_dsv41_int8 = False
     # A subclass that adds the draft's KV to the per-token bytes itself sets this,
     # replacing the (T+D)/T inflation.
     _draft_kv_priced_exactly = False
@@ -1312,6 +1313,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
             self._npu_low_ratio_bf16 = not is_npu_arch35() and any(
                 ratio in (1, 2) for ratio in cfg.compress_ratios
+            )
+            self._npu_dsv41_int8 = (
+                self._npu_low_ratio_bf16
+                and not kvc.is_draft_worker
+                and kvc.kv_cache_dtype_str == "int8"
             )
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
@@ -1645,7 +1651,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
             if self._npu_low_ratio_bf16 and compress_ratio in (0, 1, 2):
-                return self.attn_head_dim * torch.bfloat16.itemsize
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
+                    NPUDSV4KVLayout,
+                )
+
+                layout = (
+                    NPUDSV4KVLayout.V41_INT8
+                    if self._npu_dsv41_int8 and compress_ratio
+                    else NPUDSV4KVLayout.V41_BF16
+                )
+                width, dtype = layout.kv_info(
+                    self.qk_nope_head_dim, self.qk_rope_head_dim
+                )
+                return width * dtype.itemsize
             return self.kv_bytes
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
             resolve_compressed_kv_layout,
@@ -1665,6 +1683,20 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def num_swa_layers(self) -> int:
         return self.num_layers_total
 
+    def _paged_swa_row_bytes(self) -> float:
+        bf16_bytes = self._get_paged_kv_bytes_per_token()
+        packed_layers = (
+            sum(ratio in (1, 2) for ratio in self.stage_compress_ratios)
+            if self._npu_dsv41_int8
+            else 0
+        )
+        total = bf16_bytes * (self.num_swa_layers + self._npu_dspark_draft_layers)
+        if packed_layers:
+            total -= (
+                bf16_bytes - self._get_paged_kv_bytes_per_token(1)
+            ) * packed_layers
+        return total
+
     def _get_bytes_per_swa_token(self) -> float:
         """Bytes one SWA slot costs across the stage. c4_state_pool_size = swa_tokens
         // page_size * ring, so c4 compress state is priced per SWA slot too."""
@@ -1677,9 +1709,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c4_indexer_state_bytes = 2 * 2 * self.indexer_head_dim * c4_state_dtype_size
 
         c4_state_ratio = self.ring_sizes.get(4, 0) / self.page_size
-        return self._get_paged_kv_bytes_per_token() * (
-            self.num_swa_layers + self._npu_dspark_draft_layers
-        ) + (
+        return self._paged_swa_row_bytes() + (
             c4_state_ratio
             * (c4_state_bytes + c4_indexer_state_bytes)
             * self.num_layers(4)
@@ -1713,11 +1743,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 # Indexer size already includes the reserved FULL logical page.
                 # Include SWA's reserved page here as well (not in the token
                 # coefficient, regardless of whether SWA uses cap or ratio sizing).
-                padding = (
-                    self.page_size
-                    * self._get_paged_kv_bytes_per_token()
-                    * (self.num_layers_total + self._npu_dspark_draft_layers)
-                )
+                padding = self.page_size * self._paged_swa_row_bytes()
                 for ratio in (1, 2):
                     page = self.page_size // ratio
                     size = (full_tokens + self.page_size) // ratio

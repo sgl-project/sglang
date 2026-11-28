@@ -1091,6 +1091,8 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
         kv_cache_dtype = "fp8_e4m3"
         logger.warning(f"Setting KV cache dtype to {kv_cache_dtype} for {model_arch}.")
     if view.device == "npu":
+        if kv_cache_dtype == "int8" and hf_config.model_type == "deepseek_v41":
+            return {}
         kv_cache_dtype = "bfloat16"
     assert kv_cache_dtype in [
         "fp8_e4m3",

@@ -25,8 +25,8 @@ def get_a3_c2_state_bank_count(num_req_slots: int) -> int:
 class NPUDSV4KVLayout(str, enum.Enum):
     V4_BF16 = "v4_bf16"
     V4_FP8 = "v4_fp8"
-    # A3 uses the same unquantized row for SWA and C1/C2, with BF16 index K.
     V41_BF16 = "v41_bf16"
+    V41_INT8 = "v41_int8"
     V41_SWA_FP8 = "v41_fp8"
     V41_CMP_FP4 = "v41_fp4"
 
@@ -42,6 +42,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         return {
             NPUDSV4KVLayout.V4_BF16: None,
             NPUDSV4KVLayout.V41_BF16: None,
+            NPUDSV4KVLayout.V41_INT8: 64,
             NPUDSV4KVLayout.V4_FP8: None,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 16,
@@ -57,6 +58,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         return {
             NPUDSV4KVLayout.V4_BF16: None,
             NPUDSV4KVLayout.V41_BF16: None,
+            NPUDSV4KVLayout.V41_INT8: None,
             NPUDSV4KVLayout.V4_FP8: None,
             NPUDSV4KVLayout.V41_SWA_FP8: "mxfp8_bf16",
             NPUDSV4KVLayout.V41_CMP_FP4: "mxfp4_bf16",
@@ -73,6 +75,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         return {
             NPUDSV4KVLayout.V4_BF16: None,
             NPUDSV4KVLayout.V41_BF16: None,
+            NPUDSV4KVLayout.V41_INT8: 32,
             NPUDSV4KVLayout.V4_FP8: None,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 32,
@@ -90,6 +93,12 @@ class NPUDSV4KVLayout(str, enum.Enum):
         """
         if self in (NPUDSV4KVLayout.V4_BF16, NPUDSV4KVLayout.V41_BF16):
             return nope_dim + rope_dim, torch.bfloat16
+        if self is NPUDSV4KVLayout.V41_INT8:
+            if (nope_dim, rope_dim) != (448, 64):
+                raise ValueError(
+                    "DeepSeek-V4.1 INT8 KV requires 448 NoPE and 64 RoPE dimensions."
+                )
+            return 608, torch.int8
         if self is NPUDSV4KVLayout.V4_FP8:
             from sgl_kernel_npu.operators.mem_cache import get_npu_kv_quant_path
 
@@ -115,7 +124,7 @@ class NPUDSV4KVLayout(str, enum.Enum):
         and 2 share the same packed-fp4 row shape. The V4.1 scale is one uint8
         e8m0 per 32 values.
         """
-        if self is NPUDSV4KVLayout.V41_BF16:
+        if self in (NPUDSV4KVLayout.V41_BF16, NPUDSV4KVLayout.V41_INT8):
             return head_dim, 0, torch.bfloat16, torch.float32
         if self in (NPUDSV4KVLayout.V41_SWA_FP8, NPUDSV4KVLayout.V41_CMP_FP4):
             assert head_dim % 32 == 0, head_dim

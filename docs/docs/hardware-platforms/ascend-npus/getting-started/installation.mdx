@@ -130,6 +130,11 @@ python3 setup.py --arch-version 2201 --ops all --artifact wheel --third-party op
 python3 -m pip install --no-deps --force-reinstall output/sgl_kernel_npu-*.whl
 ```
 
+For `--kv-cache-dtype int8`, install an `sgl-kernel-npu` wheel with the A3 INT8
+implementation of the mixed-quant attention and metadata APIs. Use a matching
+`cann_ops_transformer` build and CANN OPP that support the signed 608-byte CSA
+format on A3. The startup probe tests both bindings against the packed cache.
+
 If imports succeed but a native operator is missing or has the wrong signature,
 test the installed wheel on the target device before starting the server:
 
