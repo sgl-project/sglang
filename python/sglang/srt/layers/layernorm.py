@@ -696,6 +696,12 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.cast_x_before_out_mul:
+            # Fused NPU norms do not expose rounding before the weight multiply.
+            # Fall back before combining residuals to preserve native semantics.
+            return self.forward_native(
+                x, residual, post_residual_addition, quant_linear
+            )
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
