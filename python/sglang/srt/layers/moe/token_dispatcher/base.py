@@ -32,6 +32,12 @@ if TYPE_CHECKING:
         DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
+        MSCCLPPExpertMajorLatencyCombineInput,
+        MSCCLPPExpertMajorLatencyDispatchOutput,
+        MSCCLPPLatencyCombineInput,
+        MSCCLPPLatencyDispatchOutput,
+        MSCCLPPRankMajorLatencyCombineInput,
+        MSCCLPPRankMajorLatencyDispatchOutput,
         StandardCombineInput,
         StandardDispatchOutput,
     )
@@ -156,6 +162,23 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_flashinfer()
 
     @staticmethod
+    def format_is_mscclpp_latency(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPLatencyDispatchOutput]:
+        return dispatch_output.format.is_mscclpp_latency()
+
+    @staticmethod
+    def format_is_mscclpp_latency_expert_major(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPExpertMajorLatencyDispatchOutput]:
+        return dispatch_output.format.is_mscclpp_latency_expert_major()
+
+    @staticmethod
+    def format_is_mscclpp_latency_rank_major(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[MSCCLPPRankMajorLatencyDispatchOutput]:
+        return dispatch_output.format.is_mscclpp_latency_rank_major()
+
     def format_is_deepep_v2(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[DeepEPv2DispatchOutput]:
@@ -168,6 +191,8 @@ class DispatchOutputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
+    MSCCLPP_LATENCY_EXPERT_MAJOR = "mscclpp_latency_expert_major"
+    MSCCLPP_LATENCY_RANK_MAJOR = "mscclpp_latency_rank_major"
     ASCEND_OPS = "ascend_ops"
 
     def is_standard(self) -> bool:
@@ -190,6 +215,18 @@ class DispatchOutputFormat(Enum):
 
     def is_flashinfer(self) -> bool:
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_mscclpp_latency(self) -> bool:
+        return self in [
+            DispatchOutputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR,
+            DispatchOutputFormat.MSCCLPP_LATENCY_RANK_MAJOR,
+        ]
+
+    def is_mscclpp_latency_expert_major(self) -> bool:
+        return self == DispatchOutputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR
+
+    def is_mscclpp_latency_rank_major(self) -> bool:
+        return self == DispatchOutputFormat.MSCCLPP_LATENCY_RANK_MAJOR
 
     def is_deepep_v2(self) -> bool:
         return self == DispatchOutputFormat.DEEPEP_V2
@@ -259,6 +296,26 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.FLASHINFER
 
     @staticmethod
+    def format_is_mscclpp_latency(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPLatencyCombineInput]:
+        return combine_input.format in [
+            CombineInputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR,
+            CombineInputFormat.MSCCLPP_LATENCY_RANK_MAJOR,
+        ]
+
+    @staticmethod
+    def format_is_mscclpp_latency_expert_major(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPExpertMajorLatencyCombineInput]:
+        return combine_input.format == CombineInputFormat.MSCCLPP_LATENCY_EXPERT_MAJOR
+
+    @staticmethod
+    def format_is_mscclpp_latency_rank_major(
+        combine_input: CombineInput,
+    ) -> TypeGuard[MSCCLPPRankMajorLatencyCombineInput]:
+        return combine_input.format == CombineInputFormat.MSCCLPP_LATENCY_RANK_MAJOR
+
     def format_is_deepep_v2(
         combine_input: CombineInput,
     ) -> TypeGuard[DeepEPv2CombineInput]:
@@ -271,6 +328,8 @@ class CombineInputFormat(Enum):
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
     DEEPEP_V2 = "deepep_v2"
+    MSCCLPP_LATENCY_EXPERT_MAJOR = "mscclpp_latency_expert_major"
+    MSCCLPP_LATENCY_RANK_MAJOR = "mscclpp_latency_rank_major"
     ASCEND_OPS = "ascend_ops"
 
 

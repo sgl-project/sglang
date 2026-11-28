@@ -44,6 +44,17 @@ from sglang.srt.layers.moe.token_dispatcher.moriep import (
     MoriEPNormalCombineInput,
     MoriEPNormalDispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.mscclpp import (
+    MSCCLPPCombineInputBase,
+    MSCCLPPDispatcher,
+    MSCCLPPDispatchOutputBase,
+    MSCCLPPExpertMajorLatencyCombineInput,
+    MSCCLPPExpertMajorLatencyDispatchOutput,
+    MSCCLPPLatencyCombineInput,
+    MSCCLPPLatencyDispatchOutput,
+    MSCCLPPRankMajorLatencyCombineInput,
+    MSCCLPPRankMajorLatencyDispatchOutput,
+)
 from sglang.srt.layers.moe.token_dispatcher.nixl import (
     NixlEPCombineInput,
     NixlEPDispatcher,
@@ -76,6 +87,15 @@ __all__ = [
     "MooncakeCombineInput",
     "MooncakeDispatchOutput",
     "MooncakeEPDispatcher",
+    "MSCCLPPCombineInputBase",
+    "MSCCLPPDispatchOutputBase",
+    "MSCCLPPDispatcher",
+    "MSCCLPPExpertMajorLatencyCombineInput",
+    "MSCCLPPExpertMajorLatencyDispatchOutput",
+    "MSCCLPPLatencyCombineInput",
+    "MSCCLPPLatencyDispatchOutput",
+    "MSCCLPPRankMajorLatencyCombineInput",
+    "MSCCLPPRankMajorLatencyDispatchOutput",
     "MoriEPNormalDispatchOutput",
     "MoriEPNormalCombineInput",
     "MoriEPLLDispatchOutput",
