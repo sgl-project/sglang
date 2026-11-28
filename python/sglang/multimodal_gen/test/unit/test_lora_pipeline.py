@@ -82,8 +82,15 @@ def test_worker_metrics_count_individual_adapters_in_multi_lora():
     registry = CollectorRegistry()
     worker = GPUWorker.__new__(GPUWorker)
     worker.pipeline = pipeline
+    worker.server_args = SimpleNamespace()
     worker.metrics = DiffusionMetrics(role="monolithic", replica="0", registry=registry)
-    with patch(_RANK_PATCH, return_value=0):
+    with (
+        patch(_RANK_PATCH, return_value=0),
+        patch(
+            "sglang.multimodal_gen.runtime.managers.gpu_worker"
+            ".get_global_component_residency_manager"
+        ) as residency_manager,
+    ):
         worker.set_lora(
             ["adapter", "second"],
             [None, None],
@@ -91,6 +98,8 @@ def test_worker_metrics_count_individual_adapters_in_multi_lora():
             strength=[0.5, 0.5],
             merge_mode="merge",
         )
+    # the merge snapshots device weights against the worker's host pin budget
+    residency_manager.assert_called_once_with(pipeline, worker.server_args)
     assert (
         registry.get_sample_value(
             "sglang:diffusion_lora_active_adapters",

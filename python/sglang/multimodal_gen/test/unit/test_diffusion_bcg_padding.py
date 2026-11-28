@@ -1039,6 +1039,8 @@ class TestBCGWeightChangeAfterCapture(unittest.TestCase):
         self.worker.metrics = None
         self.worker.pipeline = MagicMock(spec=LoRAPipeline)
         self.worker.pipeline.stages = [stage]
+        # this stub has no server args to build a residency manager from
+        self.worker._ensure_host_pin_budget = lambda: None
 
     def _assert_runs_eager(self):
         self.assertEqual(self.runner.entries, {})

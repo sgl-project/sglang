@@ -36,6 +36,10 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
     request_allows,
     request_allows_lossless,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+    HostPinBudget,
+    host_copies_would_not_fit,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     write_dense_weight,
 )
@@ -771,7 +775,7 @@ class BaseLayerWithLoRA(nn.Module):
         if not isinstance(src, DTensor):
             src, _ = self._materialized_weight_src()
         if self.cpu_weight is None:
-            self.cpu_weight = src.detach().to("cpu", copy=True)
+            self.cpu_weight = _host_snapshot(src.detach())
 
         if isinstance(self.base_layer.weight, DTensor):
             mesh = self.base_layer.weight.data.device_mesh
@@ -873,10 +877,19 @@ class BaseLayerWithLoRA(nn.Module):
             self.base_layer.weight = nn.Parameter(new_weight_data)
             del old_weight
         else:
-            # Update the offload backing store too, not a transient GPU placeholder.
-            # A copy keeps inference-tensor rebinding from aliasing the snapshot.
-            restored = self.cpu_weight.clone()
-            write_dense_weight(self.base_layer, self._as_mutable_tensor(restored))
+            # Move resident weights directly from the snapshot to the device;
+            # cloning on CPU first can exhaust the worker's host headroom.
+            # CPU/offload restores still need owned storage so inference-tensor
+            # rebinding cannot alias a snapshot retained across strength changes.
+            target = getattr(self.base_layer, "_packed_weight_cpu", None)
+            if target is None:
+                target = self.base_layer.weight
+            # Allocate a mutable restore tensor directly, even during inference.
+            with torch.inference_mode(False):
+                restored = self.cpu_weight.to(
+                    target.device, non_blocking=True, copy=True
+                )
+            write_dense_weight(self.base_layer, restored)
 
         self.merged = False
 
@@ -1067,6 +1080,46 @@ class LinearWithLoRA(BaseLayerWithLoRA):
         if not self.merged and not self.disable_lora:
             out = self._add_lora_delta(out, x, runtime_lora_scale)
         return self._add_lora_output_offset(out)
+
+
+def _snapshot_pin_budget() -> HostPinBudget | None:
+    """The worker's pinned-host allowance, or None when --pin-cpu-memory is off
+    or no worker owns a budget yet."""
+    from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+        peek_global_component_residency_manager,
+    )
+
+    manager = peek_global_component_residency_manager()
+    if manager is None or not manager.server_args.pin_cpu_memory:
+        return None
+    return manager.host_pin_budget
+
+
+def _host_snapshot(weight: torch.Tensor) -> torch.Tensor:
+    """Copy a device weight to host memory. The copy is pinned, so restoring it
+    on unmerge is a fast host-to-device copy, only while the worker's pin budget
+    covers it; otherwise it stays pageable."""
+    if weight.device.type == "cuda" and not isinstance(weight, DTensor):
+        budget = _snapshot_pin_budget()
+        size = weight.numel() * weight.element_size()
+        if (
+            budget is not None
+            and size <= budget.spendable_bytes
+            and not host_copies_would_not_fit(size)
+            and budget.request(component_name="lora_snapshot", weight_bytes=size)
+        ):
+            try:
+                host = torch.empty_like(weight, device="cpu", pin_memory=True)
+            except RuntimeError:
+                budget.release(size)
+            else:
+                # the allowance returns when the snapshot's storage is freed
+                budget.track_storage(host.untyped_storage())
+                host.copy_(weight)
+                return host
+    # copy=True copies exactly once: a device weight is not duplicated on the
+    # host again, and a host weight still gets its own storage
+    return weight.to("cpu", copy=True)
 
 
 class WeightOnlyFP8LinearWithLoRA(LinearWithLoRA):

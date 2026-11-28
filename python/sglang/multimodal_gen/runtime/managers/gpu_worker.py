@@ -1737,6 +1737,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         try:
+            self._ensure_host_pin_budget()
             self.pipeline.set_lora(
                 lora_nickname,
                 lora_path,
@@ -1763,6 +1764,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         if not isinstance(self.pipeline, LoRAPipeline):
             return OutputBatch(error="Lora is not enabled")
         try:
+            self._ensure_host_pin_budget()
             self.pipeline.merge_lora_weights(target, strength)
         finally:
             self._update_lora_metrics()
@@ -1784,6 +1786,11 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             self._update_lora_metrics()
             self._drop_breakable_cuda_graphs("LoRA changed")
         return OutputBatch()
+
+    def _ensure_host_pin_budget(self) -> None:
+        # a merge snapshots device-resident weights against the worker's host pin
+        # budget, which the residency manager owns and the first request creates
+        get_global_component_residency_manager(self.pipeline, self.server_args)
 
     def _drop_breakable_cuda_graphs(self, reason: str) -> None:
         # captured graphs replay the weights and LoRA branches of capture time
