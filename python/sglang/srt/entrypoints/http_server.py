@@ -137,7 +137,7 @@ from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.uvicorn_worker_spawn import (
     skip_main_reimport_in_spawned_workers,
 )
-from sglang.srt.entrypoints.warmup import execute_warmups
+from sglang.srt.entrypoints.warmup import default_warmups, execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
@@ -433,10 +433,14 @@ async def lifespan(fast_api_app: FastAPI):
         )
 
     # Execute custom warmups
-    if get_serving().warmups is not None:
+    warmup_names = (
+        get_serving().warmups.split(",") if get_serving().warmups is not None else []
+    )
+    warmup_names += [n for n in default_warmups() if n not in warmup_names]
+    if warmup_names:
         await execute_warmups(
             get_disagg().disaggregation_mode,
-            get_serving().warmups.split(","),
+            warmup_names,
             _global_state.tokenizer_manager,
         )
         logger.info("Warmup ended")
