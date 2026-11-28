@@ -466,7 +466,7 @@ class TextEncodingStage(ConditionEncodingStage):
             return None
         # the gather rebuilds a BaseEncoderOutput, which only a TextEncoder
         # forward produces -- a raw transformers encoder returns its own output
-        # type (e.g. Qwen2_5_VLCausalLMOutputWithPast). isinstance first: the
+        # type (e.g. CausalLMOutputWithPast). isinstance first: the
         # loader can return such an encoder, which carries no dp attribute.
         if not isinstance(text_encoder, TextEncoder):
             return None

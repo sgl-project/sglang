@@ -541,6 +541,8 @@ class NemotronHConfig(PretrainedConfig):
 
 class NemotronHPuzzleConfig(NemotronHConfig):
     model_type = "nemotron_h_puzzle"
+    # transformers < 5.20 builds a default instance in to_diff_dict() unless this is
+    # set, and Puzzle has no default block_configs; 5.20+ no longer reads it.
     has_no_defaults_at_init = True
 
     def __init__(

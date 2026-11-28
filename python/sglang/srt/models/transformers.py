@@ -235,11 +235,14 @@ def _normalize_tp_style(style: str) -> Style:
         "packed_rowwise": "rowwise",
         "local_rowwise": "rowwise",
         "local_packed_rowwise": "rowwise",
-        # transformers' tied-embedding `base_model_tp_plan`s give the embedding this
-        # style; `replace_vocab_embed_class` shards it instead.
+        # transformers names the input embeddings `embedding_rowwise` in every
+        # model plan and PLE tables `embedding_colwise`; both target an
+        # nn.Embedding, which `replace_vocab_embed_class` shards instead.
         "embedding_rowwise": "replicate",
+        "embedding_colwise": "replicate",
         "isolated": "replicate",
         "local": "replicate",
+        "local_params": "replicate",
         "replicated_with_grad_allreduce": "replicate",
         "moe_tp_experts": "replicate",
     }.get(style, style)

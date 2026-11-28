@@ -60,13 +60,12 @@ from transformers.activations import ACT2FN
 
 logger = logging.getLogger(__name__)
 
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 from transformers.models.qwen3_vl.configuration_qwen3_vl import (
     Qwen3VLTextConfig,
-)
-from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-    Qwen3VLCausalLMOutputWithPast,
-    Qwen3VLModelOutputWithPast,
 )
 
 
@@ -923,7 +922,7 @@ class Qwen3VLModel(QwenVLModelBase):
         return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Qwen3VLModelOutputWithPast]:
+    ) -> Union[tuple, BaseModelOutputWithPast]:
         r"""
         image_grid_thw (`torch.LongTensor` of shape `(num_images, 3)`, *optional*):
             The temporal, height and width of feature shape of each image in LLM.
@@ -1082,12 +1081,11 @@ class Qwen3VLModel(QwenVLModelBase):
             **kwargs,
         )
 
-        output = Qwen3VLModelOutputWithPast(
+        output = BaseModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=self.rope_deltas,
         )
 
         return output if return_dict else output.to_tuple()
@@ -1142,7 +1140,7 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         use_cache: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, Qwen3VLCausalLMOutputWithPast]:
+    ) -> Union[tuple, CausalLMOutputWithPast]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
@@ -1187,13 +1185,12 @@ class Qwen3VLForConditionalGeneration(TextEncoder):
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        return Qwen3VLCausalLMOutputWithPast(
+        return CausalLMOutputWithPast(
             loss=None,
             logits=logits,
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-            rope_deltas=outputs.rope_deltas,
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):

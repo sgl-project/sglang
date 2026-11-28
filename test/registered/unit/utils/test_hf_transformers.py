@@ -1445,8 +1445,8 @@ class TestGemma4AttentionOverrides(CustomTestCase):
 
 
 class TestNormalizeTpStyle(CustomTestCase):
-    """Every style a shipped TP plan can name must normalize; a tied-embedding
-    plan naming an unknown one stops the model loading at all."""
+    """Every style a shipped TP plan can name must normalize; a plan naming an
+    unknown one stops the model loading at all."""
 
     def test_tied_embedding_plan_normalizes(self):
         from transformers import AutoConfig, AutoModel
@@ -1467,6 +1467,22 @@ class TestNormalizeTpStyle(CustomTestCase):
         self.assertIn("embedding_rowwise", plan.values())
         for pattern, style in plan.items():
             with self.subTest(pattern=pattern):
+                _normalize_tp_style(style)
+
+    def test_shipped_plan_styles_normalize(self):
+        from transformers import AutoConfig
+        from transformers.distributed.tensor_parallel import ALL_PARALLEL_STYLES
+
+        from sglang.srt.models.transformers import _normalize_tp_style
+
+        # transformers injects `embed_tokens: embedding_rowwise` into every
+        # model plan at init and names PLE tables `embedding_colwise`.
+        styles = set(AutoConfig.for_model("llama").base_model_tp_plan.values())
+        styles |= set(AutoConfig.for_model("granite_swa").base_model_tp_plan.values())
+        styles |= {"embedding_rowwise", "embedding_colwise"}
+        for style in sorted(styles):
+            with self.subTest(style=style):
+                self.assertIn(style, ALL_PARALLEL_STYLES)
                 _normalize_tp_style(style)
 
     def test_unknown_style_still_raises(self):

@@ -69,10 +69,7 @@ class Lfm3AudioLfmEncoder(nn.Module):
         mask = None
         if self.config.sliding_window is not None:
             mask = create_sliding_window_causal_mask(
-                config=self.config,
-                inputs_embeds=embeddings,
-                attention_mask=None,
-                past_key_values=None,
+                self.config, embeddings, None, None
             )
         return self.lfm(
             inputs_embeds=embeddings,

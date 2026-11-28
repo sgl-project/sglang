@@ -423,6 +423,12 @@ def _preprocess_images_for_encoder(items: list, *, processor, image_config: dict
     )
 
 
+def _unsegmented_video_kwargs(video_processor) -> dict:
+    if hasattr(type(video_processor), "vision_segment_max_frames"):
+        return {"vision_segment_max_frames": None}
+    return {}
+
+
 def _preprocess_videos_for_encoder(items: list, *, processor, video_config: dict):
     video_config = dict(video_config)
     default_fps = video_config.pop("fps", None)
@@ -448,8 +454,15 @@ def _preprocess_videos_for_encoder(items: list, *, processor, video_config: dict
         videos.append(frames)
         metadata.append(frame_metadata)
     result = video_processor(
-        videos=videos, return_tensors="pt", **{"do_resize": False, **video_config}
+        videos=videos,
+        return_tensors="pt",
+        **{
+            "do_resize": False,
+            **video_config,
+            **_unsegmented_video_kwargs(video_processor),
+        },
     )
+    result.pop("num_chunks_per_video", None)
     result["video_timestamps"] = [
         video_frame_timestamps(
             frame_metadata, int(grid[0]), video_processor.temporal_patch_size
@@ -571,6 +584,10 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         if input_ids is None:
             if images_resized:
                 kwargs["images_kwargs"] = {"do_resize": False}
+            if videos:
+                kwargs.setdefault("videos_kwargs", {}).update(
+                    _unsegmented_video_kwargs(processor.video_processor)
+                )
             return super().process_mm_data(
                 input_text=input_text,
                 images=images,
@@ -590,13 +607,17 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
                 )
             )
         if videos:
-            result.update(
-                processor.video_processor(
-                    videos=videos,
-                    return_tensors="pt",
-                    **{"do_resize": False, **self.video_config},
-                )
+            video_result = processor.video_processor(
+                videos=videos,
+                return_tensors="pt",
+                **{
+                    "do_resize": False,
+                    **self.video_config,
+                    **_unsegmented_video_kwargs(processor.video_processor),
+                },
             )
+            video_result.pop("num_chunks_per_video", None)
+            result.update(video_result)
             if video_metadata is not None:
                 from types import SimpleNamespace
 

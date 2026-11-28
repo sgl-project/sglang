@@ -401,12 +401,16 @@ class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
         mm_token_type_ids only when the processor returns them, and no
         video_metadata. A single unpadded request needs no attention_mask.
         """
-        text_kwargs = processor._merge_kwargs(
+        merged_kwargs = processor._merge_kwargs(
             processor.valid_processor_kwargs,
             tokenizer_init_kwargs=processor.tokenizer.init_kwargs,
-        )["text_kwargs"]
+        )
+        return_mm_token_type_ids = merged_kwargs["text_kwargs"].get(
+            "return_mm_token_type_ids",
+            merged_kwargs.get("return_mm_token_type_ids", False),
+        )
         output = {"input_ids": torch.tensor([input_ids], dtype=torch.long)}
-        if text_kwargs.get("return_mm_token_type_ids", False):
+        if return_mm_token_type_ids:
             output["mm_token_type_ids"] = torch.tensor(
                 processor.create_mm_token_type_ids([input_ids]), dtype=torch.long
             )
