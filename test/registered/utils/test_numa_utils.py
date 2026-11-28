@@ -315,6 +315,18 @@ class TestGetNumaNodeIfAvailable(unittest.TestCase):
         _mock_avail.assert_not_called()
         _mock_gpu.assert_not_called()
 
+    @patch("sglang.srt.utils.numa_utils._is_numa_available")
+    @patch("sglang.srt.utils.numa_utils._query_numa_node_for_gpu")
+    def test_npu_skips_early_numa_policy(self, _mock_gpu, _mock_avail):
+        # NPU CPU affinity is planned before runtime init and applied after
+        # warmup, so the parent must not install an early CPU/memory policy,
+        # not even one requested explicitly through --numa-node.
+        args = self._make_server_args(numa_node=[5, 6])
+        args.device = "npu"
+        self.assertIsNone(get_numa_node_if_available(args, 0))
+        _mock_avail.assert_not_called()
+        _mock_gpu.assert_not_called()
+
 
 def _get_gpu_info():
     try:

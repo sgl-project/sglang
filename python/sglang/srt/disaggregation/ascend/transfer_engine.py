@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import nullcontext
 from typing import List
 
 import torch
@@ -9,6 +10,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     MooncakeTransferEngine,
 )
 from sglang.srt.utils.network import NetworkAddress
+from sglang.srt.utils.npu_pd_affinity import get_pd_thread_affinity
 
 try:
     from memfabric_hybrid import TransferEngine
@@ -76,12 +78,24 @@ class AscendTransferEngine(MooncakeTransferEngine):
 
         trans_op_type = self._resolve_trans_op_type(transfer_protocol)
         """Initialize the ascend transfer instance."""
-        ret_value = self.engine.initialize(
-            self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+        # HOST_RDMA creates native HCOM threads (DMAs, store heartbeat, group
+        # manager) that inherit their creator's CPU mask. Bind the initializing
+        # thread to the PD slice so those threads are born on the reserved
+        # cores instead of the compute slice.
+        pd_affinity = (
+            get_pd_thread_affinity() if transfer_protocol == "host_rdma" else None
         )
-        if ret_value != 0:
-            logger.error("Ascend Transfer Engine initialization failed.")
-            raise RuntimeError("Ascend Transfer Engine initialization failed.")
+        with (
+            pd_affinity.bind_initialization_thread()
+            if pd_affinity is not None
+            else nullcontext()
+        ):
+            ret_value = self.engine.initialize(
+                self.store_url, self.session_id, self.role, self.npu_id, trans_op_type
+            )
+            if ret_value != 0:
+                logger.error("Ascend Transfer Engine initialization failed.")
+                raise RuntimeError("Ascend Transfer Engine initialization failed.")
 
     def batch_register(self, ptrs: List[int], lengths: List[int]):
         try:

@@ -170,6 +170,26 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_NPU_AFFINITY_PCORES_PER_PROC`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Ascend NPU only, requires `SGLANG_SET_CPU_AFFINITY=1`: physical cores per scheduler process. The scheduler plans its non-overlapping share of the NPU's local cores before runtime init, then binds every thread after warmup. `0` uses the NPU's full share; a larger request is clipped to that share.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_NPU_PD_AFFINITY_PCORES_PER_PROC`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Ascend NPU prefill/decode with `ASCEND_MF_TRANSFER_PROTOCOL=host_rdma` and `SGLANG_SET_CPU_AFFINITY=1`: extra physical cores from the NPU's unused share, reserved for HOST_RDMA transfer threads. Never taken from the compute assignment; `0` keeps the existing uniform binding.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_NPU_AFFINITY_DEBUG_THREADS`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log every scheduler thread's name, ID, role, and read-back CPU mask after the final Ascend NPU CPU binding.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_NPU_MIGRATE_PAGES`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Best-effort `migratepages` of an Ascend NPU scheduler's existing host pages to its NUMA node after the final CPU binding succeeds. Requires `migratepages` in `PATH`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allows the scheduler to overwrite longer context length requests (often set to `1` in Docker builds)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

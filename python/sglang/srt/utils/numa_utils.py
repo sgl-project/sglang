@@ -144,6 +144,10 @@ def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional
     Returns:
         The NUMA node for the given GPU id or None if it is not available.
     """
+    # NPU affinity is applied after warmup. Do not install an early CPU or
+    # memory policy, including through the legacy non-V2 binding path.
+    if server_args.device == "npu":
+        return None
     if server_args.numa_node is not None:
         return server_args.numa_node[gpu_id]
     if not envs.SGLANG_AUTO_NUMA_BIND.get():

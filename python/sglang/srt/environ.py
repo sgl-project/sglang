@@ -2166,6 +2166,16 @@ class Envs:
     # NUMA and CPU affinity
     # ===================================================================
     SGLANG_SET_CPU_AFFINITY = EnvBool(False)
+    # NPU CPU affinity is planned early and applied to all threads after warmup.
+    # Zero uses the NPU's full, non-overlapping share of local physical cores.
+    SGLANG_NPU_AFFINITY_PCORES_PER_PROC = EnvInt(0)
+    # Extra local physical cores for HOST_RDMA PD threads; never taken from
+    # the existing compute assignment. Zero preserves the old binding path.
+    SGLANG_NPU_PD_AFFINITY_PCORES_PER_PROC = EnvInt(0)
+    # Dump thread names/IDs and read-back CPU masks after final NPU binding.
+    SGLANG_NPU_AFFINITY_DEBUG_THREADS = EnvBool(False)
+    # Optionally migrate existing host pages after final NPU CPU binding.
+    SGLANG_NPU_MIGRATE_PAGES = EnvBool(False)
     SGLANG_DISABLE_THP = EnvBool(False)
     SGLANG_NUMA_BIND_V2 = EnvBool(True)
     SGLANG_AUTO_NUMA_BIND = EnvBool(True)

@@ -470,11 +470,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"The environment variable SGLANG_DISAGGREGATION_THREAD_POOL_SIZE={transfer_thread_pool_size} must be "
                 f"greater than or equal to SGLANG_DISAGGREGATION_QUEUE_SIZE={transfer_queue_size}."
             )
+            pd_pool_initializer = self._get_transfer_pool_initializer()
+
+            def init_transfer_pool_thread():
+                bind_thread_to_device(self.kv_args.gpu_id)
+                # PD affinity registers the worker after it owns this device.
+                if pd_pool_initializer is not None:
+                    pd_pool_initializer()
+
             self.executors = [
                 concurrent.futures.ThreadPoolExecutor(
                     transfer_thread_pool_size // transfer_queue_size,
-                    initializer=bind_thread_to_device,
-                    initargs=(self.kv_args.gpu_id,),
+                    initializer=init_transfer_pool_thread,
                 )
                 for _ in range(transfer_queue_size)
             ]
@@ -493,8 +500,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # transfer_worker makes device calls (wait_event.synchronize());
                 # a thread without a current device would run them on device 0
                 # and open a second context on another rank's GPU.
-                t = threading.Thread(
+                t = self._start_transfer_thread(
                     target=run_on_device,
+                    role="transfer_worker",
                     args=(
                         self.kv_args.gpu_id,
                         self.transfer_worker,
@@ -509,16 +517,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     ),
                     daemon=True,
                 )
-                t.start()
                 self._worker_threads.append(t)
             if self.enable_failed_session_probe:
                 self._failed_session_probe_shutdown = threading.Event()
-                t = threading.Thread(
-                    target=self._failed_session_probe_loop,
+                t = self._start_transfer_thread(
+                    self._failed_session_probe_loop,
+                    role="failed_session_probe",
                     name="MooncakeFailedSessionProbe",
                     daemon=True,
                 )
-                t.start()
                 self._worker_threads.append(t)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
@@ -3950,8 +3957,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         self.update_status(room, KVPoll.WaitingForInput)
 
-        t = threading.Thread(target=bootstrap_thread, daemon=True)
-        t.start()
+        t = self._start_transfer_thread(bootstrap_thread, role="bootstrap", daemon=True)
         self._worker_threads.append(t)
 
     def start_decode_thread(self):
@@ -3989,8 +3995,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     failure_reason=reason,
                 )
 
-        t = threading.Thread(target=decode_thread, daemon=True)
-        t.start()
+        t = self._start_transfer_thread(
+            decode_thread, role="decode_completion", daemon=True
+        )
         self._worker_threads.append(t)
         t = self._start_heartbeat_checker_thread()
         self._worker_threads.append(t)

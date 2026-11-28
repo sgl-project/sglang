@@ -1235,7 +1235,8 @@
                       "docs/hardware-platforms/ascend-npus/development/contribution_guide",
                       "docs/hardware-platforms/ascend-npus/development/support_new_models",
                       "docs/hardware-platforms/ascend-npus/development/operator_development",
-                      "docs/hardware-platforms/ascend-npus/development/operator_performance_optimizing"
+                      "docs/hardware-platforms/ascend-npus/development/operator_performance_optimizing",
+                      "docs/hardware-platforms/ascend-npus/development/cpu_affinity_design"
                     ]
                   },
                   "docs/hardware-platforms/ascend-npus/mindspore_backend",
