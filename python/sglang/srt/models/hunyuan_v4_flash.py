@@ -476,6 +476,40 @@ class FlashIndexPool(nn.Module):
         rows = positions.shape[0]
         chunk = max(1, self._LOGITS_BUDGET // (4 * num_groups)) if not decode else rows
 
+        if decode and count > 0:
+            from flashinfer.topk import top_k_ragged_transform
+
+            # Decode CUDA graphs size the logits for the longest context; select
+            # each row's top groups within its own length instead of over that width.
+            lengths = torch.empty((rows,), dtype=torch.int32, device=positions.device)
+            logits = indexpool_kernels.indexpool_logits(
+                q_fp8,
+                weights,
+                pages,
+                row_to_batch,
+                positions,
+                buf,
+                page_size,
+                num_groups,
+                lengths=lengths,
+            )
+            picked = top_k_ragged_transform(
+                logits,
+                torch.zeros_like(lengths),
+                lengths,
+                count,
+                dsa_graph_safe=True,
+            )
+            return indexpool_kernels.indexpool_expand(
+                picked,
+                None,
+                positions,
+                pages,
+                row_to_batch,
+                _ragged_offsets(layout),
+                self.index_topk,
+            )
+
         def score(begin, end):
             logits = indexpool_kernels.indexpool_logits(
                 q_fp8[begin:end],

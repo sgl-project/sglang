@@ -468,20 +468,93 @@ def _logits_kernel(
     pages_stride,
     num_pages,
     G,
+    len_ptr,  # [R] int32 scored groups per row (WRITE_LENGTHS)
+    H: tl.constexpr,
+    RATIO: tl.constexpr,
+    PAGE: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    WRITE_LENGTHS: tl.constexpr,
+):
+    r = tl.program_id(0)
+    pos = tl.load(pos_ptr + r)
+    upper = tl.where(pos >= 0, pos // RATIO, 0)
+    if WRITE_LENGTHS:
+        # A length-aware top-k never reads past a row's length: walk only this
+        # row's scored blocks, strided over the programs of the row.
+        if tl.program_id(1) == 0:
+            # Padded rows can carry positions past the scored width.
+            tl.store(len_ptr + r, tl.minimum(upper, G).to(tl.int32))
+        for gb in tl.range(
+            tl.program_id(1), tl.cdiv(upper, BLOCK_G), tl.num_programs(1)
+        ):
+            _logits_block(
+                q_ptr,
+                w_ptr,
+                pages_ptr,
+                row_batch_ptr,
+                buf_ptr,
+                buf_page_stride,
+                out_ptr,
+                pages_stride,
+                num_pages,
+                G,
+                r,
+                gb,
+                upper,
+                H,
+                RATIO,
+                PAGE,
+                BLOCK_G,
+            )
+    else:
+        gb = tl.program_id(1)
+        if gb * BLOCK_G >= upper:
+            groups = gb * BLOCK_G + tl.arange(0, BLOCK_G)
+            tl.store(out_ptr + r * G + groups, -float("inf"), mask=groups < G)
+        else:
+            _logits_block(
+                q_ptr,
+                w_ptr,
+                pages_ptr,
+                row_batch_ptr,
+                buf_ptr,
+                buf_page_stride,
+                out_ptr,
+                pages_stride,
+                num_pages,
+                G,
+                r,
+                gb,
+                upper,
+                H,
+                RATIO,
+                PAGE,
+                BLOCK_G,
+            )
+
+
+@triton.jit
+def _logits_block(
+    q_ptr,
+    w_ptr,
+    pages_ptr,
+    row_batch_ptr,
+    buf_ptr,
+    buf_page_stride,
+    out_ptr,
+    pages_stride,
+    num_pages,
+    G,
+    r,
+    gb,
+    upper,
     H: tl.constexpr,
     RATIO: tl.constexpr,
     PAGE: tl.constexpr,
     BLOCK_G: tl.constexpr,
 ):
-    r = tl.program_id(0)
-    gb = tl.program_id(1)
     groups = gb * BLOCK_G + tl.arange(0, BLOCK_G)
-    pos = tl.load(pos_ptr + r)
-    upper = tl.where(pos >= 0, pos // RATIO, 0)
     in_range = groups < G
-    if gb * BLOCK_G >= upper:
-        tl.store(out_ptr + r * G + groups, -float("inf"), mask=in_range)
-        return
     live = groups < upper
     b = tl.load(row_batch_ptr + r)
     tok = groups * RATIO
@@ -535,11 +608,13 @@ def _logits_rows_kernel(
     num_pages,
     R,
     G,
+    len_ptr,  # [R] int32 scored groups per row (WRITE_LENGTHS)
     H: tl.constexpr,
     RATIO: tl.constexpr,
     PAGE: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_G: tl.constexpr,
+    WRITE_LENGTHS: tl.constexpr,
 ):
     """BLOCK_R query rows share each tile of pooled keys (one MMA with
     M = BLOCK_R * H). A row block that spans two requests scores row by row."""
@@ -554,8 +629,12 @@ def _logits_rows_kernel(
     upper = tl.where(pos >= 0, pos // RATIO, 0)
     out_offs = rows[:, None].to(tl.int64) * G + groups[None, :]
     out_mask = row_mask[:, None] & in_range[None, :]
+    if WRITE_LENGTHS:
+        if gb == 0:
+            tl.store(len_ptr + rows, tl.minimum(upper, G).to(tl.int32), mask=row_mask)
     if gb * BLOCK_G >= tl.max(upper, axis=0):
-        tl.store(out_ptr + out_offs, -float("inf"), mask=out_mask)
+        if not WRITE_LENGTHS:
+            tl.store(out_ptr + out_offs, -float("inf"), mask=out_mask)
         return
     b_first = tl.load(row_batch_ptr + rb * BLOCK_R)
     b_last = tl.load(row_batch_ptr + last)
@@ -641,17 +720,34 @@ def _logits_rows_kernel(
 
 # Rows from which scoring shares key tiles across query rows.
 _LOGITS_ROW_BLOCK_MIN_ROWS = 64
+# Programs per row when only the scored blocks are walked; arbitrary, it covers
+# 64 * 64 * 4 = 16K tokens of context in one pass.
+_LOGITS_DECODE_PROGRAMS_PER_ROW = 64
 _LOGITS_ROWS_CONFIG = (8, 128, 4)  # (BLOCK_R, BLOCK_G, num_warps)
 
 
 def indexpool_logits(
-    q_fp8, weights, pages, row_to_batch, positions, index_buf, page_size, num_groups
+    q_fp8,
+    weights,
+    pages,
+    row_to_batch,
+    positions,
+    index_buf,
+    page_size,
+    num_groups,
+    lengths=None,
 ):
     """Logits of every row against the pooled groups before its own
-    (``positions // 4`` of them); -inf past those up to ``num_groups`` columns."""
+    (``positions // 4`` of them); -inf past those up to ``num_groups`` columns.
+
+    With ``lengths`` ([R] int32) the scored group count of each row is written
+    there and the columns past it are left unwritten, for a length-aware top-k."""
     rows, heads, _ = q_fp8.shape
     out = torch.empty((rows, num_groups), dtype=torch.float32, device=q_fp8.device)
+    write_lengths = lengths is not None
     if rows == 0 or num_groups == 0:
+        if write_lengths:
+            lengths.zero_()
         return out
     block = 64
     if rows >= _LOGITS_ROW_BLOCK_MIN_ROWS:
@@ -671,15 +767,20 @@ def indexpool_logits(
             pages.shape[1],
             rows,
             num_groups,
+            lengths if write_lengths else positions,
             H=heads,
             RATIO=4,
             PAGE=page_size,
             BLOCK_R=block_r,
             BLOCK_G=block,
+            WRITE_LENGTHS=write_lengths,
             num_warps=warps,
         )
         return out
-    _logits_kernel[(rows, triton.cdiv(num_groups, block))](
+    group_blocks = triton.cdiv(num_groups, block)
+    if write_lengths:
+        group_blocks = min(group_blocks, _LOGITS_DECODE_PROGRAMS_PER_ROW)
+    _logits_kernel[(rows, group_blocks)](
         q_fp8,
         weights,
         pages,
@@ -691,10 +792,12 @@ def indexpool_logits(
         pages.stride(0),
         pages.shape[1],
         num_groups,
+        lengths if write_lengths else positions,
         H=heads,
         RATIO=4,
         PAGE=page_size,
         BLOCK_G=block,
+        WRITE_LENGTHS=write_lengths,
         num_warps=4,
     )
     return out
@@ -702,8 +805,8 @@ def indexpool_logits(
 
 @triton.jit(do_not_specialize=[*_PAGE_TABLE_ARGS, "K"])
 def _expand_kernel(
-    picked_ptr,  # [R, K] int64/int32 candidate groups (any order)
-    value_ptr,  # [R, K] fp32 their logits (-inf: not a candidate)
+    picked_ptr,  # [R, K] int64/int32 candidate groups (any order; < 0: none)
+    value_ptr,  # [R, K] fp32 their logits (-inf: not a candidate; HAS_VALUES)
     pos_ptr,  # [R] int64
     pages_ptr,  # [B, NP] int32
     row_batch_ptr,  # [R] int64
@@ -716,6 +819,7 @@ def _expand_kernel(
     RATIO: tl.constexpr,
     BLOCK_K: tl.constexpr,
     TOPK: tl.constexpr,
+    HAS_VALUES: tl.constexpr,
 ):
     r = tl.program_id(0)
     pos = tl.load(pos_ptr + r)
@@ -730,9 +834,11 @@ def _expand_kernel(
     # History: valid picked groups, packed in order of appearance.
     ks = tl.arange(0, BLOCK_K)
     in_k = ks < K
-    group = tl.load(picked_ptr + r * K + ks, mask=in_k, other=0).to(tl.int64)
-    val = tl.load(value_ptr + r * K + ks, mask=in_k, other=-float("inf"))
-    valid = in_k & (val > -float("inf")) & (group >= 0) & (group < upper)
+    group = tl.load(picked_ptr + r * K + ks, mask=in_k, other=-1).to(tl.int64)
+    valid = in_k & (group >= 0) & (group < upper)
+    if HAS_VALUES:
+        val = tl.load(value_ptr + r * K + ks, mask=in_k, other=-float("inf"))
+        valid = valid & (val > -float("inf"))
     dst = tl.cumsum(valid.to(tl.int32), axis=0) - 1
     n_hist = tl.sum(valid.to(tl.int32), axis=0)
     for o in tl.static_range(RATIO):
@@ -767,7 +873,8 @@ def indexpool_expand(
     picked, values, positions, pages, row_to_batch, ragged_offsets, topk
 ):
     """Packed sparse indices: the valid picked groups' tokens, then the query's
-    own group up to the query, then -1."""
+    own group up to the query, then -1. Without ``values``, a negative picked
+    group marks an empty slot."""
     rows = positions.shape[0]
     out = torch.empty((rows, topk), dtype=torch.int32, device=positions.device)
     if rows == 0:
@@ -777,7 +884,7 @@ def indexpool_expand(
     assert (k + 1) * 4 <= topk, f"{k} picked groups and the tail exceed topk {topk}"
     _expand_kernel[(rows,)](
         picked,
-        values,
+        values if values is not None else picked,
         positions,
         pages,
         row_to_batch,
@@ -791,6 +898,7 @@ def indexpool_expand(
         # Sized by topk, not k, so short contexts reuse the same kernel.
         BLOCK_K=triton.next_power_of_2(topk // 4),
         TOPK=topk,
+        HAS_VALUES=values is not None,
         num_warps=4,
     )
     return out
