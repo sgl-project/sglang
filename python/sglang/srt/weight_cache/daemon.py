@@ -94,6 +94,34 @@ if TYPE_CHECKING:
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
 
+# Arbitrary bound on _collect_garbage()'s passes; GLM-5.3-Flash needs three,
+# the last of which finds nothing.
+_MAX_GC_PASSES = 8
+
+
+def _collect_garbage() -> None:
+    """Run the cycle collector until a pass finds nothing to free, at most
+    _MAX_GC_PASSES times.
+
+    One pass cannot free a parameter that a view in the same garbage still
+    references: torch keeps such a parameter, and everything it refers to,
+    alive for that pass. If one of those refers back to it, e.g. a
+    weight_loader bound to its layer, only a later pass frees it, and that
+    pass can leave another such parameter for the next one. GLM-5.3-Flash
+    keeps such a view of every qkv_conv1d.weight.
+    """
+    for _ in range(_MAX_GC_PASSES):
+        found = gc.collect()
+        if not found:
+            return
+    logger.warning(
+        "[weight_cache] %d garbage collections still found %d unreachable "
+        "objects in the last one; more garbage may need another collection. "
+        "The check while packing names any original that stays referenced.",
+        _MAX_GC_PASSES,
+        found,
+    )
+
 
 @dataclasses.dataclass
 class WeightCacheDaemonArgs:
@@ -495,14 +523,16 @@ class WeightCacheDaemon:
             from sglang.srt.layers.rotary_embedding.factory import _ROPE_DICT
             from sglang.srt.models.transformers import _TRANSFORMERS_MOE_LAYERS
 
-            # This process-wide cache also owns model buffers. The standalone
-            # daemon loads one model and does not need to construct another.
+            # This process-wide cache also owns model buffers, including those
+            # of any cached rotary module the model does not use, which are not
+            # exported. The standalone daemon loads one model and does not need
+            # to construct another.
             _ROPE_DICT.clear()
             # The Transformers backend registers every MoE layer in this dict,
             # which would keep the experts' original weights alive next to
             # their packed copies.
             _TRANSFORMERS_MOE_LAYERS.clear()
-            gc.collect()
+            _collect_garbage()
         self.state_entries = self.transport_backend.prepare_export(state_tensors)
 
         if self.transport_name == VMM_FD_BACKEND:
