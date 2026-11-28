@@ -44,6 +44,7 @@ def _install_fake_aiter(monkeypatch, fused_moe):
     fake_aiter.__path__ = []
     fake_aiter.ActivationType = SimpleNamespace(Silu="Silu")
     fake_aiter.QuantType = SimpleNamespace(per_1x32="per_1x32")
+    fake_aiter.dtypes = SimpleNamespace(fp8=torch.float8_e4m3fn)
 
     fake_fused_moe = ModuleType("aiter.fused_moe")
     fake_fused_moe.fused_moe = fused_moe
@@ -88,6 +89,29 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
     assert captured["quant_type"] == "per_1x32"
     assert captured["no_combine"] is True
     assert captured["custom_fused_moe_kwarg"] == "enabled"
+
+
+def test_aiter_runner_pins_interleaved_fp4_activations_to_fp8(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    monkeypatch.setattr(aiter_runner, "is_gfx95_supported", lambda: True)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    runner.run(
+        _runner_input(),
+        _quant_info(
+            fp8_activations=True,
+            fused_moe_kwargs={"gate_mode": "INTERLEAVE"},
+        ),
+        running_state={},
+    )
+
+    assert captured["quant_dtype_a"] == torch.float8_e4m3fn
 
 
 def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(
@@ -245,6 +269,60 @@ def test_mori_pre_permute_consumes_dispatcher_cap(
     if not low_latency:
         assert result.output.shape[0] == expected_rows
         assert result.output.data_ptr() == dispatched.expert_output.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "gate_mode,expected_upscale", [("interleave", True), ("separated", False)]
+)
+def test_mori_fp4_receive_uses_effective_gate_mode(
+    monkeypatch, gate_mode, expected_upscale
+):
+    from sglang.srt.layers.moe.token_dispatcher.moriep import (
+        MoriEPNormalDispatchOutput,
+    )
+
+    upscale_calls = []
+    fake_utils = ModuleType("sglang.kernels.ops.quantization.rocm_upscale")
+    fake_utils.upscale = None
+
+    def upscale_mxfp4(hidden_states, scale, num_local_tokens, output_dtype):
+        upscale_calls.append((hidden_states, scale, num_local_tokens, output_dtype))
+        return torch.zeros((hidden_states.shape[0], 4), dtype=output_dtype)
+
+    fake_utils.upscale_mxfp4 = upscale_mxfp4
+    monkeypatch.setitem(sys.modules, fake_utils.__name__, fake_utils)
+
+    hidden = torch.empty((16, 2), dtype=torch.float4_e2m1fn_x2)
+    scales = torch.ones((16, 1))
+    ids = torch.zeros((16, 2), dtype=torch.int32)
+    weights = torch.ones((16, 2))
+    dispatched = MoriEPNormalDispatchOutput(
+        hidden_states=hidden,
+        hidden_states_scale=scales,
+        topk_ids=ids,
+        topk_weights=weights,
+        num_recv_tokens_per_expert=torch.tensor([5]),
+        origin_topk_ids=ids[:2],
+        origin_topk_weights=weights[:2],
+        out_dtype=torch.bfloat16,
+        recv_cap=0,
+        expert_output=torch.empty((16, 4), dtype=torch.bfloat16),
+    )
+    quant_info = _quant_info(
+        quant_type=AiterQuantType.PER_1X32,
+        swiglu_limit=0.0,
+        fused_moe_kwargs={"gate_mode": gate_mode},
+    )
+
+    result = aiter_runner._pre_permute_deepep_to_aiter(
+        dispatched, quant_info, MoeRunnerConfig(), {}
+    )
+
+    assert bool(upscale_calls) is expected_upscale
+    assert result.hidden_states.dtype == (
+        torch.bfloat16 if expected_upscale else torch.float4_e2m1fn_x2
+    )
+    assert (result.a1_scale is None) is expected_upscale
 
 
 if __name__ == "__main__":
