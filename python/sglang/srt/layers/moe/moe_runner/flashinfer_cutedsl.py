@@ -252,42 +252,34 @@ def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
 def refresh_cutedsl_standard_scales_for_weight_update(
     layer: torch.nn.Module,
 ) -> None:
+    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+        resolve_cutedsl_standard_scales(layer)
+    )
+    if (
+        layer.quant_config.use_per_token_activation
+        and layer._cutedsl_wrapper.quant_mode == "w4a4"
+    ):
+        used_input_scale = _make_per_token_global_scale(used_input_scale)
+
+    new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     current_scales = layer._cutedsl_scales
     current_input_scale = layer._cutedsl_input_scale
+
+    # Decode CUDA graphs capture these tensor addresses, so reloads must update
+    # their values without replacing the tensors.
     if (
         not isinstance(current_scales, tuple)
-        or len(current_scales) != 3
+        or len(current_scales) != len(new_scales)
         or not isinstance(current_input_scale, torch.Tensor)
     ):
         raise RuntimeError(
             "CuTe DSL scale metadata changed during weight reload; "
             "CUDA graph recapture is required."
         )
-
-    quant_mode = layer._cutedsl_wrapper.quant_mode
-    if quant_mode == "w4a16":
-        # W4A16 uses neutral (1.0) activation scales; only the per-expert
-        # weight decode alphas change on weight reload.
-        w1_alpha = layer.g1_alphas.to(torch.float32)
-        w2_alpha = layer.g2_alphas.to(torch.float32)
-        scale_pairs = (
-            (current_scales[0], w1_alpha),
-            (current_scales[2], w2_alpha),
-        )
-    else:
-        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-            resolve_cutedsl_standard_scales(layer)
-        )
-        if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
-            used_input_scale = _make_per_token_global_scale(used_input_scale)
-        new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
-        scale_pairs = (
-            *zip(current_scales, new_scales),
-            (current_input_scale, used_input_scale),
-        )
-
-    # Decode CUDA graphs capture these tensor addresses, so reloads must update
-    # their values without replacing the tensors.
+    scale_pairs = (
+        *zip(current_scales, new_scales),
+        (current_input_scale, used_input_scale),
+    )
     for current, new in scale_pairs:
         if (
             not isinstance(current, torch.Tensor)
