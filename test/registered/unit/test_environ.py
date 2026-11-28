@@ -10,7 +10,14 @@ import warnings
 from contextlib import ExitStack
 from unittest.mock import patch
 
-from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
+import sglang.srt.environ as environ_module
+from sglang.srt.environ import (
+    EnvField,
+    _DeprecatedEnv,
+    envs,
+    freeze_env_reads,
+    validate_env_values,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
@@ -36,6 +43,7 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH",
     "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH",
     "SGLANG_OPT_SPEC_RELAY_IN_PLACE",
+    "SGLANG_OPT_FREEZE_ENV_READS",
     "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",
     "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS",
     "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD",
@@ -131,12 +139,34 @@ class TestEnvField(unittest.TestCase):
             if envs.SGLANG_TEST_RETRACT or (1 == 1):
                 pass
 
-    def test_invalid_value_warns_and_returns_default(self):
-        os.environ["SGLANG_TEST_RETRACT"] = "not-a-bool"
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            self.assertIs(envs.SGLANG_TEST_RETRACT.get(), False)
-        self.assertIn("Invalid value", str(caught[0].message))
+    def test_invalid_value_raises_naming_variable_and_type(self):
+        for field, value, kind in (
+            (envs.SGLANG_TEST_RETRACT, "not-a-bool", "boolean"),
+            (envs.SGLANG_PORT, "not-a-port", "integer"),
+            (envs.SGLANG_WARMUP_TIMEOUT, "not-a-float", "float"),
+            (envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG, "{invalid-json", "JSON"),
+        ):
+            with self.subTest(name=field.name), field.override(value):
+                with self.assertRaisesRegex(
+                    ValueError, f"Invalid value for {field.name}: .*{kind}"
+                ):
+                    field.get()
+
+    def test_empty_value_reads_as_unset_except_for_strings(self):
+        for field in (
+            envs.SGLANG_TEST_RETRACT,
+            envs.SGLANG_PORT,
+            envs.SGLANG_WARMUP_TIMEOUT,
+            envs.SGLANG_HUMMING_INPUT_QUANT_CONFIG,
+        ):
+            with self.subTest(name=field.name), field.override(""):
+                self.assertFalse(field.is_set())
+                self.assertEqual(field.get(), field.default)
+                validate_env_values()
+
+        for field in (envs.SGLANG_ROLE_NAMESPACES, envs.SGLANG_DISABLED_MODEL_ARCHS):
+            with self.subTest(name=field.name), field.override(""):
+                self.assertTrue(field.is_set())
 
     def test_mega_runtime_defaults_and_registry_scope(self):
         with ExitStack() as stack:
@@ -243,9 +273,28 @@ class TestDocumentedBooleanKnobs(unittest.TestCase):
                     ("1", True),
                     ("false", False),
                     ("0", False),
+                    ("On", True),
+                    ("off", False),
                 ):
                     os.environ[name] = value
                     self.assertIs(field.get(), expected)
+
+
+class TestFreezeEnvReads(unittest.TestCase):
+    def test_field_writes_drop_the_memo(self):
+        self.addCleanup(setattr, environ_module, "_frozen_reads", None)
+        field = envs.SGLANG_TEST_RETRACT
+        with envs.SGLANG_OPT_FREEZE_ENV_READS.override(True), field.override(False):
+            freeze_env_reads()
+            self.assertIs(field.get(), False)
+            # Every EnvField write drops the memo (a raw os.environ write would not).
+            with field.override(True):
+                self.assertIs(field.get(), True)
+            self.assertIs(field.get(), False)
+            field.set(True)
+            self.assertIs(field.get(), True)
+            field.clear()
+            self.assertIs(field.get(), field.default)
 
 
 class TestImportTimeBooleanKnobs(unittest.TestCase):
