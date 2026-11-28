@@ -26,6 +26,20 @@ def _get_open_port() -> int:
         return sock.getsockname()[1]
 
 
+def _check_fp_rounds_once(quick_all_reduce: QuickAllReduce, device, msg: str) -> None:
+    # One rounding to bf16 gives rel L2 of about 1.7e-3 on randn; rounding after every rank
+    # gives 2.7e-3 at TP4.
+    torch.manual_seed(1234 + dist.get_rank())
+    inp = torch.randn(1 << 20, device=device).to(torch.bfloat16)
+    ref = inp.float().cpu()
+    dist.all_reduce(ref)
+    dist.barrier()
+    out = quick_all_reduce.quick_all_reduce(inp)
+    torch.cuda.synchronize()
+    rel = ((out.float().cpu() - ref).norm() / ref.norm()).item()
+    assert rel < 2.2e-3, f"{msg}: rel L2 {rel:.5f} on randn"
+
+
 def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
     os.environ["ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16"] = "1"
 
@@ -47,34 +61,48 @@ def _run_bf16_range_test(rank: int, world_size: int, port: int) -> None:
             ("input_above_fp16", 80_000.0, False),
             ("negative_sum_above_fp16", -20_000.0, False),
             ("mixed_input_above_fp16", 1.0, True),
+            # Out of reach of fp16 even with a power-of-two prescale of 16: a sum above
+            # 16 * 65504, and inputs that the prescale pushes into fp16's subnormal range.
+            ("sum_above_scaled_fp16", 400_000.0, False),
+            ("input_below_scaled_fp16_normal", 3 * 2**-21, False),
         ]
         for quant_mode in ("FP", "INT8", "INT6", "INT4"):
             os.environ["ROCM_QUICK_REDUCE_QUANTIZATION"] = quant_mode
             quick_all_reduce = QuickAllReduce(group=dist.group.WORLD, device=device)
             assert not quick_all_reduce.disabled
             assert quick_all_reduce.use_fp16_kernels
+            # The FP codec ignores the bf16 -> fp16 cast, so it must be exact either way.
+            casts = (1, 0) if quant_mode == "FP" else (1,)
             try:
-                for case_name, value, mixed in cases:
-                    inp = torch.full(
-                        (numel,), value, dtype=torch.bfloat16, device=device
-                    )
-                    if mixed:
-                        inp[::32] = 80_000.0
-                    expected = (inp.float() * world_size).to(torch.bfloat16)
+                for cast in casts:
+                    quick_all_reduce.use_fp16_kernels = cast
+                    for case_name, value, mixed in cases:
+                        inp = torch.full(
+                            (numel,), value, dtype=torch.bfloat16, device=device
+                        )
+                        if mixed:
+                            inp[::32] = 80_000.0
+                        expected = (inp.float() * world_size).to(torch.bfloat16)
 
-                    dist.barrier()
-                    out = quick_all_reduce.quick_all_reduce(inp)
-                    torch.cuda.synchronize()
-                    assert torch.isfinite(out).all().item(), (
-                        f"{quant_mode=} {case_name=} produced non-finite output"
-                    )
-                    if quant_mode == "FP" or case_name in ("low", "ordinary"):
-                        torch.testing.assert_close(
-                            out,
-                            expected,
-                            rtol=0,
-                            atol=0,
-                            msg=lambda msg: f"{quant_mode=} {case_name=}\n{msg}",
+                        dist.barrier()
+                        out = quick_all_reduce.quick_all_reduce(inp)
+                        torch.cuda.synchronize()
+                        assert torch.isfinite(out).all().item(), (
+                            f"{quant_mode=} {cast=} {case_name=} produced non-finite output"
+                        )
+                        if quant_mode == "FP" or case_name in ("low", "ordinary"):
+                            torch.testing.assert_close(
+                                out,
+                                expected,
+                                rtol=0,
+                                atol=0,
+                                msg=lambda msg: (
+                                    f"{quant_mode=} {cast=} {case_name=}\n{msg}"
+                                ),
+                            )
+                    if quant_mode == "FP":
+                        _check_fp_rounds_once(
+                            quick_all_reduce, device, f"{quant_mode=} {cast=}"
                         )
             finally:
                 quick_all_reduce.close()

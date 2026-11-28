@@ -30,6 +30,8 @@ __global__ __quickreduce_launch_bounds_two_shot__ static void allreduce_prototyp
     uint32_t data_offset,
     uint32_t* d_flag_counters,
     int64_t data_size_per_phase) {
+  set_fp16_ovfl(true);
+
   int block = blockIdx.x;
   int grid = gridDim.x;
 
