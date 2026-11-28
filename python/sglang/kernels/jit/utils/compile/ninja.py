@@ -23,7 +23,9 @@ import logging
 import os
 import pathlib
 import shlex
+import shutil
 import subprocess
+import sys
 from typing import List
 
 from sglang.kernels.jit.utils.compile import toolchain
@@ -135,6 +137,39 @@ def generate(spec: BuildSpec) -> str:
     return "\n".join(lines)
 
 
+def _resolve_ninja() -> str:
+    """Locate the ninja executable without assuming it is on ``$PATH``.
+
+    ``pip install ninja`` places the binary in the environment's ``bin/``
+    directory, which is not on ``$PATH`` when the server is launched through an
+    interpreter path (systemd units, cron, wrappers that exec Python
+    directly).  A bare ``["ninja", ...]`` then dies with ``FileNotFoundError``
+    in the middle of weight loading, so fall back to the interpreter's sibling
+    directory and to the ``ninja`` package's ``BIN_DIR`` before giving up.
+    """
+    exe = shutil.which("ninja")
+    if exe is not None:
+        return exe
+    sibling = pathlib.Path(sys.executable).parent / (
+        "ninja.exe" if os.name == "nt" else "ninja"
+    )
+    if sibling.is_file():
+        return str(sibling)
+    try:
+        import ninja as _ninja_pkg
+    except ImportError:
+        pass
+    else:
+        candidate = pathlib.Path(_ninja_pkg.BIN_DIR) / "ninja"
+        if candidate.is_file():
+            return str(candidate)
+    raise RuntimeError(
+        "The ninja build tool is required to compile JIT kernels but was not "
+        "found. Install it into this environment (`pip install ninja`) or "
+        "make it reachable via $PATH."
+    )
+
+
 def build(*, spec: BuildSpec, build_dir: pathlib.Path, build_file: str) -> pathlib.Path:
     """Write the sources and *build_file* into *build_dir*, then run ninja.
 
@@ -153,7 +188,7 @@ def build(*, spec: BuildSpec, build_dir: pathlib.Path, build_file: str) -> pathl
             (build_dir / unit.filename).write_text(unit.source)
     (build_dir / _BUILD_FILE).write_text(build_file)
 
-    command = ["ninja", "-f", _BUILD_FILE]
+    command = [_resolve_ninja(), "-f", _BUILD_FILE]
     jobs = os.environ.get("MAX_JOBS")
     if jobs:
         command += ["-j", jobs]
