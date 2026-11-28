@@ -164,6 +164,36 @@ def _maybe_copy_weight_view_before_h2d(
     return _copy_weight_view_before_h2d(loaded_weight)
 
 
+def _shard_gguf_expert_weight(
+    *,
+    loaded_weight: torch.Tensor,
+    shard_id: str,
+    w2_weight_type: Optional[int],
+    tp_size: int,
+    tp_rank: int,
+) -> torch.Tensor:
+    # A GGUF expert is [out_features, packed in_features bytes]. Gate/up are
+    # column-parallel and shard rows; down is row-parallel and shards the packed axis.
+    if shard_id == "w2":
+        from gguf import GGML_QUANT_SIZES
+
+        shard_dim = 1
+        block_size, type_size = GGML_QUANT_SIZES[w2_weight_type]
+        # Quantized tensors arrive as raw bytes, F16 as elements.
+        align = type_size if loaded_weight.dtype == torch.uint8 else block_size
+    else:
+        shard_dim = 0
+        align = 1
+    full_size = loaded_weight.size(shard_dim)
+    if full_size % (tp_size * align) != 0:
+        raise ValueError(
+            f"GGUF expert {shard_id} with shape {tuple(loaded_weight.shape)} cannot "
+            f"be split into {tp_size} TP shards of whole quant blocks."
+        )
+    shard_size = full_size // tp_size
+    return loaded_weight.narrow(shard_dim, tp_rank * shard_size, shard_size).clone()
+
+
 def _weight_layout_method(layer):
     """The method whose weight layout the loaders follow: the method a wrapper loads for
     (``weight_load_method``, set by paged experts) or the layer's own quant method."""
@@ -1343,14 +1373,16 @@ class FusedMoE(torch.nn.Module):
             return True
 
         if is_gguf_weight:
-            output_dim = getattr(param, "output_dim", None)
-            if self.moe_tp_size > 1:
-                if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
-                    shard_size = loaded_weight.size(0) // self.moe_tp_size
-                    start_idx = self.moe_tp_rank * shard_size
-                    loaded_weight = loaded_weight.narrow(
-                        0, start_idx, shard_size
-                    ).clone()
+            if self.moe_tp_size > 1 and shard_id in ("w1", "w3", "w2"):
+                loaded_weight = _shard_gguf_expert_weight(
+                    loaded_weight=loaded_weight,
+                    shard_id=shard_id,
+                    w2_weight_type=(
+                        self.w2_qweight_type.weight_type if shard_id == "w2" else None
+                    ),
+                    tp_size=self.moe_tp_size,
+                    tp_rank=self.moe_tp_rank,
+                )
 
             # Store in data_container with expert/shard info
             if not hasattr(param, "expert_data_map"):
