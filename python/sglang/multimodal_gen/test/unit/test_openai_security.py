@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 import errno
+import gzip
+import http.server
 import io
+import ipaddress
 import os
+import ssl
+import subprocess
+import tempfile
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
-from contextlib import AsyncExitStack, contextmanager
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -150,8 +157,10 @@ def image_source(request, monkeypatch):
 
     client_cls = httpx.AsyncClient
     transport = httpx.MockTransport(
-        lambda req: httpx.Response(
-            200, headers={"content-type": "image/png"}, content=b"image"
+        _streamed(
+            lambda req: httpx.Response(
+                200, headers={"content-type": "image/png"}, content=b"image"
+            )
         )
     )
     monkeypatch.setattr(
@@ -159,7 +168,7 @@ def image_source(request, monkeypatch):
         "AsyncClient",
         lambda **kwargs: client_cls(transport=transport, **kwargs),
     )
-    return "https://example.invalid/image.png", ".png"
+    return "https://93.184.216.34/image.png", ".png"
 
 
 def test_save_image_sources_within_uploads_root(tmp_path, image_source):
@@ -170,6 +179,27 @@ def test_save_image_sources_within_uploads_root(tmp_path, image_source):
     )
     assert Path(saved) == root / f"input{suffix}"
     assert Path(saved).read_bytes() == b"image"
+
+
+def _streamed(handler):
+    """Serve a handler's body as an unread stream, as a real socket would."""
+
+    def respond(request):
+        response = handler(request)
+        if response.is_stream_consumed:
+            return httpx.Response(
+                response.status_code,
+                headers=response.headers,
+                stream=httpx.ByteStream(response.content),
+            )
+        return response
+
+    return respond
+
+
+def _reason(error: BaseException) -> str:
+    """The cause of a failed image save; a URL download raises a generic error from it."""
+    return str(error.__cause__ if error.__cause__ is not None else error)
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -198,12 +228,13 @@ def test_failed_image_write_preserves_destination(
         fault.setattr(utils, "open", partial(failing_write, open), raising=False)
         fault.setattr(image_io, "open", partial(failing_write, open), raising=False)
         fault.setattr(os, "fdopen", partial(failing_write, os.fdopen))
-        with pytest.raises(Exception, match="No space left on device"):
+        with pytest.raises(Exception) as caught:
             asyncio.run(
                 utils.save_image_to_path(
                     source, str(tmp_path / "input"), uploads_root=str(tmp_path)
                 )
             )
+        assert "No space left on device" in _reason(caught.value)
     assert set(tmp_path.iterdir()) == ({target} if existing else set())
     if existing:
         assert target.read_bytes() == b"previous image"
@@ -235,30 +266,52 @@ def test_final_upload_path_cannot_follow_symlink_outside_root(tmp_path, image_so
     outside = tmp_path / "outside"
     outside.write_bytes(b"unchanged")
     (root / f"input{suffix}").symlink_to(outside)
-    with pytest.raises(Exception, match="escapes"):
+    with pytest.raises(Exception) as caught:
         asyncio.run(
             utils.save_image_to_path(
                 source, str(root / "input"), uploads_root=str(root)
             )
         )
+    assert "escapes" in _reason(caught.value)
     assert outside.read_bytes() == b"unchanged"
 
 
-@pytest.mark.parametrize(
-    "source", ["https://example.invalid/image.png", "data:image/png;base64,aW1hZ2U="]
-)
-def test_prefer_remote_source_still_avoids_disk_io(tmp_path, source):
-    root = tmp_path / "uploads"
-    saved = asyncio.run(
-        utils.save_image_to_path(
-            source,
-            str(root / "input"),
-            uploads_root=str(root),
-            prefer_remote_source=True,
-        )
+@pytest.mark.parametrize("persistent", [True, False])
+@pytest.mark.parametrize("as_url", [True, False])
+def test_input_storage_modes_admit_identical_bytes(
+    tmp_path, monkeypatch, persistent, as_url
+):
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 4), "navy").save(buffer, format="PNG")
+    data = buffer.getvalue()
+    _patch_download(
+        monkeypatch,
+        tmp_path,
+        lambda _: httpx.Response(
+            200, content=data, headers={"content-type": "image/png"}
+        ),
     )
-    assert saved == source
-    assert not root.exists()
+    source = (
+        "https://x.test/image.png"
+        if as_url
+        else "data:image/png;base64," + base64.b64encode(data).decode()
+    )
+    with utils.temp_dir_if_disabled(
+        str(tmp_path / "uploads") if persistent else None
+    ) as root:
+        path = Path(
+            asyncio.run(
+                utils.save_image_to_path(
+                    source, str(Path(root) / "input"), uploads_root=root
+                )
+            )
+        )
+        assert path.read_bytes() == data
+        with Image.open(path) as decoded:
+            assert decoded.getpixel((0, 0)) == (0, 0, 128)
+    assert path.exists() is persistent
 
 
 def test_video_upload_sanitizes_filename_and_preserves_metadata(tmp_path):
@@ -341,7 +394,7 @@ def test_mesh_upload_is_temporary_when_input_saving_is_disabled(monkeypatch, tmp
     monkeypatch.setattr(
         mesh_api,
         "get_global_server_args",
-        lambda: SimpleNamespace(input_save_path=None),
+        lambda: SimpleNamespace(input_save_path=None, output_path=str(tmp_path)),
     )
     monkeypatch.setattr(mesh_api, "generate_request_id", lambda: "request")
     monkeypatch.setattr(
@@ -418,7 +471,7 @@ def test_mesh_completion_requires_a_downloadable_file(
 
     async def run_test():
         await store.upsert("mesh", {"status": "queued", "file_path": str(path)})
-        await mesh_api._dispatch_job_async("mesh", None, resources=AsyncExitStack())
+        await mesh_api._dispatch_job_async("mesh", None)
         job = await store.get("mesh")
         assert job["status"] == ("completed" if output_exists else "failed")
         if output_exists:
@@ -436,7 +489,7 @@ def test_rejected_mesh_preparation_does_not_create_a_queued_job(monkeypatch, tmp
     monkeypatch.setattr(
         mesh_api,
         "get_global_server_args",
-        lambda: SimpleNamespace(input_save_path=None),
+        lambda: SimpleNamespace(input_save_path=None, output_path=str(tmp_path)),
     )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
@@ -527,6 +580,99 @@ def test_invalid_output_quality_is_a_400_not_a_500(monkeypatch):
     assert "output_quality" in exc_info.value.detail
 
 
+def _build_sampling_params_with_captured_kwargs(monkeypatch, server_args):
+    """Patch build_sampling_params to capture (not construct) its kwargs."""
+    captured = {}
+    monkeypatch.setattr(utils, "get_global_server_args", lambda: server_args)
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_user_sampling_params_args",
+        lambda **kw: captured.update(kw) or SimpleNamespace(),
+    )
+    return captured
+
+
+def test_build_sampling_params_rejects_perf_dump_path_outside_output_root(
+    monkeypatch, tmp_path
+):
+    """Regression test for sglang#51555: perf_dump_path reaches code that
+    creates directories and atomically overwrites files, so a client must
+    not point it outside the operator-configured output root."""
+    captured = _build_sampling_params_with_captured_kwargs(
+        monkeypatch,
+        SimpleNamespace(model_path="m", output_path=str(tmp_path)),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        utils.build_sampling_params(
+            "request", prompt="p", perf_dump_path=str(tmp_path.parent / "evil.json")
+        )
+    assert exc_info.value.status_code == 400
+    assert "perf_dump_path" in exc_info.value.detail
+
+    utils.build_sampling_params(
+        "request", prompt="p", perf_dump_path=str(tmp_path / "report.json")
+    )
+    assert captured["perf_dump_path"] == str(tmp_path / "report.json")
+
+
+def test_build_sampling_params_rejects_output_path_traversal(monkeypatch, tmp_path):
+    captured = _build_sampling_params_with_captured_kwargs(
+        monkeypatch,
+        SimpleNamespace(model_path="m", output_path=str(tmp_path)),
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        utils.build_sampling_params(
+            "request", prompt="p", output_path=str(tmp_path / ".." / "evil")
+        )
+    assert exc_info.value.status_code == 400
+    assert "output_path" in exc_info.value.detail
+
+    utils.build_sampling_params(
+        "request", prompt="p", output_path=str(tmp_path / "sub")
+    )
+    assert captured["output_path"] == str(tmp_path / "sub")
+
+
+def test_build_sampling_params_rejects_traversal_output_file_name(
+    monkeypatch, tmp_path
+):
+    captured = _build_sampling_params_with_captured_kwargs(
+        monkeypatch,
+        SimpleNamespace(model_path="m", output_path=str(tmp_path)),
+    )
+    # output_file_name is joined onto output_path, so a ".." in it would
+    # escape even a contained output_path.
+    for bad_name in ("../evil.mp4", "..\\evil.mp4", "..", "sub/evil.mp4"):
+        with pytest.raises(HTTPException) as exc_info:
+            utils.build_sampling_params(
+                "request", prompt="p", output_file_name=bad_name
+            )
+        assert exc_info.value.status_code == 400
+        assert "output_file_name" in exc_info.value.detail
+
+    utils.build_sampling_params("request", prompt="p", output_file_name="clip.mp4")
+    assert captured["output_file_name"] == "clip.mp4"
+
+
+def test_build_sampling_params_falls_back_to_tempdir_when_output_disabled(
+    monkeypatch,
+):
+    """With no operator-configured output root, only the system temp dir
+    (where the server itself generates temporary output dirs) is allowed."""
+    captured = _build_sampling_params_with_captured_kwargs(
+        monkeypatch, SimpleNamespace(model_path="m")
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        utils.build_sampling_params(
+            "request", prompt="p", perf_dump_path="/var/lib/sglang/evil.json"
+        )
+    assert exc_info.value.status_code == 400
+
+    in_tmp = os.path.join(tempfile.gettempdir(), "report.json")
+    utils.build_sampling_params("request", prompt="p", perf_dump_path=in_tmp)
+    assert captured["perf_dump_path"] == in_tmp
+
+
 @pytest.mark.parametrize(
     "endpoint,kwargs,detail",
     [
@@ -578,6 +724,15 @@ def test_undeliverable_response_format_is_rejected_before_generation(
 
 def _patch_download(monkeypatch, tmp_path, handler):
     """Route the download through handler; return the dir holding partial files."""
+    # Only the synthetic origin is allowed; neither DNS nor HTTP needs a network.
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._allowed_media_domains", frozenset({"x.test"})
+    )
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._resolve_host_ips",
+        lambda _: [ipaddress.ip_address("127.0.0.1")],
+    )
+    monkeypatch.setenv("no_proxy", "*")
     part_dir = tmp_path / "parts"
     part_dir.mkdir()
     monkeypatch.setattr(utils.tempfile, "tempdir", str(part_dir))
@@ -585,7 +740,9 @@ def _patch_download(monkeypatch, tmp_path, handler):
     monkeypatch.setattr(
         utils.httpx,
         "AsyncClient",
-        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+        lambda **kw: real_client(
+            transport=httpx.MockTransport(_streamed(handler)), **kw
+        ),
     )
     return part_dir
 
@@ -610,18 +767,74 @@ def _chunked_png(request):
 )
 def test_image_download_over_size_limit_is_rejected(monkeypatch, tmp_path, handler):
     """An oversized remote image must be aborted, not buffered and written."""
-    monkeypatch.setattr(utils, "_MAX_IMAGE_DOWNLOAD_BYTES", 1024)
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._media_url_max_file_size_bytes", 1024
+    )
     part_dir = _patch_download(monkeypatch, tmp_path, handler)
     target = tmp_path / "in" / "img.png"
-    with pytest.raises(Exception, match="exceeds"):
+    with pytest.raises(Exception) as caught:
         asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert "exceeds" in _reason(caught.value)
+    # The message reaches the client as a 400; neither the URL nor the cause is in it.
+    assert str(caught.value) == "Failed to download image from URL"
     assert not target.exists()
     assert not any(part_dir.iterdir())
     assert not list(target.parent.iterdir())
 
 
+def test_image_download_requests_identity_and_rejects_compressed_body(
+    monkeypatch, tmp_path
+):
+    """The size cap counts written bytes, so the body is never decompressed here."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.headers["accept-encoding"])
+        return httpx.Response(
+            200,
+            content=gzip.compress(b"x" * 4096),
+            headers={"content-type": "image/png", "content-encoding": "gzip"},
+        )
+
+    part_dir = _patch_download(monkeypatch, tmp_path, handler)
+    target = tmp_path / "in" / "img.png"
+    with pytest.raises(Exception) as caught:
+        asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert "Content-Encoding" in _reason(caught.value)
+    assert str(caught.value) == "Failed to download image from URL"
+    assert seen and set(seen) == {"identity"}
+    assert not target.exists()
+    assert not any(part_dir.iterdir())
+
+
+def test_image_download_has_one_deadline(monkeypatch, tmp_path):
+    """A slow drip is cut at --media-url-timeout, not after every chunk's own timeout."""
+    monkeypatch.setattr("sglang.srt.multimodal.media_io._media_url_timeout", 0.3)
+
+    async def drip():
+        for _ in range(20):
+            await asyncio.sleep(0.1)
+            yield b"x"
+
+    part_dir = _patch_download(
+        monkeypatch,
+        tmp_path,
+        lambda request: httpx.Response(
+            200, content=drip(), headers={"content-type": "image/png"}
+        ),
+    )
+    target = tmp_path / "in" / "img.png"
+    with pytest.raises(Exception) as caught:
+        asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert isinstance(caught.value.__cause__, TimeoutError)
+    assert not target.exists()
+    assert not any(part_dir.iterdir())
+
+
 def test_image_download_within_limit_is_saved(monkeypatch, tmp_path):
-    monkeypatch.setattr(utils, "_MAX_IMAGE_DOWNLOAD_BYTES", 1024)
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.media_io._media_url_max_file_size_bytes", 1024
+    )
     part_dir = _patch_download(
         monkeypatch,
         tmp_path,
@@ -699,8 +912,9 @@ def test_image_download_rejects_destination_directory(monkeypatch, tmp_path):
     )
     target = tmp_path / "image.png"
     target.mkdir()
-    with pytest.raises(Exception, match="directory"):
+    with pytest.raises(Exception) as caught:
         asyncio.run(utils._save_url_image_to_path("https://x.test/a.png", str(target)))
+    assert "directory" in _reason(caught.value)
     assert not list(target.iterdir())
     assert not list(part_dir.iterdir())
     assert set(tmp_path.iterdir()) == {target, part_dir}
@@ -732,8 +946,9 @@ def test_image_download_retry_keeps_only_complete_output(
     if recover:
         assert asyncio.run(request) == str(target)
     else:
-        with pytest.raises(Exception, match="incomplete response"):
+        with pytest.raises(Exception) as caught:
             asyncio.run(request)
+        assert "incomplete response" in _reason(caught.value)
     assert attempts == 3
     assert target.read_bytes() == (b"complete image" if recover else b"existing image")
     assert not list(part_dir.iterdir())
@@ -803,3 +1018,101 @@ def test_rife_uses_bounded_cache(monkeypatch):
     for path in ["a", "b"]:
         rife_interpolator.FrameInterpolator(model_path=path)._ensure_model_loaded()
     assert list(rife_interpolator._MODEL_CACHE) == ["b"]
+
+
+def test_pinned_https_preserves_original_sni_host_and_redirect_policy(
+    tmp_path, monkeypatch
+):
+    from PIL import Image
+
+    from sglang.srt.multimodal import media_io
+
+    crt = tmp_path / "server.crt"
+    key = tmp_path / "server.key"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-x509",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=one.media.test",
+            "-addext",
+            "subjectAltName=DNS:one.media.test,DNS:two.media.test",
+            "-keyout",
+            str(key),
+            "-out",
+            str(crt),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    seen, names = [], []
+    image = io.BytesIO()
+    Image.new("RGB", (8, 8), "navy").save(image, format="PNG")
+    body = image.getvalue()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.headers["Host"])
+            if self.path == "/first":
+                self.send_response(302)
+                self.send_header(
+                    "Location",
+                    f"https://two.media.test:{self.server.server_port}/image.png",
+                )
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+            self.end_headers()
+            if self.path != "/first":
+                self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(crt, key)
+    ctx.set_servername_callback(lambda sock, name, context: names.append(name))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    previous = media_io.media_url_security_config()
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(crt))
+    monkeypatch.setenv("SSL_CERT_FILE", str(crt))
+    # The operating system cannot resolve these fixture hostnames. Any unpinned dial fails.
+    monkeypatch.setattr(
+        media_io, "_resolve_host_ips", lambda _: [ipaddress.ip_address("127.0.0.1")]
+    )
+    media_io.configure_media_url_security(
+        ["one.media.test", "two.media.test", "other.media.test"]
+    )
+    port = server.server_port
+    url = f"https://one.media.test:{port}/first"
+    try:
+        assert media_io.get_image_bytes(url) == body
+        saved = asyncio.run(utils._save_url_image_to_path(url, str(tmp_path / "saved")))
+        assert Path(saved).read_bytes() == body
+        assert seen == [f"one.media.test:{port}", f"two.media.test:{port}"] * 2
+        assert names == ["one.media.test", "two.media.test"] * 2
+        import requests
+
+        with pytest.raises(requests.exceptions.SSLError):
+            media_io.get_image_bytes(f"https://other.media.test:{port}/image.png")
+        monkeypatch.setenv("no_proxy", "")
+        monkeypatch.setenv("NO_PROXY", "")
+        monkeypatch.setenv("https_proxy", "http://proxy.media.test:3000")
+        with pytest.raises(ValueError, match="direct route"):
+            media_io.get_image_bytes(url)
+        assert len(seen) == 4
+    finally:
+        media_io.configure_media_url_security(*previous)
+        server.shutdown()
+        server.server_close()
+        thread.join()

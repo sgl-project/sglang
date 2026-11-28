@@ -175,7 +175,8 @@ class WanT2V480PConfig(PipelineConfig):
     precision: str = "bf16"
     vae_precision: str = "fp32"
     vae_decode_precision: str = "bf16"
-    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("fp32",))
+    # The reference Wan code runs UMT5 in bf16, even where a checkpoint stores fp32.
+    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
     def __post_init__(self):
         self.vae_config.load_encoder = False
@@ -534,7 +535,6 @@ class Wan2_2_S2V_14B_Config(WanT2V480PConfig, WanI2VCommonConfig):
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
         default_factory=lambda: (_make_wan_s2v_text_encoder_config(),)
     )
-    text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     preprocess_text_funcs: tuple[Callable[[str], str], ...] = field(
         default_factory=lambda: (_wan_whitespace_clean,)
     )

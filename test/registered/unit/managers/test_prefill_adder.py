@@ -800,6 +800,7 @@ class TestPrefillAdder(CustomTestCase):
             full_attention_layer_ids=[0],
             total_bytes=8192,
             model_context_len=128,
+            req_to_token_row_width=128,
             max_num_reqs=2,
             enable_memory_saver=False,
             need_sort=False,
@@ -1774,6 +1775,7 @@ class TestPrefillAdder(CustomTestCase):
         adder.memory_budget = budget
         adder.mamba_chunk_grid = 64
         adder.strict_chunk_grid = True
+        adder.windows_retire_behind_checkpoints = True
         req = self.create_mock_req("continuing", priority=0, max_new_tokens=1)
         # Fitted on the page grid alone, the chunk is 32 tokens.
         self.assertEqual(
@@ -1789,6 +1791,23 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertIsNone(req.extend_end)
         self.assertEqual(adder.can_run_list, [])
+
+    def test_a_deterministic_continuation_keeps_one_grid_unit(self):
+        self.mock_token_allocator.available_size.return_value = 32768
+        self.mock_tree_cache.supports_mamba.return_value = True
+        req = self.create_mock_req("continuing", priority=0, max_new_tokens=1)
+        req.prefix_len = 256
+        req.full_untruncated_fill_ids = list(range(4096))
+        with get_context().override_server_args(
+            enable_deterministic_inference=True, _mamba_cache_chunk_size=64
+        ):
+            adder = self.create_adder(
+                self.create_running_batch(), rem_chunk_tokens=8192
+            )
+            adder.chunked_req_limit = 40
+
+            self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_end, 256 + 64)
 
     def test_swa_budget_for_req(self):
         # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,

@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Central request router for disaggregated diffusion pipelines."""
 
-import base64
 import json
 import logging
-import os
 import pickle
 import threading
 import time
@@ -12,7 +10,6 @@ from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import msgspec
@@ -55,6 +52,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     Req,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
+from sglang.multimodal_gen.runtime.utils.image_io import inline_local_image_paths
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
     RequestMetrics,
@@ -609,19 +607,8 @@ class DiffusionServer:
 
         if self._input_role == RoleType.PROMPT_ENCODER and req.image_path:
             # HTTP uploads belong to the head's filesystem, not the GPU workers'.
-            paths = (
-                req.image_path
-                if isinstance(req.image_path, (list, tuple))
-                else [req.image_path]
-            )
             try:
-                req.image_path = [
-                    "data:application/octet-stream;base64,"
-                    + base64.b64encode(Path(path).read_bytes()).decode("ascii")
-                    if isinstance(path, str) and os.path.isfile(path)
-                    else path
-                    for path in paths
-                ]
+                req.image_path = inline_local_image_paths(req.image_path)
                 payload = pickle.dumps(reqs)
             except OSError as error:
                 self._complete_with_error(

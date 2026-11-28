@@ -69,7 +69,7 @@ jobs:
       - name: cargo gen-api (generated bindings are up to date)
         run: |
           env -u PROTOC cargo gen-api --locked
-          generated=(sglang-api-types sglang-runtime-v1-types ../python/sglang/api/v1)
+          generated=(sglang-api-types ../python/sglang/api/v1)
           if [[ -n "$(git status --porcelain --untracked-files=all -- "${generated[@]}")" ]]; then
             git status --short --untracked-files=all -- "${generated[@]}"
             git diff -- "${generated[@]}"

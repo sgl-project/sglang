@@ -182,6 +182,7 @@ class TestLaunchServerShutdown(unittest.TestCase):
                 with (
                     patch.object(ls, "init_diffusion_tracing"),
                     patch.object(ls, "set_global_server_args"),
+                    patch.object(ls, "configure_media_url_policy"),
                     patch.object(ls, "create_app"),
                     patch.object(ls.uvicorn, "run") as run,
                 ):
