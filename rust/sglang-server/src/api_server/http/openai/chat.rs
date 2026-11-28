@@ -543,7 +543,7 @@ pub(crate) struct SamplingDefaults {
     temperature: Option<f64>,
     top_p: Option<f64>,
     /// OpenAI terminal defaults for chat completions.
-    fallback_temperature: f64,
+    pub(in crate::api_server::http) fallback_temperature: f64,
     fallback_top_p: f64,
 }
 
