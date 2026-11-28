@@ -41,9 +41,10 @@ class CustomLogitProcessor(ABC):
 
     # Whether the processor is right on every speculative verify row: it reads a
     # row's tokens as req.output_ids followed by params[ROW_PREFIX_KEY], or reads
-    # no history at all. Otherwise verify runs it on each request's first row
-    # only and commits one token per round for that request. Each row gets its
-    # own copy of the request's params.
+    # no history at all. Under overlap req.output_ids lags by the previous step,
+    # whose tokens lead every row's prefix, the first row's included. Otherwise
+    # verify runs it on each request's first row only and commits one token per
+    # round for that request. Each row gets its own copy of the request's params.
     supports_row_prefix: bool = False
 
     @abstractmethod
@@ -558,10 +559,11 @@ def apply_custom_logit_processor(
     """Apply each request's custom logit processor to its `rows_per_request`
     consecutive logits rows, in place.
 
-    `row_prefixes`, at speculative verify: per logits row, the draft tokens
-    between the request's committed output and that row. A processor that
-    supports them runs on every row with them in its params; any other runs on
-    each request's first row only, which has no draft token before it.
+    `row_prefixes`, at speculative verify: per logits row, the tokens between
+    req.output_ids and that row: the committed ones not appended yet (overlap),
+    then the row's drafts. A processor that supports them runs on every row
+    with them in its params; any other runs on each request's first row only,
+    which has no draft token before it.
     """
     if not sampling_info.has_custom_logit_processor:
         return

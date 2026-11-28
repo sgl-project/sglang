@@ -2287,11 +2287,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def custom_logit_processor_needs_sync(self) -> bool:
         """Whether a speculative verify of the next batch needs this batch's
         result processed first: its custom logit processors read req.output_ids,
-        which only result processing extends. Decode delays its sample instead."""
-        return (
-            self.sampling_info is not None
-            and self.sampling_info.has_custom_logit_processor
-            and not self.spec_algorithm.is_none()
+        which only result processing extends. A worker with the grammar barrier
+        (`supports_grammar_overlap`) puts the missing tokens in the row prefixes
+        instead, which a processor without `supports_row_prefix` does not read.
+        Non-speculative decode delays its sample instead."""
+        info = self.sampling_info
+        if (
+            info is None
+            or not info.has_custom_logit_processor
+            or self.spec_algorithm.is_none()
+        ):
+            return False
+        return not self.spec_algorithm.supports_grammar_overlap() or any(
+            not entry.processor.supports_row_prefix
+            for entry in info.custom_logit_processor.values()
         )
 
     def prepare_encoder_info_extend(

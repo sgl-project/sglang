@@ -163,8 +163,10 @@ class SpeculativeAlgorithm(Enum):
         return self.is_dflash_family()
 
     def supports_grammar_overlap(self) -> bool:
-        # Whether the worker advances the grammar FSM inside verify() (via the
-        # scheduler's grammar barrier), letting spec + grammar decode overlap.
+        # Whether the worker calls the scheduler's grammar barrier inside verify(),
+        # for the grammar FSM advance and the custom logit processors' pending
+        # tokens, so spec decode with a grammar or custom logit processors keeps
+        # overlap.
         # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
         # from a host corpus lookup, so it stays synchronous by design.
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.

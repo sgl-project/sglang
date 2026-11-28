@@ -1,7 +1,8 @@
 """Speculative verify runs a request's custom logit processor on each row's own
 history: the committed output followed by the row's draft prefix. A processor
 that does not declare it runs on the first row only, and its request commits
-one token per round."""
+one token per round. Under overlap, the committed tokens result processing has
+not appended to req.output_ids yet lead every row prefix."""
 
 import itertools
 import unittest
@@ -13,6 +14,9 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.sampling.custom_logit_processor import (
     ROW_PREFIX_KEY,
     CustomLogitProcessor,
@@ -31,6 +35,13 @@ register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 VOCAB = 32
 ROOT = 1
+
+
+class _Req:
+    """A request stub; hashable like Req, which the barrier's tokens key on."""
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
 
 
 class _CountUp(CustomLogitProcessor):
@@ -82,7 +93,7 @@ def _host_tree(layout, bs):
 
 def _sampling_info(processor, *, greedy, device):
     # Request 0 runs the processor after its committed output; request 1 has none.
-    req = SimpleNamespace(output_ids=[5, ROOT])
+    req = _Req(output_ids=[5, ROOT])
     return SamplingBatchInfo(
         temperatures=torch.ones((2, 1), device=device),
         top_ps=torch.ones(2, device=device),
@@ -108,25 +119,27 @@ def _sampling_info(processor, *, greedy, device):
 
 
 def _batch(processor, *, greedy, device):
+    info = _sampling_info(processor, greedy=greedy, device=device)
     return SimpleNamespace(
+        reqs=[info.custom_params[0]["__req__"], _Req()],
         device=device,
         forward_mode=SimpleNamespace(is_idle=lambda: False),
         seq_lens=torch.tensor([7, 11], device=device),
-        sampling_info=_sampling_info(processor, greedy=greedy, device=device),
+        sampling_info=info,
         req_pool_indices=torch.tensor([3, 5], device=device),
         return_logprob=False,
         has_grammar=False,
     )
 
 
-def _bound_verify(batch, layout):
+def _bound_verify(batch, layout, barrier=None):
     verify = VerifyStep(
         batch=batch,
         route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
         watermark=None,
         watermark_full_mask=True,
     )
-    verify.build_row_inputs(None, tree=_host_tree(layout, 2), barrier=None)
+    verify.build_row_inputs(None, tree=_host_tree(layout, 2), barrier=barrier)
     return verify
 
 
@@ -135,8 +148,39 @@ class TestRowPrefixes(CustomTestCase):
         """DFlash and DSpark verify a chain whose column 0 is the committed token."""
         chain = torch.tensor([[ROOT, 2, 3, 4], [ROOT, 7, 8, 9]])
         self.assertEqual(
-            verify_row_prefixes(*HostVerifyTree.from_linear_chain(chain).resolve()),
-            [[], [2], [2, 3], [2, 3, 4], [], [7], [7, 8], [7, 8, 9]],
+            verify_row_prefixes(
+                *HostVerifyTree.from_linear_chain(chain).resolve(),
+                pending_tokens=[[], [6, ROOT]],
+            ),
+            [
+                [],
+                [2],
+                [2, 3],
+                [2, 3, 4],
+                [6, 1],
+                [6, 1, 7],
+                [6, 1, 7, 8],
+                [6, 1, 7, 8, 9],
+            ],
+        )
+
+    def test_the_barrier_supplies_tokens_output_ids_lacks(self):
+        """Under overlap req.output_ids misses the previous step's tokens; the
+        barrier's tokens for them lead the row prefixes, so the processor reads
+        the same history as after result processing."""
+        batch = _batch(_CountUp(), greedy=True, device="cpu")
+        req = batch.reqs[0]
+        req.output_ids = [5]
+        calls = []
+
+        def barrier():
+            calls.append(None)
+            return {req: [ROOT]}
+
+        verify = _bound_verify(batch, _chain(), barrier=barrier)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            verify.row_prefixes, [[ROOT], [ROOT, 2], [ROOT, 2, 3], [], [2], [2, 3]]
         )
 
 
@@ -170,27 +214,108 @@ class TestOneTokenCap(CustomTestCase):
 
 class TestCustomLogitProcessorSync(CustomTestCase):
     """Under overlap the last result is processed after the next launch, so a
-    verify of the next batch would read req.output_ids a round late."""
+    verify of the next batch would read req.output_ids a round late, unless
+    the worker's barrier hands it the missing tokens in the row prefixes."""
 
-    def _batch(self, *, has_custom, algorithm, has_grammar=False):
+    def _batch(self, processor, *, algorithm, has_grammar=False):
+        entries = {} if processor is None else {0: SimpleNamespace(processor=processor)}
         return SimpleNamespace(
-            sampling_info=SimpleNamespace(has_custom_logit_processor=has_custom),
+            sampling_info=SimpleNamespace(
+                has_custom_logit_processor=processor is not None,
+                custom_logit_processor=entries,
+            ),
             spec_algorithm=algorithm,
             has_grammar=has_grammar,
         )
 
-    def test_the_scheduler_processes_the_last_result_first(self):
-        batch = self._batch(
-            has_custom=True, algorithm=SpeculativeAlgorithm.from_string("EAGLE")
-        )
-        batch.grammar_needs_sync = lambda: False
-        batch.custom_logit_processor_needs_sync = lambda: (
-            ScheduleBatch.custom_logit_processor_needs_sync(batch)
-        )
-        with envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False):
-            self.assertTrue(
-                Scheduler.should_process_last_batch_early(SimpleNamespace(), batch)
+    def test_the_scheduler_syncs_only_for_a_processor_the_barrier_cannot_serve(self):
+        # EAGLE has the barrier; a processor without row prefixes does not read it.
+        for processor, want in [
+            (_CountUpWithoutRowPrefix(), True),
+            (_CountUp(), False),
+        ]:
+            batch = self._batch(
+                processor, algorithm=SpeculativeAlgorithm.from_string("EAGLE")
             )
+            batch.grammar_needs_sync = lambda: False
+            batch.custom_logit_processor_needs_sync = lambda: (
+                ScheduleBatch.custom_logit_processor_needs_sync(batch)
+            )
+            with (
+                self.subTest(processor=type(processor).__name__),
+                envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
+            ):
+                self.assertEqual(
+                    Scheduler.should_process_last_batch_early(SimpleNamespace(), batch),
+                    want,
+                )
+
+
+class TestPendingTokens(CustomTestCase):
+    """The barrier lists, per custom-processor request, the tokens processing
+    the queued result will append to req.output_ids."""
+
+    def _req(self, *, custom=True, grammar=None):
+        return _Req(custom_logit_processor="proc" if custom else None, grammar=grammar)
+
+    def _pending(self, result, batch, left=()):
+        processor = SimpleNamespace(still_in_batch=lambda req: req not in left)
+        return SchedulerBatchResultProcessor.pending_output_tokens(
+            processor, result, batch
+        )
+
+    def _batch(self, reqs, *, decode, chunked_req=None):
+        return SimpleNamespace(
+            reqs=reqs,
+            chunked_req=chunked_req,
+            forward_mode=SimpleNamespace(
+                is_decode=lambda: decode, is_extend=lambda: not decode
+            ),
+        )
+
+    def test_decode_lists_each_accept_run(self):
+        plain, with_grammar, no_custom, left = (
+            self._req(),
+            self._req(grammar="fsm"),
+            self._req(custom=False),
+            self._req(),
+        )
+        result = SimpleNamespace(
+            copy_done=None,
+            next_token_ids=torch.tensor([1, 2, 0, 3, 4, 5, 6, 0, 0, 7, 8, 0]),
+            accept_lens=torch.tensor([2, 3, 1, 2]),
+            speculative_output_stride=3,
+            # advance_grammar_fsm cut the grammar request's run at termination
+            grammar_retained_tokens=[None, [3], None, None],
+        )
+        batch = self._batch([plain, with_grammar, no_custom, left], decode=True)
+        self.assertEqual(
+            self._pending(result, batch, left=(left,)),
+            {plain: [1, 2], with_grammar: [3]},
+        )
+
+    def test_extend_lists_the_prefill_token_except_a_middle_chunk(self):
+        done, chunked = self._req(), self._req()
+        result = SimpleNamespace(copy_done=None, next_token_ids=torch.tensor([9, 4]))
+        batch = self._batch([done, chunked], decode=False, chunked_req=chunked)
+        self.assertEqual(self._pending(result, batch), {done: [9]})
+
+    def test_the_barrier_advances_the_grammar_then_merges_queued_results(self):
+        req = self._req()
+        calls = []
+        processor = SimpleNamespace(
+            advance_grammar_fsm=lambda result, batch: calls.append(("fsm", result)),
+            pending_output_tokens=lambda result, batch: (
+                calls.append(("pending", result)) or {req: [result]}
+            ),
+        )
+        scheduler = SimpleNamespace(
+            result_queue=[("b1", 1), ("b2", 2)], batch_result_processor=processor
+        )
+        self.assertEqual(Scheduler._resolve_pending_results(scheduler), {req: [1, 2]})
+        self.assertEqual(
+            calls, [("fsm", 1), ("pending", 1), ("fsm", 2), ("pending", 2)]
+        )
 
 
 def _verify_input(layout, *, kind, bs):

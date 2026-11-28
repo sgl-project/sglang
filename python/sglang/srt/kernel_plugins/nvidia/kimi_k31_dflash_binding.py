@@ -81,7 +81,11 @@ class DFlashRuntime(Protocol):
         every TP rank before any launch, runs SGLang's round. A runtime that binds
         ``join_aux`` lets SGLang's aux append run on its side stream: it joins the
         pending append before its draft forward, and returns ``aux_done`` as the
-        result's ``side_stream_done`` after appending there itself."""
+        result's ``side_stream_done`` after appending there itself. A round that
+        applies the grammar mask or custom logit processors passes
+        ``grammar_barrier`` to ``VerifyStep.build_row_inputs``; under overlap the
+        barrier advances the grammar FSM and returns the previous step's tokens,
+        which req.output_ids lacks yet."""
 
 
 # ---- Binding: the worker state a runtime may read.

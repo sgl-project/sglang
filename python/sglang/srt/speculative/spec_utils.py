@@ -5,7 +5,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
@@ -941,18 +941,23 @@ def verify_row_prefixes(
     retrieve_next_token: torch.Tensor,
     retrieve_next_sibling: torch.Tensor,
     draft_tokens: torch.Tensor,
+    *,
+    pending_tokens: List[List[int]],
 ) -> List[List[int]]:
-    """Per verify row, the draft tokens on the path from the root to the row's
-    node, the root excluded: it is the request's last committed token. A chain's
-    row j gets drafts 1..j. The arguments are the (bs, num_draft_tokens) host tree.
+    """Per verify row, the request's `pending_tokens`, then the draft tokens on
+    the path from the root to the row's node, the root excluded: it is the
+    request's last committed token. A chain's row j gets drafts 1..j. The tree
+    arguments are the (bs, num_draft_tokens) host tree; `pending_tokens` holds,
+    per request, the committed tokens not yet in req.output_ids (overlap).
     """
     row_prefixes = []
-    for next_token, next_sibling, tokens in zip(
+    for next_token, next_sibling, tokens, pending in zip(
         retrieve_next_token.tolist(),
         retrieve_next_sibling.tolist(),
         draft_tokens.tolist(),
+        pending_tokens,
     ):
-        prefixes = [[] for _ in tokens]
+        prefixes = [list(pending) for _ in tokens]
         stack = [0]
         while stack:
             node = stack.pop()
@@ -971,16 +976,13 @@ def build_grammar_vocab_mask(
     tree: HostVerifyTree,
     sampling_info: SamplingBatchInfo,
     device,
-    barrier: Optional[Callable[[], None]],
 ) -> Optional[GrammarMask]:
     """Build the constrained-decoding bitmask over a verify tree and stage it on device.
 
     Call it after the target verify launch -- every step here is host work, so it all
-    overlaps that forward. ``barrier`` advances the previous batch's FSM over its
-    committed tokens, which the traversal then reads, so it has to run first.
+    overlaps that forward -- and after the barrier has advanced the FSM over the
+    previous batch's committed tokens, which the traversal reads.
     """
-    if barrier is not None:
-        barrier()
     vocab_mask, grammar = generate_token_bitmask(
         reqs,
         *tree.resolve(),
