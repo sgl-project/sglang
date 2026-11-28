@@ -6,6 +6,7 @@ Follows the same pattern as MooncakeStore:
 - Key suffix generation per TP rank / PP rank
 """
 
+import hashlib
 import logging
 import os
 import socket
@@ -239,11 +240,21 @@ def _warn_extra_config_scope(extra: dict, distributed_enabled: bool) -> None:
                 )
 
 
+# Stands in for a real page hash when sizing the SPDK key guard. Page keys are
+# SHA-256 hex, the same width as get_hash_str (cpp_utils/hash_binding.cpp,
+# kHexLen). If the page hash changes, update this and the guard together.
+_PAGE_HASH_PLACEHOLDER = hashlib.sha256(b"").hexdigest()
+
+
 class UMBPStore(HiCacheStorage):
     """Local DRAM+SSD storage backend for HiCache L3 caching.
 
     Compatible with the zero-copy v1 interface used by CacheController.
     """
+
+    # MoRI's SPDK proxy clamps keys to kMaxKeyLen - 1 = 255 bytes.
+    _SPDK_MAX_KEY_BYTES = 255
+    _spdk_key_check = False
 
     def __init__(
         self,
@@ -918,13 +929,13 @@ class UMBPStore(HiCacheStorage):
 
         # Initialize before the optional constructor-time pool registration.
         self.registered_pools: dict = {}
-        self._kv_anchor_is_logical = False
-        self._kv_anchor_is_page_envelope = False
+        self._kv_anchor_is_logical = (
+            mem_pool_host is not None and mem_pool_host.kv_buffer is None
+        )
+        self._kv_anchor_is_page_envelope = bool(
+            mem_pool_host is not None and mem_pool_host.stores_page_envelope
+        )
         self._registered_regions: set = set()
-
-        self.client = UMBPClient(cfg)
-        if mem_pool_host is not None:
-            self.register_mem_pool_host(mem_pool_host)
 
         self.enable_pp = self.pp_size > 1
         if self.enable_pp:
@@ -955,6 +966,26 @@ class UMBPStore(HiCacheStorage):
             self.local_rank,
             cfg.ssd.ssd_backend,
         )
+
+        # Only enforce the SPDK key limit for standalone auto-start. Embedded mode
+        # receives the SSD config but serves DRAM only. An external standalone server
+        # reads its own env, so this config never reaches it.
+        sp = cfg.standalone_process
+        self._spdk_key_check = (
+            cfg.ssd.enabled
+            and cfg.ssd.ssd_backend in ("spdk", "spdk_proxy")
+            and sp is not None
+            and sp.auto_start
+        )
+        if self._spdk_key_check and not self._kv_anchor_is_logical:
+            keys, _ = self._anchor_keys([_PAGE_HASH_PLACEHOLDER])
+            self._check_spdk_key_budget(keys, "anchor")
+
+        # Build the client only after the key check, so a failed check does not
+        # leave a standalone server started by UMBPClient running.
+        self.client = UMBPClient(cfg)
+        if mem_pool_host is not None:
+            self.register_mem_pool_host(mem_pool_host)
 
         # ------------------------------------------------------------------
         # Optional KV events subscriber
@@ -1164,12 +1195,35 @@ class UMBPStore(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if host_pool_name == PoolName.KV:
             return
+        if self._spdk_key_check:
+            self._check_hybrid_pool_budget(host_pool, host_pool_name)
         self.registered_pools[host_pool_name] = host_pool
         self._register_host_buffer_for_zero_copy(host_pool)
+
+    def _check_hybrid_pool_budget(self, host_pool, pool_name):
+        keys, _ = self._get_hybrid_page_component_keys(
+            [_PAGE_HASH_PLACEHOLDER], PoolTransfer(name=pool_name), host_pool=host_pool
+        )
+        if not keys:
+            return
+        self._check_spdk_key_budget(keys, f"hybrid pool {pool_name}")
 
     # ------------------------------------------------------------------
     # Key suffix generation — mirrors MooncakeStore
     # ------------------------------------------------------------------
+    def _check_spdk_key_budget(self, keys, kind: str) -> None:
+        if not keys:
+            return
+        longest = max(len(key.encode("utf-8")) for key in keys)
+        if longest > self._SPDK_MAX_KEY_BYTES:
+            prefix_bytes = len((self.config_prefix or "").encode("utf-8"))
+            raise ValueError(
+                f"UMBP SPDK store: longest {kind} key is {longest} UTF-8 bytes, "
+                f"over the SPDK key limit of {self._SPDK_MAX_KEY_BYTES}. "
+                f"The namespace prefix is {prefix_bytes} bytes; "
+                "shorten the served model name or extra_backend_tag."
+            )
+
     def _anchor_key_suffixes(self) -> tuple[str, ...]:
         if self._kv_anchor_is_page_envelope:
             # Object format does not determine whether TP ranks share its bytes.
@@ -1185,9 +1239,16 @@ class UMBPStore(HiCacheStorage):
             f"_{rank}_{component}" for rank in ranks for component in ("k", "v")
         )
 
+    def _namespace_key(self, key: str) -> str:
+        """Apply the served-model prefix. Every anchor and hybrid key goes through here."""
+        return f"{self.config_prefix}_{key}" if self.config_prefix else key
+
     def _anchor_keys(self, keys) -> tuple[list[str], int]:
         suffixes = self._anchor_key_suffixes()
-        return [f"{key}{suffix}" for key in keys for suffix in suffixes], len(suffixes)
+        key_list = [
+            self._namespace_key(f"{key}{suffix}") for key in keys for suffix in suffixes
+        ]
+        return key_list, len(suffixes)
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
@@ -1350,11 +1411,17 @@ class UMBPStore(HiCacheStorage):
     # Multi-pool v2 interface
     # ------------------------------------------------------------------
     def _get_hybrid_page_component_keys(
-        self, page_keys, transfer: PoolTransfer, *, rank_suffix: Optional[str] = None
+        self,
+        page_keys,
+        transfer: PoolTransfer,
+        *,
+        rank_suffix: Optional[str] = None,
+        host_pool=None,
     ):
-        """Expand logical page keys for one registered hybrid side pool."""
+        """Expand logical page keys for one hybrid side pool."""
         pool_name = transfer.name
-        host_pool = self.registered_pools.get(pool_name)
+        if host_pool is None:
+            host_pool = self.registered_pools.get(pool_name)
         if host_pool is None:
             raise ValueError(f"Unregistered UMBP hybrid pool: {pool_name}")
 
@@ -1401,11 +1468,7 @@ class UMBPStore(HiCacheStorage):
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
         ]
-        if self.config_prefix:
-            component_keys = [
-                f"{self.config_prefix}_{component_key}"
-                for component_key in component_keys
-            ]
+        component_keys = [self._namespace_key(key) for key in component_keys]
         return component_keys, len(suffixes)
 
     def batch_exists_v2(

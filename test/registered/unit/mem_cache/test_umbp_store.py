@@ -320,9 +320,106 @@ class TestUMBPStore(unittest.TestCase):
         mem_pool.fill_page(0, ord("C"), ord("D"))
         store.batch_set_v1(["clear_key"], make_indices([0]))
 
-        self.assertTrue(store.exists("clear_key_0_k"))
+        self.assertTrue(store.exists("test-model_clear_key_0_k"))
         store.clear()
-        self.assertFalse(store.exists("clear_key_0_k"))
+        self.assertFalse(store.exists("test-model_clear_key_0_k"))
+
+    def test_long_prefix_rejected_at_init_for_standalone_auto_start_spdk(self):
+        umbp_module = import_umbp_store_module()
+
+        class FakeUMBPConfig:
+            def __init__(self):
+                self.role = None
+                self.dram = SimpleNamespace(capacity_bytes=0)
+                self.ssd = SimpleNamespace(
+                    enabled=False,
+                    storage_dir="/tmp",
+                    capacity_bytes=0,
+                    ssd_backend="file",
+                    spdk_proxy_tenant_id=0,
+                    spdk_proxy_tenant_quota_bytes=0,
+                )
+                self.distributed = None
+                self.standalone_process = None
+
+            @classmethod
+            def from_environment(cls):
+                return cls()
+
+        built_clients = []
+
+        class FakeUMBPClient:
+            def __init__(self, _config):
+                built_clients.append(_config)
+
+        fake_role = SimpleNamespace(
+            Standalone="standalone",
+            SharedSSDLeader="leader",
+            SharedSSDFollower="follower",
+        )
+        real = umbp_module._import_umbp_client()
+        imported = (FakeUMBPClient, FakeUMBPConfig, fake_role, *real[3:])
+        long_model = "m" * 200
+        embedded_spdk = MockStorageConfig(
+            model_name=long_model,
+            extra_config={
+                "dram_capacity_bytes": 1024,
+                "ssd_enabled": True,
+                "ssd_backend": "spdk",
+            },
+        )
+        standalone_spdk = MockStorageConfig(
+            model_name=long_model,
+            extra_config={
+                **embedded_spdk.extra_config,
+                "standalone_address": "unix:///tmp/umbp-test.sock",
+                "standalone_auto_start": True,
+            },
+        )
+        standalone_external_spdk = MockStorageConfig(
+            model_name=long_model,
+            extra_config={
+                **standalone_spdk.extra_config,
+                "standalone_auto_start": False,
+            },
+        )
+        dram = MockStorageConfig(
+            model_name=long_model,
+            extra_config={"dram_capacity_bytes": 1024, "ssd_enabled": False},
+        )
+
+        with patch.object(umbp_module, "_import_umbp_client", return_value=imported):
+            umbp_module.UMBPStore(standalone_external_spdk).close()
+            clients_before = len(built_clients)
+            with self.assertRaisesRegex(ValueError, "longest anchor key"):
+                umbp_module.UMBPStore(standalone_spdk)
+            self.assertEqual(len(built_clients), clients_before)
+            umbp_module.UMBPStore(dram).close()
+            umbp_module.UMBPStore(embedded_spdk).close()
+
+            boundary_model = "m" * 186  # Anchor keys are exactly 255 bytes.
+            boundary_spdk = MockStorageConfig(
+                model_name=boundary_model, extra_config=standalone_spdk.extra_config
+            )
+            store = umbp_module.UMBPStore(boundary_spdk)
+            self.assertIsInstance(store, umbp_module.UMBPStore)
+            store.close()
+
+            pool_name = umbp_module.PoolName.DEEPSEEK_V4_C4
+            store = umbp_module.UMBPStore(boundary_spdk)
+            with self.assertRaisesRegex(ValueError, "hybrid pool"):
+                store.register_mem_host_pool_v2(MockHybridSidePool(), pool_name)
+            self.assertNotIn(pool_name, store.registered_pools)
+            store.close()
+
+            boundary_dram = MockStorageConfig(
+                model_name=boundary_model, extra_config=dram.extra_config
+            )
+            store = umbp_module.UMBPStore(boundary_dram)
+            pool = MockHybridSidePool()
+            store.register_mem_host_pool_v2(pool, pool_name)
+            self.assertIs(store.registered_pools[pool_name], pool)
+            store.close()
 
     def test_legacy_interface(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
