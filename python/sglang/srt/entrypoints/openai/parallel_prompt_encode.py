@@ -41,6 +41,7 @@ import re
 import threading
 import time
 import weakref
+from array import array
 from collections import OrderedDict
 from itertools import chain
 
@@ -54,8 +55,10 @@ _MIN_CHUNK_CHARS = 2048
 _MAX_CHUNKS = 64
 
 # Per tokenizer; a text longer than the entry limit is encoded but not kept.
-_SEGMENT_CACHE_MAX_TOKENS = 1 << 20
-_SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 8
+# Agents resend their whole history every turn; an LRU smaller than many
+# conversations' histories thrashes. int32 ids keep the bound ~256 MB.
+_SEGMENT_CACHE_MAX_TOKENS = 1 << 26
+_SEGMENT_CACHE_MAX_ENTRY_TOKENS = 1 << 20
 
 # Pre-tokenizers that act on each piece independently of its position in the
 # sequence. Metaspace (prepend_scheme="first") and anything unknown are not.
@@ -396,8 +399,9 @@ class _SegmentEncoder:
         encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
-            encoded[text] = tuple(
-                chain.from_iterable(e.ids for e in encodings[start : start + count])
+            encoded[text] = array(
+                "i",
+                chain.from_iterable(e.ids for e in encodings[start : start + count]),
             )
             start += count
 
