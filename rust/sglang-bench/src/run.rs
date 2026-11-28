@@ -12,7 +12,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use sglang_api_types::api::v1 as api;
 use tokio::sync::Semaphore;
 
-use crate::args::{Args, Protocol};
+use crate::args::{Api, Args, Protocol};
 use crate::dataset::DatasetRow;
 use crate::request::{GrpcClient, RequestOutput, RequestTemplate};
 use crate::{dataset, hf, metrics, request};
@@ -120,6 +120,17 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
     };
     let rows = dataset::load(&args, tokenizer.as_ref(), corpus.as_deref())?;
 
+    let mut extra_body = args.parse_extra_body()?;
+    // As in Python: the native route reports cached tokens unasked, the
+    // OpenAI routes split them by tier only on request.
+    if args.cache_report {
+        if !args.backend.is_sglang() {
+            println!("WARNING: --cache-report is only supported with sglang backends.");
+        } else if args.backend.api() != Api::SglangGenerate {
+            extra_body.insert("return_cached_tokens_details".to_owned(), true.into());
+        }
+    }
+
     let template = RequestTemplate {
         api: args.backend.api(),
         api_url: args.api_url(),
@@ -131,7 +142,7 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
         return_logprob: args.return_logprob,
         top_logprobs_num: args.top_logprobs_num,
         logprob_start_len: args.logprob_start_len,
-        extra_body: args.parse_extra_body()?,
+        extra_body,
         headers: headers.clone(),
         grpc,
     };

@@ -93,8 +93,8 @@ cp target/release/libsglang_bench.so \
   server's `sglang.api.v1` service (below).
 - **Datasets**: `random`, `random-ids`, `sharegpt`.
 - Poisson request pacing (`--request-rate`), a concurrency cap, warmup, cache
-  flush, profiler start/stop, the readiness probe, `--extra-request-body`,
-  custom headers, and API-key auth.
+  flush, `--cache-report`, profiler start/stop, the readiness probe,
+  `--extra-request-body`, custom headers, and API-key auth.
 - The full metric set, including the per-second peak-throughput and
   peak-concurrency windows, with NumPy's percentile interpolation and
   population standard deviation so the numbers line up with the Python
@@ -140,9 +140,8 @@ silently dropped flag would report a benchmark nobody ran.
 - **Datasets**: `image`, `mmmu`, `mooncake`, `agentic-trace`,
   `generated-shared-prefix`, `custom`, `openai`, `longbench-v2`,
   `speed-bench`, and trace-timestamp replay.
-- Multi-turn replay, LoRA request distributions, `--cache-report`,
-  `--plot-throughput`, PD-separated profiling, and the per-stage profiler
-  options.
+- Multi-turn replay, LoRA request distributions, `--plot-throughput`,
+  PD-separated profiling, and the per-stage profiler options.
 
 Reach for the Python script for any of those. Both write the same result
 shape, so a mixed set of runs stays comparable.
