@@ -169,6 +169,86 @@ class TestMatchBundles:
         assert len(results) == 1
         assert len(results[0].y) == 2
 
+    def test_baseline_missing_key_column_matches_on_shared_subset(self) -> None:
+        """Baseline dump lacks a key column the target has (e.g. a
+        framework-specific field). Matching must fall back to the shared
+        columns -- the baseline row pairs with every target group that agrees
+        on them -- rather than silently producing an empty baseline bundle.
+        """
+        target_df: pl.DataFrame = _make_df(
+            [
+                {
+                    "name": "t_a",
+                    "step": 0,
+                    "recompute_status": "on",
+                    "filename": "a.pt",
+                },
+                {
+                    "name": "t_a",
+                    "step": 0,
+                    "recompute_status": "off",
+                    "filename": "b.pt",
+                },
+            ]
+        )
+        baseline_df: pl.DataFrame = _make_df(
+            [{"name": "t_a", "step": 0, "filename": "a.pt"}]
+        )
+        assert "recompute_status" not in baseline_df.columns
+
+        results: list[Pair[TensorBundleInfo]] = match_bundles(
+            dfs=Pair(x=baseline_df, y=target_df),
+            skip_keys={"filename"},
+        )
+
+        assert len(results) == 2
+        assert all(len(r.y) == 1 for r in results)
+        assert all(len(r.x) == 1 and r.x[0].name == "t_a" for r in results)
+
+    def test_empty_baseline_yields_empty_baseline_bundles(self) -> None:
+        """Empty baseline, non-empty target: every bundle is produced with an
+        empty baseline side (no match), rather than being dropped.
+        """
+        target_df: pl.DataFrame = _make_df(
+            [_make_row(name="t_a"), _make_row(name="t_b")]
+        )
+        baseline_df: pl.DataFrame = _make_df([])
+
+        results: list[Pair[TensorBundleInfo]] = match_bundles(
+            dfs=Pair(x=baseline_df, y=target_df),
+            skip_keys={"filename"},
+        )
+
+        assert len(results) == 2
+        assert all(r.x == [] and len(r.y) == 1 for r in results)
+
+    def test_output_order_follows_target_first_appearance(self) -> None:
+        """Bundle order must follow the target's row order (first appearance of
+        each key), matching the previous unique(maintain_order=True) behavior --
+        downstream reports are read in this order.
+        """
+        target_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_c"),
+                _make_row(name="t_a"),
+                _make_row(name="t_b"),
+            ]
+        )
+        baseline_df: pl.DataFrame = _make_df(
+            [
+                _make_row(name="t_a"),
+                _make_row(name="t_b"),
+                _make_row(name="t_c"),
+            ]
+        )
+
+        results: list[Pair[TensorBundleInfo]] = match_bundles(
+            dfs=Pair(x=baseline_df, y=target_df),
+            skip_keys={"filename"},
+        )
+
+        assert [r.y[0].name for r in results] == ["t_c", "t_a", "t_b"]
+
 
 class TestMatchBundlesPipelineParallel:
     """Tests verifying that PP works correctly with the existing matching logic."""
