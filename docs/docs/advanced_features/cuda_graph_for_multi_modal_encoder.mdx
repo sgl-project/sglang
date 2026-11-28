@@ -53,6 +53,24 @@ For the same graph_key = S, you not only require the input shape to match, but a
 The feature reallocates a larger sin_cos_ws when seq_len increases.
 The max_content_len is used to make sure the maximum size of the allocated rotary buffer.
 
+### Token buckets (Qwen3-VL family on FA3)
+
+For Qwen3-VL, Qwen3.5 and the Qwen3-Omni vision tower with the `fa3` attention
+backend, the runner above is replaced by `ViTBucketedCudaGraphRunner`. It
+captures one graph per token bucket the first time an image is encoded, and
+pads each batch to the smallest bucket that holds it:
+
+- `cu_seqlens` has a fixed length per bucket and is rewritten on every replay;
+  unused entries are empty sequences, so any mix of image sizes and counts that
+  fits a bucket reuses the same graph.
+- Padding rows are split into their own short attention sequences, so they never
+  attend to real tokens.
+- Batches larger than the largest bucket run eagerly.
+- Outputs are bit-identical to the eager encoder.
+
+Buckets are pre-merge token counts and can be set with
+`SGLANG_VIT_CUDA_GRAPH_TOKEN_BUCKETS` (comma-separated multiples of the spatial
+merge unit); the default goes from 256 to 4096 tokens.
 
 ## Command Example
 You can enable CUDA Graph for ViT by setting env variable `SGLANG_VIT_ENABLE_CUDA_GRAPH=1`, for example:

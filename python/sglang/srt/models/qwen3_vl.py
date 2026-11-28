@@ -87,11 +87,16 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     RETAINED_CUDA_IPC_FEATURE_PROXY_KEY,
     CudaIpcTensorTransportProxy,
 )
+from sglang.srt.multimodal.vit_bucketed_cuda_graph_runner import (
+    ViTBucketedCudaGraphRunner,
+    parse_token_buckets,
+)
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu, round_up
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_npu, round_up
 
 _is_npu = is_npu()
+_is_cuda = is_cuda()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
 if _is_npu:
     from sglang.srt.hardware_backend.npu.graph_runner.vit_npu_graph_runner import (
@@ -481,6 +486,30 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         self.tp_size = 1 if use_data_parallel else get_parallel().tp_size
         self.graph_runners = graph_runners_dict[self.device.type](self)
+        # Token-bucketed graphs replace the exact-shape runner where the
+        # attention backend supports padded varlen metadata.
+        self.bucketed_graph_runner: Optional[ViTBucketedCudaGraphRunner] = None
+        if (
+            envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+            and _is_cuda
+            and ViTBucketedCudaGraphRunner.supports_backend(
+                self.blocks[0].attn.qkv_backend_name
+            )
+        ):
+            self.bucketed_graph_runner = ViTBucketedCudaGraphRunner(
+                self,
+                self._forward_blocks,
+                merge_unit=self.spatial_merge_unit,
+                token_buckets=parse_token_buckets(
+                    envs.SGLANG_VIT_CUDA_GRAPH_TOKEN_BUCKETS.get(),
+                    self.spatial_merge_unit,
+                ),
+            )
+            # Each bucket is warmed up before capture, so the compiled rotary
+            # kernel is never built inside a capture and graph outputs stay
+            # bit-identical to eager.
+            for blk in self.blocks:
+                blk.attn.compiled_rotary_in_cuda_graph = True
 
     @property
     def dtype(self) -> torch.dtype:
@@ -899,10 +928,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
+        use_bucketed_graph = False
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             if _is_npu:
                 return self.forward_with_npu_graph(x, grid_thw)
-            return self.forward_with_cuda_graph(x, grid_thw)
+            use_bucketed_graph = self.bucketed_graph_runner is not None
+            if not use_bucketed_graph:
+                return self.forward_with_cuda_graph(x, grid_thw)
 
         x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         x = self.patch_embed(x)
@@ -929,6 +961,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         token_cu_seqlens = np.concatenate(
             [np.zeros(1, dtype=np.int32), token_cu_seqlens]
         )
+
+        if use_bucketed_graph:
+            hidden_states = self.bucketed_graph_runner.run(
+                x, token_cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
+            )
+            if hidden_states is not None:
+                return hidden_states
 
         # ---- pre-compute attention metadata once for all layers ----
         packed_indptrs = None
@@ -980,8 +1019,23 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             flashinfer_max_seqlen=flashinfer_max_seqlen,
         )
 
-        x = x.unsqueeze(1)
+        return self._forward_blocks(
+            x.unsqueeze(1),
+            cu_seqlens,
+            rotary_pos_emb_cos,
+            rotary_pos_emb_sin,
+            forward_metadata,
+        )
 
+    def _forward_blocks(
+        self,
+        x: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+        forward_metadata: VisionAttentionMetadata,
+    ) -> torch.Tensor:
+        """Transformer blocks and mergers; shared by eager and bucketed graphs."""
         deepstack_feature_lists = []
         num_deepstack_captured = 0
 

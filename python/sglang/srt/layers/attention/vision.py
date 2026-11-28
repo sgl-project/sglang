@@ -1219,6 +1219,10 @@ class VisionAttention(nn.Module):
         print_info_once(f"Using {qkv_backend} as multimodal attention backend.")
 
         self.qkv_backend_name: str = qkv_backend
+        # Graph runners that warm up every captured shape eagerly can keep the
+        # compiled rotary kernel (see forward); the others must not compile
+        # inside a capture.
+        self.compiled_rotary_in_cuda_graph = False
 
         self.customized_position_embedding_applier = (
             customized_position_embedding_applier
@@ -1547,6 +1551,7 @@ class VisionAttention(nn.Module):
             rotary_fn = (
                 apply_rotary_pos_emb_native_eager
                 if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get()
+                and not self.compiled_rotary_in_cuda_graph
                 else apply_rotary_pos_emb
             )
             q, k = rotary_fn(q, k, cos, sin)
