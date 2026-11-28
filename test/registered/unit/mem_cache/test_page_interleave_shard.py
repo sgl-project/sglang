@@ -1194,7 +1194,7 @@ def _unified_tree(page_size=4, pool_size=256, disable=False):
     )
     req_pool = ReqToTokenPool(
         size=8,
-        max_context_len=128,
+        row_width=128,
         device="cpu",
         enable_memory_saver=False,
     )
@@ -1247,7 +1247,7 @@ class TestShardedAllocationEviction(CustomTestCase):
                 disable=False,
                 req_to_token_pool=ReqToTokenPool(
                     size=8,
-                    max_context_len=128,
+                    row_width=128,
                     device="cpu",
                     enable_memory_saver=False,
                 ),
@@ -1401,7 +1401,7 @@ class TestShardedCoreGate(_TreeCoreBackendCase):
         params = CacheInitParams(
             disable=False,
             req_to_token_pool=ReqToTokenPool(
-                size=8, max_context_len=128, device="cpu", enable_memory_saver=False
+                size=8, row_width=128, device="cpu", enable_memory_saver=False
             ),
             token_to_kv_pool_allocator=tree.token_to_kv_pool_allocator,
             page_size=4,
@@ -2334,11 +2334,10 @@ class TestOwnerMatchedLoadBack(CustomTestCase):
         self.assertEqual(len(controller.load_queue), 1)
 
 
+@parameterized_class(("tree_core_backend",), [("python",), ("rust",)])
 class TestRotationPhase(_TreeCoreBackendCase):
     """The backup's host start class: rotation base + the node's first
     position-page, read host-side (the device value is on the GPU)."""
-
-    tree_core_backend = "python"
 
     def _phase(self, tree, tokens):
         node = tree.match_prefix(

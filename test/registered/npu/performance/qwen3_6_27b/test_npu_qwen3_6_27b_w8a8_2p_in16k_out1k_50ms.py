@@ -15,6 +15,7 @@ register_npu_ci(
 )
 
 QWEN3_6_27B_16K_1k_ENVS = {
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
@@ -45,7 +46,7 @@ QWEN3_6_27B_16K_1k_OTHER_ARGS = [
     "--max-mamba-cache-size",
     74,
     "--mem-fraction-static",
-    0.70,
+    0.63,
     "--cuda-graph-bs-decode",
     1,
     2,

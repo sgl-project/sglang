@@ -162,8 +162,6 @@ class SystemOneServing(OpenAIServingDecisions):
             tokenizer_manager.tokenizer,
             request,
             max_prompt_tokens=max_joint_prompt_tokens(
-                context_len=tokenizer_manager.context_len,
-                num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
                 max_req_input_len=tokenizer_manager.max_req_input_len,
                 max_prefill_tokens=get_schedule().max_prefill_tokens,
             ),
@@ -222,8 +220,6 @@ class SystemOneServing(OpenAIServingDecisions):
         max_length = min(
             REFERENCE_MAX_LENGTH,
             max_joint_prompt_tokens(
-                context_len=tokenizer_manager.context_len,
-                num_reserved_tokens=tokenizer_manager.num_reserved_tokens,
                 max_req_input_len=tokenizer_manager.max_req_input_len,
                 max_prefill_tokens=get_schedule().max_prefill_tokens,
             ),

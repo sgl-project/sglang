@@ -4,11 +4,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
+from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.sampling_test_utils import build_step_penalties
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -32,7 +34,7 @@ def _step(num_reqs):
     pool = PenaltyStatusPool(VOCAB_SIZE, "cpu")
     pool.alloc(reqs)
     pool.reset_history(reqs)
-    return StepPenalties.build(reqs, pool)
+    return build_step_penalties(reqs, pool)
 
 
 def _sampling_info(bs):
@@ -54,6 +56,16 @@ def _sampling_info(bs):
 def _row_counts(logits, tokens):
     """Each row's count of `tokens`, read back from a frequency penalty of 1."""
     return (-logits[:, tokens]).round().long().tolist()
+
+
+def _verify(batch, grammar_mask=None):
+    return VerifyStep(
+        batch=batch,
+        route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+        watermark=None,
+        watermark_full_mask=True,
+        grammar_mask=grammar_mask,
+    )
 
 
 class TestVerifyPenaltyPaths(CustomTestCase):
@@ -84,7 +96,7 @@ class TestVerifyPenaltyPaths(CustomTestCase):
 
         with patch.object(step, "apply_verify", side_effect=apply_then_stop):
             with self.assertRaises(_Stop):
-                eagle_utils.eagle_sample(verify_input, batch, logits_output)
+                eagle_utils.eagle_sample(verify_input, _verify(batch), logits_output)
 
         self.assertEqual(
             _row_counts(logits_output.next_token_logits, [5, 6, 9]),
@@ -143,11 +155,7 @@ class TestVerifyPenaltyPaths(CustomTestCase):
         )
         with self.assertRaises(_Stop):
             eagle_utils.eagle_sample(
-                verify_input,
-                batch,
-                logits_output,
-                grammar_mask,
-                has_custom_logit_processor=True,
+                verify_input, _verify(batch, grammar_mask), logits_output
             )
         self.assertEqual(len(seen), 1)
         self.assertTrue(torch.equal(seen[0][0], expected[width:]))

@@ -433,6 +433,11 @@ class CommonKVManager(BaseKVManager):
             get_disagg().disaggregation_max_top_logprobs_num
             != MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
         )
+        # Decode reports this at registration: with a radix cache it reuses
+        # draft KV beyond the sliding window, so prefill must send all of it.
+        self.decode_enable_radix_cache = (
+            get_disagg().disaggregation_decode_enable_radix_cache
+        )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
@@ -639,8 +644,7 @@ class CommonKVManager(BaseKVManager):
         every CP rank holds the same state. When all CP ranks transfer their KV
         shards, only rank 0 needs to send that state. Cache layer split is the
         exception because each CP rank owns different state layers. Page-sharded
-        DSA indexer state likewise needs every owner; Mooncake filters its page
-        lists before transfer instead of suppressing whole ranks.
+        DSA indexer state likewise needs every owner to send its own pages.
         """
         return (
             self.attn_cp_size > 1
@@ -649,6 +653,21 @@ class CommonKVManager(BaseKVManager):
             and not get_parallel().enable_cp_tp_group_sharing
             and getattr(self, "kv_shard_size", 1) <= 1
         )
+
+    def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
+        """Pair target/draft indexer pages before narrowing to this owner."""
+        if len(src_indices) != len(dst_indices):
+            raise RuntimeError(
+                "Sharded DSA state page count mismatch: "
+                f"prefill={len(src_indices)}, dst={len(dst_indices)}"
+            )
+        local_indices, positions = filter_kv_indices_for_shard_rank(
+            kv_indices=np.asarray(src_indices, dtype=np.int32),
+            index_slice=slice(0, len(src_indices)),
+            shard_rank=self.kv_shard_rank,
+            shard_size=self.kv_shard_size,
+        )
+        return local_indices, np.asarray(dst_indices, dtype=np.int32)[positions]
 
     # The three helpers below hold under ``kv_shard_state_peer_only`` only;
     # callers check that flag first, so unsharded transfers read nothing new.
@@ -1620,14 +1639,23 @@ class CommonKVManager(BaseKVManager):
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
+        minimax_state_types = set(getattr(self.kv_args, "state_types", ())) & {
+            StateType.MINIMAX_INDEX_K,
+            StateType.MINIMAX_DENSE_KV,
+        }
         if (
-            StateType.MINIMAX_INDEX_K in getattr(self.kv_args, "state_types", ())
+            minimax_state_types
             and info.attn_tp_size != self.attn_tp_size
+            and (
+                not self.kv_args.main_kv_page_row
+                or StateType.MINIMAX_DENSE_KV in minimax_state_types
+            )
         ):
-            # MiniMax main KV pages are head-major page rows and its index state
-            # is replicated per rank; neither can be resliced by attention head.
+            # Only the NVFP4 page-row main KV has a head-sliced sender; dense KV
+            # state is a compacted layer list with no per-head split.
             raise RuntimeError(
-                "MiniMax sparse PD requires matching attention TP sizes: "
+                "MiniMax sparse PD with different attention TP sizes needs the "
+                "NVFP4 page-row KV pool and no dense layers: "
                 f"prefill={info.attn_tp_size}, decode={self.attn_tp_size}."
             )
 
@@ -2562,9 +2590,21 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
-                if component_indices is not None:
-                    self._transfer_num_state_indices += len(component_indices)
+            for i, indices in enumerate(state_indices):
+                if indices is None:
+                    continue
+                if (
+                    self.kv_mgr.kv_shard_size > 1
+                    and self.kv_mgr.kv_args.state_types[i] == StateType.DSA
+                ):
+                    # Both workers receive logical indexer pages but only send
+                    # pages owned by this rank.
+                    self._transfer_num_state_indices += np.count_nonzero(
+                        np.asarray(indices) % self.kv_mgr.kv_shard_size
+                        == self.kv_mgr.kv_shard_rank
+                    )
+                else:
+                    self._transfer_num_state_indices += len(indices)
 
     def _prepare_send_indices(
         self,
@@ -2729,9 +2769,17 @@ class CommonKVSender(BaseKVSender):
             status = self.kv_mgr.request_status.get(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
-        if isinstance(self.kv_mgr.request_status, PPConsensusStore):
-            self.kv_mgr.request_status.pop(_pp_held_key(self.bootstrap_room), None)
+        # Serialized with update_status and, under PP, the staging counter's _sync
+        # (same lock order), so neither writes the room back after the pop.
+        with self.kv_mgr._status_lock:
+            if isinstance(self.kv_mgr.request_status, PPConsensusStore):
+                with self.kv_mgr._staging_outstanding._lock:
+                    self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+                    self.kv_mgr.request_status.pop(
+                        _pp_held_key(self.bootstrap_room), None
+                    )
+            else:
+                self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
@@ -3267,7 +3315,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self.conclude_state = (
                 status if status in (KVPoll.Success, KVPoll.Failed) else KVPoll.Failed
             )
-        self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        with self.kv_mgr._status_lock:
+            self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
