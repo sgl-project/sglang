@@ -114,8 +114,8 @@ class CompressedTensorsMoEScheme(BaseMoEScheme):
 
         :param layer: torch.nn.Module with the registered weights and
             other parameters relevant to the particular scheme.
-        :param x: input to the layer
-        :param bias: bias parameter
+        :param dispatch_output: the dispatched hidden states and their
+            top-k routing output for the experts on this rank.
 
         """
         raise NotImplementedError
