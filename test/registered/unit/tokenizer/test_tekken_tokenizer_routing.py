@@ -43,6 +43,25 @@ class TestTekkenRouting(CustomTestCase):
             ids = tokenizer.encode(PROMPT, add_special_tokens=False)
             self.assertEqual(ids, EXPECTED_IDS)
 
+    def test_encode_simple_chat_returns_token_ids(self):
+        from huggingface_hub import hf_hub_download
+
+        from sglang.srt.entrypoints.openai.chat_encoding import encode_simple_chat
+
+        tekken = hf_hub_download(TEKKEN_REPO, "tekken.json")
+        with tempfile.TemporaryDirectory() as d:
+            shutil.copy(tekken, os.path.join(d, "tekken.json"))
+            tokenizer = get_tokenizer(d)
+            ids = encode_simple_chat(
+                tokenizer=tokenizer,
+                spec=None,
+                messages=[{"role": "user", "content": PROMPT}],
+            )
+            self.assertIsInstance(ids, list)
+            self.assertTrue(all(isinstance(t, int) for t in ids))
+            n = len(EXPECTED_IDS)
+            self.assertIn(EXPECTED_IDS, [ids[i : i + n] for i in range(len(ids))])
+
 
 if __name__ == "__main__":
     unittest.main()
