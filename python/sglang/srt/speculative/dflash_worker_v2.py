@@ -4142,8 +4142,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _runs_mixed_verify(self, batch: ScheduleBatch) -> bool:
         return (
-            mixed_verify_configured()
-            and batch.forward_mode.is_mixed()
+            batch.forward_mode.is_mixed()
+            and mixed_verify_configured()
             and bool(batch.decoding_reqs)
             and _plain_greedy(batch.sampling_info, has_grammar=batch.has_grammar)
             and not (

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -61,10 +62,12 @@ _DFLASH_SAMPLING_VERIFY_AVAILABLE = (
 )
 
 
+@functools.cache
 def mixed_verify_configured() -> bool:
     """Whether the server's configuration lets a mixed DFLASH batch verify its
     running requests inside the extend forward. `DFlashWorkerV2._runs_mixed_verify`
-    adds the per-batch conditions; the scheduler budgets the verify rows on this."""
+    adds the per-batch conditions; the scheduler budgets the verify rows on this.
+    Read once per process: the configuration is fixed once published."""
     return (
         get_spec().speculative_dflash_mixed_verify
         and not get_parallel().attn_dp_enabled
