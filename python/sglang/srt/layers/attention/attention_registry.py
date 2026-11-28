@@ -1,5 +1,4 @@
 import logging
-import warnings
 from typing import TYPE_CHECKING
 
 import torch
@@ -80,18 +79,14 @@ def _create_linear_attention_backend(runner, fallback):
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
     if not runner.use_mla_backend:
+        from sglang.srt.beam_search.shared_context_backend import (
+            flashinfer_backend_cls,
+        )
         from sglang.srt.layers.attention.flashinfer_backend import (
             FlashInferAttnBackend,
         )
 
-        # Init streams
-        if get_spec().speculative_algorithm == "EAGLE":
-            if (
-                not hasattr(runner, "plan_stream_for_flashinfer")
-                or not runner.plan_stream_for_flashinfer
-            ):
-                runner.plan_stream_for_flashinfer = torch.cuda.Stream()
-        return FlashInferAttnBackend(
+        return flashinfer_backend_cls(FlashInferAttnBackend)(
             runner, init_new_workspace=runner.init_new_workspace
         )
     else:
@@ -165,9 +160,18 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
+    from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
         AscendAttnBackend,
     )
+
+    config = runner.model_config.hf_config
+    if is_deepseek_dsa(config) and get_dsa_index_kpool(config) > 1:
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsa_backend import (
+            AscendDSAAttnBackend,
+        )
+
+        return AscendDSAAttnBackend(runner)
 
     return AscendAttnBackend(runner)
 
@@ -193,17 +197,6 @@ def create_qsa_backend(runner):
     )
 
     return QwenSparseAttnBackend(runner)
-
-
-@register_attention_backend("nsa")
-def _create_nsa_compat(runner):
-    warnings.warn(
-        "attention-backend='nsa' is deprecated; use 'dsa' instead. "
-        "The alias will be removed in a future release.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    return create_dsa_backend(runner)
 
 
 @register_attention_backend("dsv4")
@@ -432,10 +425,7 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     ), "hybrid_gdn can only be used with non-MLA models."
 
     from sglang.srt.configs.dots3 import Dots3Config
-    from sglang.srt.configs.model_config import (
-        is_minimax_sparse,
-        uses_minimax_m3_nvfp4_native_stack,
-    )
+    from sglang.srt.configs.model_config import is_minimax_sparse
 
     if isinstance(runner.model_config.hf_text_config, Dots3Config):
         return runner.model_config.hf_text_config.wrap_attention_backend(
@@ -443,21 +433,11 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         )
 
     if is_minimax_sparse(runner.model_config.hf_config):
-        if uses_minimax_m3_nvfp4_native_stack(runner.model_config.quantization):
-            from sglang.srt.layers.attention.minimax_sparse_nvfp4_backend import (
-                MiniMaxSparseNvfp4AttnBackend,
-            )
-
-            return MiniMaxSparseNvfp4AttnBackend(runner)
-        from sglang.srt.layers.attention.minimax_sparse_backend import (
-            MiniMaxHybridAttnBackend,
-            MiniMaxSparseAttnBackend,
+        from sglang.srt.layers.attention.minimax_sparse import (
+            build_minimax_attn_backend,
         )
 
-        sparse_backend = MiniMaxSparseAttnBackend(runner)
-        return MiniMaxHybridAttnBackend(
-            full_attn_backend, sparse_backend, sparse_backend.sparse_layer_ids
-        )
+        return build_minimax_attn_backend(runner, full_attn_backend)
 
     if cfg := mambaish_config(runner.model_config):
         from sglang.srt.configs.inkling import InklingMMConfig, InklingModelConfig
@@ -616,9 +596,20 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
                     runner, KDAAttnBackend
                 )
         elif glm5_next_config(runner.model_config) is not None:
-            linear_attn_backend = _create_linear_attention_backend(
-                runner, KDAAttnBackend
-            )
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.attention.ascend_kda_backend import (
+                    AscendKDAAttnBackend,
+                    AscendKDAHybridLinearAttnBackend,
+                )
+
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, AscendKDAAttnBackend
+                )
+                hybrid_backend_cls = AscendKDAHybridLinearAttnBackend
+            else:
+                linear_attn_backend = _create_linear_attention_backend(
+                    runner, KDAAttnBackend
+                )
         elif hybrid_lightning_config(runner.model_config) is not None:
             linear_attn_backend = LightningAttentionBackend(runner)
         else:
@@ -656,3 +647,16 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("mlu")
+def create_mlu_backend(runner):
+    if runner.use_mla_backend:
+        from sglang.srt.hardware_backend.mlu.attention.mla_backend import (
+            MLUMLABackend,
+        )
+
+        return MLUMLABackend(runner)
+    from sglang.srt.hardware_backend.mlu.attention.mha_backend import MLUMHABackend
+
+    return MLUMHABackend(runner)

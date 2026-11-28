@@ -7,7 +7,7 @@ import sys
 import time
 import unicodedata
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +30,23 @@ sys.path.insert(
     ),
 )
 import ci_register as _ci_register  # noqa: E402
+from run_ci_approval import (  # noqa: E402
+    APPROVAL_WORKFLOWS,
+    APPROVER_REPO_PERMISSIONS,
+    approval_workflows_for,
+    author_may_approve,
+    can_approve,
+    head_seen_by,
+    is_approved,
+    latest_run_per_workflow,
+    load_opt_in_tiers,
+    load_permissions,
+    pr_workflow_runs,
+    record_approval,
+    rerun_gated_runs,
+    skipped_at_gate,
+    workflow_file,
+)
 
 # install_script values from runner_configs.yml are passed verbatim into a
 # `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
@@ -39,20 +56,17 @@ import ci_register as _ci_register  # noqa: E402
 _ALLOWED_INSTALL_SCRIPT = re.compile(r"^scripts/ci/cuda/[\w.-]+\.sh$")
 
 # Configuration
-PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
+WRITE_ACCESS_CI_PERMISSIONS = {
+    "can_tag_run_ci_label": True,
+    "can_rerun_failed_ci": True,
+    "cooldown_interval_minutes": 0,
+}
 TEST_GROUPS_FILE_PATH = "scripts/ci/rerun_test_groups.json"
 PRECISION_BASELINE_TEST = "registered/debug_utils/test_nightly_precision_regression.py"
 PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 CHANGED_TESTS_FLAG = "--changed"
 CHANGED_TESTS_SHORT_FLAG = "-c"
 HW_FLAG = "--hw"
-# CI selections: name -> workflow files and an optional opt-in label.
-# A null label selects existing workflows without a new hardware gate.
-# Resolved next to this script so it loads from any cwd;
-# scripts/lint/check_opt_in_ci_tiers.py keeps it in sync with the workflows.
-OPT_IN_TIERS_FILE_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "opt_in_ci_tiers.json"
-)
 
 
 MAINTENANCE_ISSUE_NUMBER = 21065
@@ -286,33 +300,6 @@ def _strip_format_chars(s):
     return "".join(c for c in s if unicodedata.category(c) != "Cf")
 
 
-def load_permissions(user_login):
-    """
-    Reads the permissions JSON from the local file system and returns
-    the permissions dict for the specific user.
-    """
-    try:
-        print(f"Loading permissions from {PERMISSIONS_FILE_PATH}...")
-        if not os.path.exists(PERMISSIONS_FILE_PATH):
-            print(f"Error: Permissions file not found at {PERMISSIONS_FILE_PATH}")
-            return None
-
-        with open(PERMISSIONS_FILE_PATH, "r") as f:
-            data = json.load(f)
-
-        user_perms = data.get(user_login)
-
-        if not user_perms:
-            print(f"User '{user_login}' not found in permissions file.")
-            return None
-
-        return user_perms
-
-    except Exception as e:
-        print(f"Failed to load or parse permissions file: {e}")
-        sys.exit(1)
-
-
 def has_sgl_kernel_changes(pr):
     """
     Check if the PR has changes to the AOT kernel directory.
@@ -331,40 +318,92 @@ def has_sgl_kernel_changes(pr):
         return False
 
 
-def _load_opt_in_tiers():
-    with open(OPT_IN_TIERS_FILE_PATH, encoding="utf-8") as f:
-        return json.load(f)
+def _resolve_tier_args(args, tiers, layer):
+    """Return (tier_names, unknown_args) for one CI layer.
+
+    A hardware name is a tier name without `-extra`. For the base layer, a
+    hardware with no base tier (all but nv and amd) selects its extra tier.
+    """
+    names, unknown = [], []
+    for arg in args:
+        if layer == "base":
+            candidates = [arg] if arg in tiers else [f"{arg}-extra"]
+        elif arg.endswith("-extra"):
+            candidates = [arg]
+        elif layer == "extra":
+            candidates = [f"{arg}-extra"]
+        else:
+            candidates = [arg, f"{arg}-extra"]
+        picked = [name for name in candidates if name in tiers]
+        if picked:
+            names.extend(picked)
+        else:
+            unknown.append(arg)
+    return list(dict.fromkeys(names)), unknown
 
 
-def _parse_opt_in_tiers(args, tiers):
-    """Select registered tiers; legacy labeling commands ignore other suffixes."""
-    return list(dict.fromkeys(arg for arg in args if arg in tiers))
+def _hardware_names(tiers):
+    return sorted({name.removesuffix("-extra") for name in tiers})
+
+
+def _reply_bad_tier_args(pr, comment, command, unknown, tiers):
+    choices = ", ".join(f"`{name}`" for name in _hardware_names(tiers))
+    unknown_text = ", ".join(f"`{arg}`" for arg in unknown)
+    detail = f"Unknown: {unknown_text}. " if unknown else ""
+    pr.create_issue_comment(
+        f"⛔ `{command}` takes hardware arguments: {choices}. "
+        f"{detail}No labels were added and no workflows were re-run."
+    )
+    comment.create_reaction("confused")
+
+
+def _approve_head(gh_repo, pr, comment, user_perms):
+    """Check that the commenter may approve the PR's head commit, then record it.
+
+    Returns (ok, approved): ok is False after a refusal, answered here; approved
+    is False when the PR's author may approve, so nothing needs recording.
+    """
+    user_login = comment.user.login
+    allowed, reason = can_approve(gh_repo, user_login, user_perms)
+    if not allowed:
+        print(f"Permission denied: {reason}.")
+        pr.create_issue_comment(f"No commit was approved for CI: {reason}.")
+        comment.create_reaction("confused")
+        return False, False
+
+    approve_commit = not author_may_approve(gh_repo, pr.user.login)
+    head_sha = pr.head.sha
+    if approve_commit and not head_seen_by(gh_repo, pr, head_sha, comment.created_at):
+        print(f"Not approving {head_sha}: pushed after the comment, or no run yet.")
+        pr.create_issue_comment(
+            f"No commit was approved for CI: the head {head_sha[:8]} was pushed "
+            "after this comment, or CI has not started for it yet. Review the "
+            "current head, then post the command again."
+        )
+        comment.create_reaction("confused")
+        return False, False
+
+    if approve_commit:
+        record_approval(gh_repo, head_sha, user_login)
+    return True, approve_commit
 
 
 def handle_tag_run_ci(
     gh_repo, pr, comment, user_perms, react_on_success=True, tier_labels=()
 ):
     """
-    Handles the /tag-run-ci-label command.
+    /tag-and-rerun-ci and the /run-* layer commands: approve the head commit,
+    then add `run-ci` and the `run-ci-<tier>` labels of the named tiers.
 
-    tier_labels are the `run-ci-<tier>` labels of the opt-in tiers named in
-    the command (e.g. `nv-extra`). Opt-in workflows gate on BOTH `run-ci` and
-    their own label, so `run-ci` is always added alongside. Reuses the same
-    `can_tag_run_ci_label` permission for every tier.
-
-    Labels added here do not start a run: GITHUB_TOKEN label events do not
-    trigger workflows, and opt-in workflows don't listen to `labeled`. The
-    label gate in pr-gate.yml reads the live label set, so the next push, or
-    a rerun of the gated run (/tag-and-rerun-ci), picks the labels up.
-
-    Returns True if action was taken, False otherwise.
+    Labels added here start no run (GITHUB_TOKEN label events trigger no
+    workflow); the callers re-run the gated runs. Returns True on success.
     """
-    if not user_perms.get("can_tag_run_ci_label", False):
-        print("Permission denied: can_tag_run_ci_label is false.")
+    ok, _ = _approve_head(gh_repo, pr, comment, user_perms)
+    if not ok:
         return False
 
     labels = ["run-ci", *tier_labels]
-    print(f"Permission granted. Adding labels: {labels}.")
+    print(f"Adding labels: {labels}.")
     for label in labels:
         pr.add_to_labels(label)
 
@@ -377,42 +416,63 @@ def handle_tag_run_ci(
     return True
 
 
-def _latest_run_per_workflow(runs):
+def handle_approve_ci(gh_repo, pr, comment, user_perms):
     """
-    Collapse a head_sha's workflow runs to the newest run per workflow.
+    /approve-ci: approve a new head commit of a PR that already has `run-ci`.
 
-    GitHub can have several runs of the *same* workflow at one commit — a
-    `synchronize` run superseded by a `labeled` run, or a run cancelled by
-    `cancel-in-progress` (pr-test.yml sets it) while its replacement is
-    already in flight. Only the newest one reflects current state; rerunning
-    the older ones spawns duplicates that fight the live run for runners.
+    Returns True if the head was approved, so its gate-skipped runs can run.
     """
-    latest = {}
-    for run in runs:
-        current = latest.get(run.workflow_id)
-        if current is None or run.id > current.id:
-            latest[run.workflow_id] = run
-    return list(latest.values())
+    if "run-ci" not in {label.name for label in pr.get_labels()}:
+        pr.create_issue_comment(
+            "No commit was approved for CI: the PR lacks `run-ci`. "
+            "`/tag-and-rerun-ci` adds it and approves the head."
+        )
+        comment.create_reaction("confused")
+        return False
+
+    ok, approved = _approve_head(gh_repo, pr, comment, user_perms)
+    if not ok:
+        return False
+    comment.create_reaction("+1")
+    return approved
 
 
-def _pr_workflow_runs(gh_repo, pr):
-    """Keep target-event runs scoped to this PR's source repository and branch."""
-    for run in gh_repo.get_workflow_runs(head_sha=pr.head.sha):
-        if run.event == "pull_request_target" and (
-            run.head_branch != pr.head.ref
-            or run.head_repository is None
-            or pr.head.repo is None
-            or run.head_repository.id != pr.head.repo.id
-        ):
-            continue
-        yield run
+def _rerun_gated_runs_after_approval(gh_repo, pr):
+    """Re-run the approval workflows' runs whose gate skipped before the approval."""
+    print("Waiting 5 seconds for labels and the approval to propagate...")
+    time.sleep(5)
+    labels = {label.name for label in pr.get_labels()}
+    for _, message in rerun_gated_runs(
+        gh_repo, pr, pr.head.sha, approval_workflows_for(labels)
+    ):
+        print(message)
+
+
+PR_STATES_WORKFLOW_FILE = "pr-states.yml"
+
+
+def _refresh_pr_states(gh_repo, pr):
+    """Redraw the CI-states block in the PR body after a command.
+
+    Labels added with GITHUB_TOKEN start no `labeled` run, and a rerun raises
+    no `workflow_run` `requested` event, so pr-states.yml would keep the old
+    block until the rerun finishes. workflow_dispatch is the event
+    GITHUB_TOKEN can still start.
+    """
+    try:
+        gh_repo.get_workflow(PR_STATES_WORKFLOW_FILE).create_dispatch(
+            gh_repo.default_branch, {"pr_number": str(pr.number)}, throw=True
+        )
+    except Exception as e:
+        print(f"Could not refresh the CI-states block: {e}")
 
 
 def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
     """
     Handles the /rerun-failed-ci command.
     Reruns workflows that ended in 'failure', 'skipped', 'cancelled' or
-    'timed_out', restarting only the jobs that didn't succeed.
+    'timed_out', restarting only the jobs that didn't succeed, and fully
+    reruns runs whose tests pr-gate skipped once the PR can run them.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
@@ -475,8 +535,8 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #
     #   Caveat: GitHub's `run.rerun()` reuses the original event payload, so
     #   a job skipped by an `if` on that payload skips again. The label gates
-    #   read live labels inside pr-gate.yml instead, so a missing label fails
-    #   the gate job and the run is recoverable by rerun once labeled.
+    #   read live labels inside pr-gate.yml instead, so a rerun once labeled
+    #   picks the label up.
     # - cancelled / timed_out: rerun_failed_jobs() as well. GitHub restarts
     #   every job that didn't succeed — cancelled ones included — plus their
     #   dependents, and carries the passing jobs over untouched. A full
@@ -488,20 +548,54 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
     #   rerun_failed_jobs() is scoped to a single workflow run.
-    runs = _latest_run_per_workflow(_pr_workflow_runs(gh_repo, pr))
+    # - a run whose tests pr-gate skipped (green, or failed only in
+    #   pr-test-finish): run.rerun() once the PR has what that gate needs
+    #   (`run-ci`, an approved head commit for the approval workflows, not a draft, the
+    #   workflow's opt-in labels), since rerun_failed_jobs() would rerun at most the
+    #   finish job. This command never approves.
+    runs = latest_run_per_workflow(pr_workflow_runs(gh_repo, pr))
+    labels = {label.name for label in pr.get_labels()}
+    can_run = "run-ci" in labels and not pr.draft
+    head_approved = is_approved(gh_repo, head_sha, labels, pr.user.login)
+    tiers = load_opt_in_tiers().values()
 
     rerun_count = 0
+    left_skipped = False
+    left_unapproved = False
     for run in runs:
         if run.status != "completed":
             # A newer attempt is still in flight - nothing to recover.
             continue
-        if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
-            # action_required (fork PR awaiting approval) is deliberately left
-            # out: it needs an approval, not a rerun.
-            continue
-
-        print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
         try:
+            needed = {
+                t["label"]
+                for t in tiers
+                if t["label"] and workflow_file(run) in t["workflows"]
+            }
+            needs_approval = (
+                workflow_file(run) in APPROVAL_WORKFLOWS and not head_approved
+            )
+            ready = can_run and needed <= labels and not needs_approval
+            if run.conclusion == "success" and not ready:
+                continue
+            if run.conclusion in ("success", "failure") and skipped_at_gate(run):
+                if ready:
+                    print(
+                        f"Full rerun of {run.name} (ID: {run.id}): tests skipped at gate"
+                    )
+                    run.rerun()
+                    rerun_count += 1
+                else:
+                    print(f"Leaving {run.name}: its gate still skips the tests")
+                    left_skipped = left_skipped or not can_run or needs_approval
+                    left_unapproved = left_unapproved or needs_approval
+                continue
+            if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
+                # action_required (fork PR awaiting approval) is deliberately
+                # left out: it needs an approval, not a rerun.
+                continue
+
+            print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
             if run.conclusion == "skipped" or (
                 sgl_kernel_changes and not kernel_wheel_built
             ):
@@ -523,23 +617,42 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         if react_on_success:
             comment.create_reaction("+1")
         return True
-    else:
-        print("No failed, skipped, cancelled or timed-out workflows found to rerun.")
-        return False
-
-
-def _workflow_file(run):
-    # The runs API may suffix `path` with `@<ref>`.
-    return run.path.split("@", 1)[0]
+    if left_skipped:
+        # Left alone, a run whose tests the gate skipped would read as the bot
+        # being down; say what the PR still lacks.
+        approve_command = "/approve-ci" if "run-ci" in labels else "/tag-and-rerun-ci"
+        missing = [
+            step
+            for lacking, step in (
+                (pr.draft, "mark the PR ready for review"),
+                (
+                    "run-ci" not in labels and not left_unapproved,
+                    "add the `run-ci` label",
+                ),
+                (
+                    left_unapproved,
+                    f"have a maintainer approve this commit (`{approve_command}`)",
+                ),
+            )
+            if lacking
+        ]
+        pr.create_issue_comment(
+            "⛔ CI skipped its tests, so nothing was re-run. To run them, "
+            f"{' and '.join(missing)}, then comment `/rerun-failed-ci`."
+        )
+        if react_on_success:
+            comment.create_reaction("confused")
+    print("No workflow found to rerun.")
+    return False
 
 
 def _rerun_workflow_run(run):
     """Re-run one completed run, green ones included. Returns (acted, message)."""
     try:
-        if run.conclusion == "success":
-            # Nothing failed, so there are no jobs for rerun_failed_jobs() to
-            # target; the ask is an explicit re-run of green work.
-            print(f"  Full rerun of successful run {run.id}")
+        if run.conclusion == "success" or skipped_at_gate(run):
+            # Nothing ran that rerun_failed_jobs() could target: a green run,
+            # or one whose tests the gate skipped (only its finish job failed).
+            print(f"  Full rerun of run {run.id} ({run.conclusion})")
             run.rerun()
         else:
             try:
@@ -554,7 +667,12 @@ def _rerun_workflow_run(run):
 
 
 def _rerun_tier_workflows(
-    gh_repo, pr, workflow_files, *, skip_missing=False, optional_workflows=()
+    gh_repo,
+    pr,
+    workflow_files,
+    *,
+    skip_missing=False,
+    optional_workflows=(),
 ):
     """
     Re-run a registered selection's workflows for the current head SHA.
@@ -575,25 +693,23 @@ def _rerun_tier_workflows(
     """
     runs = [
         run
-        for run in _pr_workflow_runs(gh_repo, pr)
-        if _workflow_file(run) in workflow_files
+        for run in pr_workflow_runs(gh_repo, pr)
+        if workflow_file(run) in workflow_files
     ]
     # Same newest-wins rule handle_rerun_failed_ci uses: older runs at this SHA
     # are superseded and re-running them fights the live run for runners.
-    latest_by_file = {
-        _workflow_file(run): run for run in _latest_run_per_workflow(runs)
-    }
+    latest_by_file = {workflow_file(run): run for run in latest_run_per_workflow(runs)}
 
     results = []
-    for workflow_file in workflow_files:
-        run = latest_by_file.get(workflow_file)
+    for path in workflow_files:
+        run = latest_by_file.get(path)
         if run is None:
-            if skip_missing or workflow_file in optional_workflows:
+            if skip_missing or path in optional_workflows:
                 continue
             results.append(
                 (
                     False,
-                    f"⛔ No `{os.path.basename(workflow_file)}` run exists for "
+                    f"⛔ No `{os.path.basename(path)}` run exists for "
                     "this commit, so there is nothing to re-run. Push a commit "
                     "to create one.",
                 )
@@ -618,22 +734,22 @@ def _rerun_tier_workflows(
     return acted, "\n".join(message for _, message in results)
 
 
-def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier, *, additional_tiers=()):
+def handle_run_hardware_ci(gh_repo, pr, comment, user_perms, selected_tiers):
     """
-    Handles /run-<tier>-ci: add run-ci and any configured opt-in label,
-    then re-run only the selection's workflows, including successful runs.
-    Hardware full CI combines its base and extra tiers through additional_tiers.
+    Handles /run-ci, /run-extra-ci and /run-full-ci with hardware arguments:
+    add run-ci and each selected tier's opt-in label, then re-run only those
+    tiers' workflows, including successful runs.
 
     Gated on the same two permissions as the steps it performs (the label add
-    needs can_tag_run_ci_label, the re-run can_rerun_failed_ci) rather than a
-    new key, so every user who can already drive CI can drive opt-in CI.
+    and approval need run_ci_approval.can_approve, the re-run
+    can_rerun_failed_ci) rather than a new key, so every user who can already
+    drive CI can drive opt-in CI.
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_rerun_failed_ci", False):
         print("Permission denied: can_rerun_failed_ci is false.")
         return False
 
-    selected_tiers = [tier, *additional_tiers]
     tier_labels = list(
         dict.fromkeys(t["label"] for t in selected_tiers if t["label"] is not None)
     )
@@ -661,6 +777,15 @@ def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier, *, additional_tie
     print("Waiting 5 seconds for labels to propagate...")
     time.sleep(5)
 
+    # Re-run gated approval-workflow runs first, so the step below finds them in flight.
+    for _, gated_message in rerun_gated_runs(
+        gh_repo,
+        pr,
+        pr.head.sha,
+        [p for p in workflow_files if p in APPROVAL_WORKFLOWS],
+    ):
+        print(gated_message)
+
     acted, message = _rerun_tier_workflows(
         gh_repo,
         pr,
@@ -668,6 +793,7 @@ def handle_run_tier_ci(gh_repo, pr, comment, user_perms, tier, *, additional_tie
         skip_missing=not tier_labels,
         optional_workflows=set(workflow_files) - required_workflows,
     )
+    _refresh_pr_states(gh_repo, pr)
     pr.create_issue_comment(message)
     comment.create_reaction("+1" if acted else "confused")
     return acted
@@ -1030,8 +1156,8 @@ def detect_suite(file_path_from_test, hw=None):
     The registrations are read with ci_register's parser, the one run_suite.py
     selects tests with. A CUDA file yields one entry per
     `register_cuda_ci(runner_config=...)` call, its runner label, install
-    script, timeout, and rdma_devices resolved from
-    scripts/ci/runner_configs.yml, the same single source of truth that drives
+    script, timeout, and rdma_devices resolved from its stage and runner_config
+    by scripts/ci/runner_configs.py, the same single source of truth that drives
     the main PR test pipeline; the legacy single-string `suite=` carries no
     runner_config and is reported as non-dispatchable. A CPU file yields one
     entry, an NPU or AMD file one per `register_npu_ci(...)` or
@@ -1052,10 +1178,10 @@ def detect_suite(file_path_from_test, hw=None):
 
 def _resolve_runner_config(r, full_path):
     """The cuda entry of a `register_cuda_ci(runner_config=...)` registration."""
-    configs = _runner_configs.load()
-    cfg = configs.get(r.runner_config)
-    if cfg is None:
-        known = ", ".join(f"`{k}`" for k in sorted(configs))
+    try:
+        cfg = _runner_configs.resolve(r.runner_config, r.stage)
+    except ValueError:
+        known = ", ".join(f"`{k}`" for k in sorted(_runner_configs.load()))
         return (
             f"Unknown runner_config `{r.runner_config}` in `{full_path}` "
             f"— not in scripts/ci/runner_configs.yml.\n\n"
@@ -1169,7 +1295,7 @@ def _detect_npu(full_path, registrations):
                 f"NPU suite `{suite or '(multi-node)'}` of `{full_path}` has no a3 job calling "
                 f"`_npu-pr-test-stage.yml`, the only NPU stage /rerun-test "
                 f"runs (the perf/accuracy single-node stage, multi-node, "
-                f"base-a, and a2/a5 suites are not supported)."
+                f"extra-a, and a2/a5 suites are not supported)."
             )
         elif r.disabled is not None:
             out.append(
@@ -1868,17 +1994,20 @@ OWNED_COMMAND_PREFIXES = ("/tag-", "/rerun-", "/run-")
 # Suggestion targets. Documented spellings only, so a typo is pointed at the
 # canonical name rather than at an undocumented alias.
 KNOWN_COMMANDS = (
-    "/tag-run-ci-label",
     "/tag-and-rerun-ci",
+    "/approve-ci",
     "/rerun-failed-ci",
     "/rerun-group",
     "/rerun-test",
+    "/run-ci",
+    "/run-extra-ci",
     "/run-full-ci",
     "/run-cpu-ci",
 )
 
-# `/run-<tier>-ci` for each opt-in tier; `/rerun-<tier>-ci` is a silent alias.
-RUN_TIER_COMMAND = re.compile(r"^/(?:re)?run-([\w-]+)-ci$")
+# Commands that select a CI layer for the hardware named in their arguments.
+LAYER_COMMANDS = {"/run-ci": "base", "/run-extra-ci": "extra", "/run-full-ci": "full"}
+
 
 # Removed commands, kept because they were documented long enough that muscle
 # memory still sends them and difflib would suggest something unrelated.
@@ -1890,7 +2019,7 @@ RETIRED_COMMANDS = {
 }
 
 
-def handle_unknown_command(pr, comment, first_line, tiers):
+def handle_unknown_command(pr, comment, first_line):
     """
     Answer a comment addressed to this handler that matched no command.
 
@@ -1912,8 +2041,7 @@ def handle_unknown_command(pr, comment, first_line, tiers):
 
     hint = RETIRED_COMMANDS.get(command)
     if hint is None:
-        known = KNOWN_COMMANDS + tuple(f"/run-{name}-ci" for name in tiers)
-        close = difflib.get_close_matches(command, known, n=1, cutoff=0.6)
+        close = difflib.get_close_matches(command, KNOWN_COMMANDS, n=1, cutoff=0.6)
         hint = f"Did you mean `{close[0]}`?" if close else None
 
     if hint is None:
@@ -1951,9 +2079,16 @@ def main():
     pr = repo.get_pull(pr_number)
     comment = repo.get_issue(pr_number).get_comment(comment_id)
 
+    # Write access grants every CI permission; CI_PERMISSIONS.json lists only
+    # users without it.
+    if repo.get_collaborator_permission(user_login) in APPROVER_REPO_PERMISSIONS:
+        print(f"User {user_login} has write access. Granting all CI permissions.")
+        user_perms = dict(WRITE_ACCESS_CI_PERMISSIONS)
+
     # PR authors can always rerun failed CI on their own PRs, even if they are not
     # listed in CI_PERMISSIONS.json.
-    # Note: /tag-run-ci-label still requires CI_PERMISSIONS.json.
+    # Note: the labeling commands and /approve-ci still require
+    # run_ci_approval.can_approve.
     # Authorship grants nothing for /rerun-test; that gate reads the commenter.
     if pr.user.login == user_login:
         if user_perms is None:
@@ -1977,108 +2112,68 @@ def main():
     first_line = comment_body.split("\n")[0].strip()
     tokens = first_line.split()
     command = tokens[0] if tokens else ""
-    tiers = _load_opt_in_tiers()
+    tiers = load_opt_in_tiers()
 
-    # Extra and Full require an explicit hardware selection. Never fall back
-    # to shared labels or broad retries for missing or misspelled arguments.
-    if command in (
-        "/run-extra-ci",
-        "/rerun-extra-ci",
-        "/run-full-ci",
-        "/rerun-full-ci",
+    is_tag_and_rerun = command.startswith("/tag-and-rerun-ci")
+    # Takes no arguments; like /rerun-failed-ci, it ignores any.
+    is_approve = command.startswith("/approve-ci")
+    # Editing an old comment would approve whatever the head is by then.
+    if get_env_var("COMMENT_ACTION") == "edited" and (
+        command in LAYER_COMMANDS or is_tag_and_rerun or is_approve
     ):
-        hardware = tokens[1] if len(tokens) == 2 else ""
-        extra_tier = tiers.get(f"{hardware}-extra")
-        base_tier = tiers.get(hardware)
-        full = command in ("/run-full-ci", "/rerun-full-ci")
-        if extra_tier is None or (full and base_tier is None):
-            choices = ", ".join(
-                f"`{name.removesuffix('-extra')}`"
-                for name in sorted(tiers)
-                if name.endswith("-extra")
-                and (not full or name.removesuffix("-extra") in tiers)
-            )
-            pr.create_issue_comment(
-                f"⛔ `{command}` requires exactly one hardware argument: {choices}. "
-                "The shared `run-ci-extra` label is retired. "
-                "No labels were added and no workflows were re-run."
-            )
-            comment.create_reaction("confused")
-            return
-        handle_run_tier_ci(
-            repo,
-            pr,
-            comment,
-            user_perms,
-            base_tier if full else extra_tier,
-            additional_tiers=[extra_tier] if full else (),
-        )
-        return
-
-    # Normalize new spellings before entering the existing command paths.
-    # A registered tier retains precedence over an alias with the same name.
-    tier_match = RUN_TIER_COMMAND.match(command)
-    registered_tier_command = tier_match and tier_match.group(1) in tiers
-    if (
-        command in ("/run-ci", "/run-base-ci", "/rerun-base-ci")
-        and not registered_tier_command
-    ):
-        if len(tokens) == 1:
-            command = "/tag-and-rerun-ci"
-        elif len(tokens) == 2 and tokens[1] in tiers:
-            command = f"/run-{tokens[1]}-ci"
-        else:
-            choices = ", ".join(f"`{name}`" for name in sorted(tiers))
-            pr.create_issue_comment(
-                f"⛔ `{command}` accepts no arguments or one registered tier: "
-                f"{choices}. No labels were added and no workflows were re-run."
-            )
-            comment.create_reaction("confused")
-            return
-        first_line = command
-        tokens = [command]
-    is_tag = first_line.startswith("/tag-run-ci-label")
-    is_tag_and_rerun = first_line.startswith("/tag-and-rerun-ci")
-    run_tier_match = RUN_TIER_COMMAND.match(command)
-    run_tier = run_tier_match and tiers.get(run_tier_match.group(1))
-    if run_tier and run_tier_match.group(1).endswith("-extra") and len(tokens) != 1:
         pr.create_issue_comment(
-            f"⛔ `{command}` accepts no arguments. Use `/run-extra-ci nv` or "
-            "`/run-extra-ci amd` to select hardware. "
+            f"`{command}` in an edited comment does nothing: only a new comment "
+            "approves a commit for CI. Post the command as a new comment."
+        )
+        comment.create_reaction("confused")
+        return
+    if (command in LAYER_COMMANDS or is_tag_and_rerun) and "extra" in tokens[1:]:
+        choices = ", ".join(f"`{name}`" for name in _hardware_names(tiers))
+        pr.create_issue_comment(
+            "⛔ The shared `extra` tier and `run-ci-extra` label are retired. "
+            f"Name the hardware instead: {choices}, e.g. `/run-extra-ci xeon`. "
             "No labels were added and no workflows were re-run."
         )
         comment.create_reaction("confused")
         return
 
-    # Tier arguments (`/tag-run-ci-label nv-extra`) are shared by both labeling
-    # commands so the surface is symmetric.
-    tier_names = []
-    if is_tag or is_tag_and_rerun:
-        if "extra" in tokens[1:]:
-            pr.create_issue_comment(
-                "⛔ The shared `extra` tier and `run-ci-extra` label are retired. "
-                "Use `nv-extra` or `amd-extra`, or `/run-extra-ci nv` or "
-                "`/run-extra-ci amd` for hardware-specific reruns. "
-                "No labels were added and no workflows were re-run."
-            )
-            comment.create_reaction("confused")
+    # Layer commands take any number of hardware arguments. Extra and Full
+    # require at least one; never fall back to a broad retry for them.
+    layer = LAYER_COMMANDS.get(command)
+    if layer == "base" and len(tokens) == 1:
+        command = "/tag-and-rerun-ci"
+        tokens = [command]
+        is_tag_and_rerun = True
+    elif layer is not None:
+        tier_names, unknown = _resolve_tier_args(tokens[1:], tiers, layer)
+        if unknown or not tier_names:
+            _reply_bad_tier_args(pr, comment, command, unknown, tiers)
             return
-        tier_names = _parse_opt_in_tiers(tokens[1:], tiers)
-    tier_labels = [
-        tiers[name]["label"] for name in tier_names if tiers[name]["label"] is not None
-    ]
+        handle_run_hardware_ci(
+            repo, pr, comment, user_perms, [tiers[name] for name in tier_names]
+        )
+        return
 
-    if is_tag:
-        handle_tag_run_ci(repo, pr, comment, user_perms, tier_labels=tier_labels)
+    # Labeling commands resolve their arguments as /run-ci does.
+    tier_names = []
+    if is_tag_and_rerun:
+        tier_names, unknown = _resolve_tier_args(tokens[1:], tiers, "base")
+        if unknown:
+            _reply_bad_tier_args(pr, comment, command, unknown, tiers)
+            return
+    tier_labels = [tiers[name]["label"] for name in tier_names if tiers[name]["label"]]
 
-    elif run_tier:
-        handle_run_tier_ci(repo, pr, comment, user_perms, run_tier)
+    if is_approve:
+        if handle_approve_ci(repo, pr, comment, user_perms):
+            _rerun_gated_runs_after_approval(repo, pr)
+            _refresh_pr_states(repo, pr)
 
-    elif first_line.startswith(("/run-cpu-ci", "/rerun-cpu-ci")):
+    elif first_line.startswith("/run-cpu-ci"):
         handle_run_cpu_ci(repo, pr, comment, user_perms, token)
 
     elif first_line.startswith("/rerun-failed-ci"):
-        handle_rerun_failed_ci(repo, pr, comment, user_perms)
+        if handle_rerun_failed_ci(repo, pr, comment, user_perms):
+            _refresh_pr_states(repo, pr)
 
     elif is_tag_and_rerun:
         # Perform both actions, but suppress individual reactions
@@ -2093,10 +2188,8 @@ def main():
             tier_labels=tier_labels,
         )
 
-        # Wait for the label to propagate before triggering rerun
         if tagged:
-            print("Waiting 5 seconds for label to propagate...")
-            time.sleep(5)
+            _rerun_gated_runs_after_approval(repo, pr)
 
         rerun = handle_rerun_failed_ci(
             repo, pr, comment, user_perms, react_on_success=False
@@ -2104,6 +2197,7 @@ def main():
 
         # If at least one action was successful, add the reaction here
         if tagged or rerun:
+            _refresh_pr_states(repo, pr)
             comment.create_reaction("+1")
             print("Combined command processed successfully; reaction added.")
         else:
@@ -2143,7 +2237,7 @@ def main():
         )
 
     else:
-        handle_unknown_command(pr, comment, first_line, tiers)
+        handle_unknown_command(pr, comment, first_line)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,10 @@ on:
       multimodal_gen:
         required: true
         type: string
+      model_scoped_pr:
+        description: 'Defer selected older H100 cases on PRs limited to other model families.'
+        type: boolean
+        default: false
       # False when only the ComfyUI plugin (and its unit tests) changed: the
       # unit suites still run, the server / GPU suites below are skipped.
       multimodal_gen_server:
@@ -48,18 +52,39 @@ jobs:
     if: inputs.multimodal_gen == 'true' && inputs.multimodal_gen_server == 'true'
     runs-on: ubuntu-latest
     outputs:
+      h100-pr-families: ${{ steps.compute.outputs.h100-pr-families }}
       plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
       plan-2gpu: ${{ steps.compute.outputs.plan-2gpu }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Identify model-specific PR changes
+        if: inputs.model_scoped_pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Compare immutable commits. The API returns at most 300 files.
+          files="$RUNNER_TEMP/diffusion-pr-files.json"
+          if gh api "repos/$GITHUB_REPOSITORY/compare/$BASE_SHA...$HEAD_SHA?per_page=1" \
+              --jq 'if (.files | length) < 300 then [.files[] | .filename, (.previous_filename // empty)] else [] end' > "$files"; then
+            echo "DIFFUSION_PR_FILES=$files" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Diff unavailable. Running all H100 cases."
+          fi
 
       - name: Compute partitions
         id: compute
@@ -77,7 +102,9 @@ jobs:
       inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-1-gpu-h100
+      stage: base-b-diffusion
+      runner_config: 1-gpu-large
+      job_display_name: diffusion-1-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 240
       run_timeout_minutes: 240
@@ -91,7 +118,9 @@ jobs:
       inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-1-gpu-5090
+      stage: base-b-diffusion
+      runner_config: 1-gpu-small
+      job_display_name: diffusion-1-gpu-5090
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 180
       run_timeout_minutes: 120
@@ -100,19 +129,6 @@ jobs:
         (cd python && python3 -m pytest -v -rs \
           sglang/multimodal_gen/test/unit/test_fp8_fa_sm120_attn.py \
           sglang/multimodal_gen/test/unit/test_subblock_sparse_attention.py::TestSubBlockNumerics)
-    secrets: inherit
-
-  bcg-diffusion:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true' &&
-      inputs.multimodal_gen_server == 'true'
-    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
-    with:
-      runner_config: diffusion-bcg-1-gpu-h100
-      caller_inputs: ${{ toJson(inputs) }}
-      job_timeout_minutes: 90
-      run_timeout_minutes: 60
     secrets: inherit
 
   multimodal-gen-test-2-gpu:
@@ -126,25 +142,14 @@ jobs:
       inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-2-gpu-h100
+      stage: base-b-diffusion
+      runner_config: 2-gpu-large
+      job_display_name: diffusion-2-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 55
       run_timeout_minutes: 55
       retry_deadline_seconds: 3000
       partition_plan: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
-    secrets: inherit
-
-  multimodal-gen-component-accuracy:
-    if: |
-      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true' &&
-      inputs.multimodal_gen_server == 'true'
-    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
-    with:
-      runner_config: diffusion-component-2-gpu-h100
-      caller_inputs: ${{ toJson(inputs) }}
-      job_timeout_minutes: 240
-      run_timeout_minutes: 240
     secrets: inherit
 
   multimodal-gen-test-4-gpu-b200:
@@ -154,7 +159,10 @@ jobs:
       inputs.multimodal_gen_server == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-1-gpu-b200
+      stage: base-b-diffusion
+      runner_config: 4-gpu-b200
+      job_display_name: diffusion-4-gpu-b200
+      prefetch_suite_models: true
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 240
       run_timeout_minutes: 240
@@ -190,7 +198,9 @@ jobs:
       inputs.multimodal_gen == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-unit-1-gpu-h100
+      stage: base-b-diffusion-unit
+      runner_config: 1-gpu-large
+      job_display_name: diffusion-unit-1-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 120
       run_timeout_minutes: 60
@@ -208,14 +218,16 @@ jobs:
       inputs.diffusion_sm103 == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
-      runner_config: diffusion-unit-1-gpu-b300
+      stage: base-b-diffusion-unit
+      runner_config: 1-gpu-b300
+      job_display_name: diffusion-sm103-1-gpu-b300
       caller_inputs: ${{ toJson(inputs) }}
       job_timeout_minutes: 120
       run_timeout_minutes: 60
     secrets: inherit
 
   diffusion-coverage-check:
-    needs: [multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
+    needs: [compute-diffusion-partitions, multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
     if: |
       always() &&
       inputs.multimodal_gen == 'true' &&
@@ -231,7 +243,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          persist-credentials: false
+          ref: ${{ inputs.git_ref || (github.event_name == 'pull_request_target' && github.event.pull_request.head.sha) || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -242,9 +258,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: reports/
-          pattern: diffusion-report-diffusion-?-gpu-h100-*
+          pattern: diffusion-report-base-b-diffusion-test-?-gpu-large-*
           merge-multiple: false
 
       - name: Verify coverage
+        env:
+          DIFFUSION_H100_PR_FAMILIES: ${{ needs.compute-diffusion-partitions.outputs.h100-pr-families }}
         run: |
           python scripts/ci/utils/diffusion/verify_diffusion_coverage.py --reports-dir reports/

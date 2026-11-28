@@ -84,6 +84,9 @@ pub struct ServerInfo {
     /// Whether the engine's chat template renders a system message after the
     /// first; `false` when `/server_info` predates the field or did not answer.
     pub supports_inline_system: bool,
+    /// Whether a prefill engine answers a request for at most one token with
+    /// no decode; `false` when `/server_info` predates the field or did not answer.
+    pub prefill_answers_alone: bool,
 }
 
 /// PD classification derived from a worker's `/server_info` response.
@@ -216,6 +219,7 @@ impl WorkerIntrospector {
                         == Some("prefill_complete")
             }),
             supports_inline_system: parsed.supports_inline_system,
+            prefill_answers_alone: parsed.prefill_answers_alone,
         }
     }
 
@@ -337,7 +341,7 @@ fn resolve_disaggregation_role(
 }
 
 /// Substitute a wildcard bind host (`*`, `0.0.0.0`, `::`, `[::]`) with
-/// the host parsed from the worker URL — the gateway has to connect to
+/// the host parsed from the worker URL — the router has to connect to
 /// a routable address.  An unparsable worker URL leaves the host
 /// unchanged: the subsequent ZMQ connect will fail visibly with the
 /// wildcard literal, which is the same observable failure mode that
@@ -444,12 +448,15 @@ struct ServerInfoBody {
     /// `/v1/messages` acts on; only its HTTP `/server_info` reports it.
     #[serde(default)]
     supports_inline_system: bool,
+    /// Set by engines that answer a hostless one-token PD prefill request.
+    #[serde(default)]
+    prefill_answers_alone: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct KvEventsBlock {
     // Forward-compatibility: the only publisher implementation
-    // supported on the gateway side is ZMQ. Keeping the field optional
+    // supported on the router side is ZMQ. Keeping the field optional
     // means a future SGLang that adds a non-ZMQ publisher string won't
     // fail deserialize; the resulting subscriber will still try to open
     // a ZMQ connection and fail visibly.
@@ -891,6 +898,20 @@ mod tests {
             let (url, _shutdown) = spawn_fake_worker(body).await;
             let info = fast_introspector().fetch(&url).await;
             assert_eq!(info.supports_inline_system, want);
+        }
+    }
+
+    /// An engine that predates the field keeps every request on prefill and decode.
+    #[tokio::test]
+    async fn fetch_reads_prefill_answers_alone() {
+        for (body, want) in [
+            (json!({"prefill_answers_alone": true}), true),
+            (json!({"prefill_answers_alone": false}), false),
+            (json!({}), false),
+        ] {
+            let (url, _shutdown) = spawn_fake_worker(body).await;
+            let info = fast_introspector().fetch(&url).await;
+            assert_eq!(info.prefill_answers_alone, want);
         }
     }
 

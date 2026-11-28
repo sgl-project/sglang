@@ -171,7 +171,7 @@ def _build_parallelism_config(
     )
 
 
-def _mark_transformer_parallelized(transformer, config, sp_group, tp_group):
+def _mark_transformer_parallelized(transformer, config):
     if config is None:
         return
 
@@ -433,6 +433,10 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
         blocks_attr="single_blocks",
         forward_pattern=ForwardPattern.Pattern_3,
     ),
+    "LingBotVideoTransformer3DModel": CustomBlockAdapterSpec(
+        blocks_attr="blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
 }
 
 
@@ -645,7 +649,7 @@ def enable_cache_on_transformer(
     ):
         _patch_cache_dit_similarity()
 
-    _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
+    _mark_transformer_parallelized(transformer, parallelism_config)
 
     # Custom path: pass a pre-built BlockAdapter, bypassing the registry.
     # Standard path: let enable_cache discover the registered adapter.
@@ -853,10 +857,8 @@ def enable_cache_on_dual_transformer(
     if parallelism_config is not None:
         _patch_cache_dit_similarity()
 
-    _mark_transformer_parallelized(transformer, parallelism_config, sp_group, tp_group)
-    _mark_transformer_parallelized(
-        transformer_2, parallelism_config, sp_group, tp_group
-    )
+    _mark_transformer_parallelized(transformer, parallelism_config)
+    _mark_transformer_parallelized(transformer_2, parallelism_config)
 
     transformer_blocks_attr, transformer_2_blocks_attr = adapter_spec.blocks_attr
     transformer_blocks = getattr(transformer, transformer_blocks_attr, None)

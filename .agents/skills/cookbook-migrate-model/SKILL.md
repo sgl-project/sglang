@@ -150,6 +150,12 @@ toggle → low-latency / high-throughput"; "xeon: (none) → balanced"), with a
 one-line rationale each; don't enumerate 60 identical rows. The table is what
 hardware owners sign off on at review.
 
+The ids you choose here (hardware, dims, options) and the page path are also
+the keys of the page's recipe ratings (`ratingKey` in `_deployment.jsx`). A
+migration that renames an id on a page already collecting ratings resets those
+recipes to zero, so prefer keeping the live page's ids, and list any renamed
+id in the PR body.
+
 ### 3. Generate the config (codegen, then audit)
 - For >~30 cells, port the legacy `generateCommand()` into a throwaway Node
   script that enumerates combos and emits the `cells:[...]` literal (output

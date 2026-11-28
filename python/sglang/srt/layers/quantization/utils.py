@@ -67,6 +67,19 @@ _FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
     "gate_up_proj": ["gate_proj", "up_proj"],
 }
 
+
+def reads_scoped_fused_shards(quant_config: Optional[QuantizationConfig]) -> bool:
+    # Configs whose fused-layer lookup honors dotted packed_modules_mapping
+    # keys (AWQ's is_layer_skipped_awq, AutoRound's first-match fusion loop).
+    from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+    from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
+    from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+
+    if isinstance(quant_config, MoeWNA16Config):
+        return quant_config.linear_quant_method == "awq"
+    return isinstance(quant_config, (AWQConfig, AWQMarlinConfig, AutoRoundConfig))
+
+
 # GPTQ dynamic negative rules reference checkpoint-side shard names, including
 # split GDN projections (`in_proj_qkv`/`in_proj_z` and `in_proj_b`/`in_proj_a`)
 # that are fused into `in_proj_qkvz` and `in_proj_ba` in SGLang.
@@ -259,11 +272,12 @@ def override_config(config: QuantizationConfig, prefix: str):
         if config.get_name() == "gptq"
         else 32 // config.weight_bits
     )  # packed into int32
-    if config.get_name() == "gptq_marlin":
+    if config.get_name() in ("gptq", "gptq_marlin"):
         is_sym = get_dynamic_override(config, prefix, "sym", config.is_sym)
         if isinstance(is_sym, bool):
             config.is_sym = is_sym
 
+    if config.get_name() == "gptq_marlin":
         if (config.weight_bits, config.is_sym) not in config.TYPE_MAP:
             raise ValueError(
                 "Unsupported quantization config: "
@@ -754,9 +768,9 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
 
 def swizzle_blockscale(scale: torch.Tensor):
     """
-    Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
+    Swizzle NVFP4 (E4M3) or MXFP8 (UE8M0 as uint8) block scales into CUTLASS 128x4 atoms.
     """
-    assert scale.dtype == torch.float8_e4m3fn
+    assert scale.dtype in (torch.float8_e4m3fn, torch.uint8)
     # Pad and blockwise interleave weight_scale
     scale_ndim = scale.ndim
     if scale.ndim == 2:

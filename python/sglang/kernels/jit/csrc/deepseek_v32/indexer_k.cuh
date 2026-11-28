@@ -83,10 +83,11 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope(const __grid_constant__ FusedKIn
   if (work_id >= params.batch_size) return;
 
   const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * params.k_input_stride_batch;
+
+  // `positions` may come from the immediately preceding grid (e.g. the DCP `index_select`), so read it after the wait.
+  PDLWaitPrimary<kUsePDL>();
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
   const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
-
-  PDLWaitPrimary<kUsePDL>();
   Float4 data, freq, freq_sin, gamma, beta;
 
   // part 1: LayerNorm
@@ -271,10 +272,11 @@ K_INDEXER_KERNEL void fused_k_indexer_norm_rope_store(const __grid_constant__ Fu
   if (work_id >= params.batch_size) return;
 
   const auto input_ptr = static_cast<const DType*>(params.k_input) + work_id * params.k_input_stride_batch;
+
+  // `positions` may come from the immediately preceding grid (e.g. the DCP `index_select`), so read it after the wait.
+  PDLWaitPrimary<kUsePDL>();
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
   const auto cos_sin_cache = params.cos_sin_cache + position * kRopeDim;
-
-  PDLWaitPrimary<kUsePDL>();
   Float4 data, freq, freq_sin, gamma, beta;
 
   // part 1: LayerNorm

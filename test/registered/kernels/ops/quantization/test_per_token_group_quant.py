@@ -776,23 +776,6 @@ def test_dense_silu_graph_replay():
         assert torch.equal(s, expected_s)
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"silu_and_mul_mode": "unknown"},
-        {"fuse_silu_and_mul": False},
-        {"out_dtype": torch.int8},
-        {"group_size": 64},
-    ],
-)
-def test_dense_silu_invalid_mode(overrides):
-    x = torch.zeros(1, 256, device="cuda", dtype=torch.bfloat16)
-    kwargs = dict(fuse_silu_and_mul=True, silu_and_mul_mode="dense")
-    kwargs.update(overrides)
-    with pytest.raises(ValueError, match="mode"):
-        per_token_group_quant(x, **kwargs)
-
-
 @pytest.mark.parametrize("scale_ue8m0,hidden", [(False, 1408), (True, 1536)])
 def test_dense_silu_masked_bitexact(scale_ue8m0, hidden):
     """Masked dense fusion quantizes each expert's first masked_m[e] rows exactly
@@ -983,6 +966,23 @@ NON_FINITE_CASES = get_ci_test_range(
         (-float("inf"), True, True),
     ],
 )
+
+
+@pytest.mark.parametrize("column_major", [False, True])
+def test_fp16_packed_ue8m0_small_groups(column_major):
+    """Zero / tiny FP16 groups need a multiplier beyond the FP16 range (up to
+    2^42); scaling in FP16 turned them into +-448 codes."""
+    x = torch.zeros(4, 512, device="cuda", dtype=torch.float16)
+    x[1] = torch.finfo(torch.float16).tiny
+    x[2] = torch.finfo(torch.float16).smallest_normal / 4  # subnormal
+    x[3].normal_()
+    x[3, :G] = 0.0
+    q, s = per_token_group_quant(
+        x, group_size=G, scale_ue8m0=True, column_major_scales=column_major
+    )
+    q_ref, exp_ref = ref_fp8_ue8m0(x, G)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(_decode_packed_exp(s, 512 // G), exp_ref)
 
 
 @pytest.mark.parametrize("poison,scale_ue8m0,masked", NON_FINITE_CASES)

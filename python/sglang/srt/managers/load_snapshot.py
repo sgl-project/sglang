@@ -184,6 +184,10 @@ class DisaggregationMetrics(msgspec.Struct, array_like=True):
     decode_retracted_queue_reqs: int = 0
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
+    # 1 while a full host staging pool holds back ready decode prealloc requests;
+    # host-staged transfers whose KV landed but wait for device admission.
+    decode_host_pool_blocked: int = 0
+    decode_host_staged_landed_reqs: int = 0
 
 
 class QueueMetrics(msgspec.Struct, array_like=True):
@@ -226,6 +230,16 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # cumulative counters
     total_prefill_uncached_tokens: int = 0
     total_prefill_busy_us: int = 0
+    # Cumulative L3 storage-prefetch tokens: storage-hit tokens L3 queries
+    # returned, and those that did not become a usable prefetch, by reason
+    # (sglang:storage_prefetch_*_tokens_total). None without storage metrics.
+    total_storage_prefetch_hit_tokens: Optional[int] = None
+    total_storage_prefetch_unfulfilled_tokens: Optional[dict[str, int]] = None
+    # Cumulative L3 backup tokens: written to storage, and dropped before any
+    # write (sglang:backuped_tokens_total,
+    # sglang:hicache_backup_dropped_tokens_total). None without storage metrics.
+    total_backuped_tokens: Optional[int] = None
+    total_backup_dropped_tokens: Optional[int] = None
     # Decode step-time moment sums
     decode_moments: Optional[list[float]] = None
 

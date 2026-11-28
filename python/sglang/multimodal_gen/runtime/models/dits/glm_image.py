@@ -487,9 +487,6 @@ class GlmImageAttention(torch.nn.Module):
     ):
         super().__init__()
 
-        self.k_cache = None
-        self.v_cache = None
-
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.dim_head = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads
@@ -565,11 +562,13 @@ class GlmImageAttention(torch.nn.Module):
 
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
+            global_num_heads=self.heads,
             head_size=dim_head,
             num_kv_heads=self.num_local_kv_heads,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            supported_attention_backends=supported_attention_backends,
         )
 
     def forward(
@@ -972,8 +971,6 @@ class GlmImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             arch_config.patch_size * arch_config.patch_size * arch_config.out_channels,
             bias=True,
         )
-
-        self.gradient_checkpointing = False
 
     def forward(
         self,

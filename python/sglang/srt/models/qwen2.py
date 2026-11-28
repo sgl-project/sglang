@@ -427,12 +427,6 @@ class Qwen2Model(nn.Module):
         # For EAGLE3 support
         self.layers_to_capture = []
 
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.config, "scale_emb"):
-            return self.get_input_embeddings()(input_ids) * self.config.scale_emb
-        else:
-            return self.get_input_embeddings()(input_ids)
-
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -555,9 +549,6 @@ class Qwen2ForCausalLM(nn.Module):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
-
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embedding(input_ids)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

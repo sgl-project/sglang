@@ -315,19 +315,21 @@ class Glm47MoeDetector(BaseFormatDetector):
         self.use_full_assistant_constraint = False
         self.bot_token = "<tool_call>"
         self.eot_token = "</tool_call>"
-        self.func_call_regex = r"<tool_call>.*?</tool_call>"
+        # An unclosed trailing call matches the second branch, with group 1 unset,
+        # so the scan does not restart from every opener in the unclosed tail.
+        self.func_call_regex = r"(<tool_call>.*?</tool_call>)|<tool_call>.*"
+        # Each split call starts at its opener, and a later opener sees a subset of
+        # the text, so anchoring keeps a failed search from rescanning per opener.
         self.func_detail_regex = re.compile(
-            r"<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
+            r"\A<tool_call>(.*?)(<arg_key>.*?)?</tool_call>", re.DOTALL
         )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
             re.DOTALL,
         )
-        self._last_arguments = ""
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
-        self._tool_call_completed = False  # Track if tool call has been completed
         self._sent_empty_object = (
             False  # Track if empty object has been sent for no-arg functions
         )
@@ -346,7 +348,6 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
         )
-        self._tool_call_completed = False  # Reset tool call completion status
         self._sent_empty_object = False  # Reset empty object sent status
         self._buffer_arguments = None
 
@@ -360,7 +361,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        :return: StreamingParseResult with normal text and parsed tool calls.
         """
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])
@@ -371,6 +372,8 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         # Find all tool call matches
         for match in re.finditer(self.func_call_regex, text, re.DOTALL):
+            if match.group(1) is None:
+                continue
             # Add text before this tool call
             if match.start() > last_end:
                 normal_text_parts.append(text[last_end : match.start()])
@@ -656,7 +659,6 @@ class Glm47MoeDetector(BaseFormatDetector):
         if not json_increment:
             return None
 
-        self._last_arguments += json_increment
         self.streamed_args_for_tool[self.current_tool_id] += json_increment
 
         return ToolCallItem(
@@ -697,7 +699,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                     tool_index=self.current_tool_id, name=None, parameters=serialized
                 )
             )
-            self._last_arguments += serialized
             self.streamed_args_for_tool[self.current_tool_id] += serialized
             self._sent_empty_object = True
 
@@ -710,12 +711,11 @@ class Glm47MoeDetector(BaseFormatDetector):
                     parameters="{}",
                 )
             )
-            self._last_arguments += "{}"
             self.streamed_args_for_tool[self.current_tool_id] += "{}"
             self._sent_empty_object = True
         elif not self._is_first_param and not self._sent_empty_object:
             # The streamed outer `{` is only closed here; a trailing "}" in
-            # _last_arguments may belong to a nested object value.
+            # the streamed arguments may belong to a nested object value.
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,
@@ -723,7 +723,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                     parameters="}",
                 )
             )
-            self._last_arguments += "}"
             self.streamed_args_for_tool[self.current_tool_id] += "}"
             self._sent_empty_object = True
 
@@ -741,9 +740,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._buffer = current_text[match_end_pos:]
 
         # Reset state for next tool call
-        self._tool_call_completed = True
         self.current_tool_id += 1
-        self._last_arguments = ""
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
         self._reset_streaming_state()
@@ -795,9 +792,6 @@ class Glm47MoeDetector(BaseFormatDetector):
             # Update buffer to only include from the bot token onwards
             self._buffer = current_text
 
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
@@ -817,14 +811,6 @@ class Glm47MoeDetector(BaseFormatDetector):
                 self._streamed_raw_length = 0
                 self.current_tool_name_sent = False  # Reset for new tool call
                 self._reset_streaming_state()
-            # Check if this is a continuation of an existing tool call or a new one
-            elif not self.current_tool_name_sent:
-                # Only increment tool_id if we're truly starting a NEW tool call
-                # Don't increment if this is just the first time we're processing
-                # a tool call that was received in the buffer
-                # The key insight: only increment when we've COMPLETED a previous tool call
-                # and now see another bot_token in new_text
-                pass  # Remove the problematic auto-increment logic
 
             # Ensure tracking arrays are large enough (keeping existing logic)
             while len(self.prev_tool_call_arr) <= self.current_tool_id:
@@ -852,7 +838,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     calls.append(arg_item)
 
                 # Finalize tool call if end token is encountered
-                if is_tool_end == self.eot_token and not self._tool_call_completed:
+                if is_tool_end == self.eot_token:
                     finalize_calls = self._finalize_tool_call(
                         func_name,
                         func_args_raw,

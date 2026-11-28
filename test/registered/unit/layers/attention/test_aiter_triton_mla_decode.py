@@ -4,7 +4,6 @@ import os
 import sys
 import types
 import unittest
-import warnings
 from unittest import mock
 
 import torch
@@ -49,7 +48,7 @@ def _metadata(bs, triton):
         qo_indptr=torch.arange(bs + 1, dtype=torch.int32),
         kv_last_page_len=None,
         max_q_len=1,
-        max_kv_len=100,
+        batch_max_kv_len=100,
         triton_mla_block_tables=(
             torch.arange(bs, dtype=torch.int32)[:, None] + 1 if triton else None
         ),
@@ -149,17 +148,10 @@ class TestResolveAiterMlaDecodeBackend(CustomTestCase):
             return atm.resolve_aiter_mla_decode_backend(value, **kwargs)
 
     def _env_value(self, **env):
-        names = (
-            "SGLANG_AITER_MLA_DECODE_BACKEND",
-            "SGLANG_AITER_MLA_DCP_DECODE_BACKEND",
-        )
         with mock.patch.dict(os.environ):
-            for name in names:
-                os.environ.pop(name, None)
+            os.environ.pop("SGLANG_AITER_MLA_DECODE_BACKEND", None)
             os.environ.update(env)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", DeprecationWarning)
-                return envs.SGLANG_AITER_MLA_DECODE_BACKEND.get()
+            return envs.SGLANG_AITER_MLA_DECODE_BACKEND.get()
 
     def test_unset_env_runs_aiter_triton_mla_on_gfx1250(self):
         self.assertEqual(self._resolve(self._env_value()), "triton")
@@ -180,10 +172,10 @@ class TestResolveAiterMlaDecodeBackend(CustomTestCase):
             with self.subTest(**kwargs):
                 self.assertEqual(self._resolve("auto", **kwargs), "asm")
 
-    def test_explicit_triton_and_the_deprecated_name(self):
+    def test_explicit_triton(self):
         self.assertEqual(self._resolve("triton"), "triton")
         self.assertEqual(self._resolve("TRITON"), "triton")
-        value = self._env_value(SGLANG_AITER_MLA_DCP_DECODE_BACKEND="triton")
+        value = self._env_value(SGLANG_AITER_MLA_DECODE_BACKEND="triton")
         self.assertEqual(self._resolve(value), "triton")
 
     def test_triton_the_kernel_cannot_serve_raises(self):
@@ -261,7 +253,7 @@ class TestTritonMlaBlockTables(CustomTestCase):
                 tables = atm.triton_mla_block_tables(
                     req_to_token=req_to_token,
                     req_pool_indices=torch.tensor([0]),
-                    max_kv_len=page_size + 1,
+                    batch_max_kv_len=page_size + 1,
                     page_size=page_size,
                 )
                 expected = [p * ratio + i for p in pages for i in range(ratio)]
@@ -275,7 +267,7 @@ class TestTritonMlaBlockTables(CustomTestCase):
         tables = atm.triton_mla_block_tables(
             req_to_token=req_to_token,
             req_pool_indices=torch.tensor([1, 0]),
-            max_kv_len=3,
+            batch_max_kv_len=3,
             page_size=1,
         )
         torch.testing.assert_close(tables, req_to_token[[1, 0], :3])
@@ -292,12 +284,12 @@ class TestTritonMlaBlockTables(CustomTestCase):
                 for row in pages
             ]
         )
-        for max_kv_len, width in ((64, 1), (65, 2), (128, 2), (129, 3)):
-            with self.subTest(max_kv_len=max_kv_len):
+        for batch_max_kv_len, width in ((64, 1), (65, 2), (128, 2), (129, 3)):
+            with self.subTest(batch_max_kv_len=batch_max_kv_len):
                 tables = atm.triton_mla_block_tables(
                     req_to_token=req_to_token,
                     req_pool_indices=torch.tensor([1, 0]),
-                    max_kv_len=max_kv_len,
+                    batch_max_kv_len=batch_max_kv_len,
                     page_size=_PAGE_SIZE,
                 )
                 torch.testing.assert_close(
@@ -368,7 +360,8 @@ def _metadata_backend(triton):
     backend.dcp_world_size = 1
     backend.use_mla_dcp_asm = False
     backend.page_size = _PAGE_SIZE
-    backend.max_context_len = max_context_len
+    backend.max_kv_len = max_context_len
+    backend.max_num_pages = len(_SPLIT_PAGES[0])
     backend.max_split_per_batch = 16
     backend.max_num_partitions = 1
     backend._decode_partition_buckets = []
