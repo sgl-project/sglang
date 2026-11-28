@@ -4,8 +4,6 @@ import torch
 import triton
 import triton.language as tl
 
-_MIN_TOKENS_FOR_FUSED = 32
-
 
 @triton.jit
 def _post_expert_norm_weighted_sum_kernel(
@@ -78,30 +76,16 @@ def fused_post_expert_norm_weighted_sum(
 
     round_product preserves input-dtype multiplication before FP32 accumulation
     when combining an already normalized low-precision tensor.
+
+    Every token count runs the one Triton kernel. A torch chain below 32 tokens
+    took 23 to 37us on an H100 at the Muse shape against 4.7us for the kernel,
+    and gave a token different bits depending on the batch size.
     """
     x = expert_output.contiguous()
     tokens, topk, hidden = x.shape
     out = torch.empty((tokens, hidden), dtype=x.dtype, device=x.device)
     if tokens == 0:
         return out
-    if tokens < _MIN_TOKENS_FOR_FUSED and slot_expert_ids is None and not round_product:
-        y = x
-        if apply_norm:
-            f = y.float()
-            if norm_weight is not None and weight_first:
-                f = f * norm_weight.float()
-                f = f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + eps)
-            elif norm_weight is not None:
-                f = f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + eps)
-                f = f * norm_weight.float()
-            else:
-                f = f * torch.rsqrt(f.pow(2).mean(-1, keepdim=True) + eps)
-            y = f
-        else:
-            y = y.float()
-        y = y * topk_scores.float().unsqueeze(-1)
-        return y.sum(dim=1).to(x.dtype)
-
     block_h = triton.next_power_of_2(hidden)
     _post_expert_norm_weighted_sum_kernel[(tokens,)](
         x,

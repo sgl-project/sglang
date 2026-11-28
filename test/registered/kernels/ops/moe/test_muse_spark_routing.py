@@ -128,6 +128,39 @@ def test_post_expert_finalize_triton(num_tokens, weight_first, with_ids):
         assert torch.count_nonzero(out[0]) == 0
 
 
+@pytest.mark.parametrize("weight_first", [True, False])
+@pytest.mark.parametrize("with_ids", [False, True])
+def test_post_expert_finalize_is_batch_invariant(weight_first, with_ids):
+    """A token's output does not depend on how many tokens share its batch.
+
+    Decode batches of 1 to 31 tokens once took a slower torch path whose bits
+    differed from the kernel's, so this compares every prefix of a 64-token
+    batch with the whole batch's rows, bit for bit, at the Muse shape.
+    """
+    torch.manual_seed(7)
+    tokens, topk, hidden = 64, 8, 4096
+    x = torch.randn(tokens, topk, hidden, device="cuda", dtype=torch.bfloat16)
+    scores = torch.softmax(torch.randn(tokens, topk, device="cuda"), dim=-1)
+    weight = (1.0 + 0.1 * torch.randn(hidden, device="cuda")).to(torch.bfloat16)
+    ids = None
+    if with_ids:
+        ids = torch.randint(0, 32, (tokens, topk), device="cuda", dtype=torch.int32)
+        ids[:, -1] = -1
+    full = fused_post_expert_norm_weighted_sum(
+        x, scores, weight, eps=1e-8, weight_first=weight_first, slot_expert_ids=ids
+    )
+    for n in (1, 2, 3, 4, 8, 16, 24, 31, 32, 33):
+        part = fused_post_expert_norm_weighted_sum(
+            x[:n],
+            scores[:n],
+            weight,
+            eps=1e-8,
+            weight_first=weight_first,
+            slot_expert_ids=None if ids is None else ids[:n],
+        )
+        assert torch.equal(part, full[:n]), f"{n} tokens differ from the full batch"
+
+
 @pytest.mark.parametrize("strided_input", ["ids", "weight"])
 def test_post_expert_finalize_preserves_input_layout(strided_input):
     """Small-batch finalization respects transposed IDs and sliced norm weights."""
