@@ -1488,8 +1488,19 @@ class LogitsProcessor(nn.Module):
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
             else:
+                from sglang.srt.layers.quantization.unquant import (
+                    sm12x_bf16_lm_head,
+                    sm12x_bf16_lm_head_applies,
+                )
+
                 lhs = hidden_states.to(lm_head.weight.dtype)
-                if out is not None and out.dtype == lm_head.weight.dtype:
+                out_ok = out is not None and out.dtype == lm_head.weight.dtype
+                buf = out if out_ok else None
+                # SM12x: cuBLAS streams the decode-width LM head at ~175 GB/s on
+                # GB10 (M=1); the GEMV reaches ~240 GB/s.
+                if sm12x_bf16_lm_head_applies(lhs, lm_head.weight, buf):
+                    logits = sm12x_bf16_lm_head(lhs, lm_head.weight, buf)
+                elif out_ok:
                     logits = torch.matmul(lhs, lm_head.weight.T, out=out)
                 else:
                     logits = torch.matmul(lhs, lm_head.weight.T)
