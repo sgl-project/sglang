@@ -16,6 +16,7 @@ import pytest
 import torch
 from PIL import Image
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -132,11 +133,12 @@ def _image_stages(server):
         "transformer": DiT(),
     }
     pipeline = object.__new__(MiniMaxH3ImagePipeline)
-    pipeline.get_module = modules.get
-    stages = []
-    pipeline.add_stage = stages.append
+    pipeline.modules = modules
+    pipeline._disagg_role = RoleType.MONOLITHIC
+    pipeline._stages = []
+    pipeline._stage_name_mapping = {}
     pipeline.create_pipeline_stages(server)
-    return pipeline, stages, modules
+    return pipeline, pipeline.stages, modules
 
 
 @pytest.mark.parametrize("task", ["t2i", "edit"])

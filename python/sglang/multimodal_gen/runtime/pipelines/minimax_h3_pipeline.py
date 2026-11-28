@@ -277,12 +277,15 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
         return adapter_path
 
-    def validate_disagg_role(self, role: RoleType) -> None:
-        if role != RoleType.MONOLITHIC:
-            raise ValueError(
-                "MiniMaxH3Pipeline only supports monolithic deployment; "
-                f"disaggregation role {role.value!r} is not supported"
-            )
+    def _get_extra_allowed_modules_for_role(
+        self, role: RoleType, task_name: str
+    ) -> set[str]:
+        modules = super()._get_extra_allowed_modules_for_role(role, task_name)
+        if role == RoleType.ENCODER:
+            # FL2VA keyframes and Ref2VA visual/audio references are encoded
+            # before denoising, using the same VAEs as the decoder role.
+            modules.update({"video_vae", "audio_vae"})
+        return modules
 
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         self.pdd_heads = self._resolve_pdd_heads()
@@ -344,25 +347,31 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             # the native Qwen-Image path. Video releases keep the table their
             # consistency references were generated with.
             visual.rotary_pos_emb.recompute_on_device_change = True
-        self.add_stage(
-            MiniMaxH3TextEncodingStage(
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MiniMaxH3TextEncodingStage(
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
                 processor=self.get_module("processor"),
-            )
+            ),
+            "MiniMaxH3TextEncodingStage",
         )
-        self.add_stage(
-            MiniMaxH3VisualEncodingStage(
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            lambda: MiniMaxH3VisualEncodingStage(
                 video_vae=self.get_module("video_vae"),
                 vae_arch_config=server_args.pipeline_config.vae_config.arch_config,
-            )
+            ),
+            "MiniMaxH3VisualEncodingStage",
         )
         if self.is_video_pipeline:
-            self.add_stage(
-                MiniMaxH3AudioEncodingStage(
+            self.add_stage_factory(
+                RoleType.ENCODER,
+                lambda: MiniMaxH3AudioEncodingStage(
                     audio_vae=self.get_module("audio_vae"),
                     vae_arch_config=server_args.pipeline_config.audio_vae_config.arch_config,
-                )
+                ),
+                "MiniMaxH3AudioEncodingStage",
             )
         self.add_stage(MiniMaxH3LatentPreparationStage())
         self.add_stage(
@@ -381,8 +390,9 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 ),
             )
         )
-        self.add_stage(
-            MiniMaxH3DenoisingStage(
+        self.add_stage_factory(
+            RoleType.DENOISER,
+            lambda: MiniMaxH3DenoisingStage(
                 transformer=self.get_module("transformer"),
                 transformer_2=self.get_module("transformer_2"),
                 pipeline=self,
@@ -394,13 +404,16 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     release_metadata is not None
                     and release_metadata.video_output == "dwd"
                 ),
-            )
+            ),
+            "MiniMaxH3DenoisingStage",
         )
-        self.add_stage(
-            MiniMaxH3DecodingStage(
+        self.add_stage_factory(
+            RoleType.DECODER,
+            lambda: MiniMaxH3DecodingStage(
                 video_vae=self.get_module("video_vae"),
                 audio_vae=self.get_module("audio_vae"),
-            )
+            ),
+            "MiniMaxH3DecodingStage",
         )
 
     def create_comfyui_stages(self, server_args: ServerArgs) -> None:
