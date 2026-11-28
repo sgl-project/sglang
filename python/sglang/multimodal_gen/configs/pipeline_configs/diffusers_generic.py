@@ -88,6 +88,29 @@ class DiffusersTI2VPipelineConfig(DiffusersGenericPipelineConfig):
 
 
 @dataclass
+class DiffusersCosmos3PipelineConfig(DiffusersTI2VPipelineConfig):
+    """Generic diffusers pipeline config carrying Cosmos3 checkpoint variant fields."""
+
+    action_stats_path: str | None = None
+    is_edge: bool | None = None
+    is_nano: bool | None = None
+    distilled_sigmas: list[float] | None = None
+
+    def update_config_from_dict(self, args, prefix: str = "") -> None:
+        super().update_config_from_dict(args, prefix)
+        if self.model_path:
+            from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
+                get_distilled_sigmas,
+                is_edge_checkpoint,
+                is_nano_checkpoint,
+            )
+
+            self.distilled_sigmas = get_distilled_sigmas(self.model_path)
+            self.is_edge = is_edge_checkpoint(self.model_path)
+            self.is_nano = is_nano_checkpoint(self.model_path)
+
+
+@dataclass
 class DiffusersI2IPipelineConfig(DiffusersGenericPipelineConfig):
     task_type: ModelTaskType = ModelTaskType.I2I
 

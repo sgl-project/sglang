@@ -425,14 +425,29 @@ class Cosmos3SamplingParams(SamplingParams):
 
         # adjust distil and edge args — read from the pre-computed config fields
         # so no checkpoint download happens at request time.
+        from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+            DiffusersGenericPipelineConfig,
+        )
+
         pipeline_config = server_args.pipeline_config
+        is_diffusers_backend = getattr(
+            server_args, "backend", None
+        ) == "diffusers" or isinstance(pipeline_config, DiffusersGenericPipelineConfig)
         if self.action_stats_path is None:
             self.action_stats_path = getattr(pipeline_config, "action_stats_path", None)
-        distilled_sigmas = pipeline_config.distilled_sigmas
+        raw_is_edge = getattr(pipeline_config, "is_edge", None)
+        if is_diffusers_backend and raw_is_edge is None:
+            raise ValueError(
+                "Cosmos3 diffusers pipeline config is missing resolved checkpoint "
+                "variant metadata; initialize pipeline_config with model_path "
+                "before adjusting sampling params"
+            )
+        distilled_sigmas = getattr(pipeline_config, "distilled_sigmas", None)
+        is_edge = bool(raw_is_edge)
         if distilled_sigmas is not None:
             self.num_inference_steps = len(distilled_sigmas)
         self._resolve_variant_defaults(
-            bool(pipeline_config.is_edge),
+            is_edge,
             is_distilled=distilled_sigmas is not None,
         )
 
@@ -462,13 +477,17 @@ class Cosmos3SamplingParams(SamplingParams):
         self._apply_transfer_hint_defaults()
         control_paths = self._resolve_control_paths()
         if control_paths:
-            if pipeline_config.distilled_sigmas is not None:
+            if distilled_sigmas is not None:
                 raise ValueError(
                     "Cosmos3 distilled checkpoints do not support transfer inference"
                 )
-            if pipeline_config.is_edge:
+            if is_edge:
                 raise ValueError(
                     "Cosmos3 Edge checkpoints do not support transfer inference"
+                )
+            if is_diffusers_backend:
+                raise ValueError(
+                    "Cosmos3 transfer inference is not supported by the diffusers backend adapter"
                 )
             if self.num_frames == 1:
                 raise ValueError(
