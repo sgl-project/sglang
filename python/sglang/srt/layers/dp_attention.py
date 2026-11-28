@@ -1366,9 +1366,12 @@ def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     )
 
 
-def require_mlp_tp_gather(*, moe_a2a_backend=None):
+def require_mlp_tp_gather(*, moe_a2a_backend=None, speculative_draft=None):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
+
+    speculative_draft: whether the answer is for the speculative draft; None reads it
+    from speculative_moe_a2a_backend_context.
     """
     from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
 
@@ -1423,6 +1426,12 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             # the trim saves. With uniform buckets the per-tier fan-in is exact.
             # Scoped to the opt-in gate so the default path is untouched.
             return True
+        elif _is_speculative_draft(
+            speculative_draft
+        ) and _draft_lm_head_dp_shard_needs_dp_synced_rows():
+            # Same DP-sync bookkeeping, for the draft only: the DP-sharded draft LM
+            # head all-gathers rows, so every rank must replay the same bucket.
+            return True
         else:
             return (
                 get_parallel().moe_dense_tp_size
@@ -1430,6 +1439,20 @@ def require_mlp_tp_gather(*, moe_a2a_backend=None):
             )
     else:
         return False
+
+
+def _is_speculative_draft(speculative_draft: Optional[bool]) -> bool:
+    if speculative_draft is None:
+        return get_flags().moe.speculative_context
+    return speculative_draft
+
+
+def _draft_lm_head_dp_shard_needs_dp_synced_rows() -> bool:
+    from sglang.srt.layers.logits_processor import (
+        draft_lm_head_dp_shard_needs_dp_synced_rows,
+    )
+
+    return draft_lm_head_dp_shard_needs_dp_synced_rows()
 
 
 def require_attn_tp_gather():

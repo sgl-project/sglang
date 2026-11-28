@@ -884,6 +884,7 @@ class SchedulerDPAttnAdapter:
                 draft_moe_a2a_backend = get_exec().moe.moe_a2a_backend
             draft_require_mlp_tp_gather = require_mlp_tp_gather(
                 moe_a2a_backend=draft_moe_a2a_backend,
+                speculative_draft=True,
             )
 
         shutdown_vote = DPShutdownVote(self.get_shutting_down())

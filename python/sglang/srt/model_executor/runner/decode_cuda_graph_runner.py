@@ -1574,6 +1574,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         forward_batch,
                         **kwargs,
                     )
+                    # A forward that read no metadata still joins a forked branch.
+                    attn_backend.join_forward_metadata()
                     if join_in_graph_metadata_prep():
                         raise RuntimeError(
                             "The draft forward never joined its forked metadata prep; "

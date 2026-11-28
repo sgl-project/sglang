@@ -47,7 +47,7 @@ def _small_copy_kernel(
             tl.store(dst + dst_offset, values, offsets < sizes[i])
 
 
-def try_small_copy(dsts, srcs):
+def try_small_copy(dsts, srcs, max_numel=8192):
     if len(dsts) < 2 or len(dsts) != len(srcs):
         return False
     supported = (
@@ -75,7 +75,7 @@ def try_small_copy(dsts, srcs):
             or src.device != device
             or dst.shape != src.shape
             or dst.ndim not in (1, 2)
-            or dst.numel() > 8192
+            or dst.numel() > max_numel
             or dst.requires_grad
             or src.requires_grad
             or src.is_neg()

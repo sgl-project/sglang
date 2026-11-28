@@ -225,6 +225,11 @@ class AttentionBackend(ABC):
         Default: no-op.
         """
 
+    def join_forward_metadata(self) -> None:
+        """Order the current stream after any metadata prep this backend forked in
+        init_forward_metadata_in_graph; runners call it at the end of a captured
+        forward so no forked branch is left unjoined. Default: no-op."""
+
     def init_prefill_cuda_graph_state(
         self, *, max_num_tokens: int, max_req_slots: int
     ) -> None:

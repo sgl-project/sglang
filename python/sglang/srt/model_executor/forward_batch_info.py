@@ -2258,6 +2258,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :num_tokens
                     ]
+                if logits_output.next_token_argmax_partials is not None:
+                    logits_output.next_token_argmax_partials = (
+                        logits_output.next_token_argmax_partials[:num_tokens]
+                    )
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.num_tokens_per_req
@@ -2287,6 +2291,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
                     ]
+                if logits_output.next_token_argmax_partials is not None:
+                    logits_output.next_token_argmax_partials = (
+                        logits_output.next_token_argmax_partials[:bs]
+                    )
                 if logits_output.hidden_states is not None:
                     logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
@@ -2295,6 +2303,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     logits_output.next_token_logits = logits_output.next_token_logits[
                         :bs
                     ]
+                if logits_output.next_token_argmax_partials is not None:
+                    logits_output.next_token_argmax_partials = (
+                        logits_output.next_token_argmax_partials[:bs]
+                    )
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
                 if self.forward_mode.is_idle():

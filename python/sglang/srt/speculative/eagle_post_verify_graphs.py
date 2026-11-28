@@ -58,6 +58,7 @@ class EaglePostVerifyGraphs:
             body=self._body,
             commit=self._commit,
             sim_rng=simulated_acc_len_rng,
+            eager=envs.SGLANG_OPT_SPEC_EAGER_POST_VERIFY.get(),
         )
 
     def run(
@@ -322,8 +323,28 @@ class _PostVerifyGraphs:
     and outputs alternate, so one round's outputs stay valid while the host consumes
     them; the mamba state commit replays on a side stream until join()."""
 
-    def __init__(self, *, body: Callable, commit: Callable, sim_rng: torch.Generator):
+    def __init__(
+        self,
+        *,
+        body: Callable,
+        commit: Callable,
+        sim_rng: torch.Generator,
+        eager: bool = False,
+    ):
         self._body, self._commit = body, commit
+        # SGLANG_OPT_SPEC_EAGER_POST_VERIFY: run the same body unstaged every round.
+        # The host is a round ahead, so the launches cost no GPU time, while a graph
+        # costs ~4 us at entry and exit plus the staging launch.
+        self._eager = eager
+        self._eager_max_bs = envs.SGLANG_OPT_SPEC_STEP_SEAMS_MAX_BS.get()
+        if eager:
+            logger.info(
+                "EAGLE post-verify: same body launched eagerly, no graph "
+                "(SGLANG_OPT_SPEC_EAGER_POST_VERIFY)"
+            )
+        self._sim_stream = None
+        self._sim_dev: list[torch.Tensor] = []
+        self._sim_ready: list[torch.cuda.Event] = []
         # forced acceptance lengths: the worker's one stream, from which SGLang's eager
         # verify draws too; once per round, whatever else uses the global RNG
         self._sim_rng = sim_rng
@@ -340,6 +361,12 @@ class _PostVerifyGraphs:
     def run(
         self, *, key: tuple, inputs: dict, make_slot: Callable, sim_max_len: int
     ) -> Optional[tuple]:
+        if self._eager and (
+            self._eager_max_bs <= 0 or inputs["seq_lens"].shape[0] <= self._eager_max_bs
+        ):
+            return self._run_eager(
+                inputs=inputs, make_slot=make_slot, sim_max_len=sim_max_len
+            )
         state = self._states.get(key)
         if state is None:
             if len(self._states) >= _MAX_POST_VERIFY_STATES:
@@ -379,6 +406,48 @@ class _PostVerifyGraphs:
         self._commit_done.record(self._side_stream)
         self._commit_pending = True
         return slot.outputs[:6]
+
+    def _run_eager(
+        self, *, inputs: dict, make_slot: Callable, sim_max_len: int
+    ) -> tuple:
+        """The graph body on the round's own inputs, launched eagerly: the same
+        kernels on the same values as a replay, without the staging copy."""
+        sim_len, sim_turn = self._draw_sim_len(sim_max_len)
+        staged = dict(inputs)
+        if sim_len is not None:
+            staged["sim_accept_len"] = self._stage_sim_len_aside(
+                sim_len, turn=sim_turn, device=inputs["seq_lens"].device
+            )
+        slot = make_slot(staged)
+        outputs = self._body(slot)
+        self._commit(slot, outputs)
+        if sim_len is not None:
+            # After the reader: the pinned and the device slot of this turn are free.
+            self._record_sim_done(sim_turn)
+        return outputs[:6]
+
+    def _stage_sim_len_aside(
+        self, sim_len: torch.Tensor, *, turn: int, device: torch.device
+    ) -> torch.Tensor:
+        """Copy the pinned forced length to this turn's device slot on a side stream,
+        which runs it while the verify graph is still busy, and order the current
+        stream after it. _draw_sim_len waits for the turn's last reader before reuse."""
+        if self._sim_stream is None:
+            self._sim_stream = torch.cuda.Stream(device=device)
+            # Uninitialized on purpose: a fill kernel on the current stream would
+            # land after the side stream's first copy (the current stream is busy).
+            self._sim_dev = [
+                torch.empty((1,), dtype=torch.int64, device=device)
+                for _ in self._sim_host
+            ]
+            self._sim_ready = [torch.cuda.Event() for _ in self._sim_host]
+            self._sim_stream.wait_stream(torch.cuda.current_stream())
+        dst, ready = self._sim_dev[turn], self._sim_ready[turn]
+        with torch.cuda.stream(self._sim_stream):
+            dst.copy_(sim_len, non_blocking=True)
+            ready.record(self._sim_stream)
+        torch.cuda.current_stream().wait_event(ready)
+        return dst
 
     def join(self) -> None:
         if self._commit_pending:

@@ -10,6 +10,9 @@ import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
+    small_row_gather,
+)
+from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
     vocab_parallel_embedding as fused_vocab_parallel_embedding,
 )
 from sglang.srt.distributed import (
@@ -460,6 +463,18 @@ class VocabParallelEmbedding(torch.nn.Module):
             and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         )
 
+    def _use_small_row_gather(self, input_: torch.Tensor) -> bool:
+        """SGLANG_OPT_SMALL_EMBEDDING_GATHER: a decode-sized lookup of an unquantized,
+        contiguous table (the verify graph's 4-16 rows)."""
+        return (
+            input_.numel() <= 64
+            and envs.SGLANG_OPT_SMALL_EMBEDDING_GATHER.get()
+            and isinstance(self.quant_method, UnquantizedEmbeddingMethod)
+            and self.weight.is_cuda
+            and self.weight.ndim == 2
+            and self.weight.is_contiguous()
+        )
+
     def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
         """Embed against the local vocab shard; out-of-shard rows are zero
         (identity when tp_size == 1).
@@ -473,7 +488,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         )
         if self.tp_size == 1:
             with symm_alloc:
-                output_parallel = self.quant_method.embedding(self, input_.long())
+                if self._use_small_row_gather(input_):
+                    output_parallel = small_row_gather(input_.long(), self.weight)
+                else:
+                    output_parallel = self.quant_method.embedding(self, input_.long())
             if self.output_dtype is not None:
                 output_parallel = output_parallel.to(self.output_dtype)
             return output_parallel

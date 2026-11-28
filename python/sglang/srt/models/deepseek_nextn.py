@@ -60,6 +60,44 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+def _request_nextn_moe_defer_finalize(decoder: nn.Module) -> None:
+    """SGLANG_NEXTN_MOE_DEFER_FINALIZE (default off, pure BF16): fuse draft MoE
+    finalize with the shared-expert add / next collective (Check-13 clean)."""
+    import os
+
+    if os.environ.get("SGLANG_NEXTN_MOE_DEFER_FINALIZE", "").strip().lower() not in (
+        "1",
+        "on",
+        "true",
+    ):
+        return
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    experts = getattr(getattr(decoder, "mlp", None), "experts", None)
+    if experts is None:
+        return
+    qm = getattr(experts, "quant_method", None)
+    runner = getattr(qm, "runner", None) if qm is not None else None
+    backend = getattr(runner, "runner_backend", None) if runner is not None else None
+    cfg = getattr(experts, "moe_runner_config", None)
+    if (
+        isinstance(qm, UnquantizedFusedMoEMethod)
+        and qm.use_flashinfer_trtllm_moe
+        and backend is not None
+        and backend.is_flashinfer_trtllm()
+        and cfg is not None
+        and cfg.is_gated
+        and cfg.activation == "silu"
+        and not getattr(qm, "with_bias", False)
+        and not cfg.num_fused_shared_experts
+        and cfg.routing_method_type is not None
+    ):
+        experts.supports_deferred_finalize = True
+        logger.info(
+            "SGLANG_NEXTN_MOE_DEFER_FINALIZE: draft BF16 MoE finalizes with the shared-expert add (deferred finalize)"
+        )
+
+
 class DeepseekModelNextN(nn.Module):
     def __init__(
         self,
@@ -139,6 +177,7 @@ class DeepseekModelNextN(nn.Module):
                 alt_stream=self.alt_stream,
                 skip_rope=config.qk_rope_head_dim == 0,
             )
+        _request_nextn_moe_defer_finalize(self.decoder)
 
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

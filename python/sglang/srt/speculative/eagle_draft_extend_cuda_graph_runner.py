@@ -43,6 +43,7 @@ from sglang.srt.model_executor.runner_backend_utils import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_forward,
     get_parallel,
     get_spec,
 )
@@ -533,11 +534,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-            )
+            with get_forward().scoped(
+                draft_argmax_only=self.eagle_worker.draft_extend_argmax_only
+            ):
+                ret = self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -563,11 +567,14 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 global_num_tokens_cpu,
             )
             set_is_extend_in_batch(False)
-            return self.draft_runtime.run_draft_extend(
+            ret = self.draft_runtime.run_draft_extend(
                 runner=self,
                 forward_batch=forward_batch,
                 stock=run_stock,
             )
+            # A forward that read no metadata still joins a forked metadata branch.
+            self.draft_extend_attn_backend.join_forward_metadata()
+            return ret
 
         with forward_context(
             ForwardContext(attn_backend=self.draft_extend_attn_backend),
@@ -779,11 +786,17 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             )
 
         out = LogitsProcessorOutput(
-            # None when the megakernel's draft_extend kept the logits
+            # None when the megakernel's draft_extend kept the logits, or when
+            # the draft_argmax_only flag returned argmax partials instead
             next_token_logits=(
                 None
                 if out.next_token_logits is None
                 else out.next_token_logits[:raw_bs]
+            ),
+            next_token_argmax_partials=(
+                out.next_token_argmax_partials[:raw_bs]
+                if out.next_token_argmax_partials is not None
+                else None
             ),
             # The unchanged megakernel batch consumes the graph-owned rows before
             # replay; every other path detaches the recurrent state from that buffer.

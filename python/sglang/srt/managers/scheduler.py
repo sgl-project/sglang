@@ -513,6 +513,9 @@ def _accumulate_decode_moment(
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+# SGLANG_OPT_SPEC_STREAM_ORDERED_SEQ_LENS: on CUDA too, a GPU-only spec_v2 batch
+# gathers its seq_lens on the forward stream, behind the publish in stream order.
+_STREAM_ORDERED_SEQ_LENS = envs.SGLANG_OPT_SPEC_STREAM_ORDERED_SEQ_LENS.get()
 
 
 class Scheduler(
@@ -5560,7 +5563,7 @@ class Scheduler(
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 gpu_only_lens = (
-                    _is_hip
+                    (_is_hip or _STREAM_ORDERED_SEQ_LENS)
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )

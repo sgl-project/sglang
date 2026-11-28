@@ -33,6 +33,10 @@ from sglang.srt.layers.sampling_renorm import (
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import decode_alloc_targets
 from sglang.srt.runtime_context import get_spec
+from sglang.srt.speculative.chain_topp_sampling import (
+    chain_topp_applies,
+    chain_topp_sample,
+)
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
     gather_full_logits,
@@ -862,6 +866,7 @@ def eagle_sample(
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
         local_keys=local_keys,
+        has_grammar=grammar_mask is not None,
     )
 
 
@@ -880,6 +885,7 @@ def _tree_accept(
     simulated_acc_len_rng: Optional[torch.Generator],
     sparse_bonus_argmax: bool,
     local_keys: Optional[LocalKeysFn],
+    has_grammar: bool = False,
 ):
     """A gather it still needs is published to ``logits_output``."""
     from sglang.srt.layers.dp_attention import (
@@ -942,7 +948,38 @@ def _tree_accept(
         simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
         watermark=watermark,
     )
-    fused_verify = chain and (greedy or sparse or vocab_shard is not None)
+    topp_samples = None
+    if (
+        not greedy
+        and not sparse
+        and vocab_shard is None
+        and not use_rejection_sampling
+        and chain_topp_applies(
+            logits=next_token_logits,
+            temperatures=sampling_info.temperatures,
+            need_top_k=sampling_info.need_top_k_sampling,
+            need_min_p=sampling_info.need_min_p_sampling,
+            has_seed=sampling_info.sampling_seed is not None,
+            has_grammar=has_grammar,
+            chain=chain,
+            threshold_single=get_spec().speculative_accept_threshold_single,
+            threshold_acc=get_spec().speculative_accept_threshold_acc,
+            simulate_token_mode_ok=SIMULATE_ACC_LEN <= 0
+            or SIMULATE_ACC_TOKEN_MODE == "real-draft-token",
+        )
+    ):
+        topp_samples = chain_topp_sample(
+            logits=next_token_logits,
+            temperatures=sampling_info.temperatures,
+            top_ps=(
+                sampling_info.top_ps if sampling_info.need_top_p_sampling else None
+            ),
+            num_draft=verify_input.draft_token_num,
+            want_argmax=SIMULATE_ACC_LEN > 0,
+        )
+    fused_verify = chain and (
+        greedy or sparse or vocab_shard is not None or topp_samples is not None
+    )
     predict, accept_index, num_correct_drafts, verify_out = _verify_outputs(
         rows=math.prod(predict_shape),
         bs=bs,
@@ -1001,6 +1038,28 @@ def _tree_accept(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
+    elif topp_samples is not None:
+        # One top-p target sample per row, then the greedy check against it (exact
+        # for a topk-1 chain at thresholds 1); under forced acceptance the bonus is
+        # the target argmax, as below.
+        target_predict = topp_samples[0].view(bs, verify_input.draft_token_num)
+        bonus_target = (
+            topp_samples[1].view(bs, verify_input.draft_token_num)
+            if SIMULATE_ACC_LEN > 0
+            else target_predict
+        )
+        accept_lens, accept_index = _chain_accept(
+            predict=predict,
+            accept_index=accept_index,
+            num_correct_drafts=num_correct_drafts,
+            candidates=candidates,
+            verify_input=verify_input,
+            target_predict=target_predict,
+            bonus_target=bonus_target,
+            simulated_acc_len=simulated_acc_len if SIMULATE_ACC_LEN > 0 else None,
+            real_draft_tokens=SIMULATE_ACC_TOKEN_MODE == "real-draft-token",
+            finish=True,
+        )
     elif vocab_shard is not None:
         # temperature-only rows: a Gumbel-max target sample per row, then the greedy
         # check against it (exact for a topk-1 chain, whose drafts are deterministic)
@@ -1363,8 +1422,14 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
 
     # non_blocking H2D: a blocking .to() syncs the schedule stream, which the WAR
     # barrier has chained to the prev forward -> host stalls a full forward.
-    cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
-    nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+    # Only an allocating round reads the device copies; with
+    # SGLANG_OPT_SPEC_LAZY_ALLOC_H2D the others skip two pageable H2D launches
+    # that the next forward would wait for.
+    if num_needed_tokens > 0 or not envs.SGLANG_OPT_SPEC_LAZY_ALLOC_H2D.get():
+        cur_kv_lens_device = cur_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+        nxt_kv_lens_device = nxt_kv_lens_cpu.to(device=batch.device, non_blocking=True)
+    else:
+        cur_kv_lens_device = nxt_kv_lens_device = None
     tree_cache = batch.tree_cache
     req_to_token_pool = batch.req_to_token_pool
     req_pool_indices = batch.req_pool_indices

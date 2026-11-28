@@ -52,6 +52,7 @@ from sglang.srt.model_executor.runner_utils.shared_read_event import (
 )
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_parallel,
     get_spec,
     max_prefill_buffer_tokens,
@@ -66,6 +67,10 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+# SGLANG_SPEC_DRAFT_INPUT_NO_COPY: logged once per process at the first skipped copy
+_draft_no_copy_logged = False
 
 
 class EagerRunner(BaseRunner):
@@ -173,6 +178,24 @@ class EagerRunner(BaseRunner):
         this batch's shape) — the eager counterpart of the cuda-graph runners'
         load_batch."""
         if envs.SGLANG_EAGER_INPUT_NO_COPY.get():
+            return replace(forward_batch)
+        if (
+            forward_batch.forward_mode.is_decode()
+            and get_forward().draft_topk1_sink is not None
+            and envs.SGLANG_SPEC_DRAFT_INPUT_NO_COPY.get()
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # SGLANG_SPEC_DRAFT_INPUT_NO_COPY (with the top-1 sink): an EAGLE draft-decode
+            # step (inside the draft graph): its inputs are the loop's own tensors (the
+            # previous step's top-1, the advanced positions), read in place instead of
+            # copied per step.
+            global _draft_no_copy_logged
+            if not _draft_no_copy_logged:
+                _draft_no_copy_logged = True
+                logger.info(
+                    "SGLANG_SPEC_DRAFT_INPUT_NO_COPY: the draft-decode steps read their "
+                    "inputs in place (no eager input copy in the draft graph)"
+                )
             return replace(forward_batch)
         raw_bs = forward_batch.batch_size
         if forward_batch.input_ids is not None:
