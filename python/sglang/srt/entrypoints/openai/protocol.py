@@ -88,6 +88,19 @@ OPENAI_MAX_N = 128
 
 DEFAULT_MODEL_NAME = "default"
 
+# Sampling fields a request can leave to --preferred-sampling-params.
+PREFERRED_SAMPLING_FIELDS = frozenset(
+    {
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "repetition_penalty",
+    }
+)
+
 
 def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
     """Convert a JSON schema to a string.
@@ -2303,6 +2316,7 @@ class ResponsesRequest(PDRoutingFields):
         default_params: Optional[Dict] = None,
         stop: Optional[Union[str, List[str]]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        preferred_sampling_params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Convert to sampling parameters for generation.
 
@@ -2348,6 +2362,12 @@ class ResponsesRequest(PDRoutingFields):
             params["min_p"] = self.min_p
         if self.repetition_penalty is not None:
             params["repetition_penalty"] = self.repetition_penalty
+        # Omitted or null fields take --preferred-sampling-params over default_params.
+        for key, value in (preferred_sampling_params or {}).items():
+            if key in PREFERRED_SAMPLING_FIELDS and (
+                key not in self.model_fields_set or getattr(self, key) is None
+            ):
+                params[key] = value
 
         # Apply any additional default parameters
         for key, value in default_params.items():

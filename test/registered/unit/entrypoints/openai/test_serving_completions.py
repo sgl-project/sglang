@@ -226,6 +226,18 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertIn("structural_tag", sampling_params)
         self.assertIsInstance(sampling_params["structural_tag"], str)
 
+    def test_omitted_sampling_fields_take_preferred_sampling_params(self):
+        """--preferred-sampling-params fills the sampling fields a request omits
+        and never one it sends, even when the sent value is the default."""
+        preferred = {"temperature": 0.6, "top_p": 0.95, "presence_penalty": 1.5}
+        sent = {"temperature": 1.0, "top_p": 1.0, "presence_penalty": 0.0}
+        with get_context().override_server_args(preferred_sampling_params=preferred):
+            for request_fields, expected in [({}, preferred), (sent, sent)]:
+                params = self.sc._build_sampling_params(
+                    CompletionRequest(model="x", prompt="Hi", **request_fields)
+                )
+                self.assertEqual({k: params[k] for k in expected}, expected)
+
     def test_response_format_none(self):
         """Test that no response_format doesn't add extra constraints."""
         req = CompletionRequest(model="x", prompt="Generate text:", max_tokens=100)

@@ -678,6 +678,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             if processed_messages
                             else None
                         ),
+                        preferred_sampling_params=get_serving().preferred_sampling_params,
                     )
                     if processed_messages is not None:
                         set_request_reasoning_end_token_ids(

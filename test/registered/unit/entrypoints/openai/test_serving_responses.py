@@ -816,6 +816,15 @@ class SkipSpecialTokensForwardingTestCase(CustomTestCase):
         # no such field), so leave it unset for --preferred-sampling-params.
         self.assertNotIn("skip_special_tokens", params)
 
+    def test_preferred_sampling_params_reach_engine(self):
+        serving = make_serving()
+        preferred = {"top_p": 0.95}
+        enter_override(
+            self,
+            get_context().override_server_args(preferred_sampling_params=preferred),
+        )
+        self.assertEqual(self._create_responses_sampling_params(serving)["top_p"], 0.95)
+
     def test_response_template_parser_keeps_special_tokens_unspaced(self):
         serving = make_serving()
         serving.reasoning_parser = "response_template"
