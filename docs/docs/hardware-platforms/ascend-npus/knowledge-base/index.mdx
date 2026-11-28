@@ -1,0 +1,110 @@
+---
+title: "Ascend NPU knowledge base"
+sidebarTitle: "Knowledge base"
+description: "Task-oriented entry point for deploying models on Ascend NPUs: deployment matrix, quantization selection, published performance baselines, and troubleshooting."
+keywords:
+  - Ascend NPU
+  - 昇腾
+  - 昇腾 NPU 知识库
+  - deployment matrix
+  - 部署矩阵
+  - model deployment
+  - quantization selection
+  - 量化选型
+  - performance baselines
+  - 性能基线
+  - troubleshooting
+  - 故障排查
+  - TPOT
+  - W8A8
+  - W4A8
+---
+
+This page is the entry point for the Ascend NPU documentation set. It does not repeat the model tutorials or the tuning reference. Instead it collects the decisions that come before and after those pages: which model and card budget to start from, which precision to load, where published performance numbers come from, and where a specific error is documented.
+
+Use it when you are choosing a configuration. Follow the linked page when you need the full command, the parameter reference, or a log excerpt.
+
+## Find an answer by task
+
+| You want to | Start here |
+| --- | --- |
+| Bring up a first server | [Quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start), [Installation](/docs/hardware-platforms/ascend-npus/getting-started/installation) |
+| Pick a model and card budget | [Deployment matrix](#deployment-matrix) below |
+| Decide between BF16, W8A8, W4A8, or MXFP | [Quantization selection](/docs/hardware-platforms/ascend-npus/knowledge-base/quantization-selection) |
+| Hit a TPOT or TTFT target | [Parameter tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) |
+| Compare published numbers before testing | [Performance baselines](/docs/hardware-platforms/ascend-npus/knowledge-base/performance-baselines) |
+| Diagnose a startup or runtime failure | [Troubleshooting index](/docs/hardware-platforms/ascend-npus/knowledge-base/troubleshooting), [FAQ](/docs/hardware-platforms/ascend-npus/faq) |
+| Check whether a model is supported at all | [Supported models](/docs/hardware-platforms/ascend-npus/reference/support_models), [Supported features](/docs/hardware-platforms/ascend-npus/reference/support_features) |
+| Add a new model or baseline | [Contribution guide](/docs/hardware-platforms/ascend-npus/development/contribution_guide) |
+
+## Search
+
+The site search box covers every page in this section, including the keyword lists in each page header. Search for the exact string you see in a terminal first — error codes such as `507035`, `aclnnInplaceFillScalar`, or `op.preamble.length` resolve faster than descriptive phrases.
+
+If a search returns several pages, prefer the one with a matching image tag and hardware series. Numbers and flags from different image versions are not interchangeable.
+
+## Deployment matrix
+
+Each row summarizes what a published best-practice configuration uses. Card counts are physical cards; on the A3 Series each card has two dies, so `--tp-size` is twice the card count. See [Glossary](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for the device layout.
+
+| Model | Cards | Deploy mode | Precision | TPOT target | Guides |
+| --- | --- | --- | --- | --- | --- |
+| DeepSeek-R1 | 8 – 32 | PD mixed, PD disaggregation | W4A8, W8A8 | 19.0 – 50 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_r1) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) |
+| DeepSeek-V3.2 | 32 | PD disaggregation | W8A8 | 26 – 107 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2) |
+| DeepSeek-V4-Flash | 8 – 16 | PD mixed, PD disaggregation | W8A8 | 50 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v4_flash) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash) |
+| GLM-5.1 | 16 – 32 | PD mixed, PD disaggregation | W4A8 | 25 – 56.4 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_1) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_1) |
+| GLM-5.2 | 32 | PD disaggregation | W4A8 | 50 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_2) |
+| Kimi-K2.6 | 8 – 16 | PD mixed, PD disaggregation | W4A8 | 20 – 100 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/kimi_k2_6) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/kimi_k2_6) |
+| MiMo-V2-Flash | 16 | PD disaggregation | W8A8 | 20 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/mimo_v2_flash) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_flash) |
+| MiMo-V2.5-Pro | 1P1D, 2 nodes | PD disaggregation | MXFP4 | Not published | [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/mimo_v2_5_pro) |
+| MiniMax-M2.5 | 4 – 8 | PD mixed | W8A8 | 20 – 50 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/minimax_m2_5) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/minimax_m2_5) |
+| Qwen3-235B-A22B | 8 | PD mixed | BF16, W8A8 | 8 – 50.1 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_235b_a22b) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_235b_a22b) |
+| Qwen3-30B-A3B | 1 | PD mixed | BF16, W8A8 | 10 – 50 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_30b_a3b) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_30b_a3b) |
+| Qwen3-32B | 2 – 8 | PD mixed | BF16, W8A8 | 6 – 55 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_32b) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_32b) |
+| Qwen3.5-397B-A17B | 8 | PD mixed | W4A8 | 20 – 50 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_5_397b) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_5_397b) |
+| Qwen3.6-27B | 1 – 2 | PD mixed | BF16, W8A8 | 50 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_27b) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_27b) |
+| Qwen3.6-35B-A3B | 1 – 2 | PD mixed | BF16 | 16.1 – 50 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_6_35b_a3b) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_6_35b_a3b) |
+| Qwen3-8B | 1 | PD mixed | W8A8 | 5 – 37 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8b) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b) |
+| Qwen3-Next-80B-A3B-Instruct | 1 – 2 | PD mixed | W8A8 | 20 – 50 ms | [Tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_next_80b_a3b_instruct) · [Best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_next_80b_a3b_instruct) |
+
+Tutorials without a published baseline yet:
+
+- [GLM-5.3](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3)
+- [GLM-5.3-Flash](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_3_flash)
+- [Hy3](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/hy3)
+- [Qwen3.8-Max](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/qwen3_8_max)
+
+## What "validated" means
+
+A configuration listed in this section is a published best practice, not a hardware ceiling:
+
+- It was measured on the hardware series in its title with the image tag stated at the top of that page. The current baseline pages were validated with `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`.
+- The TPOT value is the latency target the configuration is tuned to. It is not an average over all possible traffic.
+- The benchmark uses fixed-length random input and output (`--dataset-name random`, `--random-range-ratio 1`) so that two runs of the same configuration are comparable.
+
+Reproduce a number on your own hardware before using it in a capacity plan. See [Performance baselines](/docs/hardware-platforms/ascend-npus/knowledge-base/performance-baselines) for the benchmark command and the caveats.
+
+## Maintenance
+
+This index is reviewed when any of the following happens:
+
+- A new stable image tag replaces the tag used by the baseline pages.
+- A model tutorial or best-practice page is merged, removed, or renamed.
+- A published configuration no longer reproduces on the stated image tag.
+
+To add an entry:
+
+1. Reproduce the configuration and record the image tag, CANN version, driver version, card count, `--tp-size`, `--mem-fraction-static`, and the benchmark command.
+2. Add the configuration to the model's best-practice page, including a summary row in its low-latency or high-throughput table.
+3. Add the row to the deployment matrix above, and add a comparison entry to the performance baselines page if the new data supports one.
+4. Keep the page keyword list current so the new entry is discoverable in search.
+
+Open the change as a normal documentation pull request and link it to the model's tracking issue, following the [contribution guide](/docs/hardware-platforms/ascend-npus/development/contribution_guide).
+
+## See also
+
+- [Quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start)
+- [Quantization selection](/docs/hardware-platforms/ascend-npus/knowledge-base/quantization-selection)
+- [Performance baselines](/docs/hardware-platforms/ascend-npus/knowledge-base/performance-baselines)
+- [Troubleshooting index](/docs/hardware-platforms/ascend-npus/knowledge-base/troubleshooting)
+- [Supported models](/docs/hardware-platforms/ascend-npus/reference/support_models)
