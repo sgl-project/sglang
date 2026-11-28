@@ -49,6 +49,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
     _use_cutedsl_moe_swap_ab,
+    refresh_cutedsl_standard_scales_for_weight_update,
     use_cutedsl_moe_swap_ab,
 )
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
@@ -315,6 +316,94 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
                 self.assertEqual(
                     configs[0]["input_global_scale"] is not None, expects_fp4
                 )
+
+    def test_cutedsl_create_weights_skips_uninitialized_swizzled_blockscales(self):
+        with (
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.FLASHINFER_CUTEDSL,
+                a2a_backend=MoeA2ABackend.NONE,
+            ),
+            mock.patch.object(
+                modelopt_quant,
+                "get_platform",
+                return_value=SimpleNamespace(is_blackwell=True),
+            ),
+            mock.patch.object(
+                modelopt_quant,
+                "swizzle_blockscale",
+                side_effect=AssertionError("unexpected swizzle_blockscale"),
+            ),
+        ):
+            method = ModelOptNvFp4FusedMoEMethod(
+                modelopt_quant.ModelOptFp4Config(
+                    is_checkpoint_nvfp4_serialized=True, group_size=16
+                )
+            )
+            layer = torch.nn.Module()
+            layer.num_experts = layer.num_local_experts = 2
+            layer.moe_runner_config = MoeRunnerConfig(is_gated=True)
+            method.create_weights(
+                layer=layer,
+                num_experts=2,
+                hidden_size=128,
+                intermediate_size_per_partition=64,
+                params_dtype=torch.bfloat16,
+                weight_loader=lambda *a, **k: None,
+            )
+            self.assertIsNone(layer.w13_blockscale_swizzled)
+            self.assertIsNone(layer.w2_blockscale_swizzled)
+
+    def test_cutedsl_scale_refresh_w4a16_fast_path_and_w4a4_in_place(self):
+        w1_cur, fc2_cur, w2_cur, inp_cur = (
+            torch.ones(4),
+            torch.ones(1),
+            torch.ones(4),
+            torch.ones(1),
+        )
+        layer = SimpleNamespace(
+            _cutedsl_wrapper=SimpleNamespace(quant_mode="w4a16"),
+            _cutedsl_scales=(w1_cur, fc2_cur, w2_cur),
+            _cutedsl_input_scale=inp_cur,
+            w13_weight_scale_2=torch.full((4, 2), 0.5),
+            w2_weight_scale_2=torch.full((4,), 0.75),
+            w13_input_scale_quant=torch.tensor([2.0]),
+            w2_input_scale_quant=torch.tensor([4.0]),
+            g1_alphas=torch.full((4,), 2.5),
+            g2_alphas=torch.full((4,), 3.5),
+            quant_config=SimpleNamespace(use_per_token_activation=False),
+        )
+        ptrs = (
+            w1_cur.data_ptr(),
+            fc2_cur.data_ptr(),
+            w2_cur.data_ptr(),
+            inp_cur.data_ptr(),
+        )
+        with mock.patch(
+            "sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl.resolve_cutedsl_standard_scales",
+            side_effect=AssertionError("W4A16 should skip full scale resolution"),
+        ):
+            refresh_cutedsl_standard_scales_for_weight_update(layer)
+        self.assertEqual((w1_cur.data_ptr(), w2_cur.data_ptr()), (ptrs[0], ptrs[2]))
+        torch.testing.assert_close(w1_cur, torch.full((4,), 2.5))
+        torch.testing.assert_close(w2_cur, torch.full((4,), 3.5))
+
+        layer._cutedsl_wrapper.quant_mode = "w4a4"
+        layer.g1_alphas = torch.full((4,), 0.25)
+        layer.g2_alphas = torch.full((4,), 0.1875)
+        refresh_cutedsl_standard_scales_for_weight_update(layer)
+        self.assertEqual(
+            (
+                w1_cur.data_ptr(),
+                fc2_cur.data_ptr(),
+                w2_cur.data_ptr(),
+                inp_cur.data_ptr(),
+            ),
+            ptrs,
+        )
+        torch.testing.assert_close(w1_cur, torch.full((4,), 0.25))
+        torch.testing.assert_close(fc2_cur, torch.tensor([4.0]))
+        torch.testing.assert_close(w2_cur, torch.full((4,), 0.1875))
+        torch.testing.assert_close(inp_cur, torch.tensor([2.0]))
 
 
 class TestGemm1Alphas(CustomTestCase):
