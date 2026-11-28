@@ -488,6 +488,22 @@ class Sm120ForwardPolicy:
             window_size_right=window_size_right,
             tile_n=tile_n,
         )
+        # A sliding window bounds an extend's visible KV; splitting it only adds the combine.
+        if requested_num_splits < 1 and is_local and max_seqlen_q > 1:
+            requested_num_splits = 1
+        # The grid sizes every row by max_seqlen_q and shorter rows exit early. With
+        # compact Q groups a row fills at most one partial M block beyond its share.
+        busy_mblocks = total_mblocks
+        if has_compact_q_groups:
+            busy_mblocks = min(
+                total_mblocks,
+                num_head_kv
+                * (
+                    (total_q * (packed_q_rows // max_seqlen_q) + tile_m - 1) // tile_m
+                    + batch_size
+                    - 1
+                ),
+            )
         num_splits = cls.select_num_splits(
             requested_num_splits=requested_num_splits,
             head_dim=head_dim,
@@ -499,7 +515,7 @@ class Sm120ForwardPolicy:
             packed_q_rows=packed_q_rows,
             tile_m=tile_m,
             tile_n=tile_n,
-            total_mblocks=total_mblocks,
+            total_mblocks=busy_mblocks,
             num_sms=num_sms,
             num_n_blocks=split_num_n_blocks,
             device=device,
