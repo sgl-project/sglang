@@ -192,6 +192,52 @@ class TestGluonMoeGfx950(CustomTestCase):
             del x, weights, router, bias, w13, w13_scale, w2, w2_scale
             empty_gpu_cache()
 
+    def test_ep_m32768_local_codes_beyond_2gib(self):
+        """EP codes past 2 GiB of the 3-GiB int16 workspace must not read as 0.
+
+        Skewed routing keeps every route on EP rank 0, so dense code rows run
+        past 2 GiB. Each token must match the same token run in a 4224-row
+        batch, whose workspace stays below 2 GiB (issue #48483).
+        """
+        from sglang.kernels.ops.moe.gluon_moe_gfx950.fused_moe_tp4_m4193_16768_shared import (
+            fused_moe,
+        )
+        from sglang.srt.layers.moe.glm_mxfp4_gluon import _pack_scale, _pack_weight
+
+        device = torch.device("cuda")
+        generator = torch.Generator(device=device).manual_seed(0)
+
+        def randint(low, high, shape):
+            return torch.randint(
+                low, high, shape, device=device, dtype=torch.uint8, generator=generator
+            )
+
+        # TP8 EP2 rank 0: 128 local experts plus the appended shared slot.
+        w13 = _pack_weight(randint(0, 256, (129, 1024, 3072)))
+        w13_scale = _pack_scale(randint(121, 124, (129, 1024, 192)))
+        w2 = _pack_weight(randint(0, 256, (129, 6144, 256)))
+        w2_scale = _pack_scale(randint(121, 124, (129, 6144, 16)))
+        router = (
+            torch.randn((256, 6144), device=device, generator=generator) * 0.02
+        ).bfloat16()
+        x = torch.randn((32768, 6144), device=device, generator=generator).bfloat16()
+        bias = torch.zeros((256,), device=device)
+        bias[:128] = 1
+        weights = (router, bias, w13, w13_scale, w2, w2_scale)
+        kwargs = {"expert_start": 0, "fuse_shared_expert": False}
+
+        try:
+            output = fused_moe(x, *weights, **kwargs)
+            torch.cuda.synchronize()
+            self.assertEqual((~torch.isfinite(output)).any(dim=1).sum().item(), 0)
+            for end in (*range(4224, 32768, 4224), 32768):
+                start = end - 4224
+                expected = fused_moe(x[start:end].contiguous(), *weights, **kwargs)
+                torch.testing.assert_close(output[start:end], expected, rtol=0, atol=0)
+        finally:
+            del x, weights, router, bias, w13, w13_scale, w2, w2_scale
+            empty_gpu_cache()
+
     def test_tp8_m1_kernel_compiles_and_runs(self):
         """Keep relocation and ABI regressions from hiding behind dispatcher-only tests."""
         from sglang.kernels.ops.moe.gluon_moe_gfx950.fused_moe_tp8_m1_16 import (
