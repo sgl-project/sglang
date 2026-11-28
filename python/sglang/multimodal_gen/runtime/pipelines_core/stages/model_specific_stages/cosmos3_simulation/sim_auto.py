@@ -23,6 +23,7 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.cosmos3_sim_auto import (
     Cosmos3SimAutoManifest,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -33,6 +34,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_multiview import (
     unpack_state,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto import (
+    ChunkReuse,
     Cosmos3SimAutoTransformer,
     KVPair,
     current_ulysses_group,
@@ -41,8 +43,11 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_sim_auto import (
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_attention import (
     REPLAY_BACKENDS,
     ReplayMask,
+    ReplayPlan,
     build_replay_mask,
     build_replay_plan,
+    drop_unused_query_blocks,
+    reusable_token_mask,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.sim_auto_layout import (
     PASS_CLEAN,
@@ -335,6 +340,9 @@ class _Session(msgspec.Struct, eq=False, kw_only=True):
     und_kv: list[KVPair]
     ring: ReplayRing
     masks: dict[tuple[Any, ...], ReplayMask]
+    reuse_enabled: bool
+    # Per plan key, the rows later forwards recompute, None to run each in full.
+    recomputed_rows: dict[tuple[Any, ...], torch.Tensor | None]
     device: torch.device
 
 
@@ -625,6 +633,10 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
                 fps=fps,
             ),
             masks={},
+            # Recomputing a subset of rows changes the GEMM batch shapes, which
+            # can move results by a rounding step.
+            reuse_enabled=quality_allows(batch.sampling_params.quality, "lossless"),
+            recomputed_rows={},
             device=device,
         )
 
@@ -832,6 +844,29 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
                 )
         return latents
 
+    def _plan_key(
+        self, session: _Session, chunk: Chunk, items: Sequence[StreamItem]
+    ) -> tuple[Any, ...]:
+        # Plans depend on the chunk shape, on which ring slots are populated and
+        # on whether chunk 0 is still inside the cross-view window (chunk 1
+        # only); absolute time otherwise shifts every stream together.
+        return (
+            min(chunk.step, 2),
+            tuple(
+                (item.kind, len(item.frames), item.condition_frames) for item in items
+            ),
+            session.ring.signature(),
+        )
+
+    def _plan(self, session: _Session, metadata: TokenMetadata) -> ReplayPlan:
+        return build_replay_plan(
+            current=metadata,
+            history=session.ring.history(),
+            history_tokens=session.ring.capacity,
+            captions=session.captions,
+            window_seconds=self.manifest.cross_view_past_window_seconds,
+        )
+
     def _block_mask(
         self,
         session: _Session,
@@ -839,32 +874,49 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         items: Sequence[StreamItem],
         metadata: TokenMetadata,
         pass_kind: str,
+        reuse: ChunkReuse | None = None,
     ) -> ReplayMask:
-        # Plans depend on the chunk shape, on which ring slots are populated and
-        # on whether chunk 0 is still inside the cross-view window (chunk 1
-        # only); absolute time otherwise shifts every stream together.
-        key = (
-            pass_kind,
-            min(chunk.step, 2),
-            tuple(
-                (item.kind, len(item.frames), item.condition_frames) for item in items
-            ),
-            session.ring.signature(),
-        )
+        key = (pass_kind, *self._plan_key(session, chunk, items))
         mask = session.masks.get(key)
         if mask is None:
-            plan = build_replay_plan(
-                current=metadata,
-                history=session.ring.history(),
-                history_tokens=session.ring.capacity,
-                captions=session.captions,
-                window_seconds=self.manifest.cross_view_past_window_seconds,
-            )
             mask = build_replay_mask(
-                plan, device=session.device, backend=self.attention_backend
+                self._plan(session, metadata),
+                device=session.device,
+                backend=self.attention_backend,
             )
             session.masks[key] = mask
-        return mask
+        if reuse is None or not reuse.ready:
+            return mask
+        reduced = session.masks.get(("recomputed", *key))
+        if reduced is None:
+            reduced = drop_unused_query_blocks(mask, reuse.rows)
+            session.masks[("recomputed", *key)] = reduced
+        return reduced
+
+    def _chunk_reuse(
+        self, session: _Session, chunk: Chunk, items: Sequence[StreamItem]
+    ) -> ChunkReuse | None:
+        if not session.reuse_enabled:
+            return None
+        key = self._plan_key(session, chunk, items)
+        if key not in session.recomputed_rows:
+            reusable = reusable_token_mask(
+                [
+                    self._plan(
+                        session,
+                        chunk_token_metadata(
+                            items, step=chunk.step, pass_kind=pass_kind
+                        ),
+                    )
+                    for pass_kind in (PASS_NOISY, PASS_CLEAN)
+                ]
+            )
+            rows = None
+            if bool(reusable.any()) and not bool(reusable.all()):
+                rows = torch.nonzero(~reusable).flatten().to(session.device)
+            session.recomputed_rows[key] = rows
+        rows = session.recomputed_rows[key]
+        return None if rows is None else ChunkReuse(rows=rows)
 
     def _forward(
         self,
@@ -875,6 +927,8 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         timestep: torch.Tensor | None,
         mask: ReplayMask,
         step_index: int,
+        reuse: ChunkReuse | None,
+        kv_only: bool = False,
     ):
         with set_forward_context(current_timestep=step_index, attn_metadata=None):
             return self.transformer(
@@ -886,6 +940,8 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
                 history_kv=session.ring.layer_kv(),
                 mask=mask,
                 rig_view_ids=session.rig_view_ids,
+                reuse=reuse,
+                kv_only=kv_only,
             )
 
     def _run_chunk(self, session: _Session, chunk: Chunk) -> None:
@@ -894,17 +950,29 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         lidar_target = items[3] if len(items) == 4 else None
         noisy_rgb = rgb_target.generated_frames
         noisy_sweeps = lidar_target.generated_frames if lidar_target is not None else ()
+        reuse = None
         if noisy_rgb or noisy_sweeps:
+            reuse = self._chunk_reuse(session, chunk, items)
             self._denoise(
-                session, chunk, items, noisy_rgb=noisy_rgb, noisy_sweeps=noisy_sweeps
+                session,
+                chunk,
+                items,
+                noisy_rgb=noisy_rgb,
+                noisy_sweeps=noisy_sweeps,
+                reuse=reuse,
             )
         if chunk.step != session.schedule[-1].step:
-            self._commit(session, chunk, items)
+            self._commit(session, chunk, items, reuse=reuse)
         self.log_info(
             f"Chunk {chunk.step + 1}/{len(session.schedule)}: RGB latents {list(chunk.rgb_frames)}"
             f"{', LiDAR sweeps %s' % list(chunk.lidar_sweeps) if chunk.lidar_sweeps else ''}, "
             f"{len(noisy_rgb) * session.num_views + len(noisy_sweeps)} generated frames, "
             f"ring slots {sorted(session.ring.slots)}"
+            + (
+                f", {reuse.rows.numel()} of {chunk_token_count(items)} tokens recomputed after the first forward"
+                if reuse is not None
+                else ""
+            )
         )
 
     def _denoise(
@@ -915,6 +983,7 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         *,
         noisy_rgb: tuple[int, ...],
         noisy_sweeps: tuple[int, ...],
+        reuse: ChunkReuse | None,
     ) -> None:
         """Fixed-step SDE over the chunk's generated frames; history K/V is read but never written."""
         manifest = self.manifest
@@ -927,7 +996,6 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
             noisy_sweeps=noisy_sweeps,
         )
         metadata = chunk_token_metadata(items, step=chunk.step, pass_kind=PASS_NOISY)
-        mask = self._block_mask(session, chunk, items, metadata, PASS_NOISY)
         # The reference seeds RGB rollouts by the chunk's first latent and joint rollouts by the step.
         sample_index = chunk.step if session.joint else chunk.rgb_frames[0]
         step_counter = [0]
@@ -938,8 +1006,11 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
                 items=items,
                 latents=layout.scatter(latents, x),
                 timestep=timestep.reshape(1),
-                mask=mask,
+                mask=self._block_mask(
+                    session, chunk, items, metadata, PASS_NOISY, reuse
+                ),
                 step_index=step_counter[0],
+                reuse=reuse,
             )
             step_counter[0] += 1
             return layout.gather(output.targets)
@@ -966,18 +1037,24 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         layout.write_back(session, denoised)
 
     def _commit(
-        self, session: _Session, chunk: Chunk, items: Sequence[StreamItem]
+        self,
+        session: _Session,
+        chunk: Chunk,
+        items: Sequence[StreamItem],
+        *,
+        reuse: ChunkReuse | None,
     ) -> None:
         """Clean refresh forward (no time embed) whose K/V becomes the chunk's ring slot."""
         metadata = chunk_token_metadata(items, step=chunk.step, pass_kind=PASS_CLEAN)
-        mask = self._block_mask(session, chunk, items, metadata, PASS_CLEAN)
         output = self._forward(
             session,
             items=items,
             latents=self._item_latents(session, items),
             timestep=None,
-            mask=mask,
+            mask=self._block_mask(session, chunk, items, metadata, PASS_CLEAN, reuse),
             step_index=0,
+            reuse=reuse,
+            kv_only=True,
         )
         slot = ring_slot_for_step(
             chunk.step,

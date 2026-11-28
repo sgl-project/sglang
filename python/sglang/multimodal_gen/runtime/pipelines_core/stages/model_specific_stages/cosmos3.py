@@ -2653,17 +2653,23 @@ class Cosmos3DecodingStage(PipelineStage):
     def _postprocess_tensor(decoded: torch.Tensor) -> torch.Tensor:
         return decoded.mul_(0.5).add_(0.5).clamp_(0, 1).float()
 
-    def _encode_while_decoding(
-        self, batch: Req, server_args: ServerArgs
-    ) -> EncodeWhileDecoding | None:
-        """An encoder fed by the decode, if the plain video frames go straight to the MP4."""
-        if (
+    @staticmethod
+    def _postprocess_streamed_chunk(decoded: torch.Tensor) -> torch.Tensor:
+        return decoded.mul(0.5).add_(0.5).clamp_(0, 1).float()
+
+    def _streams_frames(self, batch: Req) -> bool:
+        return not (
             not self.vae.supports_decode_on_frames
             or (self._guardrails and batch.use_guardrails is not False)
             or (self.sound_tokenizer is not None and batch.audio_latents is not None)
             or batch.action_latents is not None
-            or batch.extra.get("transfer_plan") is not None
-        ):
+            or self._transfer_display_is_composed(batch)
+        )
+
+    def _encode_while_decoding(
+        self, batch: Req, server_args: ServerArgs
+    ) -> EncodeWhileDecoding | None:
+        if not self._streams_frames(batch):
             return None
         save_file_path = streamed_video_output_path(
             batch, server_args, int(batch.latents.shape[0])
@@ -2671,7 +2677,7 @@ class Cosmos3DecodingStage(PipelineStage):
         if save_file_path is None:
             return None
         return EncodeWhileDecoding(
-            save_file_path, batch, finish_frames=self._postprocess_tensor
+            save_file_path, batch, finish_frames=self._postprocess_streamed_chunk
         )
 
     @staticmethod
@@ -2679,6 +2685,10 @@ class Cosmos3DecodingStage(PipelineStage):
         if is_image_gen:
             return video.squeeze(2).permute(0, 2, 3, 1).cpu().numpy()
         return video.permute(0, 2, 3, 4, 1).cpu().numpy()
+
+    @staticmethod
+    def _transfer_display_is_composed(batch: Req) -> bool:
+        return batch.extra.get("transfer_plan") is not None
 
     @staticmethod
     def _compose_transfer_display(output: torch.Tensor, batch: Req) -> torch.Tensor:

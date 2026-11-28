@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from abc import ABC, abstractmethod
 from collections import Counter
 from copy import deepcopy
 from dataclasses import MISSING, dataclass, field, fields
@@ -63,6 +64,21 @@ class BatchMetricsWindow:
     full_dispatches: int = 0
     wait_times_ms: list[float] = field(default_factory=list)
     reject_reasons: Counter[str] = field(default_factory=Counter)
+
+
+class RequestResource(ABC):
+    """A stage's hand-off in ``Req.extra``, closed by the executor if the request stops early."""
+
+    @abstractmethod
+    def close(self) -> None: ...
+
+
+def close_request_resources(requests: Sequence[Req]) -> None:
+    for request in requests:
+        for key, value in list(request.extra.items()):
+            if isinstance(value, RequestResource):
+                del request.extra[key]
+                value.close()
 
 
 @dataclass(init=False, repr=False)

@@ -7,19 +7,27 @@ wiring."""
 
 import builtins
 import copy
+import functools
 import importlib.util
 import math
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 import torch
 import torchvision.transforms.functional as TF
+from msgspec.structs import replace as msgspec_replace
 from PIL import Image
 
+from sglang.multimodal_gen.configs.models.vaes.wanvae import (
+    WanVAEArchConfig,
+    WanVAEConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     COSMOS3_MADS_CAMERAS,
@@ -31,6 +39,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
 )
 from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
     Cosmos3MultiviewSamplingParams,
+    MultiviewViewInput,
     closest_multiview_aspect_ratio,
     normalize_multiview_aspect_ratio,
     parse_local_condition_indexes,
@@ -88,6 +97,7 @@ from sglang.multimodal_gen.runtime.models.vaes.cosmos3_lidar.layers import (
     _natten_backend_cache,
     resolve_natten_backend,
 )
+from sglang.multimodal_gen.runtime.models.vaes.wanvae import AutoencoderKLWan
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     _pil_to_uint8_tensor,
 )
@@ -114,7 +124,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     pad_view_frames_uint8,
     synthetic_multiview_pixels,
 )
-from sglang.multimodal_gen.runtime.utils.vision import load_video
+from sglang.multimodal_gen.runtime.utils.vision import iter_video_frames, load_video
 
 # The V1.2 LiDAR contract of the joint export (transformer/config.json multiview.lidar).
 LIDAR_BLOCK = {
@@ -665,6 +675,7 @@ class TestBlockSparsity(unittest.TestCase):
         via_table = sparsity.group_allowed[q_groups[:, None], k_groups[None, :]]
         torch.testing.assert_close(via_table, dense)
         # Packed words round-trip bit by bit.
+        self.assertEqual(sparsity.allowed_words.dtype, torch.int32)
         words = (
             sparsity.allowed_words.view(-1, sparsity.words_per_row).to(torch.int64)
             & 0xFFFFFFFF
@@ -895,6 +906,11 @@ class TestPaddedFlexAttention(unittest.TestCase):
                     (geometry.padded_q_len, geometry.padded_und_len), (512, 128)
                 )
                 self.assertEqual(plan.q_word_base.numel(), geometry.padded_q_len)
+                self.assertEqual(plan.allowed_words.dtype, torch.int32)
+                self.assertEqual(
+                    plan.allowed_words.numel(),
+                    plan.group_allowed.shape[0] * plan.words_per_row,
+                )
                 self.assertEqual(
                     plan.k_group_ids.numel(),
                     geometry.padded_und_len + geometry.padded_q_len,
@@ -1162,6 +1178,17 @@ class TestLayoutHelpers(unittest.TestCase):
             )
 
 
+def _whole_clip_fit(frames, *, height, width):
+    orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
+    scale = max(width / orig_w, height / orig_h)
+    resize_h = int(math.ceil(scale * orig_h))
+    resize_w = int(math.ceil(scale * orig_w))
+    tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
+    resized = TF.resize(tchw, [resize_h, resize_w])
+    cropped = TF.center_crop(resized, [height, width])
+    return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3)
+
+
 class TestPixelHelpersAndPrompt(unittest.TestCase):
     def test_fisheye_canvas_crop_rounds_half_to_even(self):
         """1720x1080 fisheye sources resize to 523 rows for a 480x832 canvas; the
@@ -1194,18 +1221,8 @@ class TestPixelHelpersAndPrompt(unittest.TestCase):
     def test_fit_uint8_cthw_chunks_change_no_pixel(self):
         """Chunked resize is the whole-clip resize, value for value, at every geometry
         the corpora use: 1924x1084 MADS controls (odd, downscale), 1280x720 KPI
-        controls (identity scale), 1720x1080 fisheye and a 4:3 upscale."""
-
-        def whole_clip(frames, *, height, width):
-            orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
-            scale = max(width / orig_w, height / orig_h)
-            resize_h = int(math.ceil(scale * orig_h))
-            resize_w = int(math.ceil(scale * orig_w))
-            tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-            resized = TF.resize(tchw, [resize_h, resize_w])
-            cropped = TF.center_crop(resized, [height, width])
-            return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3)
-
+        controls (identity scale, stored without a resize), 1720x1080 fisheye and
+        a 4:3 upscale."""
         generator = torch.Generator().manual_seed(0)
         for (orig_h, orig_w), (height, width) in (
             ((1084, 1924), (720, 1280)),
@@ -1221,7 +1238,7 @@ class TestPixelHelpersAndPrompt(unittest.TestCase):
                     dtype=torch.uint8,
                     generator=generator,
                 )
-                expected = whole_clip(clip, height=height, width=width)
+                expected = _whole_clip_fit(clip, height=height, width=width)
                 for chunk_frames in (1, 4, 16, 64):
                     actual = fit_uint8_cthw(
                         clip, height=height, width=width, chunk_frames=chunk_frames
@@ -1240,31 +1257,64 @@ class TestPixelHelpersAndPrompt(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "positive"):
             fit_uint8_cthw(clip, height=480, width=832, chunk_frames=0)
-
-    def test_load_media_streams_decoded_frames_through_the_chunked_resize(self):
-        """The loader converts and resizes the decoder's frames chunk by chunk and
-        produces exactly what stacking every frame first would."""
-        generator = torch.Generator().manual_seed(1)
-        frames = [
-            Image.fromarray(
-                torch.randint(
-                    0, 256, (90, 160, 3), dtype=torch.uint8, generator=generator
-                ).numpy()
+        resize_h, resize_w = multiview_stage._fit_geometry(720, 1280, 480, 832)
+        per_frame = 720 * 1280 * 3 * (1 + 4) + resize_h * resize_w * 3 * 4
+        single_chunk = multiview_stage._resize_chunk_frames(
+            720, 1280, resize_h, resize_w, 16, concurrent_loaders=1
+        )
+        seven_chunk = multiview_stage._resize_chunk_frames(
+            720, 1280, resize_h, resize_w, 16, concurrent_loaders=7
+        )
+        self.assertLess(seven_chunk, single_chunk)
+        self.assertLessEqual(
+            7 * seven_chunk * per_frame,
+            multiview_stage.COSMOS3_MULTIVIEW_RESIZE_SCRATCH_BYTES,
+        )
+        with self.assertRaisesRegex(ValueError, "positive"):
+            multiview_stage._resize_chunk_frames(
+                720, 1280, resize_h, resize_w, 16, concurrent_loaders=0
             )
+
+    def test_load_media_fits_frames_as_they_decode(self):
+        generator = torch.Generator().manual_seed(1)
+        arrays = [
+            torch.randint(
+                0, 256, (90, 160, 3), dtype=torch.uint8, generator=generator
+            ).numpy()
             for _ in range(37)
         ]
-        stacked = torch.stack([_pil_to_uint8_tensor(frame) for frame in frames], dim=1)
+        stacked = torch.stack(
+            [_pil_to_uint8_tensor(Image.fromarray(array)) for array in arrays], dim=1
+        )
+        expected = _whole_clip_fit(stacked, height=48, width=64)
+        mixed = [
+            array if index % 2 else Image.fromarray(array)
+            for index, array in enumerate(arrays)
+        ]
         with mock.patch.object(
-            multiview_stage, "load_video", return_value=frames
-        ) as load:
+            multiview_stage, "iter_video_frames", return_value=iter(mixed)
+        ) as decode:
             actual = multiview_stage.load_media_uint8_cthw(
                 "rig/front.mp4", height=48, width=64, max_frames=37
             )
-        load.assert_called_once_with("rig/front.mp4", max_frames=37)
-        self.assertTrue(
-            torch.equal(actual, fit_uint8_cthw(stacked, height=48, width=64))
-        )
-        with mock.patch.object(multiview_stage, "load_video", return_value=[]):
+        decode.assert_called_once_with("rig/front.mp4", max_frames=37)
+        self.assertTrue(torch.equal(actual, expected))
+
+        out = torch.zeros((3, 40, 48, 64), dtype=torch.uint8)
+        with mock.patch.object(
+            multiview_stage, "iter_video_frames", return_value=iter(arrays)
+        ):
+            filled = multiview_stage.load_media_uint8_cthw(
+                "rig/front.mp4", height=48, width=64, max_frames=40, out=out
+            )
+        self.assertEqual(filled.shape[1], 37)
+        self.assertEqual(filled.data_ptr(), out.data_ptr())
+        self.assertTrue(torch.equal(out[:, :37], expected))
+        self.assertEqual(int(out[:, 37:].max()), 0)
+
+        with mock.patch.object(
+            multiview_stage, "iter_video_frames", return_value=iter(())
+        ):
             with self.assertRaisesRegex(ValueError, "No frames decoded"):
                 multiview_stage.load_media_uint8_cthw(
                     "rig/front.mp4", height=48, width=64, max_frames=4
@@ -1505,6 +1555,37 @@ class TestDeploymentConfig(unittest.TestCase):
         config.validate_server_args(args(enable_cfg_parallel=True))
 
 
+def _stage(stage_cls, *args, **kwargs):
+    from sglang.multimodal_gen.runtime.server_args import (
+        server_args as server_args_module,
+    )
+
+    with mock.patch.object(
+        server_args_module, "_global_server_args", SimpleNamespace(comfyui_mode=False)
+    ):
+        return stage_cls(*args, **kwargs)
+
+
+def _tiny_wan_vae(**config_kwargs) -> AutoencoderKLWan:
+    config = WanVAEConfig(
+        arch_config=WanVAEArchConfig(
+            base_dim=8,
+            z_dim=4,
+            dim_mult=(1, 2, 2, 2),
+            num_res_blocks=1,
+            latents_mean=(0.0,) * 4,
+            latents_std=(1.0,) * 4,
+            is_residual=True,
+            in_channels=12,
+            out_channels=12,
+            patch_size=2,
+        ),
+        **config_kwargs,
+    )
+    torch.manual_seed(0)
+    return AutoencoderKLWan(config).eval()
+
+
 def _views(cameras, *, vision=False):
     views = []
     for index, camera in enumerate(cameras):
@@ -1513,6 +1594,23 @@ def _views(cameras, *, vision=False):
             view["vision_path"] = f"vision_{index}.png"
         views.append(view)
     return views
+
+
+def _fails_if_hung(test):
+    @functools.wraps(test)
+    def bounded(self):
+        outcome = Future()
+
+        def run():
+            try:
+                outcome.set_result(test(self))
+            except BaseException as exc:
+                outcome.set_exception(exc)
+
+        threading.Thread(target=run, daemon=True).start()
+        outcome.result(timeout=60)
+
+    return bounded
 
 
 class TestSamplingParamsAndInputStage(unittest.TestCase):
@@ -1693,6 +1791,41 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "multiview.views"):
             stage._resolve_views(batch_for(Cosmos3MultiviewSamplingParams()))
 
+        released = threading.Event()
+
+        def decode(path, max_frames=None):
+            released.wait(timeout=10)
+            return iter(())
+
+        def loaders():
+            return {
+                thread
+                for thread in threading.enumerate()
+                if thread.name.startswith("cosmos3-multiview-load")
+            }
+
+        before = loaders()
+        params = Cosmos3MultiviewSamplingParams(
+            multiview={"views": subset, "condition_frame_indexes_vision": [0]},
+            aspect_ratio="16:9",
+        )
+        batch = SimpleNamespace(
+            sampling_params=params,
+            is_warmup=False,
+            height=16,
+            width=16,
+            num_frames=5,
+            fps=30,
+            extra={},
+        )
+        try:
+            with mock.patch.object(multiview_stage, "iter_video_frames", decode):
+                with self.assertRaisesRegex(ValueError, "per-camera vision inputs"):
+                    stage.forward(batch, None)
+                self.assertEqual(loaders() - before, set())
+        finally:
+            released.set()
+
 
 class TestPerViewCaptions(unittest.TestCase):
     CAMERAS = ("camera_front_wide_120fov", "camera_rear_tele_30fov")
@@ -1802,6 +1935,398 @@ class TestInputLoading(unittest.TestCase):
             self.assertEqual(len(load_video(path, max_frames=100)), 24)
             with self.assertRaisesRegex(ValueError, "max_frames"):
                 load_video(path, max_frames=0)
+            streamed = list(iter_video_frames(path, max_frames=5))
+            self.assertEqual(len(streamed), 5)
+            for array, image in zip(streamed, full):
+                self.assertIsInstance(array, np.ndarray)
+                self.assertTrue(np.array_equal(array, np.asarray(image)))
+            self.assertEqual(len(list(iter_video_frames(path))), 24)
+
+    @_fails_if_hung
+    def test_rig_packing_fills_each_camera_slice_in_place(self):
+        generator = torch.Generator().manual_seed(3)
+        lengths = {"a.mp4": 5, "b.mp4": 2, "c.mp4": 7}
+        clips = {
+            path: torch.randint(
+                0, 256, (length, 4, 6, 3), dtype=torch.uint8, generator=generator
+            ).numpy()
+            for path, length in lengths.items()
+        }
+        views = [
+            MultiviewViewInput(camera_key=path, control=path, vision=None, prompt="x")
+            for path in clips
+        ]
+        stage = _stage(
+            Cosmos3MultiviewInputStage,
+            parse_multiview_deployment_config(_transformer_config()),
+        )
+
+        def decode(path, max_frames=None):
+            return iter(clips[path][:max_frames])
+
+        def pack(**kwargs):
+            with (
+                mock.patch.object(multiview_stage, "iter_video_frames", decode),
+                torch.inference_mode(),
+                ThreadPoolExecutor(max_workers=2) as pool,
+            ):
+                return stage._pack_camera_major(
+                    views,
+                    pool=pool,
+                    gate=multiview_stage.CameraLoadGate(),
+                    height=4,
+                    width=6,
+                    **kwargs,
+                ).result()
+
+        rig = pack(field="control", num_frames=5, keep_first=False)
+        self.assertEqual(tuple(rig.shape), (1, 3, 15, 4, 6))
+        expected = [torch.from_numpy(clips[path]).permute(3, 0, 1, 2) for path in clips]
+        self.assertTrue(torch.equal(rig[0, :, 0:5], expected[0]))
+        self.assertTrue(torch.equal(rig[0, :, 5:7], expected[1]))
+        self.assertTrue(
+            torch.equal(rig[0, :, 7:10], expected[1][:, 1:2].expand(-1, 3, -1, -1))
+        )
+        self.assertTrue(torch.equal(rig[0, :, 10:15], expected[2][:, :5]))
+
+        first = pack(field="control", num_frames=5, keep_first=True)
+        self.assertEqual(tuple(first.shape), (1, 3, 3, 4, 6))
+        for index, clip in enumerate(expected):
+            self.assertTrue(torch.equal(first[0, :, index], clip[:, 0]))
+
+        vision = pack(field="vision", num_frames=5, keep_first=False)
+        self.assertEqual(vision.unique().tolist(), [128])
+        views = [msgspec_replace(view, vision=view.control) for view in views]
+        with self.assertRaisesRegex(ValueError, "complete RGB video"):
+            pack(field="vision", num_frames=5, keep_first=False, require_complete=True)
+
+    @_fails_if_hung
+    def test_a_camera_is_encoded_while_the_next_one_still_loads(self):
+        generator = torch.Generator().manual_seed(5)
+        clips = {
+            path: torch.randint(
+                0, 256, (5, 32, 48, 3), dtype=torch.uint8, generator=generator
+            ).numpy()
+            for path in ("a.mp4", "b.mp4")
+        }
+        views = [
+            MultiviewViewInput(camera_key=path, control=path, vision=None, prompt="x")
+            for path in clips
+        ]
+        input_stage = _stage(
+            Cosmos3MultiviewInputStage,
+            parse_multiview_deployment_config(_transformer_config()),
+        )
+        vae = _tiny_wan_vae(load_decoder=False)
+        latent_stage = _stage(
+            multiview_stage.Cosmos3MultiviewLatentStage,
+            vae,
+            transformer=None,
+            deployment=None,
+            lidar_encoder=None,
+            attention_backend="triton",
+        )
+        first_encode_started = threading.Event()
+        released_by_encode = []
+
+        def decode(path, max_frames=None):
+            if path == "b.mp4":
+                released_by_encode.append(first_encode_started.wait(timeout=10))
+            return iter(clips[path][:max_frames])
+
+        vae.encoder.register_forward_pre_hook(
+            lambda module, args: first_encode_started.set()
+        )
+        common = {
+            "num_views": 2,
+            "frames_per_view": 5,
+            "device": torch.device("cpu"),
+            "dtype": torch.float32,
+        }
+        with (
+            mock.patch.object(multiview_stage, "iter_video_frames", decode),
+            torch.inference_mode(),
+        ):
+            control, vision = input_stage._start_pixel_loads(
+                views,
+                height=32,
+                width=48,
+                num_frames=5,
+                vision_keep_first=False,
+                completion=False,
+            )
+            latents = latent_stage._encode_camera_major(control, **common)
+            self.assertEqual(released_by_encode, [True])
+            self.assertIsNone(vision)
+            loaded = latent_stage._encode_camera_major(control.result(), **common)
+        self.assertTrue(torch.equal(latents, loaded))
+
+    @_fails_if_hung
+    def test_camera_loads_start_one_at_a_time_until_the_consumer_waits(self):
+        clips = {
+            path: np.zeros((2, 4, 6, 3), dtype=np.uint8)
+            for path in ("a.mp4", "b.mp4", "c.mp4")
+        }
+        views = [
+            MultiviewViewInput(camera_key=path, control=path, vision=None, prompt="x")
+            for path in clips
+        ]
+        stage = _stage(
+            Cosmos3MultiviewInputStage,
+            parse_multiview_deployment_config(_transformer_config()),
+        )
+        started = []
+        second_started, third_started = threading.Event(), threading.Event()
+        second_released_by_third = []
+
+        def decode(path, max_frames=None):
+            started.append(path)
+            if path == "c.mp4":
+                third_started.set()
+            if path == "b.mp4":
+                second_started.set()
+                second_released_by_third.append(third_started.wait(timeout=10))
+            return iter(clips[path][:max_frames])
+
+        with (
+            mock.patch.object(multiview_stage, "iter_video_frames", decode),
+            torch.inference_mode(),
+        ):
+            control, _ = stage._start_pixel_loads(
+                views,
+                height=4,
+                width=6,
+                num_frames=2,
+                vision_keep_first=False,
+                completion=False,
+            )
+            control.camera(0)
+            self.assertTrue(second_started.wait(timeout=10))
+            # Nothing has waited for camera 1, so camera 2 may not load beside it.
+            gate = control._gate
+            with gate._changed:
+                self.assertEqual((gate._next, gate._running, gate._limit), (2, 1, 1))
+            control.camera(1)
+            self.assertEqual(second_released_by_third, [True])
+            control.result()
+        self.assertEqual(started, ["a.mp4", "b.mp4", "c.mp4"])
+
+    def test_closing_a_rig_skips_the_loads_that_have_not_started(self):
+        views = [
+            MultiviewViewInput(camera_key=path, control=path, vision=None, prompt="x")
+            for path in ("a.mp4", "b.mp4")
+        ]
+        stage = _stage(
+            Cosmos3MultiviewInputStage,
+            parse_multiview_deployment_config(_transformer_config()),
+        )
+        started = []
+        first_started = threading.Event()
+        release_first = threading.Event()
+
+        def decode(path, max_frames=None):
+            started.append(path)
+            first_started.set()
+            release_first.wait(timeout=10)
+            return iter(np.zeros((2, 4, 6, 3), dtype=np.uint8)[:max_frames])
+
+        with (
+            mock.patch.object(multiview_stage, "iter_video_frames", decode),
+            torch.inference_mode(),
+        ):
+            control, _ = stage._start_pixel_loads(
+                views,
+                height=4,
+                width=6,
+                num_frames=2,
+                vision_keep_first=False,
+                completion=False,
+            )
+            try:
+                self.assertTrue(first_started.wait(timeout=10))
+                control.close()
+            finally:
+                release_first.set()
+            with self.assertRaises(CancelledError):
+                control.result()
+        self.assertEqual(started, ["a.mp4"])
+
+    def test_anchor_encode_reads_only_the_frames_its_latents_depend_on(self):
+        vae = _tiny_wan_vae(load_decoder=False)
+        stage = _stage(
+            multiview_stage.Cosmos3MultiviewLatentStage,
+            vae,
+            transformer=None,
+            deployment=None,
+            lidar_encoder=None,
+            attention_backend="triton",
+        )
+        generator = torch.Generator().manual_seed(4)
+        clips = torch.randint(
+            0, 256, (1, 3, 2, 13, 32, 48), dtype=torch.uint8, generator=generator
+        )
+        anchors = clips[:, :, :, :1]
+        common = {
+            "num_views": 2,
+            "frames_per_view": 13,
+            "device": torch.device("cpu"),
+            "dtype": torch.float32,
+        }
+        fed = []
+        vae.encoder.register_forward_hook(
+            lambda module, args, output: fed.append(int(args[0].shape[2]))
+        )
+        for rig, repeated, indexes, frames_fed in (
+            # video conditions on latents 0 and 1 of both cameras
+            (clips, clips, [0, 1, 4, 5], [1, 4, 1, 4]),
+            # image anchors: latent 0 of both cameras
+            (anchors, anchors.expand(-1, -1, -1, 13, -1, -1), [0, 4], [1, 1]),
+        ):
+            with self.subTest(indexes=indexes), torch.no_grad():
+                full = stage._encode_camera_major(
+                    repeated.reshape(1, 3, 26, 32, 48), **common
+                )
+                fed.clear()
+                prefix = stage._encode_vision(
+                    rig.reshape(1, 3, -1, 32, 48),
+                    latent_frames_per_view=4,
+                    condition_indexes=indexes,
+                    **common,
+                )
+                self.assertEqual(fed, frames_fed)
+                self.assertEqual(prefix.shape, full.shape)
+                self.assertTrue(torch.equal(prefix[:, :, indexes], full[:, :, indexes]))
+
+    def test_streamed_decode_hands_out_the_camera_major_clip(self):
+        vae = _tiny_wan_vae(load_encoder=False)
+        stage = _stage(multiview_stage.Cosmos3MultiviewDecodingStage, vae)
+        latents = torch.randn(1, 4, 6, 2, 3)
+        parts = []
+        with torch.no_grad():
+            expected = torch.cat(
+                [stage._decode_latents(view) for view in latents.split(3, dim=2)],
+                dim=2,
+            )
+            clip = stage._decode_views(latents, num_views=2, latent_frames_per_view=3)
+            streamed = stage._decode_views(
+                latents, num_views=2, latent_frames_per_view=3, on_frames=parts.append
+            )
+        self.assertIsNone(streamed)
+        self.assertEqual(clip.shape[2], 2 * 9)
+        self.assertTrue(torch.equal(clip, expected))
+        self.assertTrue(torch.equal(torch.cat(parts, dim=2), expected))
+
+    def test_ranks_without_the_encoder_decode_again_with_the_output_rank(self):
+        stage = _stage(
+            multiview_stage.Cosmos3MultiviewDecodingStage,
+            _tiny_wan_vae(load_encoder=False),
+        )
+        latents = torch.zeros(1, 4, 6, 2, 3)
+        for saved, decodes in ((False, 2), (True, 1)):
+            batch = SimpleNamespace(
+                extra={
+                    multiview_stage.EXTRA_NUM_VIEWS: 2,
+                    multiview_stage.EXTRA_LATENT_FRAMES_PER_VIEW: 3,
+                    multiview_stage.EXTRA_PACKED_SHAPES: (tuple(latents.shape[1:]),),
+                },
+                latents=latents.flatten(1),
+                sampling_params=SimpleNamespace(
+                    quality="lossless", resolved_lidar=lambda: None
+                ),
+                action_latents=None,
+                is_warmup=True,
+                metrics=None,
+                rollout_trajectory_data=None,
+            )
+            with (
+                mock.patch.object(stage, "_encode_while_decoding", return_value=None),
+                mock.patch.object(stage, "_decode_views", return_value=None) as decode,
+                mock.patch.object(
+                    multiview_stage.Cosmos3DecodingStage, "forward"
+                ) as super_forward,
+                mock.patch.object(
+                    multiview_stage, "output_rank_video_path", return_value="out.mp4"
+                ),
+                mock.patch.object(
+                    multiview_stage, "output_rank_saved", return_value=saved
+                ),
+            ):
+                output = stage.forward(batch, None)
+            self.assertEqual(decode.call_count, decodes)
+            self.assertIs(decode.call_args_list[0].kwargs.get("keep_frames"), False)
+            if saved:
+                super_forward.assert_not_called()
+                self.assertNotIn("transfer_decoded_output", batch.extra)
+                self.assertIsNone(output.output)
+            else:
+                self.assertNotIn("keep_frames", decode.call_args_list[1].kwargs)
+                super_forward.assert_called_once()
+
+    def test_cfg_parallel_keeps_single_rank_decode_for_unsharded_vae(self):
+        """Under CFG parallel, an unsharded VAE decodes only on the main rank and
+        checks save completion locally without entering the decode collective."""
+        decoding = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
+        stage_cls = multiview_stage.Cosmos3MultiviewDecodingStage
+        latents = torch.zeros(1, 4, 6, 2, 3)
+        for sharded, expected_type, expects_collective in (
+            (False, multiview_stage.StageParallelismType.MAIN_RANK_ONLY, False),
+            (True, multiview_stage.StageParallelismType.REPLICATED, True),
+        ):
+            with self.subTest(sharded=sharded):
+                vae = _tiny_wan_vae(load_encoder=False)
+                vae.use_parallel_decode = sharded
+                stage = _stage(stage_cls, vae)
+                batch = SimpleNamespace(
+                    extra={
+                        multiview_stage.EXTRA_NUM_VIEWS: 2,
+                        multiview_stage.EXTRA_LATENT_FRAMES_PER_VIEW: 3,
+                        multiview_stage.EXTRA_PACKED_SHAPES: (tuple(latents.shape[1:]),),
+                    },
+                    latents=latents.flatten(1),
+                    sampling_params=SimpleNamespace(
+                        quality="lossless", resolved_lidar=lambda: None
+                    ),
+                    action_latents=None,
+                    is_warmup=True,
+                    metrics=None,
+                    rollout_trajectory_data=None,
+                )
+                fake_stream = SimpleNamespace(
+                    finish=lambda: ["out.mp4"], abort=lambda: None
+                )
+                with (
+                    mock.patch(
+                        f"{decoding}.get_global_server_args",
+                        return_value=SimpleNamespace(enable_cfg_parallel=True),
+                    ),
+                    mock.patch(
+                        f"{decoding}.model_parallel_is_initialized", return_value=True
+                    ),
+                    mock.patch.object(
+                        multiview_stage,
+                        "model_parallel_is_initialized",
+                        return_value=True,
+                    ),
+                    mock.patch(
+                        f"{decoding}.get_decode_parallel_world_size", return_value=2
+                    ),
+                    mock.patch.object(
+                        stage, "_encode_while_decoding", return_value=fake_stream
+                    ),
+                    mock.patch.object(stage, "_decode_views", return_value=None),
+                    mock.patch.object(
+                        multiview_stage,
+                        "output_rank_video_path",
+                        return_value="out.mp4",
+                    ),
+                    mock.patch.object(
+                        multiview_stage, "output_rank_saved", return_value=True
+                    ) as collective,
+                ):
+                    self.assertEqual(stage.parallelism_type_for(None), expected_type)
+                    output = stage.forward(batch, None)
+                self.assertEqual(output.output_file_paths, ["out.mp4"])
+                self.assertEqual(collective.call_count, int(expects_collective))
 
 
 class TestLidarItems(unittest.TestCase):
