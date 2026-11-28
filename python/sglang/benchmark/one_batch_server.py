@@ -530,13 +530,16 @@ def _http_session(trust_env: bool) -> requests.Session:
 
 
 def _warmup_prefixes(input_ids: List[List[int]], prefix_len: int) -> List[List[int]]:
-    def prefix(ids):
-        return ids if len(ids) <= prefix_len else ids[:prefix_len]
+    if not input_ids:
+        return input_ids
 
-    # A fixed-prompt batch can share the truncated prefix as well as the full prompt.
-    if input_ids and all(ids is input_ids[0] for ids in input_ids):
-        return [prefix(input_ids[0])] * len(input_ids)
-    return [prefix(ids) for ids in input_ids]
+    first = input_ids[0]
+    if all(ids is first for ids in input_ids):
+        if len(first) <= prefix_len:
+            return input_ids
+        return [first[:prefix_len]] * len(input_ids)
+
+    return [ids if len(ids) <= prefix_len else ids[:prefix_len] for ids in input_ids]
 
 
 def _warmup_cache(

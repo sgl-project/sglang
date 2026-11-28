@@ -287,9 +287,11 @@ class TestDpListenerSplit(CustomTestCase):
         self.assertIs(warmed[1], rows[1])
         self.assertEqual(rows[2], [4, 5, 6])
 
-    def test_fixed_prompt_shares_one_partial_warmup_prefix(self):
+    def test_fixed_prompt_shares_warmup_prefixes(self):
         prompt = [1, 2, 3, 4]
-        warmed = one_batch_server._warmup_prefixes([prompt] * 3, 2)
+        rows = [prompt] * 3
+        self.assertIs(one_batch_server._warmup_prefixes(rows, len(prompt)), rows)
+        warmed = one_batch_server._warmup_prefixes(rows, 2)
         self.assertEqual(warmed, [[1, 2]] * 3)
         self.assertTrue(all(ids is warmed[0] for ids in warmed))
         self.assertEqual(prompt, [1, 2, 3, 4])
