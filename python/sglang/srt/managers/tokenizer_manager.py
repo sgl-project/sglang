@@ -152,6 +152,12 @@ from sglang.srt.managers.utils import (
     is_health_check_generate_req,
     truncate_input_ids,
 )
+from sglang.srt.managers.worker_rid import (
+    add_worker_rid_suffix,
+    is_session_turn,
+    make_worker_rid_suffix,
+    strip_worker_rid_suffix,
+)
 from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
@@ -630,6 +636,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     tokenized_generate_req_type = TokenizedGenerateReqInput
     batch_tokenized_generate_req_type = BatchTokenizedGenerateReqInput
     canary_info_hook: Optional[CanaryInfoTokenizerManagerHook] = None
+    # Appended to every rid this worker sends on; empty with a single tokenizer worker.
+    worker_rid_suffix: str = ""
 
     # Set by whoever owns the event loop, and left None for Engine and grpc,
     # which own no server. Class-level to leave the frozen __init__ alone.
@@ -872,6 +880,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 context, zmq.PUSH, port_args.tokenizer_worker_ipc_name, False
             )
             self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
+            self.worker_rid_suffix = make_worker_rid_suffix(multi_worker=True)
 
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
@@ -2687,7 +2696,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         batch_size = obj.batch_size
 
         generators = []
-        rids = []
         if getattr(obj, "parallel_sample_num", 1) == 1:
             if self._should_use_batch_tokenization(batch_size, obj):
                 tokenized_objs = await self._batch_tokenize_and_process(batch_size, obj)
@@ -2710,7 +2718,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             tmp_obj, request, state=request_states[tmp_obj.rid]
                         )
                     )
-                    rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
                 with (
@@ -2732,7 +2739,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         generators.append(
                             self._wait_one_response(tmp_obj, request, state=state)
                         )
-                        rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
             if batch_size > 128:
@@ -2762,11 +2768,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj.mm_inputs.mm_items = [
                         copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                     ]
-                tokenized_obj.rid = tmp_obj.regenerate_rid()
+                tmp_obj.regenerate_rid()
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
                 self._init_req_state(tmp_obj)
+                # Read back after _init_req_state, which may add the worker suffix.
+                tokenized_obj.rid = tmp_obj.rid
                 state = self.rid_to_state[tmp_obj.rid]
                 request_states[tmp_obj.rid] = state
                 await self._send_with_disconnect_monitor(
@@ -2795,8 +2803,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tokenized_obj.mm_inputs.mm_items = [
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
-                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
+                    # Read back after _init_req_state, which may add the worker suffix.
+                    tokenized_obj.rid = tmp_obj.rid
                     state = self.rid_to_state[tmp_obj.rid]
                     # Initial states own the references until every sample exists.
                     state.lora_released = True
@@ -2823,7 +2833,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     generators.append(
                         self._wait_one_response(tmp_obj, request, state=state)
                     )
-                    rids.append(tmp_obj.rid)
 
                 if objs[i].rid in initial_req_states:
                     initial_req_states[objs[i].rid].time_stats.set_finished_time()
@@ -2834,7 +2843,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             outputs = await self._collect_batch_responses(generators)
             yield outputs
         else:
-            async for response in self._stream_batch_responses(generators, rids):
+            async for response in self._stream_batch_responses(generators):
                 yield response
 
     async def _collect_batch_responses(self, generators):
@@ -2851,9 +2860,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    async def _stream_batch_responses(self, generators, rids):
-        rid_to_index = {rid: i for i, rid in enumerate(rids)}
-        task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+    async def _stream_batch_responses(self, generators):
+        # Index by position: meta_info["id"] is client-facing and differs from the
+        # rid this worker hands on when it adds its worker suffix.
+        task_map = {
+            asyncio.create_task(gen.__anext__()): (gen, index)
+            for index, gen in enumerate(generators)
+        }
         try:
             while task_map:
                 done, _ = await asyncio.wait(
@@ -2861,13 +2874,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
                 for task in done:
-                    gen = task_map.pop(task)
+                    gen, index = task_map.pop(task)
                     try:
                         result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
+                        result["index"] = index
                         yield result
                         new_task = asyncio.create_task(gen.__anext__())
-                        task_map[new_task] = gen
+                        task_map[new_task] = (gen, index)
                     except StopAsyncIteration:
                         pass
         finally:
@@ -2886,6 +2899,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
             return
+        if rid not in self.rid_to_state:
+            # A client names its request by the rid it sent, without this worker's suffix.
+            suffixed_rid = add_worker_rid_suffix(rid, self.worker_rid_suffix)
+            if suffixed_rid in self.rid_to_state:
+                rid = suffixed_rid
         state = None if abort_all else self.rid_to_state.get(rid)
         if not abort_all:
             if state is not None:
@@ -3217,7 +3235,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Build meta_info and return value
             meta_info = {
-                "id": rid,
+                "id": strip_worker_rid_suffix(rid, self.worker_rid_suffix),
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": request_stats.prompt_tokens,
                 "weight_version": self.config_value("weight_version"),
@@ -4246,7 +4264,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if recv_obj.finished_reason:
             finish_reason = recv_obj.finished_reason
         meta_info = {
-            "id": recv_obj.rid,
+            "id": strip_worker_rid_suffix(recv_obj.rid, self.worker_rid_suffix),
             "finish_reason": finish_reason,
             "weight_version": self.config_value("weight_version"),
             "e2e_latency": state.time_stats.get_e2e_latency(),
@@ -4697,6 +4715,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 obj.lora_id[i] if isinstance(obj.lora_id, list) else obj.lora_id
             )
 
+    def _add_worker_rid_suffix(
+        self, obj: Union[GenerateReqInput, EmbeddingReqInput]
+    ) -> None:
+        obj.rid = add_worker_rid_suffix(obj.rid, self.worker_rid_suffix)
+        if isinstance(obj.rid, list):
+            # Sub-objects already cached by __getitem__ hold their own copy of the rid.
+            for i, sub_obj in obj.__dict__.get("_sub_obj_cache", {}).items():
+                sub_obj.rid = obj.rid[i]
+
     def _init_req_state(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -4714,6 +4741,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             elif request:
                 external_trace_header = extract_trace_headers(request.headers)
                 obj.external_trace_header = external_trace_header
+
+        # A session turn keeps the client's rid: the scheduler keys turns by rid,
+        # and a later turn names one by the rid the client sent.
+        if self.worker_rid_suffix and not (
+            isinstance(obj, GenerateReqInput) and is_session_turn(obj.session_params)
+        ):
+            self._add_worker_rid_suffix(obj)
 
         # Normalize single/batch into a uniform list of (rid, sub_obj, bootstrap_room)
         if not hasattr(obj, "is_single") or obj.is_single:
@@ -4735,7 +4769,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         rids = set()
         for rid, _, _ in items:
             if rid in self.rid_to_state or rid in rids:
-                raise ValueError(f"Duplicate request ID detected: {rid}")
+                client_rid = strip_worker_rid_suffix(rid, self.worker_rid_suffix)
+                raise ValueError(f"Duplicate request ID detected: {client_rid}")
             rids.add(rid)
 
         new_states = {}

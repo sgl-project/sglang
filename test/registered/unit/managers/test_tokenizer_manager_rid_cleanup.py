@@ -61,6 +61,7 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     TokenizerManager,
     _add_sampling_mask_to_meta_info,
 )
+from sglang.srt.managers.worker_rid import strip_worker_rid_suffix  # noqa: E402
 from sglang.srt.multimodal.modality import Modality  # noqa: E402
 from sglang.srt.multimodal.transport.cuda_ipc import (  # noqa: E402
     CudaIpcTensorTransportProxy,
@@ -1127,6 +1128,135 @@ class TestInitReqStateAtomicity(CustomTestCase):
             self.assertEqual(tm.rid_to_state[obj.rid[i]].time_stats.created_time, 123.0)
 
 
+class TestMultiWorkerRidIsolation(CustomTestCase):
+    """With several tokenizer workers one client rid can be in flight on two of them.
+    Each worker must hand on a distinct rid, or the scheduler and the detokenizer treat
+    the two requests as one and deliver one request's output to the other's client."""
+
+    def _worker(self, suffix: str) -> TokenizerManager:
+        tm = _make_tokenizer_manager(self)
+        tm.worker_rid_suffix = suffix
+        return tm
+
+    def _register(self, tm: TokenizerManager, rid) -> GenerateReqInput:
+        obj = GenerateReqInput(
+            text="a" if isinstance(rid, str) else ["a"] * len(rid),
+            rid=rid,
+            received_time=0.0,
+        )
+        obj.normalize_batch_and_arguments()
+        tm._init_req_state(obj)
+        return obj
+
+    def test_one_client_rid_on_two_workers_is_handed_on_as_two_rids(self):
+        first = self._register(self._worker("#aaaaaaaa"), "shared").rid
+        second = self._register(self._worker("#bbbbbbbb"), "shared").rid
+        self.assertNotEqual(first, second)
+
+    def test_cached_sub_objects_carry_the_handed_on_rid(self):
+        tm = self._worker("#aaaaaaaa")
+        obj = GenerateReqInput(text=["a", "b"], rid=["x0", "x1"], received_time=0.0)
+        obj.normalize_batch_and_arguments()
+        cached = obj[0]
+        tm._init_req_state(obj)
+        self.assertEqual(cached.rid, obj.rid[0])
+        self.assertIs(tm.rid_to_state[obj.rid[0]].obj, cached)
+
+    def test_a_duplicate_on_one_worker_is_rejected_by_the_client_rid(self):
+        tm = self._worker("#aaaaaaaa")
+        self._register(tm, "shared")
+        with self.assertRaisesRegex(
+            ValueError, r"Duplicate request ID detected: shared$"
+        ):
+            self._register(tm, "shared")
+
+    def test_the_client_sees_and_aborts_its_request_by_the_rid_it_sent(self):
+        tm = self._worker("#aaaaaaaa")
+        handed_on = self._register(tm, "shared").rid
+        tm._dispatch_to_scheduler = Mock()
+
+        tm.abort_request("shared")
+        self.assertEqual(tm._dispatch_to_scheduler.call_args.args[0].rid, handed_on)
+
+        state = tm.rid_to_state[handed_on]
+        asyncio.run(tm._handle_batch_output(_make_batch_str_output(handed_on)))
+        self.assertEqual(state.out_list[-1]["meta_info"]["id"], "shared")
+
+    def test_a_session_turn_keeps_the_client_rid(self):
+        # A later turn names this one by the rid the client sent, possibly on another worker.
+        tm = self._worker("#aaaaaaaa")
+        obj = GenerateReqInput(
+            text="a", rid="turn-1", session_params={"id": "s"}, received_time=0.0
+        )
+        obj.normalize_batch_and_arguments()
+        tm._init_req_state(obj)
+        self.assertEqual(obj.rid, "turn-1")
+        self.assertIn("turn-1", tm.rid_to_state)
+
+    def test_a_streamed_batch_is_indexed_by_position(self):
+        tm = self._worker("#aaaaaaaa")
+        obj = self._register(tm, ["c0", "c1"])
+
+        async def output(rid):
+            yield {"meta_info": {"id": strip_worker_rid_suffix(rid, "#aaaaaaaa")}}
+
+        async def drive():
+            stream = tm._stream_batch_responses([output(r) for r in obj.rid])
+            return [result async for result in stream]
+
+        results = asyncio.run(drive())
+        self.assertEqual(
+            sorted((r["index"], r["meta_info"]["id"]) for r in results),
+            [(0, "c0"), (1, "c1")],
+        )
+
+    def test_parallel_samples_are_sent_with_the_rid_they_are_registered_by(self):
+        tm = self._worker("#aaaaaaaa")
+        obj = GenerateReqInput(
+            text="a", rid="c", sampling_params={"n": 2}, received_time=0.0
+        )
+        obj.normalize_batch_and_arguments()
+        tm._init_req_state(obj)
+        rids = obj.rid if isinstance(obj.rid, list) else [obj.rid]
+        request_states = {rid: tm.rid_to_state[rid] for rid in rids}
+
+        sent_rids = []
+        registered_at_send = []
+
+        async def tokenize(sub_obj):
+            return SimpleNamespace(
+                rid=sub_obj.rid,
+                mm_inputs=None,
+                input_ids=[1],
+                time_stats=None,
+                sampling_params=SimpleNamespace(
+                    max_new_tokens=8, for_sample=lambda i: SimpleNamespace()
+                ),
+                stream=False,
+            )
+
+        async def send(tokenized_obj):
+            sent_rids.append(tokenized_obj.rid)
+            registered_at_send.append(tokenized_obj.rid in tm.rid_to_state)
+
+        async def wait(sub_obj, request, state=None):
+            yield {"meta_info": {"id": sub_obj.rid}}
+
+        tm._tokenize_one_request = tokenize
+        tm._send_one_request = send
+        tm._wait_one_response = wait
+
+        async def drive():
+            async for _ in tm._handle_batch_request(obj, None, request_states):
+                pass
+
+        asyncio.run(drive())
+        # One warmup plus two samples, each sent by a rid this worker registered.
+        self.assertEqual(len(sent_rids), 3)
+        self.assertTrue(all(r.endswith("#aaaaaaaa") for r in sent_rids))
+        self.assertEqual(registered_at_send, [True, True, True])
+
+
 class TestResubmitAfterCompletion(CustomTestCase):
     """End-to-end test: complete a request, then resubmit with the same rid."""
 
@@ -1393,10 +1523,7 @@ class TestParallelStreamTaskCleanup(CustomTestCase):
                 finally:
                     sibling_closed.set()
 
-            stream = tm._stream_batch_responses(
-                [failing_choice(), blocked_choice()],
-                ["choice-0", "choice-1"],
-            )
+            stream = tm._stream_batch_responses([failing_choice(), blocked_choice()])
             with self.assertRaisesRegex(RuntimeError, "choice failed"):
                 await stream.__anext__()
             self.assertTrue(sibling_closed.is_set())
