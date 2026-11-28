@@ -304,8 +304,9 @@ jobs:
   # Disabled for the temporary PR rerun pipeline: the qwen3.6-27b 1P in3k5/out1k5
   # GPQA case is replaced by the GLM-5.3-Flash 1P1D 16P case in the multi-node
   # job below, so the suite is no longer partitioned here.
-  # The qwen case runs with HCCL_DETERMINISTIC=true (see the test file) to remove
-  # the run-to-run drift observed at temperature=0.
+  # HCCL_DETERMINISTIC was removed from the test file to re-measure the
+  # temperature=0 run-to-run drift over a few nightly runs; restore it in the
+  # test file if accuracy failures beyond the 5-question tolerance reappear.
   nightly-acc-test-2-npu-a3:
     name: nightly-acc-test-2-npu-a3
     if: false
