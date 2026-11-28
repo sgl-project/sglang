@@ -32,6 +32,17 @@ from sglang.srt.mem_cache.capacity import reclaim_for_load_back, shares_memory
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.kv_load_recovery import (
+    prepare_hybrid_kv_load,
+    prepare_partial_kv_load,
+)
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -78,6 +89,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             mamba_component=self._mamba_component,
             sliding_window_size=self.sliding_window_size,
         )
+        if get_memory().kv_load_failure_policy == "repair" and (
+            self.is_swa_enabled
+            or tp_size != 1
+            or params.pp_size != 1
+            or not get_schedule().disable_overlap_schedule
+            or get_spec().speculative_algorithm is not None
+            or get_disagg().disaggregation_mode != "null"
+        ):
+            raise ValueError(
+                "KV hole repair requires full attention (optionally with recurrent state), one GPU, "
+                "and --disable-overlap-schedule"
+            )
         self._external_flows: dict[str, LMCacheExternalFlow] = {}
         self._forward_stream = forward_stream
         self._pending_stores: list[LMCachePendingStore] = []
@@ -89,6 +112,17 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def is_backuped(self, node_id: NodeId) -> bool:
         # LMCache rebuilds lookup keys from tokens, so any L1 node is valid.
         return True
+
+    def _load_stream(self, device: torch.device) -> Any:
+        # Non-overlap TP1 runs forwards on the scheduler's current stream,
+        # whereas overlap/PP run on the model runner's dedicated stream.
+        # Fence the stream that will actually consume the H2D destinations.
+        if get_schedule().disable_overlap_schedule and get_parallel().pp_size == 1:
+            return torch.get_device_module(device).current_stream()
+        return self._forward_stream
+
+    def supports_partial_load_recovery(self) -> bool:
+        return not self.is_swa_enabled and self.lmcache_connector.kv_world_size == 1
 
     def prefix_device_indices(self, req: Req) -> torch.Tensor:
         # match_prefix may append loaded slots not yet published to the tree,
@@ -118,7 +152,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             params = dataclasses.replace(
                 params, key=params.key[: flow.local_hit_tokens]
             )
-        elif flow is not None and flow.load is not None and params.cow_mamba:
+        elif (
+            flow is not None
+            and flow.load is not None
+            and params.cow_mamba
+            and flow.repair_restored_extent is None
+        ):
             # Re-arm Mamba COW from the retrieved checkpoint on retry.
             self._arm_external_mamba_cow(flow, req, take_slot=not params.defer_cow_slot)
             params = MatchPrefixParams(key=params.key, cow_mamba=False, req=req)
@@ -140,6 +179,16 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             flow.loaded_skip_tokens = max(flow.loaded_skip_tokens, skip)
             if flow.load.result:
                 self._release_unused_loaded_slots(flow)
+        if req.kv_load_recovery is not None and local_hit > req.kv_load_recovery.span_start:
+            # Another request published a longer valid prefix while this load
+            # waited for admission. Use its canonical slots, not a stale plan.
+            req.kv_load_recovery.abort(self.token_to_kv_pool_allocator)
+            req.kv_load_recovery = None
+            if flow.released_skip_tokens != len(flow.load.device_indices):
+                raise RuntimeError("Superseded repair still owns a private prefix")
+            flow.prefix_published = True
+            self._retire_loaded_flow(req.rid)
+            return result
         if total_hit <= local_hit:
             return result
 
@@ -268,10 +317,27 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self._abandon_attempt(req.cache_request_handle)
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
+        flow = self._external_flows.get(req.rid)
+        if flow is not None and flow.repair_restored_extent is not None:
+            if req.kv_load_recovery is not None or up_to != flow.repair_restored_extent:
+                raise RuntimeError("Hybrid external KV published before replay commit")
+            flow.total_hit = flow.repair_restored_extent
+            flow.repair_restored_extent = None
+            flow.load.device_indices = self.req_to_token_pool.req_to_token[
+                req.kv.req_pool_idx, flow.load.local_hit_tokens : up_to
+            ].clone()
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
         super().checkpoint(req, up_to=up_to, **kwargs)
         self._retire_loaded_flow(req.rid)
-        self._submit_store(req, req.full_untruncated_fill_ids[:up_to])
+        tokens = req.full_untruncated_fill_ids[:up_to]
+        if self.supports_partial_load_recovery():
+            for span in self.lmcache_connector.pending_writeback_ranges(req.rid, up_to):
+                self._submit_store(
+                    req,
+                    tokens if self._mamba_component is not None else tokens[: span[1]],
+                    writeback_range=span,
+                )
+        self._submit_store(req, tokens)
         if req.finished():
             self._request_session_finish(req.rid)
 
@@ -623,6 +689,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             req.kv.mamba_needs_clear = False
 
         try:
+            load_stream = self._load_stream(device_indices.device)
             load_start = local_hit // self.lmcache_connector.chunk_size
             load_start *= self.lmcache_connector.chunk_size
             # Submit asynchronously while admission can still fall back to prefill.
@@ -635,13 +702,80 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 ),
                 local_hit_tokens=local_hit,
                 owned_device_indices=device_indices,
-                producer_stream=self._forward_stream,
+                producer_stream=load_stream,
             )
             if not self.lmcache_connector.prepare_load_on_stream(
-                flow.load, self._forward_stream
+                flow.load, load_stream,
+                allow_partial=(self.supports_partial_load_recovery() and local_hit % self.lmcache_connector.chunk_size == 0),
             ):
                 raise RuntimeError("LMCache server rejected the retrieve request")
-            if mamba_value is not None:
+            coverage = flow.load.coverage
+            if coverage is not None and coverage.failed_chunks:
+                chunk = self.lmcache_connector.chunk_size
+                if coverage.total_chunks * chunk != total_hit - load_start:
+                    raise ValueError("Partial retrieve coverage has the wrong extent")
+                missing_span = (
+                    load_start + min(coverage.failed_chunks) * chunk,
+                    load_start + (max(coverage.failed_chunks) + 1) * chunk,
+                )
+                policy = get_memory().kv_load_failure_policy
+                if (
+                    req.session is not None or req.return_logprob or req.multimodal_inputs is not None
+                    or req.skip_radix_cache_insert or req.input_embeds is not None
+                    or req.positional_embed_overrides is not None
+                ):
+                    policy = "recompute"
+                if self._mamba_component is not None:
+                    if (
+                        policy == "repair"
+                        and self.token_to_kv_pool_allocator.available_size()
+                        >= missing_span[1] - local_hit
+                    ):
+                        device_indices, req.kv_load_recovery = prepare_hybrid_kv_load(
+                            loaded_start=local_hit,
+                            loaded_indices=device_indices,
+                            missing_span=missing_span,
+                            page_size=self.page_size,
+                            allocator=self.token_to_kv_pool_allocator,
+                            resume_checkpoint=mamba_value,
+                        )
+                        flow.repair_restored_extent = total_hit
+                    else:
+                        # Only the local joint checkpoint can seed recurrence
+                        # before the hole. A later checkpoint cannot run backward.
+                        policy = "recompute"
+                        self.token_to_kv_pool_allocator.free(device_indices)
+                        device_indices = device_indices[:0]
+                        self.token_to_kv_pool_allocator.state_slots.free(mamba_value)
+                        flow.mamba_value = mamba_value = None
+                        flow.free_mamba_after_load = False
+                    req.kv.mamba_cow_src_index = None
+                    req.kv.mamba_needs_clear = True
+                    if local_hit:
+                        super().match_prefix(
+                            MatchPrefixParams(
+                                key=flow.key[:local_hit],
+                                req=req,
+                                cow_mamba=True,
+                            )
+                        )
+                    flow.total_hit = local_hit
+                else:
+                    device_indices, req.kv_load_recovery = prepare_partial_kv_load(
+                        loaded_start=local_hit,
+                        loaded_indices=device_indices,
+                        missing_span=missing_span,
+                        page_size=self.page_size,
+                        allocator=self.token_to_kv_pool_allocator,
+                        policy=policy,
+                    )
+                    flow.total_hit = missing_span[0]
+                flow.load.device_indices = device_indices
+                logger.info(
+                    "Partial KV load req=%s policy=%s span=%s restored_extent=%d",
+                    req.rid, policy, missing_span, total_hit,
+                )
+            if mamba_value is not None and flow.repair_restored_extent is None:
                 # Forward waits for H2D before deferred Mamba COW runs.
                 self._arm_external_mamba_cow(flow, req)
         except Exception:
@@ -876,7 +1010,13 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.load_req = None
         flow.prefix_published = True
 
-    def _submit_store(self, req: Req, token_ids: list[int]) -> None:
+    def _submit_store(
+        self,
+        req: Req,
+        token_ids: list[int],
+        *,
+        writeback_range: tuple[int, int] | None = None,
+    ) -> None:
         key = RadixKey(
             token_ids,
             req.extra_key,
@@ -891,10 +1031,21 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         key = key[:aligned_len]
         if len(key) == 0:
             return
-        matched = super().match_prefix(MatchPrefixParams(key=key))
+        if writeback_range is not None:
+            # This range contains only failed attention KV. A reusable hybrid
+            # prefix also needs a recurrent checkpoint, which may stop before
+            # this block even though its FULL device values are resident.
+            key = key[: writeback_range[1]]
+            resident_tokens, store_node, _ = self.tree_core.match_full_device_prefix(
+                key
+            )
+        else:
+            matched = super().match_prefix(MatchPrefixParams(key=key))
+            resident_tokens = matched.device_prefix_len
+            store_node = matched.last_device_node
         # Store the currently resident SWA prefix; later callbacks may extend it.
         resident_len = torch.tensor(
-            [min(matched.device_prefix_len, len(key))],
+            [min(resident_tokens, len(key))],
             dtype=torch.int64,
             device="cpu",
         )
@@ -906,7 +1057,11 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             // self.lmcache_connector.chunk_size
             * self.lmcache_connector.chunk_size
         )
-        store_start = self.lmcache_connector.get_store_start(req.rid, len(key))
+        store_start = (
+            writeback_range[0]
+            if writeback_range is not None
+            else self.lmcache_connector.get_store_start(req.rid, len(key))
+        )
         if resident_len <= store_start:
             logger.debug(
                 "LMCache store skipped for %s: no new resident chunk "
@@ -926,12 +1081,15 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 len(key),
             )
             key = key[:resident_len]
-            # Re-match so the lock and Mamba state use the shortened boundary.
-            matched = super().match_prefix(MatchPrefixParams(key=key))
-        store_indices = self.path_device_indices(matched.last_device_node)[
-            store_start : len(key)
-        ]
-        if len(store_indices) != len(key) - store_start:
+            if writeback_range is None:
+                # Re-match so the lock and Mamba state use the shortened boundary.
+                matched = super().match_prefix(MatchPrefixParams(key=key))
+                store_node = matched.last_device_node
+        store_end = writeback_range[1] if writeback_range is not None else len(key)
+        if resident_len < store_end:
+            return
+        store_indices = self.path_device_indices(store_node)[store_start:store_end]
+        if len(store_indices) != store_end - store_start:
             logger.debug(
                 "LMCache store skipped for %s: store indices length: %d, "
                 "store start: %d, key length: %d",
@@ -941,16 +1099,29 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 len(key),
             )
             return
-        lock_params = self.inc_lock_ref(matched.last_device_node).to_dec_params()
+        skip_lock_components = (
+            (self._mamba_component.component_type,)
+            if writeback_range is not None and self._mamba_component is not None
+            else ()
+        )
+        lock_params = self.inc_lock_ref(
+            store_node, skip_lock_components=skip_lock_components
+        ).to_dec_params()
         mamba_value = (
             self.tree_core.get_component_device_value(
                 matched.best_match_node, ComponentType.MAMBA
             )
-            if self._mamba_component is not None
+            if self._mamba_component is not None and writeback_range is None
             else None
         )
         mamba_is_resident = torch.tensor(
-            [int(self._mamba_component is None or mamba_value is not None)],
+            [
+                int(
+                    writeback_range is not None
+                    or self._mamba_component is None
+                    or mamba_value is not None
+                )
+            ],
             dtype=torch.int32,
             device="cpu",
         )
@@ -958,7 +1129,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             mamba_is_resident, torch.distributed.ReduceOp.MIN
         )
         if not mamba_is_resident.item():
-            self.dec_lock_ref(matched.last_device_node, lock_params)
+            self.dec_lock_ref(store_node, lock_params)
             logger.debug(
                 "LMCache store skipped for %s: no Mamba checkpoint at token %d",
                 req.rid,
@@ -974,19 +1145,20 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     mamba_value=mamba_value,
                 ),
                 device_indices_start=store_start,
+                writeback_range=writeback_range,
                 cache_salt=self.lmcache_connector.build_cache_salt(
                     req.cache_salt, req.extra_key
                 ),
             )
         except Exception:
-            self.dec_lock_ref(matched.last_device_node, lock_params)
+            self.dec_lock_ref(store_node, lock_params)
             logger.exception("LMCache store submission failed for %s", req.rid)
             return
         if operation is None:
-            self.dec_lock_ref(matched.last_device_node, lock_params)
+            self.dec_lock_ref(store_node, lock_params)
             return
         self._pending_stores.append(
-            LMCachePendingStore(operation, matched.last_device_node, lock_params)
+            LMCachePendingStore(operation, store_node, lock_params)
         )
         self._pending_store_counts[req.rid] = (
             self._pending_store_counts.get(req.rid, 0) + 1

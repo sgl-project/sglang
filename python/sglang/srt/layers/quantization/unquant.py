@@ -16,6 +16,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.batch_invariant_ops.compiled import batch_invariant_linear
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -1096,6 +1097,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            _is_cuda
+            and is_batch_invariant_mode_enabled()
+            and torch.compiler.is_compiling()
+        ):
+            return batch_invariant_linear(x, layer.weight, bias)
         # _skip_aiter_unquant marks deterministic mode; the TLX plan also varies with M.
         if (
             _use_tlx_gemm

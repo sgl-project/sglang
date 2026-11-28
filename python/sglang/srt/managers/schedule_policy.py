@@ -1817,7 +1817,14 @@ class PrefillAdder:
                 limit = max(limit, self.mamba_chunk_grid)
             _rem_tokens = min(_rem_tokens, limit)
 
+        recovery = req.kv_load_recovery
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        if recovery is not None:
+            if not recovery.span_start <= req.prefix_len < recovery.span_end:
+                raise RuntimeError("Repair prefill prefix is outside its replay span")
+            # Mixed decode traffic can cut a replay before its commit boundary.
+            # Its continuation must stop there before the healthy suffix is adopted.
+            cand_extend_input_len = recovery.span_end - req.prefix_len
         _rem_tokens = self.grid_continuation_limit(_rem_tokens, cand_extend_input_len)
         prefix_tokens = 0
         if is_cp_sharded_padded():
@@ -1834,7 +1841,7 @@ class PrefillAdder:
         )
         if _rem_tokens is None:
             return req
-        truncated = cand_extend_input_len > _rem_tokens
+        truncated = recovery is not None or cand_extend_input_len > _rem_tokens
         new_len = self.floor_chunked_tokens(
             min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
         )
@@ -2257,7 +2264,10 @@ class PrefillAdder:
                     return AddReqResult.OTHER
                 req.host_loaded_length, req.last_node = loaded
                 state_slots = self._state_slots_for_req(req)
-                if 0 < req.host_loaded_length < promised_host_hit:
+                if (
+                    0 < req.host_loaded_length < promised_host_hit
+                    and not self.tree_cache.supports_partial_load_recovery()
+                ):
                     raise RuntimeError(
                         "HiCache load-back must commit all promised FULL tokens or none: "
                         f"req={req.rid} promised={promised_host_hit} "
@@ -2294,7 +2304,7 @@ class PrefillAdder:
                         req,
                         total_tokens=total_tokens,
                         state_slots=state_slots,
-                        host_hit_length=0,
+                        host_hit_length=req.host_loaded_length,
                         window_host_hit_lengths={},
                         truncation_align_size=truncation_align_size,
                         has_chunked_req=has_chunked_req,
@@ -2354,6 +2364,13 @@ class PrefillAdder:
         """Select a prefill shape without allocating or publishing cached KV."""
         prefix_len = req.prefix_len + host_hit_length
         extend_len = len(req.full_untruncated_fill_ids) - prefix_len
+        recovery = req.kv_load_recovery
+        if recovery is not None:
+            if has_chunked_req or self.new_chunked_req is not None:
+                return AddReqResult.OTHER
+            if not recovery.span_start <= prefix_len < recovery.span_end:
+                raise RuntimeError("Repair prefill prefix is outside its replay span")
+            extend_len = recovery.span_end - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)
         # Whether the request fits whole. Against the raw length under
         # exact-chunk-fill, so a request whose ceiled length would spill is
@@ -2389,8 +2406,15 @@ class PrefillAdder:
         ):
             return AddReqResult.OTHER
 
-        is_chunked = False
-        max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+        if (
+            recovery is not None
+            and recovery.hybrid is None
+            and chunk_tokens_limit is not None
+            and extend_len > chunk_tokens_limit
+        ):
+            return AddReqResult.OTHER
+        is_chunked = recovery is not None
+        max_new_tokens = 0 if is_chunked else min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
         tile_tokens = input_tokens
         if self.dllm_config is not None:
             assert truncation_align_size is None, (
@@ -2401,7 +2425,7 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if has_chunked_req:
+            if has_chunked_req or self.new_chunked_req is not None:
                 # Only one unfinished chunked request can be tracked; a
                 # continuation cut short by memory leaves chunk budget to spare.
                 return AddReqResult.OTHER

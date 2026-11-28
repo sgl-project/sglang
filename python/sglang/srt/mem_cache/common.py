@@ -249,6 +249,13 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
     # The tree reads req.finished() to tell a checkpoint from the final
     # insert; a finished request belongs in release_kv_cache.
     assert not req.finished(), f"checkpointing finished request {req.rid}"
+    if req.kv_load_recovery is not None:
+        if req.extend_end < req.kv_load_recovery.span_end:
+            # Intermediate hybrid replay state is private, including checkpoint
+            # buffers; publishing it would replace healthy cached state.
+            req.prefix_len = req.extend_end
+            return
+        req.kv_load_recovery.commit(req, tree_cache)
     if not req.skip_radix_cache_insert:
         tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.

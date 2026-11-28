@@ -94,6 +94,12 @@ class RadixLinearAttention(nn.Module):
         b: torch.Tensor,
     ) -> torch.Tensor:
         is_extend = forward_batch.forward_mode.is_extend()
+        if torch.compiler.is_compiling() and forward_batch.forward_mode.is_decode():
+            # Tracing indexed recurrent/conv updates can materialize entire
+            # state pools as functional intermediates per layer. Keep the
+            # backend opaque to Dynamo; its ordinary kernels are still captured
+            # by the surrounding decode CUDA graph.
+            return self._compiled_decode(forward_batch, mixed_qkv, a, b)
         if (
             is_in_prefill_graph_scope()
             and is_extend
@@ -154,6 +160,12 @@ class RadixLinearAttention(nn.Module):
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
+        )
+
+    @torch.compiler.disable
+    def _compiled_decode(self, forward_batch, mixed_qkv, a, b):
+        return get_attn_backend().forward(
+            layer=self, forward_batch=forward_batch, mixed_qkv=mixed_qkv, a=a, b=b
         )
 
     @eager_on_graph
