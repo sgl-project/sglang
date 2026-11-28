@@ -17,6 +17,7 @@ import pytest
 
 from sglang.kernels.jit.utils import arch
 from sglang.kernels.jit.utils.arch import CompileArch
+from sglang.kernels.jit.utils.common import is_hip_runtime, is_sail_runtime
 from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
@@ -493,6 +494,63 @@ def test_pure_cpp_module_does_not_link_the_gpu_runtime():
         if line.startswith("ldflags = ")
     )
     assert "cudart" in ldflags or "amdhip" in ldflags
+
+
+def _cuda_ldflags(monkeypatch, cuda_root: pathlib.Path) -> str:
+    if is_hip_runtime() or is_sail_runtime():
+        pytest.skip("CUDA runtime link flags only")
+    monkeypatch.setattr(toolchain, "cuda_home", lambda: str(cuda_root))
+    with_device = _spec(cuda_files=("/tmp/a.cu",), cpp_wrappers=(), header_only=False)
+    return next(
+        line
+        for line in ninja.generate(with_device).splitlines()
+        if line.startswith("ldflags = ")
+    )
+
+
+def test_pip_cuda_toolkit_links_the_versioned_cudart(tmp_path, monkeypatch):
+    """A device module must link against the pip CUDA wheels' layout.
+
+    `nvidia/cu13` ships `lib/libcudart.so.13` with no `lib64/` and no unversioned
+    `libcudart.so`, so `-L$CUDA_HOME/lib64 -lcudart` fails with `cannot find -lcudart`.
+    """
+    for name in ("libcudart.so.13", "libcudart.so.13.0.96"):
+        _write(tmp_path / "lib" / name, "")
+    ldflags = _cuda_ldflags(monkeypatch, tmp_path)
+    assert f"-L{tmp_path}/lib -l:libcudart.so.13" in ldflags
+    assert "lib64" not in ldflags
+
+
+def test_cuda_toolkit_link_flags_are_unchanged(tmp_path, monkeypatch):
+    """A toolkit install keeps `-L$CUDA_HOME/lib64 -lcudart` exactly.
+
+    The flags are part of the build key, so any change to them recompiles every
+    cached module; a toolkit's `lib/` must not win over `lib64/`.
+    """
+    _write(tmp_path / "lib64" / "libcudart.so", "")
+    _write(tmp_path / "lib" / "libcudart.so.13", "")
+    ldflags = _cuda_ldflags(monkeypatch, tmp_path)
+    assert f"-L{tmp_path}/lib64 -lcudart" in ldflags
+    assert "-l:" not in ldflags
+
+
+def _stubs_dir(monkeypatch, cuda_root: pathlib.Path) -> str:
+    monkeypatch.setattr(toolchain, "cuda_home", lambda: str(cuda_root))
+    return toolchain.cuda_stubs_dir.__wrapped__()
+
+
+def test_pip_cuda_toolkit_finds_the_driver_stub_under_lib(tmp_path, monkeypatch):
+    """`-lcuda` must resolve against the pip CUDA wheels' `lib/stubs` (no `lib64/`)."""
+    _write(tmp_path / "lib" / "stubs" / "libcuda.so", "")
+    assert _stubs_dir(monkeypatch, tmp_path) == str(tmp_path / "lib" / "stubs")
+
+
+def test_cuda_toolkit_stubs_dir_is_unchanged(tmp_path, monkeypatch):
+    """A toolkit keeps `lib64/stubs`, and stays the fallback when neither has the stub."""
+    assert _stubs_dir(monkeypatch, tmp_path) == str(tmp_path / "lib64" / "stubs")
+    _write(tmp_path / "lib64" / "stubs" / "libcuda.so", "")
+    _write(tmp_path / "lib" / "stubs" / "libcuda.so", "")
+    assert _stubs_dir(monkeypatch, tmp_path) == str(tmp_path / "lib64" / "stubs")
 
 
 def test_generated_ninja_is_deterministic():
