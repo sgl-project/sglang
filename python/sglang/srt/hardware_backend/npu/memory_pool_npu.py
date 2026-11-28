@@ -1,5 +1,5 @@
 import logging
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -28,10 +28,39 @@ from sglang.srt.utils.device import is_npu
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+        HostKVPool,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
 
 if is_npu():
     import torch_npu
+
+
+def pack_dsa_quant_kv_cache(
+    cache_k, cache_v, *, kv_lora_rank, qk_rope_head_dim, quant_block_size, dtype
+):
+    latent = cache_k.reshape(-1, kv_lora_rank)
+    quantized, scale = torch_npu.npu_dynamic_quant(
+        latent.reshape(-1, quant_block_size), dst_type=dtype
+    )
+    rows = latent.shape[0]
+    # Opaque record: quantized latent | rope BF16 bytes | per-tile FP32 scales.
+    packed = torch.cat(
+        (
+            quantized.reshape(rows, kv_lora_rank).view(torch.uint8),
+            cache_v.to(torch.bfloat16)
+            .reshape(rows, qk_rope_head_dim)
+            .contiguous()
+            .view(torch.uint8),
+            scale.to(torch.float32)
+            .reshape(rows, kv_lora_rank // quant_block_size)
+            .contiguous()
+            .view(torch.uint8),
+        ),
+        dim=-1,
+    )
+    return packed.view(dtype)
 
 
 def _mla_fia_nz_scatter_indices(
@@ -719,6 +748,8 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
     rows_are_dcp_collapsed = False
+    pd_host_pool: Optional["HostKVPool"] = None
+    invalidate_packed_request: Callable[[int], None]
 
     # Quantization tile of the packed one-byte DSA record, under the name the
     # CUDA DSATokenToKVPool exposes (pool wrappers forward it). The packer,
@@ -796,6 +827,39 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
         )
+        disaggregation_mode = None
+        if (
+            self.enable_sparsity_driven_kv_offload
+            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+        ):
+            if is_draft_worker:
+                self.enable_sparsity_driven_kv_offload = False
+            else:
+                disaggregation_mode = get_disagg().disaggregation_mode
+                self.enable_sparsity_driven_kv_offload = (
+                    disaggregation_mode != "prefill"
+                )
+        if disaggregation_mode == "decode":
+            if modelslim_cache_layout is not None or self.use_fia_nz:
+                raise ValueError("Ascend PD split KV requires row-major MLA caches.")
+            if dtype == torch.float8_e4m3fn:
+                if (kv_lora_rank, qk_rope_head_dim, page_size, index_head_dim) != (
+                    512,
+                    64,
+                    128,
+                    128,
+                ):
+                    raise ValueError(
+                        "Invalid packed C8 geometry for Ascend PD sparse KV."
+                    )
+            else:
+                from sgl_kernel_npu.operators.attention.fused_scatter_copy_sparse_flash_attention_split import (
+                    validate_pd_split_copy_sfa_layout,
+                )
+
+                validate_pd_split_copy_sfa_layout(
+                    kv_lora_rank, qk_rope_head_dim, page_size, dtype
+                )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
         if index_head_dim is None:
@@ -1146,6 +1210,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             )
         return kv_size_bytes
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if self.pd_host_pool is None or not self.dsa_kv_cache_store_c8:
+            return super().move_kv_cache(tgt_loc, src_loc)
+
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+            move_packed_kv,
+        )
+
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+        move_packed_kv(self, tgt_loc.view(-1).long(), src_loc.view(-1).long())
+
     def _raise_if_native_kv_cache_disabled(self):
         if (
             getattr(self, "k_buffer", None) is None
@@ -1308,23 +1385,35 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots, layer_id) entries in PD transfer order."""
-        self._raise_if_native_kv_cache_disabled()
-        global_kv = self.is_draft_worker
         kv_layer_ids = self._kv_buffer_layer_ids()
-        if self.use_combined_kv_buffer:
-            return [
-                (buffer, global_kv, layer_id)
-                for buffer, layer_id in zip(self.kv_buffer, kv_layer_ids, strict=True)
+        if self.pd_host_pool is not None:
+            # Host CKV and KPE precede the native indexer buffers.
+            entries = [
+                (buffer, True, layer_id)
+                for component in self.pd_host_pool.buffers
+                for buffer, layer_id in zip(component, kv_layer_ids, strict=True)
             ]
-        entries = [
-            (buffer, global_kv, layer_id)
-            for buffer, layer_id in zip(self.k_buffer, kv_layer_ids, strict=True)
-        ]
-        if not self.dsa_kv_cache_store_c8:
-            entries += [
+        else:
+            self._raise_if_native_kv_cache_disabled()
+            global_kv = self.is_draft_worker
+            if self.use_combined_kv_buffer:
+                return [
+                    (buffer, global_kv, layer_id)
+                    for buffer, layer_id in zip(
+                        self.kv_buffer, kv_layer_ids, strict=True
+                    )
+                ]
+            entries = [
                 (buffer, global_kv, layer_id)
-                for buffer, layer_id in zip(self.v_buffer, kv_layer_ids, strict=True)
+                for buffer, layer_id in zip(self.k_buffer, kv_layer_ids, strict=True)
             ]
+            if not self.dsa_kv_cache_store_c8:
+                entries += [
+                    (buffer, global_kv, layer_id)
+                    for buffer, layer_id in zip(
+                        self.v_buffer, kv_layer_ids, strict=True
+                    )
+                ]
         if self.index_head_dim is not None:
             entries += [
                 (buffer, True, layer_id)
@@ -1370,27 +1459,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
 
     def _pack_dsa_quant_kv_cache(self, cache_k, cache_v):
-        latent = cache_k.reshape(-1, self.kv_lora_rank)
-        quantized, scale = torch_npu.npu_dynamic_quant(
-            latent.reshape(-1, self.quant_block_size), dst_type=self.dtype
+        return pack_dsa_quant_kv_cache(
+            cache_k,
+            cache_v,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            quant_block_size=self.quant_block_size,
+            dtype=self.dtype,
         )
-        rows = latent.shape[0]
-        # Opaque record: quantized latent | rope BF16 bytes | per-tile FP32 scales.
-        packed = torch.cat(
-            (
-                quantized.reshape(rows, self.kv_lora_rank).view(torch.uint8),
-                cache_v.to(torch.bfloat16)
-                .reshape(rows, self.qk_rope_head_dim)
-                .contiguous()
-                .view(torch.uint8),
-                scale.to(torch.float32)
-                .reshape(rows, self.kv_lora_rank // self.quant_block_size)
-                .contiguous()
-                .view(torch.uint8),
-            ),
-            dim=-1,
-        )
-        return packed.view(self.dtype)
 
     def set_kv_buffer(
         self,
@@ -1725,6 +1801,12 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 buf.copy_(saved)  # H2D copy once
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        if self.pd_host_pool is not None and self.dsa_kv_cache_store_c8:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+                snapshot_packed_kv,
+            )
+
+            return snapshot_packed_kv(self, indices)
         torch.npu.synchronize()
         snapshot = {
             "kv": self._get_kv_cache_cpu_copy(indices),
@@ -1738,6 +1820,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
+        if self.pd_host_pool is not None and self.dsa_kv_cache_store_c8:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.a5_pd import (
+                restore_packed_kv,
+            )
+
+            restore_packed_kv(self, kv_cache_cpu, indices)
+            if req_pool_index is not None:
+                self.invalidate_packed_request(int(req_pool_index))
+            return
         torch.npu.synchronize()
         self._load_kv_cache_cpu_copy(kv_cache_cpu["kv"], indices)
         self._load_index_cache_cpu_copy(kv_cache_cpu["index"], indices)

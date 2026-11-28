@@ -109,6 +109,10 @@ class MemoryPoolConfig:
 
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+        BudgetPlan,
+        SparseKVHBMSizing,
+    )
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
@@ -320,6 +324,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self._kvc = kvc
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         dcp_size = get_parallel().attn_dcp_size
         # Determine effective number of layers for KV cache
@@ -332,6 +337,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = len(effective_layer_ids)
         else:
             num_layers = kvc.layer_info.num_effective_layers
+        self._num_layers = num_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
         has_kv_on_another_pp_stage = (
@@ -352,6 +358,37 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc,
             include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
         )
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            is_fused_sparse_kv_offload_enabled,
+        )
+
+        self._fused_sparse_kv = is_fused_sparse_kv_offload_enabled(
+            model_config=kvc.model_config,
+            use_mla_backend=kvc.use_mla_backend,
+            is_draft_worker=kvc.is_draft_worker,
+        )
+        packed_c8_sparse_kv = (
+            self._fused_sparse_kv and kvc.kv_cache_dtype == torch.float8_e4m3fn
+        )
+        if packed_c8_sparse_kv:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_sparsity_driven_kv_offload_indexer_layer_count,
+            )
+
+            indexer_layers = get_sparsity_driven_kv_offload_indexer_layer_count(
+                model_config=kvc.model_config,
+                num_layers=num_layers,
+                start_layer=kvc.layer_info.start_layer,
+                is_draft_worker=kvc.is_draft_worker,
+            )
+            scale_bytes_per_token = indexer_layers * torch.float32.itemsize
+            self._cell_size += scale_bytes_per_token
+            # The quantized Indexer-K pool owns one shared Hadamard matrix and
+            # one padded page of per-token FP32 scales outside its logical size.
+            self._fixed_overhead_bytes += (
+                128 * 128 * torch.bfloat16.itemsize
+                + get_schedule().page_size * scale_bytes_per_token
+            )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -377,30 +414,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # address space that KVCacheConfigurator allocates below.
                     draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
                 if is_deepseek_dsa(kvc.model_config.hf_config):
-                    target_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=num_layers,
-                    )
-                    if not dsa_shards_index_k():
-                        target_indexer_size *= dcp_size
-                    target_kv_size = self._cell_size - target_indexer_size
-                    from sglang.srt.layers.cp.utils import (
-                        get_glm_dsa_layer_split_effective_num_layers,
-                    )
-
-                    target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
-                        kvc, num_layers
-                    )
                     draft_kv_cache_dtype = _eagle_draft_kv_cache_dtype(kvc)
-                    if draft_kv_cache_dtype == kvc.kv_cache_dtype:
-                        draft_kv_size = (
-                            int(
-                                target_kv_size * draft_num_layers / target_kv_num_layers
-                            )
-                            * draft_loc_space_scale
-                        )
-                    else:
-                        # A draft with its own KV dtype has its own row layout.
+                    if (
+                        self._fused_sparse_kv
+                        or draft_kv_cache_dtype != kvc.kv_cache_dtype
+                    ):
+                        # Size full draft rows when the target stores only
+                        # index-K or the KV dtypes differ.
                         from sglang.srt.mem_cache.kv_cache_configurator import (
                             calculate_mla_kv_cache_dim,
                         )
@@ -412,8 +432,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                             )
                             * torch._utils._element_size(draft_kv_cache_dtype)
                             * draft_num_layers
-                            * draft_loc_space_scale
                         )
+                    else:
+                        from sglang.srt.layers.cp.utils import (
+                            get_glm_dsa_layer_split_effective_num_layers,
+                        )
+
+                        target_indexer_size = self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=num_layers,
+                        )
+                        if not dsa_shards_index_k():
+                            target_indexer_size *= dcp_size
+                        target_kv_size = self._cell_size - target_indexer_size
+                        target_kv_num_layers = (
+                            get_glm_dsa_layer_split_effective_num_layers(
+                                kvc, num_layers
+                            )
+                        )
+                        draft_kv_size = int(
+                            target_kv_size * draft_num_layers / target_kv_num_layers
+                        )
+                    draft_kv_size *= draft_loc_space_scale
                     # _compute_dsa_indexer_cell_size already applies the
                     # HiSparse logical-space ratio to the draft indexer.
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(
@@ -843,6 +883,18 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        published_budget = self._kvc.sparse_kv_budget_plan
+        if not self._fused_sparse_kv:
+            budget = None
+        elif published_budget is not None:
+            budget = published_budget
+        else:
+            budget = self._build_sparse_kv_budget(
+                available_bytes - self._fixed_overhead_bytes, page_size
+            )
+
+        if budget is not None:
+            available_bytes -= budget.managed_hbm_bytes
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size
@@ -850,13 +902,71 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             else self._zero_kv_max_tokens
         )
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
-        return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        config = MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+        if published_budget is None and budget is not None:
+            self._kvc.sparse_kv_budget_plan = budget
+        return config
+
+    def _build_sparse_kv_budget(self, pool_bytes: int, page_size: int) -> BudgetPlan:
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+            build_sparse_kv_budget_options,
+            get_sparse_kv_budget,
+        )
+
+        kvc = self._kvc
+        options = build_sparse_kv_budget_options(
+            model_config=kvc.model_config,
+            kv_dtype=kvc.kv_cache_dtype,
+            num_layers=self._num_layers,
+            attn_dp_size=kvc.attn_dp_size,
+        )
+        budget = get_sparse_kv_budget(
+            **options,
+            available_bytes=pool_bytes,
+            index_k_and_draft_bytes_per_token=self._cell_size,
+        )
+        if budget.prefill_workspace_tokens:
+            min_tokens = max(budget.context_len, 2 * (budget.request_rows - 1))
+            token_cap = get_schedule().max_total_tokens
+            if token_cap is not None:
+                min_tokens = min(min_tokens, token_cap)
+            index_k_and_draft_bytes = (
+                ceil_align(min_tokens, page_size) * self._cell_size
+            )
+            if budget.managed_hbm_bytes + index_k_and_draft_bytes > pool_bytes:
+                return budget.without_prefill_workspace()
+        return budget
 
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
+
+    def get_sparse_kv_hbm_sizing(
+        self, available_bytes: int, max_total_num_tokens: int
+    ) -> SparseKVHBMSizing | None:
+        if not self._fused_sparse_kv:
+            return None
+        budget = self._kvc.sparse_kv_budget_plan
+        if budget is None:
+            return None
+
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+            SparseKVHBMSizing,
+        )
+
+        index_k_and_draft_bytes = max_total_num_tokens * self._cell_size
+        return SparseKVHBMSizing(
+            available_bytes=available_bytes,
+            planned_bytes=self._fixed_overhead_bytes
+            + budget.managed_hbm_bytes
+            + index_k_and_draft_bytes,
+            index_k_and_draft_bytes=index_k_and_draft_bytes,
+            full_context_bytes_per_request=budget.full_context_bytes_per_request(
+                self._cell_size
+            ),
+        )
 
 
 class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
