@@ -21,6 +21,15 @@ _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 
 register_kernel(
     KernelSpec(
+        op="moe.moe_finalize_gate_add",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.moe.moe_finalize_gate_add:moe_finalize_gate_add",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="moe.shared_expert_gate",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.moe.shared_expert_gate:shared_expert_gate",
