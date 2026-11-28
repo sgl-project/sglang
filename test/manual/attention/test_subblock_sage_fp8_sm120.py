@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Manual SM120 Sage correctness check against selected-block FP32 attention.
 
-Requires an SM120 GPU and FlashInfer with the CuTe-DSL SM120 Sage backend.
+Requires an SM120 GPU and FlashInfer with the Cake SM120 Sage backend.
 Run: python test/manual/attention/test_subblock_sage_fp8_sm120.py
 """
 
