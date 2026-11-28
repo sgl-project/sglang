@@ -561,8 +561,10 @@ def _warmup_cache(
         f"Warming up cache with {cache_hit_rate * 100:.1f}% hit rate "
         f"({cached_token_len} tokens per request)"
     )
-    # Create prefix input_ids for cache warming
-    cache_warmup_input_ids = [ids[:cached_token_len] for ids in input_ids]
+    cache_warmup_input_ids = [
+        ids if len(ids) <= cached_token_len else ids[:cached_token_len]
+        for ids in input_ids
+    ]
 
     if backend == "vllm":
         cache_warmup_payload = {
@@ -850,7 +852,10 @@ def run_one_case(
         tok_inner = getattr(tokenizer, "tokenizer", tokenizer)
         with open(fixed_prompt_file) as f:
             prompt_ids = _encode_fixed_prompt(tok_inner, f.read(), apply_chat_template)
-        input_ids = [list(prompt_ids) for _ in range(batch_size)]
+        if not isinstance(prompt_ids, list):
+            prompt_ids = list(prompt_ids)
+        # Both backends only read these IDs when serializing the batch.
+        input_ids = [prompt_ids] * batch_size
         input_len = len(prompt_ids)
         image_data = None
     else:
@@ -1013,7 +1018,9 @@ def run_one_case(
     if cache_hit_rate > 0.0:
         if prompt_tokens_sent is not None:
             cached_token_len = int(input_len * cache_hit_rate)
-            prompt_tokens_sent += sum(len(ids[:cached_token_len]) for ids in input_ids)
+            prompt_tokens_sent += sum(
+                min(len(ids), cached_token_len) for ids in input_ids
+            )
         for gen_base, indices in zip(
             gen_bases, _round_robin_parts(len(input_ids), len(gen_bases))
         ):

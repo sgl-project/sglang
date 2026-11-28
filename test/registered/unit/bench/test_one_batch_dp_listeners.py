@@ -279,6 +279,17 @@ class TestDpListenerSplit(CustomTestCase):
         )
         self.assertEqual(sub["lora_path"], ["a", "c", "e"])
 
+    def test_warmup_truncates_only_rows_longer_than_the_prefix(self):
+        rows = [[1], [2, 3], [4, 5, 6]]
+        with patch.object(one_batch_server, "_http_session") as http_session:
+            one_batch_server._warmup_cache("http://localhost", rows, 2, 1.0)
+        post = http_session.return_value.__enter__.return_value.post
+        warmed = post.call_args.kwargs["json"]["input_ids"]
+        self.assertEqual(warmed, [[1], [2, 3], [4, 5]])
+        self.assertIs(warmed[0], rows[0])
+        self.assertIs(warmed[1], rows[1])
+        self.assertEqual(rows[2], [4, 5, 6])
+
     def test_batch_spreads_over_listeners(self):
         delay = 0.5
         rank0 = self._listener(first_chunk_delay=delay, serves_metrics=True)
