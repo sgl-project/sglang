@@ -40,6 +40,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
 logger = logging.getLogger(__name__)
 
@@ -127,10 +128,31 @@ class FlashInferMegaMoeQuantInfo(MoeQuantInfo):
     fc2_alpha: torch.Tensor | None = None
     fc1_norm_const: torch.Tensor | None = None
     apply_routed_scaling_factor: bool = False
+    needs_capture_safe_ue8m0_pack: bool = False
 
     def __post_init__(self) -> None:
         if self.mega_forward is None:
             self.mega_forward = forward_megamoe
+
+
+def _get_megamoe_output_buffer(hidden_states: torch.Tensor) -> torch.Tensor | None:
+    """Reuse the caller-provided MoE output buffer for backends without output views."""
+    try:
+        from sglang.srt.runtime_context import get_forward
+    except ImportError:
+        return None
+    provided = get_forward().moe_output_buffer
+    if (
+        provided is not None
+        and provided.shape == hidden_states.shape
+        and provided.dtype == torch.bfloat16
+        and provided.device == hidden_states.device
+        and provided.is_contiguous()
+        and provided.untyped_storage().data_ptr()
+        != hidden_states.untyped_storage().data_ptr()
+    ):
+        return provided
+    return None
 
 
 def _resolve_max_tokens_per_rank() -> int:
@@ -668,8 +690,6 @@ def run_flashinfer_megamoe(
     """Run the fused mega kernel and return per-rank outputs (no combine)."""
     from flashinfer.moe_ep import MoEEpTensors
 
-    from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
     assert isinstance(quant_info, FlashInferMegaMoeQuantInfo), (
         f"Unexpected quant_info type for flashinfer_megamoe: {type(quant_info)}"
     )
@@ -680,20 +700,36 @@ def run_flashinfer_megamoe(
     topk_ids = topk_output.topk_ids
     mega = quant_info.mega
 
-    t = MoEEpTensors(
-        hidden_states=x.to(torch.bfloat16),
+    hidden_states = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+    weights = (
+        topk_weights
+        if topk_weights.dtype == torch.float32
+        else topk_weights.to(torch.float32)
+    )
+    output_buf = (
+        None if mega.supports_output_view else _get_megamoe_output_buffer(hidden_states)
+    )
+
+    tensor_kwargs = dict(
+        hidden_states=hidden_states,
         # FlashInfer's fused staging accepts the int32 router output and widens
         # directly into its final int64 workspace buffer. Keep this path copy-free.
         topk_ids=topk_ids,
-        topk_weights=topk_weights.to(torch.float32),
+        topk_weights=weights,
         # Stage per-layer scales on every call so FlashInfer can share its
         # reference-counted workspace across layers and observe weight reloads.
         fc1_alpha=quant_info.fc1_alpha,
         fc2_alpha=quant_info.fc2_alpha,
         fc1_norm_const=quant_info.fc1_norm_const,
     )
-    with _capture_safe_ue8m0_pack():
-        assert quant_info.mega_forward is not None
+    if output_buf is not None:
+        tensor_kwargs["output"] = output_buf
+    t = MoEEpTensors(**tensor_kwargs)
+    assert quant_info.mega_forward is not None
+    if quant_info.needs_capture_safe_ue8m0_pack:
+        with _capture_safe_ue8m0_pack():
+            y = quant_info.mega_forward(mega, t)
+    else:
         y = quant_info.mega_forward(mega, t)
 
     if quant_info.apply_routed_scaling_factor:
@@ -712,10 +748,12 @@ def warmup_all_flashinfer_megamoe_layers(model: torch.nn.Module) -> None:
     and it raises rather than silently recovering. Call this once, explicitly,
     right before capture begins (see ``ModelRunner.init_cuda_graphs``) so
     every layer is built eagerly outside any graph.
-    Only the nvfp4 path is wired up below; extend the dispatch if fp4/mxfp8
-    MegaMOE hits the same gap.
     """
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+    from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptNvFp4FusedMoEMethod,
+    )
 
     n_built = 0
     for module in model.modules():
@@ -729,11 +767,22 @@ def warmup_all_flashinfer_megamoe_layers(model: torch.nn.Module) -> None:
         if getattr(module, "_flashinfer_megamoe_layer", None) is not None:
             continue  # already built (e.g. warmup's dummy batch hit it)
 
-        # Dispatch mirrors modelopt_quant.py's apply(): only the nvfp4
-        # method is wired up here today.
-        if type(module.quant_method).__name__ == "ModelOptNvFp4FusedMoEMethod":
+        if isinstance(module.quant_method, ModelOptNvFp4FusedMoEMethod):
             ensure_nvfp4_moe_layer_for_flashinfer_megamoe(module)
             n_built += 1
+        elif isinstance(module.quant_method, Fp8MoEMethod):
+            if module.quant_method.use_mxfp8:
+                ensure_mxfp8_moe_layer_for_flashinfer_megamoe(module)
+                n_built += 1
+            elif module.quant_method.is_fp4_expert:
+                ensure_fp4_moe_layer_for_flashinfer_megamoe(module)
+                n_built += 1
+            else:
+                logger.warning(
+                    "warmup_all_flashinfer_megamoe_layers: layer[%s] uses "
+                    "unsupported Fp8MoEMethod config for FlashInfer MegaMOE.",
+                    getattr(module, "layer_id", "?"),
+                )
         else:
             logger.warning(
                 "warmup_all_flashinfer_megamoe_layers: layer[%s] uses "
