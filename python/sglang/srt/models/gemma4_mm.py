@@ -290,6 +290,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
 
+    def get_dflash_noise_embedding_scale(self) -> float:
+        # Same as Gemma4ForCausalLM: the draft takes the raw embedding.
+        return 1.0 / self.config.text_config.hidden_size**0.5
+
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
         if layer_ids is None:
             raise ValueError(
