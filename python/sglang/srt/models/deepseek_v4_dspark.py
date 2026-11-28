@@ -17,7 +17,6 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_gather
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch22, is_npu_arch35
 from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
     is_unified_kv_triton,
 )
@@ -29,9 +28,6 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.modelslim.modelslim import (
-    remap_dspark_weight_name_npu,
-)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -65,6 +61,7 @@ from sglang.srt.models.dspark import (
     gather_and_crop_vocab,
     project_through_lm_head,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -81,23 +78,8 @@ logger = logging.getLogger(__name__)
 _PAD_NUM_HEADS = 64
 
 _is_npu = is_npu()
+_model_ops = current_platform.get_dsv4_model_ops()
 _is_gfx1250_supported = is_gfx1250_supported()
-
-
-def apply_rotary_emb(
-    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
-) -> torch.Tensor:
-    y = x
-    x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
-    if inverse:
-        freqs_cis = freqs_cis.conj()
-    if x.ndim == 3:
-        freqs_cis = freqs_cis.view(x.size(0), 1, x.size(-1))
-    else:
-        freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
-    x = torch.view_as_real(x * freqs_cis).flatten(-2)
-    y.copy_(x)
-    return y
 
 
 class DSparkAttention(MqaAttentionBase):
@@ -139,9 +121,8 @@ class DSparkAttention(MqaAttentionBase):
         )
 
         self.alt_streams = alt_streams
-        self._is_npu_arch22 = is_npu_arch22()
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
-        if _is_npu:
+        if _model_ops is not None:
             self.register_buffer(
                 "_q_post_norm_weight",
                 torch.ones(self.head_dim),
@@ -195,56 +176,28 @@ class DSparkAttention(MqaAttentionBase):
         q = self.q_norm(q)
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        # The no-head-norm path indexes complex RoPE frequencies, unsupported on arch22.
-        if not self.q_head_norm and not self._is_npu_arch22:
-            if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
-                fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
-                return q_out
-            if not _is_npu:
-                fused_rope_inplace(
-                    q[..., -self.rope_head_dim :],
-                    None,
-                    self.freqs_cis,
-                    positions=positions,
-                )
-            else:
-                apply_rotary_emb(
-                    q[..., -self.rope_head_dim :], self.freqs_cis[positions]
-                )
-            if q_out is None:
-                return q
-            q_out.copy_(q)
-            return q_out
-        if not _is_npu:
+        if _model_ops is not None:
+            return _model_ops.rope.draft_query_rope(
+                q,
+                positions,
+                self.freqs_cis,
+                self.rope_head_dim,
+                self._q_post_norm_weight if self.q_head_norm else None,
+                self.eps,
+                q_out,
+            )
+        if self.q_head_norm or (
+            q_out is not None and q_out.dtype == torch.float8_e4m3fn
+        ):
             if q_out is None:
                 q_out = torch.empty_like(q)
-            fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+            eps = self.eps if self.q_head_norm else None
+            fused_q_norm_rope(q, q_out, eps, self.freqs_cis, positions)
             return q_out
-        import torch_npu
-
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-
-        if self.q_head_norm:
-            q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
-        cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
-            positions,
-            q.dtype,
-            view_4d=True,
-            inverse=False,
-            allow_build=True,
-            cache_dtype=torch.float32,
+        fused_rope_inplace(
+            q[..., -self.rope_head_dim :], None, self.freqs_cis, positions=positions
         )
-        Dsv4NpuRoPE.apply_rotary_mul_inplace(
-            q,
-            None,
-            cos4,
-            sin4,
-            qk_nope_dim=q.shape[-1] - self.rope_head_dim,
-        )
-        if q_out is not None:
-            q_out.copy_(q)
-            return q_out
-        return q
+        return q if q_out is None else q_out.copy_(q)
 
     def forward(
         self,
@@ -271,6 +224,7 @@ class DSparkAttention(MqaAttentionBase):
             and hidden_states.shape[0] <= self._multi_stream_bs_limit
         )
 
+        local_q_heads = getattr(attn_backend, "supports_unpadded_dsv41_q", False)
         q_padded: Optional[torch.Tensor] = None
         q_out: Optional[torch.Tensor] = None
         if (
@@ -283,7 +237,7 @@ class DSparkAttention(MqaAttentionBase):
                 dtype=torch.float8_e4m3fn,
                 device=hidden_states.device,
             )
-        elif self.n_local_heads < _PAD_NUM_HEADS and not self._is_npu_arch22:
+        elif self.n_local_heads < _PAD_NUM_HEADS and not local_q_heads:
             q_padded = hidden_states.new_empty(
                 hidden_states.shape[0], _PAD_NUM_HEADS, self.head_dim
             )
@@ -317,9 +271,7 @@ class DSparkAttention(MqaAttentionBase):
 
         if q_padded is not None:
             q = q_padded
-        attn_sink = self._local_attn_sink(
-            self.n_local_heads if self._is_npu_arch22 else None
-        )
+        attn_sink = self._local_attn_sink(self.n_local_heads if local_q_heads else None)
 
         o = attn_backend.forward(
             q=q,
@@ -335,27 +287,11 @@ class DSparkAttention(MqaAttentionBase):
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
 
-        if not _is_npu:
+        if _model_ops is not None:
+            _model_ops.rope.draft_rope_(o, positions, self.freqs_cis, rd, inverse=True)
+        else:
             fused_rope_inplace(
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
-            )
-        else:
-            from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
-
-            cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
-                positions,
-                o.dtype,
-                view_4d=True,
-                inverse=True,
-                allow_build=True,
-                cache_dtype=torch.float32,
-            )
-            Dsv4NpuRoPE.apply_rotary_mul_inplace(
-                o,
-                None,
-                cos4,
-                sin4,
-                qk_nope_dim=o.shape[-1] - rd,
             )
 
         o = o.view(
@@ -673,13 +609,13 @@ class DSparkV4PlatformStage(
 DSparkV4Stage = DSparkV4CudaStage if _is_cuda else DSparkV4PlatformStage
 
 
+def _uses_stage_local_draft_weights() -> bool:
+    return _model_ops is not None and _model_ops.uses_stage_local_draft_weights()
+
+
 class DeepseekV4ForCausalLMDSpark(nn.Module):
     draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
 
-    # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
-    # embedding/head weights. The native CUDA path keeps the original DSpark
-    # behavior and shares the target model's vocabulary modules.
-    uses_own_vocab_modules = _is_npu and not is_npu_arch35()
     precompile_kernels_after_loading = (
         DeepseekV4ForCausalLM.precompile_kernels_after_loading
     )
@@ -690,9 +626,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         hf_config,
         quant_config,
     ):
-        if cls.uses_own_vocab_modules:
+        if _uses_stage_local_draft_weights():
             return (
-                "NPU DSpark ModelSlim weight loading does not support mapping "
+                "The stage-local DSpark checkpoint loader does not support mapping "
                 "shared experts into fused expert slots."
             )
 
@@ -713,7 +649,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self._is_npu_arch22 = is_npu_arch22()
+        self.uses_own_vocab_modules = _uses_stage_local_draft_weights()
         self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         dspark_config = parse_dspark_draft_config(draft_hf_config=config)
@@ -958,13 +894,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             if self.hc_pre_from_prev_sublayer:
                 pre, x = x.pre, x.residual
         if self.hc_pre_from_prev_sublayer:
-            if self._is_npu_arch22:
-                x = mhc.combine_premix(x, pre)
-            else:
-                from sglang.kernels.ops.layernorm.mhc import mhc_combine
-
-                # The kernel widens each element to fp32 as it loads it.
-                x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
+            x = mhc.combine_premix(x, pre)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
@@ -1044,17 +974,17 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             num_experts=(n_routed_experts + self.num_fused_shared_experts),
         )
 
-        for name, loaded_weight in weights:
-            mapped = (
-                remap_dspark_weight_name_npu(name)
-                if (_is_npu and not is_npu_arch35())
-                else self._remap_dspark_weight_name(name)
+        if _uses_stage_local_draft_weights():
+            from sglang.srt.layers.quantization.modelslim.modelslim import (
+                remap_dspark_weight_name_npu as remap,
             )
+        else:
+            remap = self._remap_dspark_weight_name
+        for name, loaded_weight in weights:
+            mapped = remap(name)
             if mapped is None:
                 continue
-            if _is_npu and mapped in ("embed_tokens.weight", "lm_head.weight"):
-                if not self.uses_own_vocab_modules:
-                    continue
+            if mapped in ("embed_tokens.weight", "lm_head.weight"):
                 stage_idx = int(name.split(".", 2)[1])
                 vocab_stage = (
                     0 if mapped == "embed_tokens.weight" else self.num_stages - 1

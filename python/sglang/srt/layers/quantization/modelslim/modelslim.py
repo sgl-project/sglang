@@ -37,7 +37,7 @@ from sglang.srt.layers.quantization.modelslim.schemes.modelslim_qk_mxfp8_dynamic
     ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.utils import apply_module_patch
+from sglang.srt.utils import apply_module_patch, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe import MoeRunnerConfig
@@ -182,10 +182,12 @@ class ModelSlimConfig(QuantizationConfig):
     """
 
     supports_kimi_k3_quantized_latent_projections = True
+    needs_hf_config_for_sidecar = True
 
     # Hardcoded compatibility for models missing an MLA fusion declaration.
     _HARDCODED_PACKED_MODULES = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "wqkv_a": ["wq_a", "wkv"],
     }
     # Legacy vision aliases: runtime path fragment -> checkpoint path fragment.
     # Apply only within the matching vision scope and when the description exists.
@@ -292,6 +294,29 @@ class ModelSlimConfig(QuantizationConfig):
         if scheme_class is None:
             raise ValueError(f"Unsupported ModelSlim KV quant_type: {quant_type!r}")
         return scheme_class
+
+    def get_engram_table_dtype(
+        self, layer_id: int, num_embeddings: int, dim: int, default: torch.dtype
+    ) -> torch.dtype:
+        if not is_npu():
+            return default
+        from sglang.srt.layers.quantization.modelslim.engram import table_dtype
+
+        modules = (
+            self.quant_description.get("optional", {})
+            .get("embedding_storage", {})
+            .get("modules", {})
+        )
+        return table_dtype(
+            modules.get(f"layers.{layer_id}.engram.embed"), num_embeddings, dim, default
+        )
+
+    @staticmethod
+    def load_engram_gate_basis(config, model: torch.nn.Module) -> None:
+        if is_npu():
+            from sglang.srt.layers.quantization.modelslim.engram import load_gate_basis
+
+            load_gate_basis(config, model)
 
     def get_modelslim_kv_scheme(self, prefix):
         if self.requested_kv_cache_dtype in ("auto", "bf16", "bfloat16"):
@@ -814,6 +839,16 @@ class ModelSlimConfig(QuantizationConfig):
         quant_prefixes = self._resolve_linear_quant_prefixes(
             prefix, output_sizes=getattr(layer, "output_sizes", None)
         )
+        if (
+            prefix.endswith(".wqkv_a")
+            and len(quant_prefixes) > 1
+            and self.quant_description[quant_prefixes[0] + ".weight"] != "FLOAT"
+        ):
+            # The target loader joins weight rows, not ModelSlim scales/offsets.
+            raise ValueError(
+                f"Cannot fuse separately quantized ModelSlim projections for {prefix}. "
+                "Set SGLANG_OPT_FUSE_WQA_WKV=0 or use a pre-fused checkpoint."
+            )
         prefix = quant_prefixes[
             0
         ]  # All components were checked to use the same scheme.

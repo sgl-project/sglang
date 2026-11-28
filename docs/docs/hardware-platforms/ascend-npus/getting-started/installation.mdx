@@ -130,6 +130,16 @@ python3 setup.py --arch-version 2201 --ops all --artifact wheel --third-party op
 python3 -m pip install --no-deps --force-reinstall output/sgl_kernel_npu-*.whl
 ```
 
+Some torch/torch-npu 2.13.0 builds register conflicting Dynamo rules for seed functions after
+`transfer_to_npu`. Before serving, check the **runtime image** in a fresh process:
+
+```bash
+python3 -c 'import torch, torch_npu; from torch_npu.contrib import transfer_to_npu; from torch._dynamo import trace_rules as r; r.clear_lru_cache(); r.get_torch_obj_rule_map()'
+```
+
+If this raises `Duplicate torch object` for `manual_seed` or `manual_seed_all`, use a matching
+TorchNPU build with consistent rules for the aliased CUDA/NPU functions. Rebuilding the operator wheel does not fix it.
+
 If imports succeed but a native operator is missing or has the wrong signature,
 test the installed wheel on the target device before starting the server:
 

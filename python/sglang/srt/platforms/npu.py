@@ -79,6 +79,18 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
     def get_default_attention_backend(self) -> str:
         return "ascend"
 
+    def get_dsv4_model_ops(self):
+        from sglang.srt.hardware_backend.npu.dsv4 import model_ops
+
+        return model_ops
+
+    def get_dsv4_paged_pool_layout(self, kvc):
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_pool_layout import (
+            NPUDSV4PagedPoolLayout,
+        )
+
+        return NPUDSV4PagedPoolLayout(kvc)
+
     def get_dispatch_key_name(self) -> str:
         return "npu"
 

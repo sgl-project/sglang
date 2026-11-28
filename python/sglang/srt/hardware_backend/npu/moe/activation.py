@@ -28,6 +28,11 @@ class NPUSwiglu(BaseActivation):
         return torch.ops.npu.npu_swiglu(hidden_states), None
 
 
+def _clipped_swiglu_fp32(hidden_states: torch.Tensor, limit: float) -> torch.Tensor:
+    gate, up = hidden_states.float().chunk(2, dim=-1)
+    return F.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+
+
 class NPUSwigluWithLimit(BaseActivation):
     """Clip gate/up before SiLU, keeping the floating output dtype."""
 
@@ -35,10 +40,9 @@ class NPUSwigluWithLimit(BaseActivation):
         self.limit = float(limit)
 
     def _apply_activation(self, hidden_states: torch.Tensor):
-        gate, up = hidden_states.float().chunk(2, dim=-1)
-        gate = gate.clamp(max=self.limit)
-        up = up.clamp(min=-self.limit, max=self.limit)
-        return (F.silu(gate) * up).to(hidden_states.dtype), None
+        return _clipped_swiglu_fp32(hidden_states, self.limit).to(
+            hidden_states.dtype
+        ), None
 
 
 def _clipped_swiglu_quant(
@@ -47,7 +51,7 @@ def _clipped_swiglu_quant(
     group_list: Optional[torch.Tensor] = None,
     group_list_type: int = 1,
 ):
-    """A3 DSV4 W8A8: clip before SiLU, then quantize each row for GMM2."""
+    """Clip before SiLU, then quantize each row for the INT8 W2 input."""
     if group_list is not None:
         if group_list_type not in (0, 1):
             raise ValueError("group_list_type must be cumulative (0) or counts (1)")
@@ -64,8 +68,7 @@ def _clipped_swiglu_quant(
         # Grouped matmul does not initialize unused capacity. Mask before SiLU
         # and reduction, so stale NaNs cannot leak into graph-padded outputs.
         hidden_states = hidden_states.masked_fill(~valid.unsqueeze(-1), 0)
-    gate, up = hidden_states.float().chunk(2, dim=-1)
-    values = F.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
+    values = _clipped_swiglu_fp32(hidden_states, limit)
     scale = (values.abs().amax(-1) / 127.0).clamp_min(1e-30)
     # Same nearest-integer convention as the existing DeepEP swiglu_quant.
     quantized = torch.floor(values / scale.unsqueeze(-1) + 0.5).clamp(-128, 127)

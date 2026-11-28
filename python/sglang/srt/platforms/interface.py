@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.managers.io_struct import ProfileReq
+    from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
     from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
         BaseBreakableGraphBackend,
     )
@@ -127,6 +128,10 @@ class SRTPlatform(DeviceMixin):
         """Return the default draft attention backend for an algorithm."""
         raise NotImplementedError
 
+    def get_dsv4_model_ops(self):
+        """Optional DeepSeek V4 model operations; None keeps the native model path."""
+        return None
+
     def get_graph_runner_cls(self) -> Optional[type]:
         """Return the graph runner class, or None for the in-tree default.
 
@@ -223,6 +228,10 @@ class SRTPlatform(DeviceMixin):
                 kind,
             )
         return legacy()
+
+    def get_dsv4_paged_pool_layout(self, kvc: KVCacheConfigurator):
+        """Override physical storage accounting for non-default DSV4 pools."""
+        return None
 
     def get_paged_allocator_cls(self) -> Optional[type]:
         """Return the paged allocator class, or None for the in-tree default.

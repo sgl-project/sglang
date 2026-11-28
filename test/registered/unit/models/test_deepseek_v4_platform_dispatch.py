@@ -255,6 +255,14 @@ class TestNpuMhcSeam(unittest.TestCase):
 
     MULT, HIDDEN = 4, 8
 
+    def setUp(self):
+        from sglang.srt.platforms.npu import NPUSRTPlatform
+
+        self.model_ops = NPUSRTPlatform().get_dsv4_model_ops()
+        use_ops = patch.object(mhc, "_model_ops", self.model_ops)
+        use_ops.start()
+        self.addCleanup(use_ops.stop)
+
     def _sub_layer(self, *, pre_from_prev=True):
         return mhc.HcSubLayer(
             cfg=mhc.HcConfig(
@@ -297,8 +305,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
         stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
-            patch.object(mhc, "_is_npu", True),
-            patch.object(mhc, "is_npu_arch35", return_value=True),
+            patch.object(self.model_ops.mhc, "is_npu_arch35", return_value=True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
@@ -344,8 +351,7 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
         stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
-            patch.object(mhc, "_is_npu", True),
-            patch.object(mhc, "is_npu_arch35", return_value=True),
+            patch.object(self.model_ops.mhc, "is_npu_arch35", return_value=True),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
@@ -359,6 +365,21 @@ class TestNpuMhcSeam(unittest.TestCase):
         self.assertEqual(pre_mix.dtype, torch.float32)
         torch.testing.assert_close(pre_mix, expected)
 
+    def test_910_lagged_premix_does_not_use_current_stats_for_collapse(self):
+        hc = self._sub_layer()
+        x = self._residual()
+        pre_prev = torch.zeros(2, self.MULT)
+        pre_prev[:, -1] = 1
+        with patch.object(self.model_ops.mhc, "is_npu_arch35", return_value=False):
+            for prev, stream in ((None, 0), (pre_prev, -1)):
+                state = mhc.HcState(x, prev)
+                torch.testing.assert_close(mhc.combine(hc, state), x[:, stream])
+                # With zero coefficients the newly predicted pre is uniform;
+                # it belongs to the next sublayer, not this collapse.
+                torch.testing.assert_close(
+                    state.stats[0], torch.full_like(pre_prev, 0.5 + hc.cfg.eps)
+                )
+
     def test_npu_empty_batch_skips_the_kernel(self):
         hc = self._sub_layer()
         x = self._residual()[:0]
@@ -369,10 +390,7 @@ class TestNpuMhcSeam(unittest.TestCase):
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
         stub.mhc_pre_dpskv4 = boom
-        with (
-            patch.object(mhc, "_is_npu", True),
-            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
-        ):
+        with patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}):
             out = mhc.combine(hc, state)
 
         self.assertEqual(out.shape, (0, self.HIDDEN))
@@ -392,8 +410,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             return residual + 1.0
 
         with (
-            patch.object(mhc, "_is_npu", True),
-            patch.object(mhc, "is_npu_arch35", return_value=True),
+            patch.object(self.model_ops.mhc, "is_npu_arch35", return_value=True),
             patch.object(
                 torch,
                 "ops",
@@ -425,10 +442,7 @@ class TestNpuMhcSeam(unittest.TestCase):
 
         stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
         stub.mhc_post_dpskv4 = fake_mhc_post_dpskv4
-        with (
-            patch.object(mhc, "_is_npu", True),
-            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
-        ):
+        with patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}):
             out = mhc.post(cfg, x, residual, post_mix, comb)
 
         self.assertEqual(seen["args"], (x, residual, post_mix, comb))

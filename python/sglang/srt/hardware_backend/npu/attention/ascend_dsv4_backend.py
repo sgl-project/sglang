@@ -2071,15 +2071,8 @@ class LowRatioCompressAscendBackendMixin:
             out = {}
             for ratio in (0, *self._dsv41_low_ratios()):
                 key = "win_metadata" if ratio == 0 else f"c{ratio}a_metadata"
-                metadata = _dsv41_a3_ops().metadata(
-                    self._dsv4_q_head_num,
-                    1,
-                    self._dsv4_head_dim,
-                    batch_size=forward_batch.batch_size,
-                    has_ori_kv=True,
-                    has_cmp_kv=ratio > 0,
-                    cmp_topk=self._dsv4_index_topk if ratio else 0,
-                    **self._dsv41_a3_attention_kwargs(forward_batch, ratio),
+                metadata = self._dsv41_smla_schedule(
+                    forward_batch, ratio, forward_batch.batch_size, fm
                 )
                 buf = fm.kernel_metadata.get(key)
                 if buf is not None:
@@ -2146,6 +2139,18 @@ class LowRatioCompressAscendBackendMixin:
         if mode is not None and mode.is_target_verify():
             return fm.actual_seq_lengths_kv.to(torch.int32)
         return forward_batch.seq_lens.to(torch.int32)
+
+    def _dsv41_smla_schedule(self, forward_batch, ratio, batch_size, metadata):
+        return _dsv41_a3_ops().metadata(
+            self._dsv4_q_head_num,
+            1,
+            self._dsv4_head_dim,
+            batch_size=batch_size,
+            has_ori_kv=True,
+            has_cmp_kv=ratio > 0,
+            cmp_topk=self._dsv4_index_topk if ratio else 0,
+            **self._dsv41_a3_attention_kwargs(forward_batch, ratio, metadata=metadata),
+        )
 
     def _dsv41_a3_attention_kwargs(self, forward_batch, ratio, *, metadata=None):
         # Unlike MQSMLA, the BF16 A3 kernel derives causal windows and the
@@ -2385,6 +2390,7 @@ class LowRatioCompressAscendBackendMixin:
             n = min(n, query_tokens)
         positions, out_loc = positions[:n], out_loc[:n]
         bs = int(forward_batch.batch_size)
+        row_live = None
         if is_a3_verify:
             # A3 verification uses fixed-width blocks. Keep ghost request rows
             # out of both compressed pools without a device-side indptr search.
@@ -2392,10 +2398,9 @@ class LowRatioCompressAscendBackendMixin:
             rows = torch.arange(n, device=device)
             req = rows // width
             safe_req = req.clamp(max=bs - 1)
-            valid = (req < bs) & (rows % width < fm.seqused[safe_req])
-            out_loc = torch.where(valid, out_loc, torch.zeros_like(out_loc))
+            row_live = (req < bs) & (rows % width < fm.seqused[safe_req])
         keep, pos_values, slot_values = self._dsv41_ratio_row_values(
-            positions, out_loc, ratio, int(self.page_size)
+            positions, out_loc, ratio, int(self.page_size), row_live=row_live
         )
         if ratio == 1:
             # Ratio 1 has no fused compressor: row i is token i, so mask in
@@ -2515,20 +2520,7 @@ class LowRatioCompressAscendBackendMixin:
                     self.graph_metadata[key] = buf
                 # Warmup/capture uses this table before the first replay
                 # refresh; an all-zero allocation is not a valid schedule.
-                buf.copy_(
-                    _dsv41_a3_ops().metadata(
-                        self._dsv4_q_head_num,
-                        1,
-                        self._dsv4_head_dim,
-                        batch_size=bs,
-                        has_ori_kv=True,
-                        has_cmp_kv=ratio > 0,
-                        cmp_topk=self._dsv4_index_topk if ratio else 0,
-                        **self._dsv41_a3_attention_kwargs(
-                            probe_batch, ratio, metadata=metadata
-                        ),
-                    )
-                )
+                buf.copy_(self._dsv41_smla_schedule(probe_batch, ratio, bs, metadata))
                 metadata.kernel_metadata[f"{attention_type}_metadata"] = buf
             return
         # Variable-size dispatch tables: probe one tensor per attention type.
@@ -2926,6 +2918,9 @@ class DeepseekV4AscendAttnBackend(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
         )
+        # BF16 sparse MLA accepts per-rank Q heads; the packed 950 kernel
+        # requires its physical head width for both Q and attention sinks.
+        self.supports_unpadded_dsv41_q = not is_npu_arch35()
         self._is_dsv41_a3_dspark_draft = (
             self._is_dspark_draft_worker
             and self._dsv4_is_v41_model

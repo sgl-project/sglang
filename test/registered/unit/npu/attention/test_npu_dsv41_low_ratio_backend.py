@@ -245,6 +245,33 @@ class TestRowLayout(unittest.TestCase):
         # 64 payload bytes + 4 scale bytes per 128-dim row == 68.
         self.assertEqual(get_dsv4_indexer_bytes_per_token(128, True), 68)
 
+    def test_index_row_budget_matches_allocated_buffers(self):
+        from sglang.srt.hardware_backend.npu.dsv4 import dsv4_pool_layout
+
+        kvc = SimpleNamespace(
+            model_config=SimpleNamespace(compress_ratios=[1, 2]),
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: False),
+        )
+        for arch35, expected in ((False, 256), (True, 68)):
+            with (
+                self.subTest(arch35=arch35),
+                patch.object(dsv4_pool_layout, "is_npu_arch35", return_value=arch35),
+            ):
+                budget = dsv4_pool_layout.NPUDSV4PagedPoolLayout(kvc)
+                pool = dsv4_memory_pool.DSV41NPUIndexerPool.__new__(
+                    dsv4_memory_pool.DSV41NPUIndexerPool
+                )
+                pool.use_fp4_indexer, pool.index_head_dim = arch35, 128
+                pool.size, pool._kernel_page_size, pool.layer_num = 16, 16, 1
+                pool.device, pool.memory_saver_adapter = "cpu", MagicMock()
+                pool._create_buffer()
+                row_bytes = sum(
+                    buf[0, 0].nbytes
+                    for buf in (pool.index_k_buffer[0], pool.index_scale_buffer[0])
+                )
+                self.assertEqual(row_bytes, expected)
+                self.assertEqual(budget.low_ratio_index_row_bytes(128), row_bytes)
+
     def test_empty_head_dim_is_rejected(self):
         with self.assertRaises(AssertionError):
             NPUDSV4KVLayout.V41_CMP_FP4.kv_info(0, 0)
