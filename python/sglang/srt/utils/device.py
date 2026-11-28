@@ -299,6 +299,15 @@ is_blackwell = is_blackwell_supported
 
 
 @lru_cache(maxsize=1)
+def is_integrated_gpu() -> bool:
+    """True when the GPU's memory is host memory (GB10 / DGX Spark). A
+    Grace-coupled discrete GPU (GH200, GB200) reports False."""
+    if not is_cuda():
+        return False
+    return bool(torch.cuda.get_device_properties(0).is_integrated)
+
+
+@lru_cache(maxsize=1)
 def is_sm120_supported() -> bool:
     return _check_cuda_device_version(
         device_capability_majors=[12], cuda_version=(12, 8)

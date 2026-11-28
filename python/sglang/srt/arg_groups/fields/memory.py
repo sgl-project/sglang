@@ -111,19 +111,24 @@ class Memory(msgspec.Struct):
         Arg(help="Enable hierarchical cache", aliases=["--enable-hicache"]),
     ] = False
     hicache_host_memory_mode: A[
-        str,
+        Optional[str],
         Arg(
-            help="Whether host memory is a persistent HiCache tier (cache) or a transient staging buffer between GPU and the storage backend (buffer_only). buffer_only requires --hicache-storage-backend.",
+            help="Whether host memory is a persistent HiCache tier (cache) or a transient staging buffer between GPU and the storage backend (buffer_only). buffer_only requires --hicache-storage-backend. Defaults to cache, or to buffer_only on a GPU that shares memory with the host (e.g. GB10) when a storage backend is set.",
             choices=["cache", "buffer_only"],
+            resolvable=True,
+            fallback="cache",
         ),
-    ] = "cache"
+    ] = None
     hicache_ratio: A[
         Optional[float],
         "The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode, 1.2 in buffer_only mode, or 0.2 for backup-only host-pool decode retraction.",
     ] = None
     hicache_size: A[
         int,
-        "The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
+        Arg(
+            help="The size of host KV cache memory pool in gigabytes. Overrides --hicache-ratio in either host memory mode.",
+            resolvable=True,
+        ),
     ] = 0
     hicache_host_memory_fraction: A[
         Optional[float],
