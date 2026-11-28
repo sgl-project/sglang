@@ -557,6 +557,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         ),
         _tp_sync=SimpleNamespace(sync=lambda site, tensor: sync_sites.append(site)),
         _use_triton_accept_bonus=False,
+        _verify_argmax=lambda logits: torch.argmax(logits, dim=-1),
         block_size=2,
     )
 
@@ -585,8 +586,6 @@ def test_accept_commits_the_block_in_one_launch_into_the_accept_ring(
     monkeypatch, branch
 ):
     """Once the greedy Triton kernel fails, the eager commit returns no stale lengths."""
-    from types import MethodType
-
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     # Row 0 rejects every draft, row 1 accepts every draft, row 2 accepts one.
@@ -610,15 +609,10 @@ def test_accept_commits_the_block_in_one_launch_into_the_accept_ring(
         device=torch.device("cpu"),
         block_size=4,
         _use_triton_accept_bonus=True,
-        _accept_bonus_buffer_cap=0,
-        _accept_bonus_buffer_slot=0,
-        _accept_len_buf=None,
+        _accept_bonus_buffers=worker_mod._AcceptBonusBuffers(),
         _selector_sample=None,
         _tp_sync=SimpleNamespace(sync=lambda site, tensor: None),
     )
-    for name in ("_ensure_accept_bonus_buffers", "_next_accept_bonus_buffers"):
-        method = getattr(worker_mod.DFlashWorkerV2, name)
-        setattr(worker, name, MethodType(method, worker))
     inputs = dict(
         candidates=candidates,
         next_token_logits=None,
@@ -666,9 +660,10 @@ def test_accept_commits_the_block_in_one_launch_into_the_accept_ring(
             assert new_seq_lens is None
             continue
         assert new_seq_lens.tolist() == [101, 204, 302]
-        assert out_tokens.data_ptr() == worker._out_tokens_bufs[slot].data_ptr()
-        assert commit_lens.data_ptr() == worker._commit_lens_bufs[slot].data_ptr()
-        assert new_seq_lens.data_ptr() == worker._new_seq_lens_bufs[slot].data_ptr()
+        bufs = worker._accept_bonus_buffers
+        assert out_tokens.data_ptr() == bufs.out_tokens[slot].data_ptr()
+        assert commit_lens.data_ptr() == bufs.commit_lens[slot].data_ptr()
+        assert new_seq_lens.data_ptr() == bufs.new_seq_lens[slot].data_ptr()
     assert len(launches) == (0 if branch == "triton_failed" else 2)
 
 
