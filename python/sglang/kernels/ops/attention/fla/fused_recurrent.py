@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_cuda
 
 
@@ -643,7 +644,12 @@ def fused_recurrent_kda_packed_decode(
     # (reduction order); small batches keep triton (launch-bound anyway).
     # Safe-gate layers stay on triton: at GLM-5.3-Flash's 8-32 heads per rank it
     # is faster than the row-streaming kernel at every batch on H200 and B200.
-    if use_qk_l2norm_in_kernel and lower_bound is None:
+    # It only engages from a batch size up, so batch-invariant mode keeps triton.
+    if (
+        use_qk_l2norm_in_kernel
+        and lower_bound is None
+        and not is_batch_invariant_mode_enabled()
+    ):
         from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
 
         if kda_decode_cuda.covered(
