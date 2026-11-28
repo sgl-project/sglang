@@ -1,18 +1,17 @@
 """MLX-native in-graph sampling for the MLX backend.
 
-Token selection (temperature / top-k / top-p / min-p / per-request seed)
-built entirely from ``mx`` ops, so it lives inside the same lazy graph as
-the forward pass.  That is what lets sampling coexist with the overlap
-scheduler: ``decode_batch_start_chained`` feeds step N's still-unevaluated
-sampled tokens as step N+1's input ids, with no host sync.
+Token selection (penalties / min_new_tokens / temperature / top-k / top-p /
+min-p / per-request seed) built entirely from ``mx`` ops, so it lives inside
+the same lazy graph as the forward pass.  That is what lets sampling coexist
+with the overlap scheduler: ``decode_batch_start_chained`` feeds step N's
+still-unevaluated sampled tokens as step N+1's input ids, with no host sync.
 
-Semantics mirror ``top_k_top_p_min_p_sampling_from_probs_torch`` /
-``multinomial_with_seed`` in ``sglang/srt/layers/sampler.py``.
+Semantics mirror ``sglang/srt/sampling/penalties.py`` and
+``top_k_top_p_min_p_sampling_from_probs_torch`` / ``multinomial_with_seed``
+in ``sglang/srt/layers/sampler.py``.
 
 Gaps against that backend:
 
-* Penalties (frequency/presence/repetition) are not applied (warned once
-  per process).
 * Custom logit processors run on pure-decode steps only: the first
   generated token and decode steps mixed into an extend batch are not
   processed (``apply_custom_logit_processor`` requires logits rows to
@@ -44,8 +43,30 @@ DEFAULT_SAMPLING_SEED = 42
 # meaningfully cheaper than the [B, vocab] one it replaces.
 MAX_BOUNDED_TOP_K = 1024
 
-_warned_ignored_penalties = False
 _warned_ignored_seed = False
+
+
+def _collect_stop_token_ids(req: Any) -> tuple[int, ...]:
+    """Collect non-negative stop/EOS token ids for ``min_new_tokens`` masking.
+
+    Mirrors ``sglang.srt.sampling.penalties._stop_token_ids``; upper-bound
+    filtering against ``vocab_size`` happens when the mask is built.
+    """
+    sp = req.sampling_params
+    tokenizer = getattr(req, "tokenizer", None)
+    stop_ids: set[int] = set()
+    if getattr(sp, "stop_token_ids", None):
+        stop_ids.update(sp.stop_token_ids)
+    if getattr(req, "eos_token_ids", None):
+        stop_ids.update(req.eos_token_ids)
+    if tokenizer is not None:
+        additional = getattr(tokenizer, "additional_stop_token_ids", None)
+        if additional:
+            stop_ids.update(additional)
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_id is not None:
+            stop_ids.add(eos_id)
+    return tuple(sorted(t for t in stop_ids if t is not None and t >= 0))
 
 
 @dataclass(frozen=True)
@@ -57,23 +78,18 @@ class MlxSamplingParams:
     top_p: float
     min_p: float
     seed: int | None
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_new_tokens: int = 0
+    stop_token_ids: tuple[int, ...] = ()
 
     @classmethod
     def from_req(
         cls, req: Any, deterministic_seeding: bool = False
     ) -> MlxSamplingParams:
         sp = req.sampling_params
-        global _warned_ignored_penalties, _warned_ignored_seed
-        if not _warned_ignored_penalties and (
-            sp.frequency_penalty != 0.0
-            or sp.presence_penalty != 0.0
-            or sp.repetition_penalty != 1.0
-        ):
-            _warned_ignored_penalties = True
-            logger.warning(
-                "MLX sampling ignores frequency/presence/repetition penalties; "
-                "a request specified them. (Warning logged once.)"
-            )
+        global _warned_ignored_seed
         # Under --enable-deterministic-inference every row is seeded (default
         # DEFAULT_SAMPLING_SEED), as in SamplingBatchInfo. Unlike the other backends,
         # MLX ignores per-request seeds outside that flag.
@@ -90,22 +106,163 @@ class MlxSamplingParams:
                 "MLX sampling ignores sampling_seed unless "
                 "--enable-deterministic-inference is set. (Warning logged once.)"
             )
+        min_new_tokens = getattr(sp, "min_new_tokens", 0) or 0
+        stop_token_ids = _collect_stop_token_ids(req) if min_new_tokens > 0 else ()
         return cls(
             temperature=sp.temperature,
             top_k=sp.top_k,
             top_p=sp.top_p,
             min_p=sp.min_p,
             seed=seed,
+            frequency_penalty=getattr(sp, "frequency_penalty", 0.0),
+            presence_penalty=getattr(sp, "presence_penalty", 0.0),
+            repetition_penalty=getattr(sp, "repetition_penalty", 1.0),
+            min_new_tokens=min_new_tokens,
+            stop_token_ids=stop_token_ids,
         )
 
     @property
     def is_greedy(self) -> bool:
         return self.top_k == 1
 
+    @property
+    def uses_penalty(self) -> bool:
+        return (
+            self.frequency_penalty != 0.0
+            or self.presence_penalty != 0.0
+            or self.repetition_penalty != 1.0
+            or self.min_new_tokens > 0
+        )
+
 
 GREEDY_PARAMS = MlxSamplingParams(
     temperature=1.0, top_k=1, top_p=1.0, min_p=0.0, seed=None
 )
+
+
+@dataclass
+class MlxPenaltyState:
+    """Per-request lazy output-token history for in-graph sampling penalties.
+
+    ``counts`` is a lazy ``[vocab]`` int32 array updated via pure ``mx`` ops
+    after each sampled token, keeping penalty tracking inside the same lazy
+    graph as forward and sampling (no host sync, chained-decode safe).
+    """
+
+    counts: mx.array  # [vocab] int32
+    length: int = 0
+
+    @classmethod
+    def from_history(
+        cls, vocab_size: int, output_ids: tuple[int, ...] | list[int] = ()
+    ) -> MlxPenaltyState:
+        counts = mx.zeros((vocab_size,), dtype=mx.int32)
+        if output_ids:
+            valid = [int(t) for t in output_ids if 0 <= int(t) < vocab_size]
+            if valid:
+                counts = counts.at[mx.array(valid, dtype=mx.int32)].add(1)
+        return cls(counts=counts, length=len(output_ids))
+
+
+def apply_penalties(
+    last_logits: mx.array,
+    params: list[MlxSamplingParams],
+    states: list[MlxPenaltyState | None],
+) -> mx.array:
+    """Apply frequency, presence, min_new_tokens, and repetition penalties.
+
+    Pure ``mx`` ops matching ``sglang.srt.sampling.penalties._compute_logit_penalties``
+    and ``apply_scaling_penalties``: additive penalties (frequency, presence,
+    min_new_tokens stop mask) run first, followed by multiplicative
+    repetition_penalty scaling.  Returns ``last_logits`` unchanged when no row
+    uses penalties.
+    """
+    if not any(p.uses_penalty for p in params):
+        return last_logits
+
+    vocab_size = last_logits.shape[-1]
+    logits = last_logits.astype(mx.float32)
+
+    has_freq = any(p.frequency_penalty != 0.0 for p in params)
+    has_pres = any(p.presence_penalty != 0.0 for p in params)
+    has_rep = any(p.repetition_penalty != 1.0 for p in params)
+    active_stop_rows: list[tuple[int, list[int]]] = []
+    for row, (p, state) in enumerate(zip(params, states)):
+        if (
+            p.min_new_tokens > 0
+            and state is not None
+            and state.length < p.min_new_tokens
+            and p.stop_token_ids
+        ):
+            valid_stops = [t for t in p.stop_token_ids if 0 <= t < vocab_size]
+            if valid_stops:
+                active_stop_rows.append((row, valid_stops))
+
+    if has_freq or has_pres or has_rep:
+        zero_row: mx.array | None = None
+        count_rows: list[mx.array] = []
+        for state in states:
+            if state is not None:
+                count_rows.append(state.counts)
+            else:
+                if zero_row is None:
+                    zero_row = mx.zeros((vocab_size,), dtype=mx.int32)
+                count_rows.append(zero_row)
+        counts = mx.stack(count_rows, axis=0)
+        present = counts > 0 if (has_pres or has_rep) else None
+
+        if has_freq:
+            freq = mx.array([p.frequency_penalty for p in params], dtype=mx.float32)[
+                :, None
+            ]
+            logits = logits - counts.astype(mx.float32) * freq
+        if has_pres:
+            presence = mx.array([p.presence_penalty for p in params], dtype=mx.float32)[
+                :, None
+            ]
+            logits = logits - present.astype(mx.float32) * presence
+
+    if active_stop_rows:
+        row_idx: list[int] = []
+        tok_idx: list[int] = []
+        for row, stops in active_stop_rows:
+            row_idx.extend([row] * len(stops))
+            tok_idx.extend(stops)
+        stop_mask = mx.zeros(logits.shape, dtype=mx.float32)
+        stop_mask = stop_mask.at[
+            mx.array(row_idx, dtype=mx.int32), mx.array(tok_idx, dtype=mx.int32)
+        ].add(-float("inf"))
+        logits = logits + stop_mask
+
+    if has_rep:
+        rep = mx.array([p.repetition_penalty for p in params], dtype=mx.float32)[
+            :, None
+        ]
+        scaling = mx.where(present, rep, 1.0)
+        logits = mx.where(logits < 0, logits * scaling, logits / scaling)
+
+    return logits
+
+
+def commit_penalties(
+    states: list[MlxPenaltyState | None],
+    tokens: mx.array,
+) -> list[mx.array]:
+    """Lazily accumulate sampled ``tokens`` ([B]) into each penalized row's state.
+
+    Updates ``state.counts`` in-graph (no host sync) and increments
+    ``state.length``.  Returns the updated count arrays so callers can schedule
+    them with ``mx.async_eval`` / ``mx.eval`` alongside the sampled tokens.
+    """
+    updated: list[mx.array] = []
+    for row, state in enumerate(states):
+        if state is None:
+            continue
+        tok = tokens[row].astype(mx.int32)
+        state.counts = state.counts.at[tok].add(1)
+        state.length += 1
+        updated.append(state.counts)
+    return updated
 
 
 @dataclass(frozen=True)
