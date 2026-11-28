@@ -205,7 +205,7 @@ def _fa_batch(extend_lens, prefix_lens, mm_items_per_req):
     )
 
 
-def _prepare_on(backend, forward_batch):
+def _prepare_on(backend, forward_batch, **kwargs):
     model = SimpleNamespace(
         config=SimpleNamespace(
             text_config=SimpleNamespace(use_bidirectional_attention="vision")
@@ -213,14 +213,19 @@ def _prepare_on(backend, forward_batch):
     )
     with patch.object(gemma4_mm, "get_attn_backend", return_value=backend):
         Gemma4ForConditionalGeneration.prepare_attn_masks(
-            model, forward_batch, torch.zeros(1, dtype=torch.int64), torch.bfloat16
+            model,
+            forward_batch,
+            torch.zeros(1, dtype=torch.int64),
+            torch.bfloat16,
+            **kwargs,
         )
 
 
 class TestGemma4Fa4ImageTokenRanges(unittest.TestCase):
     """The FA4 metadata path: fa4, and fa3 upgraded to FA4 for the 512-wide
-    global layers, both emit image_token_ranges; other non-triton backends
-    fall back to causal attention and leave the metadata alone."""
+    global layers, both emit image_token_ranges and carry sliding_layers_only;
+    other non-triton backends fall back to causal attention and leave the
+    metadata alone."""
 
     @staticmethod
     def _backend(**flags):
@@ -241,6 +246,18 @@ class TestGemma4Fa4ImageTokenRanges(unittest.TestCase):
         expected[2:6] = torch.tensor([2, 5], dtype=torch.int32)
         expected[8 + 1 : 8 + 4] = torch.tensor([5, 7], dtype=torch.int32)
         self.assertTrue(torch.equal(ranges, expected), (ranges, expected))
+        self.assertTrue(backend.forward_metadata.image_mask_sliding_layers_only)
+
+    def test_fa4_respects_sliding_layers_only_opt_out(self):
+        # DiffusionGemma opts out with sliding_layers_only=False so full layers
+        # also keep bidirectional image attention.
+        backend = self._backend(fa_impl_ver=4)
+        _prepare_on(
+            backend,
+            _fa_batch((6,), (0,), ([_image_item((1, 4))],)),
+            sliding_layers_only=False,
+        )
+        self.assertFalse(backend.forward_metadata.image_mask_sliding_layers_only)
 
     def test_plain_fa3_without_upgrade_leaves_metadata_alone(self):
         backend = self._backend(fa_impl_ver=3, fa3_upgrades_to_fa4=False)

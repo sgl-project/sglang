@@ -133,6 +133,9 @@ class FlashAttentionMetadata:
     fa_skip_max_seqlen_q: int = None
     # Packed absolute image ranges for Gemma4 prefill; None for text/decode.
     image_token_ranges: torch.Tensor = None
+    # Gemma 4 image masks apply only to sliding-window layers; DiffusionGemma
+    # opts out (False) so full-attention layers also attend bidirectionally.
+    image_mask_sliding_layers_only: bool = False
     # Window size (typically used by Gemma)
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
@@ -1720,9 +1723,13 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias_decode_epilogue=None,
         rel_bias_presheared: bool = False,
     ):
-        ver = self._ver_for(
-            layer, needs_fa4=self.forward_metadata.image_token_ranges is not None
+        use_image_mask = self.forward_metadata.image_token_ranges is not None and (
+            not self.forward_metadata.image_mask_sliding_layers_only
+            or (
+                layer.sliding_window_size is not None and layer.sliding_window_size >= 0
+            )
         )
+        ver = self._ver_for(layer, needs_fa4=use_image_mask)
         if score_mod is not None and ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         if return_lse and self.use_mla:
@@ -1836,7 +1843,7 @@ class FlashAttentionBackend(AttentionBackend):
         if score_mod is not None:
             kwargs["score_mod"] = score_mod
             kwargs["aux_tensors"] = aux_tensors
-        if metadata.image_token_ranges is not None:
+        if use_image_mask:
             if (
                 ver != 4
                 or cp_active

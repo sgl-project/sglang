@@ -28,6 +28,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
 
 # Gemma-4 head widths: global layers run FA4, sliding-window layers stay on FA3.
 WIDE_HEAD_DIM = 512
@@ -146,6 +147,256 @@ class TestFa3Fa4HybridDenseAttention(CustomTestCase):
                 self.assertFalse(
                     torch.allclose(actual, causal, atol=DENSE_ATOL, rtol=DENSE_RTOL)
                 )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+@unittest.skipIf(
+    get_device_sm() // 10 not in (9, 10),
+    "FA4 image masks run on Hopper (SM90) and Blackwell (SM100)",
+)
+class TestFa4ImageMaskLayerScoping(CustomTestCase):
+    """End-to-end GPU FA4 verification of image_mask_sliding_layers_only (#51861):
+    Gemma 4 keeps full-attention layers causal and restricts bidirectional image
+    masks to sliding-window layers; DiffusionGemma opts out with False."""
+
+    HIDDEN_SIZE = 512
+    DTYPE = torch.bfloat16
+
+    def _run_with_ranges(
+        self,
+        *,
+        sliding_window_size,
+        head_dim,
+        sliding_layers_only,
+    ):
+        case = DenseAttentionCase(
+            name=f"fa4_img_scope_w{sliding_window_size}_d{head_dim}",
+            backend="fa4",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=64,
+            prefix_lens=(0, 4),
+            extend_lens=(10, 6),
+            sliding_window_size=sliding_window_size,
+        )
+        spans = [(2, 6), (5, 8)]
+        ranges = torch.full((case.num_input_tokens, 2), -1, dtype=torch.int32)
+        bidir_masks = []
+        offset = 0
+        for prefix, length, (begin, end) in zip(
+            case.prefix_lens, case.extend_lens, spans
+        ):
+            ranges[offset + begin - prefix : offset + end + 1 - prefix] = torch.tensor(
+                [begin, end], dtype=torch.int32
+            )
+            offset += length
+            mask = torch.ones(length, prefix + length, dtype=torch.bool).tril(
+                diagonal=prefix
+            )
+            if sliding_window_size is not None and sliding_window_size > -1:
+                q_pos = torch.arange(prefix, prefix + length)[:, None]
+                k_pos = torch.arange(prefix + length)[None, :]
+                mask &= k_pos >= (q_pos - sliding_window_size)
+            mask[begin - prefix : end + 1 - prefix, begin : end + 1] = True
+            bidir_masks.append(mask)
+
+        fixture = build_dense_attention_fixture(
+            self,
+            case,
+            head_dim=head_dim,
+            model_head_dim=WIDE_HEAD_DIM,
+            hidden_size=self.HIDDEN_SIZE,
+            dtype=self.DTYPE,
+        )
+        backend = fixture.backend
+        with (
+            torch.no_grad(),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            backend.init_forward_metadata(fixture.forward_batch)
+            backend.forward_metadata.image_token_ranges = ranges.to(
+                fixture.input_hidden.device
+            )
+            backend.forward_metadata.image_mask_sliding_layers_only = (
+                sliding_layers_only
+            )
+            actual = fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
+
+        causal = expected_dense_fixture_output(fixture)
+        bidir_masks = [m.to(fixture.input_hidden.device) for m in bidir_masks]
+        bidir = dense_attention_reference_with_custom_mask(
+            fixture.reference_module,
+            case,
+            fixture.prefix_hidden,
+            fixture.input_hidden,
+            bidir_masks,
+        )
+        return actual, causal, bidir
+
+    def test_hybrid_routing_and_score_mod_preservation(self):
+        """Using the real GPU fixture, verify FA3->FA4 hybrid version routing
+        and caller score_mod preservation when image_mask_sliding_layers_only=True."""
+        from unittest.mock import patch
+
+        def _capture_call(
+            *,
+            backend_name,
+            sliding_window_size,
+            head_dim,
+            sliding_layers_only,
+            score_mod=None,
+            aux_tensors=None,
+        ):
+            case = DenseAttentionCase(
+                name=f"route_{backend_name}_w{sliding_window_size}_d{head_dim}",
+                backend=backend_name,
+                forward_mode=ForwardMode.EXTEND,
+                num_heads=4,
+                num_kv_heads=2,
+                page_size=64,
+                prefix_lens=(0,),
+                extend_lens=(6,),
+                sliding_window_size=sliding_window_size,
+            )
+            fixture = build_dense_attention_fixture(
+                self,
+                case,
+                head_dim=head_dim,
+                model_head_dim=WIDE_HEAD_DIM,
+                hidden_size=self.HIDDEN_SIZE,
+                dtype=self.DTYPE,
+            )
+            backend = fixture.backend
+            recorded = {}
+
+            def _fake_fa(**kw):
+                recorded.clear()
+                recorded.update(kw)
+                return torch.zeros_like(kw["q"])
+
+            ranges = torch.full(
+                (case.num_input_tokens, 2),
+                -1,
+                dtype=torch.int32,
+                device=fixture.input_hidden.device,
+            )
+            ranges[1:4] = torch.tensor(
+                [1, 3], dtype=torch.int32, device=fixture.input_hidden.device
+            )
+            with (
+                torch.no_grad(),
+                forward_context(ForwardContext(attn_backend=backend)),
+                patch.object(backend, "flash_attn_with_kvcache", side_effect=_fake_fa),
+            ):
+                backend.init_forward_metadata(fixture.forward_batch)
+                backend.forward_metadata.image_token_ranges = ranges
+                backend.forward_metadata.image_mask_sliding_layers_only = (
+                    sliding_layers_only
+                )
+                q = torch.zeros(
+                    (case.num_input_tokens, 4, head_dim),
+                    dtype=self.DTYPE,
+                    device=fixture.input_hidden.device,
+                )
+                backend.forward_extend(
+                    q,
+                    None,
+                    None,
+                    fixture.actual_module.attn,
+                    fixture.forward_batch,
+                    save_kv_cache=False,
+                    score_mod=score_mod,
+                    aux_tensors=aux_tensors,
+                )
+            return recorded
+
+        # FA3->FA4 hybrid (only on SM90 where fa3 is available, else FA4 directly).
+        if get_device_sm() == 90:
+            # Narrow full layer stays on FA3 (ver=3), causal, no image mask.
+            rec_narrow_full = _capture_call(
+                backend_name="fa3",
+                sliding_window_size=None,
+                head_dim=128,
+                sliding_layers_only=True,
+            )
+            self.assertEqual(rec_narrow_full["ver"], 3)
+            self.assertTrue(rec_narrow_full["causal"])
+            self.assertNotIn("mask_mod", rec_narrow_full)
+
+            # Wide (512) full layer upgrades to FA4 for head_dim, causal, no image mask.
+            rec_wide_full = _capture_call(
+                backend_name="fa3",
+                sliding_window_size=None,
+                head_dim=WIDE_HEAD_DIM,
+                sliding_layers_only=True,
+            )
+            self.assertEqual(rec_wide_full["ver"], 4)
+            self.assertTrue(rec_wide_full["causal"])
+            self.assertNotIn("mask_mod", rec_wide_full)
+
+            # Narrow sliding layer upgrades to FA4 for image mask.
+            rec_narrow_swa = _capture_call(
+                backend_name="fa3",
+                sliding_window_size=4,
+                head_dim=128,
+                sliding_layers_only=True,
+            )
+            self.assertEqual(rec_narrow_swa["ver"], 4)
+            self.assertFalse(rec_narrow_swa["causal"])
+            self.assertIn("mask_mod", rec_narrow_swa)
+
+        # Caller score_mod and aux_tensors are preserved on full layers when
+        # image_mask_sliding_layers_only=True.
+        sentinel_aux = [torch.tensor([1], device="cuda")]
+        rec_score = _capture_call(
+            backend_name="fa4",
+            sliding_window_size=None,
+            head_dim=128,
+            sliding_layers_only=True,
+            score_mod="custom_score_mod",
+            aux_tensors=sentinel_aux,
+        )
+        self.assertEqual(rec_score["score_mod"], "custom_score_mod")
+        self.assertIs(rec_score["aux_tensors"], sentinel_aux)
+        self.assertNotIn("mask_mod", rec_score)
+
+    def test_sliding_layers_only_keeps_full_layers_causal_and_swa_bidirectional(self):
+        # 1) Full-attention layers stay strictly causal when sliding_layers_only=True.
+        with self.subTest(layer="full_causal"):
+            actual, causal, bidir = self._run_with_ranges(
+                sliding_window_size=None,
+                head_dim=128,
+                sliding_layers_only=True,
+            )
+            torch.testing.assert_close(actual, causal, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+            self.assertFalse(
+                torch.allclose(actual, bidir, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+            )
+
+        # 2) Sliding-window layers still apply the bidirectional image overlay.
+        with self.subTest(layer="swa_bidirectional"):
+            actual, causal, bidir = self._run_with_ranges(
+                sliding_window_size=4,
+                head_dim=128,
+                sliding_layers_only=True,
+            )
+            torch.testing.assert_close(actual, bidir, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+            self.assertFalse(
+                torch.allclose(actual, causal, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+            )
+
+        # 3) DiffusionGemma opt-out (sliding_layers_only=False) keeps full layers bidirectional.
+        with self.subTest(layer="full_diffusion_opt_out"):
+            actual, causal, bidir = self._run_with_ranges(
+                sliding_window_size=None,
+                head_dim=128,
+                sliding_layers_only=False,
+            )
+            torch.testing.assert_close(actual, bidir, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+            self.assertFalse(
+                torch.allclose(actual, causal, atol=DENSE_ATOL, rtol=DENSE_RTOL)
+            )
 
 
 if __name__ == "__main__":
