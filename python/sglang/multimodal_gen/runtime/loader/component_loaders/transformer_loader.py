@@ -27,6 +27,9 @@ from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     resolve_minimax_h3_checkpoint_quantization,
     validate_minimax_h3_checkpoint_variant,
 )
+from sglang.multimodal_gen.runtime.loader.replicated_weight_copy import (
+    replicated_load_group,
+)
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     TransformerQuantLoadSpec,
     resolve_transformer_checkpoint_files,
@@ -561,6 +564,14 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                 component_name,
             )
 
+        # every rank loads this DiT whole from the same safetensors files
+        replicated_group = (
+            None
+            if use_fsdp or quant_spec.gguf_file is not None or direct_gpu_weight_loading
+            else replicated_load_group(
+                component_server_args, weight_load_plan.checkpoint_load_device
+            )
+        )
         quantized_attn_backend = _default_quantized_attention_backend(
             quant_spec, component_server_args
         )
@@ -599,6 +610,7 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                     if quant_spec.gguf_file is not None
                     else None
                 ),
+                replicated_group=replicated_group,
             )
 
         # post-hooks (e.g., patch scales (nunchaku))

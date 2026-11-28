@@ -21,17 +21,25 @@ class CudaCommunicator(DeviceCommunicatorBase):
         unique_name: str = "",
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
+        # created on the first all-reduce (a collective of the whole group): the
+        # runtime routes a group's collectives through torch.distributed and
+        # uses this communicator only for all_to_all_4D, so an eager NCCL
+        # communicator (seconds of init per group, plus its device buffers)
+        # usually served nothing
+        self._pynccl_comm = None
 
-        from sglang.multimodal_gen.runtime.distributed.device_communicators.pynccl import (
-            PyNcclCommunicator,
-        )
+    @property
+    def pynccl_comm(self):
+        if self._pynccl_comm is None and self.world_size > 1:
+            from sglang.multimodal_gen.runtime.distributed.device_communicators.pynccl import (
+                PyNcclCommunicator,
+            )
 
-        self.pynccl_comm: PyNcclCommunicator | None = None
-        if self.world_size > 1:
-            self.pynccl_comm = PyNcclCommunicator(
+            self._pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
             )
+        return self._pynccl_comm
 
     def all_reduce(self, input_, op: torch.distributed.ReduceOp | None = None):
         pynccl_comm = self.pynccl_comm
@@ -52,7 +60,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
-        pynccl_comm = self.pynccl_comm
+        # point-to-point: only two ranks take part, so never create it here
+        pynccl_comm = self._pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.send(tensor, dst)
         else:
@@ -67,7 +76,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        pynccl_comm = self.pynccl_comm
+        pynccl_comm = self._pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.recv(tensor, src)
         else:
@@ -75,5 +84,4 @@ class CudaCommunicator(DeviceCommunicatorBase):
         return tensor
 
     def destroy(self) -> None:
-        if self.pynccl_comm is not None:
-            self.pynccl_comm = None
+        self._pynccl_comm = None

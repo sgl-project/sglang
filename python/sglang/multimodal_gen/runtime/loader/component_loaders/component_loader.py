@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterator
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import transformers
 from diffusers import AutoModel
 from torch import nn
@@ -750,6 +751,7 @@ class WeightOverrideComponentLoader(ComponentLoader):
         weight_load_plan: WeightLoadPlan | None = None,
         checkpoint_key_filter: Callable[[str], bool] | None = None,
         weights_iterator: Iterator[tuple[str, torch.Tensor]] | None = None,
+        replicated_group: dist.ProcessGroup | None = None,
     ) -> nn.Module:
         """Restore mapped model state with optional TP/FSDP materialization."""
         return maybe_load_fsdp_model(
@@ -768,6 +770,7 @@ class WeightOverrideComponentLoader(ComponentLoader):
             weight_load_plan=weight_load_plan,
             checkpoint_key_filter=checkpoint_key_filter,
             weights_iterator=weights_iterator,
+            replicated_group=replicated_group,
         )
 
     def validate_checkpoint_keys(
