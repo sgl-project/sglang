@@ -42,7 +42,10 @@ from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_world_rank,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -1627,10 +1630,6 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
     arrays when frames are returned); otherwise a joint request returns only video.
     """
 
-    # output_rank_saved is a collective over the VAE decode group, so every
-    # rank of the group runs this stage, also when the base rule picks one.
-    parallelism_type = StageParallelismType.REPLICATED
-
     def __init__(
         self,
         vae,
@@ -1708,8 +1707,8 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
         num_views: int,
         latent_frames_per_view: int,
         on_frames: Callable[[torch.Tensor], None] | None = None,
+        keep_frames: bool = True,
     ) -> torch.Tensor | None:
-        """The camera-major clip, or ``None`` when ``on_frames`` took the frames."""
         clips = []
         for view in range(num_views):
             clip = self._decode_latents(
@@ -1720,7 +1719,7 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
                 ],
                 on_frames=on_frames,
             )
-            if on_frames is None:
+            if keep_frames and on_frames is None:
                 clips.append(clip)
         return torch.cat(clips, dim=2) if clips else None
 
@@ -1747,6 +1746,7 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
             is not None
         )
         output_file_paths = None
+        streamed_saved = False
         with self.use_declared_component(component_name="vae", module=self.vae):
             with (
                 torch.no_grad(),
@@ -1760,6 +1760,7 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
                         num_views=num_views,
                         latent_frames_per_view=latent_frames_per_view,
                         on_frames=stream,
+                        keep_frames=not output_rank_streams,
                     )
                     if stream is not None:
                         output_file_paths = stream.finish()
@@ -1767,9 +1768,18 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
                     if stream is not None:
                         stream.abort()
                     raise
-                if output_rank_streams and not output_rank_saved(
-                    output_file_paths is not None
-                ):
+                if output_rank_streams:
+                    single_rank_decode = (
+                        model_parallel_is_initialized()
+                        and self.parallelism_type
+                        == StageParallelismType.MAIN_RANK_ONLY
+                    )
+                    streamed_saved = (
+                        output_file_paths is not None
+                        if single_rank_decode
+                        else output_rank_saved(output_file_paths is not None)
+                    )
+                if output_rank_streams and not streamed_saved:
                     # The streamed encode failed, so the worker saves the clip.
                     del decoded
                     decoded = self._decode_views(
@@ -1785,7 +1795,7 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
                 f"Decoded camera-major video: {num_views} cameras x {frames_per_view} "
                 f"frames at {batch.fps} fps; camera order {list(batch.extra.get(EXTRA_CAMERAS) or [])}"
             )
-        if output_file_paths is not None:
+        if streamed_saved:
             output_batch = OutputBatch(
                 output=None,
                 output_file_paths=output_file_paths,

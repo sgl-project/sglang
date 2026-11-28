@@ -2218,11 +2218,15 @@ class TestInputLoading(unittest.TestCase):
                 ),
                 action_latents=None,
                 is_warmup=True,
+                metrics=None,
+                rollout_trajectory_data=None,
             )
             with (
                 mock.patch.object(stage, "_encode_while_decoding", return_value=None),
-                mock.patch.object(stage, "_decode_views") as decode,
-                mock.patch.object(multiview_stage.Cosmos3DecodingStage, "forward"),
+                mock.patch.object(stage, "_decode_views", return_value=None) as decode,
+                mock.patch.object(
+                    multiview_stage.Cosmos3DecodingStage, "forward"
+                ) as super_forward,
                 mock.patch.object(
                     multiview_stage, "output_rank_video_path", return_value="out.mp4"
                 ),
@@ -2230,28 +2234,82 @@ class TestInputLoading(unittest.TestCase):
                     multiview_stage, "output_rank_saved", return_value=saved
                 ),
             ):
-                stage.forward(batch, None)
+                output = stage.forward(batch, None)
             self.assertEqual(decode.call_count, decodes)
+            self.assertIs(decode.call_args_list[0].kwargs.get("keep_frames"), False)
+            if saved:
+                super_forward.assert_not_called()
+                self.assertNotIn("transfer_decoded_output", batch.extra)
+                self.assertIsNone(output.output)
+            else:
+                self.assertNotIn("keep_frames", decode.call_args_list[1].kwargs)
+                super_forward.assert_called_once()
 
-    def test_every_rank_decodes_under_cfg_parallel_with_an_unsharded_vae(self):
-        """A streamed request returns under CFG parallel when the VAE does not
-        shard its decode: no rank skips the stage that exchanges the save result."""
+    def test_cfg_parallel_keeps_single_rank_decode_for_unsharded_vae(self):
+        """Under CFG parallel, an unsharded VAE decodes only on the main rank and
+        checks save completion locally without entering the decode collective."""
         decoding = "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding"
         stage_cls = multiview_stage.Cosmos3MultiviewDecodingStage
-        stage = stage_cls.__new__(stage_cls)
-        stage.vae = SimpleNamespace(use_parallel_decode=False)
-        with (
-            mock.patch(
-                f"{decoding}.get_global_server_args",
-                return_value=SimpleNamespace(enable_cfg_parallel=True),
-            ),
-            mock.patch(f"{decoding}.model_parallel_is_initialized", return_value=True),
-            mock.patch(f"{decoding}.get_decode_parallel_world_size", return_value=2),
+        latents = torch.zeros(1, 4, 6, 2, 3)
+        for sharded, expected_type, expects_collective in (
+            (False, multiview_stage.StageParallelismType.MAIN_RANK_ONLY, False),
+            (True, multiview_stage.StageParallelismType.REPLICATED, True),
         ):
-            self.assertEqual(
-                stage.parallelism_type_for(None),
-                multiview_stage.StageParallelismType.REPLICATED,
-            )
+            with self.subTest(sharded=sharded):
+                vae = _tiny_wan_vae(load_encoder=False)
+                vae.use_parallel_decode = sharded
+                stage = _stage(stage_cls, vae)
+                batch = SimpleNamespace(
+                    extra={
+                        multiview_stage.EXTRA_NUM_VIEWS: 2,
+                        multiview_stage.EXTRA_LATENT_FRAMES_PER_VIEW: 3,
+                        multiview_stage.EXTRA_PACKED_SHAPES: (tuple(latents.shape[1:]),),
+                    },
+                    latents=latents.flatten(1),
+                    sampling_params=SimpleNamespace(
+                        quality="lossless", resolved_lidar=lambda: None
+                    ),
+                    action_latents=None,
+                    is_warmup=True,
+                    metrics=None,
+                    rollout_trajectory_data=None,
+                )
+                fake_stream = SimpleNamespace(
+                    finish=lambda: ["out.mp4"], abort=lambda: None
+                )
+                with (
+                    mock.patch(
+                        f"{decoding}.get_global_server_args",
+                        return_value=SimpleNamespace(enable_cfg_parallel=True),
+                    ),
+                    mock.patch(
+                        f"{decoding}.model_parallel_is_initialized", return_value=True
+                    ),
+                    mock.patch.object(
+                        multiview_stage,
+                        "model_parallel_is_initialized",
+                        return_value=True,
+                    ),
+                    mock.patch(
+                        f"{decoding}.get_decode_parallel_world_size", return_value=2
+                    ),
+                    mock.patch.object(
+                        stage, "_encode_while_decoding", return_value=fake_stream
+                    ),
+                    mock.patch.object(stage, "_decode_views", return_value=None),
+                    mock.patch.object(
+                        multiview_stage,
+                        "output_rank_video_path",
+                        return_value="out.mp4",
+                    ),
+                    mock.patch.object(
+                        multiview_stage, "output_rank_saved", return_value=True
+                    ) as collective,
+                ):
+                    self.assertEqual(stage.parallelism_type_for(None), expected_type)
+                    output = stage.forward(batch, None)
+                self.assertEqual(output.output_file_paths, ["out.mp4"])
+                self.assertEqual(collective.call_count, int(expects_collective))
 
 
 class TestLidarItems(unittest.TestCase):
