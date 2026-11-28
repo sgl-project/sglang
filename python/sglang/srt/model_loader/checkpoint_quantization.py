@@ -14,6 +14,7 @@ __all__ = [
     "CheckpointQuantSpec",
     "QuantMetadataSource",
     "resolve_checkpoint_quant_spec",
+    "is_modelslim_backend_summary",
 ]
 
 
@@ -95,4 +96,11 @@ def resolve_checkpoint_quant_spec(
         declared_method=(declared_method if isinstance(declared_method, str) else None),
         config=copied_config,
         source=source,
+    )
+
+
+def is_modelslim_backend_summary(config: dict) -> bool:
+    """An Ascend backend marker has no per-layer weight or expert schemes."""
+    return config.get("quant_method") in ("ascend", "modelslim") and not any(
+        isinstance(key, str) and "." in key for key in config
     )

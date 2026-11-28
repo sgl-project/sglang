@@ -67,6 +67,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.model_loader.checkpoint_quantization import (
+    is_modelslim_backend_summary,
     resolve_checkpoint_quant_spec,
 )
 from sglang.srt.model_loader.ci_weight_validation import (
@@ -457,7 +458,11 @@ def get_quant_config(
                 )
             )
         )
-        if not modelopt_mixed_config_incomplete:
+        modelslim_config_incomplete = (
+            model_config.quantization == "modelslim"
+            and is_modelslim_backend_summary(hf_quant_config)
+        )
+        if not (modelopt_mixed_config_incomplete or modelslim_config_incomplete):
             hf_quant_config["packed_modules_mapping"] = packed_modules_mapping
             hf_quant_config["hf_config"] = model_config.hf_config
 
