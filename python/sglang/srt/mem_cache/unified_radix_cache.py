@@ -2116,10 +2116,16 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _discard_restore_backups(self) -> None:
         """Wait for every pending restore copy and return its host slots."""
-        for finish_event, backup in self._pending_restore_backups:
-            finish_event.synchronize()
-            self.discard_kv_cache_backup(backup)
-        self._pending_restore_backups = []
+        drained = 0
+        try:
+            for finish_event, backup in self._pending_restore_backups:
+                finish_event.synchronize()
+                self.discard_kv_cache_backup(backup)
+                drained += 1
+        finally:
+            # A later fence can fail after earlier host slots have been freed.
+            # A retried reset must resume at the first outstanding restore.
+            del self._pending_restore_backups[:drained]
 
     def _finish_restore(self, kv: ReqKvInfo) -> None:
         """Wait for the copy restoring ``kv``'s row, if any, and return its host
