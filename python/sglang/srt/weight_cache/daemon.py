@@ -5,7 +5,7 @@ TP-sharded model weights in GPU memory and serves them via pluggable transport b
 Each GPU runs one daemon process for its TP rank. The daemon:
 1. Loads model weights from disk (full pipeline: disk → TP shard → quantize)
 2. Exports every parameter/buffer through the selected transport
-   (--weight-cache-transport): CUDA IPC handles (torch_ipc), or CUDA VMM
+   (--weight-cache-transport): CUDA IPC handles (torch_ipc), or VMM
    allocations shared as file descriptors (vmm_fd)
 3. Serves transport entries over a Unix socket to requesting engine processes
 4. Validates CacheConfig compatibility before serving
@@ -153,8 +153,8 @@ class WeightCacheDaemon:
 
     Holds the complete post-quantization state_dict in GPU memory and
     serves it to engine processes over a Unix socket, through the selected
-    transport: CUDA IPC handles (torch_ipc) or CUDA VMM allocations passed as
-    file descriptors (vmm_fd).
+    transport: CUDA IPC handles (torch_ipc) or VMM allocations passed as file
+    descriptors (vmm_fd), which each platform implements with its own driver.
     """
 
     def __init__(
@@ -262,26 +262,20 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
-        # Zero-copy IPC weight sharing requires a platform whose tensors can be
-        # exported through multiprocessing reduction: CUDA-alike platforms
-        # (CUDA / ROCm) via _share_cuda_, and NPU via native torch_npu reduction.
-        # Fail loud here instead of dying deep inside the export with an opaque
-        # error on anything else.
-        if not current_platform.is_cuda_alike() and not current_platform.is_npu():
+        # Fail loud here instead of dying deep inside the export with an
+        # opaque error on a device no transport can serve.
+        if not current_platform.weight_cache_transports():
             raise RuntimeError(
-                f"[WeightCacheDaemon] the weight cache daemon requires an "
-                f"IPC-capable platform (CUDA, ROCm, or NPU/Ascend) for zero-copy "
-                f"weight sharing, but the active platform device type is "
-                f"{current_platform.device_type!r}. Disable the weight cache "
-                f"(--weight-cache-mode off)."
+                f"[WeightCacheDaemon] the weight cache daemon requires a platform "
+                f"that declares a weight cache transport, but the active platform "
+                f"device type {current_platform.device_type!r} declares none. "
+                f"Disable the weight cache (--weight-cache-mode off)."
             )
-        # expandable_segments makes torch's caching allocator hand out memory
-        # that cannot be exported via _share_cuda_, so the IPC export below would
-        # die mid-way with an opaque CUDA error. Fail fast with an actionable
-        # message before touching the device. vmm_fd copies the weights into
-        # allocations of its own, so it works with either allocator setting.
+        # An allocator whose memory the transport cannot export would make the
+        # export below die mid-way. Fail fast before touching the device. vmm_fd
+        # copies into allocations of its own, so it needs no such check.
         if self.transport_name == TORCH_IPC_BACKEND:
-            self._assert_ipc_compatible_allocator()
+            current_platform.validate_weight_cache_allocator()
         current_platform.set_device(current_platform.get_device(self.gpu_id))
         # Pick the transport before loading, so an unusable one fails fast.
         self.transport_backend = create_daemon_transport_backend(
@@ -375,7 +369,7 @@ class WeightCacheDaemon:
         )
 
         current_platform.empty_cache()
-        memory_before_load = torch.cuda.memory_reserved(self.gpu_id)
+        memory_before_load = current_platform.memory_reserved(self.gpu_id)
 
         # Build load config
         load_config = LoadConfig(
@@ -409,7 +403,7 @@ class WeightCacheDaemon:
         current_platform.synchronize()
         current_platform.empty_cache()
         self.preloaded_weights_bytes = max(
-            0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
+            0, current_platform.memory_reserved(self.gpu_id) - memory_before_load
         )
 
         # Export all parameters and buffers through the transport backend
@@ -420,7 +414,10 @@ class WeightCacheDaemon:
             # holds (originals that something else kept alive, if any).
             current_platform.empty_cache()
             self.preloaded_weights_bytes = (
-                max(0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load)
+                max(
+                    0,
+                    current_platform.memory_reserved(self.gpu_id) - memory_before_load,
+                )
                 + self.transport_backend.exported_bytes
             )
 
@@ -430,32 +427,6 @@ class WeightCacheDaemon:
             f"(transport={self.transport_name}, "
             f"preloaded_weights_bytes={self.preloaded_weights_bytes})."
         )
-
-    @staticmethod
-    def _assert_ipc_compatible_allocator() -> None:
-        """Reject allocator configs incompatible with CUDA IPC export.
-
-        The expandable-segments allocator returns memory that cannot be shared
-        through torch's _share_cuda_ handle, which would make the export fail
-        partway with an opaque error. Detect it up front and fail loud.
-        """
-        for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
-            conf = os.environ.get(var, "")
-            for field in conf.split(","):
-                key, _, value = field.partition(":")
-                if (
-                    key.strip() == "expandable_segments"
-                    and value.strip().lower() == "true"
-                ):
-                    raise RuntimeError(
-                        f"[WeightCacheDaemon] {var} sets expandable_segments:True, "
-                        f"which is incompatible with CUDA IPC weight sharing: the "
-                        f"expandable-segments allocator hands out memory that cannot "
-                        f"be exported via _share_cuda_, so the IPC handle export "
-                        f"would fail mid-way. Unset expandable_segments for the "
-                        f"weight cache daemon process (it can stay enabled for the "
-                        f"engine itself), or use --weight-cache-transport vmm_fd."
-                    )
 
     def _export_state(self):
         """Export model state entries through the selected transport backend."""

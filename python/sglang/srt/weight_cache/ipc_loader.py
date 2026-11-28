@@ -89,8 +89,8 @@ _LOADED_MODEL_TRANSPORTS: List[WeightCacheTransportBackend] = []
 
 class WeightCacheModelLoader(BaseModelLoader):
     """Load model weights from a Weight Cache Daemon through the transport the
-    daemon serves: CUDA IPC handles (torch_ipc) or CUDA VMM allocations passed
-    as file descriptors (vmm_fd).
+    daemon serves: CUDA IPC handles (torch_ipc) or VMM allocations passed as
+    file descriptors (vmm_fd).
 
     In daemon mode (weight_cache_mode="daemon"), the engine and daemon share
     the same GPU. Falling back to disk loading would cause OOM because both
