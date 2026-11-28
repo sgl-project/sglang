@@ -88,8 +88,6 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             if self.watermark is not None
             else None
         )
-        # The info the sampler reads: the watermark's request-filtered rows draw
-        # with top_p=1 and min_p=0.
         sampler_info = sampling_info
         logprob_logits = None
         next_token_ids = None
