@@ -490,6 +490,8 @@ class OpenAIServingResponses(OpenAIServingChat):
         model_error = self._validate_model(request.model)
         if model_error is not None:
             return model_error
+        if request.model is None:
+            request.model = self.tokenizer_manager.served_model_name
 
         # FIXME: If the engine is dead, raise an error
         # This is required for the streaming case

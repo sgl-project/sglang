@@ -777,6 +777,24 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             pass
 
     # ---- tests ----
+    def test_response_uses_served_model_when_omitted(self):
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                result = client.responses.create(
+                    input="Hello", max_output_tokens=8, store=False, stream=stream
+                )
+                if stream:
+                    responses = [
+                        event.response for event in result if hasattr(event, "response")
+                    ]
+                    self.assertEqual(responses[0].status, "in_progress")
+                else:
+                    responses = [result]
+                self.assertIn(responses[-1].status, ("completed", "incomplete"))
+                for response in responses:
+                    self.assertEqual(response.model, self.model)
+
     def test_response(self):
         resp = self.run_response(temperature=0, max_output_tokens=32)
         assert resp.id
