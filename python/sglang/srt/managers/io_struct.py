@@ -2691,6 +2691,9 @@ class ProfileReq(BaseReq, kw_only=True):
     profile_stages: Optional[List[str]] = None
     # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
     detailed_annotations: bool = False
+    # Extra keyword arguments for the profiler backend (e.g. custom tracer
+    # levels and hardware experimental options).
+    profiler_kwargs: Optional[Dict[str, Any]] = None
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):
