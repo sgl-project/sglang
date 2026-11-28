@@ -7,10 +7,11 @@ export const config = (() => {
     const flags = ["--model-path " + modelOf(s), ...[]];
     let gpus = 1;
     let t = { tp_size: 1, ulysses_degree: 1, ring_degree: 1 };
-    const env = [];
+    const env = s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [];
     const warnings = [];
     const errors = [];
-    if (s.placement === "offload") flags.push("--dit-cpu-offload", "--text-encoder-cpu-offload", "--vae-cpu-offload");
+    if (s.placement === "offload" && s.hw !== "xeon")
+      flags.push("--dit-cpu-offload", "--text-encoder-cpu-offload", "--vae-cpu-offload");
     return { flags, gpus, topology: t, env, warnings, errors };
   };
   const defaults = {
@@ -25,8 +26,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "LongLive 2.0",
-    supportedHardware: ["cuda"],
-    hardware: [{ id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" }],
+    supportedHardware: ["cuda", "xeon"],
+    hardware: [
+      { id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+    ],
     groupHardware: false,
     matchDims: [],
     overlayDims: [
@@ -37,7 +41,7 @@ export const config = (() => {
         default: "auto",
         options: [
           { id: "auto", label: "Auto" },
-          { id: "offload", label: "Component offload" },
+          { id: "offload", label: "Component offload", disabled: (s) => s.hw === "xeon", disableReason: "Not applicable on Intel Xeon CPUs." },
         ],
       },
     ],
@@ -45,7 +49,7 @@ export const config = (() => {
       defaultSelection: defaults,
       resource: {
         limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 1 } },
-        verifiedRecipes: ["cuda"].map((hw) => {
+        verifiedRecipes: ["cuda", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {

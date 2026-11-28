@@ -8,11 +8,13 @@ export const config = (() => {
     const flags = ["--model-path " + modelOf(s), ...["--port {{PORT}}"]];
     let gpus = 1;
     let t = { tp_size: 1, ulysses_degree: 1, ring_degree: 1 };
-    const env = [];
+    const env = s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [];
     const warnings = [];
     const errors = [];
-    gpus = Number(s.gpus_per_node);
-    flags.splice(1, 0, "--num-gpus " + gpus);
+    if (s.hw !== "xeon") {
+      gpus = Number(s.gpus_per_node);
+      flags.splice(1, 0, "--num-gpus " + gpus);
+    }
     if (gpus === 2) {
       t = { tp_size: s.parallel === "tp" ? 2 : 1, ulysses_degree: s.parallel === "sp" ? 2 : 1, ring_degree: 1 };
       flags.push(s.parallel === "tp" ? "--tp-size 2" : "--ulysses-degree 2");
@@ -37,8 +39,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "Krea-2",
-    supportedHardware: ["h200", "cuda"],
-    hardware: [{ id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" }],
+    supportedHardware: ["h200", "cuda", "xeon"],
+    hardware: [
+      { id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+    ],
     groupHardware: false,
     matchDims: [],
     overlayDims: [
@@ -57,6 +62,7 @@ export const config = (() => {
         title: "Parallelism",
         scope: "serve",
         default: "sp",
+        showWhen: (s) => s.hw !== "xeon",
         options: [
           { id: "sp", label: "Ulysses" },
           { id: "tp", label: "Tensor parallel" },
@@ -66,8 +72,11 @@ export const config = (() => {
     commandBuilder: {
       defaultSelection: defaults,
       resource: {
-        limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 4 } },
-        verifiedRecipes: ["h200", "cuda"].map((hw) => {
+        limits: {
+          nodes: { min: 1, max: 1 },
+          gpus_per_node: { min: 1, max: 4, disabledWhen: (s) => s.hw === "xeon", disabledValue: 1 },
+        },
+        verifiedRecipes: ["h200", "cuda", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {

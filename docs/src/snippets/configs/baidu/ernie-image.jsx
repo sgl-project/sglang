@@ -5,10 +5,13 @@ export const config = (() => {
       turbo: "baidu/ERNIE-Image-Turbo",
     })[s.checkpoint || "standard"];
   const plan = (s) => {
-    const flags = ["--model-path " + modelOf(s), ...["--num-gpus 1", "--performance-mode auto", "--port {{PORT}}"]];
+    const flags = [
+      "--model-path " + modelOf(s),
+      ...(s.hw === "xeon" ? ["--port {{PORT}}"] : ["--num-gpus 1", "--performance-mode auto", "--port {{PORT}}"]),
+    ];
     let gpus = 1;
     let t = { tp_size: 1, ulysses_degree: 1, ring_degree: 1 };
-    const env = [];
+    const env = s.hw === "xeon" ? ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE=cpu"] : [];
     const warnings = [];
     const errors = [];
     return { flags, gpus, topology: t, env, warnings, errors };
@@ -25,10 +28,11 @@ export const config = (() => {
   };
   const config = {
     modelName: "ERNIE-Image",
-    supportedHardware: ["cuda", "rocm"],
+    supportedHardware: ["cuda", "rocm", "xeon"],
     hardware: [
       { id: "cuda", label: "NVIDIA CUDA", vram: "", vendor: "nvidia" },
       { id: "rocm", label: "AMD ROCm", vram: "", vendor: "amd" },
+      { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
     ],
     groupHardware: false,
     matchDims: [],
@@ -48,7 +52,7 @@ export const config = (() => {
       defaultSelection: defaults,
       resource: {
         limits: { nodes: { min: 1, max: 1 }, gpus_per_node: { min: 1, max: 1 } },
-        verifiedRecipes: ["cuda", "rocm"].map((hw) => {
+        verifiedRecipes: ["cuda", "rocm", "xeon"].map((hw) => {
           const s = { ...defaults, hw };
           const p = plan(s);
           return {
