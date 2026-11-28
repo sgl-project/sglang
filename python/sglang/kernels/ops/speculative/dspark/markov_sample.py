@@ -20,10 +20,18 @@ _BLOCK = 1024
 # block width when the kernel computes the step bias (fold): the fold weight dominates
 _FOLD_BLOCK = 128
 _NO_INDEX = tl.constexpr(2147483647)
-# 2**-32: maps a 32-bit Philox word to a uniform in (0, 1].
 _UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
 _PHILOX_ROUNDS = 10
 _ROUND_CODE = {torch.float32: 0, torch.bfloat16: 1, torch.float16: 2}
+
+
+@triton.jit
+def _exponential_from_philox(bits):
+    # For u = (bits + 0.5) * 2**-32, folding the word before the FP32
+    # conversion retains 1-u even when u would round to 1.
+    lower = bits < 0x80000000
+    folded = (tl.minimum(bits, ~bits).to(tl.float32) + 0.5) * _UNIFORM_SCALE
+    return tl.where(lower, -libdevice.log1p(-folded), -tl.log(folded))
 
 
 @triton.jit
@@ -148,9 +156,7 @@ def _select_block(
             PHILOX_ROUNDS,
         )
         bits = tl.interleave(tl.interleave(w0, w2), tl.interleave(w1, w3))
-        # Small words convert to FP32 exactly, so the winning small noise stays precise.
-        uniform = (bits.to(tl.float32) + 0.5) * _UNIFORM_SCALE
-        exp_noise = -libdevice.log1p(-uniform)
+        exp_noise = _exponential_from_philox(bits)
         key = value / temperature - tl.log(exp_noise)
     nan = valid & (key != key)
     has_nan = tl.sum(nan.to(tl.int32), 0) > 0
@@ -501,8 +507,13 @@ class MarkovSampleStep:
             )
             words = torch.broadcast_tensors(*words)
             bits = torch.stack(words, dim=-1).reshape(rows, -1)[:, :padded]
-            uniform = (bits.float() + 0.5) * _UNIFORM_SCALE.value
-            exp_noise = -torch.log1p(-uniform)
+            # _philox returns uint32 words stored in int64 tensors.
+            folded = (
+                torch.minimum(bits, 0xFFFFFFFF - bits).float() + 0.5
+            ) * _UNIFORM_SCALE.value
+            exp_noise = torch.where(
+                bits < 0x80000000, -torch.log1p(-folded), -torch.log(folded)
+            )
             sampled = temperatures != 0
             safe_temperatures = torch.where(sampled, temperatures, 1.0)[:, None]
             noised = value / safe_temperatures - torch.log(exp_noise)
