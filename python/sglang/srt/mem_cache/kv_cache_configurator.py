@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+from bisect import bisect_left
 from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
@@ -290,6 +291,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.model_executor.pool_configurator import (
         MemoryPoolConfig,
+        MemoryPoolConfigurator,
     )
 
 
@@ -3457,7 +3459,9 @@ class KVCacheConfigurator:
 
         return base + additional_ratio
 
-    def _apply_token_constraints(self, token_capacity: int) -> int:
+    def _apply_token_constraints(
+        self, token_capacity: int, *, sync_pp: bool = True, warn_limits: bool = True
+    ) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
 
         Page alignment is handled by the configurator, not here.
@@ -3467,7 +3471,7 @@ class KVCacheConfigurator:
 
         # Apply user-specified upper bound
         if user_limit is not None:
-            if user_limit > token_capacity:
+            if user_limit > token_capacity and warn_limits:
                 logger.warning(
                     f"max_total_tokens={user_limit} is larger than the profiled value "
                     f"{token_capacity}. Use the profiled value instead."
@@ -3475,7 +3479,7 @@ class KVCacheConfigurator:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
-        if get_parallel().pp_size > 1:
+        if sync_pp and get_parallel().pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(
                 tensor,
@@ -3486,7 +3490,9 @@ class KVCacheConfigurator:
 
         return token_capacity
 
-    def resolve_max_num_reqs(self, token_capacity: int) -> int:
+    def resolve_max_num_reqs(
+        self, token_capacity: int, *, warn_limits: bool = True
+    ) -> int:
         """Compute max concurrent requests (per dp worker) from the finalized
         token capacity."""
         if get_memory().enable_unified_memory and self._unified_sized is not None:
@@ -3509,7 +3515,8 @@ class KVCacheConfigurator:
             mamba_cap = get_schedule().max_mamba_cache_size // ratio
             if mamba_cap < max_num_reqs:
                 capped_by_mamba = True
-                logger.warning(
+                logger.log(
+                    logging.WARNING if warn_limits else logging.DEBUG,
                     "max_running_requests is capped to %d by the mamba state "
                     "cache (max_mamba_cache_size=%d, %d state slots per "
                     "request). To raise it: increase --mamba-full-memory-ratio "
@@ -3535,7 +3542,8 @@ class KVCacheConfigurator:
             and max_num_reqs < requested_per_worker
             and not capped_by_mamba
         ):
-            logger.warning(
+            logger.log(
+                logging.WARNING if warn_limits else logging.DEBUG,
                 "max_running_requests was reduced from the requested %d to %d "
                 "(per dp worker) due to the available KV cache capacity.",
                 requested_per_worker,
@@ -3557,14 +3565,26 @@ class KVCacheConfigurator:
         if replayed is not None:
             return replayed
         available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        memory = get_memory()
+        budgeted_requests = None
+        if (
+            not memory.enable_unified_memory
+            and not self.is_draft_worker
+            and self.req_to_token_pool is None
+            and self.device == "cuda"
+            and not uses_compressed_kv_attention(self.model_config.hf_config)
+        ):
+            available_bytes, budgeted_requests = self._budget_with_request_tables(
+                available_bytes
+            )
         config = self.config_from_budget(available_bytes)
-        if get_memory().enable_unified_memory and not self.is_draft_worker:
+        if memory.enable_unified_memory and not self.is_draft_worker:
             config.mem_fraction_static = get_schedule().mem_fraction_static
             get_foundry_adapter().record_memory_pool_config(config)
             return config
-        config.max_running_requests = self.resolve_max_num_reqs(
-            config.max_total_num_tokens
-        )
+        if budgeted_requests is None:
+            budgeted_requests = self.resolve_max_num_reqs(config.max_total_num_tokens)
+        config.max_running_requests = budgeted_requests
         configurator = create_memory_pool_configurator(self)
         config = configurator.finalize_with_max_running_requests(config)
         config.mem_fraction_static = get_schedule().mem_fraction_static
@@ -3572,8 +3592,86 @@ class KVCacheConfigurator:
         get_foundry_adapter().record_memory_pool_config(config)
         return config
 
+    def _budget_with_request_tables(self, available_bytes: int) -> tuple[int, int]:
+        from sglang.srt.model_executor.pool_configurator import (
+            InsufficientPoolMemoryError,
+            InsufficientSWAMemoryError,
+            create_memory_pool_configurator,
+        )
+
+        configurator = create_memory_pool_configurator(self)
+
+        def consensus(value: int) -> int:
+            parallel = get_parallel()
+            if parallel.pp_size == 1:
+                return value
+            tensor = torch.tensor(value, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=parallel.world_group.cpu_group,
+            )
+            return int(tensor.item())
+
+        def budget_for(requests: int) -> int:
+            return available_bytes - self._req_to_token_bytes(requests)
+
+        def request_capacity(budget: int) -> int:
+            tokens = 0
+            if budget > 0:
+                try:
+                    config = self.config_from_budget(
+                        budget,
+                        sync_pp=False,
+                        configurator=configurator,
+                        warn_limits=False,
+                    )
+                    tokens = config.max_total_num_tokens
+                except (InsufficientPoolMemoryError, InsufficientSWAMemoryError):
+                    pass
+            # A zero-KV PP stage can return an unbounded token sentinel.
+            tokens = consensus(tokens)
+            if tokens < 2:
+                return 0
+            return consensus(self.resolve_max_num_reqs(tokens, warn_limits=False))
+
+        def over_budget(requests: int) -> bool:
+            return request_capacity(budget_for(requests)) < requests
+
+        upper = request_capacity(available_bytes)
+        if upper > 0 and not over_budget(upper):
+            return budget_for(upper), upper
+        # More rows leave fewer KV bytes; the request limit from the regular
+        # static pool sizers cannot increase. Keep the highest feasible
+        # concurrency, then give the remaining bytes to KV.
+        requests = bisect_left(range(1, upper), True, key=over_budget)
+        if requests > 0:
+            return budget_for(requests), requests
+        raise ValueError(
+            "No KV capacity and request-to-token table fit the memory budget. "
+            "Reduce --max-running-requests or --context-length, or increase "
+            "--mem-fraction-static."
+        )
+
+    def _req_to_token_bytes(self, max_num_reqs: int) -> int:
+        rows = self._req_pool_rows(max_num_reqs) + self._req_pool_pre_alloc_size() + 1
+        row_width = get_req_to_token_row_width(self.model_config.context_len)
+        tables = 1
+        if (
+            self.spec_algorithm.is_dflash()
+            and get_spec().speculative_draft_window_size is not None
+        ):
+            tables += 1
+        return tables * rows * row_width * torch.int32.itemsize
+
     def config_from_budget(
-        self, budget_bytes: int, *, cap_tokens: Optional[int] = None
+        self,
+        budget_bytes: int,
+        *,
+        cap_tokens: Optional[int] = None,
+        sync_pp: bool = True,
+        configurator: Optional[MemoryPoolConfigurator] = None,
+        warn_limits: bool = True,
     ) -> MemoryPoolConfig:
         """Turn a KV byte budget into a pool config via the configurator, re-applying
         the external token constraints (user cap, page alignment, PP sync) and the
@@ -3585,7 +3683,8 @@ class KVCacheConfigurator:
             create_memory_pool_configurator,
         )
 
-        configurator = create_memory_pool_configurator(self)
+        if configurator is None:
+            configurator = create_memory_pool_configurator(self)
         config = configurator.calculate_pool_sizes(
             budget_bytes, get_schedule().page_size
         )
@@ -3594,7 +3693,9 @@ class KVCacheConfigurator:
             # buffer as the KV/state dtype, so the total must be a dtype-size
             # multiple and a profiled budget is not. Flooring never overcommits.
             config.unified_total_bytes = budget_bytes - (budget_bytes % 4096)
-        max_tokens = self._apply_token_constraints(config.max_total_num_tokens)
+        max_tokens = self._apply_token_constraints(
+            config.max_total_num_tokens, sync_pp=sync_pp, warn_limits=warn_limits
+        )
         if cap_tokens is not None:
             max_tokens = min(max_tokens, cap_tokens)
         # calculate_pool_sizes_from_max_tokens takes a token count, not a byte

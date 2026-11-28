@@ -251,6 +251,51 @@ class TestDefaultConfigurator(CustomTestCase):
             config = cfg.calculate_pool_sizes(available_bytes, page_size)
         return mr, cfg, config
 
+    def _assert_request_table_fits(self, context_len, expected_requests):
+        from types import MethodType
+
+        import torch
+
+        from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_row_width
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+        mr = _make_model_runner(self, num_layers=2, max_running_requests=4)
+        mr.device = "cuda"
+        mr.model_config.context_len = context_len
+        mr.req_to_token_pool = None
+        for name in (
+            "config_from_budget",
+            "_apply_token_constraints",
+            "resolve_max_num_reqs",
+            "_req_to_token_bytes",
+            "_req_pool_rows",
+            "_req_pool_pre_alloc_size",
+            "_budget_with_request_tables",
+        ):
+            setattr(mr, name, MethodType(getattr(KVCacheConfigurator, name), mr))
+        mr._profile_available_bytes.return_value = 2_000_000
+        width = get_req_to_token_row_width(mr.model_config.context_len)
+        table = ReqToTokenPool(
+            size=expected_requests,
+            row_width=width,
+            device="cpu",
+            enable_memory_saver=False,
+        ).req_to_token
+        self.assertEqual(table.dtype, torch.int32)
+        with mock_cpu_env():
+            config = KVCacheConfigurator._resolve_memory_pool_config(mr, 0)
+        used = _actual_memory_used(mr, config) + table.nbytes
+        self.assertLessEqual(used, 2_000_000)
+        self.assertLess(2_000_000 - used, _full_per_token(mr) * 2)
+        self.assertEqual(config.max_running_requests, expected_requests)
+
+    def test_startup_budget_includes_the_request_table(self):
+        self._assert_request_table_fits(8192, 4)
+
+    def test_startup_uses_remaining_kv_budget_when_request_limit_reduces(self):
+        self._assert_request_table_fits(150_000, 2)
+
     def test_memory_utilization(self):
         """Memory used should be <= available and within 1% of available."""
         available = 10_000_000
