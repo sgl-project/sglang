@@ -1877,6 +1877,11 @@ macro_rules! tree_core_methods {
                     .map_err(node_access_error)
             }
 
+            fn rotation_phase_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
+                py.detach(|| self.core().rotation_phase_of(node_id))
+                    .map_err(node_access_error)
+            }
+
             fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
                 py.detach(|| self.core().dfs_weight_order(&node_ids))
                     .map_err(node_access_error)
@@ -2087,6 +2092,10 @@ macro_rules! tree_core_methods {
             /// Set the write-back (vs write-through) policy; decided at HiCache init.
             fn set_is_write_back(&self, py: Python<'_>, is_write_back: bool) {
                 py.detach(|| self.core().set_is_write_back(is_write_back));
+            }
+
+            fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) {
+                py.detach(|| self.core().set_mamba_path_cap_counts_host(enabled));
             }
 
             /// The current write-back (vs write-through) policy.
@@ -3312,6 +3321,10 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.rotation_base_of(py, node_id))
             }
 
+            fn rotation_phase_of(&self, py: Python<'_>, node_id: NodeId) -> PyResult<Option<i64>> {
+                catch_native_panic(|| self.inner.rotation_phase_of(py, node_id))
+            }
+
             fn dfs_weight_order(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<Vec<usize>> {
                 catch_native_panic(|| self.inner.dfs_weight_order(py, node_ids))
             }
@@ -3458,6 +3471,14 @@ macro_rules! tree_core_binding {
             /// The current write-back (vs write-through) policy.
             fn is_write_back(&self, py: Python<'_>) -> PyResult<bool> {
                 catch_native_panic(|| Ok(self.inner.is_write_back(py)))
+            }
+
+            /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
+            fn set_mamba_path_cap_counts_host(&self, py: Python<'_>, enabled: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.set_mamba_path_cap_counts_host(py, enabled);
+                    Ok(())
+                })
             }
 
             /// Set the write-through backup hit threshold; decided at HiCache init.

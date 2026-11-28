@@ -14,7 +14,7 @@ import json
 import math
 from collections import deque
 from collections.abc import Iterator
-from contextlib import closing
+from contextlib import closing, contextmanager
 from fractions import Fraction
 from itertools import islice
 from typing import Any
@@ -102,6 +102,7 @@ from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.runtime.utils.vision import (
     load_image,
     load_video,
+    open_video_source,
     preprocess_image,
 )
 from sglang.srt.environ import envs
@@ -256,9 +257,12 @@ def _iter_video_frames_pyav(
     if keep not in ("first", "last"):
         raise ValueError("keep must be 'first' or 'last'")
 
-    with av.open(video_path) as container:
+    with (
+        open_video_source(video_path) as source,
+        av.open(source, options={"protocol_whitelist": "data"}) as container,
+    ):
         if not container.streams.video:
-            raise ValueError(f"No video stream in {video_path!r}")
+            raise ValueError("Input media has no video stream.")
         stream = container.streams.video[0]
         stream.codec_context.thread_type = "SLICE"
         stream.codec_context.thread_count = 1
@@ -341,7 +345,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
         frames = load_video(control_path, max_frames=max_frames)
         if not frames:
-            raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
+            raise ValueError("No frames decoded from transfer video.")
         frames = frames[:max_frames]
         frames_cthw = torch.stack(
             [_pil_to_uint8_tensor(frame.convert("RGB")) for frame in frames],
@@ -571,7 +575,7 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
                 else:
                     processed = _preprocess_video_frames_gpu(frames, target_h, target_w)
             if not processed:
-                raise ValueError(f"No frames decoded from video: {video_path!r}")
+                raise ValueError("No frames decoded from input video.")
             # Pad CUDA frames after conversion to the VAE dtype instead.
             if force_cpu:
                 if len(processed) < num_source_frames:
@@ -1302,6 +1306,9 @@ class Cosmos3DenoisingStage(PipelineStage):
         # ``batch.extra["transformer_extra_kwargs"]`` (e.g. the Cosmos3
         # multiview attention layout and temporal wrap period).
         self._extra_transformer_kwargs: dict[str, Any] = {}
+        # The request being denoised; bound only for one denoising loop so the
+        # stage never keeps a finished request (and its tensors) alive.
+        self._request_batch: Req | None = None
 
         # Apply torch.compile if enabled
         if server_args is not None:
@@ -1415,7 +1422,11 @@ class Cosmos3DenoisingStage(PipelineStage):
         """
         if current_timestep is None:
             current_timestep = int(timestep.flatten()[0].item())
-        with set_forward_context(current_timestep=current_timestep, attn_metadata=None):
+        with set_forward_context(
+            current_timestep=current_timestep,
+            attn_metadata=None,
+            forward_batch=self._request_batch,
+        ):
             return self.transformer(
                 hidden_states=latents,
                 encoder_hidden_states=None,  # Not used by Cosmos3
@@ -1616,10 +1627,13 @@ class Cosmos3DenoisingStage(PipelineStage):
                 batch.num_inference_steps, device=batch.latents.device
             )
             batch.timesteps = self.scheduler.timesteps
-            with self.use_declared_component(
-                component_name="transformer",
-                module=self.transformer,
-                phase="denoise",
+            with (
+                self.use_declared_component(
+                    component_name="transformer",
+                    module=self.transformer,
+                    phase="denoise",
+                ),
+                self._bind_request(batch),
             ):
                 self._denoise_once(batch, server_args, generator=generator)
             with self.use_declared_component(
@@ -2091,12 +2105,23 @@ class Cosmos3DenoisingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.extra.get("transfer_plan") is not None:
             return self._forward_transfer(batch, server_args)
-        with self.use_declared_component(
-            component_name="transformer",
-            module=self.transformer,
-            phase="denoise",
+        with (
+            self.use_declared_component(
+                component_name="transformer",
+                module=self.transformer,
+                phase="denoise",
+            ),
+            self._bind_request(batch),
         ):
             return self._denoise_once(batch, server_args)
+
+    @contextmanager
+    def _bind_request(self, batch: Req):
+        self._request_batch = batch
+        try:
+            yield
+        finally:
+            self._request_batch = None
 
     def _predict_noise_cfg(
         self,

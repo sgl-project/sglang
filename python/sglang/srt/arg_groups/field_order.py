@@ -571,6 +571,8 @@ POSITIONAL_FIELD_ORDER = (
     "decode_state_free_radix_default",
     "disable_multimodal",
     "gc_freeze_on_idle_secs",
+    "elastic_ep_retiree_lifecycle",
+    "elastic_ep_reuse_cuda_graph",
     "enable_dsa_fp4_indexer",
     "kda_dwdp_size",
     "weight_cache_transport",
@@ -593,5 +595,7 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_loop_num_passes",
     "inkling2_loop_share_cache",
     "inkling2_tool_call_author_name_mode",
+    "disaggregation_decode_first_token_stream",
+    "allow_private_media_hosts",
 )
 # fmt: on

@@ -109,6 +109,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.linker_attachment import LinkerAttachment
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
@@ -387,6 +388,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        # Owns the external linker lifecycle; built by the registry.
+        self.linker_attachment: Optional[LinkerAttachment] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -483,9 +486,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         if cache_linker.load_mode == "prefetch":
-            memory = get_memory()
             self.prefetch_stop_policy = cache_linker.prefetch_policy
-            config = memory.unified_cache_external_linker_config
             (
                 _,
                 _,
@@ -493,9 +494,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 timeout_per_ki_token,
                 _,
             ) = HybridCacheController.parse_storage_backend_extra_config(
-                json.dumps(config)
-                if config is not None
-                else memory.hicache_storage_backend_extra_config
+                json.dumps(get_memory().unified_cache_external_linker_config)
             )
             self.prefetch_timeout_per_page = (
                 self.page_size / 1024 * timeout_per_ki_token
@@ -660,6 +659,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self._init_mamba_path_cap_counts_host()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -4487,6 +4487,15 @@ class UnifiedRadixCache(BasePrefixCache):
         while acks and acks[0].finish_event.query():
             self._log_write_ack_metrics(acks.popleft())
 
+    def wait_fenced_writes(self) -> None:
+        """Wait for the stream-fenced write-back copies, which
+        ongoing_write_through no longer tracks."""
+        acks = self._fenced_write_acks
+        while acks:
+            ack = acks.popleft()
+            ack.finish_event.synchronize()
+            self._log_write_ack_metrics(ack)
+
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
     ) -> None:
@@ -4613,6 +4622,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if comp is None:
             return False
         return comp._mamba_host_only_checkpoint()
+
+    def _init_mamba_path_cap_counts_host(self) -> None:
+        """Let the per-path Mamba state cap count and free host copies; a no-op
+        without a cap (checkpoints level 3) or a Mamba host pool in cache mode."""
+        comp = self.components.get(ComponentType.MAMBA)
+        cap = comp.mamba_max_states_per_path if comp is not None else -1
+        if (
+            cap < 0
+            or comp._mamba_pool_host is None
+            or self.host_memory_mode == "buffer_only"
+        ):
+            return
+        self.tree_core.set_mamba_path_cap_counts_host(True)
+        logger.info("Mamba path cap counts host copies (cap %d)", cap)
 
     # ---- HiCache: Scheduler Entry Points ----
 

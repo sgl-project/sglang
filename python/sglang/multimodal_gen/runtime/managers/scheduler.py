@@ -87,6 +87,7 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin i
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
+    configure_media_url_policy,
     set_global_server_args,
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
@@ -160,6 +161,7 @@ class Scheduler(
             local_rank = gpu_id
 
         set_global_server_args(server_args=server_args)
+        configure_media_url_policy(server_args)
 
         # Each DP replica is a contiguous rank block (dp is the outermost
         # layout axis); its first rank binds the replica's ingress, and the

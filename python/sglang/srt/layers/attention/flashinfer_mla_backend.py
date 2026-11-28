@@ -1264,7 +1264,6 @@ class FlashInferMLAMultiStepDraftBackend:
         self.forward_metadata = None
 
         # Cached variables for generate_draft_decode_kv_indices
-        self.req_to_token_pool = model_runner.req_to_token_pool
         self.max_kv_len = self.attn_backends[0].max_kv_len
         self.page_size = get_schedule().page_size
         self.runner_ids = model_runner.runner_ids
