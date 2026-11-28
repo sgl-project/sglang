@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
 from functools import partial
@@ -55,6 +56,18 @@ class DevicePoolEntry:
 
         if not self.components or any(not component for component in self.components):
             raise ValueError(f"Device pool {name} has no storage buffers.")
+        # Storage keys carry the page layout, so writers that lay a page out
+        # differently (dtype, packed or sidecar drafts) never read each other.
+        layout = (
+            packed,
+            page_size,
+            self._row_span,
+            [
+                [(str(buffer.dtype), tuple(buffer.shape[1:])) for buffer in component]
+                for component in self.components
+            ],
+        )
+        self.key_tag = hashlib.sha256(repr(layout).encode()).hexdigest()[:12]
         self.kv_buffer = [buffer for group in self.components for buffer in group]
         self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
 

@@ -43,11 +43,16 @@ MAX_RANGES_PER_READ = 4096
 
 
 def _storage_suffix(
-    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+    *,
+    rank_replicated: bool,
+    tp_rank: int,
+    tp_size: int,
+    attn_cp_rank: int,
+    pp_rank: int,
 ) -> str:
     parts = []
     if not rank_replicated:
-        parts.append(f"tp{tp_rank}")
+        parts.append(f"tp{tp_rank}of{tp_size}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
 
@@ -59,6 +64,7 @@ def _shared_pool_suffix(
     *,
     tp_shared: bool,
     tp_rank: int,
+    tp_size: int,
     attn_cp_rank: int,
     pp_rank: int,
     dcp_sharded: bool,
@@ -67,7 +73,7 @@ def _shared_pool_suffix(
 ) -> str:
     """Key suffix for a pool whose pages are byte-identical across attention TP.
     The versioned shared term keeps it from aliasing an older per-rank object."""
-    parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
+    parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}of{tp_size}"]
     if dcp_sharded:
         parts.append(f"dcp{dcp_size}r{dcp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
@@ -98,6 +104,7 @@ def _storage_sharing(
         name: _shared_pool_suffix(
             tp_shared=name in tp_shared,
             tp_rank=tp_rank,
+            tp_size=tp_size,
             attn_cp_rank=attn_cp_rank,
             pp_rank=pp_rank,
             dcp_sharded=name in dcp_sharded,
@@ -186,6 +193,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         storage_suffix = _storage_suffix(
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
+            tp_size=tp_size,
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
         )

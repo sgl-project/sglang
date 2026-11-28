@@ -32,6 +32,33 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDevicePoolEntry(CustomTestCase):
+    def test_key_tag_follows_the_page_layout(self):
+        def entry(*components, packed=True):
+            return DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=components,
+                layer_mapping={0: 0},
+                page_size=2,
+                rows_are_pages=True,
+                packed=packed,
+            )
+
+        def buf(width, dtype=torch.uint8):
+            return torch.zeros((4, width), dtype=dtype)
+
+        tag = entry([buf(8)], [buf(4)]).key_tag
+        self.assertEqual(entry([buf(8)], [buf(4)]).key_tag, tag)
+        for other in (
+            entry([buf(8, torch.float8_e4m3fn)], [buf(4)]),
+            entry([buf(8), buf(8)], [buf(4), buf(4)]),
+            entry([buf(8)], [buf(4)], [buf(2)]),
+            entry([buf(16)], [buf(4)]),
+            entry([buf(8)], [buf(4)], packed=False),
+        ):
+            self.assertNotEqual(other.key_tag, tag)
+
     def test_sparse_multi_component_layer_ranges(self):
         k0 = torch.zeros((8, 3), dtype=torch.uint8)
         k2 = torch.zeros((8, 5), dtype=torch.uint8)
