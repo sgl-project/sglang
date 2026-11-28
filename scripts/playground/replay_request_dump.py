@@ -145,13 +145,22 @@ if __name__ == "__main__":
         "--input-file", type=str, default=None, help="Single pickle file to process"
     )
     parser.add_argument("--file-number", type=int, default=1)
-    parser.add_argument("--req-number", type=int, default=1000000)
+    parser.add_argument(
+        "--req-number",
+        type=int,
+        default=1000000,
+        help="Maximum requests to select after --req-start",
+    )
     parser.add_argument("--req-start", type=int, default=0)
     parser.add_argument("--parallel", type=int, default=512)
-    parser.add_argument("--idx", type=int, default=None)
+    parser.add_argument(
+        "--idx", type=int, help="Replay only this index within the selected requests"
+    )
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--speed", type=float, default=1)
     args = parser.parse_args()
+    if args.req_number < 0:
+        parser.error("--req-number must be non-negative")
 
     set_ulimit()
 
@@ -171,8 +180,9 @@ if __name__ == "__main__":
     records = read_records(files)
     # Sort by the receive time, before filtering
     records.sort(key=lambda x: x[-2])
-    records = records[args.req_start :]
-    if args.idx:
+    del records[: args.req_start]
+    del records[args.req_number :]
+    if args.idx is not None:
         records = [records[args.idx]]
         print(f"testing {args.idx=}")
         print(f"{records[0]}")
