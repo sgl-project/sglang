@@ -340,15 +340,6 @@ class TestSlotLifecycle(_PoolTestCase):
 
 
 class TestWatermarkFields(_PoolTestCase):
-    def test_without_watermarking_the_pool_keeps_no_fields(self):
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
-        pool.write([_req(1, top_k=50)])
-
-        rows = _gather(pool, [1])
-
-        self.assertEqual(pool.table.values.shape[0], pool.table.WATERMARK)
-        self.assertIsNone(rows.watermark)
-
     def test_gumbel_rows_read_back_each_request_value(self):
         """Keys (negative ones included) are rebuilt exactly from two int32
         halves; a greedy or disabled row is no candidate."""

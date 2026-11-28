@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
@@ -89,8 +89,7 @@ class SamplingBatchInfo:
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
 
     def set_rows(self, rows: SamplingRows) -> None:
-        """Set the step's state read from its rows of `SamplingParamsPool`: the
-        sampler params, the per-row seeds, the penalties, and the watermark rows."""
+        """Set the step's state from its rows of `SamplingParamsPool`."""
         for name, value in zip(rows._fields, rows):
             setattr(self, name, value)
 

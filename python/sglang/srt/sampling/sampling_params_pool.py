@@ -11,8 +11,6 @@ penalty index, its seed, and the watermark algorithm's per-request values.
   Under overlap a later admission may rewrite a slot before an earlier replay
   reads it; only a finished, retracted, or aborted row's slot is reused, so the
   row it changes is discarded, and the target sampler reads the launch's gather.
-- The host keeps what the batch-level flags and counts need, so a launch derives
-  them without a pass over its requests or a device sync.
 """
 
 from __future__ import annotations
@@ -64,7 +62,6 @@ class SamplingRows(NamedTuple):
 
     @classmethod
     def empty(cls, device) -> SamplingRows:
-        """The rows of a batch with no requests."""
         return cls(
             temperatures=torch.empty((0, 1), dtype=torch.float32, device=device),
             top_ps=torch.empty(0, dtype=torch.float32, device=device),
