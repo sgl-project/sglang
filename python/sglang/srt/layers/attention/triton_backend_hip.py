@@ -147,9 +147,9 @@ def init_full_cg_extend_metadata(backend, forward_batch, in_capture):
     if bufs is None:
         assert in_capture
         bufs = backend.full_cg_extend_buffers = (
-            # every prefix is shorter than the context
+            # every prefix fits a req_to_token row
             torch.empty(
-                bs * backend.max_context_len, dtype=torch.int64, device=backend.device
+                bs * backend.max_kv_len, dtype=torch.int64, device=backend.device
             ),
             torch.empty(
                 bs * window if name is not None else 0,

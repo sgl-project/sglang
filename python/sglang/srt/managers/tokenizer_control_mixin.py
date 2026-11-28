@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    ElasticControlOutput,
     EndWeightUpdateReqInput,
     EndWeightUpdateReqOutput,
     ExpertDistributionReq,
@@ -90,6 +91,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
+    unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.platforms import current_platform
@@ -194,6 +196,7 @@ class TokenizerControlMixin:
 
     def init_communicators(self: TokenizerManager):
         dispatch_pairs = []
+        self._control_communicator_by_type = {}
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
@@ -204,9 +207,27 @@ class TokenizerControlMixin:
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
+            self._control_communicator_by_type[resp_type] = comm
+        dispatch_pairs.append(
+            (ElasticControlOutput, self._handle_elastic_control_reply)
+        )
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
-    def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
+    def _handle_elastic_control_reply(
+        self: TokenizerManager, reply: ElasticControlOutput
+    ):
+        payload = unwrap_from_pickle(reply.payload)
+        comm = self._control_communicator_by_type.get(type(payload))
+        if comm is None:
+            self._result_dispatcher(payload)
+        else:
+            comm.handle_recv(payload, sender=reply.sender_dp_rank)
+
+    def update_control_communicator_fan_out(
+        self: TokenizerManager, worker_count: int, *, keep_scale_fan_out: bool = False
+    ):
+        """``keep_scale_fan_out``: leave scale_elastic_ep wide, as it still needs the
+        retirees' acks while every other control call stops waiting on them."""
         primary_group_control = (
             get_parallel().attn_dp_enabled and not is_control_broadcast_local()
         )
@@ -218,9 +239,15 @@ class TokenizerControlMixin:
             control_fan_out = worker_count
 
         for spec in _COMMUNICATOR_SPECS:
-            getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
+            if keep_scale_fan_out and spec[0] == "scale_elastic_ep":
+                continue
+            getattr(self, f"{spec[0]}_communicator").set_fan_out(
+                worker_count, live_senders=worker_count
+            )
 
-        self.get_internal_state_communicator.set_fan_out(control_fan_out)
+        self.get_internal_state_communicator.set_fan_out(
+            control_fan_out, live_senders=worker_count
+        )
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -332,9 +359,10 @@ class TokenizerControlMixin:
         self: TokenizerManager, timeout_s: Optional[float] = None
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        result = (
-            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
-        )[0]
+        results = await self.flush_cache_communicator(
+            FlushCacheReqInput(timeout_s=timeout_s)
+        )
+        result = next((reply for reply in results if not reply.success), results[0])
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result

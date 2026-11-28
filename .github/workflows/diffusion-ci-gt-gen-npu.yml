@@ -9,7 +9,7 @@ on:
         default: ''
         type: string
       case_ids:
-        description: 'Specific case IDs to run (space-separated, optional)'
+        description: 'Specific case IDs to run (space-separated). Defaults to consistency-enabled cases.'
         required: false
         default: ''
         type: string
@@ -74,14 +74,18 @@ jobs:
       - name: Compute partitions
         env:
           USE_NPU_CONFIGS: true
+          CASE_IDS: ${{ inputs.case_ids }}
         id: compute
+        shell: bash
         run: |
+          read -r -a case_ids <<< "$CASE_IDS"
           python scripts/ci/utils/diffusion/compute_diffusion_partitions.py \
             --min-time 1200 \
             --target-time 1800 \
             --max-time 2400 \
             --max-partitions 10 \
-            --parametrized-only
+            --parametrized-only \
+            --case-ids "${case_ids[@]}"
 
   multimodal-diffusion-gen-1npu:
     needs: compute-diffusion-partitions
@@ -94,7 +98,7 @@ jobs:
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-1npu) }}
     timeout-minutes: 150
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.2.0-a3-ubuntu22.04-py3.12
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -113,6 +117,7 @@ jobs:
 
       - name: Generate outputs
         env:
+          CASE_IDS: ${{ inputs.case_ids }}
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1npu }}
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -120,7 +125,9 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+        shell: bash
         run: |
+          read -r -a case_ids <<< "$CASE_IDS"
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
             --suite 1-npu \
@@ -128,7 +135,8 @@ jobs:
             --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-1npu'] }} \
             --partition-plan-json "$PARTITION_PLAN_JSON" \
             --out-dir ./${{ env.OUTPUT_NAME }} \
-            ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
+            --consistency-only \
+            --case-ids "${case_ids[@]}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -156,7 +164,7 @@ jobs:
       matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2npu) }}
     timeout-minutes: 150
     container:
-      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
+      image: swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:9.2.0-a3-ubuntu22.04-py3.12
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -175,6 +183,7 @@ jobs:
 
       - name: Generate outputs
         env:
+          CASE_IDS: ${{ inputs.case_ids }}
           PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2npu }}
           SGLANG_USE_MODELSCOPE: true
           SGLANG_IS_IN_CI: true
@@ -182,7 +191,9 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+        shell: bash
         run: |
+          read -r -a case_ids <<< "$CASE_IDS"
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
             --suite 2-npu \
@@ -190,7 +201,8 @@ jobs:
             --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-2npu'] }} \
             --partition-plan-json "$PARTITION_PLAN_JSON" \
             --out-dir ./${{ env.OUTPUT_NAME }} \
-            ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
+            --consistency-only \
+            --case-ids "${case_ids[@]}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

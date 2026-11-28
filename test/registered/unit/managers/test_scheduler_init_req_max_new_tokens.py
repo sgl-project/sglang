@@ -6,13 +6,19 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
+
+maybe_stub_sgl_kernel()
+
+from sglang.srt.managers.scheduler import Scheduler
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -28,11 +34,11 @@ def setUpModule():
     unittest.addModuleCleanup(patcher.stop)
 
 
-class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
+class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
-      1. context: input_len + max_new_tokens < max_req_len
+      1. context: input_len + max_new_tokens <= max_req_len
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size * shard_widening
          < max_total_num_tokens * shard_widening
@@ -57,7 +63,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls._scheduler_logger.setLevel(cls._old_level)
+        if hasattr(cls, "_scheduler_logger") and hasattr(cls, "_old_level"):
+            cls._scheduler_logger.setLevel(cls._old_level)
 
     def setUp(self):
         # Tests use an unsharded topology unless they explicitly override it.
@@ -74,6 +81,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.transfer_backend = TransferBackend.NIXL
         scheduler.max_req_len = max_req_len
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
@@ -96,9 +104,16 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator.page_size = page_size
         return scheduler
 
-    def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
+    def _new_req(
+        self,
+        max_new_tokens,
+        input_len: int = 8,
+        min_new_tokens: int = 0,
+        bootstrap_host=None,
+    ):
         return SimpleNamespace(
             rid="test-req",
+            bootstrap_host=bootstrap_host,
             origin_input_ids=[0] * input_len,
             sampling_params=SimpleNamespace(
                 max_new_tokens=max_new_tokens, min_new_tokens=min_new_tokens
@@ -120,7 +135,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
-            context_ok = input_len + candidate < scheduler.max_req_len
+            context_ok = input_len + candidate <= scheduler.max_req_len
             budget_ok = (
                 paged_input_len + candidate + page_size * shard_widening
                 < scheduler.max_total_num_tokens * shard_widening
@@ -168,8 +183,25 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             scheduler = self._new_scheduler(max_req_len=max_req_len)
             req = self._new_req(max_new_tokens=64, input_len=input_len)
             self.assertEqual(
-                self._init_and_check(scheduler, req), max_req_len - input_len - 1
+                self._init_and_check(scheduler, req), max_req_len - input_len
             )
+
+    def test_public_context_boundary_is_not_clipped(self):
+        """A request accepted at the public context limit keeps its full output."""
+        context_len, input_len = 4096, 4080
+        scheduler = self._new_scheduler(
+            max_req_len=context_len,
+            max_total_num_tokens=1 << 20,
+        )
+        req = self._new_req(
+            max_new_tokens=context_len - input_len,
+            input_len=input_len,
+        )
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(
+            req.sampling_params.max_new_tokens,
+            context_len - input_len,
+        )
 
     def test_budget_rule_binds_tighter_than_limit(self):
         max_total_num_tokens, page_size, input_len = 24, 4, 8
@@ -309,13 +341,12 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         size_full = scheduler.token_to_kv_pool_allocator.size_full
         scheduler.max_total_num_tokens = size_full // 4
         scheduler.max_req_len = size_full // 2
-        # The longest prompt the tokenizer lets through: max_req_len - 5.
-        input_len = scheduler.max_req_len - 5
+        input_len = scheduler.max_req_len - 6
         req = self._new_req(max_new_tokens=32, input_len=input_len)
         req.set_finish_with_abort = lambda msg: self.fail(f"aborted: {msg}")
         scheduler.init_req_max_new_tokens(req)
         self.assertEqual(
-            req.sampling_params.max_new_tokens, scheduler.max_req_len - input_len - 1
+            req.sampling_params.max_new_tokens, scheduler.max_req_len - input_len
         )
 
     def test_pd_prefill_forces_one_handoff_token(self):
@@ -329,16 +360,53 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler = self._new_scheduler(max_total_num_tokens=32)
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
 
-        req = self._new_req(max_new_tokens=64, input_len=30, min_new_tokens=8)
+        req = self._new_req(
+            max_new_tokens=64, input_len=30, min_new_tokens=8, bootstrap_host="10.0.0.1"
+        )
         scheduler.init_req_max_new_tokens(req)
         self.assertEqual(req.sampling_params.max_new_tokens, 1)
         self.assertEqual(req.sampling_params.min_new_tokens, 1)
 
         # Without a user minimum, EOS stays legal as the handoff token.
-        req = self._new_req(max_new_tokens=None, input_len=30, min_new_tokens=0)
+        req = self._new_req(
+            max_new_tokens=None,
+            input_len=30,
+            min_new_tokens=0,
+            bootstrap_host="10.0.0.1",
+        )
         scheduler.init_req_max_new_tokens(req)
         self.assertEqual(req.sampling_params.max_new_tokens, 1)
         self.assertEqual(req.sampling_params.min_new_tokens, 0)
+
+    def test_pd_prefill_keeps_budget_of_request_it_answers_alone(self):
+        """A hostless request on a real-backend prefill server has no decode
+        to take a handoff, so a 0 or 1 budget stays; everything else gets 1."""
+        scheduler = self._new_scheduler(max_total_num_tokens=32)
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+
+        for asked in (0, 1):
+            req = self._new_req(max_new_tokens=asked, input_len=30)
+            scheduler.init_req_max_new_tokens(req)
+            self.assertEqual(req.sampling_params.max_new_tokens, asked)
+
+        # Intake rejects it before the budget matters; the budget itself stays
+        # the handoff token.
+        req = self._new_req(max_new_tokens=64, input_len=30, min_new_tokens=8)
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 1)
+        self.assertEqual(req.sampling_params.min_new_tokens, 1)
+
+        for asked in (0, 1, 64, None):
+            req = self._new_req(
+                max_new_tokens=asked, input_len=30, bootstrap_host="10.0.0.1"
+            )
+            scheduler.init_req_max_new_tokens(req)
+            self.assertEqual(req.sampling_params.max_new_tokens, 1)
+
+        scheduler.transfer_backend = TransferBackend.FAKE
+        req = self._new_req(max_new_tokens=0, input_len=30)
+        scheduler.init_req_max_new_tokens(req)
+        self.assertEqual(req.sampling_params.max_new_tokens, 1)
 
 
 if __name__ == "__main__":

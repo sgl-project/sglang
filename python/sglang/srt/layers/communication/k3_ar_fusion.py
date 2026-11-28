@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 import torch
 
 import sglang.srt.runtime_context as ctx
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
 
@@ -35,6 +36,13 @@ logger = logging.getLogger(__name__)
 # push wins below ~0.5 MB on B200x8/GB300 (bs<=32 @ H=7168); NVLS 2shot wins
 # above (measured: push 8.5us vs pull 11.0us at 448KB, 15.5 vs 11.0 at 896KB).
 _PUSH_MAX_BYTES = 512 * 1024
+_PUSH_MAX_BYTES_SM107 = 2 * 1024 * 1024
+
+
+def _push_max_bytes() -> int:
+    """Largest message the 1shot push takes; the NVLS 2shot pull takes the rest."""
+    return _PUSH_MAX_BYTES_SM107 if current_arch().is_sm(10, 7) else _PUSH_MAX_BYTES
+
 
 # Deferred-finalize push eliminates the standalone MoE finalize write+read on
 # [M, NORM_DIM] and runs across all SMs, so using the full already-allocated
@@ -295,7 +303,7 @@ def all_reduce(
     if x.shape[0] == 0:
         return x if residual is None else x + residual
     nbytes = x.numel() * 2
-    if nbytes <= min(_PUSH_MAX_BYTES, state.push_slot_bytes):
+    if nbytes <= min(_push_max_bytes(), state.push_slot_bytes):
         return mod.all_reduce_push_res(state.world_size, x, residual)
     return mod.all_reduce_pull_res(
         state.world_size, x, residual, input_mc_ptr=get_mc_ptr(x)
@@ -346,7 +354,7 @@ def all_reduce_norm(
     if x.shape[0] == 0:
         return x
     nbytes = x.numel() * 2
-    if nbytes <= min(_PUSH_MAX_BYTES, state.push_slot_bytes):
+    if nbytes <= min(_push_max_bytes(), state.push_slot_bytes):
         return mod.all_reduce_push_norm(
             state.world_size,
             x,
