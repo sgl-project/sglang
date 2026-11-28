@@ -84,6 +84,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
+from sglang.test.nixl_utils import attach_nixl_transport
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=23, suite="base-a-test-cpu")
@@ -2327,6 +2328,12 @@ class _MemcpyNixlAgent:
     def __init__(self, memory: np.ndarray):
         self.memory = memory
 
+    def register_memory(self, addrs, mem_type):
+        return addrs
+
+    def add_remote_agent(self, metadata):
+        return metadata.decode("ascii")
+
     def get_xfer_descs(self, reqs, mem_type):
         return reqs
 
@@ -2411,7 +2418,13 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
         self.assertEqual(rc, 0)
 
     def _send_nixl(self, memory, prefill, dst_rank, decode_tp, dst_ptrs, item_len):
-        prefill.agent = _MemcpyNixlAgent(memory)
+        attach_nixl_transport(
+            prefill,
+            _MemcpyNixlAgent(memory),
+            state=prefill.kv_args.state_data_ptrs,
+            peers=("decode",),
+            peer_state=[dst_ptrs],
+        )
         prefill.enable_kv_packing = False
         prefill._prepared_state_plans = {}
         prefill._state_layout_rejections = {}
@@ -2421,7 +2434,6 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
                 [np.array(self.SRC_PAGES, dtype=np.int32)],
                 [dst_ptrs],
                 [self.DST_PAGES],
-                0,
                 decode_tp,
                 decode_tp_rank=dst_rank,
                 dst_state_item_lens=[[item_len] * len(dst_ptrs)],
@@ -3586,7 +3598,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             ),
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token, row_width=req_to_token.shape[1]
+            ),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([4, 4], dtype=torch.int64),
         )
@@ -3649,7 +3663,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             ),
             req_pool_indices=torch.tensor([1, 1], dtype=torch.int64),
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token, row_width=req_to_token.shape[1]
+            ),
             seq_lens=torch.tensor([4, 3], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([4, 3], dtype=torch.int64),
         )
