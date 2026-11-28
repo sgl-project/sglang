@@ -11,7 +11,6 @@ from __future__ import annotations
 import importlib.util
 import logging
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
@@ -25,6 +24,7 @@ from sglang.srt.mem_cache.kv.plan import (
     TREE_WINDOW,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.rust_extensions.loader import query_rust_toolchain
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -112,19 +112,10 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
             return "the requested Rust TreeCore source build has no sources"
         return "this installation contains neither the Rust TreeCore extension nor its sources"
     # Even a cached source build needs these version queries for its fingerprint.
-    # Match the loader's commands and cwd so rustup workspace overrides apply.
-    for command in (("cargo", "--version", "--verbose"), ("rustc", "-vV")):
-        try:
-            subprocess.run(
-                command,
-                cwd=workspace,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return f"the Rust TreeCore toolchain is unavailable ({' '.join(command)})"
+    try:
+        query_rust_toolchain(workspace)
+    except (OSError, RuntimeError) as exc:
+        return f"the Rust TreeCore toolchain is unavailable: {exc}"
     return None
 
 

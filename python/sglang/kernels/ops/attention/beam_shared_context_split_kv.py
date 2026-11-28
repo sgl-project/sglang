@@ -38,6 +38,7 @@ from sglang.kernels.ops.attention.beam_shared_context import (
     attend_prompt_block,
     check_shared_context_inputs,
     empty_softmax_state,
+    max_element_offset,
 )
 
 # Fastest of ten tiles on RTX PRO 6000 at 256 beams, head_dim 128; untuned elsewhere.
@@ -338,12 +339,6 @@ def resident_ctas_per_sm(kernel) -> int:
     if error != driver.CUresult.CUDA_SUCCESS or count < 1:
         raise RuntimeError(f"{kernel.name} fits no CTA on an SM: {error}, {count}")
     return count
-
-
-def max_element_offset(tensor: torch.Tensor) -> int:
-    return sum(
-        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
-    )
 
 
 _WAVE_CTAS: dict[tuple, int] = {}

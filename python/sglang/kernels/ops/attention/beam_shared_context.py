@@ -80,7 +80,7 @@ def _shared_context_attention_kernel(
     row_indices,  # [groups, BEAM_WIDTH] int32, each beam's row of q and output
     context_slots,  # [>= total prompt tokens] int32 KV slots, groups back to back
     context_cu_seqlens,  # [groups + 1] int32, each group's start in context_slots
-    decode_slots,  # [groups, MAX_DECODE * BEAM_WIDTH] int32 KV slots, step-major
+    decode_slots,  # [groups, decode capacity * BEAM_WIDTH] int32 KV slots, step-major
     decode_lens,  # [groups] int32, decode steps each beam attends to
     output,  # like q; only the rows in row_indices are written
     softmax_scale,
@@ -103,10 +103,10 @@ def _shared_context_attention_kernel(
     BEAM_WIDTH: tl.constexpr,
     Q_PER_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    MAX_DECODE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    WIDE_KV_OFFSETS: tl.constexpr,  # K/V offsets past 2^31: slot * stride needs 64 bits
 ):
     group = tl.program_id(0)
     q_head = tl.program_id(1)
@@ -153,6 +153,8 @@ def _shared_context_attention_kernel(
             mask=token_mask,
             other=0,
         )
+        if WIDE_KV_OFFSETS:
+            slots = slots.to(tl.int64)
         k_offsets = (
             slots[:, None] * stride_k_slot
             + kv_head * stride_k_head
@@ -190,17 +192,18 @@ def _shared_context_attention_kernel(
         )
 
     decode_length = tl.load(decode_lens + group)
-    for step in range(0, MAX_DECODE):
-        step_valid = step < decode_length
+    for step in range(0, decode_length):
         decode_offsets = (
             group * stride_decode_group
             + (step * BEAM_WIDTH + beam_offsets) * stride_decode_token
         )
         slots = tl.load(
             decode_slots + decode_offsets,
-            mask=beam_mask & step_valid,
+            mask=beam_mask,
             other=0,
         )
+        if WIDE_KV_OFFSETS:
+            slots = slots.to(tl.int64)
         k_offsets = (
             slots[:, None] * stride_k_slot
             + kv_head * stride_k_head
@@ -213,12 +216,12 @@ def _shared_context_attention_kernel(
         )
         k_values = tl.load(
             k_buffer + k_offsets,
-            mask=beam_mask[:, None] & step_valid & dim_mask[None, :],
+            mask=beam_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
         v_values = tl.load(
             v_buffer + v_offsets,
-            mask=beam_mask[:, None] & step_valid & dim_mask[None, :],
+            mask=beam_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
         score_matrix = tl.dot(q_values, tl.trans(k_values))
@@ -227,7 +230,7 @@ def _shared_context_attention_kernel(
             tl.where(diagonal_mask, score_matrix, 0.0),
             axis=1,
         )
-        scores = tl.where(beam_mask & step_valid, scores, negative_infinity)
+        scores = tl.where(beam_mask, scores, negative_infinity)
         max_values, normalizers, accumulator = attend_beam_token(
             scores,
             v_values,
@@ -282,6 +285,12 @@ def check_shared_context_inputs(
         raise ValueError("Context offsets must contain one boundary per beam group")
     if output is not None and output.shape != q.shape:
         raise ValueError("Output must match Q shape")
+
+
+def max_element_offset(tensor: torch.Tensor) -> int:
+    return sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
 
 
 def shared_context_attention(
@@ -355,10 +364,11 @@ def shared_context_attention(
         BEAM_WIDTH=beam_width,
         Q_PER_KV=q_heads // kv_heads,
         HEAD_DIM=head_dim,
-        MAX_DECODE=decode_slots.shape[1] // beam_width,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=block_d,
+        # 64-bit address math costs 2-5% of the kernel; pay it only when needed.
+        WIDE_KV_OFFSETS=max(map(max_element_offset, (k_buffer, v_buffer))) >= 2**31,
         num_warps=num_warps,
         num_stages=num_stages,
     )

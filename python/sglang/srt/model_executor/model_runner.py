@@ -1768,6 +1768,13 @@ class ModelRunner:
 
             return UnoDecodeCudaGraphRunner
 
+        from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
+            BeamDecodeCudaGraphRunner,
+        )
+
+        if BeamDecodeCudaGraphRunner.enabled(self.spec_algorithm):
+            return BeamDecodeCudaGraphRunner
+
         from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
             DecodeCudaGraphRunner,
         )

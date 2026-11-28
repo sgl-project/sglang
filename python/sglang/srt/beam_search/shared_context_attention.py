@@ -68,6 +68,13 @@ def resolve_attention_kernel() -> Callable:
     return shared_context_attention
 
 
+def has_shared_context(forward_batch: ForwardBatch) -> bool:
+    return (
+        forward_batch.beam is not None
+        and forward_batch.beam.attention_metadata is not None
+    )
+
+
 def _unsupported_reason(model_runner: ModelRunner) -> Optional[str]:
     from sglang.srt.configs.model_config import AttentionArch
     from sglang.srt.layers.radix_attention import RadixAttention

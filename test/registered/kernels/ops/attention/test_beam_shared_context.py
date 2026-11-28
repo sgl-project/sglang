@@ -236,18 +236,22 @@ class TestBeamSharedContextAttention(CustomTestCase):
         scale = 1.0 / math.sqrt(head_dim)
         reference = torch.empty(q.shape, dtype=torch.float32, device=device)
         _reference(q, kv, kv, bucket, scale, reference)
-        output = shared_context_attention_split_kv(
-            q,
-            kv,
-            kv,
-            bucket.row_indices,
-            bucket.context_slots,
-            bucket.context_cu_seqlens,
-            bucket.decode_slots,
-            bucket.decode_lens,
-            softmax_scale=scale,
-        )
-        torch.testing.assert_close(output.float(), reference, rtol=1e-2, atol=1e-2)
+        for name, kernel in KERNELS.items():
+            with self.subTest(kernel=name):
+                output = kernel(
+                    q,
+                    kv,
+                    kv,
+                    bucket.row_indices,
+                    bucket.context_slots,
+                    bucket.context_cu_seqlens,
+                    bucket.decode_slots,
+                    bucket.decode_lens,
+                    softmax_scale=scale,
+                )
+                torch.testing.assert_close(
+                    output.float(), reference, rtol=1e-2, atol=1e-2
+                )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_kernels_write_only_their_buckets_rows(self):
