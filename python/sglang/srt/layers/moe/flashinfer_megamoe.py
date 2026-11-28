@@ -257,8 +257,9 @@ def _ensure_flashinfer_megamoe_layer(
     layer: FusedMoE,
     *,
     megakernel_config: Any,
-    w13_scale: torch.Tensor,
-    w2_scale: torch.Tensor,
+    w13_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    transformed_weights: Any = None,
     with_decode_workspace: bool = False,
 ) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
@@ -272,10 +273,11 @@ def _ensure_flashinfer_megamoe_layer(
         MoEEpMegaLayer,
     )
 
-    transformed_weights = (
-        (layer.w13_weight.data, w13_scale.data),
-        (layer.w2_weight.data, w2_scale.data),
-    )
+    if transformed_weights is None:
+        transformed_weights = (
+            (layer.w13_weight.data, w13_scale.data),
+            (layer.w2_weight.data, w2_scale.data),
+        )
     world_size, rank = _layer_ep_world_rank(layer)
 
     max_tokens_per_rank = _resolve_max_tokens_per_rank()
@@ -340,6 +342,21 @@ def ensure_fp4_moe_layer_for_flashinfer_megamoe(layer: FusedMoE) -> Any:
     mega = _get_or_init_flashinfer_megamoe_layer_state(layer)
     if mega is not None:
         return mega
+
+    if _uses_mxfp4_w4a4(layer):
+        from flashinfer.moe_ep import Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+
+        return _ensure_flashinfer_megamoe_layer(
+            layer,
+            megakernel_config=Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=layer.intermediate_size_per_partition,
+                top_k=layer.top_k,
+                gate_up_clamp=layer.moe_runner_config.swiglu_limit,
+            ),
+            # FlashInfer's own tensors; the layer's parameters are byte views
+            # of them (see _prepare_mxfp4_w4a4_weights).
+            transformed_weights=layer._flashinfer_megamoe_mxfp4_weights,
+        )
 
     from flashinfer.moe_ep import DeepGemmMegaMoeConfig
 
@@ -454,7 +471,9 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
 
     SGLang loads FP4-packed expert weights plus raw block scales. FlashInfer's
     current moe_ep API owns backend-specific weight preprocessing, including
-    DeepGEMM scale layout transforms.
+    DeepGEMM scale layout transforms. With --enable-w4a4-mxfp4-megamoe the
+    layer runs FlashInfer's SM107 MXFP4 x MXFP4 kernel instead of DeepGEMM's
+    FP8 x FP4 one.
     """
     if (
         not layer.moe_runner_config.is_gated
@@ -462,6 +481,9 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
     ):
         raise ValueError("FlashInfer DeepGEMM MegaMOE only supports gated SiLU.")
     _init_flashinfer_megamoe_layer_state(layer)
+    if _uses_mxfp4_w4a4(layer):
+        _prepare_mxfp4_w4a4_weights(layer)
+        return
 
     from flashinfer.moe_ep import (
         MoEWeightPack,
@@ -485,6 +507,101 @@ def prepare_fp4_moe_weights_for_flashinfer_megamoe(
         w13_scale_name="w13_weight_scale_inv",
         w2_scale_name="w2_weight_scale_inv",
     )
+
+
+def _uses_mxfp4_w4a4(layer: FusedMoE) -> bool:
+    """FP4-expert layers built with --enable-w4a4-mxfp4-megamoe (MXFP4 weights,
+    E8M0 scales per 32 values) quantize activations to MXFP4 as well."""
+    return bool(getattr(layer, "_mega_moe_w4a4", False))
+
+
+def _as_e8m0(sf: torch.Tensor) -> torch.Tensor:
+    """Per-32 block scales as float8_e8m0fnu. FP32 / BF16 scales must be
+    non-negative powers of two (E8M0 holds only the exponent)."""
+    if sf.dtype == torch.float8_e8m0fnu:
+        return sf
+    if sf.dtype in (torch.uint8, torch.int8):
+        return sf.view(torch.uint8).view(torch.float8_e8m0fnu)
+    bits = sf.float().contiguous().view(torch.int32)
+    if bool((bits & 0x7FFFFF).any()) or bool((bits < 0).any()):
+        raise ValueError("MXFP4 block scales are not powers of two")
+    return ((bits >> 23) & 0xFF).to(torch.uint8).view(torch.float8_e8m0fnu)
+
+
+def _expert_byte_slabs(t: torch.Tensor, num_local: int, name: str) -> torch.Tensor:
+    """A one-byte (E, ...) tensor whose expert slices are each one gapless block
+    (any inner stride order), viewed as a contiguous (E, bytes) uint8 tensor over
+    the same memory."""
+    if t.element_size() != 1 or t.shape[0] != num_local:
+        raise ValueError(f"{name}: unexpected {t.dtype} {tuple(t.shape)}")
+    u = t.view(torch.uint8)
+    slab = u[0]
+    expected = 1
+    for stride, size in sorted(zip(slab.stride(), slab.shape)):
+        if size == 1:
+            continue
+        if stride != expected:
+            raise ValueError(
+                f"{name}: expert slice {tuple(slab.shape)} {slab.stride()} is not dense"
+            )
+        expected *= size
+    if num_local > 1 and u.stride(0) < slab.numel():
+        raise ValueError(f"{name}: expert slices overlap")
+    return torch.as_strided(
+        u, (num_local, slab.numel()), (u.stride(0), 1), u.storage_offset()
+    )
+
+
+def _prepare_mxfp4_w4a4_weights(layer: FusedMoE) -> None:
+    try:
+        from flashinfer.moe_ep import PrequantizedMoEWeights
+        from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp4_mxfp4_bf16_cutedsl.weights import (
+            preprocess_mega_weights,
+        )
+    except ImportError as e:
+        raise ImportError(
+            "--enable-w4a4-mxfp4-megamoe with --moe-a2a-backend flashinfer_megamoe "
+            "needs FlashInfer's SM107 MXFP4 MegaMoE "
+            "(Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig, FlashInfer 0.7.5 or later)."
+        ) from e
+
+    num_local = layer.w13_weight.shape[0]
+    hidden = layer.hidden_size
+    intermediate = layer.intermediate_size_per_partition
+    w13 = layer.w13_weight.data.view(torch.uint8)
+    w2 = layer.w2_weight.data.view(torch.uint8)
+    if tuple(w13.shape) != (num_local, 2 * intermediate, hidden // 2) or tuple(
+        w2.shape
+    ) != (num_local, hidden, intermediate // 2):
+        raise ValueError(
+            f"MXFP4 expert shapes {tuple(w13.shape)} / {tuple(w2.shape)} do not "
+            f"match hidden {hidden}, intermediate {intermediate}"
+        )
+    transformed = preprocess_mega_weights(
+        PrequantizedMoEWeights(
+            w13,
+            w2,
+            _as_e8m0(layer.w13_weight_scale_inv.data),
+            _as_e8m0(layer.w2_weight_scale_inv.data),
+        ),
+        intermediate_size=intermediate,
+        hidden_size=hidden,
+    )
+    del w13, w2
+    # The kernel reads FlashInfer's tensors. Each routed-expert parameter becomes
+    # a per-expert byte view of the matching tensor, so EPLB rebalancing moves the
+    # kernel's weights in place, and SGLang's original copies are freed.
+    layer._flashinfer_megamoe_mxfp4_weights = transformed
+    (l1_w, l1_sf), (l2_w, l2_sf) = transformed
+    for name, t in (
+        ("w13_weight", l1_w),
+        ("w13_weight_scale_inv", l1_sf),
+        ("w2_weight", l2_w),
+        ("w2_weight_scale_inv", l2_sf),
+    ):
+        getattr(layer, name).data = _expert_byte_slabs(t, num_local, name)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def make_nvfp4_megamoe_weight_loader(

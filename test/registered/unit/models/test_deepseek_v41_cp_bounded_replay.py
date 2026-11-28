@@ -14,7 +14,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import eager_runner
 from sglang.srt.models import deepseek_v4, deepseek_v4_nextn
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -446,6 +446,64 @@ class TestCpBoundedReplayConfiguration(CustomTestCase):
                         ValueError, "prefill CP with the prefill CUDA graph"
                     ):
                         deepseek_v4_hook.validate_deepseek_v41_features(object())
+
+
+class TestDecoderReplayDpAttentionMoeBackends(CustomTestCase):
+    """Under DP attention, decoder bounded replay resolves on by default exactly for
+    the MoE A2A backends whose late layers route each rank's own tail rows."""
+
+    def _resolved(self, moe_a2a_backend):
+        cfg = SimpleNamespace(
+            enable_encoder_swa_bounded_replay=False,
+            enable_decoder_swa_bounded_replay=None,
+            dsv4_attn_backend="auto",
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend=Backend.DISABLED)
+            ),
+            enable_hisparse=False,
+            enable_two_batch_overlap=False,
+            enable_return_hidden_states=False,
+            pp_size=1,
+            speculative_algorithm=None,
+            disaggregation_mode="null",
+            enable_prefill_cp=False,
+            attn_cp_size=1,
+            dcp_size=1,
+            tp_size=2,
+            attn_dp_size=2,
+            moe_a2a_backend=moe_a2a_backend,
+        )
+        with (
+            override_platform(is_cuda=True, is_hip=False),
+            mock.patch.object(deepseek_v4_hook, "resolving_view", return_value=cfg),
+            mock.patch.object(
+                deepseek_v4_hook,
+                "model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(model_type="deepseek_v41")
+                ),
+            ),
+            mock.patch(
+                "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
+                return_value=False,
+            ),
+            mock.patch.object(
+                deepseek_v4_hook, "attn_dp_enabled_of", return_value=True
+            ),
+            mock.patch.object(deepseek_v4_hook, "declare_resolution") as declare,
+        ):
+            deepseek_v4_hook.validate_deepseek_v41_features(object())
+        return declare.call_args.kwargs["enable_decoder_swa_bounded_replay"]
+
+    def test_megamoe_backends_keep_bounded_replay_on(self):
+        for backend, expected in (
+            ("none", True),
+            ("megamoe", True),
+            ("flashinfer_megamoe", True),
+            ("deepep", False),
+        ):
+            with self.subTest(moe_a2a_backend=backend):
+                self.assertIs(self._resolved(backend), expected)
 
 
 if __name__ == "__main__":
