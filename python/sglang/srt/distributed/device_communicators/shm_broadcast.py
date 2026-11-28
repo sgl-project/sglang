@@ -30,6 +30,37 @@ SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
 logger = logging.getLogger(__name__)
 
 
+def _get_network_namespace_id() -> Optional[int]:
+    """Return an ID of the network namespace this process lives in.
+
+    The ID is the inode of /proc/self/ns/net, which uniquely identifies a
+    network namespace on Linux. Returns None when the namespace cannot be
+    determined (for example on non-Linux systems), in which case callers
+    fall back to the previous behavior.
+    """
+    try:
+        return os.stat("/proc/self/ns/net").st_ino
+    except OSError:
+        return None
+
+
+def _in_same_network_namespace_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
+    """Return whether each rank shares the source rank's network namespace.
+
+    This is a collective operation. If the source rank's namespace cannot
+    be determined, every rank is reported as sharing it, preserving the
+    previous behavior. A rank whose own namespace cannot be determined is
+    reported as not sharing it, so callers take the path that also works
+    across namespaces.
+    """
+    netns_ids: List[Optional[int]] = [None] * dist.get_world_size(pg)
+    dist.all_gather_object(netns_ids, _get_network_namespace_id(), group=pg)
+    source_netns_id = netns_ids[source_rank]
+    if source_netns_id is None:
+        return [True] * len(netns_ids)
+    return [netns_id == source_netns_id for netns_id in netns_ids]
+
+
 class ShmRingBuffer:
     def __init__(
         self,
@@ -496,7 +527,17 @@ class MessageQueue:
         from sglang.srt.distributed.parallel_state import in_the_same_node_as
 
         status = in_the_same_node_as(pg, source_rank=writer_rank)
-        same_node_ranks = [i for i, s in enumerate(status) if s]
+        # A local reader also connects to the writer over 127.0.0.1, so it
+        # must share the writer's network namespace, not just its shared
+        # memory. Processes can share /dev/shm while living in different
+        # network namespaces (for example two Pods on one host mounting the
+        # host's /dev/shm); treating such a rank as a local reader makes
+        # wait_until_ready hang because the loopback connection can never
+        # reach the writer. Such ranks use the remote reader path instead.
+        same_netns = _in_same_network_namespace_as(pg, source_rank=writer_rank)
+        same_node_ranks = [
+            i for i, (s, n) in enumerate(zip(status, same_netns)) if s and n
+        ]
         n_reader = group_world_size - 1
         n_local_reader = len(same_node_ranks) - 1
         local_reader_ranks = [i for i in same_node_ranks if i != writer_rank]
