@@ -81,6 +81,7 @@ except ImportError:
     initialize_mamba_selective_state_update_backend = None
 import traceback
 
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -214,6 +215,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateCacheLinkerReqInput,
+    UpdateCacheLinkerReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -401,11 +404,10 @@ from sglang.srt.rust_server.server import (
     claim_sigterm_before_compiles,
     drain_notify_name,
 )
-from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
-from sglang.srt.sampling.sampler_params import SamplerParamsPool
+from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params_pool import SamplingParamsPool
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
-from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -710,7 +712,7 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
         self.init_penalty_status_pool()
-        self.init_sampler_params_pool()
+        self.init_sampling_params_pool()
 
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
@@ -1405,10 +1407,11 @@ class Scheduler(
             device=self.req_to_token_pool.device,
         )
 
-    def init_sampler_params_pool(self) -> None:
-        self.sampler_params_pool = SamplerParamsPool(
+    def init_sampling_params_pool(self) -> None:
+        self.sampling_params_pool = SamplingParamsPool(
             num_rows=self.req_to_token_pool.req_to_token.shape[0],
             device=self.req_to_token_pool.device,
+            penalty_status_pool=self.penalty_status_pool,
         )
 
     def init_running_status(self):
@@ -2019,6 +2022,7 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
+                (UpdateCacheLinkerReqInput, self.update_cache_linker_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
@@ -3886,7 +3890,10 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.enable_unified_cache_external_linker:
+        if (
+            self.enable_unified_cache_external_linker
+            and self.tree_cache.linker is not None
+        ):
             return self.tree_cache.linker.prefetch(req)
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -4423,7 +4430,10 @@ class Scheduler(
         if (
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
-            or self.enable_unified_cache_external_linker
+            or (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker is not None
+            )
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
@@ -5094,9 +5104,9 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
-        self.sampler_params_pool.write(new_batch.reqs)
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
+        self.sampling_params_pool.write(new_batch.reqs)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -5541,17 +5551,11 @@ class Scheduler(
         if self.is_generation:
             # A beam tail's member rows follow the requests' rows; they take no params.
             num_reqs = len(batch.reqs)
-            batch.sampling_info.set_sampler_params(
-                self.sampler_params_pool.gather(
+            batch.sampling_info.set_rows(
+                self.sampling_params_pool.gather(
                     batch.req_pool_indices[:num_reqs],
                     batch.req_pool_indices_cpu[:num_reqs],
                 )
-            )
-            batch.sampling_info.step_penalties = StepPenalties.build(
-                batch.reqs, self.penalty_status_pool
-            )
-            batch.sampling_info.watermark = build_watermark_rows(
-                batch.reqs, batch.device
             )
             batch.sampling_info.set_step_state(batch.reqs)
             if self.enable_overlap:
@@ -5914,6 +5918,12 @@ class Scheduler(
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
                 self.future_map.stash(future_indices, payload)
+            return
+        if is_beam_only_batch(batch):
+            # Nothing was sampled; the coordinator relays every row.
+            self.beam_coordinator.maybe_select_and_relay(
+                batch, batch_result, chunked_req=self.chunked_req
+            )
             return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
@@ -6292,6 +6302,7 @@ class Scheduler(
                 or self.deferred_responses.has_pending()
                 or (
                     self.enable_unified_cache_external_linker
+                    and self.tree_cache.linker is not None
                     and self.tree_cache.linker.prefetches
                 )
             ):
@@ -6430,7 +6441,10 @@ class Scheduler(
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
-            if self.enable_unified_cache_external_linker:
+            if (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker is not None
+            ):
                 idle &= not self.tree_cache.linker.prefetches
 
         return idle
@@ -6544,6 +6558,18 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def update_cache_linker_wrapped(
+        self, recv_req: UpdateCacheLinkerReqInput
+    ) -> UpdateCacheLinkerReqOutput:
+        if not self.enable_unified_cache_external_linker:
+            message = "Launch with --enable-unified-cache-external-linker to manage an external linker."
+        elif not self.is_fully_idle():
+            message = "Reject external linker update: scheduler is not idle."
+        else:
+            success, message = self.tree_cache.linker_attachment.update(recv_req.attach)
+            return UpdateCacheLinkerReqOutput(success=success, message=message)
+        return UpdateCacheLinkerReqOutput(success=False, message=message)
 
     def flush_cache(
         self, empty_cache: bool = True, *, pp_all_idle: bool = False
