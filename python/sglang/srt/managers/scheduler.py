@@ -480,6 +480,9 @@ STEP_MAX_US = 2_000_000
 # spins on_idle without sleeping. Bounds the O(queue) get_loads for both the
 # DP-balancing writer and the router-facing socket.
 LOAD_STALL_REFRESH_S = 0.05
+# Measured with the file backend at TP=1 on one L4;
+# a 2 ms wait lets the L3 reader run as fast as it does during batches.
+HICACHE_STORAGE_IO_WAIT_MS = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -6293,7 +6296,11 @@ class Scheduler(
                 self.load_publisher.publish_load_stat(
                     self.load_inquirer.get_loads, force=True, snapshot=snapshot
                 )
-            if (
+            if self._should_block_for_storage_io():
+                # After time.sleep(0) this thread usually takes the GIL back first;
+                # blocking for input with a timeout lets the storage threads run.
+                self.request_receiver.wait_for_input(HICACHE_STORAGE_IO_WAIT_MS)
+            elif (
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
@@ -6342,6 +6349,17 @@ class Scheduler(
             # sleep until next event
             self.maybe_sleep_on_idle()
         self.metrics_reporter.record_scheduler_idle()
+
+    def _should_block_for_storage_io(self) -> bool:
+        # Measured on a single-rank engine only;
+        # PD polls and held responses keep the zero sleep.
+        return (
+            self.enable_hicache_storage
+            and self.world_group.world_size == 1
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and not self.deferred_responses.has_pending()
+            and self.tree_cache.storage_io_in_flight()
+        )
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
         if self.deferred_responses.has_pending():
