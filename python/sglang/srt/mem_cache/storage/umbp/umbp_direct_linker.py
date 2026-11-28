@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import threading
@@ -38,6 +39,8 @@ device_module = get_device_module()
 # Keep every control-plane RPC comfortably below gRPC's message-size limit.
 # This is a logical-page count; existence queries carry keys only, no ranges.
 CHUNK_PAGES = 64
+# Windows a lookup probes one at a time before the every-page fallback.
+WINDOW_PROBES = 8
 
 # Budget by ranges because pool layouts attach different counts per object;
 # 8192 stays below gRPC's default message limit.
@@ -456,7 +459,11 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             return []
 
         valid_pages = list(range(1, len(page_keys) + 1))
+        windows = []
         for transfer in expanded:
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                windows.append(transfer)
+                continue
             # Probe only as far as the surviving boundary: no hit policy reads
             # past its own end offset, so pages beyond the longest candidate
             # cannot change the answer. This runs synchronously inside the
@@ -466,6 +473,8 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             valid_pages = self._apply_hit_policy(valid_pages, page_exists, transfer)
             if not valid_pages:
                 break
+        if valid_pages and windows:
+            valid_pages = self._longest_window_hit(page_keys, valid_pages, windows)
 
         self._stats["lookup"] += 1
         if valid_pages:
@@ -476,6 +485,51 @@ class UMBPDirectLinker(UnifiedCacheLinker):
                 len(valid_pages),
             )
         return valid_pages
+
+    def _longest_window_hit(
+        self,
+        page_keys: list[str],
+        candidates: list[int],
+        transfers: list[PoolTransfer],
+    ) -> list[int]:
+        """Longest candidate whose window every window pool stores.
+
+        A store may renew the keys an existence query finds, and a load reads
+        only the window that ends the prefix, so probing every page would keep
+        the windows of earlier turns resident though nothing restores from them.
+        Windows are probed from the longest candidate down instead; after
+        ``WINDOW_PROBES`` of them the rest fall back to the every-page probe.
+        """
+        known = [{} for _ in transfers]
+        index = len(candidates) - 1
+        for _ in range(WINDOW_PROBES):
+            end = candidates[index]
+            missing = None
+            for present, transfer in zip(known, transfers):
+                window = range(max(0, end - max(1, len(transfer.keys or ()))), end)
+                unknown = [page for page in window if page not in present]
+                if unknown:
+                    exists = self._page_exists(
+                        [page_keys[page] for page in unknown], transfer
+                    )
+                    present.update(zip(unknown, exists))
+                missing = next((page for page in window if not present[page]), None)
+                if missing is not None:
+                    break
+            if missing is None:
+                return [end]
+            # Every candidate in (missing, end] has `missing` in its window.
+            index = bisect.bisect_right(candidates, missing, hi=index) - 1
+            if index < 0:
+                return []
+
+        remaining = candidates[: index + 1]
+        for transfer in transfers:
+            page_exists = self._page_exists(page_keys[: remaining[-1]], transfer)
+            remaining = self._apply_hit_policy(remaining, page_exists, transfer)
+            if not remaining:
+                break
+        return remaining
 
     def prefetch(self, transfers: list[PoolTransfer]) -> None:
         return None

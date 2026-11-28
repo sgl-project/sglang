@@ -1825,7 +1825,7 @@ class TestUnifiedCacheLinkerTreeCoreRustBackend(
 
 
 def test_restorable_prefix_intersects_sparse_rank_results():
-    remote_mask = torch.tensor([0, 0, 1, 0, 0], dtype=torch.int)
+    remote_mask = torch.tensor([0, 0, 1, 0, 0, 2], dtype=torch.int)
 
     def intersect_remote_mask(mask, op):
         assert op == torch.distributed.ReduceOp.MIN
@@ -1836,7 +1836,7 @@ def test_restorable_prefix_intersects_sparse_rank_results():
 
     hit_pages = wrapper._sync_restorable_prefix([2, 4], num_pages=4, device_hit_pages=0)
 
-    assert hit_pages == 2
+    assert hit_pages == (2, 2)
 
 
 def test_restorable_prefix_ignores_candidates_outside_the_tail():
@@ -1844,16 +1844,16 @@ def test_restorable_prefix_ignores_candidates_outside_the_tail():
     wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
 
     # Candidates at or below the device hit and beyond the tail are dropped.
-    assert (
-        wrapper._sync_restorable_prefix(
-            [1, 2, 3, 5, 9], num_pages=5, device_hit_pages=2
-        )
-        == 5
+    assert wrapper._sync_restorable_prefix(
+        [1, 2, 3, 5, 9], num_pages=5, device_hit_pages=2
+    ) == (5, 5)
+    assert wrapper._sync_restorable_prefix(
+        [1, 2, 9], num_pages=5, device_hit_pages=2
+    ) == (0, 0)
+    assert wrapper._sync_restorable_prefix([], num_pages=5, device_hit_pages=0) == (
+        0,
+        0,
     )
-    assert (
-        wrapper._sync_restorable_prefix([1, 2, 9], num_pages=5, device_hit_pages=2) == 0
-    )
-    assert wrapper._sync_restorable_prefix([], num_pages=5, device_hit_pages=0) == 0
 
 
 def test_async_offload_pins_node_until_completion():

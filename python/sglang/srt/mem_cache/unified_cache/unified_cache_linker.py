@@ -235,16 +235,18 @@ class UnifiedCacheLinker(ABC):
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
-        """Return every prefix length (in pages) that is fully restorable.
+        """Return prefix lengths (in pages) that are fully restorable, including
+        the longest one; shorter ones may be omitted.
 
         A length is included only when *all* pools satisfy their hit policy at
         that exact boundary (contiguous prefix pools, plus each trailing-window
         pool's window ending there). Trailing-window state (SWA / compress
         state) only exists at offloaded node boundaries, so the set is sparse
-        and generally non-contiguous -- returning just the local maximum would
-        let the tree pick a length that is invalid on another rank.
+        and generally non-contiguous -- reducing the local maxima would let the
+        tree pick a length that is invalid on another rank.
 
-        Local to this rank; the tree intersects the sets across ranks.
+        Local to this rank; the tree intersects the sets across ranks and looks
+        up again below the shortest maximum when they share none.
         """
 
     @abstractmethod
@@ -422,10 +424,10 @@ class UnifiedCacheLinkerWrapper:
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
 
         # Tail-relative: page 0 of `tail_hashes` is the first uncached page.
-        hit_pages = self._sync_restorable_prefix(
-            self.cache_linker.lookup(req.rid, lookup_transfers),
-            num_pages=len(tail_hashes),
-            device_hit_pages=0,
+        hit_pages = self._sync_lookup(
+            lambda transfers: self.cache_linker.lookup(req.rid, transfers),
+            tail_hashes,
+            lookup_transfers,
         )
         self._record_lookup(len(tail_hashes) * page, hit_pages * page)
         if hit_pages == 0:
@@ -486,17 +488,18 @@ class UnifiedCacheLinkerWrapper:
         ]
         if any(t is None for t in lookups):
             return
-        try:
-            # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
-            restorable = self.cache_linker.lookup(req.rid, lookups)
-        except Exception:
-            logger.warning("External linker prefetch lookup failed", exc_info=True)
-            if self.metrics is not None:
-                self.metrics.increment_linker_failures("lookup")
-            restorable = []
-        pages = self._sync_restorable_prefix(
-            restorable, num_pages=len(hashes), device_hit_pages=0
-        )
+
+        def lookup(transfers: list[PoolTransfer]) -> list[int]:
+            try:
+                # TODO: Run storage lookup asynchronously to avoid blocking scheduling.
+                return self.cache_linker.lookup(req.rid, transfers)
+            except Exception:
+                logger.warning("External linker prefetch lookup failed", exc_info=True)
+                if self.metrics is not None:
+                    self.metrics.increment_linker_failures("lookup")
+                return []
+
+        pages = self._sync_lookup(lookup, hashes, lookups)
         self._record_lookup(len(hashes) * page, pages * page)
         if not pages:
             return
@@ -672,27 +675,60 @@ class UnifiedCacheLinkerWrapper:
         if self.metrics is not None:
             self.metrics.increment_linker_lookup_tokens(lookup_tokens, hit_tokens)
 
+    def _sync_lookup(
+        self,
+        lookup: Callable[[list[PoolTransfer]], list[int]],
+        hashes: list[str],
+        transfers: list[PoolTransfer],
+    ) -> int:
+        """Longest prefix of ``hashes`` (in pages) that every rank can restore.
+
+        A lookup may report only its longest length. When the ranks share none,
+        the shortest maximum is one some rank can restore, so look up again with
+        the prefix capped there; the cap shrinks on every round.
+        """
+        num_pages = len(hashes)
+        while True:
+            pages, floor = self._sync_restorable_prefix(
+                lookup(transfers), num_pages=num_pages, device_hit_pages=0
+            )
+            if pages or not floor:
+                return pages
+            num_pages = floor
+            transfers = [
+                component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOOKUP, None, hashes[:num_pages]
+                )
+                for component in self._components
+            ]
+            if any(transfer is None for transfer in transfers):
+                return 0
+
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
-    ) -> int:
+    ) -> tuple[int, int]:
         """Intersect the per-rank sets of restorable prefix lengths and return the
-        longest one, or 0 when the ranks share none beyond the device prefix.
+        longest one, or 0 when the ranks share none beyond the device prefix,
+        together with the shortest per-rank maximum.
 
         A rank's set is sparse, so reducing per-rank maxima could land on a
         length that only some ranks can restore. On a 0/1 mask MIN is AND, which
         makes the reduction an intersection.
         """
-        mask = torch.zeros(num_pages + 1, dtype=torch.int)
+        # The last slot carries the rank's maximum through the same reduction.
+        mask = torch.zeros(num_pages + 2, dtype=torch.int)
         # A lookup reports up to one candidate per page; a per-element tensor
         # store costs microseconds each on the scheduler's critical path.
         valid = [pages for pages in restorable if device_hit_pages < pages <= num_pages]
         if valid:
             mask[torch.tensor(valid, dtype=torch.long)] = 1
+            mask[-1] = max(valid)
         self.cache._all_reduce_attn_groups(mask, torch.distributed.ReduceOp.MIN)
-        common = mask.nonzero()
+        floor = int(mask[-1].item())
+        common = mask[:-1].nonzero()
         if common.numel() == 0:
-            return 0
-        return int(common[-1].item())
+            return 0, floor
+        return int(common[-1].item()), floor
 
     def _tail_hashes(
         self, key: RadixKey, result: MatchResult, device_hit_len: int
