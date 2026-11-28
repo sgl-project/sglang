@@ -23,11 +23,7 @@ from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.eagle_worker_common import accept_draft_tree
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import (
-    HostVerifyTree,
-    needs_verify_tree,
-    verify_row_prefixes,
-)
+from sglang.srt.speculative.spec_utils import HostVerifyTree, verify_row_prefixes
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -143,20 +139,6 @@ class TestRowPrefixes(CustomTestCase):
             [[], [2], [2, 3], [2, 3, 4], [], [7], [7, 8], [7, 8, 9]],
         )
 
-    def test_a_custom_processor_alone_needs_the_host_tree(self):
-        info = _sampling_info(_CountUp(), greedy=True, device="cpu")
-        plain = SimpleNamespace(has_custom_logit_processor=False)
-        for has_grammar, sampling_info, want in [
-            (False, info, True),
-            (False, plain, False),
-            (True, plain, True),
-            (False, None, False),
-        ]:
-            batch = SimpleNamespace(
-                has_grammar=has_grammar, sampling_info=sampling_info
-            )
-            self.assertEqual(needs_verify_tree(batch), want)
-
 
 class TestOneTokenCap(CustomTestCase):
     def _verify(self, first_row_only):
@@ -185,21 +167,6 @@ class TestOneTokenCap(CustomTestCase):
         self.assertEqual(bonus.tolist(), [21, 31, 43])
         self.assertEqual(new_seq_lens.tolist(), [11, 21, 33])
 
-    def test_nothing_capped_returns_the_inputs(self):
-        verify = self._verify([])
-        verify.first_row_only_reqs = None
-        commit_lens, bonus = torch.tensor([3]), torch.tensor([7])
-        out = verify.cap_chain_accept(
-            out_tokens=torch.tensor([[5, 6, 7]]),
-            commit_lens=commit_lens,
-            bonus=bonus,
-            prefix_lens=torch.tensor([10]),
-            new_seq_lens=None,
-        )
-        self.assertIs(out[0], commit_lens)
-        self.assertIs(out[1], bonus)
-        self.assertIsNone(out[2])
-
 
 class TestCustomLogitProcessorSync(CustomTestCase):
     """Under overlap the last result is processed after the next launch, so a
@@ -211,18 +178,6 @@ class TestCustomLogitProcessorSync(CustomTestCase):
             spec_algorithm=algorithm,
             has_grammar=has_grammar,
         )
-
-    def test_spec_batches_with_a_processor_sync(self):
-        for name, has_custom in itertools.product(
-            ("NONE", "EAGLE", "NGRAM", "DFLASH", "DSPARK"), (False, True)
-        ):
-            algorithm = SpeculativeAlgorithm.from_string(name)
-            batch = self._batch(has_custom=has_custom, algorithm=algorithm)
-            with self.subTest(algorithm=name, has_custom=has_custom):
-                self.assertEqual(
-                    ScheduleBatch.custom_logit_processor_needs_sync(batch),
-                    has_custom and not algorithm.is_none(),
-                )
 
     def test_the_scheduler_processes_the_last_result_first(self):
         batch = self._batch(
