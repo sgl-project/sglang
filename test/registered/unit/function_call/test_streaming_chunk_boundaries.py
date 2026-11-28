@@ -190,7 +190,7 @@ def _dsml(block: str, invoke: str = "invoke", parameter: str = "parameter"):
     )
 
 
-# thinkingmachines/Inkling-Small; inkling2 parses the same format.
+# thinkingmachines/Inkling-Small
 _INKLING = Sample(
     calls=tuple(
         f"<|message_model|>{name}<|content_invoke_tool_json|>"
@@ -352,7 +352,6 @@ SAMPLES = {
         special_tokens=_ARG_TAGS + ("<tool_calls>", "</tool_calls>", "<tool_sep>"),
     ),
     "inkling": _INKLING,
-    "inkling2": _INKLING,
     # Detokenized with spaces_between_special_tokens, the server default.
     "interns1": Sample(
         calls=_json_calls(
