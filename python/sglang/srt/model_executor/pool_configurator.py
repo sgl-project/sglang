@@ -1743,14 +1743,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         return 1 / 128 * self._get_paged_kv_bytes_per_token(128)
 
     def _get_npu_kv_padding_bytes(self, full_tokens: int) -> float:
+        padding_bytes = 0
+        if self._npu_is_v41 or self.swa_cap_tokens is None:
+            swa_layers = self.num_swa_layers + self._npu_dspark_draft_layers
+            padding_bytes = self.page_size * self.kv_bytes * swa_layers
+
         if self._npu_is_v41:
             from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
                 DSV41_INDEX_PAGE_SIZE,
             )
 
             # V4.1 uses the upstream SWA and low-ratio reserved-page budget.
-            swa_layers = self.num_swa_layers + self._npu_dspark_draft_layers
-            padding_bytes = self.page_size * self.kv_bytes * swa_layers
             for ratio in (1, 2):
                 num_layers = self.num_layers(ratio)
                 if not num_layers:
@@ -1768,30 +1771,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # Keep the upstream A3 V4.1 padding budget unscaled.
             if self._npu_low_ratio_bf16:
                 return padding_bytes
-            return padding_bytes * self._spec_infl
 
-        padding_bytes = 0
-        if self.swa_cap_tokens is None:
-            swa_tokens = self._get_swa_tokens(full_tokens, self.page_size)
-            rounded_off = full_tokens * self.swa_ratio - swa_tokens
-            # Page-aligned SWA capacity gets one reserved physical page.
-            padding_bytes += (
-                (self.page_size - rounded_off) * self.kv_bytes * self.num_swa_layers
-            )
-            num_c4_layers = self.num_layers(4)
-            if num_c4_layers:
-                ring = self.ring_sizes[4]
-                state_size = swa_tokens // self.page_size * ring
-                state_rows = ceil_align(state_size + ring + 1, lcm(4, ring))
-                extra_state_rows = (
-                    state_rows - state_size - rounded_off * ring / self.page_size
-                )
-                state_row_bytes = (
-                    4
-                    * (self.attn_head_dim + self.indexer_head_dim)
-                    * torch.float32.itemsize
-                )
-                padding_bytes += extra_state_rows * state_row_bytes * num_c4_layers
         return padding_bytes * self._spec_infl
 
     def _get_low_ratio_kv_padding_bytes(self, full_tokens: int) -> float:

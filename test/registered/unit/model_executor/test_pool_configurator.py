@@ -2422,7 +2422,7 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             planner.swa_ratio = 0.1
             self.assertEqual(
                 planner._get_npu_kv_padding_bytes(12800),
-                128 * 1024 * 2 + 16 * (512 + 128) * 4 * 4,
+                128 * 1024 * 2,
             )
 
     def test_npu_v41_budget_uses_distinct_swa_and_compressed_rows(self):
