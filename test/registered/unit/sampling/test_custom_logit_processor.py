@@ -130,7 +130,6 @@ class TestCustomLogitProcessorRows(CustomTestCase):
                     "sglang.srt.sampling.sampling_batch_info.get_exec",
                     return_value=exec_context,
                 ):
-                    # No seeds, penalties, or watermark.
                     rows = SamplingRows(**dict.fromkeys(SamplingRows._fields))
                     rows = rows._replace(facts=SamplingFacts())
                     info.set_step_state(reqs, rows, num_prefill_rows=0)
