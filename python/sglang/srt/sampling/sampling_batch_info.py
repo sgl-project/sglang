@@ -121,10 +121,8 @@ class SamplingBatchInfo:
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
     def set_step_state(self, reqs: List[Req], rows: SamplingRows) -> None:
-        """Set one launch's state: the rows gathered from `SamplingParamsPool`; the
-        stages' inputs built from the step's requests (logit_bias, the grammars,
-        the custom logit processors, and the sampling-mask rows); then the facts,
-        the rows' param facts plus the stage facts."""
+        """Set one launch's state: the gathered `rows`, the stages' inputs built from
+        `reqs`, then the facts over both."""
         for name, value in zip(rows._fields, rows):
             setattr(self, name, value)
 

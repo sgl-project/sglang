@@ -5502,8 +5502,6 @@ class Scheduler(
         return forward_done
 
     def _set_sampling_step_state(self, batch: ScheduleBatch) -> None:
-        """Set the batch's sampling state for its launch, from its slots' rows of
-        the sampling params pool and from its requests."""
         # A beam tail's member rows follow the requests' rows; they take no params.
         num_reqs = len(batch.reqs)
         batch.sampling_info.set_step_state(
