@@ -1533,22 +1533,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"sparse-attention operator, got {self._npu_c128_page_size}"
             )
 
-    def _npu_swa_pool_bytes(self, swa_tokens: int) -> int:
-        # Same reserved-page rule as NPUDeepSeekV4SingleKVPool.create_buffer.
-        swa_pages = (swa_tokens + self.page_size + 1) // self.page_size
-        swa_rows = swa_pages * self.page_size
-        kv_bytes = swa_rows * self.kv_bytes * self.num_swa_layers
-        if not self.num_layers(4):
-            return kv_bytes
-        ring = self.ring_sizes[4]
-        state_size = swa_tokens // self.page_size * ring
-        state_rows = ceil_align(state_size + ring + 1, lcm(4, ring))
-        state_row_bytes = 4 * (self.attn_head_dim + self.indexer_head_dim)
-        return (
-            kv_bytes
-            + state_rows * state_row_bytes * torch.float32.itemsize * self.num_layers(4)
-        )
-
     def num_layers(self, ratio: int) -> int:
         """Layers of this stage owning ratio's compressed storage."""
         return len(self.stage_owner_layers.get(ratio, ()))
@@ -1680,12 +1664,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         padding_bytes = 0
         if self.swa_cap_tokens is None:
-            # Reserved pages and C4 state padding cover SWA page rounding.
             swa_tokens = self._get_swa_tokens(full_tokens, self.page_size)
-            logical_swa_bytes = (
-                full_tokens * self.swa_ratio * self._get_bytes_per_swa_token()
+            rounded_off = full_tokens * self.swa_ratio - swa_tokens
+            # Page-aligned SWA capacity gets one reserved physical page.
+            padding_bytes += (
+                (self.page_size - rounded_off) * self.kv_bytes * self.num_swa_layers
             )
-            padding_bytes += self._npu_swa_pool_bytes(swa_tokens) - logical_swa_bytes
+            num_c4_layers = self.num_layers(4)
+            if num_c4_layers:
+                ring = self.ring_sizes[4]
+                state_size = swa_tokens // self.page_size * ring
+                state_rows = ceil_align(state_size + ring + 1, lcm(4, ring))
+                extra_state_rows = (
+                    state_rows - state_size - rounded_off * ring / self.page_size
+                )
+                state_row_bytes = (
+                    4
+                    * (self.attn_head_dim + self.indexer_head_dim)
+                    * torch.float32.itemsize
+                )
+                padding_bytes += extra_state_rows * state_row_bytes * num_c4_layers
         for ratio, layers in self.stage_owner_layers.items():
             size = full_tokens // ratio
             page = self._npu_c128_page_size if ratio == 128 else self.page_size // ratio
