@@ -70,7 +70,8 @@ def gguf_moe_a8_vec(
     The down projection retains the original route shape with top_k=1.
     Quantization, vector reduction and output rounding match the AOT operation.
     """
-    output = torch.zeros((tokens * top_k, row), dtype=input.dtype, device=input.device)
+    # The projection writes every output element, including zeros for inactive routes.
+    output = torch.empty((tokens * top_k, row), dtype=input.dtype, device=input.device)
     padded = (input.shape[1] + 511) // 512 * 512
     quantized_input = torch.empty(
         (tokens, padded // 32 * 9), dtype=torch.int32, device=input.device

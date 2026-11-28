@@ -606,6 +606,10 @@ class GGUFMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_qweight_type, extra_weight_attrs)
         layer.register_parameter("w2_qweight_type", w2_qweight_type)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module):
+        # previously we inherited the default blank implementation, causing a bug
+        layer.materialize_gguf_weights()
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
