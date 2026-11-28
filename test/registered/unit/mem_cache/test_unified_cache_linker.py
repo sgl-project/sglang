@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 
+from sglang.srt.managers.io_struct import LinkerOffloadVerdict
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -61,6 +62,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -844,6 +846,7 @@ def test_cache_linker_attachment_is_backend_independent():
     cache.tree_components = (ComponentType.FULL,)
     index_slots(cache, cache.tree_components)
     cache.linker = None
+    cache.pp_size = 1
     cache._components_tuple = ()
     cache.components = {}
     index_slots(cache, cache.components)
@@ -875,13 +878,163 @@ def test_cache_linker_rejects_unsupported_tree_components(component_type, load_m
     assert not cache.tree_core.enable_external_cache_linker
 
 
-def test_pipeline_parallelism_rejects_only_prefetch_mode():
-    cache = _cache_for_wrapper(pp_size=2)
-    UnifiedCacheLinkerWrapper(cache, _FakeLinker())
-    assert cache.tree_core.enable_external_cache_linker
+class _PipelineFakeLinker(_FakeLinker):
+    def __init__(self, restorable=()):
+        super().__init__()
+        self.restorable = list(restorable)
+        self.pp_lookup_calls = []
 
-    cache = _cache_for_wrapper(pp_size=2)
-    backend = _FakeLinker()
+    def prepare_pp_lookup(self, groups, windows):
+        def lookup(rid, hashes):
+            self.pp_lookup_calls.append((rid, list(hashes)))
+            if isinstance(self.restorable, Exception):
+                raise self.restorable
+            return self.restorable
+
+        return lookup
+
+
+def _pipeline_cache(reductions=None, **kwargs):
+    def all_reduce(tensor, op):
+        if reductions is not None:
+            reductions.append(tensor.clone())
+
+    return _cache_for_wrapper(
+        pp_size=2,
+        pp_group="pp",
+        attn_cp_group=None,
+        attn_tp_group=None,
+        tp_group=None,
+        page_size=2,
+        tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
+        _all_reduce_attn_groups=all_reduce,
+        get_last_hash_value=lambda node: f"{node:064x}",
+        **kwargs,
+    )
+
+
+def _arrival_req(tokens, rid="rid", device_prefix=0, last_node=1):
+    return SimpleNamespace(
+        rid=rid,
+        origin_input_ids=array("q", tokens),
+        extra_key=None,
+        cache_salt=None,
+        positional_embed_overrides=None,
+        _compute_max_prefix_len=lambda length: length,
+        prefix_len=device_prefix,
+        last_node=last_node,
+        pp_linker_restorable_pages=[],
+        pp_linker_probe_start_pages=0,
+    )
+
+
+def _arrive(wrapper, *reqs):
+    relays = [SimpleNamespace() for _ in reqs]
+    for req, relay in zip(reqs, relays):
+        wrapper.queue_pp_arrival(req, relay)
+    arrivals = wrapper.lookup_pp_arrivals()
+    assert [arrival.relay for arrival in arrivals] == relays
+    return arrivals
+
+
+def test_pipeline_arrival_lookup_keeps_boundaries_inside_the_prompt():
+    backend = _PipelineFakeLinker(restorable=[1, 3, 9])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(), backend)
+
+    (arrival,) = _arrive(wrapper, req := _arrival_req(range(1, 10)))
+    assert req.pp_linker_restorable_pages == [1, 3]
+    assert req.pp_linker_probe_start_pages == 0
+    ((rid, hashes),) = backend.pp_lookup_calls
+    assert rid == "rid" and hashes == get_storage_hash_str(
+        arrival.key[:8], None, page_size=2
+    )
+
+    backend.restorable = RuntimeError("store down")
+    _arrive(wrapper, req := _arrival_req(range(1, 10)))
+    assert req.pp_linker_restorable_pages == []
+
+
+def test_pipeline_arrival_lookup_probes_only_past_the_device_prefix():
+    backend = _PipelineFakeLinker(restorable=[1, 2])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(), backend)
+
+    (arrival,) = _arrive(
+        wrapper, req := _arrival_req(range(1, 13), device_prefix=4, last_node=7)
+    )
+
+    # Pages 2-5 of the prompt, anchored on the device prefix's last hash.
+    ((_, hashes),) = backend.pp_lookup_calls
+    assert hashes == get_storage_hash_str(arrival.key[4:12], f"{7:064x}", page_size=2)
+    # Tail-relative hits become prompt-relative boundaries.
+    assert req.pp_linker_probe_start_pages == 2
+    assert req.pp_linker_restorable_pages == [3, 4]
+
+
+def test_pipeline_arrival_lookup_reduces_the_round_once():
+    reductions = []
+    backend = _PipelineFakeLinker(restorable=[2])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(reductions), backend)
+
+    first = _arrival_req(range(1, 9), rid="a")
+    second = _arrival_req(range(1, 9), rid="b", device_prefix=2)
+    _arrive(wrapper, first, second)
+
+    assert [rid for rid, _ in backend.pp_lookup_calls] == ["a", "b"]
+    # One reduction for the round: four tail pages of "a", three of "b".
+    (mask,) = reductions
+    assert mask.tolist() == [0, 0, 1, 0, 0] + [0, 0, 1, 0]
+    assert first.pp_linker_restorable_pages == [2]
+    assert second.pp_linker_restorable_pages == [3]
+    assert wrapper.pp_arrivals == []
+
+
+def test_pipeline_arrival_lookup_defers_to_the_leader_on_other_ranks():
+    reductions = []
+    backend = _PipelineFakeLinker(restorable=[2])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(reductions), backend)
+    wrapper._is_attn_leader = lambda: False
+
+    _arrive(wrapper, req := _arrival_req(range(1, 9)))
+
+    assert backend.pp_lookup_calls == []
+    (mask,) = reductions
+    assert mask.tolist() == [0, 1, 1, 1, 1]
+    # Without a reduction partner every unprobed page reads as present; the
+    # real MIN takes the leader's answer.
+    assert req.pp_linker_restorable_pages == [1, 2, 3, 4]
+
+
+def test_pipeline_arrival_lookup_skips_the_reduction_without_tails():
+    reductions = []
+    backend = _PipelineFakeLinker(restorable=[1])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(reductions), backend)
+
+    _arrive(wrapper, full_hit := _arrival_req(range(1, 9), device_prefix=8))
+
+    assert backend.pp_lookup_calls == [] and reductions == []
+    assert full_hit.pp_linker_restorable_pages == []
+    assert full_hit.pp_linker_probe_start_pages == 4
+
+
+def test_pipeline_arrival_lookup_keeps_the_layout_without_an_anchor():
+    # Whether a rank finds the anchor hash must not change the reduction's
+    # layout, or the ranks would reduce tensors of different sizes.
+    reductions = []
+    backend = _PipelineFakeLinker(restorable=[1])
+    wrapper = UnifiedCacheLinkerWrapper(_pipeline_cache(reductions), backend)
+    wrapper.cache.get_last_hash_value = lambda node: None
+
+    _arrive(wrapper, no_anchor := _arrival_req(range(1, 9), device_prefix=2))
+
+    assert backend.pp_lookup_calls == []
+    (mask,) = reductions
+    assert mask.tolist() == [0, 0, 0, 0]
+    assert no_anchor.pp_linker_restorable_pages == []
+
+
+def test_pipeline_parallelism_rejects_only_prefetch_mode():
+    cache = _pipeline_cache()
+    backend = _PipelineFakeLinker()
     backend.load_mode = "prefetch"
     with pytest.raises(ValueError, match="prefetch currently requires PP=1"):
         UnifiedCacheLinkerWrapper(cache, backend)
@@ -1001,6 +1154,21 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
 
     def close(self):
         self.reset()
+
+
+class _PipelineInMemoryLinker(_InMemoryUnifiedCacheLinker):
+    def __init__(self, stored_keys, queue_loads=True):
+        super().__init__(stored_keys)
+        self.queue_loads = queue_loads
+
+    def prepare_pp_lookup(self, groups, windows):
+        def lookup(rid, hashes):
+            raise AssertionError("match must not query the store under PP")
+
+        return lookup
+
+    def load(self, rid, transfers):
+        return self.queue_loads and super().load(rid, transfers)
 
 
 class _TreeCoreBackendTestMixin:
@@ -1138,6 +1306,58 @@ class TestUnifiedCacheLinkerPythonBackend(
         consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
         consumer.sanity_check()
+
+    def test_pipeline_match_takes_arrival_boundaries_and_fails_unqueued_loads(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        tokens = list(range(1, 9))
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        # A probe start above the device prefix (here empty) means the prefix
+        # PP0 matched on arrival has since been evicted: nothing is loaded.
+        for boundaries, probe_start, hit, queued in (
+            ([4], 0, 8, True),
+            ([1, 2], 0, 4, True),
+            ([], 0, 0, True),
+            ([4], 0, 8, False),
+            ([4], 1, 0, True),
+        ):
+            with self.subTest(
+                boundaries=boundaries, probe_start=probe_start, queued=queued
+            ):
+                consumer, _, consumer_req_pool = build_fixture(cfg)
+                consumer_linker = _PipelineInMemoryLinker(stored_keys, queued)
+                consumer.pp_size = 2
+                consumer.init_cache_linker(consumer_linker)
+                req = self._make_req(consumer_req_pool)
+                req.pp_linker_restorable_pages = boundaries
+                req.pp_linker_probe_start_pages = probe_start
+                match = consumer.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+                )
+                self.assertEqual(match.host_hit_length, hit)
+                self.assertEqual(consumer_linker.lookup_calls, [])
+                if not hit:
+                    continue
+                self._apply_match_to_req(req, match)
+                loaded_len, _ = consumer.init_load_back(
+                    InitLoadBackParams(
+                        best_match_node=match.best_match_node,
+                        host_hit_length=match.host_hit_length,
+                        req=req,
+                    )
+                )
+                self.assertEqual(loaded_len, hit)
+                consumer.ready_to_load_host_cache()
+                self.assertEqual(
+                    consumer.linker.finish_loads(), [] if queued else [req.rid]
+                )
 
     def test_metrics_follow_offload_lookup_and_layer_wise_load(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
@@ -2285,13 +2505,17 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
     assert wrapper.inflight_load_rids == []
 
 
-def test_check_hicache_events_commits_common_rank_results():
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_check_hicache_events_commits_common_rank_results(pp_size):
     committed = []
+    queued = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.pp_size, cache.pp_rank = pp_size, 0
     cache.linker = SimpleNamespace(
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
+        queue_offload_verdict=queued.append,
         check_prefetch_events=lambda: None,
     )
 
@@ -2310,7 +2534,74 @@ def test_check_hicache_events_commits_common_rank_results():
 
     cache.check_hicache_events()
 
-    assert committed == [[False]]
+    assert (committed, queued) == (([[False]], []) if pp_size == 1 else ([], [[False]]))
+
+
+def _pipeline_offload_stage(pp_rank, landed):
+    linker = _PipelineFakeLinker()
+    linker.completed_offloads.extend(landed)
+    nodes = {
+        node_id: SimpleNamespace(
+            id=node_id, external_cache_stored=False, write_through_pending_id=None
+        )
+        for node_id in (1, 2)
+    }
+    unlocks = []
+    cache = _cache_for_wrapper(
+        pp_size=2,
+        pp_rank=pp_rank,
+        pp_group="pp",
+        attn_cp_group=None,
+        attn_tp_group=None,
+        tp_group=None,
+        tree_core=_FakeExternalTreeCore(nodes),
+        inc_lock_ref=lambda node: SimpleNamespace(to_dec_params=lambda: None),
+        dec_lock_ref=lambda node, params: unlocks.append(node),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    wrapper.offload_nodes([1, 2])
+    return wrapper, linker, nodes, unlocks
+
+
+def test_pipeline_stages_commit_the_relayed_offload_verdict():
+    first, _, first_nodes, first_unlocks = _pipeline_offload_stage(0, [True, False])
+    later, later_linker, later_nodes, later_unlocks = _pipeline_offload_stage(1, [])
+
+    first.queue_offload_verdict(first.take_completed_offloads(2))
+
+    assert first.num_completed_offloads() == 0
+    assert all(node.write_through_pending_id for node in first_nodes.values())
+    verdict = first.take_offload_verdict()
+    assert verdict == LinkerOffloadVerdict((True, False), 0)
+    assert first.take_offload_verdict() is None
+
+    landing = threading.Timer(
+        0.05, later_linker.completed_offloads.extend, [[True, True]]
+    )
+    landing.start()
+    for wrapper in (first, later):
+        wrapper.commit_offload_verdict(verdict)
+    landing.join()
+
+    for nodes in (first_nodes, later_nodes):
+        assert [node.external_cache_stored for node in nodes.values()] == [True, False]
+        assert not any(node.write_through_pending_id for node in nodes.values())
+    assert first_unlocks == later_unlocks == [1, 2]
+    assert later_linker.completed_offloads == []
+
+
+def test_reset_drops_an_undelivered_offload_verdict():
+    first, _, first_nodes, first_unlocks = _pipeline_offload_stage(0, [True, True])
+    first.queue_offload_verdict(first.take_completed_offloads(2))
+    verdict = first.take_offload_verdict()
+
+    first.reset()
+    first.commit_offload_verdict(verdict)
+
+    assert first.decided_offloads == 0
+    assert first.pending_offloads == []
+    assert not any(node.external_cache_stored for node in first_nodes.values())
+    assert first_unlocks == [1, 2]
 
 
 @pytest.mark.parametrize(

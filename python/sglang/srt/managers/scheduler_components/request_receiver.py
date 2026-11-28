@@ -26,6 +26,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     FlushCacheReqInput,
+    LinkerOffloadVerdict,
     MMInputsProcessError,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
@@ -346,6 +347,7 @@ class SchedulerRequestReceiver:
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
                     AbortReq,
+                    LinkerOffloadVerdict,
                 ),
             ) or (isinstance(req, FlushCacheReqInput) and req.pp_probe):
                 work_reqs.append(req)

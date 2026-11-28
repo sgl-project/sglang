@@ -80,6 +80,7 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and batch is not None
         and batch.forward_mode == ForwardMode.EXTEND
         and len(batch.reqs) == 1
+        and not batch.pp_linker_load
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
@@ -154,6 +155,7 @@ class SchedulerPPMixin:
     _pp_reqs_awaiting_verdict: Tuple[
         Union[ReleaseMemoryOccupationReqInput, RpcReqInput], ...
     ] = ()
+    _pp_linker_chunk_batch: Optional[ScheduleBatch] = None
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -335,7 +337,9 @@ class SchedulerPPMixin:
 
                 self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
-                    last_batch=self.last_batch, running_batch=self.running_batch
+                    last_batch=self.last_batch,
+                    running_batch=self.running_batch,
+                    hold_chunk=self._pp_linker_chunk_batch is not None,
                 )
                 self._process_hicache_events()
                 batch = None
@@ -1023,6 +1027,9 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
+        if result.pp_failed_load_rids:
+            tensor_dict["pp_failed_load_rids"] = result.pp_failed_load_rids
+
         if self._pp_spec_relay and result.accept_lens is not None:
             # PP+spec verify round: earlier stages need the accept results to
             # mirror seq_lens/KV bookkeeping and the bonus token to root the
@@ -1120,8 +1127,14 @@ class SchedulerPPMixin:
         self: Scheduler, result: GenerationBatchResult
     ) -> None:
         with torch.profiler.record_function("send_proxy_dict_to_next_stage"):
+            tensors = result.pp_hidden_states_proxy_tensors.tensors
+            # Keep request-local metadata off model-owned replay buffers.
+            if result.pp_failed_load_rids:
+                tensors = {**tensors, "pp_failed_load_rids": result.pp_failed_load_rids}
+            if result.pp_linker_load_rids:
+                tensors = {**tensors, "pp_linker_load_rids": result.pp_linker_load_rids}
             self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                result.pp_hidden_states_proxy_tensors.tensors,
+                tensors,
                 async_send=True,
                 msg_type="proxy",
                 ready_event=self.launch_event,
@@ -1248,6 +1261,16 @@ class SchedulerPPMixin:
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
         routed_experts_rows = pp_outputs.tensors.pop(PP_ROUTED_EXPERTS_KEY, None)
+        # Left in place for later stages; rows come from the forward-time batch.
+        if failed_rids := pp_outputs.tensors.get("pp_failed_load_rids"):
+            fwd_batch = mb_metadata.fwd_batch or batch
+            failed = self.tree_cache.mark_failed_linker_loads(
+                fwd_batch.reqs, failed_rids
+            )
+            if self.chunked_req in failed:
+                self._pending_chunked_abort_req = self.chunked_req
+        if self._pp_linker_chunk_batch is batch:
+            self._pp_linker_chunk_batch = None
 
         if (
             batch.return_logprob
@@ -1956,13 +1979,45 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                earlier_failures = ()
+                load_rids = (
+                    tuple(self.tree_cache.linker.inflight_load_rids)
+                    if cur_batch.pp_linker_load
+                    else ()
+                )
+                if (
+                    load_rids
+                    and cur_batch.chunked_req is not None
+                    and cur_batch.chunked_req.rid in load_rids
+                ):
+                    # Its next chunk must not build on KV that may not have landed.
+                    self._pp_linker_chunk_batch = cur_batch
                 if pp_proxy_tensors is not None:
+                    earlier_failures = pp_proxy_tensors.tensors.pop(
+                        "pp_failed_load_rids", ()
+                    )
+                    # Stages that load different rows would hold the next chunk
+                    # on some stages only and hang the pipeline.
+                    prev_load_rids = pp_proxy_tensors.tensors.pop(
+                        "pp_linker_load_rids", ()
+                    )
+                    if set(prev_load_rids) != set(load_rids):
+                        raise RuntimeError(
+                            "PP linker load mismatch: previous stage loads "
+                            f"{prev_load_rids!r}, stage {self.pp_group.rank_in_group} "
+                            f"loads {load_rids!r}"
+                        )
                     # Prevent allocator reuse of received tensors while the forward
                     # stream is still consuming them.
                     for tensor in pp_proxy_tensors.tensors.values():
                         if isinstance(tensor, torch.Tensor) and not tensor.is_cpu:
                             tensor.record_stream(self.forward_stream)
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
+                result.pp_linker_load_rids = load_rids
+                if earlier_failures:
+                    result.pp_failed_load_rids = tuple(
+                        dict.fromkeys((*earlier_failures, *result.pp_failed_load_rids))
+                    )
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_end_time",

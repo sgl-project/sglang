@@ -137,6 +137,7 @@ class TestPPOutputSkipWhileCapturingRoutedExperts(CustomTestCase):
         middle_chunk = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             reqs=[object()],
+            pp_linker_load=False,
             contains_last_prefill_chunk=False,
             return_logprob=False,
         )

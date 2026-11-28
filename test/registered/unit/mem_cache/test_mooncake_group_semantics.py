@@ -287,6 +287,35 @@ def _make_store(
 
 
 class TestMooncakeGroupSemantics(CustomTestCase):
+    def test_pp0_query_requires_every_stage_and_head_shard(self):
+        keys = ["a", "b"]
+        suffixes = []
+        objects = set()
+        for pp in range(2):
+            for tp in range(2):
+                config = replace(
+                    _make_config(tp_rank=tp, tp_size=2, extra_backend_tag="tag"),
+                    pp_rank=pp,
+                    pp_size=2,
+                )
+                store, fake = _make_store(storage_config=config)
+                store.register_mem_pool_host(FakeHostKVCache(2))
+                store.batch_set_v1(keys, torch.arange(2))
+                objects.update(fake.existing_keys)
+                suffixes.extend(store.pp_query_layout()[PoolName.KV])
+                if pp == tp == 0:
+                    reader, shared = store, fake
+        objects.remove("tag_b_0_1_v")
+        shared.existing_keys = objects
+        self.assertEqual(reader.batch_exists(keys), 2)
+        hit = reader.batch_exists_v2(
+            keys,
+            [PoolTransfer(name=PoolName.KV)],
+            pool_suffixes={PoolName.KV: suffixes},
+        )
+        self.assertEqual(hit.restorable_prefix_pages, [1])
+        self.assertEqual(hit.extra_pool_hit_pages[PoolName.KV], 1)
+
     def test_c128_query_restores_only_complete_block_boundaries(self):
         for pages, endpoints, expected in (
             (0, (), []),

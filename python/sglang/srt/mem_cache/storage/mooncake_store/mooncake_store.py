@@ -1368,15 +1368,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        *,
+        pool_suffixes: Optional[Mapping[str, Sequence[str]]] = None,
     ) -> PoolTransferResult:
-        if self.mem_pool_host.kv_buffer is None:
-            # Logical anchor: no physical KV object exists in Mooncake, so the
-            # usable prefix is determined entirely by required sidecar objects.
+        if pool_suffixes is not None or self.mem_pool_host.kv_buffer is None:
+            # PP names every object in pool_suffixes; a logical anchor has no KV object.
             kv_pages = len(keys)
         else:
             kv_pages = self.batch_exists(keys, extra_info)
 
-        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        hit_count: dict = (
+            {PoolName.KV: kv_pages}
+            if kv_pages
+            and (pool_suffixes is None or not pool_suffixes.get(PoolName.KV))
+            else {}
+        )
         # Start from every KV prefix and let each pool remove the stop points it
         # cannot serve. Collect the whole set, not just its maximum: a
         # TRAILING_PAGES pool leaves holes (see PoolTransferResult), and the
@@ -1389,9 +1395,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         prepared = []
         all_component_keys = []
         for transfer in pool_transfers or []:
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
-            )
+            if pool_suffixes is None:
+                component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                    keys, transfer
+                )
+            else:
+                suffixes = pool_suffixes[transfer.name]
+                key_multiplier = len(suffixes)
+                component_keys = [key + suffix for key in keys for suffix in suffixes]
             component_keys = self._tag_keys(component_keys)
             start = len(all_component_keys)
             all_component_keys.extend(component_keys)
@@ -1994,39 +2005,49 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         exist_result = self._batch_exist([key])
         return exist_result[0] == 1
 
+    def _kv_key_suffixes(self) -> tuple[str, ...]:
+        if self.unified_suffixes is not None:
+            return tuple(f"_{suffix}" for suffix in self.unified_suffixes)
+        if self.is_mla_backend:
+            return (f"_{self.mla_suffix}_k",)
+        shards = self.mha_suffix if self.should_split_heads else (self.mha_suffix,)
+        return tuple(f"_{shard}_{part}" for shard in shards for part in ("k", "v"))
+
+    def pp_query_layout(self) -> dict[str, tuple[str, ...]]:
+        layout = {PoolName.KV: ()}
+        for name, pool in self.registered_pools.items():
+            if name != PoolName.KV or isinstance(pool, DevicePoolEntry):
+                keys, _ = self._get_hybrid_page_component_keys(
+                    [""], PoolTransfer(name=name)
+                )
+                layout[name] = tuple(keys)
+        if self.mem_pool_host.kv_buffer is not None:
+            layout[PoolName.KV] = self._kv_key_suffixes()
+        return layout
+
+    def pp_query_namespace(self) -> tuple:
+        config = self.config
+        return (
+            config.master_server_address,
+            config.metadata_server,
+            config.tenant_id,
+            self.config_prefix,
+        )
+
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        # Apply config prefix if available.
-        keys = self._tag_keys(keys)
-
-        if self.unified_suffixes is not None:
-            # A page is a hit only when every chunk this rank owns exists.
-            query_keys = self._unified_object_keys(keys)
-            key_multiplier = len(self.unified_suffixes)
-        elif self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
-        else:
-            query_keys = []
-            if self.should_split_heads:
-                for key in keys:
-                    for suffix in self.mha_suffix:
-                        query_keys.append(f"{key}_{suffix}_k")
-                        query_keys.append(f"{key}_{suffix}_v")
-                key_multiplier = 2 * self.split_factor
-            else:
-                for key in keys:
-                    query_keys.append(f"{key}_{self.mha_suffix}_k")
-                    query_keys.append(f"{key}_{self.mha_suffix}_v")
-                key_multiplier = 2
+        suffixes = self._kv_key_suffixes()
+        query_keys = [
+            key + suffix for key in self._tag_keys(keys) for suffix in suffixes
+        ]
 
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             exist_result = self._batch_exist(query_keys)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
-                return i // key_multiplier
-        return len(query_keys) // key_multiplier
+                return i // len(suffixes)
+        return len(keys)
 
     def close(self):
         # MooncakeDistributedStore will automatically call the destructor, so

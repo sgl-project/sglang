@@ -4704,7 +4704,11 @@ class UnifiedRadixCache(BasePrefixCache):
         them."""
         if self.linker is None:
             return []
-        failed_rids = set(self.linker.finish_loads())
+        return self.mark_failed_linker_loads(reqs, self.linker.finish_loads())
+
+    @staticmethod
+    def mark_failed_linker_loads(reqs: list[Req], failed_rids) -> list[Req]:
+        failed_rids = set(failed_rids)
         failed = [req for req in reqs if req.rid in failed_rids]
         if failed:
             from sglang.srt.managers.req_types import FINISH_ABORT
@@ -4735,20 +4739,31 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
-            finish_counts = torch.tensor(
-                [self.linker.num_completed_offloads()],
-                dtype=torch.int,
-                device="cpu",
-            )
-            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            offload_count = int(finish_counts.item())
-            local_successes = self.linker.take_completed_offloads(offload_count)
-            if local_successes:
-                successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
-                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
-                self.linker.commit_completed_offloads(
-                    [bool(success) for success in successes.tolist()]
+            if self.pp_rank == 0:
+                finish_counts = torch.tensor(
+                    [self.linker.num_completed_offloads()],
+                    dtype=torch.int,
+                    device="cpu",
                 )
+                self._all_reduce_attn_groups(
+                    finish_counts, torch.distributed.ReduceOp.MIN
+                )
+                offload_count = int(finish_counts.item())
+                local_successes = self.linker.take_completed_offloads(offload_count)
+                if local_successes:
+                    successes = torch.tensor(
+                        local_successes, dtype=torch.int, device="cpu"
+                    )
+                    self._all_reduce_attn_groups(
+                        successes, torch.distributed.ReduceOp.MIN
+                    )
+                    successes = [bool(success) for success in successes.tolist()]
+                    # Committing releases node locks, which eviction sees; later PP
+                    # stages commit this verdict when it arrives with the requests.
+                    if self.pp_size > 1:
+                        self.linker.queue_offload_verdict(successes)
+                    else:
+                        self.linker.commit_completed_offloads(successes)
             self.linker.check_prefetch_events()
             return
 

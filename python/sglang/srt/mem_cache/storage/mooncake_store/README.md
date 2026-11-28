@@ -46,6 +46,12 @@ Full/SWA/Mamba within existing linker layout limits and requires PP=1.
 All attention TP ranks read into private GPU slots; only complete KV confirmed
 successful by every rank joins the radix tree. Failed reads fall back to recomputation.
 
+With pipeline parallelism, use `layer_wise`. PP0 checks every stage's objects
+in one batch when a request arrives and forwards the restorable prefix lengths
+with the request, so the stages admit the same prefix without voting. A stage
+whose read fails reports the request through the pipeline, and every stage
+aborts it.
+
 Set `prefetch_policy` in the same JSON:
 
 - `best_effort`: use completed KV at admission; otherwise stop waiting and recompute.

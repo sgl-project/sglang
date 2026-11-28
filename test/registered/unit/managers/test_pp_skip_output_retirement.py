@@ -85,7 +85,12 @@ def _launch(stage, forward_result):
     stage._pp_wait_forward_dependencies = lambda: None
     stage.run_batch = lambda batch, pp_proxy_tensors: forward_result
     stage.pp_group = SimpleNamespace(is_last_rank=False)
-    batch = SimpleNamespace(reqs=[], spec_algorithm=SpeculativeAlgorithm.NONE)
+    batch = SimpleNamespace(
+        reqs=[],
+        spec_algorithm=SpeculativeAlgorithm.NONE,
+        forward_mode=ForwardMode.DECODE,
+        pp_linker_load=False,
+    )
     mb_metadata = [None]
     stage._pp_launch_batch(0, batch, None, mb_metadata, deque())
     return forward_stream, mb_metadata[0]
