@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.capacity import reclaim_for_load_back, shares_memory
+from sglang.srt.mem_cache.evict_policy import get_cache_priority
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -841,7 +842,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 prev_prefix_len=prev_prefix_len,
                 component_evicted_seqlens=self.insert_window_cursors(req.kv),
                 inserted_len=len(key),
-                priority=req.priority or 0,
+                priority=get_cache_priority(
+                    req.priority, self.schedule_low_priority_values_first
+                ),
             )
         )
 

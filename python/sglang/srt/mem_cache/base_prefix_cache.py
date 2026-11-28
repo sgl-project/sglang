@@ -122,6 +122,7 @@ class InsertParams:
     # The inserting request already inserted [0, here) (req.kv.cache_inserted_len);
     # only the nodes past it count a hit, so a request counts each node once.
     inserted_len: int = 0
+    # Cache retention rank (larger is kept longer), normalized from request priority.
     priority: int = 0
     session_id: Optional[str] = None
     track_adopted_ranges: bool = False
