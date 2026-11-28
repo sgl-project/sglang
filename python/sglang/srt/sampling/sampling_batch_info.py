@@ -3,15 +3,12 @@ from __future__ import annotations
 import dataclasses
 import logging
 import operator
-from functools import cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.environ import envs
-from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_exec, get_spec
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
@@ -193,7 +190,9 @@ class SamplingBatchInfo:
         )
 
     def copy_for_forward(self):
-        if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
+        if type(self) is SamplingBatchInfo:
+            # The same fields as dataclasses.replace (no __post_init__, no init=False
+            # field), without a keyword __init__ call per forward.
             new = object.__new__(SamplingBatchInfo)
             new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
         else:
@@ -205,19 +204,6 @@ def need_truncated_sampling(info: SamplingBatchInfo) -> bool:
     """Whether some row truncates its distribution with top-k, top-p, or min-p."""
     return (
         info.need_top_k_sampling or info.need_top_p_sampling or info.need_min_p_sampling
-    )
-
-
-@cache
-def _fast_copy_enabled() -> bool:
-    # Preserve the original EAGLE runtime policy without the resource-pool dependency.
-    return (
-        current_platform.is_cuda()
-        and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
-        and (get_spec().speculative_algorithm or "").upper() == "EAGLE"
-        and (get_spec().speculative_eagle_topk or 1) == 1
-        and not get_schedule().disable_overlap_schedule
-        and get_parallel().moe_ep_size == 1
     )
 
 
