@@ -113,9 +113,7 @@ class TestNgramWorkerPrompt(CustomTestCase):
         other = Req("text", "", array("q", [30, 31, 32, 33]), SamplingParams())
 
         # Middle chunk: skip batch.chunked_req so only the completed req is inserted.
-        worker._insert_extend_prompt_tails(
-            SimpleNamespace(reqs=[req, other], chunked_req=req)
-        )
+        worker.insert_prompt_tails(SimpleNamespace(reqs=[req, other], chunked_req=req))
         worker.ngram_corpus.synchronize()
         self.assertIn(
             32, worker.ngram_corpus.batch_get(["other-mid"], [[30, 31]], [2])[0]
@@ -125,9 +123,7 @@ class TestNgramWorkerPrompt(CustomTestCase):
         )
 
         # Final chunk: unpadded prompt tail + output_ids inserted in order, bounded to window.
-        worker._insert_extend_prompt_tails(
-            SimpleNamespace(reqs=[req, other], chunked_req=None)
-        )
+        worker.insert_prompt_tails(SimpleNamespace(reqs=[req, other], chunked_req=None))
         worker.ngram_corpus.synchronize()
         cross_boundary = worker.ngram_corpus.batch_get(
             ["req-boundary"], [[20, 21]], [2]

@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // states for collectives
@@ -46,6 +47,14 @@ struct SharedData {
 void shared_open(SharedData* data, const char* name, size_t nbytes) {
   int d = shm_open(name, O_RDWR, S_IRUSR | S_IWUSR);
   if (d != -1) {
+    struct stat status;
+    fstat(d, &status);
+    if (status.st_size < static_cast<off_t>(nbytes)) {
+      close(d);
+      data->descriptor = -1;
+      errno = ENOENT;
+      return;
+    }
     void* bytes = mmap(NULL, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, d, 0);
     data->name = name;
     data->descriptor = d;
@@ -101,6 +110,7 @@ struct allreduce_workspace {
        2 * MAX_BUF_SIZE                 // all_to_all
 
   ];
+  int mapped;
 };
 
 #define BUFFER0_OFFSET(current_buffer) current_buffer* NAIVE_ALLREDUCE_THRESHOLD
@@ -231,6 +241,7 @@ int64_t shm_initialize(int size, int rank, const char* addr_string, const char* 
   struct allreduce_workspace* workspace_buf;
   struct allreduce_workspace* workspace_buf_other;
   workspace_buf = (struct allreduce_workspace*)malloc(sizeof(struct allreduce_workspace));
+  workspace_buf->mapped = 0;
   snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, rank);
   shared_create(&allreduce_buffer, shm_name, workspace_buf, sizeof(struct allreduce_workspace));
   free(workspace_buf);
@@ -294,6 +305,14 @@ int64_t shm_initialize(int size, int rank, const char* addr_string, const char* 
     ctx->alltoall_buffer[0][i] = ctx->workspace[i]->buffer + BUFFER5_OFFSET(0);
     ctx->alltoall_buffer[1][i] = ctx->workspace[i]->buffer + BUFFER5_OFFSET(1);
   }
+
+  __atomic_store_n(&workspace_buf->mapped, 1, __ATOMIC_RELEASE);
+  for (int i = 0; i < size; i++) {
+    while (!__atomic_load_n(&ctx->workspace[i]->mapped, __ATOMIC_ACQUIRE)) {
+    }
+  }
+  snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, rank);
+  shm_unlink(shm_name);
 
   const int64_t handle = static_cast<int64_t>(shm_contexts.size());
   shm_contexts.push_back(ctx);

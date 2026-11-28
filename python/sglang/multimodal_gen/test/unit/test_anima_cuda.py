@@ -110,12 +110,18 @@ def test_transformer_matches_cosmos(dtype, batch_size, monkeypatch):
         calls.append(norm)
         return project(norm, embedded_timestep, temb)
 
-    req = SimpleNamespace(extra={}, do_classifier_free_guidance=True)
+    negative = -context
+    req = SimpleNamespace(
+        extra={},
+        do_classifier_free_guidance=True,
+        prompt_embeds=[context],
+        negative_prompt_embeds=[negative],
+    )
     next_t = t / 2
     norms_per_forward = 3 * kwargs["num_layers"] + 1
     with patch.object(anima.AnimaAdaLayerNorm, "project_modulation", counted):
         for i, (conditioning, timestep) in enumerate(
-            ((context, t), (-context, t), (context, next_t), (-context, next_t))
+            ((context, t), (negative, t), (context, next_t), (negative, next_t))
         ):
             expected = reference(
                 x, timestep.to(dtype) / 1000, conditioning, padding_mask=padding
