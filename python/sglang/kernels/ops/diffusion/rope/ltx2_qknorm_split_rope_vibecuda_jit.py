@@ -191,6 +191,11 @@ def ltx2_qknorm_split_rope_vibecuda(
     head_dim: int,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize and rotate contiguous BF16 Q/K on SM100 or SM103.
+
+    RoPE tables must have unit inner stride. When ``out`` is supplied, both
+    outputs must be contiguous, non-overlapping, and independent of all inputs.
+    """
     if head_dim % 8 != 0:
         raise RuntimeError("vibecuda LTX2 QKNorm split-RoPE requires head_dim % 8 == 0")
     if not can_use_ltx2_qknorm_split_rope_vibecuda(
