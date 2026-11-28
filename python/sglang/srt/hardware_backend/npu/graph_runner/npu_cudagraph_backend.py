@@ -31,6 +31,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
@@ -67,6 +68,15 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         self._device_module = cuda_graph_runner.device_module
         self._device_id = self._device_module.current_device()
         self._tp_group = get_parallel().tp_group
+        if (
+            self._tp_group.world_size > 1
+            and is_deepseek_v4(cuda_graph_runner.model_runner.model_config.hf_config)
+            and not is_npu_arch35()
+        ):
+            # On A3, initialize HCCP before the graph's first AICPU metadata op.
+            warmup = torch.zeros(1, device=f"npu:{self._device_id}")
+            torch.distributed.all_reduce(warmup, group=self._tp_group.device_group)
+            self._device_module.synchronize()
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -156,11 +166,17 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                 mla_backend.forward_metadata.seq_lens_cpu_list[: runner.raw_bs]
             )
             return seq_lens + [0] * (runner.bs - len(seq_lens))
-        if forward_batch.forward_mode.is_target_verify():
+        if forward_batch.forward_mode.is_target_verify() or (
+            forward_batch.forward_mode.is_idle()
+            and runner.model_runner.spec_algorithm.is_dflash()
+        ):
             # Only DFlash refreshes forward_metadata.seq_lens_cpu_list at
             # replay; other algorithms keep the capture-time list, so
             # recompute from the live batch as before — reading the
             # backend list there would replay stale capture-time lengths.
+            # The IDLE arm covers a dflash idle rank replaying the verify
+            # graph with an empty live batch; graph.update must carry the
+            # planned (non-zero) lengths.
             if runner.model_runner.spec_algorithm.is_dflash():
                 _attn = runner.attn_backend
                 _meta = getattr(_attn, "forward_metadata", None)
@@ -329,6 +345,9 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                 bs=runner.bs,
                 raw_bs=runner.raw_bs,
                 num_tokens=runner.bs * runner.captured_req_width,
+                global_num_tokens_cpu=runner._global_num_tokens_for_graph(
+                    runner.bs * runner.captured_req_width
+                ),
                 seq_len_fill_value=runner.seq_len_fill_value,
                 capture_forward_mode=runner.capture_forward_mode,
                 is_encoder_decoder=runner.is_encoder_decoder,

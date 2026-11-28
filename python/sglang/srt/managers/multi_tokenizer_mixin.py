@@ -66,6 +66,7 @@ from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     zmq_reader_owner,
 )
+from sglang.srt.managers.mm_utils import discard_shm_features
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.trace import process_tracing_init
 from sglang.srt.runtime_context import get_observability
@@ -75,7 +76,7 @@ from sglang.srt.utils import (
     kill_itself_when_parent_died,
     kill_process_tree,
 )
-from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.network import await_zmq_send, get_zmq_socket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
@@ -515,7 +516,19 @@ class MultiTokenizerRouter:
                     await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
-            await async_sock_send(self.send_to_scheduler, recv_obj)
+            forwarded = False
+
+            def mark_forwarded():
+                nonlocal forwarded
+                forwarded = True
+
+            try:
+                await await_zmq_send(
+                    sock_send(self.send_to_scheduler, recv_obj), mark_forwarded
+                )
+            finally:
+                if not forwarded:
+                    discard_shm_features(recv_obj)
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker."""

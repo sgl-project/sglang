@@ -109,6 +109,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.linker_attachment import LinkerAttachment
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
@@ -227,6 +228,9 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # Whether storage can hold Full KV past its last SWA window, a gap the cache
+    # then heals: a buffer-mode Full + SWA cache, resolved in init_hicache.
+    _heals_storage_swa_gap: bool = False
 
     def __init__(
         self,
@@ -384,6 +388,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        # Owns the external linker lifecycle; built by the registry.
+        self.linker_attachment: Optional[LinkerAttachment] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
@@ -480,9 +486,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
         if cache_linker.load_mode == "prefetch":
-            memory = get_memory()
             self.prefetch_stop_policy = cache_linker.prefetch_policy
-            config = memory.unified_cache_external_linker_config
             (
                 _,
                 _,
@@ -490,9 +494,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 timeout_per_ki_token,
                 _,
             ) = HybridCacheController.parse_storage_backend_extra_config(
-                json.dumps(config)
-                if config is not None
-                else memory.hicache_storage_backend_extra_config
+                json.dumps(get_memory().unified_cache_external_linker_config)
             )
             self.prefetch_timeout_per_page = (
                 self.page_size / 1024 * timeout_per_ki_token
@@ -521,6 +523,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
+        # Where storage's Full KV ends for the request, when that is past the
+        # last restorable SWA window (see _record_storage_swa_gap).
+        self._storage_swa_gap_end_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
         self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
@@ -550,6 +555,13 @@ class UnifiedRadixCache(BasePrefixCache):
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
         self.host_memory_mode = get_memory().hicache_host_memory_mode
+        # Several windows rebind on a miss instead of branching.
+        self._heals_storage_swa_gap = (
+            self.host_memory_mode == "buffer_only"
+            and self.is_swa_enabled
+            and not self.is_mamba_enabled
+            and len(self.window_slots()) == 1
+        )
         if self.host_memory_mode == "buffer_only":
             supported = {ComponentType.FULL, ComponentType.MAMBA, *self.window_slots()}
             if not set(self.tree_components) <= supported:
@@ -620,7 +632,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 storage_prefetch_threshold=storage_prefetch_threshold,
             )
             self.buffer_pipeline = self.component_of(TREE_TOKEN).create_buffer_pipeline(
-                max_context_len=get_model().context_length or 0,
+                context_length=get_model().context_length or 0,
                 swa_component=swa,
                 further_window_components=further_windows,
                 # Leak backstop only: the queue is charged once per unique node
@@ -647,6 +659,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self._init_mamba_path_cap_counts_host()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -729,6 +742,8 @@ class UnifiedRadixCache(BasePrefixCache):
             and get_disagg().disaggregation_mode != "decode"
         ):
             result = self.linker.match(params.key, params.req, result)
+        if self._heals_storage_swa_gap:
+            result = self._branch_at_storage_swa_gap(params, result)
         return result
 
     def _linker_offload_skip_prefix(self, req: Req, token_ids):
@@ -1615,6 +1630,9 @@ class UnifiedRadixCache(BasePrefixCache):
             and req.finished()
         ):
             self.cache_controller.release_pp_prefetch(req.rid)
+        if self._heals_storage_swa_gap:
+            # The request already carries its branch point; a retracted one re-queries.
+            self._storage_swa_gap_end_by_reqid.pop(req.cache_request_handle, None)
         return self.session.try_cache_finished_req(req)
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
@@ -1835,6 +1853,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+
+        if (
+            is_finished
+            and result.swa_branch_inserted
+            and effective_cache_len < len(token_ids)
+        ):
+            # No later checkpoint picks up what the branch cut off a finished request.
+            self._checkpoint_into_tree(req, up_to=up_to, **kwargs)
+            return
 
         if self.enable_session_radix_cache and is_finished:
             from sglang.srt.managers.req_types import FINISH_ABORT
@@ -3534,6 +3561,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.release_request(request)
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
+        if self._heals_storage_swa_gap:
+            self._storage_swa_gap_end_by_reqid.pop(request, None)
         self.storage_prefetch_retries.cancel(rid)
         if (
             self.buffer_pipeline is not None
@@ -3635,6 +3664,46 @@ class UnifiedRadixCache(BasePrefixCache):
                 hit_pages,
                 evidence=evidence,
             )
+
+    def _record_storage_swa_gap(self, operation) -> None:
+        """Remember where storage's Full KV ends when the rank-agreed hit stops
+        short of it for want of an SWA window: the request recomputes that KV,
+        and a branch there ends a node, whose window the backup then stores."""
+        # A cut query's agreed hit may be a MIN over skipped lookups, not a verdict.
+        if not self._heals_storage_swa_gap or operation.deadline_expired:
+            return
+        kv_pages = operation.query_pool_hit_pages.get(PoolName.KV)
+        if kv_pages is None:
+            return
+        # The KV boundary counts pages from the untrimmed query start.
+        kv_end = (
+            operation.storage_start
+            + (kv_pages - operation.prefetch_kv_page_offset) * self.page_size
+        )
+        # An insert stops only at a page boundary, so an unaligned point would
+        # cap every later insert of the request.
+        assert kv_end % self.page_size == 0, (operation.storage_start, kv_pages)
+        restorable_end = operation.storage_start + operation.storage_hit_count
+        # A shorter gap than one worth fetching is not worth a window either.
+        if kv_end - restorable_end >= self.prefetch_threshold:
+            self._storage_swa_gap_end_by_reqid[operation.handle] = kv_end
+        else:
+            self._storage_swa_gap_end_by_reqid.pop(operation.handle, None)
+
+    def _branch_at_storage_swa_gap(
+        self, params: MatchPrefixParams, result: MatchResult
+    ) -> MatchResult:
+        """Report the recorded gap end as the SWA branch point, unless the tree
+        reports its own branch or already matches past it."""
+        if params.req is None or result.swa_branching_seqlen is not None:
+            return result
+        branch = self._storage_swa_gap_end_by_reqid.get(params.req.cache_request_handle)
+        if (
+            branch is None
+            or branch <= result.device_prefix_len + result.host_hit_length
+        ):
+            return result
+        return result._replace(swa_branching_seqlen=branch)
 
     def _account_prefetch_outcome(self, operation, revoked: bool) -> None:
         """Feed the cumulative prefetch-outcome counters at the (rank-synced)
@@ -3939,6 +4008,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     if hit_tokens > 0:
                         self.discard_storage_prefetch_accounting(request)
                     continue
+                self._record_storage_swa_gap(operation)
                 if hit_tokens > 0:
                     self._record_storage_prefetch_hit(request, hit_tokens)
                 if operation.is_terminated():
@@ -4417,6 +4487,15 @@ class UnifiedRadixCache(BasePrefixCache):
         while acks and acks[0].finish_event.query():
             self._log_write_ack_metrics(acks.popleft())
 
+    def wait_fenced_writes(self) -> None:
+        """Wait for the stream-fenced write-back copies, which
+        ongoing_write_through no longer tracks."""
+        acks = self._fenced_write_acks
+        while acks:
+            ack = acks.popleft()
+            ack.finish_event.synchronize()
+            self._log_write_ack_metrics(ack)
+
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
     ) -> None:
@@ -4543,6 +4622,20 @@ class UnifiedRadixCache(BasePrefixCache):
         if comp is None:
             return False
         return comp._mamba_host_only_checkpoint()
+
+    def _init_mamba_path_cap_counts_host(self) -> None:
+        """Let the per-path Mamba state cap count and free host copies; a no-op
+        without a cap (checkpoints level 3) or a Mamba host pool in cache mode."""
+        comp = self.components.get(ComponentType.MAMBA)
+        cap = comp.mamba_max_states_per_path if comp is not None else -1
+        if (
+            cap < 0
+            or comp._mamba_pool_host is None
+            or self.host_memory_mode == "buffer_only"
+        ):
+            return
+        self.tree_core.set_mamba_path_cap_counts_host(True)
+        logger.info("Mamba path cap counts host copies (cap %d)", cap)
 
     # ---- HiCache: Scheduler Entry Points ----
 

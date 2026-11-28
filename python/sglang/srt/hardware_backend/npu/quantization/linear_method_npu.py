@@ -29,6 +29,16 @@ logger = logging.getLogger(__name__)
 MXFP8_BLOCK_SIZE = 32
 
 
+def _empty_quant_matmul_output(
+    x: torch.Tensor, layer: torch.nn.Module, dtype: torch.dtype
+) -> torch.Tensor:
+    # npu_quant_matmul raises "QuantMatmul not support to process empty tensor
+    # currently" on 0-row inputs, which attn-DP idle ranks legitimately produce
+    # (0-token keep-alive batches). Mirror GEMM semantics ([M, K] x [K, N] ->
+    # [M, N]) using the pre-transposed [K, N] NPU weight layout.
+    return x.new_empty((*x.shape[:-1], layer.weight.shape[1]), dtype=dtype)
+
+
 def _prepare_mxfp4_w4a8_bias(
     bias: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
@@ -74,6 +84,8 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
         from sglang.srt.layers.linear import RowParallelLinear
 
         original_dtype = x.dtype
+        if x.numel() == 0:
+            return _empty_quant_matmul_output(x, layer, original_dtype)
         original_shape = x.shape
         x_2d = x.reshape(-1, original_shape[-1]) if x.ndim > 2 else x
         if original_dtype != torch.int8:
@@ -122,6 +134,8 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             """dynamic_scale is calculated in malprolog kernel"""
             original_dtype = torch.bfloat16
             quant_out, dynamic_scale = x
+            if quant_out.numel() == 0:
+                return _empty_quant_matmul_output(quant_out, layer, original_dtype)
             return torch.ops.npu.npu_quant_matmul(
                 quant_out,
                 layer.weight,
@@ -138,6 +152,8 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
         original_shape = x.shape
         x_2d = x.reshape(-1, original_shape[-1]) if x.ndim > 2 else x
         quant_out, dynamic_scale = torch.ops.npu.npu_dynamic_quant(x_2d)
+        if quant_out.numel() == 0:
+            return _empty_quant_matmul_output(quant_out, layer, original_dtype)
         out = torch.ops.npu.npu_quant_matmul(
             quant_out,
             layer.weight,

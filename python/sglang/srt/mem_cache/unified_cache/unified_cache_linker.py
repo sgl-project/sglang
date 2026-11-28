@@ -155,6 +155,17 @@ class LayerWiseLoadCounter:
         self.blocked_seconds.clear()
 
 
+class OffsetLayerCounter:
+    """Layer wait hook for a pool whose layer ``i`` rides transfer layer ``offset + i``."""
+
+    def __init__(self, counter: object, offset: int):
+        self.counter = counter
+        self.offset = offset
+
+    def wait_until(self, threshold: int) -> None:
+        self.counter.wait_until(self.offset + threshold)
+
+
 class TransferReady(NamedTuple):
     """What a transfer waits on: the page indices, then the forward using the pages."""
 
@@ -207,6 +218,16 @@ class UnifiedCacheLinker(ABC):
         forward_done = device_module.Event()
         forward_done.record(self.forward_stream)
         return TransferReady(indices_ready, forward_done)
+
+    def draft_layer_counter(self) -> OffsetLayerCounter:
+        """Layer wait hook for the sidecar draft pool.
+
+        The offset comes from the DRAFT entry's transfer layers, so the wait
+        follows wherever the pool assembler placed the draft bytes.
+        """
+        return OffsetLayerCounter(
+            self.layer_done_counter, min(self.pools[PoolName.DRAFT].layer_mapping)
+        )
 
     def prefetch(self, transfers: list[PoolTransfer]) -> Future[bool] | None:
         """Read all layers; the future completes after all device writes stop."""
@@ -360,6 +381,7 @@ class UnifiedCacheLinkerWrapper:
         self.offload_skip_prefix_len = 0
 
         cache.tree_core.enable_external_cache_linker = True
+        self.saved_write_through_threshold = cache.write_through_threshold
         cache.write_through_threshold = 1
         self.metrics = cache.metrics_collector
         if self.metrics is not None:
@@ -1010,3 +1032,5 @@ class UnifiedCacheLinkerWrapper:
     def close(self) -> None:
         self.cache_linker.close()
         self._clear_state()
+        self.cache.tree_core.enable_external_cache_linker = False
+        self.cache.write_through_threshold = self.saved_write_through_threshold

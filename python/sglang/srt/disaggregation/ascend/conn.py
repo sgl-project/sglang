@@ -1,5 +1,4 @@
 import concurrent.futures
-import enum
 import logging
 from typing import List, Optional, Tuple
 
@@ -25,16 +24,7 @@ from sglang.srt.utils.network import get_local_ip_auto
 logger = logging.getLogger(__name__)
 
 
-class AscendStateType(str, enum.Enum):
-    """DSV4-on-NPU PD components without a cross-hardware equivalent."""
-
-    DSV4_C128 = "dsv4_c128"
-    # Ascend 950 C4 state (attention + indexer) transfers row by row because
-    # the prefill and decode peers may use different SWA-page ring sizes.
-    DSV4_C4_STATE = "dsv4_c4_state"
-
-
-_DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
+_DSV4_KVCACHE_STATE_TYPES = (StateType.DSV4_C128,)
 
 
 def _build_page_interleaved_dcp_plan(
@@ -200,17 +190,8 @@ class AscendKVManager(MooncakeKVManager):
             c128_start = sum(ratio == 128 for ratio in mla_ratios[:start_layer])
             c128_end = sum(ratio == 128 for ratio in mla_ratios[:end_layer])
 
-            if state_type == AscendStateType.DSV4_C128:
+            if state_type == StateType.DSV4_C128:
                 dst = dst_kv_ptrs[c128_start:c128_end]
-                return src_kv_ptrs, dst, len(src_kv_ptrs)
-
-            if state_type == AscendStateType.DSV4_C4_STATE:
-                # Layout: [attn_state_0..attn_{c4_full-1},
-                #          idx_state_0..idx_{c4_full-1}]
-                # Two groups, each c4_full entries; slice both by PP stage.
-                dst = []
-                for offset in (0, c4_full):
-                    dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
             # NPU main KV layout: [C4 KV, index K, index scale].
@@ -218,17 +199,6 @@ class AscendKVManager(MooncakeKVManager):
                 dst = []
                 for offset in (0, c4_full, 2 * c4_full):
                     dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
-                return src_kv_ptrs, dst, len(src_kv_ptrs)
-
-            # On Ascend 950, StateType.SWA only contains SWA KV
-            # buffers (C4 compress state is registered separately as
-            # DSV4_C4_STATE).  The common _mla_slice_ptrs_for_pp assumes
-            # SWA + C4 state are bundled (swa_L + 2*c4_full), so intercept
-            # here and slice SWA KV by layer index directly.
-            if state_type == StateType.SWA and AscendStateType.DSV4_C4_STATE in (
-                self.kv_args.state_types or []
-            ):
-                dst = list(dst_kv_ptrs[start_layer:end_layer])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
             return super().get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs, state_type)
@@ -295,7 +265,9 @@ class AscendKVManager(MooncakeKVManager):
         # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
         # decode peer registers all model layers. Pair only this layout by
         # global layer id; every other Ascend layout keeps the legacy path.
-        if self.is_hybrid_mla_backend and self.pp_size > 1:
+        if self.is_hybrid_mla_backend and (
+            self.pp_size > 1 or get_parallel().enable_dsa_cache_layer_split
+        ):
             return self._send_kvcache_generic(
                 mooncake_session_id=mooncake_session_id,
                 item_lens=self.kv_args.kv_item_lens,
