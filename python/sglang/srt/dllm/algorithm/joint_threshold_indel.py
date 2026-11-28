@@ -19,6 +19,8 @@ class JointThresholdInDel(DllmAlgorithm):
     reappears. This intentionally differs from the released reference decoder.
     """
 
+    config_keys = ("threshold", "edit_threshold", "max_post_edit_steps")
+
     def __init__(self, config: DllmConfig):
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.5)
