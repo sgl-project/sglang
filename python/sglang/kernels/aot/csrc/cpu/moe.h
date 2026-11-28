@@ -1,4 +1,5 @@
 #pragma once
+#include "gemm.h"
 #include "vec.h"
 
 template <typename scalar_t>
@@ -20,23 +21,6 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ i
   }
   for (; d < size; ++d) {
     out[d] = input[d];
-  }
-}
-
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const float* __restrict__ input, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [x0, x1] = load_float_vec2(input + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0, x1);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d]);
   }
 }
 
@@ -204,24 +188,6 @@ inline void clamp_sigmoid_and_mul_stub(
   }
 }
 
-template <typename scalar_t>
-inline void copy_mul_stub(scalar_t* __restrict__ out, const float* __restrict__ input, float weight, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec weight_vec = fVec(weight);
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [x0, x1] = load_float_vec2(input + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0 * weight_vec, x1 * weight_vec);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] * weight);
-  }
-}
-
 // input = input + input2
 inline void add_bias_stub(float* __restrict__ input, const float* __restrict__ input2, int64_t size) {
   using fVec = at::vec::Vectorized<float>;
@@ -236,23 +202,5 @@ inline void add_bias_stub(float* __restrict__ input, const float* __restrict__ i
   }
   for (; d < size; ++d) {
     input[d] = input[d] + input2[d];
-  }
-}
-
-template <typename scalar_t>
-inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, float weight, int64_t size) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  constexpr int kVecSize = bVec::size();
-  const fVec weight_vec = fVec(weight);
-  int64_t d;
-#pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    auto [x0, x1] = load_float_vec2(input + d);
-    bVec out_vec = convert_from_float_ext<scalar_t>(x0 * weight_vec, x1 * weight_vec);
-    out_vec.store(out + d);
-  }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>(input[d] * weight);
   }
 }

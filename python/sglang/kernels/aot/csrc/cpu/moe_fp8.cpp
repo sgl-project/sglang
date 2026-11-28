@@ -2,8 +2,8 @@
 #include "gemm.h"
 #include "moe.h"
 
-template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
-void fused_experts_fp_kernel_impl(
+template <typename scalar_t>
+void fused_experts_fp8_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
     scalar_t* __restrict__ ic1,
@@ -12,12 +12,12 @@ void fused_experts_fp_kernel_impl(
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
-    const packed_t* __restrict__ packed_w1,
-    const packed_t* __restrict__ packed_w2,
+    const at::Float8_e4m3fn* __restrict__ packed_w1,
+    const at::Float8_e4m3fn* __restrict__ packed_w2,
     const float* __restrict__ w1_bias,
     const float* __restrict__ w2_bias,
-    const param_t* __restrict__ w1s,
-    const param_t* __restrict__ w2s,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
     int64_t block_size_N,
     int64_t block_size_K,
     const float* __restrict__ topk_weights,
@@ -43,37 +43,30 @@ void fused_experts_fp_kernel_impl(
   int64_t scale_size_N = div_up(2 * N, block_size_N);
   int64_t scale_size_K = div_up(K, block_size_K);
   int64_t blocks_n_per_group = block_size_N / BLOCK_N;
-  std::function<int64_t(int64_t)> scale_offset_per_block;
-  if constexpr (is_mxfp4) {
-    scale_offset_per_block = [&](int64_t a) { return a * BLOCK_N; };
-  } else {
-    scale_offset_per_block = [&](int64_t a) { return a / blocks_n_per_group; };
-  }
 
-  const int64_t packed_K = get_row_size<packed_t>(K);
+  const int64_t packed_K = get_row_size<at::Float8_e4m3fn>(K);
 
   const int64_t stride_e = 2 * N * packed_K;
   const int64_t stride_n = packed_K;
 
   int64_t avg_M = std::max(int64_t(1), M * topk / E);
-  const bool use_brgemm = can_use_brgemm<packed_t>(avg_M);
+  const bool use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(avg_M);
 
   int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
 
-  // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
     int tid = get_thread_num();
     scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
 
-    loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
 
       // B shape [K, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
-      const packed_t* __restrict__ B = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
-      const param_t* __restrict__ Bs =
-          w1s + expert_id * scale_size_N * scale_size_K + scale_offset_per_block(nb) * scale_size_K;
+      const at::Float8_e4m3fn* __restrict__ B = packed_w1 + expert_id * stride_e + nb * BLOCK_N * stride_n;
+      const float* __restrict__ Bs =
+          w1s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
       const float* __restrict__ B_bias = with_bias ? w1_bias + expert_id * 2 * N + nb * BLOCK_N : nullptr;
 
       // do unpacking for the first row or a new expert
@@ -145,7 +138,7 @@ void fused_experts_fp_kernel_impl(
   const int64_t NB2 = div_up(OC, BLOCK_N);
   scale_size_N = div_up(K, block_size_N);
   scale_size_K = div_up(N, block_size_K);
-  const int64_t packed_IC = get_row_size<packed_t>(IC);
+  const int64_t packed_IC = get_row_size<at::Float8_e4m3fn>(IC);
   const int64_t stride_e2 = OC * packed_IC;
   const int64_t stride_oc = packed_IC;
 
@@ -154,7 +147,7 @@ void fused_experts_fp_kernel_impl(
     int tid = get_thread_num();
     alignas(64) scalar_t C[BLOCK_M * BLOCK_K];
 
-    loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
 
@@ -165,9 +158,9 @@ void fused_experts_fp_kernel_impl(
 
       // B shape [IC, n_size] in vnni format
       int32_t expert_id = expert_ids[mb];
-      const packed_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
-      const param_t* __restrict__ Bs =
-          w2s + expert_id * scale_size_N * scale_size_K + scale_offset_per_block(nb) * scale_size_K;
+      const at::Float8_e4m3fn* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
+      const float* __restrict__ Bs =
+          w2s + expert_id * scale_size_N * scale_size_K + (nb / blocks_n_per_group) * scale_size_K;
       const float* __restrict__ B_bias = with_bias ? w2_bias + expert_id * OC + nb * BLOCK_N : nullptr;
 
       // do unpacking for the first row or a new expert
@@ -215,43 +208,41 @@ void fused_experts_fp_kernel_impl(
   });
 }
 
-#define INSTANTIATE_MOE_FP_TEMPLATE(TYPE1, TYPE2, TYPE3, IS_MXFP4)           \
-  template void fused_experts_fp_kernel_impl<TYPE1, TYPE2, TYPE3, IS_MXFP4>( \
-      TYPE1* __restrict__ output,                                            \
-      TYPE1* __restrict__ ic0,                                               \
-      TYPE1* __restrict__ ic1,                                               \
-      TYPE1* __restrict__ ic2,                                               \
-      TYPE1* __restrict__ A_tmp,                                             \
-      TYPE1* __restrict__ B_tmp,                                             \
-      float* __restrict__ C_tmp,                                             \
-      const TYPE1* __restrict__ input,                                       \
-      const TYPE2* __restrict__ packed_w1,                                   \
-      const TYPE2* __restrict__ packed_w2,                                   \
-      const float* __restrict__ w1_bias,                                     \
-      const float* __restrict__ w2_bias,                                     \
-      const TYPE3* __restrict__ w1s,                                         \
-      const TYPE3* __restrict__ w2s,                                         \
-      int64_t block_size_N,                                                  \
-      int64_t block_size_K,                                                  \
-      const float* __restrict__ topk_weights,                                \
-      const int32_t* __restrict__ sorted_ids,                                \
-      const int32_t* __restrict__ expert_ids,                                \
-      const int32_t* __restrict__ offsets,                                   \
-      int64_t M,                                                             \
-      int64_t N,                                                             \
-      int64_t K,                                                             \
-      int64_t E,                                                             \
-      int64_t topk,                                                          \
-      int64_t num_tokens_post_pad,                                           \
-      float alpha,                                                           \
-      float limit,                                                           \
-      CPUActMethod act_func,                                                 \
+#define INSTANTIATE_MOE_FP8_TEMPLATE(TYPE)             \
+  template void fused_experts_fp8_kernel_impl<TYPE>(   \
+      TYPE* __restrict__ output,                       \
+      TYPE* __restrict__ ic0,                          \
+      TYPE* __restrict__ ic1,                          \
+      TYPE* __restrict__ ic2,                          \
+      TYPE* __restrict__ A_tmp,                        \
+      TYPE* __restrict__ B_tmp,                        \
+      float* __restrict__ C_tmp,                       \
+      const TYPE* __restrict__ input,                  \
+      const at::Float8_e4m3fn* __restrict__ packed_w1, \
+      const at::Float8_e4m3fn* __restrict__ packed_w2, \
+      const float* __restrict__ w1_bias,               \
+      const float* __restrict__ w2_bias,               \
+      const float* __restrict__ w1s,                   \
+      const float* __restrict__ w2s,                   \
+      int64_t block_size_N,                            \
+      int64_t block_size_K,                            \
+      const float* __restrict__ topk_weights,          \
+      const int32_t* __restrict__ sorted_ids,          \
+      const int32_t* __restrict__ expert_ids,          \
+      const int32_t* __restrict__ offsets,             \
+      int64_t M,                                       \
+      int64_t N,                                       \
+      int64_t K,                                       \
+      int64_t E,                                       \
+      int64_t topk,                                    \
+      int64_t num_tokens_post_pad,                     \
+      float alpha,                                     \
+      float limit,                                     \
+      CPUActMethod act_func,                           \
       bool with_bias)
 
-INSTANTIATE_MOE_FP_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float, false);
-INSTANTIATE_MOE_FP_TEMPLATE(at::Half, at::Float8_e4m3fn, float, false);
-INSTANTIATE_MOE_FP_TEMPLATE(at::BFloat16, uint8_t, uint8_t, true);
-INSTANTIATE_MOE_FP_TEMPLATE(at::Half, uint8_t, uint8_t, true);
+INSTANTIATE_MOE_FP8_TEMPLATE(at::BFloat16);
+INSTANTIATE_MOE_FP8_TEMPLATE(at::Half);
 
 template <typename scalar_t>
 void shared_expert_fp8_kernel_impl(

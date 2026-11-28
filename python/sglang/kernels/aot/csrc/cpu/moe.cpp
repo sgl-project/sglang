@@ -2,14 +2,11 @@
 
 #include "common.h"
 #include "gemm.h"
+#include "moe_align.h"
 
 namespace {
 
 // [NOTE]: Fused MoE kernel with AMX
-//
-//   This file contains implementations for
-//     * `moe_align_block_size`
-//     * `fused_moe`
 //
 //   The functionality is identical to triton kernel, excepts:
 //     * fuse silu_and_mul with gemm1, therefore this kernel
@@ -25,98 +22,6 @@ namespace {
 //     2. add prefetch for load A which is indexed access
 //     3. abstract at::native::cpublas::brgemm with WoQ gemm (M = 1 & M != 1)
 //
-
-template <int BLOCK_M>
-int moe_align_block_size(
-    int32_t* __restrict__ sorted_ids,
-    int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ total_cnts,
-    int32_t* __restrict__ cumsums,
-    int32_t* __restrict__ offsets,
-    int num_experts,
-    int numel,
-    int num_threads) {
-#define T_INDEX(tt) total_cnts + (tt) * num_experts
-
-  // accumulate count of expert ids locally
-  at::parallel_for(0, numel, 0, [&](int begin, int end) {
-    int tid = at::get_thread_num();
-    int32_t* __restrict__ local_cnts = T_INDEX(tid + 1);
-
-    for (int i = begin; i < end; ++i) {
-      local_cnts[topk_ids[i]]++;
-    }
-  });
-
-  using iVec = at::vec::Vectorized<int32_t>;
-  for (int t = 0; t < num_threads; ++t) {
-    at::vec::map2<int32_t>(
-        [](iVec x, iVec y) { return x + y; }, T_INDEX(t + 1), T_INDEX(t + 1), T_INDEX(t), num_experts);
-  }
-
-  // the last row holds sums of each experts
-  int32_t* total_cnts_t_1 = T_INDEX(num_threads);
-
-  cumsums[0] = 0;
-  for (int e = 0; e < num_experts; ++e) {
-    // accumulate `num_tokens_post_pad`, also as the expert offset
-    cumsums[e + 1] = cumsums[e] + div_up(total_cnts_t_1[e], BLOCK_M) * BLOCK_M;
-
-    for (int k = cumsums[e]; k < cumsums[e + 1]; k += BLOCK_M) {
-      expert_ids[k / BLOCK_M] = e;
-    }
-  }
-  int num_tokens_post_pad = cumsums[num_experts];
-
-  at::parallel_for(0, numel, 0, [&](int begin, int end) {
-    int tid = at::get_thread_num();
-    // thread tid offsets in `total_cnts`
-    int32_t* __restrict__ offsets = T_INDEX(tid);
-
-    for (int i = begin; i < end; ++i) {
-      int32_t expert_id = topk_ids[i];
-      int32_t b_offset = cumsums[expert_id];
-      int32_t t_offset = offsets[expert_id];
-      sorted_ids[b_offset + t_offset] = i;
-      offsets[expert_id]++;
-    }
-  });
-
-  // debug: the offset for thread t_1 should be identical to t_2
-  int32_t* total_cnts_t_2 = T_INDEX(num_threads - 1);
-  for (int e = 0; e < num_experts; ++e) {
-    TORCH_CHECK(total_cnts_t_1[e] == total_cnts_t_2[e]);
-  }
-
-  // padding value for sorted_ids: numel
-  auto sorted_id_size = [=](const int32_t* sorted_ids_ptr) {
-    for (int d = 0; d < BLOCK_M; ++d) {
-      if (sorted_ids_ptr[d] == numel) {
-        return d;
-      }
-    }
-    return BLOCK_M;
-  };
-
-  // offsets holds starting offset for each valida M blocks
-  //   shape : [num_token_blocks + 1]
-  offsets[0] = 0;
-  const int num_token_blocks = num_tokens_post_pad / BLOCK_M;
-  at::parallel_for(0, num_token_blocks, GRAIN_SIZE / BLOCK_M, [&](int begin, int end) {
-    for (int mb = begin; mb < end; ++mb) {
-      offsets[mb + 1] = sorted_id_size(sorted_ids + mb * BLOCK_M);
-    }
-  });
-  // TODO: do we need to vecterize this ?
-  for (int mb = 0; mb < num_token_blocks; ++mb) {
-    offsets[mb + 1] += offsets[mb];
-  }
-  // debug: the last value of offsets should be `numel`
-  TORCH_CHECK(offsets[num_token_blocks] == numel);
-
-  return num_tokens_post_pad;
-}
 
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2 {
@@ -947,10 +852,10 @@ at::Tensor fused_experts_cpu(
 
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
-  if (!(moe_comp_method == CPUQuantMethod::INT4_W4A8)) {
+  if (moe_comp_method != CPUQuantMethod::INT4_W4A8) {
     CHECK_EQ(w2.size(1), K);
-    CHECK_EQ(packed_w1.size(2), packed_K / (moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 2 : 1));
-    CHECK_EQ(packed_w2.size(2), packed_N / (moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 2 : 1));
+    CHECK_EQ(packed_w1.size(2), packed_K);
+    CHECK_EQ(packed_w2.size(2), packed_N);
   }
   // check scales
   check_moe_scales(moe_comp_method, w1_scale, w2_scale, block_size);
@@ -1009,10 +914,16 @@ at::Tensor fused_experts_cpu(
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
   //
+  // for int4 w4a8:
+  //   5. intermediate_cache0 : [M * topk, 2N]
+  //   6. Aq_tmp : [M, K] or [M * topk, N]
+  //   7. As_tmp : [M * topk]
+  //   8. dqB_tmp : [T, cache_size_per_thread]
+  //
   int64_t buffer_size_nbytes =
       M * topk * N * 2 + M * topk * K * 2 +
       num_threads * BLOCK_M * K *
-          (moe_comp_method == CPUQuantMethod::INT8_W8A8 | moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 1 : 2) +
+          (moe_comp_method == CPUQuantMethod::INT8_W8A8 || moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 1 : 2) +
       num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
 
   if (moe_comp_method == CPUQuantMethod::INT8_W8A8) {
@@ -1022,8 +933,11 @@ at::Tensor fused_experts_cpu(
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
   }
   if (moe_comp_method == CPUQuantMethod::INT4_W4A8) {
+    const int64_t cache_size_per_thread = std::max(
+        int64_t(get_cache_blocks<int8_t>(2 * BLOCK_N * K)) * 2 * BLOCK_N * K,
+        int64_t(get_cache_blocks<int8_t>(BLOCK_N * N)) * BLOCK_N * N);
     buffer_size_nbytes += M * topk * 2 * N * 2 + std::max(M * K, M * topk * N) + M * topk * sizeof(float) +
-                          num_threads * 2 * get_4bit_block_k_size(K / w1_scale.value().size(2)) * BLOCK_N;
+                          num_threads * cache_size_per_thread;
   }
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 
@@ -1074,7 +988,7 @@ at::Tensor fused_experts_cpu(
       bool with_bias = w1_bias.has_value();
 
       CHECK_MOE_SCALES_FP8(1, 2);
-      fused_experts_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
+      fused_experts_fp8_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
           intermediate_cache1,
@@ -1118,7 +1032,7 @@ at::Tensor fused_experts_cpu(
       auto w2s = w2_scale.value();
       TORCH_CHECK(w1s.numel() == (E * 2 * N * K >> 5), "mxfp4 w1_scale must hold one scale per 32 weights.");
       TORCH_CHECK(w2s.numel() == (E * K * N >> 5), "mxfp4 w2_scale must hold one scale per 32 weights.");
-      fused_experts_fp_kernel_impl<scalar_t, uint8_t, uint8_t, true>(
+      fused_experts_fp4_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
           intermediate_cache1,
@@ -1133,7 +1047,6 @@ at::Tensor fused_experts_cpu(
           with_bias ? w2_bias.value().data_ptr<float>() : nullptr,
           w1s.data_ptr<uint8_t>(),
           w2s.data_ptr<uint8_t>(),
-          /*block_size_N*/ 1,
           /*block_size_K*/ group_size,
           topk_weights_.data_ptr<float>(),
           sorted_ids,
@@ -1170,7 +1083,6 @@ at::Tensor fused_experts_cpu(
           A_tmp,
           Aq_tmp,
           As_tmp,
-          nullptr,
           C_tmp,
           dqB_tmp,
           hidden_states.data_ptr<scalar_t>(),
