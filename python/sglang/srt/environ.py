@@ -1367,6 +1367,12 @@ class Envs:
     # Requantization is lossy (128x128 FP32 scales -> 1x32 UE8M0): enable
     # explicitly for performance after validating workload accuracy.
     SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8 = EnvBool(False)
+    # Ascend 950 (arch35) online MXFP8 LM-Head: "draft" (lossless MTP/DSpark/DFlash
+    # draft lm_head), "all" (also target lm_head), or "0"/"off" to disable.
+    SGLANG_NPU_ARCH35_MXFP8_LM_HEAD = EnvStr("draft")
+    # Ascend 950 (arch35) online BF16->MXFP8 quantization for DSpark/DFlash dense
+    # draft layers (100% lossless since target verifies all draft tokens).
+    SGLANG_NPU_ARCH35_MXFP8_DSPARK_DRAFT = EnvBool(True)
     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.

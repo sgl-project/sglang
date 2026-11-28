@@ -351,6 +351,21 @@ class SRTPlatform(DeviceMixin):
         """
         pass
 
+    def post_load_draft_model(self, model: torch.nn.Module) -> None:
+        """Called once after a speculative draft model's weights are loaded."""
+        pass
+
+    def maybe_project_mxfp8_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: torch.nn.Module,
+        *,
+        is_draft: bool = True,
+        force: bool = False,
+    ) -> Optional[torch.Tensor]:
+        """Optional platform-accelerated online MXFP8 LM-head projection; None falls back."""
+        return None
+
     # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------

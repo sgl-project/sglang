@@ -1,4 +1,5 @@
 import logging
+import weakref
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -197,6 +198,11 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if (
+            hasattr(layer, "weight_scale_inv")
+            and layer.weight.dtype == torch.float8_e4m3fn
+        ):
+            return
         weight = layer.weight.data
         if weight.dtype == torch.float8_e4m3fn:
             # Offline (ModelSlim) path: weight is already MXFP8-quantised and
@@ -257,14 +263,16 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(x, tuple):
-            # MLAProlog supplies a [tokens, hidden] quantized query norm.
+            # Pre-quantized MXFP8 activation from fused norm/swiglu+mx_quant or MLAProlog.
             qx, input_scale = x
             input_shape = qx.shape
-            if input_scale.dtype == torch.uint8:
-                input_scale = input_scale.view(_get_float8_e8m0fnu_dtype())
-            input_scale = input_scale.reshape(
-                qx.shape[0], qx.shape[1] // (2 * MXFP8_BLOCK_SIZE), 2
-            ).contiguous()
+            e8m0_dt = _get_float8_e8m0fnu_dtype()
+            if input_scale.dtype == torch.uint8 and isinstance(e8m0_dt, torch.dtype):
+                input_scale = input_scale.view(e8m0_dt)
+            if input_scale.ndim != 3 or not input_scale.is_contiguous():
+                input_scale = input_scale.reshape(
+                    qx.shape[0], qx.shape[1] // (2 * MXFP8_BLOCK_SIZE), 2
+                ).contiguous()
             original_dtype = torch.bfloat16
         else:
             original_dtype = x.dtype
@@ -302,6 +310,288 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         # Restore original shape (replace last dim with output features)
         output_shape = list(input_shape[:-1]) + [output.shape[-1]]
         return output.reshape(output_shape)
+
+
+# Tensor-keyed online MXFP8 weight cache:
+# data_ptr -> (weakref(w), w_q_t, w_scale_t, shape, stride, dtype, device, version).
+# Sharing by underlying weight tensor guarantees zero duplicate copies across target & draft
+# lm_heads (including set_embed_and_head weight sharing), ABA safety, and GC cleanup.
+_NPU_ARCH35_MXFP8_WEIGHT_CACHE: dict[
+    int,
+    Tuple[
+        weakref.ReferenceType,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Size,
+        Tuple[int, ...],
+        torch.dtype,
+        torch.device,
+        int,
+    ],
+] = {}
+
+
+def _is_valid_online_mxfp8_weight(w: Optional[torch.Tensor]) -> bool:
+    return (
+        w is not None
+        and w.is_floating_point()
+        and w.ndim == 2
+        and w.dtype in (torch.bfloat16, torch.float16)
+        and w.shape[1] % (2 * MXFP8_BLOCK_SIZE) == 0
+    )
+
+
+def _get_or_quantize_mxfp8_weight(
+    w: torch.Tensor, *, allow_create: bool = True
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    key = w.data_ptr()
+    entry = _NPU_ARCH35_MXFP8_WEIGHT_CACHE.get(key)
+    if entry is not None:
+        w_live = entry[0]()
+        if w_live is not None and (
+            (w_live is w and entry[7] == w._version)
+            or (
+                w_live.data_ptr() == key
+                and entry[3] == w.shape
+                and entry[4] == w.stride()
+                and entry[5] == w.dtype
+                and entry[6] == w.device
+            )
+        ):
+            return entry[1], entry[2]
+    if not allow_create or torch.get_device_module().is_current_stream_capturing():
+        return None
+    w_src = w.detach()
+    w_in = (
+        w_src
+        if w_src.dtype in (torch.bfloat16, torch.float16)
+        else w_src.to(torch.bfloat16)
+    )
+    qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(w_in, dst_type=torch.float8_e4m3fn)
+    # Keep non-contiguous transpose views (stride-1 reduction along K).
+    w_q_t, w_scale_t = qw.transpose(0, 1), w_scale.transpose(0, 1)
+    w_ref = weakref.ref(w)
+    _NPU_ARCH35_MXFP8_WEIGHT_CACHE[key] = (
+        w_ref,
+        w_q_t,
+        w_scale_t,
+        w.shape,
+        w.stride(),
+        w.dtype,
+        w.device,
+        w._version,
+    )
+
+    def _evict(_k=key, _ref=w_ref):
+        cur = _NPU_ARCH35_MXFP8_WEIGHT_CACHE.get(_k)
+        if cur is not None and cur[0] is _ref:
+            _NPU_ARCH35_MXFP8_WEIGHT_CACHE.pop(_k, None)
+
+    weakref.finalize(w, _evict)
+    return w_q_t, w_scale_t
+
+
+def npu_arch35_prepare_online_mxfp8_cache(
+    weight_holder: torch.nn.Module,
+    *,
+    weight: Optional[torch.Tensor] = None,
+    cache_attr: str = "_npu_arch35_mxfp8_cache",
+) -> bool:
+    """Eagerly populate the online MXFP8 weight cache before ACLGraph capture."""
+    w = weight if weight is not None else getattr(weight_holder, "weight", None)
+    if not _is_valid_online_mxfp8_weight(w):
+        return False
+    pair = _get_or_quantize_mxfp8_weight(w, allow_create=True)
+    if pair is None:
+        return False
+    setattr(weight_holder, cache_attr, (pair[0], pair[1], w.shape, w.data_ptr()))
+    return True
+
+
+def npu_arch35_online_mxfp8_matmul(
+    x: torch.Tensor,
+    weight_holder: torch.nn.Module,
+    *,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    cache_attr: str = "_npu_arch35_mxfp8_cache",
+) -> torch.Tensor:
+    """Online BF16/FP16 -> MXFP8 matmul on Ascend 950 (arch35) without mutating weight."""
+    w = weight if weight is not None else weight_holder.weight
+    pair = _get_or_quantize_mxfp8_weight(w, allow_create=True)
+    if pair is None:
+        return F.linear(x.to(w.dtype), w, bias)
+    w_q_t, w_scale_t = pair
+    orig_shape, orig_dtype = x.shape, x.dtype
+    x_2d = x.reshape(-1, orig_shape[-1])
+    if x_2d.dtype not in (torch.float16, torch.bfloat16):
+        x_2d = x_2d.to(torch.bfloat16)
+    qx, x_scale = torch.ops.npu.npu_dynamic_mx_quant(x_2d, dst_type=torch.float8_e4m3fn)
+    e8m0_dtype = _get_float8_e8m0fnu_dtype()
+    out_dtype = (
+        orig_dtype if orig_dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
+    )
+    out = torch.ops.npu.npu_quant_matmul(
+        qx,
+        w_q_t,
+        w_scale_t,
+        scale_dtype=e8m0_dtype,
+        pertoken_scale=x_scale,
+        pertoken_scale_dtype=e8m0_dtype,
+        bias=bias.to(torch.float32) if bias is not None else None,
+        output_dtype=out_dtype,
+        group_sizes=[1, 1, MXFP8_BLOCK_SIZE],
+    )
+    return out.reshape(*orig_shape[:-1], out.shape[-1])
+
+
+def npu_arch35_mxfp8_lm_head_enabled(*, is_draft: bool) -> bool:
+    """Return whether Ascend 950 online MXFP8 LM-head is enabled for draft/target."""
+    mode = envs.SGLANG_NPU_ARCH35_MXFP8_LM_HEAD.get().strip().lower()
+    return mode in ("draft", "all", "1", "true") if is_draft else mode == "all"
+
+
+def npu_arch35_maybe_project_mxfp8_lm_head(
+    hidden_states: torch.Tensor,
+    lm_head: torch.nn.Module,
+    *,
+    is_draft: bool = True,
+    force: bool = False,
+) -> Optional[torch.Tensor]:
+    """Unified Ascend 950 online MXFP8 LM-head hook for LogitsProcessor, DSpark, and DFlash."""
+    if hidden_states.shape[0] <= 0:
+        return None
+    if not force and not npu_arch35_mxfp8_lm_head_enabled(is_draft=is_draft):
+        return None
+    weight = getattr(lm_head, "weight", None)
+    if not _is_valid_online_mxfp8_weight(weight):
+        return None
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    if not is_npu_arch35():
+        return None
+    return npu_arch35_online_mxfp8_matmul(hidden_states, lm_head)
+
+
+def _find_unquantized_lm_head(model: torch.nn.Module) -> Optional[torch.nn.Module]:
+    head = getattr(model, "lm_head", None)
+    if head is None:
+        lm = getattr(model, "language_model", None)
+        head = getattr(lm, "lm_head", None) if lm is not None else None
+    if head is None:
+        return None
+    from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+
+    if should_apply_lm_head_quant_method(head, getattr(head, "quant_method", None)):
+        return None
+    return head
+
+
+def npu_arch35_post_load_model(model: torch.nn.Module, *, is_draft: bool) -> None:
+    """Centralized Ascend 950 post-load hook invoked by NPUSRTPlatform.
+
+    Handles all speculative draft & target models in one place:
+      - Marks draft ``logits_processor._is_draft_lm_head = True`` (MTP/EAGLE/Standalone).
+      - Pre-warms tensor-keyed online MXFP8 cache on target/draft ``lm_head`` before graph capture.
+      - Converts dense BF16 DSpark/DFlash draft backbones (MLP/o_proj/fc) to online MXFP8.
+    """
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    if is_draft:
+        lp = getattr(model, "logits_processor", None)
+        if lp is not None:
+            lp._is_draft_lm_head = True
+
+    if not is_npu_arch35():
+        return
+
+    if is_draft:
+        if npu_arch35_mxfp8_lm_head_enabled(is_draft=True):
+            head = _find_unquantized_lm_head(model)
+            if head is not None:
+                npu_arch35_prepare_online_mxfp8_cache(head)
+        if envs.SGLANG_NPU_ARCH35_MXFP8_DSPARK_DRAFT.get():
+            from sglang.srt.models.dflash import DFlashDraftModel
+
+            if isinstance(model, DFlashDraftModel):
+                npu_arch35_quantize_dspark_draft_model(model)
+    else:
+        from sglang.srt.runtime_context import get_spec
+
+        try:
+            has_spec = bool(get_spec().speculative_algorithm)
+        except Exception:
+            has_spec = False
+        if npu_arch35_mxfp8_lm_head_enabled(is_draft=False) or (
+            has_spec and npu_arch35_mxfp8_lm_head_enabled(is_draft=True)
+        ):
+            head = _find_unquantized_lm_head(model)
+            if head is not None:
+                npu_arch35_prepare_online_mxfp8_cache(head)
+
+
+def npu_arch35_quantize_dspark_draft_model(model: torch.nn.Module) -> int:
+    """Convert dense BF16 DSpark/DFlash draft MLP, o_proj, and aux fc layers to online MXFP8.
+
+    Leaves ``qkv_proj`` and stacked target-context KV projections in BF16 to preserve
+    full attention K/V cache precision (maximizing speculative acceptance length),
+    while quantizing MLP (``gate_up_proj``/``down_proj``), ``o_proj``, and ``fc``
+    (~80% of draft weight bandwidth) to MXFP8 with fused
+    ``npu_add_rms_norm_dynamic_mx_quant`` and ``npu_swiglu_mx_quant``. 100% lossless
+    because all draft tokens are verified by the target model. Idempotent if invoked
+    more than once.
+    """
+    from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    converted = 0
+    for layer in getattr(model, "layers", ()):
+        candidates = []
+        mlp = getattr(layer, "mlp", None)
+        if mlp is None:
+            inner = getattr(layer, "decoder_layer", None)
+            mlp = getattr(inner, "mlp", None) if inner is not None else None
+        if mlp is not None:
+            candidates.extend(
+                [getattr(mlp, "gate_up_proj", None), getattr(mlp, "down_proj", None)]
+            )
+        attn = getattr(layer, "self_attn", None)
+        if attn is not None:
+            candidates.append(getattr(attn, "o_proj", None))
+        for mod in candidates:
+            if (
+                mod is None
+                or not isinstance(mod, LinearBase)
+                or type(mod.quant_method) is not UnquantizedLinearMethod
+                or not hasattr(mod, "weight")
+                or mod.weight.dtype not in (torch.bfloat16, torch.float16)
+                or mod.weight.ndim != 2
+                or mod.weight.shape[1] % (2 * MXFP8_BLOCK_SIZE) != 0
+            ):
+                continue
+            mxfp8_method = NPUMXFP8LinearMethod()
+            mod.quant_method = mxfp8_method
+            mxfp8_method.process_weights_after_loading(mod)
+            converted += 1
+
+    fc = getattr(model, "fc", None)
+    if (
+        isinstance(fc, torch.nn.Linear)
+        and fc.bias is None
+        and fc.weight.dtype in (torch.bfloat16, torch.float16)
+        and fc.weight.ndim == 2
+        and fc.weight.shape[1] % (2 * MXFP8_BLOCK_SIZE) == 0
+        and getattr(fc, "_npu_arch35_mxfp8_cache", None) is None
+    ):
+        if npu_arch35_prepare_online_mxfp8_cache(fc):
+            converted += 1
+
+    if converted > 0:
+        logger.info(
+            "Ascend 950: quantized %d draft linear layers to online MXFP8.",
+            converted,
+        )
+    return converted
 
 
 def npu_w8a8_mxfp8_linear(
