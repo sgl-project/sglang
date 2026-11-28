@@ -6,7 +6,7 @@
 //! An empty sample reports 0 where the Python script writes `x or 0`, and NaN
 //! for the end-to-end latencies, which it does not guard.
 
-use crate::args::{Args, Backend};
+use crate::args::{Args, Backend, DatasetName};
 use crate::request::RequestOutput;
 
 /// NumPy's `percentile` with the default linear interpolation. `q` is in
@@ -400,19 +400,26 @@ pub fn result_json(
         );
         put("request_rate", rate);
         put("max_concurrency", serde_json::json!(args.max_concurrency));
-        put(
-            "sharegpt_output_len",
-            serde_json::json!(args.sharegpt_output_len),
-        );
-        put("random_input_len", serde_json::json!(args.random_input_len));
-        put(
-            "random_output_len",
-            serde_json::json!(args.random_output_len),
-        );
-        put(
-            "random_range_ratio",
-            serde_json::json!(args.random_range_ratio),
-        );
+        // Only the active dataset's shaping args, as `DATASET_RESULT_ARG_KEYS`
+        // selects them in the Python client: the other datasets' defaults
+        // would misdescribe the workload.
+        match args.dataset_name {
+            DatasetName::Sharegpt => put(
+                "sharegpt_output_len",
+                serde_json::json!(args.sharegpt_output_len),
+            ),
+            DatasetName::Random | DatasetName::RandomIds => {
+                put("random_input_len", serde_json::json!(args.random_input_len));
+                put(
+                    "random_output_len",
+                    serde_json::json!(args.random_output_len),
+                );
+                put(
+                    "random_range_ratio",
+                    serde_json::json!(args.random_range_ratio),
+                );
+            }
+        }
         // Information.
         put("server_info", serde_json::json!(server_info));
         // Results.
@@ -666,5 +673,46 @@ mod tests {
             None
         );
         assert_eq!(accept_length_from_server_info(&serde_json::json!({})), None);
+    }
+
+    /// The result names only the shaping args of the dataset that ran, so a
+    /// ShareGPT run carries no `random_*` defaults and vice versa.
+    #[test]
+    fn result_json_keeps_only_the_active_datasets_args() {
+        let outputs = vec![RequestOutput {
+            success: false,
+            ..Default::default()
+        }];
+        let metrics = calculate(&outputs, &[0], 1.0);
+        let result_for = |dataset_name: &str| {
+            let args: Args = serde_json::from_value(serde_json::json!({
+                "dataset_name": dataset_name,
+                "sharegpt_output_len": 64,
+            }))
+            .unwrap();
+            result_json(&metrics, &args, f64::INFINITY, 1.0, None, None, &outputs)
+        };
+        let random_keys = [
+            "random_input_len",
+            "random_output_len",
+            "random_range_ratio",
+        ];
+
+        let sharegpt = result_for("sharegpt");
+        assert_eq!(sharegpt["sharegpt_output_len"], 64);
+        for key in random_keys {
+            assert!(sharegpt.get(key).is_none(), "sharegpt result has {key}");
+        }
+
+        for dataset_name in ["random", "random-ids"] {
+            let random = result_for(dataset_name);
+            assert!(
+                random.get("sharegpt_output_len").is_none(),
+                "{dataset_name} result has sharegpt_output_len"
+            );
+            assert_eq!(random["random_input_len"], 1024);
+            assert_eq!(random["random_output_len"], 1024);
+            assert_eq!(random["random_range_ratio"], 0.0);
+        }
     }
 }
