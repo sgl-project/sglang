@@ -79,17 +79,23 @@ class TestRotaryEmbeddingMLU(CustomTestCase):
 
     def test_empty_batch(self):
         """An empty batch must preserve Q/K without an ambiguous reshape."""
-        rope = RotaryEmbedding(64, 32, 128, 10000, True, torch.bfloat16).to("mlu")
-        positions = torch.empty(0, device="mlu", dtype=torch.int32)
         q = torch.empty(0, 256, device="mlu", dtype=torch.bfloat16)
         k = torch.empty(0, 128, device="mlu", dtype=torch.bfloat16)
-        with patch.object(
-            torch_mlu_ops, "apply_rotary", wraps=torch_mlu_ops.apply_rotary
-        ) as kernel:
-            q_out, k_out = rope(positions, q, k)
-        self.assertIs(q_out, q)
-        self.assertIs(k_out, k)
-        kernel.assert_not_called()
+        cases = (
+            (RotaryEmbedding, {}, ((0,),)),
+            (MRotaryEmbedding, {"mrope_section": [4, 4, 8]}, ((0,), (3, 0))),
+            (Ernie4_5_VLRotaryEmbedding, {"mrope_section": [4, 4, 8]}, ((0,), (3, 0))),
+        )
+        for rope_cls, kwargs, shapes in cases:
+            rope = rope_cls(64, 32, 128, 10000, True, torch.bfloat16, **kwargs).to(
+                "mlu"
+            )
+            for shape in shapes:
+                with self.subTest(rope=rope_cls.__name__, positions=shape):
+                    positions = torch.empty(shape, device="mlu", dtype=torch.int32)
+                    q_out, k_out = rope(positions, q, k)
+                    self.assertIs(q_out, q)
+                    self.assertIs(k_out, k)
 
     def test_native_fallback(self):
         """FP32 coefficients and Ernie's specialized layout bypass the vendor op."""

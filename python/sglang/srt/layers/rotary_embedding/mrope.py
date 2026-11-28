@@ -356,7 +356,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg=None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if positions.ndim == 1:
+        if positions.ndim == 1 or query.numel() == 0:
             return RotaryEmbedding.forward_mlu(
                 self,
                 positions,
@@ -688,5 +688,7 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
                 raise NotImplementedError(
                     "fused_set_kv_buffer_arg is not supported for Ernie MRoPE"
                 )
+            if query.numel() == 0:
+                return query, key
             return self.forward_native(positions, query, key)
         return self.forward_cuda(positions, query, key)
