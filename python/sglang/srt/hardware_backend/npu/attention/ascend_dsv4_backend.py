@@ -37,8 +37,8 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.ragged_verify import (
     RaggedVerifyMode,
-    read_ragged_verify_mode,
     ragged_verify_token_rows,
+    read_ragged_verify_mode,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
@@ -405,7 +405,7 @@ class CompressorAscendBackendMixin:
 
             if _verify_compress:
                 self._build_npu_compress_metadata_verify(forward_batch)
-        else: #dsv4.1的路径
+        else:  # dsv4.1的路径
             #  [Compact] V4.1 eager 走 ratio 1/2。ACLGraph 回放走 _refresh_graph_verify_rows。
             # V4.1: no allocator bundle and no c4/c128 tables; only the shared
             # seq scalars the fused low-ratio compressor consumes.
@@ -1986,7 +1986,7 @@ class LowRatioCompressAscendBackendMixin:
         if seq_lens is None:
             return None
 
-        seq_lens = seq_lens.reshape(-1) # 请求长度数组的容量，不是 token 数
+        seq_lens = seq_lens.reshape(-1)  # 请求长度数组的容量，不是 token 数
         n = int(seq_lens.numel())
         mode = getattr(forward_batch, "forward_mode", None)
         layout = getattr(forward_batch, "ragged_verify_layout", None)
@@ -1996,11 +1996,13 @@ class LowRatioCompressAscendBackendMixin:
             raw_num_requests = int(layout.bs)
             # 原始布局layout描述的输入请求数，不包含图回放新增的 BS padding 槽位。 ctx.ragged_layout才会包含padding后的信息
 
-            if raw_num_requests == 0: # 后续检视看是否删除
-                return torch.zeros( t, dtype=torch.bool, device=seq_lens.device)
+            if raw_num_requests == 0:  # 后续检视看是否删除
+                return torch.zeros(t, dtype=torch.bool, device=seq_lens.device)
 
             # ragged_verify_token_rows： 给 compact 后的一维 verify token 数组中的每个位置，找出它属于 batch 中的第几个请求。
-            request_rows = ragged_verify_token_rows(layout, t).to(device=seq_lens.device) #(num_token, )
+            request_rows = ragged_verify_token_rows(layout, t).to(
+                device=seq_lens.device
+            )  # (num_token, )
             # [Compact] 例 verify_lens=[3, 4, 5]，request_rows [12] 为
             # [0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2]。24 行图的尾部 12 行归到越界编号 3。
 
@@ -2164,9 +2166,8 @@ class LowRatioCompressAscendBackendMixin:
         if mode.is_target_verify():
             layout = getattr(forward_batch, "ragged_verify_layout", None)
             if layout is not None:
-                if layout.total_verify_tokens is not None:
-                    return layout.total_verify_tokens
-                return int(self.forward_metadata.actual_seq_lengths_q_pa_cpu[-1])
+                # 保留 Compact token tier，包含图容量 padding。
+                return int(layout.graph_num_tokens)
             # Fixed-width verify may be graph-captured: use host geometry.
             width = int(forward_batch.spec_info.draft_token_num)
             return int(forward_batch.batch_size) * width
@@ -2250,6 +2251,7 @@ class LowRatioCompressAscendBackendMixin:
                         torch.int32
                     ),
                 )
+
             attn_out, _ = _dsv41_a3_ops().attention(
                 attention_q,
                 ori_kv=pool.get_swa_buffer(layer.layer_id),
@@ -2424,7 +2426,10 @@ class LowRatioCompressAscendBackendMixin:
             n = min(n, query_tokens)
         positions, out_loc = positions[:n], out_loc[:n]
         bs = int(forward_batch.batch_size)
-        if is_a3_verify and getattr(forward_batch, "ragged_verify_layout", None) is None:
+        if (
+            is_a3_verify
+            and getattr(forward_batch, "ragged_verify_layout", None) is None
+        ):
             # A3 verification uses fixed-width blocks. Keep ghost request rows
             # out of both compressed pools without a device-side indptr search.
             width = int(forward_batch.spec_info.draft_token_num)
@@ -2481,8 +2486,15 @@ class LowRatioCompressAscendBackendMixin:
             )
         setattr(fm, f"c{ratio}_index_page_table", index_page_table)
 
-    def _init_dsv41_graph_metadata(self, metadata, bs: int, tokens_per_req: int, device,
-                                   num_tokens: Optional[int] = None, forward_batch=None) -> None:
+    def _init_dsv41_graph_metadata(
+        self,
+        metadata,
+        bs: int,
+        tokens_per_req: int,
+        device,
+        num_tokens: Optional[int] = None,
+        forward_batch=None,
+    ) -> None:
         """Allocate the aclgraph-persistent low-ratio buffers for one bs bucket."""
         # t = bs * tokens_per_req
         # static：默认 t = bs * tokens_per_req。
@@ -2492,7 +2504,9 @@ class LowRatioCompressAscendBackendMixin:
 
         # [Compact] 图与 padding。相同 token 档位下，请求槽更多也可能增大 C2 输出容量。
         # 例图 token 容量 12、请求槽容量 8 时，C2 缓冲区长度为 min(12, 12 // 2 + 8)=12。
-        for ratio in self._dsv41_low_ratios(): # 压缩输出容量：为各请求跨前缀完成的压缩组预留余量
+        for ratio in (
+            self._dsv41_low_ratios()
+        ):  # 压缩输出容量：为各请求跨前缀完成的压缩组预留余量
             pad = min(t, t // ratio + bs)
             setattr(
                 metadata,
@@ -2825,12 +2839,15 @@ class LowRatioCompressAscendBackendMixin:
             # 12 行图的 ratio 1 保留 12 行。ratio 2 只保留 5 个组结束行，
             # 用物理槽整除 2 得到压缩写入槽 [562, 1124, 1125, 1686, 1687]。
  """
-
             keep, pos_values, slot_values = self._dsv41_ratio_row_values(
                 positions, out_loc, ratio, int(self.page_size), row_live=row_live
             )
-            pos_dst = getattr(fm, f"positions_cmp_padding_c{ratio}") # 已分配的压缩位置缓冲区，shape: (P,) 记录压缩的KV对应原本哪个token
-            slot_dst = getattr(fm, f"c{ratio}_loc")  #已分配的压缩槽位缓冲区，shape: (P,)，与 pos_dst 逐行对应, 记录压缩的KV对应缓存池里哪个物理槽位
+            pos_dst = getattr(
+                fm, f"positions_cmp_padding_c{ratio}"
+            )  # 已分配的压缩位置缓冲区，shape: (P,) 记录压缩的KV对应原本哪个token
+            slot_dst = getattr(
+                fm, f"c{ratio}_loc"
+            )  # 已分配的压缩槽位缓冲区，shape: (P,)，与 pos_dst 逐行对应, 记录压缩的KV对应缓存池里哪个物理槽位
             if ratio == 1:
                 # Per-token rows (native projection): identity, not compacted.
                 pos_dst.copy_(
@@ -3557,7 +3574,11 @@ class DeepseekV4AscendAttnBackend(
             and forward_mode.is_target_verify()
         ):
             capture_prefix = forward_batch.seq_lens.to(torch.int32)
-            verify_lens = ragged_layout.verify_lens if ragged_layout is not None else tokens_per_req
+            verify_lens = (
+                ragged_layout.verify_lens
+                if ragged_layout is not None
+                else tokens_per_req
+            )
             metadata.actual_seq_lengths_kv.copy_(
                 torch.where(
                     capture_prefix > 0,
@@ -3614,7 +3635,12 @@ class DeepseekV4AscendAttnBackend(
             )
             # V4.1: MQSMLA/QLI dispatch tables plus window/topk-length buffers.
             self._init_dsv41_graph_metadata(
-                metadata, bs, tokens_per_req, device, num_tokens=n_tok, forward_batch=forward_batch
+                metadata,
+                bs,
+                tokens_per_req,
+                device,
+                num_tokens=n_tok,
+                forward_batch=forward_batch,
             )
 
         metadata.ori_sparse_indices = None
@@ -3975,7 +4001,9 @@ class DeepseekV4AscendAttnBackend(
                                 m = min(int(raw_out_loc.numel()), n)
                                 out_loc[:m] = raw_out_loc[:m]
 
-                        mask = (valid_request & per_req[safe_request_rows] & (out_loc > 0))
+                        mask = (
+                            valid_request & per_req[safe_request_rows] & (out_loc > 0)
+                        )
 
                 else:
                     per_req = ctx.final_seq_lens_cpu.reshape(-1)[: ctx.bs].to(
@@ -4413,19 +4441,7 @@ class DeepseekV4AscendAttnBackend(
             return
 
         device = forward_batch.seq_lens.device
-        raw_layout = forward_batch.ragged_verify_layout
-        a3_compact = (
-            self._dsv4_has_low_ratio
-            and not is_npu_arch35()
-            and forward_batch.forward_mode.is_target_verify()
-            and raw_layout is not None
-        )
-        ragged_layout = (
-            raw_layout
-            if a3_compact
-            else self._dspark_ragged_verify_layout(forward_batch)
-        )
-        # ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
+        ragged_layout = self._dspark_ragged_verify_layout(forward_batch)
         # cu_seqlens_q must hold per-request QUERY token counts, not KV lengths.
         if (
             forward_batch.forward_mode.is_extend()
@@ -4465,14 +4481,6 @@ class DeepseekV4AscendAttnBackend(
             fm.actual_seq_lengths_q_pa = ragged_layout.qo_indptr_device.to(
                 device=device, dtype=torch.int32
             )
-            if a3_compact:
-                pad_bs = forward_batch.batch_size - ragged_layout.bs
-                if pad_bs > 0:
-                    cu_q = fm.actual_seq_lengths_q_pa
-                    fm.actual_seq_lengths_q_pa = torch.cat((cu_q, cu_q[-1:].expand(pad_bs)))
-            if ragged_layout.total_verify_tokens is None:
-                fm.actual_seq_lengths_q_pa_cpu = fm.actual_seq_lengths_q_pa.cpu()
-
             fm.actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:]
         elif (
             forward_batch.forward_mode.is_target_verify()
@@ -4543,6 +4551,22 @@ class DeepseekV4AscendAttnBackend(
                     ).to(torch.int32)
             else:
                 fm.actual_seq_lengths_kv = forward_batch.seq_lens.to(torch.int32)
+        #
+        # if (
+        #     self.is_hybrid_swa
+        #     and fm.block_tables_swa is None
+        #     and self._dsv4_has_low_ratio
+        #     and forward_batch.forward_mode.is_target_verify()
+        # ):
+        #     # Leave one page of slack for the potentially lagging host bound.
+        #     hint = forward_batch.max_seq_len_host
+        #     max_len = hint + self.page_size if hint else None
+        #     full_locs = self.req_to_token[
+        #         forward_batch.req_pool_indices, : max_len : self.page_size
+        #     ]
+        #     fm.block_tables_swa = (
+        #         self.full_to_swa_index_mapping[full_locs] // self.page_size
+        #     ).to(torch.int32)
 
         fm.swa_page_table = (
             fm.block_tables_swa if fm.block_tables_swa is not None else fm.block_tables
