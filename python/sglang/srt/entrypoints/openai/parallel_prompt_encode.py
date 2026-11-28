@@ -291,6 +291,14 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
     return chunks
 
 
+def _encode_batch(backend, texts):
+    """``backend.encode_batch`` without the character offsets, which only the
+    ids are read from: the same ids, with less work in the pool and on the
+    calling thread (building and freeing the offsets)."""
+    encode = getattr(backend, "encode_batch_fast", None) or backend.encode_batch
+    return encode(texts, add_special_tokens=False)
+
+
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
     global _parallel_ok, _parallel_pid
@@ -322,7 +330,7 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     check = _parallel_ok is None
     if check:
         w0, c0 = time.perf_counter(), time.process_time()
-    encodings = backend.encode_batch(chunks, add_special_tokens=False)
+    encodings = _encode_batch(backend, chunks)
     if check:
         wall, cpu = time.perf_counter() - w0, time.process_time() - c0
         # Rayon worker CPU adds up well beyond wall time. Serial stays near 1.0;
@@ -488,7 +496,7 @@ class _SegmentEncoder:
             )
             chunks.extend(pieces)
             counts.append(len(pieces))
-        encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
+        encodings = _encode_batch(self.backend, chunks)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
             if count == 1:

@@ -659,6 +659,26 @@ class TestGatesAndArgumentAllowlist(_EncodeCase):
         self._assert_original(self.text, None)
 
 
+class TestEncodeBatchWithoutOffsets(CustomTestCase):
+    def test_the_offset_free_encode_is_used_when_the_backend_has_it(self):
+        fast = unittest.mock.Mock(spec=["encode_batch", "encode_batch_fast"])
+        self.assertIs(
+            ppe._encode_batch(fast, ["a"]), fast.encode_batch_fast.return_value
+        )
+        fast.encode_batch_fast.assert_called_once_with(["a"], add_special_tokens=False)
+        fast.encode_batch.assert_not_called()
+        old = unittest.mock.Mock(spec=["encode_batch"])
+        self.assertIs(ppe._encode_batch(old, ["a"]), old.encode_batch.return_value)
+
+    def test_it_gives_the_ids_encode_batch_gives(self):
+        backend = Tokenizer.from_str(_safe_backend_json())
+        texts = [t for t in _EDGE_TEXTS if t] + _fuzz_texts()[:200]
+        self.assertEqual(
+            [e.ids for e in ppe._encode_batch(backend, texts)],
+            [e.ids for e in backend.encode_batch(texts, add_special_tokens=False)],
+        )
+
+
 def _fuzz_segments():
     """Prompts as a renderer hands them over: specials on their own, between
     text that may end or start with part of a special, or hold whole ones."""
