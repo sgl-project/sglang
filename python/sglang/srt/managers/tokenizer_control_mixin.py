@@ -83,6 +83,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateCacheLinkerReqInput,
+    UpdateCacheLinkerReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -141,6 +143,7 @@ _COMMUNICATOR_SPECS = [
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
     ("clear_hicache_storage", ClearHiCacheReqOutput),
+    ("update_cache_linker", UpdateCacheLinkerReqOutput),
     ("attach_hicache_storage", AttachHiCacheStorageReqOutput),
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
     ("profile", ProfileReqOutput),
@@ -431,6 +434,16 @@ class TokenizerControlMixin:
                 hicache_storage_backend_extra_config=None,
             )
         return out
+
+    async def update_cache_linker(
+        self: TokenizerManager, attach: bool
+    ) -> UpdateCacheLinkerReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.update_cache_linker_communicator(
+            UpdateCacheLinkerReqInput(attach=attach)
+        )
+        success, message = FanOutCommunicator.merge_results(results)
+        return UpdateCacheLinkerReqOutput(success=success, message=message)
 
     async def start_profile(
         self: TokenizerManager,
