@@ -1,12 +1,13 @@
 """Sampling-penalty state: per-token output counts and lengths plus the
-request's penalty parameters, one table row per penalized request, addressed by
+request's penalty parameters, one table entry per penalized request, addressed by
 its penalty index.
 
-- Host calls (`alloc`, `reset_history`, `free`, `StepPenalties.build`) only queue
-  writes; the tables are written, grown, and read on the sampling stream.
+- Host calls (`alloc`, `reset_history`, `free`) only queue writes; the tables are
+  written, grown, and read on the sampling stream.
 - A request takes an index at its first extend admission; every extend admission
-  resets its history and replays `output_ids`. A retraction keeps the index;
-  `RequestRetirer` frees it at exit.
+  resets its history and replays `output_ids`, and `SamplingParamsPool` records
+  the index, which a step reads from there. A retraction keeps the index;
+  `RequestRetirer` frees it at exit, with the request's slot.
 - A step reads and commits the indices it was built with. No request is admitted
   between a step's build and its sampling, so none of them is reused before then.
 - Freeing the last live index drops the tables at once; their memory is from the
@@ -21,14 +22,16 @@ import functools
 import operator
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 
 from sglang.srt.utils.device import (
-    async_h2d,
+    async_h2d_tensor,
     get_compiler_backend,
     get_device_sm,
     is_cuda,
     is_npu,
+    rows_where,
 )
 
 _is_cuda = is_cuda()
@@ -68,17 +71,40 @@ def uses_penalty(sampling_params) -> bool:
     return _penalty_kinds(sampling_params) != 0
 
 
+# Rows of `PenaltyTables.params`, floats as fp32 bits: one copy writes all four.
+_FREQUENCY_ROW, _PRESENCE_ROW, _REPETITION_ROW, _MIN_NEW_TOKENS_ROW = range(4)
+
+
+def _default_params(capacity: int, device) -> torch.Tensor:
+    params = torch.zeros((4, capacity), dtype=torch.int32, device=device)
+    params.view(torch.float32)[_REPETITION_ROW] = 1.0
+    return params
+
+
 class PenaltyTables(NamedTuple):
-    """One row per penalty index."""
+    """One row, or one `params` column, per penalty index."""
 
     counts: torch.Tensor  # [rows, vocab] int32 output-token counts
     lens: torch.Tensor  # [rows] int32 output lengths
-    frequency: torch.Tensor  # [rows] fp32
-    presence: torch.Tensor  # [rows] fp32
-    repetition: torch.Tensor  # [rows] fp32
-    min_new_tokens: torch.Tensor  # [rows] int32
+    params: torch.Tensor  # [4, rows] int32
     # [rows, k] int64, padded with vocab_size; empty unless min_new_tokens > 0.
     stop_token_ids: torch.Tensor
+
+    @property
+    def frequency(self) -> torch.Tensor:  # [rows] fp32
+        return self.params.view(torch.float32)[_FREQUENCY_ROW]
+
+    @property
+    def presence(self) -> torch.Tensor:  # [rows] fp32
+        return self.params.view(torch.float32)[_PRESENCE_ROW]
+
+    @property
+    def repetition(self) -> torch.Tensor:  # [rows] fp32
+        return self.params.view(torch.float32)[_REPETITION_ROW]
+
+    @property
+    def min_new_tokens(self) -> torch.Tensor:  # [rows] int32
+        return self.params[_MIN_NEW_TOKENS_ROW]
 
 
 class _RequestParams(NamedTuple):
@@ -113,10 +139,7 @@ class PenaltyStatusPool:
         return PenaltyTables(
             counts=empty(self.vocab_size, dtype=torch.int32),
             lens=empty(dtype=torch.int32),
-            frequency=empty(dtype=torch.float32),
-            presence=empty(dtype=torch.float32),
-            repetition=empty(dtype=torch.float32),
-            min_new_tokens=empty(dtype=torch.int32),
+            params=_default_params(0, self.device),
             stop_token_ids=empty(1, dtype=torch.int64),
         )
 
@@ -178,13 +201,12 @@ class PenaltyStatusPool:
                 return _grown(table, (new_capacity, *table.shape[1:]), fill)
 
             tables = self.tables
+            params = _default_params(new_capacity, self.device)
+            params[:, :capacity] = tables.params
             self.tables = PenaltyTables(
                 counts=grown(tables.counts, 0),
                 lens=grown(tables.lens, 0),
-                frequency=grown(tables.frequency, 0.0),
-                presence=grown(tables.presence, 0.0),
-                repetition=grown(tables.repetition, 1.0),
-                min_new_tokens=grown(tables.min_new_tokens, 0),
+                params=params,
                 stop_token_ids=grown(tables.stop_token_ids, self.vocab_size),
             )
         needed_stop_width = max(
@@ -200,56 +222,63 @@ class PenaltyStatusPool:
                 )
             )
 
-        if self.pending_params:
-            self._write_params()
-        if self.pending_init:
-            self._replay_histories()
+        if self.pending_params or self.pending_init:
+            self._write_pending()
 
-    def _write_params(self) -> None:
+    def _write_pending(self) -> None:
+        """Write the queued params and history resets with one copy."""
         tables = self.tables
-        indices = list(self.pending_params)
         params = list(self.pending_params.values())
-        self.pending_params.clear()
-        stop_width = tables.stop_token_ids.shape[1]
-        coefficients_cpu = [[p.frequency, p.presence, p.repetition] for p in params]
-        stop_token_ids_cpu = [
-            p.stop_token_ids + [self.vocab_size] * (stop_width - len(p.stop_token_ids))
-            for p in params
-        ]
-        indices_device = async_h2d(indices, dtype=torch.int64, device=self.device)
-        coefficients = async_h2d(
-            coefficients_cpu, dtype=torch.float32, device=self.device
-        )
-        min_new_tokens = async_h2d(
-            [p.min_new_tokens for p in params], dtype=torch.int32, device=self.device
-        )
-        stop_token_ids = async_h2d(
-            stop_token_ids_cpu, dtype=torch.int64, device=self.device
-        )
-        tables.frequency[indices_device] = coefficients[:, 0]
-        tables.presence[indices_device] = coefficients[:, 1]
-        tables.repetition[indices_device] = coefficients[:, 2]
-        tables.min_new_tokens[indices_device] = min_new_tokens
-        tables.stop_token_ids[indices_device] = stop_token_ids
-
-    def _replay_histories(self) -> None:
-        tables = self.tables
-        indices = list(self.pending_init)
         histories = list(self.pending_init.values())
-        self.pending_init.clear()
-        indices_device = async_h2d(indices, dtype=torch.int64, device=self.device)
-        tables.counts[indices_device] = 0
-        tables.lens[indices_device] = async_h2d(
-            [len(h) for h in histories], dtype=torch.int32, device=self.device
+        lens_cpu = [len(h) for h in histories]
+        num_replays = sum(lens_cpu)
+        values_cpu = np.empty((4, len(params)), dtype=np.int32)
+        floats_cpu = values_cpu.view(np.float32)
+        floats_cpu[_FREQUENCY_ROW] = [p.frequency for p in params]
+        floats_cpu[_PRESENCE_ROW] = [p.presence for p in params]
+        floats_cpu[_REPETITION_ROW] = [p.repetition for p in params]
+        values_cpu[_MIN_NEW_TOKENS_ROW] = [p.min_new_tokens for p in params]
+        stop_token_ids_cpu = np.full(
+            (len(params), tables.stop_token_ids.shape[1]), self.vocab_size, np.int64
         )
-        replay_indices = [index for index, h in zip(indices, histories) for _ in h]
-        if replay_indices:
-            replay_tokens = [token for h in histories for token in h]
+        for row, p in zip(stop_token_ids_cpu, params):
+            row[: len(p.stop_token_ids)] = p.stop_token_ids
+        history_indices_cpu = np.fromiter(self.pending_init, np.int64, len(histories))
+        segments = [
+            np.fromiter(self.pending_params, np.int64, len(params)),
+            values_cpu,
+            stop_token_ids_cpu,
+            history_indices_cpu,
+            np.asarray(lens_cpu, dtype=np.int64),
+            np.repeat(history_indices_cpu, lens_cpu),
+            np.fromiter((t for h in histories for t in h), np.int64, num_replays),
+        ]
+        self.pending_params.clear()
+        self.pending_init.clear()
+        block = async_h2d_tensor(
+            torch.from_numpy(np.concatenate([s.ravel() for s in segments])),
+            self.device,
+        )
+        (
+            param_indices,
+            values,
+            stop_token_ids,
+            history_indices,
+            lens,
+            replay_indices,
+            replay_tokens,
+        ) = block.split([s.size for s in segments])
+
+        if params:
+            values = values.view(4, -1).to(torch.int32)
+            tables.params.index_copy_(1, param_indices, values)
+            tables.stop_token_ids[param_indices] = stop_token_ids.view(len(params), -1)
+        if histories:
+            tables.counts.index_fill_(0, history_indices, 0)
+            tables.lens.index_copy_(0, history_indices, lens.to(torch.int32))
+        if num_replays:
             tables.counts.index_put_(
-                (
-                    async_h2d(replay_indices, dtype=torch.int64, device=self.device),
-                    async_h2d(replay_tokens, dtype=torch.int64, device=self.device),
-                ),
+                (replay_indices, replay_tokens),
                 torch.ones(len(replay_indices), dtype=torch.int32, device=self.device),
                 accumulate=True,
             )
@@ -339,20 +368,24 @@ class StepPenalties:
     ] = dataclasses.field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
-    def build(cls, reqs: Sequence, pool: PenaltyStatusPool) -> Optional[StepPenalties]:
-        batch_indices = [i for i, r in enumerate(reqs) if r.penalty_index is not None]
-        if not batch_indices:
+    def build(
+        cls,
+        pool: PenaltyStatusPool,
+        penalty_indices: torch.Tensor,
+        penalty_indices_host: np.ndarray,
+    ) -> Optional[StepPenalties]:
+        """From each batch row's penalty index ([bs] on the device and its host
+        copy, -1 for a row without one), without a copy or a sync."""
+        penalized = penalty_indices_host[penalty_indices_host >= 0]
+        if penalized.size == 0:
             return None
-        penalty_indices = [reqs[i].penalty_index for i in batch_indices]
-        kinds = functools.reduce(operator.or_, (pool.kinds[i] for i in penalty_indices))
-        indices = async_h2d(
-            [batch_indices, penalty_indices], dtype=torch.int64, device=pool.device
-        )
+        kinds = functools.reduce(operator.or_, (pool.kinds[i] for i in penalized))
+        batch_indices = rows_where(penalty_indices >= 0, penalized.size)
         return cls(
             pool=pool,
-            batch_size=len(reqs),
-            batch_indices=indices[0],
-            penalty_indices=indices[1],
+            batch_size=penalty_indices_host.size,
+            batch_indices=batch_indices,
+            penalty_indices=penalty_indices[batch_indices].long(),
             kinds=kinds,
         )
 
@@ -372,6 +405,13 @@ class StepPenalties:
         if self._logit_penalties is None:
             self._logit_penalties = self._build_logit_penalties()
         return self._logit_penalties
+
+    def apply(self, logits: torch.Tensor) -> None:
+        additive, scaling = self.logit_penalties()
+        if additive is not None:
+            logits.add_(additive)
+        if scaling is not None:
+            apply_scaling_penalties(logits, scaling)
 
     def _build_logit_penalties(
         self,
@@ -543,7 +583,9 @@ def _compute_logit_penalties(
         if frequency is not None:
             additive.addcmul_(counts, frequency, value=-1)
         if presence is not None:
-            additive.addcmul_(present, presence, value=-1)
+            mask = present.to(additive.dtype) if _is_npu else present
+            # aclnnInplaceAddcmul rejects DT_BOOL tensors; promote on NPU only.
+            additive.addcmul_(mask, presence, value=-1)
         if min_new_tokens is not None:
             stop_penalties = torch.zeros(
                 (counts.shape[0], vocab_size + 1), dtype=torch.float32, device=device

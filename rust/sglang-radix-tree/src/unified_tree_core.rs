@@ -679,6 +679,9 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) namespaced_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
+    /// The per-path Mamba cap also counts host copies and frees the host
+    /// copies of the states it caps (decided at HiCache init).
+    pub(crate) mamba_path_cap_counts_host: bool,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
@@ -1065,6 +1068,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
+            mamba_path_cap_counts_host: false,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
             empty_device_indices: params.empty_device_indices,
             ongoing_insert_walk_state: None,
@@ -3910,6 +3914,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.write_through_threshold = value;
     }
 
+    /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
+    pub fn set_mamba_path_cap_counts_host(&mut self, enabled: bool) {
+        self.mamba_path_cap_counts_host = enabled;
+    }
+
     pub fn enable_storage(&self) -> bool {
         self.enable_storage
     }
@@ -3942,6 +3951,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         value: bool,
     ) -> Result<(), TreeCoreRuntimeError> {
+        // Stored marks describe the store being detached, not the next one.
+        if !value {
+            for node_id in self.collect_all_nodes_() {
+                self.arena.node_mut(node_id).external_cache_stored = false;
+            }
+        }
         self.enable_external_cache_linker = value;
         Ok(())
     }
@@ -4764,6 +4779,22 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn rotation_base_of(&self, node_id: NodeId) -> Result<Option<i64>, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
         Ok(self.arena.node(node_id).rotation_base)
+    }
+
+    /// The rotation base plus the node's first position-page: the shard owner
+    /// of its first page, which host backups draw their slots from.
+    pub fn rotation_phase_of(&self, node_id: NodeId) -> Result<Option<i64>, NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        let mut node = self.arena.node(node_idx);
+        let Some(rotation_base) = node.rotation_base else {
+            return Ok(None);
+        };
+        let mut prefix_len = 0;
+        while !node.is_root() {
+            node = self.arena.node(node.parent());
+            prefix_len += node.key.atom_len();
+        }
+        Ok(Some(rotation_base + (prefix_len / self.page_size) as i64))
     }
 
     /// Return input indices in depth-first, subtree-weight order.

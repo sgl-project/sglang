@@ -3053,6 +3053,20 @@ class KVCacheConfigurator:
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
         if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
+            if (
+                _is_npu
+                and get_parallel().enable_dsa_cache_layer_split
+                and not self.is_draft_worker
+            ):
+                from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
+                    LayerSplitNPUDSATokenToKVPool,
+                )
+
+                return partial(
+                    LayerSplitNPUDSATokenToKVPool,
+                    layer_shard_rank=get_parallel().attn_cp_rank,
+                    layer_shard_size=get_parallel().attn_cp_size,
+                )
             if _is_npu and get_dsa_index_kpool(self.model_config.hf_config) > 1:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
@@ -3354,10 +3368,11 @@ class KVCacheConfigurator:
         # measured against an understated free-memory figure and the pool can be
         # sized orders of magnitude too small while GPU memory sits idle.
         gc.collect()
+        solo_join = get_exec().moe.is_ep_offset_joiner  # No WORLD peers to poll.
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_parallel().launch_world_size > 1,
+            distributed=not solo_join and get_parallel().launch_world_size > 1,
             cpu_group=get_parallel().world_group.cpu_group,
         )
 
