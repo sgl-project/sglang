@@ -60,18 +60,36 @@ def tp_group_on_one_host(group) -> bool:
 def _all_peers_accessible(group) -> bool:
     """Whether every rank of ``group`` can access every peer GPU (CUDA IPC maps peer
     memory only then), agreed over the group so that all ranks pull guests or none.
-    A collective: every rank must reach it in the same order."""
+
+    Peers are matched by GPU UUID: with SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS every
+    rank is cuda:0 and sees only its own GPU, so a peer it cannot see cannot be
+    checked and counts as inaccessible. Under --enable-p2p-check the cached P2P
+    probe must pass too. A collective: every rank must reach it in the same order.
+    """
+    from sglang.srt.distributed.device_communicators import custom_all_reduce_utils
+
     me = torch.cuda.current_device()
-    devices = [None] * group.world_size
-    dist.all_gather_object(devices, me, group=group.cpu_group)
-    visible = torch.cuda.device_count()
+    visible = {_gpu_uuid(i): i for i in range(torch.cuda.device_count())}
+    mine = _gpu_uuid(me)
+    peers = [None] * group.world_size
+    dist.all_gather_object(peers, mine, group=group.cpu_group)
     ok = all(
-        d == me or (d < visible and torch.cuda.can_device_access_peer(me, d))
-        for d in devices
+        uuid == mine
+        or (
+            uuid in visible
+            and torch.cuda.can_device_access_peer(me, visible[uuid])
+            # True unless --enable-p2p-check (bootstrap patches it otherwise)
+            and custom_all_reduce_utils.gpu_p2p_access_check(me, visible[uuid])
+        )
+        for uuid in peers
     )
     agreed = torch.tensor([int(ok)], dtype=torch.int32)
     dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=group.cpu_group)
     return bool(agreed.item())
+
+
+def _gpu_uuid(device: int) -> str:
+    return str(torch.cuda.get_device_properties(device).uuid)
 
 
 class _Setup:
