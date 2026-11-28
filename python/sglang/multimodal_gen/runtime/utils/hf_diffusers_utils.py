@@ -55,7 +55,7 @@ from sglang.multimodal_gen.runtime.utils.quantization_utils import (
 from sglang.multimodal_gen.runtime.weights.source import resolve_weight
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import check_gguf_file
-from sglang.utils import is_in_ci
+from sglang.utils import is_in_ci, is_modelscope_not_found_error
 
 logger = init_logger(__name__)
 
@@ -112,20 +112,6 @@ def _snapshot_has_files(
             recursive=True,
         )
     )
-
-
-def _is_modelscope_not_found_error(error: BaseException) -> bool:
-    if not envs.SGLANG_USE_MODELSCOPE.get():
-        return False
-
-    from modelscope.hub.errors import NotExistError
-
-    current: Optional[BaseException] = error
-    while current is not None:
-        if isinstance(current, NotExistError):
-            return True
-        current = current.__cause__
-    return False
 
 
 def _is_diffusers_component_entry(value: Any) -> bool:
@@ -1233,7 +1219,7 @@ def maybe_download_model(
                 f"Please check the model ID or ensure you have access to the repository. Error: {e}"
             ) from e
         except (RequestException, RequestsConnectionError, ConnectionError) as e:
-            if _is_modelscope_not_found_error(e):
+            if is_modelscope_not_found_error(e):
                 raise ValueError(
                     f"Model or revision not found at {model_name_or_path}. "
                     "Please check the model ID or ensure you have access to the repository."
@@ -1291,7 +1277,6 @@ def hf_hub_download(
     """Unified hf_hub_download that supports both Hugging Face Hub and ModelScope."""
     if envs.SGLANG_USE_MODELSCOPE.get():
         from modelscope import model_file_download
-        from modelscope.hub.errors import NotExistError
 
         try:
             return model_file_download(
@@ -1300,7 +1285,9 @@ def hf_hub_download(
                 local_dir=str(local_dir) if local_dir is not None else None,
                 **kwargs,
             )
-        except NotExistError as exc:
+        except Exception as exc:
+            if not is_modelscope_not_found_error(exc):
+                raise
             # Keep the Hugging Face-compatible exception contract used by
             # maybe_download_model_index for repositories without model_index.json.
             raise EntryNotFoundError(str(exc)) from exc

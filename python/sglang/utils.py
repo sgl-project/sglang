@@ -26,6 +26,21 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 
+def is_modelscope_not_found_error(error: BaseException) -> bool:
+    """Recognize a missing ModelScope resource even when the client wraps the error."""
+    if not envs.SGLANG_USE_MODELSCOPE.get():
+        return False
+
+    from modelscope.hub.errors import NotExistError
+
+    current: Optional[BaseException] = error
+    while current is not None:
+        if isinstance(current, NotExistError):
+            return True
+        current = current.__cause__
+    return False
+
+
 def load_diffusion_overlay_registry_from_env() -> dict[str, dict[str, Any]]:
     raw_value = os.getenv("SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY", "").strip()
     if not raw_value:
