@@ -56,6 +56,12 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     make_next_draft_input,
 )
+from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
+    bind_worker_draft_kv_ring_to_backend,
+    build_worker_draft_kv_ring,
+    record_worker_draft_kv_ring_floors,
+    worker_hicache_draft_plan,
+)
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
@@ -639,26 +645,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        if get_spec().speculative_dflash_draft_kv_ring:
-            from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
-                bind_dspark_draft_kv_ring,
-                build_dspark_draft_kv_ring,
-            )
-
-            self.draft_kv_ring = build_dspark_draft_kv_ring(
-                draft_hf_config=self.draft_model_runner.model_config.hf_config,
-                draft_pool=self.draft_model_runner.token_to_kv_pool,
-                req_to_token_rows=self.model_runner.req_to_token_pool.req_to_token.shape[
-                    0
-                ],
-                device=self.device,
-                log_rank_zero=self._target_tp_rank == 0,
-            )
-            bind_dspark_draft_kv_ring(
-                ring=self.draft_kv_ring,
-                kv_injector=self._kv_injector,
-                proposer=self._proposer,
-            )
+        build_worker_draft_kv_ring(self)
         if self._static_epilogue_needs_draft_fold and not draft_folds_static_commit(
             draft_model=self.draft_model, kv_injector=self._kv_injector
         ):
@@ -668,17 +655,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
     def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
-        if self.draft_kv_ring is not None:
-            return HiCacheDraftPlan()
-        return super()._build_hicache_draft_plan()
+        return worker_hicache_draft_plan(self) or super()._build_hicache_draft_plan()
 
     def init_attention_backends(self):
         if not self._hosts_draft:
             return
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
-        if self.draft_kv_ring is not None:
-            self.draft_model_runner.attn_backend.set_draft_kv_ring(self.draft_kv_ring)
+        bind_worker_draft_kv_ring_to_backend(self)
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
             target_model=self.target_worker.model_runner.model,
             draft_model=self.draft_model,
@@ -917,12 +901,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_pool.set_swa_valid_from(
                     batch.req_pool_indices.index_select(0, placed_rows), valid_from
                 )
-        if self.draft_kv_ring is not None:
-            self.draft_kv_ring.record_floors(
-                batch.reqs,
-                batch.prefix_lens,
-                self.model_runner.req_to_token_pool.req_generation,
-            )
+        record_worker_draft_kv_ring_floors(self, batch)
         # Inject under the draft's TP placement, like the draft and decode paths.
         with self._draft_context():
             self._kv_injector.inject_prefill(

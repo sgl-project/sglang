@@ -173,7 +173,7 @@ def set_gqa_draft_kv_ring(backend: TritonAttnBackend, ring) -> None:
     backend.verify_reads_window_kv_only = True
 
 
-def maybe_fill_draft_ring_window_buffer(
+def ring_window_rail(
     backend: TritonAttnBackend,
     *,
     name: str,
@@ -184,7 +184,7 @@ def maybe_fill_draft_ring_window_buffer(
     graph: bool,
 ):
     """Fill a sliding-window rail from the per-request ring on non-MLA drafts, or None."""
-    ring = backend.gqa_draft_kv_ring_hip
+    ring = getattr(backend, "gqa_draft_kv_ring_hip", None)
     if ring is None or backend.use_mla:
         return None
     from sglang.kernels.ops.attention.dspark_ring_window_hip import (

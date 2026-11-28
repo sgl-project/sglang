@@ -24,6 +24,9 @@ from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMod
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
+    bind_proposer_out_cache_loc,
+)
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.online_acceptance_estimator import (
     OnlineAcceptanceEstimator,
@@ -664,12 +667,14 @@ class DraftBlockProposer:
             self.draft_model_runner.runner_ids,
             cols=slice(0, query_token_num),
         )
-        if self.draft_kv_ring is not None:
-            draft_forward_batch.out_cache_loc = self.draft_kv_ring.block_locs(
-                batch.req_pool_indices[:bs],
-                draft_positions,
-                block_size=query_token_num,
-            )
+        bind_proposer_out_cache_loc(
+            self,
+            batch,
+            draft_forward_batch,
+            bs=bs,
+            query_token_num=query_token_num,
+            draft_positions=draft_positions,
+        )
         self._fill_dp_moe_sync_metadata(draft_forward_batch, batch)
         graph_runner = self.draft_model_runner.decode_cuda_graph_runner
         runs_graph = graph_runner is not None and graph_runner.can_run_graph(

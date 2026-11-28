@@ -11,6 +11,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.model_executor.forward_batch_info import compute_position
+from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
+    prefill_inject_cache_loc,
+)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.utils import is_pin_memory_available
 
@@ -106,15 +109,14 @@ class TargetHiddenKvInjector:
             )
         # The draft KV goes to the slots the target prefill writes.
         iteration_ids = self.model_runner.runner_ids.own_plan(batch)
-        if self.draft_kv_ring is not None:
-            cache_loc = self.draft_kv_ring.extend_locs(
-                req_pool_indices=batch.req_pool_indices,
-                positions=positions,
-                extend_lens=ctx_lens.to(torch.int64),
-                seq_ends=(draft_seq_lens + ctx_lens).to(torch.int64),
-            )
-        else:
-            cache_loc = self.ids_for(iteration_ids)
+        cache_loc = prefill_inject_cache_loc(
+            self,
+            batch=batch,
+            positions=positions,
+            ctx_lens=ctx_lens,
+            draft_seq_lens=draft_seq_lens,
+            iteration_ids=iteration_ids,
+        )
         pool = self.draft_model_runner.token_to_kv_pool
         swa_loc = None
         if hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope"):

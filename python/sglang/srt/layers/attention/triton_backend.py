@@ -190,7 +190,6 @@ class TritonAttnBackend(AttentionBackend):
     verify_mla_draft_fwd: Optional[Callable[..., bool]] = None
     runs_decode: bool = True
     mla_dcp_window_verify: Optional[MlaDcpWindowVerify] = None
-    gqa_draft_kv_ring_hip: Optional[DFlashDraftKVRing] = None
     # Every window rail this backend builds: the sub-pool the window layers
     # read, with the window they attend over; set per instance in __init__.
     window_lengths: Mapping[str, int] = MappingProxyType({})
@@ -684,8 +683,8 @@ class TritonAttnBackend(AttentionBackend):
         CUDA-graph buffers when ``graph``; ``aligned`` adds the tile-aligned rail."""
         rails = {}
         for name, window in self.window_lengths.items():
-            ring_buf = (
-                _draft_hip.maybe_fill_draft_ring_window_buffer(
+            ring_rail = (
+                _draft_hip.ring_window_rail(
                     self,
                     name=name,
                     req_pool_indices=req_pool_indices,
@@ -698,8 +697,8 @@ class TritonAttnBackend(AttentionBackend):
                 else None
             )
             kv_indptr, kv_indices, kv_lens, kv_offsets = (
-                ring_buf
-                if ring_buf is not None
+                ring_rail
+                if ring_rail is not None
                 else update_sliding_window_buffer(
                     self.window_kv_indptr[name],
                     self.runner_ids,
