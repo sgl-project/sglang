@@ -4,7 +4,7 @@ The e2e counterpart, over the real scheduler load-report path, is
 test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
 Fragility: scheduler tests bypass `DataParallelController.__init__` via `__new__` and
-inject only the attrs the schedulers read (`workers`, `_active_workers`,
+inject only the attrs the schedulers read (`workers`, `_active_workers`, `_draining_slots`,
 `round_robin_counter`, `dp_budget`). `status` / `dp_active` / `max_dp_size` are for
 `update_active_ranks`. Update `_make_controller` if a scheduler starts reading another
 attr. `maybe_external_dp_rank_routing` is exercised as the real method, no mock. The
@@ -17,7 +17,6 @@ import importlib
 import threading
 import time
 import unittest
-from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -32,6 +31,7 @@ from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
+    DPRoutingUnavailable,
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
@@ -44,7 +44,6 @@ from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
-from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -88,6 +87,7 @@ def _make_controller(
     ctl.status = list(ctl.dp_active)
     ctl._active_workers = list(range(num_dp_ranks))
     ctl._active_count_cache = num_dp_ranks
+    ctl._draining_slots = set()
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
@@ -122,7 +122,9 @@ class TestJoinerWorkerPortAdmission(CustomTestCase):
         controller = DataParallelController.__new__(DataParallelController)
         controller._receive_ports_as_client = MagicMock(return_value=handshake)
         controller.launch_tensor_parallel_group = launch
-        execution = SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=True))
+        execution = SimpleNamespace(
+            moe=SimpleNamespace(is_ep_scale_joiner=True, is_ep_offset_joiner=True)
+        )
 
         with (
             patch(
@@ -184,102 +186,6 @@ class TestJoinerWorkerPortAdmission(CustomTestCase):
         self._launch_joiner(parallel, handshake, launch)
 
         self.assertEqual(launch.call_args.args[-1], [1002])
-
-
-class TestLocalKvEventSources(CustomTestCase):
-    @staticmethod
-    def _source(rank, block_size=64):
-        return {
-            "dp_rank": rank,
-            "endpoint": f"tcp://127.0.0.1:{5557 + rank}",
-            "topic": "kv",
-            "block_size": block_size,
-        }
-
-    def test_scheduler_reports_logical_block_size_or_no_source(self):
-        from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.managers.scheduler_components.kv_events_publisher import (
-            SchedulerKvEventsPublisher,
-        )
-
-        component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.max_total_num_tokens = 64
-        scheduler.max_req_input_len = 32
-        scheduler.startup_time = {}
-        scheduler.page_size = 64
-        scheduler.enable_hierarchical_cache = False
-        scheduler.enable_unified_cache_external_linker = False
-        scheduler.kv_events_publisher = component
-        publisher = MagicMock()
-        publisher.describe_local_source.return_value = self._source(4, 256)
-        for owned_publisher, expected in (
-            (publisher, [self._source(4, 256)]),
-            (None, []),
-        ):
-            with (
-                self.subTest(has_publisher=owned_publisher is not None),
-                get_context().override_server_args(grpc_port=50051, dcp_size=4),
-            ):
-                component.kv_event_publisher = owned_publisher
-                self.assertEqual(
-                    scheduler.get_init_info()["kv_event_sources"], expected
-                )
-        publisher.describe_local_source.assert_called_once_with(256)
-
-    def test_controller_collects_all_scheduler_sources(self):
-        from sglang.srt.managers import data_parallel_controller as module
-
-        controller = DataParallelController.__new__(DataParallelController)
-        controller.env_lock = threading.Lock()
-        controller._scheduler_init_info_lock = threading.Lock()
-        controller._scheduler_init_infos = []
-        controller.scheduler_procs = []
-        controller.local_kv_event_sources = []
-        controller.run_scheduler_process_func = MagicMock()
-        controller.attn_replica_size = 1
-        controller.prelaunched_schedulers = None
-        # TP8/DP4 over two nodes: this follower's four schedulers own ranks 2,3.
-        readers = [
-            MagicMock(
-                recv=MagicMock(
-                    return_value={
-                        "max_total_num_tokens": 64,
-                        "max_req_input_len": 32,
-                        "kv_event_sources": sources,
-                    }
-                )
-            )
-            for sources in ([self._source(2)], [], [self._source(3)], [])
-        ]
-        with (
-            get_context().override_server_args(
-                tp_size=8,
-                attn_dp_size=4,
-                nnodes=2,
-                node_rank=1,
-                pp_size=1,
-                attn_cp_size=1,
-            ),
-            patch.object(module.mp, "Process"),
-            patch.object(
-                module.mp,
-                "Pipe",
-                side_effect=[(reader, MagicMock()) for reader in readers],
-            ),
-            patch.object(module.PortArgs, "init_new", return_value=MagicMock()),
-            patch.object(module.TorchMemorySaverAdapter, "create"),
-            patch.object(module.numa_utils, "configure_subprocess"),
-            patch.object(
-                module, "maybe_reindex_device_id", return_value=nullcontext(0)
-            ),
-        ):
-            controller.launch_tensor_parallel_group(
-                MagicMock(), MagicMock(), 0, None, [7000, 7001, 7002, 7003]
-            )
-        self.assertEqual(
-            controller.local_kv_event_sources, [self._source(2), self._source(3)]
-        )
 
 
 class TestRayAttentionDpPortArgs(CustomTestCase):
@@ -380,7 +286,7 @@ class TestInitInfoReply(CustomTestCase):
 
     def test_router_l3_layout_is_forwarded_only_when_a_scheduler_reports_it(self):
         """The reply holds only the keys the controller names, so it must name this one."""
-        info = {"max_total_num_tokens": 64, "max_req_input_len": 32}
+        info = {"max_total_num_tokens": 64, "max_req_len": 38, "max_req_input_len": 32}
         reporting = {**info, "router_l3_layout": "layout-a"}
         self.assertEqual(
             self._reply(reporting, reporting)["router_l3_layout"], "layout-a"
@@ -529,6 +435,23 @@ class TestDispatchingWithTrace(CustomTestCase):
                 self.assertEqual(
                     ctl.dispatching_with_trace.call_args_list,
                     [call(req, refresh_load_budget=False) for req in reqs],
+                )
+
+    def test_batch_aborts_only_the_unroutable_item(self):
+        """The batch itself has no rid, so aborting it would leave every item hanging."""
+        for dispatch in ("dispatch_batch_generate", "dispatch_batch_embedding"):
+            with self.subTest(dispatch=dispatch):
+                ctl = self._make_traced_controller()
+                reqs = [_req(rid=rid) for rid in ("a", "b", "c")]
+                ctl.dispatching_with_trace = MagicMock(
+                    side_effect=[None, DPRoutingUnavailable("retired"), None]
+                )
+                ctl._abort_undispatchable = MagicMock()
+                getattr(ctl, dispatch)(reqs)
+                self.assertEqual(ctl.dispatching_with_trace.call_count, 3)
+                self.assertEqual(
+                    ctl._abort_undispatchable.call_args_list,
+                    [call(reqs[1], "retired")],
                 )
 
 

@@ -14,6 +14,10 @@
       "destination": "/cookbook/autoregressive/Baidu/:slug*"
     },
     {
+      "source": "/cookbook/diffusion/LingBot-Video/LingBot-Video",
+      "destination": "/cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
+    },
+    {
       "source": "/cookbook/autoregressive/Reflection/Beam-1.0",
       "destination": "/cookbook/autoregressive/Reflection/Beam-1_0"
     },
@@ -1592,7 +1596,6 @@
                   },
                   {
                     "group": "Black Forest Labs",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/FLUX/FLUX.3",
                       "cookbook/diffusion/FLUX/FLUX"
@@ -1602,6 +1605,12 @@
                     "group": "CircleStone",
                     "pages": [
                       "cookbook/diffusion/CircleStone/Anima"
+                    ]
+                  },
+                  {
+                    "group": "FireRedTeam",
+                    "pages": [
+                      "cookbook/diffusion/FireRed/FireRed-Image-Edit"
                     ]
                   },
                   {
@@ -1626,12 +1635,12 @@
                   {
                     "group": "JD.com",
                     "pages": [
+                      "cookbook/diffusion/JoyAI-Image/JoyAI-Image-Edit",
                       "cookbook/diffusion/JoyEcho/JoyEcho"
                     ]
                   },
                   {
                     "group": "Kandinsky",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Kandinsky/Kandinsky6",
                       "cookbook/diffusion/Kandinsky/Kandinsky6-SR"
@@ -1651,6 +1660,13 @@
                     ]
                   },
                   {
+                    "group": "MAGI",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/diffusion/MAGI/MAGI-2"
+                    ]
+                  },
+                  {
                     "group": "Meituan",
                     "pages": [
                       "cookbook/diffusion/LongCat/LongCat-Image"
@@ -1658,6 +1674,7 @@
                   },
                   {
                     "group": "MiniMax",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3",
                       "cookbook/diffusion/MiniMax/MiniMax-H3-Image"
@@ -1704,6 +1721,7 @@
                   {
                     "group": "Tencent",
                     "pages": [
+                      "cookbook/diffusion/Tencent/Hunyuan3D-2",
                       "cookbook/diffusion/Tencent/HunyuanImage3",
                       "cookbook/diffusion/HY-Nomas/HY-Nomas"
                     ]
@@ -1716,7 +1734,6 @@
                   },
                   {
                     "group": "Wan",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
                       "cookbook/diffusion/Wan/Wan2.2",
@@ -1726,19 +1743,17 @@
                 ]
               },
               {
-                "group": "VLA (Vision-Language-Action) Models",
+                "group": "Action Models",
                 "pages": [
                   "cookbook/vla/intro",
                   {
                     "group": "Black Forest Labs",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/vla/FLUX/FLUX-3-Action"
                     ]
                   },
                   {
                     "group": "OpenPI",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
                     ]
@@ -1750,6 +1765,12 @@
                       "cookbook/vla/Runway/Praxis-1"
                     ]
                   }
+                ]
+              },
+              {
+                "group": "Use Cases",
+                "pages": [
+                  "cookbook/use-cases/robotics-physical-ai"
                 ]
               },
               {
@@ -1780,7 +1801,14 @@
               "docs/sglang-diffusion/index",
               "docs/sglang-diffusion/installation",
               "docs/sglang-diffusion/compatibility_matrix",
-              "docs/sglang-diffusion/disaggregation",
+              {
+                "group": "Disaggregated serving",
+                "pages": [
+                  "docs/sglang-diffusion/disaggregation",
+                  "docs/sglang-diffusion/disaggregation/stage-deployments",
+                  "docs/sglang-diffusion/disaggregation/stage-contracts"
+                ]
+              },
               {
                 "group": "Usage",
                 "pages": [

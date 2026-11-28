@@ -21,6 +21,7 @@ from diffusion_case_parser import (
     DiffusionSuiteInfo,
     DiffusionTestCaseVisitor,
     collect_diffusion_suites,
+    pr_model_families,
     resolve_case_config_path,
 )
 
@@ -147,6 +148,11 @@ def item_repo_ids(
     for standalone_file in standalone_files:
         path = os.path.normpath(repo_root / STANDALONE_DIR_REL_PATH / standalone_file)
         found[standalone_file] = scanner.file_repo_ids(os.path.relpath(path, repo_root))
+    # The NVFP4 pipeline loads its shared components from a second Hub repo.
+    # Only partitions that load the Comfy checkpoint need to prefetch it.
+    for repos in found.values():
+        if "Comfy-Org/Ideogram-4" in repos:
+            repos.add("ideogram-ai/ideogram-4-fp8")
     return found
 
 
@@ -186,7 +192,7 @@ def build_partition_plan(
     }
 
 
-def output_github_value(name: str, value: dict) -> None:
+def output_github_value(name: str, value: dict | tuple[str, ...]) -> None:
     value_json = json.dumps(value, separators=(",", ":"))
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
@@ -316,7 +322,16 @@ def main():
         print(f"Error: {exc}")
         sys.exit(1)
 
-    suites = collect_diffusion_suites(case_config_path, baseline_path)
+    families = ()
+    changed_files = os.environ.get("DIFFUSION_PR_FILES")
+    if changed_files and not args.case_ids and not USE_NPU_CONFIGS:
+        families = tuple(
+            sorted(pr_model_families(json.loads(Path(changed_files).read_text())))
+        )
+    output_github_value("h100-pr-families", families)
+    suites = collect_diffusion_suites(
+        case_config_path, baseline_path, pr_families=families
+    )
     validate_suite_case_coverage(suites)
 
     # A scan problem leaves the prefetch without a list, never fails the plan.

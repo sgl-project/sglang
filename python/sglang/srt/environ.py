@@ -42,6 +42,29 @@ def _default_on_in_ci() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+# Parsed values by name once `freeze_env_reads` ran; None reads os.environ every time.
+_frozen_reads: Optional[Dict[str, Any]] = None
+
+
+def freeze_env_reads() -> None:
+    """Serve every later ``EnvField.get`` from a per-process memo.
+
+    Gated by SGLANG_OPT_FREEZE_ENV_READS, for a process whose hot loop reads the
+    same variables every step, once its startup is over. Writes through ``set`` /
+    ``override`` / ``clear`` drop the memo; a raw ``os.environ`` write after this
+    call is not seen.
+    """
+    global _frozen_reads
+    if _frozen_reads is None and envs.SGLANG_OPT_FREEZE_ENV_READS.get():
+        _frozen_reads = {}
+
+
+def _drop_frozen_reads() -> None:
+    # Callable defaults read other fields, so one write can change several values.
+    if _frozen_reads is not None:
+        _frozen_reads.clear()
+
+
 class EnvField:
     _allow_set_name = True
     # An empty value reads as unset for a type where "" cannot parse; a string
@@ -68,6 +91,16 @@ class EnvField:
         return self.default() if callable(self.default) else self.default
 
     def get(self) -> Any:
+        frozen = _frozen_reads
+        if frozen is None:
+            return self._read()
+        try:
+            return frozen[self.name]
+        except KeyError:
+            value = frozen[self.name] = self._read()
+            return value
+
+    def _read(self) -> Any:
         value = os.getenv(self.name)
 
         # Explicitly set to None
@@ -90,6 +123,7 @@ class EnvField:
     def set(self, value: Any):
         self._set_to_none = value is None
         os.environ[self.name] = str(value)
+        _drop_frozen_reads()
 
     @contextmanager
     def override(self, value: Any):
@@ -105,10 +139,12 @@ class EnvField:
             else:
                 os.environ.pop(self.name, None)
             self._set_to_none = backup_set_to_none
+            _drop_frozen_reads()
 
     def clear(self):
         os.environ.pop(self.name, None)
         self._set_to_none = False
+        _drop_frozen_reads()
 
     def __bool__(self):
         raise RuntimeError(
@@ -178,7 +214,7 @@ class _DeprecatedEnvFallback:
         super().__init__(default, secret=secret)
         self.deprecated_name = deprecated_name
 
-    def get(self) -> Any:
+    def _read(self) -> Any:
         if not self.is_set():
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
@@ -192,7 +228,7 @@ class _DeprecatedEnvFallback:
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
-        return super().get()
+        return super()._read()
 
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
@@ -681,10 +717,10 @@ class Envs:
     # gather stays an NCCL allgather.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
 
-    # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
-    # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead
-    # of the occupancy-starved mha_batch_prefill FMHA. Independent kill-switch
-    # for the new path; pairs with SGLANG_AITER_UNIFIED_VERIFY. Default on.
+    # Attention (aiter, ROCm): route NEXTN/EAGLE draft_extend through aiter
+    # unified_attention instead of mha_batch_prefill. On by default for non-MLA
+    # topk<=1 even when prefill/target verify keep their default kernels; set 0
+    # for the CK fallback. Target verify still requires SGLANG_USE_AITER_UNIFIED_ATTN.
     SGLANG_AITER_UNIFIED_DRAFT_EXTEND = EnvBool(True)
     # Use ASM prefill for gfx950 HD128 FP8 KV, including cached prefixes.
     SGLANG_AITER_ASM_PREFILL_HD128 = EnvBool(True)
@@ -760,8 +796,16 @@ class Envs:
     # ===================================================================
     # Shared-prompt decode attention for wide beam batches (FlashInfer MHA only).
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
+    # Run shared-context attention with the split-KV kernel (prompt split across CTAs).
+    SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
+    # Replay decode batches made only of beam requests as CUDA graphs.
+    SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
+    # Beam width of the shared-context beam graphs.
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH = EnvInt(None)
+    # Tokens per request the beam graphs hold; needed when the model has no trie.
+    SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY = EnvInt(None)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
@@ -1109,6 +1153,9 @@ class Envs:
     SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
     # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
     SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
+    # Qwen4-Exp HC sites with <= 128 rows on gfx950: fold the per-branch norm and the
+    # inject GEMV into a FlyDSL mix. Off by default: not bit-exact (~1 bf16 ulp).
+    SGLANG_ROCM_OPT_QWEN4_FUSED_HC = EnvBool(False)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
@@ -1544,6 +1591,8 @@ class Envs:
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvInt(32)
+    # Reshuffle experts in the elastic scale finalizer, not the next EPLB tick.
+    SGLANG_ENABLE_ELASTIC_SCALE_REBALANCE = EnvBool(True)
 
     # ===================================================================
     # DeepGEMM
@@ -1683,6 +1732,8 @@ class Envs:
     # static local-batch path.
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
+    # Unset, mooncake sends fp8, which cannot feed a deep_gemm runner on BF16 weights.
+    SGLANG_MOONCAKE_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
@@ -1750,6 +1801,9 @@ class Envs:
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    # SM120: fuse SiLU-and-mul into unquantized bf16 gate_up GEMMs (quack) through
+    # DualGemm, for MLPs built on LlamaMLP or Qwen2MLP.
+    SGLANG_USE_QUACK_SWIGLU_GEMM = EnvBool(False)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 
@@ -1826,6 +1880,13 @@ class Envs:
     # Let an unchanged top-k-1 EAGLE round read the previous round's top-1 and hidden
     # rows where the draft-extend graph left them instead of relaying copies.
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Once the scheduler's event loop starts, serve EnvField reads from a memo
+    # (freeze_env_reads). Opt-in: torch.compile traces EnvField.get, so a function
+    # compiled before the freeze and called outside graph replay recompiles once at
+    # the freeze and again whenever a new variable enters the memo.
+    SGLANG_OPT_FREEZE_ENV_READS = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.
@@ -2095,11 +2156,9 @@ class Envs:
     # Native gRPC server
     # ===================================================================
     # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
-    # --grpc-port CLI flag; setting either enables the native server alongside
-    # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI
-    # surface).
+    # --grpc-port CLI flag; setting either enables the Rust server's native
+    # gRPC listener (requires SGLANG_RUST_SERVER).
     SGLANG_GRPC_PORT = EnvInt(None)
-    SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
 
     # ===================================================================
     # NUMA and CPU affinity
@@ -2249,6 +2308,35 @@ class Envs:
     # CUDA: fuse inverse RoPE into the UE8M0 FP8 wo_a activation quantization.
     # Off by default; requires the FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
+    # ROCm gfx950 TP-only: overlap wo_b's all-reduce with its GEMM through mori
+    # cco. Off by default: it reserves a symmetric window outside torch's
+    # allocator, so a run that enables it wants a lower --mem-fraction-static.
+    # It also substitutes the GEMM, so the output moves. Only where wo_a hands
+    # over an Fp8GridActivation -- the gfx950 native mxfp8 route -- do the two
+    # quantise identically and agree bit for bit. On --fp8-gemm-backend aiter,
+    # which the MI355X recipes pin, wo_b gets a plain bf16 tensor and each path
+    # rounds it itself: relative L2 7.5e-3 to 8.2e-3, measured at M=16384 TP4.
+    SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
+    # Send the fused wo_b's all-gather leg as fp8 e4m3 with a per-row scale,
+    # halving its bytes. Off by default: it costs accuracy, and that is e4m3's
+    # mantissa width rather than a granularity that can be tuned away.
+    SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER = EnvBool(False)
+    # Which transport carries the fused wo_b's all-gather leg, "lsa" or "sdma".
+    # LSA pulls, so with an fp8 gather it widens on the way in rather than in a
+    # second kernel. Only read when the fused path is on.
+    SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT = EnvStr("lsa")
+    # Seconds the fused wo_b's self-test may spend in its device phases. They end
+    # in cross-rank barriers with no timeout of their own, so a stack whose SDMA
+    # queues exist but never complete wedges every rank there; past this the path
+    # is turned off instead. A healthy self-test is well under a second -- the
+    # compile already happened in warmup -- so this is a loose upper bound.
+    SGLANG_OPT_FUSED_WO_B_AR_SELF_TEST_TIMEOUT_S = EnvFloat(60.0)
+    # Debug: log the distribution of M the fused wo_b is offered. M is the token
+    # count of one forward, not of one request, so this is the only way to see
+    # what the scheduler actually batches.
+    SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG = EnvBool(False)
+    # Debug: run both the fused and the unfused wo_b and log their relative L2.
+    SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     # DSpark decode: build the verify window and the draft anchor column in one
@@ -2788,7 +2876,12 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_GRPC_WORKER_THREADS": _DeprecatedEnv(
+        note="The Python gRPC bridge was removed; the Rust server sizes its own "
+        "thread pools."
+    ),
+}
 
 
 def _handle_deprecated_envs():

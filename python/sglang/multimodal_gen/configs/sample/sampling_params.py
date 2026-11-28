@@ -213,6 +213,23 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
+def _floor_to_multiple(size: int, multiple: int) -> int:
+    return max(multiple, size // multiple * multiple)
+
+
+def _round_down_request_size(
+    *, width: int | None, height: int | None, multiple: int
+) -> tuple[int, int] | None:
+    """Round a request size down to ``multiple``; None leaves it unchanged.
+
+    A missing or non-positive side is never rounded up, so request validation still
+    rejects it.
+    """
+    if width is None or height is None or width <= 0 or height <= 0:
+        return None
+    return _floor_to_multiple(width, multiple), _floor_to_multiple(height, multiple)
+
+
 # Arbitrary upper bounds; upscaling_scale squares the pixel count.
 _FRAME_INTERPOLATION_SCALE_RANGE = (0.25, 4.0)
 _MAX_UPSCALING_SCALE = 8
@@ -349,6 +366,13 @@ class SamplingParams:
     # A prompt-free pipeline (e.g. a text-free SR / video-to-video DiT) sets this to
     # ``True`` so the multipart video-generation route does not require ``prompt``.
     prompt_optional: ClassVar[bool] = False
+    # False when a smaller frame count or resolution fails this type's validation,
+    # so warmup probes keep their shape instead of being halved.
+    supports_warmup_lightening: ClassVar[bool] = True
+
+    # A model whose pipeline rejects sizes off its grid names itself here (for the
+    # warning) and overrides _request_size_multiple; None means no alignment rule.
+    _request_size_model_name: ClassVar[str | None] = None
 
     height: int | None = None
     width: int | None = None
@@ -597,7 +621,36 @@ class SamplingParams:
         self, req: Any, server_args: Any
     ) -> None:
         """Resolve model-specific facts for one synthetic warmup request."""
-        del req, server_args
+        del req
+        if self._request_size_model_name is not None:
+            # Warmup overwrites the dimensions after _adjust has run.
+            self._align_request_size(server_args.pipeline_config)
+
+    def _request_size_multiple(self, pipeline_config: Any) -> int | None:
+        """The grid request sizes round down to, or None to leave them as is."""
+        del pipeline_config
+        return None
+
+    def _align_request_size(self, pipeline_config: Any) -> None:
+        multiple = self._request_size_multiple(pipeline_config)
+        if multiple is None:
+            return
+        requested_size = (self.width, self.height)
+        aligned_size = _round_down_request_size(
+            width=self.width, height=self.height, multiple=multiple
+        )
+        if aligned_size is None:
+            return
+        self.width, self.height = aligned_size
+        if aligned_size != requested_size:
+            logger.warning(
+                "%s requires dimensions divisible by %s; adjusted requested "
+                "resolution from %sx%s to %sx%s",
+                self._request_size_model_name,
+                multiple,
+                *requested_size,
+                *aligned_size,
+            )
 
     def request_task(self) -> str | None:
         """Task name that ``--request-time-limit TASK=SECONDS`` matches, or None
@@ -1019,6 +1072,9 @@ class SamplingParams:
 
         if not server_args.comfyui_mode:
             self._set_output_file_name()
+
+        # After the output name, which hashes the requested size.
+        self._align_request_size(pipeline_config)
 
     @classmethod
     def from_pretrained(cls, model_path: str, **kwargs) -> "SamplingParams":

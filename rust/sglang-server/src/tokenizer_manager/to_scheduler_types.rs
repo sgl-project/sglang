@@ -23,11 +23,14 @@ pub struct Limits {
     /// `model_config.vocab_size`; bounds client-supplied token ids. A required
     /// field of the `ServerArgs` schema, so intake can check unconditionally.
     pub vocab_size: u64,
-    /// `model_config.context_len`, the ceiling for input + `max_new_tokens`.
-    pub context_len: u64,
+    /// The scheduler's `max_req_len`: input, reserved slots and `max_new_tokens` together.
+    pub max_req_len: u64,
+    /// The scheduler's `max_req_input_len`, inclusive; reserved slots are already out of it.
+    pub max_req_input_len: u64,
     /// Output slots reserved on top of the input (eagle draft tokens).
     pub num_reserved_tokens: u64,
-    /// Clamp `max_new_tokens` to what fits instead of rejecting the request.
+    /// Truncate a text input and clamp `max_new_tokens` to what fits instead
+    /// of rejecting the request.
     pub allow_auto_truncate: bool,
     /// The most a request's `return_hidden_states` may ask for.
     pub return_hidden_states_mode: HiddenStatesMode,
@@ -38,7 +41,8 @@ impl From<&ServerArgs> for Limits {
         Self {
             skip_tokenizer_init: sa.skip_tokenizer_init,
             vocab_size: sa.model_config.vocab_size,
-            context_len: sa.model_config.context_len,
+            max_req_len: sa.max_req_len,
+            max_req_input_len: sa.max_req_input_len,
             num_reserved_tokens: sa.num_reserved_tokens,
             allow_auto_truncate: sa.allow_auto_truncate,
             return_hidden_states_mode: sa.hidden_states_mode(),

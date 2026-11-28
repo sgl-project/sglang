@@ -17,7 +17,10 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     conditioning_cache_group,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
+    get_world_rank,
+)
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
     IPC_A2A_MULTI,
 )
@@ -31,6 +34,10 @@ from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_out_of_memory_error,
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.profiler import (
@@ -43,6 +50,33 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
+
+
+def _forward_error_ends_the_replica(error: Exception) -> bool:
+    """Errors the worker turns into an exit instead of a request error.
+
+    An error output would let this rank take the next request while the other
+    ranks are still inside the failed forward's collectives, or keep serving
+    from a device that can no longer be trusted.
+    """
+    if is_out_of_memory_error(error):
+        return get_replica_group().world_size > 1
+    # Only RuntimeError messages are matched: a request error may quote the
+    # caller's text (e.g. a Cosmos3 domain name) that contains a marker.
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        message = str(error)
+        if "out of memory" not in message.lower() and (
+            isinstance(error, torch.AcceleratorError)
+            or (
+                isinstance(error, RuntimeError)
+                and is_unrecoverable_device_error(message)
+            )
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
 
 
 class PipelineExecutor(ABC):
@@ -162,6 +196,38 @@ class PipelineExecutor(ABC):
         profiler = SGLDiffusionProfiler.get_instance()
         if profiler:
             profiler.step_stage()
+
+    @staticmethod
+    def retain_stage_output(current, result):
+        if not isinstance(result, OutputBatch):
+            return result
+        if result.error:
+            raise RuntimeError(result.error)
+        current.extra["_deployment_result"] = result
+        current.output = result.output
+        current.audio = result.audio
+        current.audio_sample_rate = result.audio_sample_rate
+        if result.fps is not None:
+            current.fps = result.fps
+        return current
+
+    def stage_runner(self, server_args, run_stage):
+        """keep the request context across stage outputs; monolithic runs are untouched"""
+        if getattr(server_args, "stage_deployment", None) is None:
+            return run_stage
+
+        def run(stage, current):
+            result = run_stage(stage, current)
+            if isinstance(result, list):
+                if any(isinstance(item, OutputBatch) for item in result):
+                    return [
+                        self.retain_stage_output(req, item)
+                        for req, item in zip(current, result, strict=True)
+                    ]
+                return result
+            return self.retain_stage_output(current, result)
+
+        return run
 
     def execute_with_profiling(
         self,
@@ -307,6 +373,8 @@ class PipelineExecutor(ABC):
                         error=str(e), cancelled=True, metrics=batch.metrics
                     )
                 except Exception as e:
+                    if _forward_error_ends_the_replica(e):
+                        raise
                     logger.error(
                         "Sequential DiT/VAE inference failed for request %s: %s",
                         batch.request_id,

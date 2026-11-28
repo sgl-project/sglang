@@ -52,6 +52,7 @@ MEMORY_POOL_HOST_MODULE = "sglang.srt.mem_cache.memory_pool_host"
 DSA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.dsa"
 MHA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mha"
 MLA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mla"
+MAMBA_POOL_HOST_MODULE = "sglang.srt.mem_cache.pool_host.mamba"
 
 
 def _indices(start: int, end: int) -> torch.Tensor:
@@ -705,7 +706,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             )
 
     def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
-        """FIA views and packed drafts must restore without querying their owners."""
+        """FIA views and packed drafts restore through their current backing."""
         from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 
         with mock.patch.dict("os.environ", {"ASCEND_USE_FIA": "True"}):
@@ -724,10 +725,9 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 for layers in (2, 1)
             )
         infos = tuple(pool.get_device_pool_infos()[0].buffer_info for pool in pools)
-        for pool in pools:
-            pool.get_hicache_transfer_buffers = mock.Mock(
-                side_effect=AssertionError("runtime owner query")
-            )
+        npu_patch = mock.patch(f"{MHA_POOL_HOST_MODULE}._is_npu", True)
+        npu_patch.start()
+        self.addCleanup(npu_patch.stop)
         host = MHATokenToKVPoolHost(
             infos[0],
             2,
@@ -741,6 +741,16 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             draft_buffer_infos=infos[1:],
         )
         self.addCleanup(host.destroy)
+        self.assertEqual(
+            host.k_buffer.shape,
+            (
+                host.page_num,
+                host.layer_num,
+                host.page_size,
+                host.head_num,
+                host.head_dim,
+            ),
+        )
         expected = []
         for i, info in enumerate(infos):
             for tensor in info.transfer_buffers():
@@ -754,19 +764,22 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 if direction == "D2H":
                     host_buffer[0].copy_(device_buffer[:, 1])
                 else:
-                    device_buffer[:, 1].copy_(host_buffer[0])
+                    layer = kwargs["device_layer_id"]
+                    device_buffer[layer, 1].copy_(
+                        host_buffer[0, kwargs["host_layer_id"]]
+                    )
 
         with (
             mock.patch(
-                f"{MHA_POOL_HOST_MODULE}.TransferDirection",
-                SimpleNamespace(H2D="H2D", D2H="D2H"),
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_all_layer_kv_split_lf_pf",
+                side_effect=lambda **kw: transfer(direction="D2H", **kw),
                 create=True,
-            ),
+            ) as backup,
             mock.patch(
-                f"{MHA_POOL_HOST_MODULE}.transfer_kv_dim_exchange",
-                side_effect=transfer,
+                f"{MHA_POOL_HOST_MODULE}.transfer_kv_per_layer_kv_split_pf_lf",
+                side_effect=lambda **kw: transfer(direction="H2D", **kw),
                 create=True,
-            ),
+            ) as load,
         ):
             host.backup_from_device_all_layer(
                 object(), _indices(0, 16), _indices(16, 32), "kernel_ascend"
@@ -774,12 +787,28 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             for info in infos:
                 for buffer in info.transfer_buffers():
                     buffer.zero_()
-            host.load_to_device_per_layer(
-                object(), _indices(0, 16), _indices(16, 32), 0, "kernel_ascend"
-            )
+            for layer_id in range(3):
+                host.load_to_device_per_layer(
+                    object(),
+                    _indices(0, 16),
+                    _indices(16, 32),
+                    layer_id,
+                    "kernel_ascend",
+                    is_draft=layer_id >= host.target_layer_num,
+                )
+        self.assertEqual(backup.call_count, 2)
+        self.assertEqual(load.call_count, 3)
         actual = [tensor[:, 1] for info in infos for tensor in info.transfer_buffers()]
         for before, after in zip(expected, actual, strict=True):
             self.assertTrue(torch.equal(before, after))
+
+    def test_npu_mha_rejects_layer_first(self):
+        host = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host.layout = "layer_first"
+        with self.assertRaisesRegex(ValueError, "Unsupported layout: layer_first"):
+            host.backup_from_device_all_layer(
+                object(), _indices(0, 1), _indices(0, 1), "kernel_ascend"
+            )
 
     def test_mla_backup_then_load_roundtrip_uses_staged(self):
         layer_num = 2
@@ -994,22 +1023,52 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.temporal_device_ptrs = torch.empty(0, dtype=torch.uint64)
         host.conv_device_ptrs = [torch.empty(0, dtype=torch.uint64)]
 
-        host.backup_from_device_all_layer(
-            device_pool,
-            host_indices,
-            device_indices,
-            io_backend="kernel_ascend",
-        )
-        device_pool.mamba_cache.temporal.zero_()
-        device_pool.mamba_cache.conv[0].zero_()
-        for layer_id in range(num_layers):
-            host.load_to_device_per_layer(
+        def copy_to_host(
+            *, device_states, host_states, device_indices, host_indices, impl
+        ):
+            self.assertEqual(impl, "auto")
+            for device, host_buffer in zip(device_states, host_states):
+                values = device.index_select(1, device_indices).transpose(0, 1)
+                host_buffer.index_copy_(0, host_indices, values.unsqueeze(2))
+
+        def copy_to_device(*, src, dst, src_indices, dst_indices, layer_id, impl):
+            self.assertEqual(impl, "auto")
+            values = src.index_select(0, src_indices)[:, layer_id, 0]
+            dst.index_copy_(0, dst_indices, values)
+
+        # CPU CI has no NPU imports. Emulate the two transfer operations while
+        # retaining the roundtrip data checks below.
+        with (
+            mock.patch(
+                f"{MAMBA_POOL_HOST_MODULE}.transfer_kv_all_layer_direct_lf_pf",
+                side_effect=copy_to_host,
+                create=True,
+            ) as d2h_op,
+            mock.patch(
+                f"{MAMBA_POOL_HOST_MODULE}.transfer_kv_per_layer_direct_pf_lf",
+                side_effect=copy_to_device,
+                create=True,
+            ) as h2d_op,
+        ):
+            host.backup_from_device_all_layer(
                 device_pool,
                 host_indices,
                 device_indices,
-                layer_id,
                 io_backend="kernel_ascend",
             )
+            device_pool.mamba_cache.temporal.zero_()
+            device_pool.mamba_cache.conv[0].zero_()
+            for layer_id in range(num_layers):
+                host.load_to_device_per_layer(
+                    device_pool,
+                    host_indices,
+                    device_indices,
+                    layer_id,
+                    io_backend="kernel_ascend",
+                )
+
+        self.assertEqual(d2h_op.call_count, 2)
+        self.assertEqual(h2d_op.call_count, 2 * num_layers)
 
         self.assertTrue(
             torch.equal(

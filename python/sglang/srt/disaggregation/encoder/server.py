@@ -62,7 +62,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
     resolve_encoder_media_processor_config,
 )
-from sglang.srt.multimodal.media_io import configure_media_url_security
+from sglang.srt.multimodal.media_io import configure_worker_media_policy
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import (
@@ -549,12 +549,7 @@ class MMEncoder:
         argument."""
         assert_published(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
-        configure_media_url_security(
-            get_mm().allowed_media_domains,
-            get_mm().media_url_max_file_size_mb,
-            get_mm().media_url_timeout,
-            get_mm().allow_local_media_files,
-        )
+        configure_worker_media_policy(get_mm())
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
         self.rank = rank

@@ -578,7 +578,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,
             max_bs=max_bs,
-            max_context_len=self.max_kv_len,
+            max_kv_len=self.max_kv_len,
             num_draft_tokens=self.num_draft_tokens,
             device=self.device,
             is_read=False,
