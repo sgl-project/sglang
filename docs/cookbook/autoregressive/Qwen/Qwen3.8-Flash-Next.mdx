@@ -298,6 +298,51 @@ sglang serve \
   --port 30000
 ```
 
+### H200 deployment with FP8 KV and HiCache (concurrency 16–24)
+
+The official `Qwen/Qwen3.8-Flash-Next-FP8` checkpoint with NEXTN MTP on two H200 (TP2, EP2), for long agentic sessions at 16 to 24 concurrent agents. Below concurrency 16 use the GPU-KV commands in the panel above. At 16 agents and more, the BF16 KV pool fills (99% in our runs at concurrency 16) and the server evicts and recomputes long prefixes. These commands add an FP8 KV cache and HiCache host-memory offload to the InferenceX H200 recipe ([InferenceX #2753](https://github.com/SemiAnalysisAI/InferenceX/pull/2753), [#4888](https://github.com/SemiAnalysisAI/InferenceX/pull/4888)). Nothing else changes. [InferenceX #5194](https://github.com/SemiAnalysisAI/InferenceX/pull/5194), open and not yet run by InferenceX, proposes them there.
+
+- **AgentX panel.** This recipe is the HiCache option (concurrency 16, 20, 24) of the H200 TP2·EP2 cell, config `qwen3.8next-fp8-h200-sglang-agentic-mtp`, in the AgentX panel above. It shows as in progress until InferenceX runs [#5194](https://github.com/SemiAnalysisAI/InferenceX/pull/5194). This section explains its flags and the measured effect.
+- **Container image.** `lmsysorg/sglang:v0.5.23-cu130` (`sha256:f832b5c39559c9caa900b22ad37c76fcce66470676855c42052102c537812f1f`, the image InferenceX uses for this cell), run without patches.
+- **FP8 KV.** `--kv-cache-dtype fp8_e4m3` stores the KV cache in FP8 E4M3. On two H200 the KV pool grows from about 2.1 million to about 4.0 million tokens (1.9x). The MTP draft KV follows the target dtype; no draft-specific dtype is set.
+- **HiCache.** `--enable-hierarchical-cache` with `--hicache-io-backend kernel`, `--hicache-mem-layout page_first` and `--hicache-write-policy write_back` keeps evicted KV in host memory instead of dropping it. `--hicache-size` is in gigabytes per rank: 50 GB per rank (100 GB for the two ranks).
+- **Batch limits.** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency: 32, 40 and 48 at concurrency 16, 20 and 24. The command below is for concurrency 24.
+- **Effect.** In three 1-hour runs on our own machines (two separate nodes, each 2x H200; not InferenceX CI) with the InferenceX AgentX client and traces, concurrency 16 gave 37,995 total tok/s/GPU against 34,178 for the same recipe without these flags (+11.2%; published InferenceX run 447792: 34,070). Most of these tokens are cached input; output rose from 306 to 335 tok/s/GPU (+9.3%), with P90 TTFT 0.93 s against 2.53 s and GSM8K (first 100 questions) 0.99 against 0.98–0.99. Concurrency 24 gave 54,476 total tok/s/GPU (443 output) at the P90 interactivity of the stock recipe at concurrency 16. At concurrency 8 the flags give no gain and at 14 about 5%. Timing used a fixed MTP acceptance length (`SGLANG_SIMULATE_ACC_LEN=2.32`), as InferenceX does, so the numbers do not include any change in real acceptance. With real acceptance on GSM8K, FP8 KV accepted about 4% fewer tokens per step (3.13 against 3.27), so the real gain may be smaller ([paper](https://doi.org/10.5281/zenodo.24457433)).
+- **Thinking.** The command follows the InferenceX recipe, which uses `--reasoning-parser auto` and leaves the model's thinking-on default. Add `--default-chat-template-kwargs '{"enable_thinking": false}'` for non-thinking replies.
+
+```bash Concurrency 24 (16 and 20: set both batch limits to 32 or 40)
+sglang serve \
+  --model-path Qwen/Qwen3.8-Flash-Next-FP8 \
+  --trust-remote-code \
+  --tensor-parallel-size 2 \
+  --expert-parallel-size 2 \
+  --data-parallel-size 1 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 8192 \
+  --linear-attn-prefill-backend flashinfer \
+  --linear-attn-decode-backend flashinfer \
+  --mamba-ssm-dtype float32 \
+  --speculative-algorithm NEXTN \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-linear-replayssm-spec \
+  --max-running-requests 48 \
+  --cuda-graph-max-bs-decode 48 \
+  --kv-cache-dtype fp8_e4m3 \
+  --enable-hierarchical-cache \
+  --hicache-size 50 \
+  --hicache-io-backend kernel \
+  --hicache-mem-layout page_first \
+  --hicache-write-policy write_back \
+  --reasoning-parser auto \
+  --stream-interval 50 \
+  --scheduler-recv-interval 10 \
+  --tokenizer-worker-num 6 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
 ### ReplaySSM verify pipeline tuning
 
 The measured Rubin TP1 recipe uses BF16 SSM checkpoints, NEXTN with three steps
