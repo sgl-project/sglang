@@ -743,6 +743,10 @@ class Envs:
     # SWA pool) instead of its full-attention slots. Needs draft window <= the
     # target's sliding window; ignored (with the reason logged) where it does not apply.
     SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(True)
+    # Under PD disaggregation keep that pool on the sliding-window slots and send
+    # it with the target's window state instead of as KV pages. Set it on both
+    # servers; mori transfer backend only.
+    SGLANG_ROCM_DFLASH_PD_WINDOW_DRAFT_KV = EnvBool(False)
 
     # ===================================================================
     # Scheduler token budgeting and admission

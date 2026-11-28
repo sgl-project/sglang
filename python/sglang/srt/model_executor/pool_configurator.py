@@ -205,12 +205,35 @@ def dflash_draft_kv_follows_target_swa(kvc: KVCacheConfigurator) -> bool:
         reasons.append("--enable-unified-memory is set")
     if get_parallel().attn_dcp_size > 1:
         reasons.append("DCP widens the draft id space")
+    if get_disagg().disaggregation_mode != "null":
+        if not envs.SGLANG_ROCM_DFLASH_PD_WINDOW_DRAFT_KV.get():
+            reasons.append("PD transfer addresses the draft KV by full-attention page")
+        elif get_disagg().disaggregation_transfer_backend != "mori":
+            raise NotImplementedError(
+                "SGLANG_ROCM_DFLASH_PD_WINDOW_DRAFT_KV needs "
+                "--disaggregation-transfer-backend mori"
+            )
     if reasons:
         logger.warning(
             "SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV ignored: %s", "; ".join(reasons)
         )
         return False
     return True
+
+
+def dflash_pd_window_draft_reach() -> Optional[int]:
+    """The window tail a PD server keeps and sends for a DFLASH draft that goes with
+    the target's window state: the draft's window, one token past the target's. Read
+    from the launch flags, so every PD peer and pipeline stage keeps the same tail."""
+    if (
+        not _is_hip
+        or not envs.SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV.get()
+        or not envs.SGLANG_ROCM_DFLASH_PD_WINDOW_DRAFT_KV.get()
+        or get_disagg().disaggregation_mode == "null"
+    ):
+        return None
+    draft_window = get_spec().speculative_draft_window_size
+    return None if draft_window is None else int(draft_window)
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -1169,6 +1192,9 @@ def compute_swa_request_cap(
     max_running_requests: int | None = None,
 ) -> int:
     """Worst-case SWA slots the scheduler holds live at max_running_requests."""
+    draft_reach = dflash_pd_window_draft_reach()
+    if draft_reach is not None:
+        window = max(window, draft_reach)
     draft_tokens = get_spec().speculative_num_draft_tokens or 1
     eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
