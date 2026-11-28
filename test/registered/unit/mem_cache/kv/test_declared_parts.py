@@ -3809,6 +3809,11 @@ class TestDeclaredParts(CustomTestCase):
                 StateSlotStrategy(
                     extra_buffer=True, overlap=True, lazy=True, skip_decode_lock=True
                 ),
+                3,
+                1,
+            ),
+            (
+                StateSlotStrategy(extra_buffer=True, overlap=True, lazy=True),
                 4,
                 1,
             ),
