@@ -372,6 +372,7 @@ class RocmPlatform(Platform):
         stride: tuple[int, ...],
         kt: int,
         compute_bf16: bool = False,
+        weight_3d: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Replace F.conv3d with temporal-unfolded batched Conv2D.
 
@@ -389,6 +390,16 @@ class RocmPlatform(Platform):
         the output is cast back to the original dtype.
         """
         orig_dtype = x_padded.dtype
+        if weight_3d is not None:
+            # The unfold materializes Kt copies of the input (in its original
+            # dtype, before the BF16 cast); MIOpen's direct BF16 conv3d reads
+            # the input once and is faster at every Wan VAE decoder shape.
+            # module.to() moves the buffer back to the VAE dtype
+            w = weight_3d.to(torch.bfloat16) if compute_bf16 else weight_3d
+            x_in = x_padded.to(w.dtype)
+            b = bias.to(w.dtype) if bias is not None else None
+            out = F.conv3d(x_in, w, b, stride=stride)
+            return out if out.dtype == orig_dtype else out.to(orig_dtype)
         N, C_in, T, H, W = x_padded.shape
         C_out = weight_2d.shape[0]
         stride_t, stride_h, stride_w = stride
@@ -507,6 +518,13 @@ class RocmPlatform(Platform):
                 # NCHW and back and runs 1.4-2.9x slower on these shapes.
                 os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
             child.register_buffer("_weight_2d", weight_2d)
+            # SGLANG_ROCM_VAE_NATIVE_CONV3D=1 is set on the serve command line on MI355X when
+            # the native BF16 Conv3d decode is wanted. It keeps the original Conv3d weight, so
+            # the VAE runs one F.conv3d instead of the temporal unfold. It is off by default
+            # because it was only validated on Wan2.2 T2V 832x480 decode.
+            if os.environ.get("SGLANG_ROCM_VAE_NATIVE_CONV3D") == "1":
+                weight_3d = child.weight.data.contiguous()
+                child.register_buffer("_weight_3d", weight_3d)
 
             def _patched_forward(
                 self,
@@ -536,6 +554,7 @@ class RocmPlatform(Platform):
                     _stride,
                     _kt,
                     compute_bf16=_bf16,
+                    weight_3d=getattr(self, "_weight_3d", None),
                 )
                 return out if residual is None else out + residual
 
@@ -560,6 +579,7 @@ class RocmPlatform(Platform):
                     _stride,
                     _kt,
                     compute_bf16=_bf16,
+                    weight_3d=getattr(self, "_weight_3d", None),
                 )
 
             if is_spatial_parallel:
