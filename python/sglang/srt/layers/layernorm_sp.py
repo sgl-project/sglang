@@ -35,15 +35,24 @@ nothing in this module executes.
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import torch
 import torch.distributed as dist
 
-from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
-from sglang.srt.utils import is_npu
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_resources,
+)
+from sglang.srt.utils import is_cuda, is_npu
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import get_device
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 
 # Architectures whose decoder layers route attention/MLP through
 # layer boundaries with the standard participant linears, and for which SP
@@ -65,6 +74,12 @@ SP_SUPPORTED_ARCHITECTURES = (
         }
     )
 )
+# Enabled where validated, not by --enable-layernorm-sp: extends of at least
+# MINIMAX_M3_SP_MIN_TOKENS only, with the TP-sharded MoE run on the gathered sequence.
+MINIMAX_M3_SP_ARCHITECTURES = frozenset(
+    {"MiniMaxM3SparseForCausalLM", "MiniMaxM3SparseForConditionalGeneration"}
+)
+MINIMAX_M3_SP_MIN_TOKENS = 4096
 
 
 def is_muse_spark_architecture(architecture: Optional[str]) -> bool:
@@ -76,11 +91,64 @@ def initialize_layernorm_sp(*, model_config) -> None:
     setup, alongside ``initialize_dp_attention``."""
     architectures = model_config.hf_config.architectures
     architecture = architectures[0] if architectures else None
+    m3_min_tokens = _minimax_m3_sp_min_tokens(architecture)
     enabled = bool(
-        get_parallel().enable_layernorm_sp
-        and architecture in SP_SUPPORTED_ARCHITECTURES
+        (
+            get_parallel().enable_layernorm_sp
+            and architecture in SP_SUPPORTED_ARCHITECTURES
+        )
+        or m3_min_tokens > 0
     )
     get_flags().sp.enabled = enabled
+    get_flags().sp.min_tokens = m3_min_tokens
+    if m3_min_tokens > 0:
+        _init_push_comm(hidden=model_config.hidden_size)
+
+
+def _minimax_m3_sp_min_tokens(architecture: Optional[str]) -> int:
+    """The SP threshold for an M3 model, or 0 for off."""
+    if architecture in MINIMAX_M3_SP_ARCHITECTURES and _minimax_m3_sp_supported():
+        return MINIMAX_M3_SP_MIN_TOKENS
+    return 0
+
+
+def _minimax_m3_sp_supported() -> bool:
+    """CUDA TP2 without attention DP/CP or PP, with TP MoE or MegaMoE over the TP
+    ranks: the setup where SP reproduces the replicated path bitwise."""
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    parallel = get_parallel()
+    # The published config, not get_moe_a2a_backend(): the MoE flags are
+    # seeded after this runs and would read as the "none" default here.
+    a2a_backend = get_exec().moe.moe_a2a_backend
+    a2a_supported = a2a_backend == "none" or (
+        a2a_backend == "megamoe"
+        and sorted(parallel.moe_ep_group.ranks) == sorted(parallel.tp_group.ranks)
+    )
+    # A breakable graph captures the whole forward, logits included, so each
+    # bucket decides SP once from its padded size; other captured backends do not.
+    # MegaMoE reads unsharded forward_batch.num_token_non_padded on padded buckets,
+    # so only allow breakable prefill graphs when a2a_backend != "megamoe".
+    prefill_backend = get_exec().graph.cuda_graph_config.prefill.backend
+    graph_ok = (
+        prefill_backend == Backend.DISABLED
+        or (prefill_backend == Backend.BREAKABLE and a2a_backend != "megamoe")
+        or _max_prefill_bucket() < MINIMAX_M3_SP_MIN_TOKENS
+    )
+    return (
+        is_cuda()
+        and parallel.tp_size == 2
+        and parallel.attn_tp_size == parallel.tp_size
+        and parallel.attn_cp_size == 1
+        and parallel.pp_size == 1
+        and parallel.moe_dense_tp_size != 1
+        and a2a_supported
+        and graph_ok
+    )
+
+
+def _max_prefill_bucket() -> int:
+    return max(get_exec().graph.cuda_graph_config.prefill.bs or [0])
 
 
 def layernorm_sp_enabled() -> bool:
@@ -89,7 +157,8 @@ def layernorm_sp_enabled() -> bool:
 
 def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
     """Whether this forward runs SP: an enabled model, prefill only, and more
-    than --layernorm-sp-min-tokens tokens (0, the default, admits every pass).
+    than --layernorm-sp-min-tokens tokens (0, the default, admits every pass),
+    or at least ``flags.sp.min_tokens`` when the model sets its own threshold.
 
     ``num_tokens`` is the pass's token count, before the entry scatter. Every
     in-tree caller passes it, so the entry scatter, the layer-boundary entry and
@@ -114,6 +183,9 @@ def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
             "without it the caller skips --layernorm-sp-min-tokens and, on a pass "
             "at or under the threshold, disagrees with the entry and exit gathers."
         )
+    model_min_tokens = get_flags().sp.min_tokens
+    if model_min_tokens > 0:
+        return num_tokens >= model_min_tokens
     return num_tokens > get_parallel().layernorm_sp_min_tokens
 
 
@@ -235,6 +307,9 @@ def sp_entry_scatter(hidden_states: torch.Tensor) -> torch.Tensor:
     """
     num_tokens = hidden_states.shape[0]
     set_sp_num_tokens(num_tokens)
+    push_comm = get_resources().layernorm_sp_push_comm
+    if push_comm is not None:
+        push_comm.reset()
     group = get_parallel().tp_group
     if group.world_size == 1:
         return hidden_states
@@ -267,9 +342,9 @@ def maybe_exit_gather(
     and the predicate from ``runs_sp``, so this stays correct on CUDA graph
     replay, where the writes made inside the captured region do not re-execute.
     """
-    if input_ids is None or not runs_sp(forward_mode, input_ids.shape[0]):
+    num_tokens = _sp_exit_tokens(input_ids, forward_mode)
+    if num_tokens is None:
         return hidden_states, hidden_states_before_norm
-    num_tokens = input_ids.shape[0]
     hidden_states = sp_exit_gather(hidden_states, num_tokens=num_tokens)
     if hidden_states_before_norm is not None:
         hidden_states_before_norm = sp_exit_gather(
@@ -277,6 +352,250 @@ def maybe_exit_gather(
         )
     get_forward().set("sp_active", False)
     return hidden_states, hidden_states_before_norm
+
+
+def maybe_gather_aux_hidden_states(aux_hidden_states, *, input_ids, forward_mode):
+    """Gather the sequence-sharded aux captures back to the replicated token
+    order the draft consumes, packed into one tensor; no-op outside SP."""
+    from sglang.srt.layers.aux_hidden_states import pack_aux_hidden_states
+
+    num_tokens = _sp_exit_tokens(input_ids, forward_mode)
+    if aux_hidden_states is None or num_tokens is None:
+        return aux_hidden_states
+    return sp_exit_gather(
+        pack_aux_hidden_states(aux_hidden_states), num_tokens=num_tokens
+    )
+
+
+def _sp_exit_tokens(input_ids, forward_mode) -> Optional[int]:
+    """The token count to gather back to when this forward ran SP, else None."""
+    if input_ids is None or not runs_sp(forward_mode, input_ids.shape[0]):
+        return None
+    return input_ids.shape[0]
+
+
+def _peer_store(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Elementwise store into peer-mapped memory; ``copy_`` there takes the slower
+    driver peer memcpy."""
+    assert src.element_size() in (1, 2), (
+        f"unsupported element size {src.element_size()}"
+    )
+    dtype = torch.int16 if src.element_size() == 2 else torch.uint8
+    torch.bitwise_or(src.view(dtype), 0, out=dst.view(dtype))
+
+
+# Cap symmetric-memory preallocation (~2.4 GB at hidden=6144); larger prefills fall back to NCCL.
+_PUSH_COMM_MAX_TOKENS = 32768
+
+
+class _PushComm:
+    """TP2 reduce-scatter / all-gather of ``[tokens, hidden]`` rows through
+    symmetric memory: each rank stores the peer's rows straight into the peer's
+    buffer, then one GPU barrier. Two generations per op kind; every op's
+    barrier orders a generation's reuse two ops later after its last read.
+    """
+
+    def __init__(
+        self,
+        *,
+        group,
+        max_tokens: int,
+        hidden: int,
+        dtype,
+        device,
+        gather_mxfp8: bool = False,
+    ):
+        import torch.distributed._symmetric_memory as symm_mem
+
+        self.rank = group.rank_in_group
+        self.peer = 1 - self.rank
+        name = group.device_group.group_name
+
+        def pair(shape, dtype=dtype):
+            local = symm_mem.empty(shape, dtype=dtype, device=device)
+            handle = symm_mem.rendezvous(local, name)
+            return local, handle.get_buffer(self.peer, shape, dtype), handle
+
+        self.max_tokens = max_tokens
+        self.recv = [pair((max_tokens // 2, hidden)) for _ in range(2)]
+        self.gather = [pair((max_tokens, hidden)) for _ in range(2)]
+        self.partials = [pair((max_tokens, hidden)) for _ in range(2)]
+        # MXFP8 gathers: [tokens, hidden] e4m3 bytes, and the 128x4-swizzled
+        # UE8M0 scales, hidden / 32 bytes per row.
+        self.gather_mxfp8 = None
+        if gather_mxfp8:
+            self.gather_mxfp8 = [
+                (
+                    pair((max_tokens, hidden), torch.uint8),
+                    pair((max_tokens * (hidden // 32),), torch.uint8),
+                )
+                for _ in range(2)
+            ]
+        self.reset()
+
+    def reset(self) -> None:
+        self.recv_gen = 0
+        self.gather_gen = 0
+        self.partial_gen = 0
+
+    def partial_sink(self, rows: int) -> torch.Tensor:
+        """Where the next stage compute may write its partial, letting the
+        reduce-scatter read the peer's rows in place (``pull``)."""
+        return self.partials[self.partial_gen][0][:rows]
+
+    def pull_reduce_scatter(self, rows: int) -> torch.Tensor:
+        local, peer, handle = self.partials[self.partial_gen]
+        self.partial_gen ^= 1
+        own = slice(self.rank * rows // 2, (self.rank + 1) * rows // 2)
+        handle.barrier(channel=0)
+        return torch.add(local[own], peer[own])
+
+    def reduce_scatter(self, partial: torch.Tensor) -> torch.Tensor:
+        rows = partial.shape[0] // 2
+        local, peer, handle = self.recv[self.recv_gen]
+        self.recv_gen ^= 1
+        _peer_store(peer[:rows], partial[self.peer * rows : (self.peer + 1) * rows])
+        handle.barrier(channel=0)
+        return torch.add(
+            partial[self.rank * rows : (self.rank + 1) * rows], local[:rows]
+        )
+
+    def all_gather(self, shard: torch.Tensor) -> torch.Tensor:
+        rows = shard.shape[0]
+        local, peer, handle = self.gather[self.gather_gen]
+        self.gather_gen ^= 1
+        own = slice(self.rank * rows, (self.rank + 1) * rows)
+        local[own].copy_(shard)
+        _peer_store(peer[own], shard)
+        handle.barrier(channel=0)
+        return local[: 2 * rows]
+
+    def all_gather_mxfp8(
+        self, data: torch.Tensor, scales: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-gather a shard's swizzled MXFP8 rows; the shard must hold a
+        multiple of 128 rows, the unit the scale layout concatenates on."""
+        rows, sf_bytes = data.shape[0], scales.shape[0]
+        (q_local, q_peer, handle), (s_local, s_peer, _) = self.gather_mxfp8[
+            self.gather_gen
+        ]
+        self.gather_gen ^= 1
+        own = slice(self.rank * rows, (self.rank + 1) * rows)
+        own_sf = slice(self.rank * sf_bytes, (self.rank + 1) * sf_bytes)
+        data = data.view(torch.uint8)
+        q_local[own].copy_(data)
+        _peer_store(q_peer[own], data)
+        s_local[own_sf].copy_(scales)
+        _peer_store(s_peer[own_sf], scales)
+        handle.barrier(channel=0)
+        return (
+            q_local[: 2 * rows].view(torch.float8_e4m3fn),
+            s_local[: 2 * sf_bytes],
+        )
+
+
+def take_partial_sink(like: torch.Tensor) -> Optional[torch.Tensor]:
+    """The symmetric buffer an SP stage compute should write its final partial
+    into (``torch.add(..., out=sink)``), or None to allocate as usual."""
+    forward = get_forward()
+    sink = forward.sp_partial_sink
+    forward.set("sp_partial_sink", None)
+    if sink is None or sink.shape != like.shape or sink.dtype != like.dtype:
+        return None
+    return sink
+
+
+def _init_push_comm(*, hidden: int) -> None:
+    """Allocate the TP2 symmetric-memory comm at startup, before the KV pool is
+    sized, at the largest prefill the server admits; skipped when that is below
+    the SP threshold or the TP2 pair is not in one NVLink domain (NCCL then)."""
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+        in_one_nvlink_domain,
+    )
+    from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+        recommended_max_tokens,
+    )
+
+    tp_group = get_parallel().tp_group
+    max_tokens = min(
+        ceil_align(
+            recommended_max_tokens(include_prefill=True, floor=_max_prefill_bucket()), 2
+        ),
+        _PUSH_COMM_MAX_TOKENS,
+    )
+    if max_tokens < MINIMAX_M3_SP_MIN_TOKENS:
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not in_one_nvlink_domain(tp_group.cpu_group, device):
+        return
+    get_resources().layernorm_sp_push_comm = _PushComm(
+        group=tp_group,
+        max_tokens=max_tokens,
+        hidden=hidden,
+        dtype=torch.bfloat16,
+        device=device,
+        gather_mxfp8=hidden % 128 == 0,
+    )
+
+
+def sp_gathers_mxfp8(shard_rows: int) -> bool:
+    """Whether an SP stage may read its ``shard_rows``-row input as swizzled
+    MXFP8 and have ``sp_gathered_compute`` gather it in that form."""
+    comm = get_resources().layernorm_sp_push_comm
+    num_tokens = sp_num_tokens()
+    return (
+        comm is not None
+        and comm.gather_mxfp8 is not None
+        and num_tokens <= comm.max_tokens
+        and shard_rows * 2 == num_tokens
+        and shard_rows % 128 == 0
+    )
+
+
+def sp_gathered_compute(
+    compute, hidden_states: Union[torch.Tensor, Mxfp8SwizzledInput]
+) -> torch.Tensor:
+    """Run a TP-partial stage compute on the whole sequence: all-gather this
+    rank's shard, run ``compute`` outside the SP region (participant linears
+    take their replicated path), then reduce-scatter its partial output.
+
+    At TP2 the two-way sum rounds alike in either order, so the result is
+    bitwise the replicated path's all-reduce, sliced to this rank's rows.
+    """
+    from sglang.srt.layers.layer_boundary.ops import tp_reduce_scatter
+    from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+
+    num_tokens = sp_num_tokens()
+    padded = ceil_align(num_tokens, get_parallel().tp_size)
+    comm = get_resources().layernorm_sp_push_comm
+    if isinstance(hidden_states, Mxfp8SwizzledInput):
+        # Read that way only when sp_gathers_mxfp8 held for this shard.
+        full = Mxfp8SwizzledInput(
+            *comm.all_gather_mxfp8(hidden_states.data, hidden_states.scales)
+        )
+    elif (
+        comm is None
+        or padded > comm.max_tokens
+        or hidden_states.dtype != torch.bfloat16
+    ):
+        comm = None
+        full = sp_exit_gather(hidden_states, num_tokens=num_tokens)
+    else:
+        full = comm.all_gather(hidden_states)[:num_tokens]
+    sink = (
+        comm.partial_sink(num_tokens)
+        if comm is not None and padded == num_tokens
+        else None
+    )
+    with get_forward().scoped(sp_active=False, sp_partial_sink=sink):
+        partial = compute(full)
+    if sink is not None and partial.data_ptr() == sink.data_ptr():
+        return comm.pull_reduce_scatter(num_tokens)
+    if padded != num_tokens:
+        partial = torch.nn.functional.pad(partial, (0, 0, 0, padded - num_tokens))
+    if comm is not None:
+        return comm.reduce_scatter(partial)
+    return tp_reduce_scatter(partial, None)[0]
 
 
 # --- fused matmul + collective fast-paths for the participant linears ---------
