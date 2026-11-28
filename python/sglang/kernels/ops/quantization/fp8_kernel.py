@@ -597,6 +597,17 @@ def _run_per_token_group_quant_8bit_kernel(
         return
 
     if (
+        _is_hip
+        and not (scale_ue8m0 or fuse_silu_and_mul)
+        and masked_m is None
+        and x_s.is_contiguous()
+    ):
+        _per_token_group_quant_8bit_raw(
+            x, group_size, eps, dtype=x_q.dtype, output_q=x_q, output_s=x_s
+        )
+        return
+
+    if (
         scale_ue8m0
         and x_s.dtype == torch.float32
         and not (
