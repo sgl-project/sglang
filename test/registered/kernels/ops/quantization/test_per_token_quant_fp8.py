@@ -106,5 +106,90 @@ def test_per_token_quant_fp8_preserves_padded_tail():
     assert torch.all(scale[1:] == 2.0)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dispatch", ["cta", "warp"])
+@pytest.mark.parametrize("hidden_dim", [1536, 1544, 1540])
+def test_aot_per_token_quant_fp8_rejects_unaligned_input(dtype, dispatch, hidden_dim):
+    """A contiguous offset view must raise before a misaligned CUDA load (#53579)."""
+    num_tokens = 1 if dispatch == "cta" else _warp_dispatch_num_tokens()
+    storage = torch.rand(num_tokens * hidden_dim + 1, dtype=dtype, device="cuda")
+    input = storage[1:].view(num_tokens, hidden_dim)
+    output = torch.full(input.shape, 1.0, dtype=torch.float8_e4m3fn, device="cuda")
+    scale = torch.full((num_tokens, 1), 2.0, dtype=torch.float32, device="cuda")
+    assert input.is_contiguous()
+
+    with pytest.raises(RuntimeError, match="input must be .*byte aligned"):
+        aot_per_token_quant_fp8(input, output, scale)
+
+    # A host-side rejection must leave both the CUDA context and outputs intact.
+    torch.cuda.synchronize()
+    assert torch.all(output.float() == 1.0)
+    assert torch.all(scale == 2.0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dispatch", ["cta", "warp"])
+def test_aot_per_token_quant_fp8_rejects_unaligned_output(dtype, dispatch):
+    """An aligned input must not allow an unaligned uint4 output store."""
+    num_tokens = 1 if dispatch == "cta" else _warp_dispatch_num_tokens()
+    input = torch.rand((num_tokens, 1536), dtype=dtype, device="cuda")
+    storage = torch.full(
+        (input.numel() + 2,), 1.0, dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    output = storage[1:-1].view_as(input)
+    scale = torch.full((num_tokens, 1), 2.0, dtype=torch.float32, device="cuda")
+    assert output.is_contiguous()
+
+    with pytest.raises(RuntimeError, match="output_q must be 16-byte aligned"):
+        aot_per_token_quant_fp8(input, output, scale)
+
+    torch.cuda.synchronize()
+    assert torch.all(storage.float() == 1.0)
+    assert torch.all(scale == 2.0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dispatch", ["cta", "warp"])
+@pytest.mark.parametrize(
+    "hidden_dim,input_alignment,output_offset",
+    [(1536, 16, 16), (1544, 16, 1), (1540, 8, 1)],
+)
+def test_aot_per_token_quant_fp8_accepts_aligned_offset_views(
+    dtype, dispatch, hidden_dim, input_alignment, output_offset
+):
+    """Valid offset views retain bit-exact quantization and preserve storage guards."""
+    num_tokens = 1 if dispatch == "cta" else _warp_dispatch_num_tokens()
+    # FP32 uses float4 loads even when only four elements are processed at a time.
+    if dtype == torch.float32:
+        input_alignment = 16
+    input_offset = input_alignment // torch.empty((), dtype=dtype).element_size()
+    storage = torch.rand(
+        num_tokens * hidden_dim + input_offset, dtype=dtype, device="cuda"
+    )
+    input = storage[input_offset:].view(num_tokens, hidden_dim)
+    output_storage = torch.full(
+        (input.numel() + output_offset + 1,),
+        1.0,
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    output = output_storage[output_offset:-1].view_as(input)
+    scale_storage = torch.full(
+        (num_tokens + 2, 1), 2.0, dtype=torch.float32, device="cuda"
+    )
+    scale = scale_storage[1:-1]
+
+    expected_output, expected_scale = _run_impl(input.clone(), use_jit=False)
+    aot_per_token_quant_fp8(input, output, scale)
+    torch.cuda.synchronize()
+
+    _assert_bitwise_equal(output, expected_output)
+    _assert_bitwise_equal(scale, expected_scale)
+    assert torch.all(output_storage[:output_offset].float() == 1.0)
+    assert output_storage[-1].float().item() == 1.0
+    assert scale_storage[0].item() == 2.0
+    assert scale_storage[-1].item() == 2.0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

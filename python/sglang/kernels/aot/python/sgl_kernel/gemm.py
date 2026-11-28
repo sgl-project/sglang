@@ -73,6 +73,13 @@ def sgl_per_token_quant_fp8(
     output_q: torch.Tensor,
     output_s: torch.Tensor,
 ) -> None:
+    """Quantize rows to FP8 using aligned, contiguous CUDA buffers.
+
+    Input vector loads require 16-byte alignment, except FP16/BF16 with a
+    hidden dimension divisible by 4 but not 8, which requires 8 bytes.
+    Output quantized buffers require 16-byte alignment when the hidden
+    dimension is divisible by 16. Incompatible offset views raise RuntimeError.
+    """
     torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(input, output_q, output_s)
 
 

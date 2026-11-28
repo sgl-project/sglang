@@ -1,6 +1,8 @@
 #include <ATen/cuda/CUDAContext.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
@@ -267,6 +269,19 @@ void sgl_per_token_quant_fp8(torch::Tensor input, torch::Tensor output_q, torch:
   }
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
+    // Contiguous offset views need not satisfy FlashInfer's vector-load alignment.
+    const int vec_size = use_vec16 ? 16 : (use_vec8 ? 8 : 4);
+    const size_t input_alignment = std::min<size_t>(16, vec_size * sizeof(scalar_t));
+    TORCH_CHECK(
+        reinterpret_cast<std::uintptr_t>(input.data_ptr()) % input_alignment == 0,
+        "input must be ",
+        input_alignment,
+        "-byte aligned for vectorized FP8 quantization");
+    // The 16-element path writes FP8 outputs through uint4; smaller paths store scalars.
+    TORCH_CHECK(
+        !use_vec16 || reinterpret_cast<std::uintptr_t>(output_q.data_ptr()) % 16 == 0,
+        "output_q must be 16-byte aligned for vectorized FP8 quantization");
+
     if (use_warp_kernel) {
       // -------- warp‑local ---------------------------------------------------
       constexpr int THREADS = TOKENS_PER_CTA * kWarpSize;
