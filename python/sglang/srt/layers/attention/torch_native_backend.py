@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
@@ -135,6 +138,15 @@ class TorchNativeAttnBackend(AttentionBackend):
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
+            if (
+                self.use_sliding_window_kv_pool
+                and not is_cross_attn
+                and sliding_window_size is not None
+                and sliding_window_size > -1
+            ):
+                per_req_tokens = self.runner_ids.ids_in(
+                    IdSpaceKind.SLIDING_WINDOW, per_req_tokens
+                )
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -236,6 +248,15 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
+            if (
+                self.use_sliding_window_kv_pool
+                and not is_cross_attn
+                and sliding_window_size is not None
+                and sliding_window_size > -1
+            ):
+                per_req_tokens = self.runner_ids.ids_in(
+                    IdSpaceKind.SLIDING_WINDOW, per_req_tokens
+                )
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
