@@ -30,6 +30,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization import fp8 as fp8_module
 from sglang.srt.layers.quantization import mxfp4_flashinfer_cutlass_moe as cutlass_mxfp4
+from sglang.srt.layers.quantization import modelopt_quant as modelopt_quant_module
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
     HybridFp8NvFp4Config,
@@ -212,6 +213,7 @@ class TestMxfp4MoEMethodContract(CustomTestCase):
             get_flags().moe.override(runner_backend=backend),
             patch.object(fp8_module, "get_platform", return_value=platform),
             patch.object(cutlass_mxfp4, "get_platform", return_value=platform),
+            patch.object(modelopt_quant_module, "get_platform", return_value=platform),
         ):
             for requested in (
                 None,
@@ -275,19 +277,26 @@ class TestMxfp4MoEMethodContract(CustomTestCase):
 
     def test_hybrid_mtp_adapter_preserves_routing_policy(self):
         """Excluded MXFP4 MTP experts retain the same construction contract as
-        adapters selected directly by Fp8Config."""
+        adapters selected directly by Fp8Config, including architecture dispatch."""
         prefix = "model.mtp.experts"
         config = HybridFp8NvFp4Config(
             self._fp4_expert_config(),
             ModelOptFp4Config(exclude_modules=[prefix]),
         )
-        self._check_construction(
-            config=config,
-            backend=MoeRunnerBackend.FLASHINFER_MXFP4,
-            platform=SimpleNamespace(is_sm90=False, is_sm120=False),
-            expected_type=Mxfp4FlashinferTrtllmMoEMethod,
-            prefix=prefix,
+        cases = (
+            (True, False, cutlass_mxfp4.Mxfp4FlashinferCutlassMoEMethod),
+            (False, True, cutlass_mxfp4.Mxfp4FlashinferCutlassMoEMethod),
+            (False, False, Mxfp4FlashinferTrtllmMoEMethod),
         )
+        for sm90, sm120, expected_type in cases:
+            with self.subTest(sm90=sm90, sm120=sm120):
+                self._check_construction(
+                    config=config,
+                    backend=MoeRunnerBackend.FLASHINFER_MXFP4,
+                    platform=SimpleNamespace(is_sm90=sm90, is_sm120=sm120),
+                    expected_type=expected_type,
+                    prefix=prefix,
+                )
 
 
 class TestFp8MoEAiterQuantInfo(CustomTestCase):
