@@ -7,16 +7,46 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.models.deepseek_common.utils import _use_aiter
+from sglang.srt.runtime_context import get_model
 
 if _use_aiter:
+    from sglang.kernels.ops.gemm.router_gemv_hip import (
+        ROCM_GLM_ROUTER_MAX_TOKENS,
+        rocm_gemv_split_k_max_tokens,
+    )
     from sglang.kernels.ops.moe.rocm_router_gate import rocm_router_max_tokens
     from sglang.srt.layers.rocm_linear_utils import rocm_dsv3_router_split_k
 
 
 def router_max_tokens(gate, config, is_hash_moe: bool) -> int:
     """Rows up to which the split-K router serves gate (a MoEGate), -1 when it never does:
-    V4.1 only, DSv4 keeps aiter's router GEMM and gate."""
+    V4.1 and single-group sigmoid routing with a fused shared expert slot (GLM-5.3-Flash),
+    whose Triton router sums the partials; DSv4 keeps aiter's router GEMM and gate."""
+    if (
+        _use_aiter
+        and not gate.is_deepseek_v4
+        and not is_hash_moe
+        and getattr(config, "scoring_func", None) == "sigmoid"
+        and getattr(config, "topk_method", None) == "noaux_tc"
+        and (getattr(config, "n_group", None) or 1) == 1
+        and (getattr(config, "topk_group", None) or 1) == 1
+    ):
+        # without a global shared slot the partials would only be reduced back to logits
+        num_shared_slots = get_model().shared_experts.num_shared_topk_slots
+        if num_shared_slots == 0 or has_per_rank_fused_shared_slots(num_shared_slots):
+            return -1
+        if (
+            rocm_gemv_split_k_max_tokens(
+                n=config.n_routed_experts,
+                k=config.hidden_size,
+                weight_dtype=gate.weight.dtype,
+            )
+            < 0
+        ):
+            return -1
+        return ROCM_GLM_ROUTER_MAX_TOKENS
     if not (
         _use_aiter
         and gate.is_deepseek_v4

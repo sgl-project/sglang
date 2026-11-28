@@ -54,6 +54,8 @@ def _router_triton_kernel(
     HAS_PACKED: tl.constexpr,
     RENORMALIZE_EPSILON: tl.constexpr,
     USE_PDL: tl.constexpr,
+    SCORES_SPLIT_K: tl.constexpr,  # > 1: scores are split-K partials, summed in order
+    PAD_ROUTED_ID: tl.constexpr,  # padded rows' routed id; -1 also clears shared ids
     stride_bias,
     stride_bias_alt,
     stride_input_ids,
@@ -65,6 +67,7 @@ def _router_triton_kernel(
     stride_ik,
     stride_pm,
     stride_pk,
+    stride_split,
 ) -> None:
     # Row-tiled: each program handles BLOCK_M rows; all reductions run along the
     # expert (N) axis. Tiling rows keeps CTAs large enough to stay occupancy-bound
@@ -108,9 +111,16 @@ def _router_triton_kernel(
 
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = live_m[:, None] & mask_n[None, :]
-    scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
-        tl.float32
-    )  # [BLOCK_M, BLOCK_N]
+    if SCORES_SPLIT_K == 1:
+        scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
+            tl.float32
+        )  # [BLOCK_M, BLOCK_N]
+    else:
+        scores = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        for split in tl.static_range(SCORES_SPLIT_K):
+            scores += tl.load(
+                row_ptr + split * stride_split, mask=mask2d, other=0.0
+            ).to(tl.float32)
 
     if SCORING_FUNC == 0:
         # sigmoid(x) = 1 / (1 + exp(-x)); bias is for ranking only, weight is bias-free.
@@ -228,7 +238,11 @@ def _router_triton_kernel(
         selected_idx = tl.where(is_shared, shared_idx, selected_idx)
     if HAS_PADDING:
         selected_vals = tl.where(live_m[:, None], selected_vals, 0.0)
-        selected_idx = tl.where(live_m[:, None], selected_idx, -1)
+        if PAD_ROUTED_ID < 0:
+            selected_idx = tl.where(live_m[:, None], selected_idx, -1)
+        else:
+            pad_idx = tl.where(offs_k[None, :] >= K_ROUTED, selected_idx, PAD_ROUTED_ID)
+            selected_idx = tl.where(live_m[:, None], selected_idx, pad_idx)
 
     out_w_ptr = (
         out_weights_ptr + offs_m[:, None] * stride_wm + offs_k[None, :] * stride_wk
@@ -281,14 +295,18 @@ def moe_fused_gate(
     renormalize_epsilon: float = 0.0,
     packed_out: Optional[torch.Tensor] = None,
     sqrtsoftplus_log1p: bool = False,
+    padded_routed_id: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Triton fused router: scoring + bias + topk + (optional) renorm/scale.
 
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
-    within). ``scores`` contains raw GEMM logits.
+    within). ``scores`` contains raw GEMM logits, ``[M, N]``, or their fp32 split-K
+    partials ``[S, M, N]``, which the kernel sums over S in order first.
 
-    Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
+    Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids,
+    or, with ``padded_routed_id >= 0``, that routed id and the usual shared ids (the
+    aiter MoE kernels on ROCm cannot take -1).
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
     ``sqrtsoftplus_log1p`` evaluates sqrtsoftplus through ``log1p`` and ranks NaNs first
     (DeepSeek-V4.1); off, the DeepSeek-V4 formula and NaN order are kept.
@@ -305,7 +323,12 @@ def moe_fused_gate(
         torch.float16,
         torch.bfloat16,
     ), "scores must be float32/float16/bfloat16"
-    assert scores.ndim == 2, "scores must be 2D"
+    split_k, stride_split = 1, 0
+    if scores.ndim == 3:
+        assert scores.dtype == torch.float32, "split-K partials must be float32"
+        split_k, stride_split = scores.shape[0], scores.stride(0)
+        scores = scores[0]
+    assert scores.ndim == 2, "scores must be 2D, or 3D split-K partials"
     if bias is None:
         assert scoring_func == "softmax", "bias is required for non-softmax routing"
     else:
@@ -344,8 +367,10 @@ def moe_fused_gate(
     # expert-id order (skipping the biased-descending sort; downstream MoE
     # kernels are order-insensitive). It is 3.1-3.5x faster than the Triton
     # kernel at [1..8192, 896] top-16 on B200.
+    # The fast paths read one 2-D score tensor, not split-K partials.
     if (
-        scoring_func == "sigmoid"
+        split_k == 1
+        and scoring_func == "sigmoid"
         and num_fused_shared_experts == 0
         and num_expert_group <= 1
         and moe_softcapping == 0.0
@@ -369,7 +394,9 @@ def moe_fused_gate(
     # One-warp-per-token CUDA router: same selection, order and padding contract
     # as the Triton kernel below.
     if (
-        moe_softcapping == 0.0
+        split_k == 1
+        and padded_routed_id < 0
+        and moe_softcapping == 0.0
         and moe_route_warp.covered(
             scores.dtype,
             scores.shape[1],
@@ -470,6 +497,8 @@ def moe_fused_gate(
         HAS_PACKED=packed_out is not None,
         RENORMALIZE_EPSILON=renormalize_epsilon,
         USE_PDL=use_pdl,
+        SCORES_SPLIT_K=split_k,
+        PAD_ROUTED_ID=padded_routed_id,
         stride_bias=bias.stride(0) if bias is not None else 0,
         stride_bias_alt=bias_alt.stride(0) if bias_alt is not None else 0,
         stride_input_ids=input_ids.stride(0) if input_ids is not None else 0,
@@ -481,6 +510,7 @@ def moe_fused_gate(
         stride_ik=indices.stride(1),
         stride_pm=packed_out.stride(0) if packed_out is not None else 0,
         stride_pk=packed_out.stride(1) if packed_out is not None else 0,
+        stride_split=stride_split,
         num_warps=num_warps,
         **extra,
     )
