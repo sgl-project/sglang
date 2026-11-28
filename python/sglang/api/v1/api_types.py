@@ -3108,8 +3108,8 @@ class OpenAiClassifyData(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.OpenAiClassifyData: JSON object (unknown keys ignored)."""
 
     index: int = 0
-    label: str = ""
-    probs: List[float] = []
+    label: Optional[StringOrList] = None
+    probs: Optional[OpenAiClassifyProbabilities] = None
     num_classes: int = 0
 
     @classmethod
@@ -4500,6 +4500,12 @@ OpenAiEmbeddingVector = Union[DoubleList, str]
 
 # sglang.api.v1.OpenAiClassifyInput: JSON: the value's shape picks the arm.
 OpenAiClassifyInput = Union[str, StringList, TokenIds]
+
+# sglang.api.v1.OpenAiClassifyProbabilityRows: JSON bare array.
+OpenAiClassifyProbabilityRows = List[DoubleList]
+
+# sglang.api.v1.OpenAiClassifyProbabilities: JSON: the value's shape picks the arm.
+OpenAiClassifyProbabilities = Union[DoubleList, OpenAiClassifyProbabilityRows]
 
 # sglang.api.v1.OpenAiScoreQuery: JSON: the value's shape picks the arm.
 OpenAiScoreQuery = Union[str, TokenIds]
@@ -10296,6 +10302,34 @@ def encode_OpenAiClassifyRequest(v: OpenAiClassifyRequest) -> Dict[str, Any]:
     return d
 
 
+def decode_OpenAiClassifyProbabilityRows(value: Any) -> OpenAiClassifyProbabilityRows:
+    return [decode_DoubleList(e) for e in _expect_seq(value, expected="a sequence")]
+
+
+def encode_OpenAiClassifyProbabilityRows(v: OpenAiClassifyProbabilityRows) -> List[Any]:
+    return [encode_DoubleList(e) for e in v]
+
+
+def decode_OpenAiClassifyProbabilities(value: Any) -> OpenAiClassifyProbabilities:
+    if isinstance(value, list):
+        if not value:
+            return decode_DoubleList(value)
+        if _is_int(value[0]) or _is_number(value[0]):
+            return decode_DoubleList(value)
+        if isinstance(value[0], list):
+            return decode_OpenAiClassifyProbabilityRows(value)
+        raise _invalid_type(value, expected="one of the OpenAiClassifyProbabilities list shapes")
+    raise _invalid_type(value, expected="one of the OpenAiClassifyProbabilities shapes")
+
+
+def encode_OpenAiClassifyProbabilities(v: OpenAiClassifyProbabilities) -> Any:
+    if isinstance(v, list) and (not v or _is_int(v[0]) or _is_number(v[0])):
+        return encode_DoubleList(v)
+    if isinstance(v, list) and bool(v) and (isinstance(v[0], list)):
+        return encode_OpenAiClassifyProbabilityRows(v)
+    return v
+
+
 def decode_OpenAiClassifyData(value: Any) -> OpenAiClassifyData:
     m = _expect_map(value, expected="struct OpenAiClassifyData")
     kw: Dict[str, Any] = {}
@@ -10303,9 +10337,9 @@ def decode_OpenAiClassifyData(value: Any) -> OpenAiClassifyData:
         if key == "index":
             kw["index"] = _expect_int(x, expected="i64")
         elif key == "label":
-            kw["label"] = _expect_str(x, expected="a string")
+            kw["label"] = None if x is None else decode_StringOrList(x)
         elif key == "probs":
-            kw["probs"] = [] if x is None else [_expect_float(e, expected="f64") for e in _expect_seq(x, expected="a sequence")]
+            kw["probs"] = None if x is None else decode_OpenAiClassifyProbabilities(x)
         elif key == "num_classes":
             kw["num_classes"] = _expect_int(x, expected="i64")
     return OpenAiClassifyData(**kw)
@@ -10314,9 +10348,10 @@ def decode_OpenAiClassifyData(value: Any) -> OpenAiClassifyData:
 def encode_OpenAiClassifyData(v: OpenAiClassifyData) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["index"] = v.index
-    d["label"] = v.label
-    if v.probs:
-        d["probs"] = [float(e) for e in v.probs]
+    if v.label is not None:
+        d["label"] = encode_StringOrList(v.label)
+    if v.probs is not None:
+        d["probs"] = encode_OpenAiClassifyProbabilities(v.probs)
     d["num_classes"] = v.num_classes
     return d
 

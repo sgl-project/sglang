@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -211,6 +212,29 @@ class TestPointerAndIndexViewsAgree(CustomTestCase):
 
                 self.assertEqual(count, num)
                 self.assertEqual(sliced_dst, [dst_ptrs[j] for j in indices])
+
+    def test_cp_layer_split_tiles_target_and_draft_at_pp_one(self):
+        # Without the CP offset, later ranks overwrite decode's first layers.
+        # Only the last rank owns draft KV, which follows all target layers.
+        with get_parallel().override(enable_dsa_cache_layer_split=True):
+            for num_draft in (0, 1):
+                covered = []
+                n_dst = NUM_LAYERS + num_draft
+                for rank, (start, num) in enumerate(_pp_layer_split(NUM_LAYERS, 4)):
+                    local_draft = num_draft if rank == 3 else 0
+                    n_src = num + local_draft
+                    manager = _StubKVManager(
+                        pp_size=1, prefill_start_layer=start, n_src=n_src
+                    )
+                    manager.kv_args.num_draft_entries = local_draft
+                    with self.subTest(rank=rank, num_draft=num_draft):
+                        indices = _resolve(manager, _peer(n_dst=n_dst), n_src, n_dst)
+                        expected = list(range(start, start + num))
+                        if local_draft:
+                            expected.append(NUM_LAYERS)
+                        self.assertEqual(indices, expected)
+                        covered += indices
+                self.assertEqual(sorted(covered), list(range(n_dst)))
 
 
 if __name__ == "__main__":

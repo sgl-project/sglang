@@ -85,14 +85,16 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             get_waiting_storage_span=Mock(return_value=storage_span),
         )
 
-    def test_load_report_carries_the_storage_prefetch_counters(self):
+    def test_load_report_carries_the_storage_counters(self):
         collector = SimpleNamespace(
             total_storage_prefetch_hit_tokens=500,
             total_storage_prefetch_unfulfilled_tokens={"storage_transfer": 20},
+            total_backuped_tokens=900,
+            total_backup_dropped_tokens=70,
         )
         for storage, expected in [
-            (collector, (500, {"storage_transfer": 20})),
-            (None, (None, None)),
+            (collector, (500, {"storage_transfer": 20}, 900, 70)),
+            (None, (None, None, None, None)),
         ]:
             inquirer = replace(
                 self.make_inquirer(),
@@ -125,6 +127,8 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
                 (
                     load.total_storage_prefetch_hit_tokens,
                     load.total_storage_prefetch_unfulfilled_tokens,
+                    load.total_backuped_tokens,
+                    load.total_backup_dropped_tokens,
                 ),
                 expected,
             )

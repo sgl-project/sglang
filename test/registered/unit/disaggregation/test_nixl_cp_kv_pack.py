@@ -13,6 +13,10 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=40, stage="base-b", runner_config="1-gpu-small")
 
 
+def _posted():
+    return SimpleNamespace(xfer=object(), result=None, error=None)
+
+
 def production_method():
     return NixlKVManager.send_kvcache_slice_packed
 
@@ -52,40 +56,35 @@ def test_fragmented_pages_bit_exact(page_size, groups, head_group):
             kv_data_ptrs=[t.data_ptr() for t in src],
         ),
         decode_kv_args_table={
-            "peer": SimpleNamespace(
-                dst_kv_item_len=page_size * width,
-                dst_kv_ptrs=[t.data_ptr() for t in dst],
-                gpu_id=0,
-            )
+            "peer": SimpleNamespace(dst_kv_item_len=page_size * width)
         },
-        prep_handle_slice_src=(None, groups, regions, slots),
-        prep_handles_slice_dst={"peer": (None, slots, head_group)},
+        _slice_src=SimpleNamespace(num_groups=groups, num_ptr_pairs=regions),
+        _slice_dst={"peer": SimpleNamespace(head_group_idx=head_group)},
+        _peers={"peer": SimpleNamespace(keys=SimpleNamespace(kv=list(range(regions))))},
+        _staging_keys={buf.get_ptr(): "pack"},
         get_mha_kv_ptrs_with_pp=lambda s, d: (s[:2], s[2:], d[:2], d[2:], 2),
     )
+    manager._dcp_pack_sources = lambda *a: NixlKVManager._dcp_pack_sources(manager, *a)
 
-    def send(**kw):
+    def send(peer, copies):
         assert not pending, "scratch overwritten before previous write completed"
-        assert kw["force_flat"] and kw["bypass_prepped"]
-        pending.append(kw)
+        pending.append(copies)
         events.append("post")
-        return len(events)
+        return [_posted()]
 
     def wait(handles, failure_seen):
         assert len(handles) == 1 and not failure_seen
-        kw = pending.pop()
-        for i, ptr in enumerate(kw["src_data_ptrs"]):
-            offset = ptr - buf.get_ptr()
-            count = len(kw["prefill_data_indices"])
-            packed = buf.buffer[offset : offset + count * page_size * width].view(
-                count, page_size, width
-            )
-            for j, page in enumerate(kw["dst_data_indices"]):
-                dst[i].view(slots, page_size, width)[int(page)].copy_(packed[j])
+        for copy in pending.pop():
+            assert copy.src == "pack"
+            for src_off, dst_off, length in copy.ranges.tolist():
+                dst[copy.dst].view(-1)[dst_off : dst_off + length].copy_(
+                    buf.buffer[src_off : src_off + length]
+                )
         torch.cuda.synchronize()
         events.append("done")
         return True, False
 
-    manager._send_kvcache_generic = send
+    manager._transfer_copies = send
     manager._await_handles = wait
     handles = []
     production_method()(manager, "peer", pages, target, buf, handles)
@@ -106,22 +105,25 @@ def test_fragmented_pages_bit_exact(page_size, groups, head_group):
 def test_failed_write_quarantines_scratch(outcome):
     src = torch.arange(64, dtype=torch.uint8, device="cuda").reshape(4, 16)
     buf = StagingBuffer(64, "cuda", torch.cuda.current_device())
-    info = SimpleNamespace(dst_kv_item_len=8, dst_kv_ptrs=[123, 456], gpu_id=0)
+    info = SimpleNamespace(dst_kv_item_len=8)
+    posted = _posted()
     manager = SimpleNamespace(
         kv_args=SimpleNamespace(
             page_size=1, kv_item_lens=[16, 16], kv_data_ptrs=[src.data_ptr()] * 2
         ),
         decode_kv_args_table={"p": info},
-        prep_handle_slice_src=(None, 2, 2, 4),
-        prep_handles_slice_dst={"p": (None, 4, 1)},
+        _slice_src=SimpleNamespace(num_groups=2, num_ptr_pairs=2),
+        _slice_dst={"p": SimpleNamespace(head_group_idx=1)},
+        _peers={"p": SimpleNamespace(keys=SimpleNamespace(kv=[0, 1]))},
+        _dcp_pack_sources=lambda pb, ptrs: [("pack", p - pb.get_ptr()) for p in ptrs],
         get_mha_kv_ptrs_with_pp=lambda s, d: (s[:1], s[1:], d[:1], d[1:], 1),
-        _send_kvcache_generic=lambda **kw: "posted",
+        _transfer_copies=lambda peer, copies: [posted],
         _await_handles=lambda *a, **kw: outcome,
     )
     handles = []
     with pytest.raises(RuntimeError, match="did not complete"):
         production_method()(manager, "p", np.array([2]), np.array([1]), buf, handles)
-    assert buf.nixl_poisoned and handles == ["posted"]
+    assert buf.nixl_poisoned and handles == [posted]
 
 
 if __name__ == "__main__":

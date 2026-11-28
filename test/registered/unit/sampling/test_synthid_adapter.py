@@ -15,7 +15,6 @@ from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.sampling.watermarking.synthid import adapter
-from sglang.srt.sampling.watermarking.synthid.adapter import SynthIDRows
 from sglang.srt.sampling.watermarking.synthid.algorithm import SynthIDConfig
 from sglang.srt.sampling.watermarking.synthid.watermark import SynthIDWatermark
 from sglang.srt.server_args import ServerArgs
@@ -111,6 +110,11 @@ def _top_k_top_p(top_ks, top_ps):
     return filter_probs
 
 
+def _rows(candidates):
+    """The rows build_rows makes from the pool's gathered candidate field."""
+    return adapter.build_rows(torch.tensor([[int(c) for c in candidates]]), candidates)
+
+
 class TestSynthIDConfig(CustomTestCase):
     def test_file_fields_resolve_and_keys_are_redacted(self):
         cfg = _resolve({"keys": _KEYS, "ngram_len": 3, "num_candidates": 40})
@@ -183,19 +187,20 @@ class TestSynthIDRequestPolicy(CustomTestCase):
     def test_rows_hold_enabled_sampling_rows(self):
         on, off = {"enabled": True}, {"enabled": False}
         requests = [_request(on), _request(off), _request(on, top_k=1), _request(on)]
-        rows = adapter.build_rows(requests, features=_features(), device="cpu")
+        candidates, values = zip(
+            *(adapter.pool_values(r, features=_features()) for r in requests)
+        )
+        self.assertEqual(candidates, (True, False, False, True))
+        rows = adapter.build_rows(torch.tensor(values).T, list(candidates))
         self.assertEqual(rows.indices.tolist(), [0, 3])
         self.assertEqual(rows.candidates_host, [True, False, False, True])
         self.assertFalse(rows.all_on)
-        self.assertIsNone(
-            adapter.build_rows(requests[1:3], features=_features(), device="cpu")
-        )
 
 
 class TestSynthIDEngine(CustomTestCase):
     def test_seed_payload_covers_prefill_rows_only(self):
         engine = adapter.SynthIDEngine(_watermarks()[0], allow_fused_sample=False)
-        rows = SynthIDRows.from_candidates([True, False, True, True], "cpu")
+        rows = _rows([True, False, True, True])
         reqs = [SimpleNamespace(output_ids=ids) for ids in ([], [5], [7, 8], [9])]
 
         def batch(mode, *, decoding_reqs=None, num_mixed=0):
@@ -219,10 +224,23 @@ class TestSynthIDEngine(CustomTestCase):
             engine.seed_payload(batch(ForwardMode.EXTEND, decoding_reqs=reqs))
         )
 
+    def test_fused_sample_is_skipped_for_a_custom_logit_processor(self):
+        engine = adapter.SynthIDEngine(_watermarks()[0], allow_fused_sample=True)
+        rows = _rows([True, True])
+        info = _info(2, watermark=rows)
+        forward_batch = SimpleNamespace(
+            sampling_info=info, req_pool_indices=torch.tensor([0, 1])
+        )
+        sample = engine.bind_sample(forward_batch)
+
+        self.assertTrue(sample._can_fuse(keep_logits=False))
+        info.has_custom_logit_processor = True
+        self.assertFalse(sample._can_fuse(keep_logits=False))
+
     def test_sample_watermarks_on_rows_and_commits_their_slots(self):
         watermark, twin = _watermarks()
         engine = adapter.SynthIDEngine(watermark, allow_fused_sample=False)
-        rows = SynthIDRows.from_candidates([True, False, True, False], "cpu")
+        rows = _rows([True, False, True, False])
         info = _info(
             4,
             top_ks=torch.tensor([3, 2, TOP_K_ALL, TOP_K_ALL]),
@@ -269,7 +287,7 @@ class TestSynthIDEngine(CustomTestCase):
     def test_verify_watermarks_on_rows_and_appends_their_tokens(self):
         watermark, twin = _watermarks()
         engine = adapter.SynthIDEngine(watermark, allow_fused_sample=False)
-        rows = SynthIDRows.from_candidates([False, True, True], "cpu")
+        rows = _rows([False, True, True])
         info = _info(3, top_ks=torch.tensor([TOP_K_ALL, 4, TOP_K_ALL]))
         req_pool_indices = torch.tensor([5, 3, 7])
         draft_tokens = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])

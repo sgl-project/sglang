@@ -243,7 +243,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
             patch.object(
                 topk_module,
                 "grouped_topk_gpu",
-                topk_module.grouped_topk_gpu._torchdynamo_orig_callable,
+                topk_module.grouped_topk_gpu.__wrapped__,
             ),
             patch(
                 "sglang.srt.layers.quantization.compressed_tensors.schemes."
@@ -325,7 +325,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
         hidden = torch.ones((1, 4))
         logits = torch.tensor([[3.0, 2.0, 1.0, 0.0, -1.0, -2.0, -3.0, -4.0]])
         for name in ("grouped_topk_gpu", "biased_topk_impl"):
-            router = getattr(topk_module, name)._torchdynamo_orig_callable
+            router = getattr(topk_module, name).__wrapped__
             for renormalize in (True, False):
                 for fold in (True, False):
                     with self.subTest(router=name, renormalize=renormalize, fold=fold):
@@ -878,7 +878,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 patch.object(
                     topk_module,
                     "grouped_topk_gpu",
-                    topk_module.grouped_topk_gpu._torchdynamo_orig_callable,
+                    topk_module.grouped_topk_gpu.__wrapped__,
                 ),
             ):
                 block = block_type(config=config, layer_id=0)

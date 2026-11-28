@@ -4,12 +4,13 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
+from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import ProcessorEntry, SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.sampling_test_utils import build_step_penalties
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -33,7 +34,7 @@ def _step(num_reqs):
     pool = PenaltyStatusPool(VOCAB_SIZE, "cpu")
     pool.alloc(reqs)
     pool.reset_history(reqs)
-    return StepPenalties.build(reqs, pool)
+    return build_step_penalties(reqs, pool)
 
 
 def _sampling_info(bs):

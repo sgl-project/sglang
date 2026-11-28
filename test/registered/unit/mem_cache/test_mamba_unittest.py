@@ -82,11 +82,12 @@ class TestMamba(unittest.TestCase):
             for group_count in (2, 3):
                 with self.subTest(group_count=group_count):
                     pool.full_kv_pool = SimpleNamespace(
+                        get_kv_layer_ids=lambda count=group_count: [0, 1] * count,
                         get_contiguous_buf_infos=lambda: (
                             list(range(2 * group_count)),
                             [],
                             [],
-                        )
+                        ),
                     )
                     self.assertEqual(pool.get_kv_layer_ids(), [3, 7] * group_count)
 
