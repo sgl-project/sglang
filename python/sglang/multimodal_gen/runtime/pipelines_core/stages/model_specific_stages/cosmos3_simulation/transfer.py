@@ -13,6 +13,7 @@ paired control/RGB window with pinned sink frames.
 
 import json
 import math
+import os
 from typing import Any
 
 import imageio.v3 as iio
@@ -81,7 +82,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.vision import load_video
+from sglang.multimodal_gen.runtime.utils.vision import load_video, local_video_path
 
 logger = init_logger(__name__)
 
@@ -182,7 +183,13 @@ def format_transfer_prompt(
 
 
 def read_video_fps(path: str) -> float | None:
-    """Frame rate from the container metadata, or None when the backend has none."""
+    """Frame rate from the container metadata of a local file, or None.
+
+    A URL is never opened here: the caller fetches it under the media URL
+    policy and passes the local copy.
+    """
+    if not os.path.isfile(path):
+        return None
     try:
         fps = iio.immeta(path).get("fps")
     except (OSError, ValueError, RuntimeError, KeyError):
@@ -194,7 +201,7 @@ def load_control_frames(path: str, *, max_frames: int) -> torch.Tensor:
     """First ``max_frames`` frames of the control clip as ``uint8 [3, T, H, W]``."""
     frames = load_video(path, max_frames=max_frames)
     if not frames:
-        raise ValueError(f"No frames decoded from control video {path!r}.")
+        raise ValueError("No frames decoded from control video.")
     arrays = [
         np.asarray(frame.convert("RGB"), dtype=np.uint8)
         for frame in frames[:max_frames]
@@ -426,13 +433,13 @@ class CosmosDreamsControlVideoStage(PipelineStage):
         result.add_check("num_frames", batch.num_frames, V.positive_int)
         return result
 
-    def _resolve_fps(self, batch: Req, control_path: str) -> float:
+    def _resolve_fps(self, batch: Req, local_path: str) -> float:
         if batch.sampling_params.is_explicit("fps"):
             return float(batch.fps)
-        fps = read_video_fps(control_path)
+        fps = read_video_fps(local_path)
         if fps is None:
             raise ValueError(
-                f"Could not read the frame rate of {control_path!r}; pass fps explicitly."
+                "Could not read the frame rate of the control video; pass fps explicitly."
             )
         return fps
 
@@ -457,10 +464,12 @@ class CosmosDreamsControlVideoStage(PipelineStage):
             raise ValueError(
                 f"Checkpoint {manifest.checkpoint_id} accepts control hints {list(allowed_hints)}, got {hint!r}."
             )
-        frames = load_control_frames(
-            control_path, max_frames=int(sampling_params.max_frames)
-        )
-        return frames, hint, self._resolve_fps(batch, control_path), control_path
+        with local_video_path(control_path) as local_path:
+            frames = load_control_frames(
+                local_path, max_frames=int(sampling_params.max_frames)
+            )
+            fps = self._resolve_fps(batch, local_path)
+        return frames, hint, fps, control_path
 
     def _fit_control(
         self,
