@@ -112,6 +112,29 @@ class TestSWAEvictionInterval(unittest.TestCase):
                     torch.equal(free.call_args.args[0], torch.arange(272, 400))
                 )
 
+    def test_retirement_passes_the_tree_replay_tail(self):
+        # Without the tail, the window behind the replay-trimmed match is freed.
+        for tail, cursor in ((0, 272), (16, 256)):
+            with (
+                self.subTest(tail=tail),
+                envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
+                envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
+            ):
+                cache = _SwaCache()
+                cache.window_reprefill_tail_tokens = lambda req=None, t=tail: t
+                req = SimpleNamespace(
+                    seqlen=401, decode_batch_idx=1, kv=ReqKvInfo(req_pool_idx=0)
+                )
+                batch = ScheduleBatch(
+                    reqs=[req],
+                    tree_cache=cache,
+                    req_to_token_pool=cache.req_to_token_pool,
+                    token_to_kv_pool_allocator=cache.token_to_kv_pool_allocator,
+                    forward_mode=ForwardMode.DECODE,
+                )
+                batch.maybe_evict_swa()
+                self.assertEqual(req.kv.get_evicted_seqlen("swa"), cursor)
+
     def test_forward_cadence_is_not_gated_again_by_token_interval(self):
         cache = _SwaCache()
         req = SimpleNamespace(

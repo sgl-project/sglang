@@ -371,6 +371,7 @@ class KVStorage:
         eviction_interval: int = 1,
         tracking: Optional[TrackingAdvance] = None,
         window_sub_pool: Optional[str] = None,
+        reprefill_tail_tokens: int = 0,
     ) -> None:
         """Apply checkpoint tracking and retire rows outside the read window.
 
@@ -398,6 +399,7 @@ class KVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
+            reprefill_tail_tokens=reprefill_tail_tokens,
             window_sub_pool=sub_pool,
             free_segment=lambda ids, start_pos: self._allocator.free_window_segment(
                 sub_pool, ids, start_pos=start_pos

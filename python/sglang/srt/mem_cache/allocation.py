@@ -185,6 +185,7 @@ def retire_window(
             shares_prefixes=tree_cache.supports_prefix_sharing(),
             eviction_interval=eviction_interval,
             window_sub_pool=sub_pool,
+            reprefill_tail_tokens=tree_cache.window_reprefill_tail_tokens(req),
         )
 
 
