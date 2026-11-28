@@ -187,11 +187,10 @@ class AscendOpsDispatcher(BaseDispatcher):
             if not (
                 parallel.tp_size == parallel.moe_ep_size
                 and self.num_local_experts * self.ep_size == self.num_experts
-                and not moe_runner_config.num_fused_shared_experts
             ):
                 raise ValueError(
-                    "NPU AllGather requires TP=EP, contiguous expert placement "
-                    "and no fused shared experts"
+                    "NPU AllGather requires TP=EP and contiguous expert "
+                    "placement (per-rank fused shared slots included)"
                 )
 
     def _init_fused_op(self, config: MoeRunnerConfig) -> None:
