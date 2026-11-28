@@ -40,9 +40,8 @@ docker pull lmsysorg/sglang:v0.5.8-rocm700-mi35x
 # Prefer the newest MI30x ROCm image tag from Docker Hub when available, or build from source.
 docker pull lmsysorg/sglang:v0.5.8-rocm700-mi30x
 
-# Ascend NPU (A2/A3 Series)
-docker pull lmsysorg/sglang:dsv32-a2
-docker pull lmsysorg/sglang:dsv32-a3
+# Ascend NPU A3 Series, 4-node PD disaggregation (reference recipe; see Section 3.3)
+docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 ```
 
 ## 3. Model Deployment
@@ -51,14 +50,14 @@ This section provides a progressive guide from quick deployment to performance o
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities. SGLang supports serving DeepSeek V3.2 on NVIDIA H200, B200, and AMD MI300X/MI355X GPUs.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities. SGLang supports serving DeepSeek V3.2 on NVIDIA H200, B200, AMD MI300X/MI355X GPUs, and Ascend A3 NPUs. For Ascend A3, select the role and instance ID to get the command for each single-node instance in the four-server 2P2D deployment described in [Section 3.3](#3-3-ascend-npu-deployment).
 
 import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32-deployment.jsx";
 
 <DeepSeekV32Deployment />
 
 <Warning>
-  All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on DeepSeek-V3.2.
+  The GPU recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on DeepSeek-V3.2. The Ascend recipe uses `--attention-backend ascend`; see its version and validation caveats in Section 3.3.
 </Warning>
 
 ### 3.2 Configuration Tips
@@ -74,6 +73,87 @@ import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32
     --tool-call-parser deepseekv32 --reasoning-parser deepseek-v3
   ```
 - **NCCL timeout:** Slow model loading → add `--dist-timeout 3600`.
+
+### 3.3 Ascend NPU Deployment
+
+This section describes a four-server A3 **2P2D** deployment: two independent prefill instances and two independent decode instances. Each instance occupies one server with 8 physical cards (16 dies), using a 16-rank process group (`--tp 16`). The complete deployment uses 32 physical cards (64 dies). Prefill uses **CP 16 EP 16**; decode uses ** DP 16 EP 16**. These are fixed per-instance settings, not parallelism across the four instances. Accuracy and performance results for this recipe are not included; validate both on the target cluster.
+
+The checkpoint source reports a download size of 695 GB. One available checkpoint copy occupied 647 GB on disk; that measurement applies to that copy. Disk size alone does not establish device-memory fit. Each instance loads its own model, with MoE expert weights distributed over its 16 EP ranks; attention, dense layers, KV cache, and runtime buffers also consume device memory.
+
+<Warning>
+This recipe adapts the [DeepSeek-V3.2 Ascend best practice](../../../docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2), using `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3` as the reference image. The upstream 1P1D example spans two servers per instance with TP 32; it is not the same topology as this single-server-per-instance 2P2D setup. Parallelism, instance addressing, Router registration, and ports are adapted here. Prefill uses `interleave` rather than the upstream example's `zigzag`, which current DeepSeek-V3.2 code rejects. Check support in the pinned image and validate memory fit, accuracy, and performance before production use; this is not an end-to-end validated recipe.
+</Warning>
+
+#### 3.3.1 Target Configuration (4 × A3)
+
+The following is the target configuration for the four-node 2P2D recipe.
+
+| Component | Target configuration |
+| --- | --- |
+| Hardware | Atlas 800T A3 ×4; 8 cards (16 dies) per node |
+| Deployment | 2 independent prefill instances + 2 independent decode instances; one server per instance |
+| Prefill parallelism | 16 ranks per instance; CP 16, EP 16 |
+| Decode parallelism | 16 ranks per instance; DP 16, EP 16 |
+| Image | `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3` |
+| Checkpoint | DeepSeek-V3.2-W8A8; revision `8c4f13004d0742b650b9f2c51b751dbef7d0c1ee` |
+
+#### 3.3.2 Target Topology
+
+| Role | Instances / servers | Cards / dies per instance | Parallelism per instance | Key features |
+| --- | --- | --- | --- | --- |
+| Prefill | 2 instances / 2 servers | 8 cards / 16 dies | CP 16 , EP 16 | DeepEP normal mode, INT8 dispatch, MTP (1 step) |
+| Decode | 2 instances / 2 servers | 8 cards / 16 dies | DP 16, EP 16 | DeepEP low-latency mode, NPU graph, MTP (3 steps) |
+| Router | any host | — | — | `sglang_router` in PD mode, `cache_aware` policy |
+
+On A3, each physical card has two dies. DeepSeek-V3.2 is an MoE model: EP 16 partitions its expert weights, while CP 16 distributes prefill context and DP 16 distributes decode attention work (attention TP is 1). Both roles use `--moe-dense-tp-size 1`. See the [Ascend NPU glossary](../../../docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+
+The generated decode command uses the reference image's legacy spelling `--enable-dp-attention --dp-size 16` for **attention DP**, not 16 independent model replicas. On current versions, the equivalent spelling is `--attn-dp-size 16`; do not combine the two forms.
+
+Memory fractions, request/token limits, graph sizes, MTP settings, and communication-buffer settings are inherited from the upstream recipe, not tuned or measured for this 16-die-per-instance topology. Recheck these settings on the target hardware rather than assuming that halving the instance size preserves memory fit or performance.
+
+#### 3.3.3 Prerequisites
+
+1. Set up four A3 servers with eight cards (16 dies) each as described in the [Ascend NPU quick start](../../../docs/hardware-platforms/ascend-npus/getting-started/quick_start). Start each container with its eight local `davinci` devices mounted, as shown in the [DeepSeek-V3.2 Ascend tutorial](../../../docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2#installation). The launch script tunes kernel parameters with `sysctl`, so the container must run with `--privileged=true --net=host`.
+2. Download [DeepSeek-V3.2-W8A8](https://www.modelscope.cn/models/sgl-npu/DeepSeek-V3.2-W8A8) (source-listed size 695 GB) to storage readable by all four nodes, and mount it into each container.
+
+#### 3.3.4 Launch
+
+In the [Interactive Command Generator](#3-1-basic-configuration), select **Ascend A3** as the hardware platform, then:
+
+1. On the two prefill servers, select **Prefill** with **Instance ID 0** and **Instance ID 1**, respectively. Replace the `<...>` placeholders and the model path, and run each command on its own server. Do the same on the two decode servers with **Decode**.
+2. Wait until all four independent instances print `The server is fired up and ready to roll!`.
+3. Select **Router** and run the router command. It listens on port `6688`.
+
+Each instance is single-node: all four commands use `--nnodes 1 --node-rank 0`, and `--dist-init-addr` points to that instance's own server. **Instance ID** selects a separate instance, not a distributed node rank. The IP placeholders retain the names `<prefill-node0-ip>`, `<prefill-node1-ip>`, `<decode-node0-ip>`, and `<decode-node1-ip>`; each identifies a separate server and instance. `ASCEND_MF_STORE_URL` must point to prefill instance 0 on all four servers.
+
+All four servers listen on port `30000`, instead of the best-practice ports `8000` and `8001`. Each prefill instance also listens on bootstrap port `8998`. The Router uses explicit PD mode and registers both prefill URLs (with their bootstrap ports) and both decode URLs. Registering only instance 0 of each role would leave half the deployment unused.
+
+#### 3.3.5 Verification
+
+Send a request through the router:
+
+```bash Command
+curl http://127.0.0.1:6688/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "max_tokens": 64,
+    "temperature": 0
+  }'
+```
+
+An HTTP 200 response whose content mentions "Paris" is a smoke check for the selected prefill/decode path, not proof that all four instances have been exercised. Check Router worker health and per-instance request logs or metrics under load to verify that both prefill instances and both decode instances receive traffic and complete KV transfers.
+
+For an accuracy run on the target cluster, run `sgl-eval` from its own virtual environment, at the version pinned in the repository's test dependencies. Use the full GSM8K test set with the recommended DeepSeek-V3.2 sampling settings (`temperature=1.0`, `top_p=0.95`). Record the image, checkpoint revision, thinking mode, generation limits, and results for your deployment:
+
+```bash Command
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:6688/v1 \
+  --num-examples 1319 \
+  --temperature 1.0 \
+  --top-p 0.95 \
+  --max-tokens 1000
+```
 
 ## 4. Model Invocation
 
