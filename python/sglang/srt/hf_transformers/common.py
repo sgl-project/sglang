@@ -120,6 +120,17 @@ else:
 
 from transformers import PretrainedConfig
 
+# transformers v5 config classes are strict dataclasses (huggingface_hub):
+# loading a config.json that stores an integral float as a JSON int raises
+# StrictDataclassFieldValidationError, which is NOT a ValueError. Empty tuple
+# on huggingface_hub versions without the error class.
+try:
+    from huggingface_hub.errors import StrictDataclassFieldValidationError
+
+    HF_STRICT_CONFIG_ERRORS = (StrictDataclassFieldValidationError,)
+except ImportError:
+    HF_STRICT_CONFIG_ERRORS = ()
+
 # ---------------------------------------------------------------------------
 # Config registry
 # ---------------------------------------------------------------------------

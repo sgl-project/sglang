@@ -20,11 +20,7 @@ import warnings
 from pathlib import Path
 from typing import Optional, Union
 
-from transformers import (
-    AutoTokenizer,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerFast,
-)
+from transformers import AutoTokenizer, PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, logger
@@ -32,6 +28,7 @@ from sglang.srt.utils.hf_transformers_patches import _ensure_gguf_version
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 from .common import (
+    HF_STRICT_CONFIG_ERRORS,
     _resolve_local_or_cached_file,
     attach_additional_stop_token_ids,
     check_gguf_file,
@@ -51,6 +48,13 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 
 # Class name used by transformers v5 when no tokenizer mapping exists for a model_type.
 _TOKENIZERS_BACKEND = "TokenizersBackend"
+
+# tokenizer_class values that are abstract bases: AutoTokenizer resolves them to
+# the slow Python backend, which cannot be instantiated because no class
+# implements the vocab methods.
+_ABSTRACT_TOKENIZER_CLASS_NAMES = frozenset(
+    {"PreTrainedTokenizer", "PreTrainedTokenizerBase"}
+)
 
 
 def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
@@ -83,7 +87,7 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
         return None
 
     # Skip base classes that don't implement required methods (e.g. get_vocab)
-    if tok_class_name in ("PreTrainedTokenizer", "PreTrainedTokenizerBase"):
+    if tok_class_name in _ABSTRACT_TOKENIZER_CLASS_NAMES:
         return None
 
     tok_cls = getattr(transformers, tok_class_name, None)
@@ -173,8 +177,87 @@ def _resolve_tokenizer_name(tokenizer_name, kwargs):
     return tokenizer_name
 
 
+def _load_tokenizers_backend_direct(tokenizer_name, *args, **common_kwargs):
+    """Load tokenizer.json directly via TokenizersBackend, or None.
+
+    AutoTokenizer can fail to load a perfectly usable tokenizer.json:
+    - tokenizer_config.json declares an abstract base class (e.g.
+      PreTrainedTokenizer), which resolves to the slow Python backend and
+      raises "Couldn't instantiate the backend tokenizer" because the
+      checkpoint ships no sentencepiece/tiktoken vocab;
+    - AutoTokenizer's internal model-config load raises a huggingface_hub
+      strict-dataclass validation error (int where a float field is
+      declared), which is not a ValueError.
+    TokenizersBackend reads tokenizer.json directly and does not load the
+    model config, so it covers both. The file is fetched on demand, so an
+    uncached checkpoint works too; a missing tokenizer.json surfaces as OSError.
+    """
+    try:
+        from transformers import TokenizersBackend
+    except ImportError:
+        return None
+    try:
+        return TokenizersBackend.from_pretrained(tokenizer_name, *args, **common_kwargs)
+    except (OSError, ValueError, TypeError, ImportError, RuntimeError) as e:
+        logger.debug(
+            "Direct TokenizersBackend load unavailable for %s: %s", tokenizer_name, e
+        )
+        return None
+
+
+def _declared_tokenizer_class_is_abstract(tokenizer_name, revision=None) -> bool:
+    """True when tokenizer_config.json declares an abstract tokenizer class.
+
+    A checkpoint that declares ``"tokenizer_class": "PreTrainedTokenizer"``
+    makes AutoTokenizer pick the slow Python backend, which raises
+    "Couldn't instantiate the backend tokenizer" when the checkpoint ships no
+    sentencepiece/tiktoken vocab. Checking the declaration up front avoids
+    depending on that message text; an uncached checkpoint resolves to False
+    and falls back to the error-driven path.
+    """
+    import inspect
+
+    import transformers
+
+    try:
+        local_file = Path(tokenizer_name) / "tokenizer_config.json"
+        if local_file.is_file():
+            config_file = str(local_file)
+        elif Path(tokenizer_name).is_dir():
+            # A local checkpoint without tokenizer_config.json.
+            return False
+        else:
+            config_file = _resolve_local_or_cached_file(
+                tokenizer_name, "tokenizer_config.json", revision
+            )
+        with open(config_file) as f:
+            tok_class_name = json.load(f).get("tokenizer_class")
+    except (OSError, ValueError):
+        return False
+    if isinstance(tok_class_name, (list, tuple)):
+        tok_class_name = tok_class_name[0] if tok_class_name else None
+    if not isinstance(tok_class_name, str) or not tok_class_name:
+        return False
+    if tok_class_name in _ABSTRACT_TOKENIZER_CLASS_NAMES:
+        return True
+    tok_cls = getattr(transformers, tok_class_name, None)
+    return tok_cls is not None and inspect.isabstract(tok_cls)
+
+
 def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
     """Call ``AutoTokenizer.from_pretrained`` with error handling."""
+    revision = common_kwargs.get("tokenizer_revision") or common_kwargs.get("revision")
+    if _declared_tokenizer_class_is_abstract(tokenizer_name, revision):
+        backend = _load_tokenizers_backend_direct(
+            tokenizer_name, *args, **common_kwargs
+        )
+        if backend is not None:
+            logger.info(
+                "Load %s via TokenizersBackend: tokenizer_config.json declares "
+                "an abstract tokenizer_class, so the slow backend has no vocab",
+                tokenizer_name,
+            )
+            return backend
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name, *args, **common_kwargs
@@ -194,6 +277,14 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
             return retry_without_mistral_common_kwargs(
                 tokenizer_name, *args, **common_kwargs
             )
+        # The declared tokenizer class is an abstract base (e.g.
+        # PreTrainedTokenizer): no slow vocab exists, but tokenizer.json does.
+        if "Couldn't instantiate the backend tokenizer" in str(e):
+            backend = _load_tokenizers_backend_direct(
+                tokenizer_name, *args, **common_kwargs
+            )
+            if backend is not None:
+                return backend
         # If the error pertains to the tokenizer class not existing or not
         # currently being imported, suggest using the --trust-remote-code flag.
         if not common_kwargs.get("trust_remote_code") and (
@@ -207,6 +298,16 @@ def _auto_tokenizer_from_pretrained(tokenizer_name, *args, **common_kwargs):
                 "or using the `--trust-remote-code` flag in the CLI."
             )
             raise RuntimeError(err_msg) from e
+        raise
+    except HF_STRICT_CONFIG_ERRORS:
+        # AutoTokenizer's internal model-config load failed on a
+        # strict-dataclass config; the tokenizer itself is still loadable
+        # from tokenizer.json.
+        backend = _load_tokenizers_backend_direct(
+            tokenizer_name, *args, **common_kwargs
+        )
+        if backend is not None:
+            return backend
         raise
 
 
@@ -229,11 +330,25 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
         tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_name, *args, **common_kwargs
         )
-    except (ValueError, TypeError, OSError, ImportError, RuntimeError) as e:
-        raise RuntimeError(
-            f"Retry with use_fast=False for {tokenizer_name} also failed "
-            f"(initial load returned TokenizersBackend): {e}"
-        ) from e
+    except (
+        *HF_STRICT_CONFIG_ERRORS,
+        ValueError,
+        TypeError,
+        OSError,
+        ImportError,
+        RuntimeError,
+    ) as e:
+        # The initial load failed for a reason that repeats here (abstract
+        # declared class or strict-dataclass config); tokenizer.json is the
+        # last resort.
+        tokenizer = _load_tokenizers_backend_direct(
+            tokenizer_name, *args, **common_kwargs
+        )
+        if tokenizer is None:
+            raise RuntimeError(
+                f"Retry with use_fast=False for {tokenizer_name} also failed "
+                f"(initial load returned TokenizersBackend): {e}"
+            ) from e
 
     if type(tokenizer).__name__ == _TOKENIZERS_BACKEND:
         tokenizer = (
@@ -576,9 +691,7 @@ def get_tokenizer(
 
     try:
         if is_bare_tekken_checkpoint(tokenizer_name, revision):
-            from transformers.tokenization_mistral_common import (
-                MistralCommonTokenizer,
-            )
+            from transformers.tokenization_mistral_common import MistralCommonTokenizer
 
             logger.info(
                 "Detected bare-tekken checkpoint %s (tekken.json, no "
