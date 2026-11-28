@@ -1487,19 +1487,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     ) -> List[int]:
         """Map source entries to destination entries for this transfer.
 
-        Heterogeneous PP over a plain MLA pool uses the source stage's layer span.
+        PP or DSA cache layer split over a plain MLA pool uses its layer span.
         All other layouts use explicit layer IDs, or positional pairing for non-PP.
         """
-        use_pp_mla_offsets = (
-            self.pp_size > 1
-            and n_src != n_dst
+        use_mla_offsets = (
+            n_src != n_dst
             and not self.kv_args.kv_layer_ids
             and not peer_info.dst_kv_layer_ids
             and self.is_mla_backend
             and not self.is_hybrid_mla_backend
             and not self.kv_args.mla_compression_ratios
         )
-        if not use_pp_mla_offsets:
+        if not use_mla_offsets:
             pairs = build_transfer_entry_pairs(
                 self.kv_args.kv_layer_ids,
                 peer_info.dst_kv_layer_ids,
@@ -1522,15 +1521,19 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             return [j for _, j in pairs]
 
-        indices = list(range(start, end))
+        # Map local target layers and append draft KV from the decode pool's tail.
+        _, indices, _ = self.get_mla_kv_ptrs_with_pp(
+            list(range(n_src)), list(range(n_dst))
+        )
         src_item_lens = list(self.kv_args.kv_item_lens)
         dst_item_lens = [peer_info.dst_kv_item_lens[j] for j in indices]
         if src_item_lens != dst_item_lens:
             # Disagreeing cell sizes mean the peers did not build the same KV geometry;
             # writing anyway would silently corrupt the peer's pool.
             raise RuntimeError(
-                "PP-heterogeneous MLA transfer: decode KV cell geometry differs from "
-                f"prefill over layers [{start}, {end}): prefill item_lens="
+                "MLA layer-offset transfer (PP or DSA cache layer split): decode KV "
+                f"cell geometry differs from prefill over layers [{start}, {end}): "
+                f"prefill item_lens="
                 f"{src_item_lens}, decode item_lens={dst_item_lens}"
             )
         return indices
