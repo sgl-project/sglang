@@ -503,10 +503,11 @@ async def benchmark_shared_prefix_pct(
 
     if prefix_len > 0:
         print(f"Warming shared prefix only ({prefix_len} tokens) ...")
-        prefix_ids = prompts[0]["input_ids"]
-        if suffix_len:
-            prefix_ids = prefix_ids[:prefix_len]
-        await warm_shared_prefix(api_url=api_url, shared_prefix_ids=prefix_ids)
+        first_ids = prompts[0]["input_ids"]
+        await warm_shared_prefix(
+            api_url=api_url,
+            shared_prefix_ids=first_ids[:prefix_len] if suffix_len else first_ids,
+        )
 
     print(f"Sending requests (max_concurrency={args.max_concurrency}) ...")
     benchmark_start_time = time.perf_counter()
