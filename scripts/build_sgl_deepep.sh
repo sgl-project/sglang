@@ -14,11 +14,16 @@ usage() {
 Usage: build_sgl_deepep.sh <python-version> <cuda-version> <deepep-source> [architecture]
 
   python-version:     3.11, 3.12, or 3.13
-  cuda-version:       13.0
+  cuda-version:       13.0 or 13.4
   deepep-source:      DeepEP checkout containing the sgl_deep_ep package
   architecture:       x86_64 or aarch64 (defaults to the current machine)
 
 Set SGL_DEEP_EP_VERSION to override the checked-in package version.
+Set TORCH_VERSION to override the PyTorch version the wheel is built against
+(defaults: 2.14.1 for CUDA 13.0, 2.15.0 for CUDA 13.4). The wheel requires
+exactly that torch version.
+
+Only the CUDA 13.0 build also writes a PyPI wheel to <deepep-source>/dist-pypi.
 EOF
 }
 
@@ -47,6 +52,11 @@ esac
 case "${CUDA_VERSION}" in
     13.0)
         CUDA_TAG=cu130
+        DEFAULT_TORCH_VERSION=2.14.1
+        ;;
+    13.4)
+        CUDA_TAG=cu134
+        DEFAULT_TORCH_VERSION=2.15.0
         ;;
     *)
         echo "Unsupported CUDA version: ${CUDA_VERSION}" >&2
@@ -78,6 +88,7 @@ if ! command -v docker >/dev/null; then
     exit 1
 fi
 
+TORCH_VERSION="${TORCH_VERSION:-${DEFAULT_TORCH_VERSION}}"
 PYTHON_TAG="cp${PYTHON_VERSION//.}-cp${PYTHON_VERSION//.}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPOSITORY_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -91,6 +102,7 @@ mkdir -p "${DIST_DIR}" "${PYPI_DIST_DIR}"
 echo "----------------------------------------"
 echo "Python:            ${PYTHON_VERSION} (${PYTHON_TAG})"
 echo "CUDA:              ${CUDA_VERSION} (${CUDA_TAG})"
+echo "PyTorch:           ${TORCH_VERSION}"
 echo "Architecture:      ${ARCHITECTURE}"
 echo "Base image:        ${BASE_IMAGE}:cuda${CUDA_VERSION}"
 echo "DeepEP source:     ${DEEPEP_SOURCE}"
@@ -104,7 +116,7 @@ docker build \
     --build-arg CUDA_TAG="${CUDA_TAG}" \
     --build-arg PYTHON_TAG="${PYTHON_TAG}" \
     --build-arg ARCHITECTURE="${ARCHITECTURE}" \
-    --build-arg TORCH_VERSION="${TORCH_VERSION:-2.14.1}" \
+    --build-arg TORCH_VERSION="${TORCH_VERSION}" \
     --tag "${IMAGE_TAG}" \
     --network=host \
     "${REPOSITORY_ROOT}/docker"

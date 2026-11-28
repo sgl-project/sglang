@@ -51,7 +51,7 @@ jobs:
       matrix:
         include:
           - python-version: "3.11"
-            cuda-version: "13.0"
+            cuda-version: "13.4"
     name: ${{ inputs.job_display_name }}
     steps:
       - name: Cleanup

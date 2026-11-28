@@ -67,6 +67,14 @@ Use Python 3.11 or higher and a compatible CUDA 13 environment.
 
 SGLang requires CUDA 13. CUDA 12 (`cu129`) wheels and images were retired with the upgrade to PyTorch 2.14, which publishes no CUDA 12.9 builds. SGLang 0.5.19 is the last release with a CUDA 12 lane (PyTorch 2.13).
 
+SGLang is built and tested against PyTorch 2.15 for CUDA 13.4 (`cu134`). PyPI's default PyTorch 2.15 Linux wheel targets CUDA 13.2, so add the PyTorch `cu134` index to get the build CI tests:
+
+```bash Command
+uv pip install --prerelease=allow --index-strategy unsafe-best-match --extra-index-url https://download.pytorch.org/whl/cu134 sglang
+```
+
+A source checkout installed with uv (`uv pip install -e "python"`) takes the `cu134` build automatically through `[tool.uv.sources]` in `python/pyproject.toml`; pip ignores that table and needs the same `--extra-index-url`.
+
 </Accordion>
 
 **Prepare the environment**
