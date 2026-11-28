@@ -415,6 +415,7 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
                 SimpleNamespace(beam_group=Mock() if beam else None),
                 SimpleNamespace(beam_group=None),
             ],
+            decode_to_extend_prefix_lens=lambda: [4, 6],
         )
         with (
             patch.object(
@@ -450,6 +451,79 @@ class TestDecodeToExtendConversionVote(CustomTestCase):
 
     def test_beam_request_blocks_conversion(self):
         self.assertFalse(self._vote(beam=True))
+
+    def test_vote_judges_the_converted_prefix(self):
+        """A runner whose captured breaks went through the MHA companion
+        replays only prefix-free batches. The vote used to judge a decode batch
+        with no prefix, so this rank voted to replay and, once converted to a
+        prefix-carrying extend, ran eager at forward time while its peers
+        replayed."""
+        runner_cls = dp_attn.PrefillCudaGraphRunner
+        runner = Mock(spec=runner_cls)
+        runner.enable_lora = False
+        runner.max_context_size = None
+        runner.max_seq_len = None
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._is_full_backend = False
+        runner._captured_attn_metadata_max_bs = None
+        runner.prefer_eager_mixed_prefill = False
+        runner._captured_attn_states = frozenset({object()})
+        runner._has_uncapturable_chunked_prefix.return_value = False
+        runner.capture_hidden_mode = None
+        runner.max_num_tokens = 64
+        runner.capture_num_tokens = [2, 64]
+        runner._pad_to_bucket = runner_cls._pad_to_bucket
+        runner.can_replay_locally.side_effect = lambda **kwargs: (
+            runner_cls.can_replay_locally(self=runner, **kwargs)
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=lambda: 2,
+            return_logprob=False,
+            has_grammar=False,
+            multimodal_inputs=None,
+            reqs=[SimpleNamespace(beam_group=None), SimpleNamespace(beam_group=None)],
+            decode_to_extend_prefix_lens=lambda: [4, 6],
+        )
+
+        def vote(companion):
+            runner._captured_mha_companion = companion
+            with (
+                patch.object(
+                    dp_attn,
+                    "get_moe_a2a_backend",
+                    return_value=Mock(is_none=lambda: True),
+                ),
+                patch.object(dp_attn, "uses_ssm_state", return_value=False),
+                patch.object(
+                    dp_attn,
+                    "get_memory",
+                    return_value=SimpleNamespace(enable_hisparse=False),
+                ),
+                patch.object(
+                    dp_attn,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        overlap=SimpleNamespace(enable_two_batch_overlap=False)
+                    ),
+                ),
+                patch.object(dp_attn, "get_cp_strategy", return_value=None),
+            ):
+                return dp_attn._local_prefill_cuda_graph_vote(
+                    local_batch=batch,
+                    num_tokens=2,
+                    prefill_graph_runner=runner,
+                    coordinated_prefill=True,
+                    breakable_prefill=True,
+                    spec_algorithm=SpeculativeAlgorithm.NONE,
+                    model_config=object(),
+                )
+
+        self.assertFalse(vote(companion=True))
+        self.assertTrue(vote(companion=False))
+        self.assertEqual(
+            runner.can_replay_locally.call_args.kwargs["prefix_lens"], [4, 6]
+        )
 
 
 class TestPrefillCudaGraphVote(CustomTestCase):
@@ -515,7 +589,8 @@ class TestPrefillCudaGraphVote(CustomTestCase):
         runner._captured_attn_metadata_max_bs = 2
         runner.prefer_eager_mixed_prefill = False
         runner.prefill_backend_name = Backend.BREAKABLE
-        runner.has_mha_companion_layers = False
+        runner._captured_attn_states = frozenset()
+        runner._captured_mha_companion = False
         runner._has_uncapturable_chunked_prefix.return_value = False
         runner.max_num_tokens = 64
         runner.capture_num_tokens = [64]

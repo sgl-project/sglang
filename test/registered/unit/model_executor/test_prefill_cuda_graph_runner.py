@@ -33,6 +33,10 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    PrefillAttentionBreaks,
+    PrefillAttentionState,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -134,7 +138,6 @@ def _load_batch_runner(backend):
     runner._is_full_backend = False
     runner._is_breakable_backend = isinstance(backend, BreakableCudaGraphBackend)
     runner.backend = backend
-    runner.has_mha_companion_layers = False
     runner._prefill_static_buffers = None
     runner.static_draft_hidden_states = None
     runner.capture_return_pooled_hidden_states = False
@@ -551,6 +554,37 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         self.assertIs(static_batch.input_candidate_selectors, selectors)
         self.assertEqual(static_batch.token_ids_logprobs, [[7]])
 
+    def test_breakable_capture_detects_mha_companion_breaks(self):
+        """Prefix gating follows the layers that broke, not the fields they set."""
+        mla, mha = object(), object()
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.mha_companion_layers = [None, mha]
+        for broken_layers, expected in (({mla}, False), ({mla, mha}, True)):
+            runner._publish_attention_breaks(
+                PrefillAttentionBreaks(
+                    states={PrefillAttentionState()}, layers=broken_layers
+                )
+            )
+            self.assertIs(runner._captured_mha_companion, expected)
+            self.assertEqual(runner._breakable_attn_state, PrefillAttentionState())
+
+    def test_breakable_replay_restores_the_captured_attention_state(self):
+        """Replay sees exactly the captured state: none for MLA, MHA's for MHA."""
+        mha = PrefillAttentionState(
+            mha_one_shot=True, mha_return_lse=False, attn_attend_prefix_cache=False
+        )
+        for captured, expected in (
+            ((), PrefillAttentionState()),
+            ({PrefillAttentionState()}, PrefillAttentionState()),
+            ({mha}, mha),
+        ):
+            runner = _load_batch_runner(SimpleNamespace())
+            runner._captured_attn_states = frozenset(captured)
+
+            static_batch, _ = runner.load_batch(_three_token_extend(runner))
+
+            self.assertEqual(PrefillAttentionState.of(static_batch), expected)
+
     def test_eagle_target_full_reaches_graph_construction(self):
         override = get_context().override_server_args(
             enable_return_hidden_states=True,
@@ -753,7 +787,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_context_size = None
         runner.max_seq_len = None
         runner._capture_chunked_prefix = False
-        runner.has_mha_companion_layers = False
 
         batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -822,7 +855,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_seq_len = None
         runner.backend = SimpleNamespace()
         runner.prefill_backend_name = Backend.FULL
-        runner.has_mha_companion_layers = False
         runner._prefix_chunk_len = 2
         runner._prefix_capture_variants = (1, 2, 4)
 

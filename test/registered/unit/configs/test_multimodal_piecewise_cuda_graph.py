@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from sglang.srt.arg_groups.cuda_graph_hook import apply_cuda_graph_compatibility
 from sglang.srt.arg_groups.model_hook import handle_model_capability_adjustments
@@ -11,7 +11,6 @@ from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
 from sglang.srt.configs.model_config import (
     AttentionArch,
 )
-from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -20,6 +19,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    PrefillAttentionState,
 )
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
@@ -38,7 +40,6 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
         runner.enable_lora = False
         runner._capture_chunked_prefix = False
         runner.prefill_backend_name = backend
-        runner.has_mha_companion_layers = backend == Backend.BREAKABLE
         runner.capture_hidden_mode = CaptureHiddenMode.NULL
         runner.capture_num_tokens = [4, 16]
         runner.max_context_size = None
@@ -92,26 +93,40 @@ class TestMultimodalPiecewiseCudaGraph(CustomTestCase):
 
         self.assertTrue(runner.can_run_graph(self._make_multimodal_forward_batch()))
 
-    def test_breakable_prefill_takes_nonzero_prefix_on_cuda_only(self):
+    def _can_run_after_capture(self, *, prefix_len, states=(), mha_companion=False):
         runner = self._make_prefill_runner(Backend.BREAKABLE)
+        runner._captured_attn_states = frozenset(states)
+        runner._captured_mha_companion = mha_companion
         forward_batch = self._make_multimodal_forward_batch()
-        forward_batch.extend_prefix_lens_cpu = [1]
+        forward_batch.extend_prefix_lens_cpu = [prefix_len]
+        return runner.can_run_graph(forward_batch)
 
-        target = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda"
-        with patch(target, return_value=True):
-            self.assertTrue(runner.can_run_graph(forward_batch))
-        with patch(target, return_value=False):
-            self.assertFalse(runner.can_run_graph(forward_batch))
+    def test_breakable_prefill_takes_nonzero_prefix_after_mla_capture(self):
+        """An MLA capture keeps prefix replays on every platform, not only CUDA."""
+        self.assertTrue(
+            self._can_run_after_capture(prefix_len=1, states={PrefillAttentionState()})
+        )
 
-    def test_breakable_prefill_takes_nonzero_prefix_off_cuda_for_dsa(self):
-        runner = self._make_prefill_runner(Backend.BREAKABLE)
-        runner.model_runner.attn_backend = MagicMock(spec=DeepseekSparseAttnBackend)
-        forward_batch = self._make_multimodal_forward_batch()
-        forward_batch.extend_prefix_lens_cpu = [1]
+    def test_breakable_prefill_rejects_nonzero_prefix_after_mha_capture(self):
+        """An MHA companion capture is prefix-free, whatever fields it left set."""
+        mha = PrefillAttentionState(
+            mha_one_shot=True, mha_return_lse=False, attn_attend_prefix_cache=False
+        )
+        # The second state is aiter's: its MHA core leaves every field unset.
+        for state in (mha, PrefillAttentionState()):
+            self.assertFalse(
+                self._can_run_after_capture(
+                    prefix_len=1, states={state}, mha_companion=True
+                )
+            )
+        self.assertTrue(
+            self._can_run_after_capture(prefix_len=0, states={mha}, mha_companion=True)
+        )
 
-        target = "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda"
-        with patch(target, return_value=False):
-            self.assertTrue(runner.can_run_graph(forward_batch))
+    def test_breakable_prefill_stays_eager_after_mixed_capture(self):
+        """One replay restore cannot serve breaks captured in different states."""
+        mixed = {PrefillAttentionState(), PrefillAttentionState(mha_one_shot=True)}
+        self.assertFalse(self._can_run_after_capture(prefix_len=0, states=mixed))
 
     def test_embedding_gemma_forces_breakable_prefill(self):
         args = ServerArgs(model_path="dummy")
