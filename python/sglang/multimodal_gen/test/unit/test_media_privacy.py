@@ -310,6 +310,32 @@ def test_request_logger_requires_opt_in_for_reproduction_inputs():
         assert "secret-text" not in str(logger._result_view(result))
 
 
+def test_ci_request_logger_records_full_prompts_once(monkeypatch):
+    from sglang.multimodal_gen.runtime.utils.request_logger import (
+        DiffusionRequestLogger,
+    )
+
+    monkeypatch.setenv("SGLANG_DIFFUSION_CI_DIAGNOSTICS", "1")
+    logger = DiffusionRequestLogger(True, 3, "text", None)
+    target = Mock()
+    logger.targets = [target]
+    prompt = "synthetic positive " * 160
+    negative = "synthetic negative " * 160
+    req = SimpleNamespace(
+        request_id="test",
+        sampling_params=SimpleNamespace(
+            prompt=prompt, negative_prompt=negative, seed=42
+        ),
+    )
+    logger.log_received_request(req)
+    logger.log_finished_request(req, SimpleNamespace(error=None))
+    received, finished = (call.args[0] for call in target.info.call_args_list)
+    assert prompt in received and negative in received
+    assert "'prompt':" not in finished and "'negative_prompt':" not in finished
+    assert "synthetic" not in finished
+    assert "'seed': 42" in finished and "e2e_latency" in finished
+
+
 @pytest.mark.parametrize("success", [True, False])
 def test_ephemeral_mesh_upload_lives_exactly_as_long_as_job(
     monkeypatch, tmp_path, success, gateway_key

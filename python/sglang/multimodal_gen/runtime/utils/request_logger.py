@@ -15,6 +15,7 @@
 
 from typing import Any, Optional
 
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.srt.environ import envs
 from sglang.srt.observability.request_logger import (
     _dataclass_to_string_truncated,
@@ -78,7 +79,9 @@ class DiffusionRequestLogger:
         """The request's id, or ``None`` if absent."""
         return getattr(req, "request_id", None)
 
-    def _config_view(self, req: Any, *, drop_seed: bool = False) -> dict:
+    def _config_view(
+        self, req: Any, *, drop_seed: bool = False, include_prompt: bool = True
+    ) -> dict:
         """Sampling config + (level >= 2) prompt, gated by the log level.
         Returns ``{}`` below level 1."""
         sp = getattr(req, "sampling_params", None)
@@ -88,7 +91,7 @@ class DiffusionRequestLogger:
         if drop_seed:
             cfg.pop("seed", None)
         view: dict = {"sampling_params": cfg}
-        if self.log_requests_level >= 2:
+        if include_prompt and self.log_requests_level >= 2:
             view["prompt"] = getattr(sp, "prompt", None)
             view["negative_prompt"] = getattr(sp, "negative_prompt", None)
         return view
@@ -118,16 +121,22 @@ class DiffusionRequestLogger:
             view["seed"] = getattr(sp, "seed", None) if sp is not None else None
         return view
 
-    def _batch_record(self, reqs: list) -> tuple:
+    def _batch_record(self, reqs: list, *, include_prompt: bool = True) -> tuple:
         """Build the ``rid`` / ``obj`` for one forward call"""
         rids = [self._request_id(req) or "unknown" for req in reqs]
         if len(reqs) == 1:
             # Single request: scalar rid + flat dict obj (id + config).
             req = reqs[0]
-            obj = {"request_id": self._request_id(req), **self._config_view(req)}
+            obj = {
+                "request_id": self._request_id(req),
+                **self._config_view(req, include_prompt=include_prompt),
+            }
             return rids[0], obj
 
-        shared_views = [self._config_view(req, drop_seed=True) for req in reqs]
+        shared_views = [
+            self._config_view(req, drop_seed=True, include_prompt=include_prompt)
+            for req in reqs
+        ]
         if all(view == shared_views[0] for view in shared_views):
             obj = {
                 **shared_views[0],
@@ -136,7 +145,10 @@ class DiffusionRequestLogger:
         else:
             # Configs genuinely differ: list each request's full payload verbatim.
             obj = [
-                {"request_id": self._request_id(req), **self._config_view(req)}
+                {
+                    "request_id": self._request_id(req),
+                    **self._config_view(req, include_prompt=include_prompt),
+                }
                 for req in reqs
             ]
         return rids, obj
@@ -185,7 +197,10 @@ class DiffusionRequestLogger:
         if self.log_exceeded_ms > 0 and e2e_latency_ms < self.log_exceeded_ms:
             return
 
-        rid, obj = self._batch_record(reqs)
+        # CI already recorded the full test inputs on receipt.
+        rid, obj = self._batch_record(
+            reqs, include_prompt=not diffusion_envs.SGLANG_DIFFUSION_CI_DIAGNOSTICS
+        )
         max_length = self._max_length
 
         if self.log_requests_format == "json":

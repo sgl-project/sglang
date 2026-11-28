@@ -426,7 +426,7 @@ class ServerManager:
             *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
         if is_in_ci():
-            command.extend(["--log-requests", "--log-requests-level", "1"])
+            command.extend(["--log-requests", "--log-requests-level", "3"])
         if self.extra_args.strip():
             command.extend(shlex.split(self.extra_args))
         access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
