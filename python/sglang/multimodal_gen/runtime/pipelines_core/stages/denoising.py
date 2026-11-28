@@ -91,6 +91,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
     world_group_is_initialized,
 )
+from sglang.multimodal_gen.runtime.distributed.pipeline_parallel import (
+    overlap_stage_outputs,
+)
 from sglang.multimodal_gen.runtime.layers.attention import layer as attention_layer
 from sglang.multimodal_gen.runtime.layers.attention.backends.skip_softmax import (
     set_request_skip_softmax_params,
@@ -2450,7 +2453,8 @@ class DenoisingStage(PipelineStage):
                 predictions = predict_batched_fn(*cfg_policy.branches)
             if predictions is None:
                 # perform cfg branches one-by-one locally
-                predictions = [predict_fn(branch) for branch in cfg_policy.branches]
+                with overlap_stage_outputs():
+                    predictions = [predict_fn(branch) for branch in cfg_policy.branches]
 
         return cfg_policy.combine(
             predictions,

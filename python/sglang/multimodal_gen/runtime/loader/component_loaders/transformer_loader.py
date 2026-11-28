@@ -607,4 +607,6 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
 
         _warn_if_expected_param_dtype_missing(model, quant_spec.param_dtype)
 
+        if component_server_args.pp_size > 1 and not hasattr(model, "_pp_owned"):
+            raise ValueError(f"{type(model).__name__} does not support --pp-size > 1")
         return model
