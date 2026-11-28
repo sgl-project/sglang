@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
     DSV4AttnMetadata,
     late_layer_whole_extend,
 )
+from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.mm_utils import pad_mm_tokens
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
@@ -537,11 +538,133 @@ class TestFoldedReplayUnderPrefillGraph(CustomTestCase):
         torch.testing.assert_close(raw, fb.out_cache_loc)
 
 
+class TestFoldedReplayUnderCP(CustomTestCase):
+    def test_uneven_cp_queries_do_not_commit_padding_or_shard_window_writes(self):
+        """CP8 has padded per-rank queries but gathers only real global KV rows.
+
+        The folded hits must keep the same request floors and ring commits as
+        CP1. A padding row may neither enter the ring nor acquire a write slot
+        in the gathered KV stream.
+        """
+        fx = _Fixture()
+        cp_size = 8
+        full = _extend_batch(fx)
+        live = full.out_cache_loc.numel()
+        padded = -(-live // cp_size) * cp_size
+        self.assertGreater(padded, live)
+        full.attn_cp_metadata = InterleaveContextParallelMetadata(
+            per_rank_actual_token=[padded // cp_size] * cp_size,
+            max_rank_len=[padded // cp_size] * cp_size,
+            total_seq_lens=live,
+            bs=full.batch_size,
+            per_rank_logical_token=[
+                len(range(rank, live, cp_size)) for rank in range(cp_size)
+            ],
+        )
+        expected = _build_metadata(
+            fx, _extend_batch(fx)
+        ).core_attn_metadata.request_window_layout
+        for rank in (0, cp_size - 1):
+            with (
+                self.subTest(rank=rank),
+                patch(
+                    "sglang.srt.layers.attention.deepseek_v4_backend.is_cp_active",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+                    return_value=SimpleNamespace(
+                        attn_cp_size=cp_size, attn_cp_rank=rank
+                    ),
+                ),
+            ):
+                core = _build_metadata(fx, full).core_attn_metadata
+            layout = core.request_window_layout
+            self.assertEqual(layout.pos.numel(), padded)
+            for field in (
+                "pos",
+                "req",
+                "write_loc",
+                "indices",
+                "lengths",
+                "commit_mask",
+            ):
+                torch.testing.assert_close(
+                    getattr(layout, field)[:live], getattr(expected, field)
+                )
+            self.assertFalse(bool(layout.commit_mask[live:].any()))
+            self.assertTrue(bool((layout.indices[live:] == -1).all()))
+            torch.testing.assert_close(core.swa_out_cache_loc, expected.write_loc)
+            torch.testing.assert_close(
+                core.swa_topk_lengths, layout.lengths[rank::cp_size]
+            )
+            torch.testing.assert_close(
+                core.swa_page_indices, layout.indices[rank::cp_size]
+            )
+
+    def test_compact_cp_tail_keeps_global_write_layout_and_local_queries(self):
+        """Decoder replay pads compact rank shards independently of the tail's
+        global order; padding must never become a request-window commit."""
+        fx = _Fixture()
+        full = _extend_batch(fx)
+        full.capture_hidden_mode = CaptureHiddenMode.NULL
+        full.return_logprob = False
+        backend = _backend(fx)
+        core_module = "sglang.srt.layers.attention.deepseek_v4_backend"
+        with (
+            patch.object(DSV4AttnMetadata, "init_compression_metadata"),
+            patch.object(DSV4AttnMetadata, "init_flashmla_related"),
+        ):
+            reference = backend._build_late_layer_tail_metadata(full)
+            expected = reference.core_attn_metadata.request_window_layout
+            for rank in (0, 7):
+                with (
+                    self.subTest(rank=rank),
+                    patch(f"{core_module}.is_cp_active", return_value=True),
+                    patch(
+                        f"{core_module}.get_parallel",
+                        return_value=SimpleNamespace(attn_cp_size=8, attn_cp_rank=rank),
+                    ),
+                ):
+                    actual = backend._build_late_layer_tail_metadata(full)
+                layout = actual.core_attn_metadata.request_window_layout
+                tail = actual.late_layer_tail
+                live = sum(tail.extend_seq_lens_cpu)
+                self.assertGreater(layout.pos.numel(), live)
+                torch.testing.assert_close(
+                    layout.commit_mask[:live], expected.commit_mask
+                )
+                self.assertFalse(bool(layout.commit_mask[live:].any()))
+                torch.testing.assert_close(tail.swa_out_cache_loc, expected.write_loc)
+                torch.testing.assert_close(
+                    actual.core_attn_metadata.swa_out_cache_loc, expected.write_loc
+                )
+                torch.testing.assert_close(
+                    actual.core_attn_metadata.swa_page_indices,
+                    layout.indices[tail.cp_metadata.local_index],
+                )
+                torch.testing.assert_close(
+                    actual.core_attn_metadata.swa_topk_lengths,
+                    layout.lengths[tail.cp_metadata.local_index],
+                )
+                backend.forward_metadata = actual
+                backend.pre_kv_store_hook = None
+                backend.token_to_kv_pool.request_window.activate = MagicMock()
+                torch.testing.assert_close(
+                    backend.get_swa_out_cache_loc(full), expected.write_loc
+                )
+
+
 class TestEncoderReplayPrefillGraphGate(CustomTestCase):
-    def _validate(self, prefill_backend):
+    def _validate(self, prefill_backend, *, cp_size=1, mode="null"):
         args = ServerArgs(
             model_path="local-deepseek-v41",
             attention_backend="dsv4",
+            tp_size=cp_size,
+            attn_cp_size=cp_size,
+            enable_prefill_cp=cp_size > 1,
+            cp_strategy="interleave",
+            disaggregation_mode=mode,
             enable_encoder_swa_bounded_replay=True,
             enable_decoder_swa_bounded_replay=False,
             cuda_graph_config=CudaGraphConfig(
@@ -563,6 +686,14 @@ class TestEncoderReplayPrefillGraphGate(CustomTestCase):
                 self.assertRaisesRegex(ValueError, "other than breakable"),
             ):
                 self._validate(backend)
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_eager_cuda_interleave_cp_can_replay_but_graphs_and_pd_cannot(self):
+        self._validate(Backend.DISABLED, cp_size=8)
+        with self.assertRaisesRegex(ValueError, "outside eager CUDA interleave"):
+            self._validate(Backend.BREAKABLE, cp_size=8)
+        with self.assertRaisesRegex(ValueError, "outside eager CUDA interleave"):
+            self._validate(Backend.DISABLED, cp_size=8, mode="prefill")
 
     @override_platform(is_cuda=False, is_hip=True)
     def test_rocm_rejects_the_prefill_graph(self):
@@ -747,6 +878,7 @@ class TestEncoderReplayDpStartupCheck(CustomTestCase):
             ),
             enable_encoder_swa_bounded_replay=True,
             attn_cp_size=1,
+            enable_prefill_cp=False,
             attn_dp_size=attn_dp_size,
             ep_join_mode=None,
             enable_unified_cache_external_linker=False,
