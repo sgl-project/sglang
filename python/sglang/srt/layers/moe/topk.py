@@ -1086,10 +1086,15 @@ def fused_topk_torch_native(
 
     if correction_bias is not None:
         n_routed_experts = gating_output.shape[-1]
+        if scoring_func == "softmax":
+            # fp32 softmax like the reference: the bias is a large offset with a ~1e-3 spread,
+            # so bf16 probabilities change the selection.
+            gating_output = gating_output.float()
         scores = scoring_func_impl(gating_output)
-        scores_for_choice = scores.view(
-            -1, n_routed_experts
-        ) + correction_bias.unsqueeze(0)
+        # The bias may be (E,) or (1, E).
+        scores_for_choice = scores.view(-1, n_routed_experts) + correction_bias.reshape(
+            1, n_routed_experts
+        )
         topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False)[1]
         topk_weights = scores.gather(1, topk_ids)
     else:
@@ -1219,6 +1224,37 @@ def fused_topk(
     num_token_non_padded: Optional[torch.Tensor] = None,
 ):
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    if scoring_func == "softmax" and correction_bias is not None:
+        # Rank by softmax(logits) + bias, gate with the unbiased probabilities (ERNIE-4.5);
+        # the plain softmax branches below would drop the bias.
+        if _is_cuda or _is_hip:
+            from sglang.kernels.ops.moe.moe_fused_gate import (
+                moe_fused_gate as _jit_moe_fused_gate,
+            )
+
+            return _jit_moe_fused_gate(
+                gating_output,
+                correction_bias.reshape(-1),
+                topk,
+                scoring_func="softmax",
+                num_fused_shared_experts=num_fused_shared_experts,
+                renormalize=renormalize,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                num_token_non_padded=num_token_non_padded,
+                packed_out=packed_out,
+                softmax_bias_on_probs=True,
+            )
+        topk_weights, topk_ids = fused_topk_torch_native(
+            hidden_states=hidden_states,
+            gating_output=gating_output,
+            topk=topk,
+            renormalize=renormalize,
+            correction_bias=correction_bias,
+            scoring_func=scoring_func,
+        )
+        return topk_weights, topk_ids.to(torch.int32)
 
     M, _ = hidden_states.shape
 
