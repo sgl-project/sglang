@@ -22,13 +22,11 @@ from sglang.kernels.jit.utils.compile.loader import load_jit
 from sglang.kernels.jit.utils.compile.parallel import parallel_compile
 from sglang.kernels.jit.utils.compile.paths import DEFAULT_INCLUDE, KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
-from sglang.kernels.jit.utils.compile.toolchain import cuda_stubs_dir
 
 __all__ = [
     "BuildSpec",
     "DEFAULT_INCLUDE",
     "KERNEL_PATH",
-    "cuda_stubs_dir",
     "load_jit",
     "make_cpp_args",
     "parallel_compile",

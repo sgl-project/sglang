@@ -29,7 +29,6 @@ def _module() -> Module:
         "vsa_block_sparse_sm100",
         cuda_files=["diffusion/vsa_block_sparse_sm100.cuh"],
         cuda_wrappers=[("vsa_block_sparse_sm100", "VsaBlockSparseSm100Kernel::run")],
-        extra_ldflags=["-lcuda"],
     )
 
 

@@ -33,9 +33,9 @@
 //
 // Build (torch cpp_extension JIT):
 //   -O3 -std=c++20 -gencode arch=compute_{100a,103a},code=sm_{100a,103a}
-//   (the device's arch) -use_fast_math -lineinfo, link -lcuda
-//   (cuTensorMapEncodeTiled). Only the tcgen05 cta_group::1 subset that sm_100a
-//   and sm_103a share is used, so both B200 and B300 run it.
+//   (the device's arch) -use_fast_math -lineinfo. Only the tcgen05
+//   cta_group::1 subset that sm_100a and sm_103a share is used, so both B200
+//   and B300 run it.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -3073,15 +3073,25 @@ __global__ void __launch_bounds__(512) k2_chain_tc_vl(
 
 // Host side: tensor-map encoders, cached workspace, torch entry point.
 
-#define KDA_CU_CHECK(expr)                                                                             \
-  do {                                                                                                 \
-    CUresult _e = (expr);                                                                              \
-    if (_e != CUDA_SUCCESS) {                                                                          \
-      const char* _s = nullptr;                                                                        \
-      cuGetErrorString(_e, &_s);                                                                       \
-      TORCH_CHECK(false, "CUDA driver call failed at ", __FILE__, ":", __LINE__, ": ", _s ? _s : "?"); \
-    }                                                                                                  \
+#define KDA_CU_CHECK(expr)                                                                                       \
+  do {                                                                                                           \
+    CUresult _e = (expr);                                                                                        \
+    TORCH_CHECK(                                                                                                 \
+        _e == CUDA_SUCCESS, "CUDA driver call failed at ", __FILE__, ":", __LINE__, ": ", static_cast<int>(_e)); \
   } while (0)
+
+// cuTensorMapEncodeTiled, resolved through the runtime so the extension does not link libcuda.
+template <typename... Args>
+static CUresult encode_tiled(Args... args) {
+  static const auto fn = [] {
+    void* sym = nullptr;
+    cudaDriverEntryPointQueryResult status;
+    C10_CUDA_CHECK(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &sym, 12000, cudaEnableDefault, &status));
+    TORCH_CHECK(status == cudaDriverEntryPointSuccess && sym != nullptr, "cuTensorMapEncodeTiled unavailable");
+    return reinterpret_cast<decltype(&::cuTensorMapEncodeTiled)>(sym);
+  }();
+  return fn(args...);
+}
 
 // TMA maps over K1's bf16 outputs (128B swizzle, K-major tiles)
 static CUtensorMap enc2d(void* ptr, uint64_t rows, uint64_t cols, uint32_t brows, uint32_t bcols) {
@@ -3090,7 +3100,7 @@ static CUtensorMap enc2d(void* ptr, uint64_t rows, uint64_t cols, uint32_t brows
   cuuint32_t bdim[2] = {bcols, brows};
   cuuint32_t estr[2] = {1, 1};
   CUtensorMap m{};
-  KDA_CU_CHECK(cuTensorMapEncodeTiled(
+  KDA_CU_CHECK(encode_tiled(
       &m,
       CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
       2,
@@ -3114,7 +3124,7 @@ static CUtensorMap enc2df(void* ptr, uint64_t rows, uint64_t cols) {
   cuuint32_t bdim[2] = {8, 128};
   cuuint32_t estr[2] = {1, 1};
   CUtensorMap m{};
-  KDA_CU_CHECK(cuTensorMapEncodeTiled(
+  KDA_CU_CHECK(encode_tiled(
       &m,
       CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
       2,
@@ -3138,7 +3148,7 @@ static CUtensorMap enc2dfn(void* ptr, uint64_t rows, uint64_t cols) {
   cuuint32_t bdim[2] = {(cuuint32_t)cols, BT};
   cuuint32_t estr[2] = {1, 1};
   CUtensorMap m{};
-  KDA_CU_CHECK(cuTensorMapEncodeTiled(
+  KDA_CU_CHECK(encode_tiled(
       &m,
       CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
       2,
@@ -3163,7 +3173,7 @@ static CUtensorMap enc2dgb(void* ptr, uint64_t rows, uint64_t cols) {
   cuuint32_t bdim[2] = {K, BT};
   cuuint32_t estr[2] = {1, 1};
   CUtensorMap m{};
-  KDA_CU_CHECK(cuTensorMapEncodeTiled(
+  KDA_CU_CHECK(encode_tiled(
       &m,
       CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
       2,

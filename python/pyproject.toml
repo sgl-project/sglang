@@ -31,6 +31,7 @@ dependencies = [
   "build",
   "compressed-tensors==0.18.0",
   "cuda-python>=13.0",
+  "cuda-toolkit[nvcc]",  # JIT nvcc; unversioned, so torch's cuda-toolkit pin keeps it at torch's CUDA minor
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "distro",

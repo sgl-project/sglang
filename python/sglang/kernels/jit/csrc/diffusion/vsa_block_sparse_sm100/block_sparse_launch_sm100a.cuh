@@ -78,13 +78,13 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
                        (uint64_t)SUB_COLS_BF16 * 2u };
     uint32_t bd[4] = { (uint32_t)SUB_COLS_BF16, 1u, (uint32_t)M_TILE, (uint32_t)Q_SUBTILES };
     uint32_t es[4] = { 1u, 1u, 1u, 1u };
-    if (cuTensorMapEncodeTiled(&tq_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
+    if (sglang::host::tma::encode_tiled_fn()(&tq_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
                                const_cast<__nv_bfloat16*>(a.q), gd, gs, bd, es,
                                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                                CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
                                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
       return cudaErrorInvalidValue;
-    if (cuTensorMapEncodeTiled(&to_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, a.o, gd, gs, bd, es,
+    if (sglang::host::tma::encode_tiled_fn()(&to_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, a.o, gd, gs, bd, es,
                                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                                CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
                                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
@@ -102,7 +102,7 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
     uint32_t bd[4] = { (uint32_t)SUB_COLS_BF16, (uint32_t)BLOCK,
                        BLK128 ? (uint32_t)K_SUBTILES : 1u, 1u };
     uint32_t es[4] = { 1u, 1u, 1u, 1u };
-    if (cuTensorMapEncodeTiled(&tk_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, BHSD ? 4 : 3,
+    if (sglang::host::tma::encode_tiled_fn()(&tk_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, BHSD ? 4 : 3,
                                const_cast<__nv_bfloat16*>(a.k), gd, gs, bd, es,
                                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                                CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
@@ -110,7 +110,7 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
       return cudaErrorInvalidValue;
     // V map is byte-for-byte the K map over a.v: MN-major V needs no transpose (blk128).
     const __nv_bfloat16* vbase = a.v ? a.v : a.k;
-    if (cuTensorMapEncodeTiled(&tv_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, BHSD ? 4 : 3,
+    if (sglang::host::tma::encode_tiled_fn()(&tv_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, BHSD ? 4 : 3,
                                const_cast<__nv_bfloat16*>(vbase), gd, gs, bd, es,
                                CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                                CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
@@ -126,7 +126,7 @@ __host__ inline cudaError_t launch_block_sparse_sm100a(const BlockSparseVsaArgs&
       uint64_t gs[2] = { (uint64_t)tq * 2u, (uint64_t)SUB_COLS_BF16 * 2u };
       uint32_t bd[3] = { (uint32_t)SUB_COLS_BF16, (uint32_t)hd, (uint32_t)V_SUBTILES };
       uint32_t es[3] = { 1u, 1u, 1u };
-      if (cuTensorMapEncodeTiled(&tvt_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
+      if (sglang::host::tma::encode_tiled_fn()(&tvt_, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
                                  const_cast<__nv_bfloat16*>(vt), gd, gs, bd, es,
                                  CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                                  CU_TENSOR_MAP_L2_PROMOTION_L2_128B,

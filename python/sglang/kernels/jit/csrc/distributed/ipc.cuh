@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cuda.h>
+#include <cudaTypedefs.h>
 #include <cuda_runtime.h>
 #include <functional>
 #include <map>
@@ -29,15 +30,28 @@ struct AllocationRange {
   size_t offset;
 };
 
+/// The driver's `cuMemGetAddressRange`, resolved once through the runtime, so the
+/// module does not link libcuda (the pip CUDA wheels ship no stub to link against).
+inline PFN_cuMemGetAddressRange_v3020 get_address_range_fn() {
+  static const auto fn = [] {
+    void* sym = nullptr;
+    cudaDriverEntryPointQueryResult status;
+#if CUDART_VERSION >= 12050
+    CHECK_CUDA(cudaGetDriverEntryPointByVersion("cuMemGetAddressRange", &sym, 3020, cudaEnableDefault, &status));
+#else  // the ByVersion query is CUDA 12.5+; older headers only have the unversioned one
+    CHECK_CUDA(cudaGetDriverEntryPoint("cuMemGetAddressRange", &sym, cudaEnableDefault, &status));
+#endif
+    RuntimeCheck(status == cudaDriverEntryPointSuccess && sym != nullptr, "cuMemGetAddressRange unavailable");
+    return reinterpret_cast<PFN_cuMemGetAddressRange_v3020>(sym);
+  }();
+  return fn;
+}
+
 inline auto get_allocation_range(uintptr_t ptr) -> AllocationRange {
   CUdeviceptr base = 0;
   size_t size = 0;
-  const CUresult res = cuMemGetAddressRange(&base, &size, ptr);
-  if (res != CUDA_SUCCESS) {
-    const char* name = nullptr;
-    cuGetErrorName(res, &name);
-    RuntimeCheck(false, "cuMemGetAddressRange failed: ", name ? name : "unknown");
-  }
+  const CUresult res = get_address_range_fn()(&base, &size, ptr);
+  RuntimeCheck(res == CUDA_SUCCESS, "cuMemGetAddressRange failed: ", static_cast<int>(res));
   const auto b = static_cast<uintptr_t>(base);
   return {.base = b, .size = size, .offset = ptr - b};
 }

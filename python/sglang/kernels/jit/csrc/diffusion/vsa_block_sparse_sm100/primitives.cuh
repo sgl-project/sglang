@@ -20,6 +20,8 @@
 #include <cstring>
 #include <vector_types.h>
 
+#include <sgl_kernel/ptx/async.cuh>  // encode_tiled_fn: cuTensorMapEncodeTiled without linking libcuda
+
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(stmt) do {                                                 \
     cudaError_t _e = (stmt);                                                  \
@@ -507,7 +509,7 @@ inline cudaError_t make_tma_2d_tiled(
   uint32_t boxDim[2]        = { (uint32_t)box_cols, (uint32_t)box_rows };
   uint32_t elemStrides[2]   = { 1u, 1u };
 
-  CUresult r = cuTensorMapEncodeTiled(
+  CUresult r = sglang::host::tma::encode_tiled_fn()(
       out, dtype, 2,
       const_cast<void*>(ptr), globalDim, globalStrides,
       boxDim, elemStrides,
