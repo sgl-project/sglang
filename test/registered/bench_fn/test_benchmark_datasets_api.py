@@ -402,6 +402,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
 
     def _write_openai_jsonl(self):
         rows = [
+            {"messages": []},
             {
                 "messages": [{"role": "user", "content": "What is 1+1?"}],
                 "max_tokens": 7,
@@ -412,6 +413,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 "max_tokens": 8,
                 "tools": [{"type": "function", "function": {"name": "tool_a"}}],
             },
+            {"messages": [{"role": "user", "content": "What is 3+3?"}]},
         ]
         path = self.tmpdir_path / "openai.jsonl"
         with open(path, "w") as f:
