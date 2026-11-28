@@ -87,12 +87,12 @@ patches:
 
 _PR_REVERT_YAML_26972 = """
 patches:
-  - target: sglang.srt.mem_cache.allocation_sizing.get_req_to_token_headroom
+  - target: sglang.srt.mem_cache.allocation_sizing.get_req_to_token_row_width
     edits:
       - match: |
-          return get_spec_decode_reach(get_alloc_page_size())
+          return context_len + get_max_decode_ahead(get_alloc_page_size())
         replacement: |
-          return 4 + (max_speculative_num_draft_tokens() or 0)
+          return context_len + 4 + (max_speculative_num_draft_tokens() or 0)
 """
 
 

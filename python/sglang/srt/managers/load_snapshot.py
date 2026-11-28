@@ -230,6 +230,11 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     # cumulative counters
     total_prefill_uncached_tokens: int = 0
     total_prefill_busy_us: int = 0
+    # Cumulative L3 storage-prefetch tokens: storage-hit tokens L3 queries
+    # returned, and those that did not become a usable prefetch, by reason
+    # (sglang:storage_prefetch_*_tokens_total). None without storage metrics.
+    total_storage_prefetch_hit_tokens: Optional[int] = None
+    total_storage_prefetch_unfulfilled_tokens: Optional[dict[str, int]] = None
     # Decode step-time moment sums
     decode_moments: Optional[list[float]] = None
 

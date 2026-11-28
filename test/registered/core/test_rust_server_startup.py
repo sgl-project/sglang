@@ -27,7 +27,10 @@ register_cuda_ci(est_time=200, stage="base-b", runner_config="1-gpu-small")
 class TestRustServerStartupWarmupFailure(CustomTestCase):
     def _launch_until_exit(self, rust_server: bool):
         host, port = DEFAULT_URL_FOR_TEST.removeprefix("http://").rsplit(":", 1)
-        # A context window shorter than the warmup prompt fails the warmup.
+        # A context window that admits a prompt of at most 2 tokens
+        # (max_req_input_len = 8 - 6) starts, but rejects the 7-token warmup
+        # prompt, so the warmup fails. A window too small for any prompt,
+        # such as 4, fails the scheduler startup before the warmup instead.
         command = [
             sys.executable,
             "-m",
@@ -39,7 +42,7 @@ class TestRustServerStartupWarmupFailure(CustomTestCase):
             "--port",
             port,
             "--context-length",
-            "4",
+            "8",
         ]
         process = subprocess.Popen(
             command,
