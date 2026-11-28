@@ -1497,9 +1497,18 @@ class EngramEmbedding(nn.Module):
             )
             return out
         if cp_all_tokens and self.tp_size > 1:
+            parallel = get_parallel()
+            if parallel.attn_dp_size > 1:
+                metadata = forward_batch.attn_cp_metadata
+                shard_counts = (
+                    metadata.per_rank_logical_token or metadata.per_rank_actual_token
+                )
+                # Use the same DP collective path as idle ranks.
+                return self._dp_global_buffer_lookup(
+                    indices, forward_batch, shard_counts
+                )
             # Prefill CP: gather the hash ids over the CP group first so every
             # TP rank looks up the same indices, then keep this rank's slice.
-            parallel = get_parallel()
             local_rows = indices.shape[0]
             all_indices = indices.new_empty(
                 (parallel.attn_cp_size * local_rows, *indices.shape[1:])
@@ -1703,7 +1712,10 @@ class EngramEmbedding(nn.Module):
         return list(sizes)
 
     def _dp_global_buffer_lookup(
-        self, indices: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        indices: torch.Tensor,
+        forward_batch: ForwardBatch,
+        cp_shard_counts: Optional[list[int]] = None,
     ) -> torch.Tensor:
         """Look up every DP rank's indices in the global DP buffer and reduce them."""
         rows = get_global_dp_buffer_len()
@@ -1711,7 +1723,7 @@ class EngramEmbedding(nn.Module):
             (rows, *indices.shape[1:]), dtype=indices.dtype, device=indices.device
         )
         # The MAX_LEN gather may zero its local input in place, hence the clone.
-        dp_gather_replicate(ids_global, indices.clone(), forward_batch)
+        dp_gather_replicate(ids_global, indices.clone(), forward_batch, cp_shard_counts)
         if rows == 0:
             return self.new_rows(indices)
         values = self._owned_rows(ids_global).view(rows, -1)
@@ -1734,7 +1746,9 @@ class EngramEmbedding(nn.Module):
             else:
                 dp_reduce_scatter_tensor(local, values)
         else:
-            dp_scatter(local, self._reduce_owned_rows(values), forward_batch)
+            dp_scatter(
+                local, self._reduce_owned_rows(values), forward_batch, cp_shard_counts
+            )
         return local.view(*indices.shape, self.dim)
 
 

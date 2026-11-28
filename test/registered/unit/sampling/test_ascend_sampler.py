@@ -19,6 +19,34 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestAscendSamplerDispatch(unittest.TestCase):
+    def test_cp_broadcast_precedes_logprob_lookup(self):
+        sampler = Sampler.__new__(Sampler)
+        torch.nn.Module.__init__(sampler)
+        sampler.output_logprob_processor = sampler_module.OutputLogprobProcessor()
+        logits = torch.tensor([[3.0, 1.0]])
+        output = LogitsProcessorOutput(next_token_logits=logits)
+        info = SimpleNamespace(
+            is_all_greedy=True,
+            grammars=None,
+            sampling_mask_batch_indices=None,
+            sampling_support_logprobs_capture_indices=None,
+        )
+        broadcast = MagicMock(side_effect=lambda ids: ids.fill_(1))
+        parallel = SimpleNamespace(
+            attn_cp_size=2, attn_cp_group=SimpleNamespace(broadcast=broadcast)
+        )
+        with (
+            patch.object(sampler_module, "is_npu", return_value=True),
+            patch.object(sampler_module, "get_parallel", return_value=parallel),
+            patch.object(sampler_module, "SYNC_TOKEN_IDS_ACROSS_TP", False),
+        ):
+            ids = sampler(output, info, True, [0], [None], torch.tensor([0]))
+        broadcast.assert_called_once()
+        self.assertEqual(ids.tolist(), [1])
+        torch.testing.assert_close(
+            output.next_token_logprobs, logits.log_softmax(-1)[:, 1]
+        )
+
     @torch.random.fork_rng(devices=[])
     def test_top_k_dispatch_does_not_read_device_values_on_cpu(self):
         logits = torch.tensor([[0.1, 0.2, 0.3, 0.4]])

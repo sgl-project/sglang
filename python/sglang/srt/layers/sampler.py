@@ -303,6 +303,14 @@ class Sampler(nn.Module):
                     )
                 del probs
 
+        cp_token_ids_synced = (
+            is_npu()
+            and get_parallel().attn_cp_size > 1
+            and batch_next_token_ids.numel() > 0
+        )
+        if cp_token_ids_synced:
+            # Replicated schedulers advance with the CP leader's sampled tokens.
+            get_parallel().attn_cp_group.broadcast(batch_next_token_ids)
         if return_logprob:
             if target_logprobs is not None:
                 logprobs = target_logprobs
@@ -332,7 +340,11 @@ class Sampler(nn.Module):
                 )
             else:
                 assert sampling_mask_capture is not None
-                if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+                if (
+                    cp_token_ids_synced
+                    or SYNC_TOKEN_IDS_ACROSS_TP
+                    or sampling_info.grammars
+                ):
                     # Token synchronization can replace the producer-selected token.
                     sampling_mask_capture = sampling_mask_capture._replace(
                         selected_weight=None
