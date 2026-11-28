@@ -28,6 +28,10 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import
 
 
 class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
+    # FastVideo/FastH3 bundles keep the diffusers-side name in
+    # ``vae/config.json``; the pipeline loader resolves ``_class_name`` through
+    # ModelRegistry, which only knows this class name.
+    _aliases = ["AutoencoderKLMiniMaxH3"]
     layerwise_offload_dit_group_enabled = False
     # EncoderFCN3D indexes its down containers instead of calling them, so they
     # cannot host layerwise hooks. Keep the small encoder resident.
@@ -165,6 +169,7 @@ class MiniMaxH3ImageVAE(MiniMaxH3VideoVAE):
 
 
 class MiniMaxH3AudioVAE(DacAudioVAE, LayerwiseOffloadableModuleMixin):
+    _aliases = ["AutoencoderKLMiniMaxH3Audio"]
     layerwise_offload_dit_group_enabled = False
     # BigVGAN stores each executable upsampler inside a one-element ModuleList.
     # The outer ``decoder.ups`` containers are indexed but never called, so hooks
