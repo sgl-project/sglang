@@ -26,6 +26,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.models.llava import LlavaForConditionalGeneration
+from sglang.srt.models.utils import WeightsMapper
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,24 @@ class MistralForCausalLMMistralFormat(MistralForCausalLM):
 
 class Mistral3ForConditionalGeneration(LlavaForConditionalGeneration):
     MULTIMODAL_PROJECTOR_TYPE = Mistral3MultiModalProjector
+
+    # Checkpoints name the shards of the fused projections; the quantization
+    # config matches a fused layer through these shard names.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+    # The renames of load_weights below, plus the Pixtral attention output
+    # projection (o_proj in the checkpoint, proj in VisionAttention), applied to
+    # the quantization config's module lists.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "language_model.model.",
+            "model.vision_tower.": "vision_tower.",
+            "model.multi_modal_projector.": "multi_modal_projector.",
+        },
+        orig_to_new_suffix={".attention.o_proj": ".attention.proj"},
+    )
 
     def __init__(
         self,
