@@ -74,6 +74,7 @@ class TestKVCacheEventQueue(unittest.TestCase):
             block_size=block_size,
             lora_id=lora_id,
             medium=medium,
+            lora_name=None,
             cache_salt=cache_salt,
             session_id=session_id,
         )
