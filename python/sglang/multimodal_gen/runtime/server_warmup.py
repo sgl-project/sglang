@@ -255,7 +255,6 @@ async def run_async_client_warmup(
     server_args: ServerArgs,
     forward: Callable[..., Awaitable[OutputBatch]],
     *,
-    fail_open: bool = False,
     rewarm: bool = False,
     step_limit: int | None = None,
     check_backend: Callable[[], None] | None = None,
@@ -264,8 +263,7 @@ async def run_async_client_warmup(
 
     `forward(req, replica=i)` must deliver to replica i: each replica compiles
     and allocates on its own GPUs, and each counts the same `warmup_total`.
-    `check_backend` must raise if serving is no longer possible; backend death
-    must not be suppressed by the synthetic probe's `fail_open` fallback.
+    `check_backend` must raise if serving is no longer possible.
     """
     try:
         warmup_input_path = None
@@ -297,11 +295,6 @@ async def run_async_client_warmup(
     except Exception:
         if check_backend is not None:
             check_backend()
-        if fail_open:
-            logger.warning(
-                "Synthetic server warmup failed; continuing startup", exc_info=True
-            )
-            return
         raise
 
 
