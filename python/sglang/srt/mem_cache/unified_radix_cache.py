@@ -2654,6 +2654,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if spec is None:
             return
 
+        # In-flight writes hold host locks until acked; cap them so a store slower
+        # than prefill cannot starve host eviction.
+        cc = self.cache_controller
+        kv_tokens = len(spec.hash_value) * self.page_size
+        if cc.backup_rate_limited(kv_tokens):
+            return
+
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
             host_indices=spec.host_value,
@@ -2672,13 +2679,14 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        # Settlement returns exactly this amount, so the budget never drifts; it
+        # moves only at rank-agreed points (write-through acks, agreed backup drains).
+        cc.backup_tokens_occupied += kv_tokens
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
         )
-        self._backup_requested_tokens[operation_id] = (
-            len(spec.hash_value) * self.page_size
-        )
+        self._backup_requested_tokens[operation_id] = kv_tokens
 
     def is_backuped(self, node_id: NodeId) -> bool:
         return self.tree_core.is_backuped(node_id)
@@ -4209,7 +4217,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 ),
             )
         else:
-            self._backup_requested_tokens.pop(operation.id, None)
+            kv_tokens = self._backup_requested_tokens.pop(operation.id, None)
+            if kv_tokens is not None:
+                self.cache_controller.backup_tokens_occupied -= kv_tokens
             entry = self.ongoing_backup.pop(operation.id, None)
             if entry is not None:
                 node_id, lock_params = entry

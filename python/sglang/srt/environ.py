@@ -987,6 +987,9 @@ class Envs:
     SGLANG_HICACHE_FILE_BACKEND_ENABLE_METADATA_CACHE = EnvBool(False)
     # Positive cache TTL for filesystem metadata lookups (-1 disables positive expiration)
     SGLANG_HICACHE_FILE_BACKEND_METADATA_TTL = EnvFloat(5.0)
+    # Cache mode: in-flight L3 backups hold host locks until acked. Cap = fraction
+    # of the host pool they may hold, in (0, 1]; 0.5 is a starting point, not tuned.
+    SGLANG_HICACHE_STORAGE_BACKUP_LOCK_CAP = EnvFloat(0.5)
     # Buffer mode: staged prefetches pin their device anchor from IO commit
     # to consumption so eviction cannot waste the fetch. Cap = fraction of
     # the pool the pins may hold; 0 disables pinning.

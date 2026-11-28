@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
 from array import array
@@ -103,6 +104,18 @@ class _FailingBatchBackend(HiCacheStorageFailureInjector):
         return self._backend.batch_set(keys, values, target_locations, target_sizes)
 
 
+class _GatedBackend(HiCacheStorageFailureInjector):
+    """The real backend, holding every write until ``release`` is set."""
+
+    def __init__(self, backend):
+        super().__init__(backend, 0.0, 0.0)
+        self.release = threading.Event()
+
+    def batch_set(self, keys, values=None, target_locations=None, target_sizes=None):
+        self.release.wait()
+        return self._backend.batch_set(keys, values, target_locations, target_sizes)
+
+
 def _build_cache(
     cleanup: contextlib.ExitStack,
     *,
@@ -170,8 +183,8 @@ def _build_cache(
     return cache, allocator, req_to_token_pool
 
 
-def _insert_span(cache, allocator, num_tokens):
-    tokens = array("q", range(1, 1 + num_tokens))
+def _insert_span(cache, allocator, num_tokens, first_token=1):
+    tokens = array("q", range(first_token, first_token + num_tokens))
     value = allocator.alloc(num_tokens)
     cache.insert(InsertParams(key=RadixKey(tokens), value=value))
     return cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens))).last_device_node
@@ -352,10 +365,9 @@ class TestStorageBackupSettlementPagedKeys(_SettlementCase):
         self.cache.sanity_check()
 
 
-class TestCacheModeShortSettlement(unittest.TestCase):
-    """Cache mode: a short write releases the host lock as before and is
-    counted; the span is sent again by the existing write-through cycle once
-    the host copy is evicted and the node is hit again."""
+class _CacheModeCase(unittest.TestCase):
+    """Cache mode: a real cache with the file backend, one span of _PAGES
+    tokens inserted, storage writes spied."""
 
     def setUp(self):
         self._cleanup = contextlib.ExitStack()
@@ -371,6 +383,12 @@ class TestCacheModeShortSettlement(unittest.TestCase):
         self.collector = self.cache.storage_metrics_collector = mock.Mock()
         self.cache.enable_storage_metrics = True
         self.writes = _spy_storage_writes(self.cc)
+
+
+class TestCacheModeShortSettlement(_CacheModeCase):
+    """Cache mode: a short write releases the host lock as before and is
+    counted; the span is sent again by the existing write-through cycle once
+    the host copy is evicted and the node is hit again."""
 
     def test_short_write_settles_and_releases_the_host_lock(self):
         backend = _FailingBatchBackend(
@@ -404,6 +422,44 @@ class TestCacheModeShortSettlement(unittest.TestCase):
         # The host copy stays; the next write-through of the node (after its
         # host eviction) sends the span again.
         self.assertTrue(self.cache.tree_core.is_backuped(self.leaf))
+        self.cache.sanity_check()
+
+
+class TestCacheModeBackupThrottle(_CacheModeCase):
+    """Cache mode: in-flight L3 writes hold host locks until acked, so their
+    total is capped; past the cap a write-through is not queued for L3 and
+    leaves its host copy evictable (sgl-project/sglang#52891)."""
+
+    def test_write_past_the_budget_is_not_queued_and_holds_no_host_lock(self):
+        self.cc.backup_capacity_limit = _PAGES - 1
+        _backup_to_host(self.cache, self.leaf)
+
+        self.assertEqual(self.cache.ongoing_backup, {})
+        self.assertEqual(self.cc.backup_tokens_occupied, 0)
+        self.assertEqual(
+            node_host_lock_ref(self.cache, self.leaf, ComponentType.FULL), 0
+        )
+        for _ in range(3):
+            self.cache.check_hicache_events()
+        self.writes.assert_not_called()
+        self.assertTrue(self.cache.tree_core.is_backuped(self.leaf))
+        self.cache.sanity_check()
+
+    def test_acked_write_returns_its_budget(self):
+        # A leaked budget would throttle every later write-through for good.
+        self.cc.backup_capacity_limit = _PAGES
+        _backup_to_host(self.cache, self.leaf)
+        self.assertEqual(self.cc.backup_tokens_occupied, _PAGES)
+        self.assertEqual(
+            node_host_lock_ref(self.cache, self.leaf, ComponentType.FULL), 1
+        )
+
+        _tick_until(self.cache, lambda: not self.cache.ongoing_backup)
+        self.assertEqual(self.cc.backup_tokens_occupied, 0)
+        self.assertEqual(
+            node_host_lock_ref(self.cache, self.leaf, ComponentType.FULL), 0
+        )
+        self.assertEqual(self.writes.call_count, 1)
         self.cache.sanity_check()
 
 
@@ -514,18 +570,94 @@ def _two_rank_settlement(rank, rendezvous_dir, skip_rank):
         torch.distributed.destroy_process_group()
 
 
-class TestTwoRankSettlement(unittest.TestCase):
-    def _spawn(self, skip_rank):
-        with tempfile.TemporaryDirectory(prefix="hicache-backup-settle-") as directory:
-            torch.multiprocessing.spawn(
-                _two_rank_settlement, args=(directory, skip_rank), nprocs=2, join=True
-            )
+def _assert_ranks_agree(cache, writes, step):
+    snapshot = (
+        cache.cache_controller.backup_tokens_occupied,
+        sorted(cache.ongoing_backup),
+        _write_spans(writes),
+    )
+    peers = [None, None]
+    torch.distributed.all_gather_object(peers, snapshot)
+    assert peers[0] == peers[1], (step, peers)
+    return snapshot
 
+
+def _two_rank_backup_throttle(rank, rendezvous_dir):
+    """Rank 1's store holds its write while rank 0's acks at once. The
+    throttle budget must stay equal on both ranks with no collective of its
+    own, so a second write-through is skipped on both ranks, not just one."""
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous_dir}/gloo",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=120),
+    )
+    cleanup = contextlib.ExitStack()
+    try:
+        storage_dir = os.path.join(rendezvous_dir, f"rank{rank}")
+        os.makedirs(storage_dir)
+        cache, allocator, _ = _build_cache(
+            cleanup, host_memory_mode="cache", storage_dir=storage_dir
+        )
+        cache.tp_group = torch.distributed.group.WORLD
+        cache.tp_world_size = 2
+        cc = cache.cache_controller
+        cc.backup_capacity_limit = _PAGES
+        backend = _GatedBackend(cc.storage_backend)
+        cc.storage_backend = backend
+        # Unblock the backup thread before teardown joins it, even on failure.
+        cleanup.callback(backend.release.set)
+        if rank == 0:
+            backend.release.set()
+        writes = _spy_storage_writes(cc)
+
+        first = _insert_span(cache, allocator, _PAGES)
+        _backup_to_host(cache, first)
+        # Rank 0 acks, rank 1 cannot: the agreed drain settles nothing.
+        for step in range(20):
+            cache.check_hicache_events()
+            _assert_ranks_agree(cache, writes, step)
+            time.sleep(0.01)
+        assert cc.backup_tokens_occupied == _PAGES
+
+        second = _insert_span(cache, allocator, _PAGES, first_token=1 + _PAGES)
+        _backup_to_host(cache, second)
+        snapshot = _assert_ranks_agree(cache, writes, "second")
+        assert snapshot[0] == _PAGES and len(snapshot[1]) == 1, snapshot
+        assert node_host_lock_ref(cache, second, ComponentType.FULL) == 0
+
+        backend.release.set()
+        for step in range(500):
+            cache.check_hicache_events()
+            snapshot = _assert_ranks_agree(cache, writes, step)
+            if snapshot[0] == 0 and not snapshot[1]:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("the storage backups did not settle")
+        assert writes.call_count == 1
+        assert node_host_lock_ref(cache, first, ComponentType.FULL) == 0
+        cache.sanity_check()
+    finally:
+        cleanup.close()
+        torch.distributed.destroy_process_group()
+
+
+def _spawn_two_ranks(fn, *args):
+    with tempfile.TemporaryDirectory(prefix="hicache-backup-settle-") as directory:
+        torch.multiprocessing.spawn(fn, args=(directory, *args), nprocs=2, join=True)
+
+
+class TestTwoRankSettlement(unittest.TestCase):
     def test_rank_local_failure_settles_both_ranks_at_the_agreed_prefix(self):
-        self._spawn(skip_rank=False)
+        _spawn_two_ranks(_two_rank_settlement, False)
 
     def test_non_writer_rank_vouches_for_the_span(self):
-        self._spawn(skip_rank=True)
+        _spawn_two_ranks(_two_rank_settlement, True)
+
+    def test_backup_budget_stays_equal_across_ranks_without_a_collective(self):
+        _spawn_two_ranks(_two_rank_backup_throttle)
 
 
 if __name__ == "__main__":

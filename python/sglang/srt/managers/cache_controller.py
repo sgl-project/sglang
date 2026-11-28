@@ -42,6 +42,7 @@ from sglang.srt.arg_groups.hicache_hook import UNIFIED_KEY_SCHEME_STORAGE_BACKEN
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cpp_utils.native_hash import ensure_native_hash
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
@@ -285,6 +286,16 @@ HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
 # Write-staging floor: writes are deferrable, so the flush gate grows the
 # write window dynamically into whatever load staging is not using.
 HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
+
+
+def _backup_capacity_limit(host_pool_size: int) -> int:
+    """Host tokens that in-flight cache-mode L3 backups may lock."""
+    cap = envs.SGLANG_HICACHE_STORAGE_BACKUP_LOCK_CAP.get()
+    if not 0 < cap <= 1:
+        raise ValueError(
+            f"SGLANG_HICACHE_STORAGE_BACKUP_LOCK_CAP must be in (0, 1], got {cap}."
+        )
+    return int(cap * host_pool_size)
 
 # Bound on waiting for the storage workers to stop. After the stop event a
 # worker finishes only the backend call it is inside (the queued work is
@@ -793,6 +804,9 @@ class HiCacheController:
                 )
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
+            self.backup_capacity_limit = _backup_capacity_limit(self.mem_pool_host.size)
+            # tracking the number of tokens locked by in-flight L3 writes, updated by the main scheduler thread
+            self.backup_tokens_occupied = 0
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
@@ -1075,6 +1089,7 @@ class HiCacheController:
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
+            self.backup_tokens_occupied = 0
 
         self.storage_stop_event.clear()
 
@@ -1566,6 +1581,10 @@ class HiCacheController:
     ) -> None:
         """Roll back a hit-sized host bounce before transfer ownership moves."""
         self.mem_pool_host.free(host_indices)
+
+    def backup_rate_limited(self, kv_tokens: int) -> bool:
+        """Throttle L3 write queueing so in-flight writes never starve host eviction."""
+        return self.backup_tokens_occupied + kv_tokens > self.backup_capacity_limit
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         last_hash = operation.last_hash
