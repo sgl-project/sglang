@@ -7,7 +7,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.srt.layers.moe import MoeRunnerConfig
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe import MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import utils as moe_utils
+from sglang.srt.layers.moe.moe_runner import aiter as aiter_runner
+from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4_moe
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
     QuarkW4A4MXFp4MoE,
 )
@@ -78,6 +82,55 @@ def test_apply_weights_defaults_swiglu_limit_zero_without_clamp(monkeypatch):
     scheme.apply_weights(_fake_layer(), dispatch_output=object())
 
     assert store["quant_info"].swiglu_limit == 0.0
+
+
+def _aiter_scheme(monkeypatch, *, is_draft, supports_stage2_fp8=True):
+    """A gfx95 scheme whose create_moe_runner picked the AITER runner."""
+    monkeypatch.setattr(quark_w4a4_mxfp4_moe, "_is_gfx95", True)
+    monkeypatch.setattr(quark_w4a4_mxfp4_moe, "_is_gfx1250", False)
+    monkeypatch.setattr(quark_w4a4_mxfp4_moe, "MoeRunner", lambda *args: None)
+    monkeypatch.setattr(
+        moe_utils, "get_moe_runner_backend", lambda: MoeRunnerBackend.AITER
+    )
+    monkeypatch.setattr(
+        aiter_runner,
+        "_aiter_fused_moe_supports_stage2_fp8",
+        lambda: supports_stage2_fp8,
+    )
+    scheme = _make_scheme()
+    layer = _fake_layer()
+    layer.is_draft = is_draft
+    scheme.create_moe_runner(layer, MoeRunnerConfig(activation="silu"))
+    return scheme, layer
+
+
+@pytest.mark.parametrize(
+    "flag, is_draft, expected",
+    [(True, False, True), (True, True, None), (False, False, None)],
+)
+def test_stage2_fp8_target_layers_only(monkeypatch, flag, is_draft, expected):
+    monkeypatch.delattr(torch, "float4_e2m1fn_x2", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "aiter.ops.flydsl.moe_common",
+        SimpleNamespace(GateMode=SimpleNamespace(SEPARATED=SimpleNamespace(value=1))),
+    )
+    with envs.SGLANG_AITER_MOE_STAGE2_FP8.override(flag):
+        scheme, layer = _aiter_scheme(monkeypatch, is_draft=is_draft)
+    store = {}
+    scheme.runner = _capturing_runner(store)
+
+    scheme.apply_weights(layer, dispatch_output=object())
+
+    kwargs = store["quant_info"].fused_moe_kwargs
+    assert kwargs["gate_mode"] == 1
+    assert kwargs.get("stage2_fp8") is expected
+
+
+def test_stage2_fp8_needs_aiter_support(monkeypatch):
+    with envs.SGLANG_AITER_MOE_STAGE2_FP8.override(True):
+        with pytest.raises(RuntimeError, match="stage2_fp8"):
+            _aiter_scheme(monkeypatch, is_draft=False, supports_stage2_fp8=False)
 
 
 class TestOnlineWeightLoader(CustomTestCase):
