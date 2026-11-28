@@ -6,6 +6,7 @@
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
+from sglang.version import __version__
 
 
 def generate_cmd_init() -> list[CLISubcommand]:
@@ -32,7 +33,7 @@ def main() -> None:
     apply_plugin_hooks()
 
     parser = FlexibleArgumentParser(description="sglang-diffusion CLI")
-    parser.add_argument("-v", "--version", action="version", version="0.1.0")
+    parser.add_argument("-v", "--version", action="version", version=__version__)
 
     subparsers = parser.add_subparsers(required=False, dest="subparser")
 
