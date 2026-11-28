@@ -247,7 +247,6 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
-        self.local_kv_event_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
         self._active_workers: list[int] = list(range(self.launch_dp_size))
@@ -863,21 +862,13 @@ class DataParallelController:
         for i in range(len(scheduler_pipe_readers)):
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
-        # Pure-DP TP groups launch concurrently. Their ready replies contain
-        # only publishers owned by schedulers on this node.
-        with self.env_lock:
-            self.local_kv_event_sources.extend(
-                source
-                for info in scheduler_info
-                for source in info.get("kv_event_sources", [])
-            )
-
         self._record_scheduler_init_infos(scheduler_info)
 
     def _record_scheduler_init_infos(self, infos: list[dict]) -> None:
         with self._scheduler_init_info_lock:
             self._scheduler_init_infos.extend(infos)
             self.max_total_num_tokens = infos[0]["max_total_num_tokens"]
+            self.max_req_len = infos[0]["max_req_len"]
             self.max_req_input_len = infos[0]["max_req_input_len"]
             self.startup_time = aggregate_scheduler_startup_times(
                 info.get("startup_time") for info in self._scheduler_init_infos
@@ -888,6 +879,7 @@ class DataParallelController:
         with self._scheduler_init_info_lock:
             init_info = {
                 "max_total_num_tokens": self.max_total_num_tokens,
+                "max_req_len": self.max_req_len,
                 "max_req_input_len": self.max_req_input_len,
                 "startup_time": self.startup_time,
             }
@@ -1078,10 +1070,6 @@ def run_data_parallel_controller_process(
             **controller.get_init_info(),
             SCHEDULER_PIDS_ARG: scheduler_pids,
         }
-        if get_serving().grpc_port is not None:
-            init_info["kv_event_sources"] = sorted(
-                controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
-            )
         pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.
         if get_parallel().node_rank == 0 and not get_exec().moe.is_ep_offset_joiner:

@@ -64,7 +64,6 @@ def _make_tm(
     tm.model_config = MagicMock()
     tm.model_config.hf_config = hf_config
     tm.served_model_name = "test-model"
-    tm.max_req_input_len = 8192
     tm.mm_processor = _make_mm_processor(declares_audio)
     return tm
 

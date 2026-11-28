@@ -99,6 +99,7 @@ def test_tp_worker_attaches_observer_output_to_the_result(has_observer, can_run_
         published_topology(),
         patch.object(ForwardBatch, "init_new", return_value=forward_batch),
         patch("sglang.srt.managers.tp_worker.capture_pre_sample_logits"),
+        patch("sglang.srt.managers.tp_worker.is_beam_only_batch", return_value=False),
     ):
         result = _tp_worker(runner).forward_batch_generation(batch)
 

@@ -481,6 +481,33 @@ class TestShortestPrefillLoadScaling(CustomTestCase):
         self.assertEqual(policy.shortest_prefill_backlog, 12288)
         self.assertEqual(policy.shortest_prefill_class_boundary, 1024)
 
+    def test_backlog_skips_confirmed_storage_hit_until_the_prefetch_drops(self):
+        policy = self.make_policy(halving_chunks=0.5, decay_start_chunks=2)
+        stored = self.make_req("stored", 12000, cached=1000, arrived=1)
+        short = self.make_req("short", 500, arrived=2)
+        spans = {stored.cache_request_handle: (0, 12000)}
+        with patch.object(
+            policy.tree_cache,
+            "waiting_storage_span",
+            side_effect=lambda handle: spans.get(handle),
+        ):
+            # The hit beyond the device match is not backlog; the sort still
+            # ranks the request by its full work.
+            self.assertEqual(
+                self.sorted_rids(policy, [stored, short]), ["short", "stored"]
+            )
+            self.assertEqual(policy.shortest_prefill_backlog, 1500)
+            self.assertEqual(policy.shortest_prefill_class_boundary, 4096)
+            # A revoked or failed prefetch drops its span: full work next pass.
+            spans.clear()
+            self.assertEqual(
+                self.sorted_rids(policy, [stored, short]), ["short", "stored"]
+            )
+            self.assertEqual(policy.shortest_prefill_backlog, 12500)
+            self.assertAlmostEqual(
+                policy.shortest_prefill_class_boundary, 4096 * 2 ** (-4308 / 2048)
+            )
+
     def test_reservation_stops_at_the_first_arrival_ordered_request(self):
         # 14768 tokens left in the chunk and 1616 waiting: two halvings of 2 chunks.
         policy = self.make_policy(halving_chunks=2, decay_start_chunks=0)

@@ -181,9 +181,6 @@ class TestReceiverControlMessages(CustomTestCase):
             draft_rows_dcp_collapsed=True,
             num_draft_entries=0,
         )
-        manager.agent = SimpleNamespace(
-            name="nixl-peer", get_agent_metadata=lambda: b"agent-desc"
-        )
         # The mori package imports conn.py, so this needs the stub of setUpClass.
         from sglang.srt.disaggregation.mori.buffers import BufferKeys, BufferKind
 
@@ -195,6 +192,8 @@ class TestReceiverControlMessages(CustomTestCase):
         }
         manager.transport = SimpleNamespace(
             session_id="mooncake-peer",
+            agent_name="nixl-peer",
+            agent_metadata=b"agent-desc",
             engine_key="mori-peer",
             engine_desc_blob=b"engine-desc",
             mem_desc_blobs=lambda keys: [mori_descs[key.kind] for key in keys],

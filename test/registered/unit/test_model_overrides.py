@@ -3383,10 +3383,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
             )
 
+        # SM90 keeps the custom all-reduce; the fusion is opt-in there.
         with (
             _confidential_compute(False),
             override_platform(is_sm90=True),
             override_platform(is_sm100=False),
+        ):
+            self.assertEqual(_flashinfer_allreduce_fusion_auto_enable(_view()), {})
+
+        with (
+            _confidential_compute(False),
+            override_platform(is_sm90=False),
+            override_platform(is_sm100=True),
         ):
             self.assertEqual(
                 _flashinfer_allreduce_fusion_auto_enable(_view()),
@@ -3419,10 +3427,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _view(moe_a2a_backend="deepep")
                 ),
                 {},
-            )
-            # SM90 multi-node: blocked (nnodes>1 needs SM100)
-            self.assertEqual(
-                _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)), {}
             )
             # user-set backend survives
             self.assertEqual(

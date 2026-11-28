@@ -178,6 +178,7 @@ class Xing4_0Detector(BaseFormatDetector):
         self.bot_token = TOOL_START_TOKEN
         self.eot_token = TOOL_END_TOKEN
         self._buffer = ""
+        self._tool_indices = None
 
     def has_tool_call(self, text: str) -> bool:
         return self.bot_token in text
@@ -188,7 +189,9 @@ class Xing4_0Detector(BaseFormatDetector):
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
-        tool_indices = self._get_tool_indices(tools)
+        if self._tool_indices is None:
+            self._tool_indices = self._get_tool_indices(tools)
+        tool_indices = self._tool_indices
         calls: List[ToolCallItem] = []
 
         try:

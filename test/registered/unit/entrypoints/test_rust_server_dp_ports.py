@@ -59,6 +59,8 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
         rust_server_tokenizer_path=lambda: "tokenizer",
         tokenizer=None,
         max_total_num_tokens=1024,
+        max_req_len=1024,
+        max_req_input_len=1018,
         load_snapshot_writer=load_snapshot_writer,
         rust_server_endpoints=[{"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}],
     )

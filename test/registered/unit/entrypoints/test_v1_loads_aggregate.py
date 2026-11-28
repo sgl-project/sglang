@@ -117,8 +117,8 @@ class TestLoadsResponse(CustomTestCase):
         self.assertEqual(response["loads"][0]["num_waiting_reqs"], 2)
 
 
-class TestLoadsStoragePrefetchCounters(CustomTestCase):
-    def test_response_carries_both_storage_prefetch_counters(self):
+class TestLoadsStorageCounters(CustomTestCase):
+    def test_response_carries_the_storage_counters(self):
         manager = _FakeHttpTokenizerManager(
             [
                 LoadSnapshot(
@@ -128,6 +128,8 @@ class TestLoadsStoragePrefetchCounters(CustomTestCase):
                         "storage_transfer": 20,
                         "device_covered": 3,
                     },
+                    total_backuped_tokens=900,
+                    total_backup_dropped_tokens=70,
                 ),
                 LoadSnapshot(dp_rank=1),
             ],
@@ -140,9 +142,13 @@ class TestLoadsStoragePrefetchCounters(CustomTestCase):
             loads[0]["total_storage_prefetch_unfulfilled_tokens"],
             {"storage_transfer": 20, "device_covered": 3},
         )
-        # Without storage metrics a rank reports neither counter.
+        self.assertEqual(loads[0]["total_backuped_tokens"], 900)
+        self.assertEqual(loads[0]["total_backup_dropped_tokens"], 70)
+        # Without storage metrics a rank reports none of the counters.
         self.assertIsNone(loads[1]["total_storage_prefetch_hit_tokens"])
         self.assertIsNone(loads[1]["total_storage_prefetch_unfulfilled_tokens"])
+        self.assertIsNone(loads[1]["total_backuped_tokens"])
+        self.assertIsNone(loads[1]["total_backup_dropped_tokens"])
 
     def test_counters_survive_the_msgpack_slot(self):
         snapshot = LoadSnapshot(

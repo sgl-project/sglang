@@ -1,5 +1,6 @@
 import importlib.abc
 import importlib.machinery
+import json
 import multiprocessing
 import os
 import subprocess
@@ -29,6 +30,36 @@ def _hold_filesystem_lock(path: str, ready, release) -> None:
     with rust_extension._filesystem_lock(Path(path)):
         ready.set()
         release.wait(timeout=10)
+
+
+# A rustup proxy that installs on first use and fails while another install runs.
+_FIRST_USE_INSTALL_PROXY = """#!/bin/sh
+root="$FAKE_RUSTUP_HOME"
+if [ ! -e "$root/installed" ]; then
+    mkdir "$root/installing" 2>/dev/null || {
+        echo "error: the toolchain is being installed by another process" >&2
+        exit 1
+    }
+    sleep 0.3
+    touch "$root/installed"
+    rmdir "$root/installing"
+fi
+echo "$(basename "$0") 1.92.0"
+"""
+
+
+_QUERY_TOOLCHAIN_PROCESS = """
+import json, sys, time
+from pathlib import Path
+from sglang.srt.rust_extensions.loader import query_rust_toolchain
+workspace, cache, start = sys.argv[1:]
+while not Path(start).exists():
+    time.sleep(0.01)
+try:
+    print(json.dumps(query_rust_toolchain(Path(workspace), Path(cache))))
+except RuntimeError as exc:
+    print(json.dumps(str(exc)))
+"""
 
 
 class _FailingExtensionLoader(importlib.abc.Loader):
@@ -441,6 +472,7 @@ crate-type = ["cdylib"]
                     "features": ("python", "inspection"),
                     "build_fingerprint": {"native": "abi"},
                     "extension_module": "demo._inspection",
+                    "cache_dir": (root / "cache").resolve(),
                 },
             )
             self.assertEqual(
@@ -583,6 +615,44 @@ crate-type = ["cdylib"]
             self.assertEqual(process.exitcode, 0)
             self.assertTrue(acquired.is_set())
 
+    def test_concurrent_toolchain_queries_share_one_first_use_install(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            for command in ("cargo", "rustc"):
+                proxy = bin_dir / command
+                proxy.write_text(_FIRST_USE_INSTALL_PROXY, encoding="utf-8")
+                proxy.chmod(0o755)
+            start = root / "start"
+            environment = {
+                **os.environ,
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                "FAKE_RUSTUP_HOME": os.fspath(root),
+            }
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        _QUERY_TOOLCHAIN_PROCESS,
+                        directory,
+                        os.fspath(root / "cache"),
+                        os.fspath(start),
+                    ],
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(8)
+            ]
+            start.touch()
+            outcomes = [
+                json.loads(process.communicate(timeout=120)[0]) for process in processes
+            ]
+            expected = {"cargo": "cargo 1.92.0", "rustc": "rustc 1.92.0"}
+            self.assertEqual(outcomes, [expected] * len(processes))
+
     def test_failed_import_does_not_poison_sys_modules(self):
         module_name = "demo._broken_core"
         module_spec = importlib.machinery.ModuleSpec(
@@ -601,21 +671,13 @@ crate-type = ["cdylib"]
 
     def test_checked_in_crates_are_discovered_from_wheel_metadata(self):
         # No crate reads `proto/` at build time: the generated bindings are
-        # checked in under rust/sglang-api-types and
-        # rust/sglang-runtime-v1-types (`cargo gen-api`), so the workspace is
-        # every extension's only source input.
+        # checked in under rust/sglang-api-types (`cargo gen-api`), so the
+        # workspace is every extension's only source input.
         for python_module, package, library, features, source_inputs in (
             (
                 "sglang.srt.rust_extensions._server",
                 "sglang-server",
                 "sglang_server",
-                (),
-                (),
-            ),
-            (
-                "sglang.srt.rust_extensions._grpc",
-                "sglang-grpc",
-                "sglang_grpc_core",
                 (),
                 (),
             ),

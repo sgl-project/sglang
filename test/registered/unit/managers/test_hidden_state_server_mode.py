@@ -21,7 +21,8 @@ class TestHiddenStateServerMode(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         manager = TokenizerManager.__new__(TokenizerManager)
-        manager.context_len = 128
+        manager.max_req_len = 128
+        manager.max_req_input_len = 122
         manager.num_reserved_tokens = 0
         manager.allow_auto_truncate = False
         manager.validate_total_tokens = False

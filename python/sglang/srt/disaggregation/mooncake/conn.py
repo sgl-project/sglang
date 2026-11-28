@@ -77,7 +77,6 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     draft_kv_ring_row_pairs,
-    filter_kv_indices_for_shard_rank,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
@@ -2695,6 +2694,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
+            StateType.DSV4_C128,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
@@ -2706,22 +2706,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DRAFT_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
+            StateType.DSV4_C128,
         )
-
-    def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
-        """Pair target/draft indexer pages before narrowing to this owner."""
-        if len(src_indices) != len(dst_indices):
-            raise RuntimeError(
-                "Sharded DSA state page count mismatch: "
-                f"prefill={len(src_indices)}, dst={len(dst_indices)}"
-            )
-        local_indices, positions = filter_kv_indices_for_shard_rank(
-            kv_indices=np.asarray(src_indices, dtype=np.int32),
-            index_slice=slice(0, len(src_indices)),
-            shard_rank=self.kv_shard_rank,
-            shard_size=self.kv_shard_size,
-        )
-        return local_indices, np.asarray(dst_indices, dtype=np.int32)[positions]
 
     def maybe_send_extra(
         self,
@@ -4269,27 +4255,6 @@ class MooncakeKVSender(CommonKVSender):
             num_kv_tokens=num_kv_tokens,
             indices_event=indices_event,
         )
-
-    def _record_transfer_indices(
-        self,
-        kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List],
-    ):
-        metric_state_indices = state_indices
-        if metric_state_indices and get_parallel().enable_kv_cache_sharding:
-            # The queued state remains logical and is filtered by the worker.
-            # Account only for this sender's pages, including all target/draft
-            # indexer buffers represented by the DSA component's item lengths.
-            metric_state_indices = list(state_indices)
-            for i, (st, indices) in enumerate(
-                zip(self.kv_mgr.kv_args.state_types, state_indices)
-            ):
-                if st == StateType.DSA and indices is not None:
-                    pages = np.asarray(indices, dtype=np.int32)
-                    metric_state_indices[i] = pages[
-                        pages % self.kv_mgr.kv_shard_size == self.kv_mgr.kv_shard_rank
-                    ]
-        super()._record_transfer_indices(kv_indices, metric_state_indices)
 
 
 class MooncakeKVReceiver(CommonKVReceiver):

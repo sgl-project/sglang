@@ -4,10 +4,12 @@ from unittest.mock import Mock
 
 import numpy as np
 
+from sglang.srt.disaggregation.nixl.buffers import BufferKind, NixlBufferKey
 from sglang.srt.disaggregation.nixl.packed import (
     PackedKVSender,
     packed_page_indices,
 )
+from sglang.srt.disaggregation.nixl.transport import NixlHandle, NixlTransport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -92,50 +94,82 @@ class TestPackedPageIndices(CustomTestCase):
                 self.assertFalse(got[untouched].any())
 
 
+class _PackAgent:
+    """The NIXL agent calls a PackedKVSender makes through NixlTransport."""
+
+    name = "prefill"
+
+    def __init__(self, transfer_results):
+        self.prepped = []
+        self.posted = []
+        self.dst_dlists = []
+        self._results = iter(transfer_results)
+
+    def register_memory(self, descs, kind):
+        return descs
+
+    def add_remote_agent(self, metadata):
+        pass
+
+    def prep_xfer_dlist(self, peer_name, runs, kind):
+        self.prepped.append(peer_name)
+        return f"dlist{len(self.prepped)}"
+
+    def make_prepped_xfer(self, op, src_dlist, src_idx, dst_dlist, dst_idx):
+        handle = f"h{len(self.posted)}"
+        self.posted.append((handle, len(src_idx)))
+        self.dst_dlists.append(dst_dlist)
+        return handle
+
+    def transfer(self, handle):
+        return next(self._results)
+
+
+_BUFFER_KEY = NixlBufferKey(BufferKind.STAGING, 0)
+_DST_KEYS = (NixlBufferKey(BufferKind.KV, 0), NixlBufferKey(BufferKind.KV, 1))
+
+
 def _packer(buffer_bytes, transfer_results, failed_handles=()):
-    """A PackedKVSender with a fake agent and no GPU: the gather is a mock."""
+    """A PackedKVSender over a NixlTransport with a fake agent and no GPU: the
+    gather is a mock."""
+    agent = _PackAgent(transfer_results)
+    transport = NixlTransport(agent=agent)
+    transport.register(_BUFFER_KEY, 0x1000, buffer_bytes, 0)
+    remote = transport.import_registration(
+        agent_name="decode-0",
+        metadata=b"decode-0",
+        bases=dict(zip(_DST_KEYS, (10, 11))),
+        devices=dict.fromkeys(_DST_KEYS, 1),
+    )
     packer = object.__new__(PackedKVSender)
+    packer.transport = transport
+    packer.layout = "kv_pack:0"
     packer.gpu_id = 0
     packer.inflight = None
     packer.buffer = SimpleNamespace(
         get_size=lambda: buffer_bytes, get_ptr=lambda: 0x1000
     )
+    packer._buffer_key = _BUFFER_KEY
     packer._gather = Mock()
-    packer._src_handles, packer._dst_handles = {}, {}
-    packer.prep_dlist = Mock(
-        side_effect=lambda peer, runs, mem: f"dlist-{peer or 'local'}"
-    )
-    posted = []
-    results = iter(transfer_results)
-
-    def make_prepped_xfer(op, src_handle, src_idx, dst_handle, dst_idx):
-        handle = f"h{len(posted)}"
-        posted.append((handle, len(src_idx)))
-        return handle
-
-    packer.agent = SimpleNamespace(
-        make_prepped_xfer=make_prepped_xfer,
-        transfer=lambda handle: next(results),
-    )
     packer.await_handles = Mock(
-        side_effect=lambda hs, failure_seen: (True, hs[0] in failed_handles)
+        side_effect=lambda hs, failure_seen: (True, hs[0].xfer in failed_handles)
     )
-    return packer, posted
+    return packer, remote, agent
 
 
-def _send(packer, *, num_pages, handles=None):
+def _send(packer, remote, *, num_pages, handles=None):
     pages = np.arange(num_pages, dtype=np.int64)
     packer.send(
-        peer_name="decode-0",
+        remote=remote,
+        target="kv",
         src_ptrs=[0, 1],
-        dst_ptrs=[10, 11],
+        dst_keys=_DST_KEYS,
         src_pages=pages,
         dst_pages=pages,
         src_page_bytes=256,
         dst_page_bytes=128,
         page_size=4,
         head_offset_bytes=0,
-        dst_gpu_id=1,
         dst_num_slots=64,
         handles=[] if handles is None else handles,
     )
@@ -144,42 +178,53 @@ def _send(packer, *, num_pages, handles=None):
 class TestPackedKVSender(CustomTestCase):
     def test_batches_by_buffer_and_posts_every_batch_for_the_caller_to_settle(self):
         # 2 tensors x 128-byte pages: a 1 KB buffer holds 4 pages per batch.
-        packer, posted = _packer(1024, ["DONE"] * 3)
+        packer, remote, agent = _packer(1024, ["DONE"] * 3)
         handles = []
-        _send(packer, num_pages=10, handles=handles)
-        self.assertEqual([n for _, n in posted], [8, 8, 4])
-        self.assertEqual(handles, ["h0", "h1", "h2"])
+        _send(packer, remote, num_pages=10, handles=handles)
+        self.assertEqual([n for _, n in agent.posted], [8, 8, 4])
+        self.assertEqual([h.xfer for h in handles], ["h0", "h1", "h2"])
         self.assertEqual(packer._gather.call_count, 3)
         self.assertIsNone(packer.inflight)
 
     def test_dlists_are_prepped_once_per_buffer_and_peer(self):
         """Transfers are built by index from cached dlists, not from raw descriptors per batch."""
-        packer, _ = _packer(1024, ["DONE"] * 6)
-        _send(packer, num_pages=10)
-        _send(packer, num_pages=10)
-        self.assertEqual(packer.prep_dlist.call_count, 2)
+        packer, remote, agent = _packer(1024, ["DONE"] * 6)
+        _send(packer, remote, num_pages=10)
+        _send(packer, remote, num_pages=10)
+        self.assertEqual(agent.prepped, ["", "decode-0"])
+
+    def test_a_peer_reload_rebuilds_the_peer_dlist(self):
+        """A dlist prepared over a peer is invalid once NIXL loads the peer again,
+        so a send after the reload must post with the rebuilt one."""
+        packer, remote, agent = _packer(1024, ["DONE"] * 2)
+        _send(packer, remote, num_pages=2)
+        packer.transport.reload(remote)
+        _send(packer, remote, num_pages=2)
+        self.assertEqual(agent.prepped, ["", "decode-0", "decode-0"])
+        self.assertEqual(agent.dst_dlists, ["dlist2", "dlist3"])
 
     def test_a_failed_post_does_not_fail_the_next_room(self):
-        packer, posted = _packer(1024, ["ERR", "DONE"], failed_handles={"h0"})
+        packer, remote, agent = _packer(1024, ["ERR", "DONE"], failed_handles={"h0"})
         with self.assertRaises(RuntimeError):
-            _send(packer, num_pages=2)
+            _send(packer, remote, num_pages=2)
         # The next room on this worker reaches a healthy peer and must succeed.
-        _send(packer, num_pages=2)
-        self.assertEqual(len(posted), 2)
+        _send(packer, remote, num_pages=2)
+        self.assertEqual(len(agent.posted), 2)
         self.assertIsNone(packer.inflight)
 
     def test_a_failed_batch_fails_its_own_room(self):
-        packer, _ = _packer(1024, ["DONE", "DONE"], failed_handles={"h0"})
+        packer, remote, _ = _packer(1024, ["DONE", "DONE"], failed_handles={"h0"})
         with self.assertRaises(RuntimeError):
-            _send(packer, num_pages=6)
+            _send(packer, remote, num_pages=6)
 
     def test_an_unsettled_leftover_blocks_reuse_of_the_buffer(self):
-        packer, _ = _packer(1024, ["DONE"])
-        packer.inflight = "stale"
+        packer, remote, _ = _packer(1024, ["DONE"])
+        stale = NixlHandle(xfer="stale")
+        packer.inflight = stale
         packer.await_handles = Mock(return_value=(False, False))
         with self.assertRaises(RuntimeError):
-            _send(packer, num_pages=2)
-        self.assertEqual(packer.inflight, "stale")
+            _send(packer, remote, num_pages=2)
+        self.assertIs(packer.inflight, stale)
         packer._gather.assert_not_called()
 
 

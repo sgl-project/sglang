@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -28,9 +27,8 @@ from starlette.routing import Mount
 
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
-from sglang.srt.runtime_context import describe_kv_events_publisher, get_serving
+from sglang.srt.runtime_context import describe_kv_events_publisher
 from sglang.srt.server_args import redact_server_args_secrets
-from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +210,11 @@ def build_server_info(server_args, scheduler_info: Dict[str, Any]) -> Dict[str, 
     result["launch_command"] = server_args.launch_command
     result.update(scheduler_info)
     result["kv_events"] = describe_kv_events_publisher(server_args)
+    # A PD prefill answers a request naming no bootstrap host and asking for at
+    # most one token by itself; sgl-router reads this before sending one.
+    result["prefill_answers_alone"] = (
+        server_args.disaggregation_transfer_backend != "fake"
+    )
     return result
 
 
@@ -240,34 +243,6 @@ def build_model_info_fields(model_config, server_args) -> Dict[str, Any]:
             model_config=model_config,
         )
     return result
-
-
-def start_follower_grpc_server(server_args, scheduler_info: Dict[str, Any]):
-    """Expose GetServerInfo only, without constructing a TokenizerManager.
-
-    The snapshot is taken after scheduler readiness. This does not launch a
-    sidecar or enable inference/control RPCs.
-    """
-    serving = get_serving()
-    if serving.grpc_port is None:
-        return None
-    if envs.SGLANG_RUST_SERVER.get():
-        return None
-
-    from sglang.srt.rust_extensions import load_rust_extension
-    from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
-
-    grpc_native = load_rust_extension("sglang.srt.rust_extensions._grpc")
-    return grpc_native.start_metadata_server(
-        host=serving.host,
-        port=serving.grpc_port,
-        server_info_json=json.dumps(
-            msgspec_to_builtins(
-                redact_watermark_secrets(build_server_info(server_args, scheduler_info))
-            ),
-            default=str,
-        ),
-    )
 
 
 def launch_dummy_health_check_server(host, port, enable_metrics):

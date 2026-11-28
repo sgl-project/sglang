@@ -24,15 +24,14 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import msgspec
 import msgspec.structs
 
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
-from sglang.srt.entrypoints import http_server, server_utils
-from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
+from sglang.srt.entrypoints import http_server
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -134,7 +133,7 @@ def _call_server_info_with(
 
     tokenizer_manager = _stub_tokenizer_manager(server_args, _fake_internal_state)
     if scheduler_info is None:
-        scheduler_info = {"max_req_input_len": 1024}
+        scheduler_info = {"max_req_len": 1030, "max_req_input_len": 1024}
     stub_state = SimpleNamespace(
         tokenizer_manager=tokenizer_manager,
         scheduler_info=scheduler_info,
@@ -182,7 +181,10 @@ class TestServerInfoTransportParity(CustomTestCase):
             "--api-key sk-api --admin-api-ke=sk-api admin"
         )
         scheduler = SimpleNamespace(
-            server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+            server_args=args,
+            max_total_num_tokens=2048,
+            max_req_len=1030,
+            max_req_input_len=1024,
         )
         info = rust_config._launch_server_info(scheduler)
         for secret in ("sk-api", 'admin"', "old-admin"):
@@ -196,7 +198,7 @@ class TestServerInfoTransportParity(CustomTestCase):
             "--api-key <redacted> --admin-api-ke=<redacted>",
         )
 
-    def test_http_and_both_grpc_roles_share_startup_metadata(self):
+    def test_http_and_rust_launch_share_startup_metadata(self):
         secrets = {
             "api_key": "api-secret",
             "admin_api_key": "admin-secret",
@@ -209,7 +211,7 @@ class TestServerInfoTransportParity(CustomTestCase):
                 )
                 http_info = _call_server_info_with(args)
                 self.assertEqual(http_info["frontend"], "python")
-                # Every transport below reports the same fields.
+                # The Rust launch info below reports the same fields.
                 for name in secrets:
                     self.assertEqual(http_info[name], "<redacted>")
                 for field in (
@@ -221,26 +223,20 @@ class TestServerInfoTransportParity(CustomTestCase):
                 ):
                     self.assertIn(field, http_info)
                     http_info.pop(field)
-
-                bridge = RuntimeHandle.__new__(RuntimeHandle)
-                bridge.tokenizer_manager = SimpleNamespace(
-                    server_args=args, mm_processor=None
-                )
-                bridge.scheduler_info = {"max_req_input_len": 1024}
-                leader = json.loads(bridge.get_server_info())
-                # Only the leader serves requests, so only it lists media inputs.
-                self.assertEqual(leader.pop("grpc_features"), [])
-                self.assertEqual(leader, json.loads(json.dumps(http_info)))
+                http_info = json.loads(json.dumps(http_info))
 
                 # The embedded Rust server's launch-time fields, which stamp
                 # the init info the scheduler handshake carries for Python.
                 scheduler = SimpleNamespace(
-                    server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+                    server_args=args,
+                    max_total_num_tokens=2048,
+                    max_req_len=1030,
+                    max_req_input_len=1024,
                 )
                 rust_launch = json.loads(rust_config._launch_server_info(scheduler))
                 self.assertEqual(rust_launch.pop("status"), "ready")
                 self.assertEqual(rust_launch.pop("max_total_num_tokens"), 2048)
-                self.assertEqual(rust_launch, leader)
+                self.assertEqual(rust_launch, http_info)
 
                 # The Rust listener serves h2c with --enable-http2, so it
                 # advertises it and its stream limit, which a router reads to
@@ -254,48 +250,6 @@ class TestServerInfoTransportParity(CustomTestCase):
                 rust_launch = json.loads(rust_config._launch_server_info(scheduler))
                 self.assertIs(rust_launch["enable_http2"], True)
                 self.assertEqual(rust_launch["http2_max_concurrent_streams"], 64)
-
-                with (
-                    patch.object(
-                        server_utils,
-                        "get_serving",
-                        return_value=SimpleNamespace(
-                            host="127.0.0.1",
-                            grpc_port=50051,
-                        ),
-                    ),
-                    patch("sglang.srt.rust_extensions.load_rust_extension") as load,
-                ):
-                    server_utils.start_follower_grpc_server(args, bridge.scheduler_info)
-                start = load.return_value.start_metadata_server
-                start.assert_called_once_with(
-                    host="127.0.0.1", port=50051, server_info_json=ANY
-                )
-                self.assertEqual(
-                    json.loads(start.call_args.kwargs["server_info_json"]), leader
-                )
-
-    def test_rust_server_followers_skip_runtime_metadata_server(self):
-        """A follower node hosting a Rust listener must not bind grpc_port a
-        second time; that node's KV publishers are served by the listener."""
-        with (
-            envs.SGLANG_RUST_SERVER.override(True),
-            patch.object(
-                server_utils,
-                "get_serving",
-                return_value=SimpleNamespace(
-                    host="127.0.0.1",
-                    grpc_port=50051,
-                ),
-            ),
-            patch("sglang.srt.rust_extensions.load_rust_extension") as load,
-        ):
-            self.assertIsNone(
-                server_utils.start_follower_grpc_server(
-                    ServerArgs(model_path="dummy"), {}
-                )
-            )
-        load.return_value.start_metadata_server.assert_not_called()
 
 
 class TestServerInfoInternalStatesRedaction(CustomTestCase):
@@ -427,6 +381,8 @@ class TestModelInfoTransportParity(CustomTestCase):
             rust_server_tokenizer_path=lambda: "/loaded-tokenizer",
             tokenizer=None,
             max_total_num_tokens=1024,
+            max_req_len=1024,
+            max_req_input_len=1018,
             load_snapshot_writer=None,
             rust_server_endpoints=[
                 {"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}
@@ -469,6 +425,19 @@ class TestModelInfoTransportParity(CustomTestCase):
         self.assertIn("embedding", python_body)
         self.maxDiff = None
         self.assertEqual(rust_body, python_body)
+
+
+class TestServerInfoPrefillAnswersAlone(CustomTestCase):
+    def test_reported_unless_the_transfer_backend_is_fake(self):
+        # sgl-router skips decode for a one-token request only on engines that
+        # report this; on the fake backend a hostless request still hands off.
+        for backend, expected in (("mooncake", True), ("nixl", True), ("fake", False)):
+            with self.subTest(backend=backend):
+                args = ServerArgs(
+                    model_path="dummy", disaggregation_transfer_backend=backend
+                )
+                info = _call_server_info_with(args)
+                self.assertIs(info["prefill_answers_alone"], expected)
 
 
 class TestServerInfoKvEventsField(CustomTestCase):

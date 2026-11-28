@@ -58,6 +58,7 @@ from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import reads_scoped_fused_shards
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -872,6 +873,27 @@ class Gemma4DecoderLayer(nn.Module):
         return hidden_states
 
 
+def _declare_k_eq_v_qkv_shards(
+    config: Gemma4TextConfig,
+    quant_config: Optional[QuantizationConfig],
+    layers_prefix: str,
+) -> None:
+    # K=V layers ship only q_proj and k_proj; load_weights copies K into V.
+    if not config.attention_k_eq_v:
+        return
+    if not reads_scoped_fused_shards(quant_config):
+        return
+    scoped = {}
+    for i, layer_type in enumerate(config.layer_types):
+        if layer_type == "full_attention":
+            attn = f"{layers_prefix}.{i}.self_attn"
+            scoped[f"{attn}.qkv_proj"] = [f"{attn}.q_proj", f"{attn}.k_proj"]
+    # Scoped keys first: AutoRound takes the first key found in the layer name.
+    quant_config.update_packed_modules_mapping(
+        {**scoped, **quant_config.packed_modules_mapping}
+    )
+
+
 class Gemma4TextModel(PreTrainedModel):
     def __init__(
         self,
@@ -967,6 +989,7 @@ class Gemma4TextModel(PreTrainedModel):
             self.per_layer_input_scale = None
             self.per_layer_projection_scale = None
 
+        _declare_k_eq_v_qkv_shards(config, quant_config, add_prefix("layers", prefix))
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Gemma4DecoderLayer(

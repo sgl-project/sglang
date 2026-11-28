@@ -76,6 +76,42 @@ class TestMediaURLTimeout(_PolicyTestCase):
             download.assert_called_once_with(url, timeout=7.0)
 
 
+class TestDirectCodecMediaSource(_PolicyTestCase):
+    def test_direct_video_decoder_fetches_before_decoding(self):
+        from sglang.srt.utils import video_decoder
+
+        url = "https://example.com/fixture.mp4"
+        with (
+            patch(
+                "sglang.srt.multimodal.media_io.get_video_bytes",
+                return_value=b"video fixture",
+            ) as fetch,
+            patch.object(video_decoder, "_BACKEND", "torchcodec"),
+            patch.object(video_decoder, "VideoDecoder", create=True) as decode,
+        ):
+            video_decoder.VideoDecoderWrapper(url)
+        fetch.assert_called_once_with(url)
+        decode.assert_called_once_with(b"video fixture", dimension_order="NHWC")
+
+    def test_direct_audio_decoder_receives_downloaded_bytes(self):
+        import wave
+
+        from sglang.srt.multimodal.audio_from_video import decode_audio_container
+
+        fixture = io.BytesIO()
+        with wave.open(fixture, "wb") as wav:
+            wav.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
+            wav.writeframes(bytes(320))
+        url = "https://example.com/fixture.wav"
+        with patch(
+            "sglang.srt.multimodal.media_io.download_remote_media",
+            return_value=fixture.getvalue(),
+        ) as fetch:
+            audio = decode_audio_container(url, target_sr=8000, mono=True)
+        self.assertEqual(audio.size, 160)
+        self.assertEqual(fetch.call_args.args, (url,))
+
+
 class TestLocalMediaFiles(_PolicyTestCase):
     def setUp(self):
         super().setUp()
