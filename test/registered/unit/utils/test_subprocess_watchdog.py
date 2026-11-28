@@ -11,11 +11,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Tests for SubprocessWatchdog in watchdog.py"""
+"""Tests for SubprocessWatchdog and WatchdogRaw in watchdog.py"""
 
 import multiprocessing as mp
 import os
 import signal
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 import unittest.mock
@@ -24,8 +27,8 @@ from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
+register_cpu_ci(est_time=16, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="extra-test-cpu-intel")
 
 
 def healthy_worker():
@@ -167,6 +170,50 @@ class TestSubprocessWatchdog(CustomTestCase):
         thread.join(timeout=5)
         self.assertEqual(errors, [])
         self.assertFalse(thread.is_alive())
+
+
+class TestWatchdogExitSelf(CustomTestCase):
+    def test_timeout_exits_self_without_signalling_parent(self):
+        """With exit_self_on_watchdog_timeout() set (a Ray actor, whose parent
+        is the raylet), a hard timeout ends the stuck process itself and sends
+        nothing to its parent."""
+        child_script = textwrap.dedent("""
+            import time
+            from sglang.srt.utils.watchdog import (
+                WatchdogRaw,
+                exit_self_on_watchdog_timeout,
+            )
+
+            exit_self_on_watchdog_timeout()
+            WatchdogRaw(
+                debug_name="test",
+                get_counter=lambda: 0,
+                is_active=lambda: True,
+                watchdog_timeout=0.2,
+            )
+            time.sleep(60)
+            """)
+        parent_got_sigquit = threading.Event()
+        previous = signal.signal(
+            signal.SIGQUIT, lambda signum, frame: parent_got_sigquit.set()
+        )
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_script],
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                _, stderr = child.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                _, stderr = child.communicate()
+        finally:
+            signal.signal(signal.SIGQUIT, previous)
+
+        self.assertIn("test watchdog timeout", stderr)
+        self.assertFalse(parent_got_sigquit.is_set())
+        self.assertEqual(child.returncode, 1, msg=stderr)
 
 
 if __name__ == "__main__":

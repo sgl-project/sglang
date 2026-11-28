@@ -20,6 +20,17 @@ from sglang.srt.utils.cudacore_pyspy_dump_utils import (
 
 logger = logging.getLogger(__name__)
 
+_exit_self_on_timeout = False
+
+
+def exit_self_on_watchdog_timeout() -> None:
+    """Make a hard watchdog timeout exit this process instead of sending
+    ``SIGQUIT`` to its parent, for a process whose parent does not tear the
+    process tree down on ``SIGQUIT`` (a Ray actor's parent is the raylet,
+    which exits on ``SIGQUIT``)."""
+    global _exit_self_on_timeout
+    _exit_self_on_timeout = True
+
 
 class Watchdog:
     @staticmethod
@@ -175,9 +186,12 @@ class WatchdogRaw:
                     self.before_crash()
                 except BaseException:  # e.g. a Rust panic; SIGQUIT must still go
                     logger.exception(f"{self.debug_name} watchdog: before_crash failed")
-            # Wait for some time so that the parent process can print the error.
-            time.sleep(5)
-            self.parent_process.send_signal(signal.SIGQUIT)
+            if _exit_self_on_timeout:
+                os._exit(1)
+            else:
+                # Wait for some time so that the parent process can print the error.
+                time.sleep(5)
+                self.parent_process.send_signal(signal.SIGQUIT)
 
 
 class SubprocessWatchdog:
