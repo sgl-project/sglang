@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 import triton
@@ -279,6 +279,8 @@ class DeepGemmRunnerInput(RunnerInput):
     # Number of activation elements sharing one scale along K.
     # Records the actual input quantization group, independently of weight scales.
     activation_scale_block_size: Optional[int] = None
+    a_row_indices: Optional[torch.Tensor] = None
+    release_recv_view: Optional[Callable[[], None]] = None
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -378,34 +380,38 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> DeepGemmRunnerOutput:
-        weight_dtype = quant_info.w13_weight.dtype
-        if self.config.silu_mul_keep_fp32 and weight_dtype != torch.float8_e4m3fn:
-            raise ValueError("silu_mul_keep_fp32 requires FP8 expert weights")
-        alignment = (
-            running_state.get("contiguous_layout_alignment")
-            if not runner_input.use_masked_gemm
-            else None
-        )
-        with deep_gemm_wrapper.contiguous_layout_alignment_scope(alignment):
-            if not runner_input.use_masked_gemm:
-                if weight_dtype == torch.bfloat16:
-                    hidden_states = self._run_bf16_contiguous_gemm(
-                        runner_input, quant_info, running_state
-                    )
+        try:
+            weight_dtype = quant_info.w13_weight.dtype
+            if self.config.silu_mul_keep_fp32 and weight_dtype != torch.float8_e4m3fn:
+                raise ValueError("silu_mul_keep_fp32 requires FP8 expert weights")
+            alignment = (
+                running_state.get("contiguous_layout_alignment")
+                if not runner_input.use_masked_gemm
+                else None
+            )
+            with deep_gemm_wrapper.contiguous_layout_alignment_scope(alignment):
+                if not runner_input.use_masked_gemm:
+                    if weight_dtype == torch.bfloat16:
+                        hidden_states = self._run_bf16_contiguous_gemm(
+                            runner_input, quant_info, running_state
+                        )
+                    else:
+                        hidden_states = self._run_contiguous_gemm(
+                            runner_input, quant_info, running_state
+                        )
                 else:
-                    hidden_states = self._run_contiguous_gemm(
-                        runner_input, quant_info, running_state
-                    )
-            else:
-                if weight_dtype == torch.bfloat16:
-                    hidden_states = self._run_masked_bf16_gemm(
-                        runner_input, quant_info, running_state
-                    )
-                else:
-                    hidden_states = self._run_masked_gemm(
-                        runner_input, quant_info, running_state
-                    )
-        return DeepGemmRunnerOutput(hidden_states=hidden_states)
+                    if weight_dtype == torch.bfloat16:
+                        hidden_states = self._run_masked_bf16_gemm(
+                            runner_input, quant_info, running_state
+                        )
+                    else:
+                        hidden_states = self._run_masked_gemm(
+                            runner_input, quant_info, running_state
+                        )
+            return DeepGemmRunnerOutput(hidden_states=hidden_states)
+        finally:
+            if runner_input.release_recv_view is not None:
+                runner_input.release_recv_view()
 
     def _run_contiguous_gemm(
         self,
@@ -682,14 +688,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             dtype=torch.bfloat16,
         )
 
-        deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
-            hidden_states,
-            w13_weight,
-            gateup_output,
-            m_indices,
-        )
-
-        dispose_tensor(hidden_states)
+        if runner_input.a_row_indices is None:
+            deep_gemm_wrapper.grouped_gemm_nt_bf16_contig(
+                hidden_states, w13_weight, gateup_output, m_indices
+            )
+            dispose_tensor(hidden_states)
+        else:
+            try:
+                deep_gemm_wrapper.grouped_gemm_nt_bf16_contig_gathered(
+                    hidden_states,
+                    w13_weight,
+                    gateup_output,
+                    m_indices,
+                    runner_input.a_row_indices,
+                )
+            finally:
+                # GEMM1 is the last slab reader; never dispose communication storage.
+                runner_input.release_recv_view()
 
         # Act: (M, N) -> (M, N/2)
         if not _is_musa:
@@ -1724,6 +1739,73 @@ def _apply_swiglu_limit(
     return gateup_output
 
 
+def _pre_permute_borrowed_deepep_v2(
+    dispatch_output: DeepEPv2DispatchOutput,
+    quant_info: DeepGemmMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    running_state: dict,
+) -> DeepGemmRunnerInput:
+    from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter_from_psum
+
+    try:
+        if (
+            dispatch_output.is_expanded
+            or dispatch_output.use_masked_gemm
+            or dispatch_output.hidden_states_scale is not None
+            or quant_info.w13_weight.dtype != torch.bfloat16
+            or quant_info.w2_weight.dtype != torch.bfloat16
+            or runner_config.activation != "silu"
+            or runner_config.silu_mul_keep_fp32
+        ):
+            raise ValueError("Borrowed prefill supports contiguous BF16 SiLU experts")
+        slab = dispatch_output.hidden_states
+        topk_ids = dispatch_output.topk_ids
+        psum = dispatch_output.psum_num_recv_tokens_per_expert
+        all_tokens = int(psum[-1].item())
+        source_rows = torch.zeros(
+            (all_tokens, 1), device=slab.device, dtype=torch.int64
+        )
+        m_indices = torch.empty(all_tokens, device=slab.device, dtype=torch.int32)
+        output_index = torch.full_like(topk_ids, -1)
+        if all_tokens:
+            # Reuse the native route permutation, moving indices instead of activations.
+            ep_scatter_from_psum(
+                dispatch_output.recv_view.row_indices.view(-1, 1),
+                None,
+                topk_ids,
+                psum,
+                torch.empty_like(psum),
+                source_rows,
+                None,
+                m_indices,
+                output_index,
+                quant_block_size=1,
+            )
+        running_state.update(
+            all_tokens=all_tokens,
+            hidden_states_shape=(topk_ids.shape[0], slab.shape[1]),
+            hidden_states_device=slab.device,
+            hidden_states_dtype=slab.dtype,
+            topk_ids=topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+            output_index=output_index,
+            contiguous_layout_alignment=dispatch_output.expert_alignment,
+            deepep_v2_borrowed=True,
+        )
+        return DeepGemmRunnerInput(
+            hidden_states=slab,
+            hidden_states_scale=None,
+            use_masked_gemm=False,
+            m_indices=m_indices,
+            a_row_indices=source_rows.view(-1),
+            release_recv_view=dispatch_output.release_recv_view,
+            activation_scale_block_size=dispatch_output.activation_scale_block_size,
+        )
+    except BaseException:
+        dispatch_output.release_recv_view()
+        raise
+
+
 @register_pre_permute("deepep_v2", "deep_gemm")
 def pre_permute_deepep_v2_to_deep_gemm(
     dispatch_output: DeepEPv2DispatchOutput,
@@ -1735,6 +1817,11 @@ def pre_permute_deepep_v2_to_deep_gemm(
         ep_scatter_from_psum,
         fill_m_indices_from_psum,
     )
+
+    if dispatch_output.recv_view is not None:
+        return _pre_permute_borrowed_deepep_v2(
+            dispatch_output, quant_info, runner_config, running_state
+        )
 
     hidden_states = dispatch_output.hidden_states
     hidden_states_scale = dispatch_output.hidden_states_scale

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 import torch
 import torch.distributed as dist
@@ -39,7 +39,10 @@ sglang_per_token_group_quant_fp8 = None
 
 
 try:
-    from deep_ep import ElasticBuffer
+    if envs.SGLANG_DEEPEP_V2_USE_EP_BUFFER.get():
+        from deep_ep import EPBuffer as ElasticBuffer
+    else:
+        from deep_ep import ElasticBuffer
 
     use_deepep_v2 = True
 except Exception as exc:  # deep_ep's import-time host checks; see deepep.py
@@ -68,6 +71,8 @@ class DeepEPv2DispatchOutput(NamedTuple):
     total_expanded: int = 0
     expert_alignment: int = 128
     activation_scale_block_size: int = _SCALE_BLOCK_SIZE
+    recv_view: Optional[Any] = None
+    release_recv_view: Optional[Callable[[], None]] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -171,6 +176,11 @@ class DeepEPv2Buffer:
         if allow_hybrid_mode is None:
             allow_hybrid_mode = _get_allow_hybrid_mode()
         state = cls._state()
+        ep_buffer_kwargs = {}
+        if envs.SGLANG_DEEPEP_V2_USE_EP_BUFFER.get():
+            ep_buffer_kwargs["deterministic"] = (
+                torch.are_deterministic_algorithms_enabled()
+            )
         # A key change rebuilds ElasticBuffer collectively on every rank.
         key = (
             group,
@@ -180,6 +190,7 @@ class DeepEPv2Buffer:
             use_fp8_dispatch,
             allow_hybrid_mode,
             dist.get_world_size(group),
+            ep_buffer_kwargs.get("deterministic"),
         )
         if state.buffer is not None and state.key == key:
             return state.buffer
@@ -198,6 +209,7 @@ class DeepEPv2Buffer:
             allow_hybrid_mode=allow_hybrid_mode,
             sl_idx=0,
             prefer_overlap_with_compute=False,
+            **ep_buffer_kwargs,
         )
         # Publish only after collective construction succeeds.
         state.buffer = buffer
@@ -246,6 +258,7 @@ class _DeepEPv2Impl:
         self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         self.use_fp8_dispatch = use_fp8_dispatch
         self._handle = None
+        self._recv_view = None
         self._pad_empty_combine = False
         prefill_expand = envs.SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND.get()
         if prefill_expand is None:
@@ -254,7 +267,13 @@ class _DeepEPv2Impl:
             prefill_expand = not scale_format.ue8m0
         self._prefill_expand_enabled = prefill_expand
 
+    def _release_recv_view(self) -> None:
+        if self._recv_view is not None:
+            self._recv_view.release(torch.cuda.current_stream())
+            self._recv_view = None
+
     def _destroy_handle(self) -> None:
+        self._release_recv_view()
         self._handle = None
 
     def _get_buffer(self) -> ElasticBuffer:
@@ -343,6 +362,20 @@ class _DeepEPv2Impl:
         is_decode = not get_is_extend_in_batch()
         use_masked = is_decode
         use_expand_layout = is_decode or self._prefill_expand_enabled
+        borrow_recv = envs.SGLANG_DEEPEP_V2_BORROW_RECV.get() and not is_decode
+        if borrow_recv and (
+            not envs.SGLANG_DEEPEP_V2_USE_EP_BUFFER.get()
+            or use_expand_layout
+            or self.use_fp8_dispatch
+            or hidden_states.dtype != torch.bfloat16
+            or torch.cuda.get_device_capability() != (9, 0)
+            or dist.get_world_size(self.group) != 8
+            or _get_allow_hybrid_mode()
+        ):
+            raise ValueError(
+                "Borrowed DeepEP v2 prefill requires the experimental EPBuffer, "
+                "compact BF16, SM90 and single-node EP8 direct mode"
+            )
 
         # CPU-synced dispatch needs a dummy token to notify from an idle rank.
         self._pad_empty_combine = (not use_masked) and hidden_states.shape[0] == 0
@@ -393,12 +426,17 @@ class _DeepEPv2Impl:
             use_tma_aligned_col_major_sf=use_tma_aligned_col_major_sf,
             do_cpu_sync=do_cpu_sync_val,
             do_expand=use_expand_layout,
+            **({"borrow_recv": True} if borrow_recv else {}),
         )
         local_tokens = hidden_states.shape[0]
         if event.event is not None:
             event.current_stream_wait()
 
-        if isinstance(recv_x, tuple):
+        if borrow_recv:
+            self._recv_view = recv_x
+            recv_hidden_states = recv_x.slab
+            recv_hidden_states_scale = None
+        elif isinstance(recv_x, tuple):
             recv_hidden_states, recv_hidden_states_scale = recv_x
         else:
             recv_hidden_states = recv_x
@@ -418,7 +456,8 @@ class _DeepEPv2Impl:
             )
             recv_topk_idx = recv_topk_idx[:num_recv_tokens]
             recv_topk_weights = recv_topk_weights[:num_recv_tokens]
-            recv_hidden_states = recv_hidden_states[:num_recv_tokens]
+            if not borrow_recv:
+                recv_hidden_states = recv_hidden_states[:num_recv_tokens]
             if recv_hidden_states_scale is not None:
                 recv_hidden_states_scale = recv_hidden_states_scale[:num_recv_tokens]
 
@@ -458,6 +497,8 @@ class _DeepEPv2Impl:
             total_expanded,
             _EXPERT_ALIGNMENT,
             activation_scale_block_size=self.activation_scale_block_size,
+            recv_view=self._recv_view,
+            release_recv_view=self._release_recv_view if borrow_recv else None,
         )
 
     def combine(self, combine_input: DeepEPv2CombineInput) -> torch.Tensor:
