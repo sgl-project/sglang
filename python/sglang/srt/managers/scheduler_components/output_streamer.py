@@ -390,6 +390,7 @@ class SchedulerOutputStreamer:
         has_tensor_embeddings = False
         phs_list = []
         has_phs = False
+        use_pickle_ipc = envs.SGLANG_USE_PICKLE_IPC.get()
         for req in reqs:
             if req.finished():
                 record_send(req, "stream")
@@ -398,7 +399,16 @@ class SchedulerOutputStreamer:
                 finished_reasons.append(req.finished_reason.to_json())
                 if isinstance(req.embedding, torch.Tensor):
                     embeddings.append([])
-                    tensor_embeddings.append(req.embedding)
+                    row = req.embedding
+                    # Pickle serializes the whole storage behind each tensor view.
+                    # Avoid sending the other rows of the batch with every request.
+                    if (
+                        use_pickle_ipc
+                        and row.layout == torch.strided
+                        and row.untyped_storage().nbytes() > row.nbytes
+                    ):
+                        row = row.clone()
+                    tensor_embeddings.append(row)
                     has_tensor_embeddings = True
                 else:
                     embeddings.append(req.embedding)
