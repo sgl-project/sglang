@@ -2584,6 +2584,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         skip_swizzled_blockscales = (
             self.enable_flashinfer_trtllm_moe
             or moe_runner_backend.is_flashinfer_megamoe()
+            or moe_runner_backend.is_flashinfer_cutedsl()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_lora_marlin()
             or moe_runner_backend.is_auto()
@@ -3093,34 +3094,36 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w13_k = layer.w13_weight.shape[2] * 2
                 w2_m = layer.w2_weight.shape[1]
                 w2_k = layer.w2_weight.shape[2] * 2
-                copy_or_rebind_param(
-                    layer,
-                    "w13_blockscale_mma",
-                    convert_sf_to_mma_layout(
-                        layer.w13_blockscale_swizzled.contiguous()
-                        .view(torch.uint8)
-                        .reshape(-1),
-                        m=w13_m,
-                        k=w13_k,
+                for mma_name, swizzled_tensor, m_dim, k_dim in (
+                    ("w13_blockscale_mma", layer.w13_blockscale_swizzled, w13_m, w13_k),
+                    ("w2_blockscale_mma", layer.w2_blockscale_swizzled, w2_m, w2_k),
+                ):
+                    mma_view = convert_sf_to_mma_layout(
+                        swizzled_tensor.contiguous().view(torch.uint8).reshape(-1),
+                        m=m_dim,
+                        k=k_dim,
                         num_groups=num_local_experts,
                         sf_vec_size=sf_vec_size,
-                    ),
-                )
-                copy_or_rebind_param(
-                    layer,
-                    "w2_blockscale_mma",
-                    convert_sf_to_mma_layout(
-                        layer.w2_blockscale_swizzled.contiguous()
-                        .view(torch.uint8)
-                        .reshape(-1),
-                        m=w2_m,
-                        k=w2_k,
-                        num_groups=num_local_experts,
-                        sf_vec_size=sf_vec_size,
-                    ),
-                )
+                    )
+                    existing = getattr(layer, mma_name, None)
+                    # convert_sf_to_mma_layout returns a 6D strided view of
+                    # w*_blockscale_swizzled. On weight reload the underlying
+                    # storage is already updated in place; calling
+                    # copy_or_rebind_param would self-copy a non-contiguous
+                    # view onto itself.
+                    if (
+                        isinstance(existing, Parameter)
+                        and existing.data.data_ptr() == mma_view.data_ptr()
+                        and existing.data.shape == mma_view.shape
+                        and existing.data.stride() == mma_view.stride()
+                        and existing.data.dtype == mma_view.dtype
+                        and existing.data.device == mma_view.device
+                    ):
+                        continue
+                    copy_or_rebind_param(layer, mma_name, mma_view)
                 if layer._cutedsl_wrapper is not None:
                     refresh_cutedsl_standard_scales_for_weight_update(layer)
+                layer._cutedsl_quant_info = None
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -3162,6 +3165,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401 – triggers @register_fused_func
 
             layer._cutedsl_wrapper = None
+            layer._cutedsl_quant_info = None
 
         if moe_runner_backend.is_flashinfer_cutlass():
             import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
@@ -3301,12 +3305,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return self.runner.run(dispatch_output, quant_info)
 
         if moe_runner_backend.is_flashinfer_cutedsl():
-            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
-                CuteDslFp4MoeQuantInfo,
-                ensure_cutedsl_wrapper,
-            )
-
             if self._is_cutedsl_v1_deepep:
+                from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                    CuteDslFp4MoeQuantInfo,
+                )
+
                 if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get():
                     raise ValueError(
                         "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 does not support "
@@ -3332,28 +3335,37 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             # v2 standard path (a2a=none/flashinfer): uses CuteDslMoEWrapper
             # with [Up, Gate] interleaved weights and MMA blockscales.
-            ensure_cutedsl_wrapper(layer)
-            w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
-            quant_mode = layer._cutedsl_wrapper.quant_mode
-            quant_info = CuteDslFp4MoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_weight_sf=getattr(
-                    layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
-                ),
-                w2_weight_sf=getattr(
-                    layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
-                ),
-                w1_alpha=w1_alpha,
-                w2_alpha=w2_alpha,
-                a1_scale=layer._cutedsl_input_scale,
-                a2_scale=fc2_input_scale,
-                wrapper=layer._cutedsl_wrapper,
-                use_per_token_activation=(
-                    self.quant_config.use_per_token_activation and quant_mode == "w4a4"
-                ),
-                quant_mode=quant_mode,
-            )
+            quant_info = getattr(layer, "_cutedsl_quant_info", None)
+            if quant_info is None:
+                from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                    CuteDslFp4MoeQuantInfo,
+                    ensure_cutedsl_wrapper,
+                )
+
+                ensure_cutedsl_wrapper(layer)
+                w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
+                quant_mode = layer._cutedsl_wrapper.quant_mode
+                quant_info = CuteDslFp4MoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    w13_weight_sf=getattr(
+                        layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
+                    ),
+                    w2_weight_sf=getattr(
+                        layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
+                    ),
+                    w1_alpha=w1_alpha,
+                    w2_alpha=w2_alpha,
+                    a1_scale=layer._cutedsl_input_scale,
+                    a2_scale=fc2_input_scale,
+                    wrapper=layer._cutedsl_wrapper,
+                    use_per_token_activation=(
+                        self.quant_config.use_per_token_activation
+                        and quant_mode == "w4a4"
+                    ),
+                    quant_mode=quant_mode,
+                )
+                layer._cutedsl_quant_info = quant_info
             return self.runner.run(dispatch_output, quant_info)
 
         if moe_runner_backend.is_flashinfer_cutlass():

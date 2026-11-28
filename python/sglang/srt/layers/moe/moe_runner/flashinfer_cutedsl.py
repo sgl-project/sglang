@@ -13,6 +13,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferCombineInput
+from sglang.srt.layers.moe.token_dispatcher.standard import (
+    StandardCombineInput,
+    StandardDispatchOutput,
+)
+from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
@@ -245,34 +252,42 @@ def _make_per_token_global_scale(input_tensor: torch.Tensor) -> torch.Tensor:
 def refresh_cutedsl_standard_scales_for_weight_update(
     layer: torch.nn.Module,
 ) -> None:
-    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-        resolve_cutedsl_standard_scales(layer)
-    )
-    if (
-        layer.quant_config.use_per_token_activation
-        and layer._cutedsl_wrapper.quant_mode == "w4a4"
-    ):
-        used_input_scale = _make_per_token_global_scale(used_input_scale)
-
-    new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     current_scales = layer._cutedsl_scales
     current_input_scale = layer._cutedsl_input_scale
-
-    # Decode CUDA graphs capture these tensor addresses, so reloads must update
-    # their values without replacing the tensors.
     if (
         not isinstance(current_scales, tuple)
-        or len(current_scales) != len(new_scales)
+        or len(current_scales) != 3
         or not isinstance(current_input_scale, torch.Tensor)
     ):
         raise RuntimeError(
             "CuTe DSL scale metadata changed during weight reload; "
             "CUDA graph recapture is required."
         )
-    scale_pairs = (
-        *zip(current_scales, new_scales),
-        (current_input_scale, used_input_scale),
-    )
+
+    quant_mode = layer._cutedsl_wrapper.quant_mode
+    if quant_mode == "w4a16":
+        # W4A16 uses neutral (1.0) activation scales; only the per-expert
+        # weight decode alphas change on weight reload.
+        w1_alpha = layer.g1_alphas.to(torch.float32)
+        w2_alpha = layer.g2_alphas.to(torch.float32)
+        scale_pairs = (
+            (current_scales[0], w1_alpha),
+            (current_scales[2], w2_alpha),
+        )
+    else:
+        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+            resolve_cutedsl_standard_scales(layer)
+        )
+        if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
+            used_input_scale = _make_per_token_global_scale(used_input_scale)
+        new_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+        scale_pairs = (
+            *zip(current_scales, new_scales),
+            (current_input_scale, used_input_scale),
+        )
+
+    # Decode CUDA graphs capture these tensor addresses, so reloads must update
+    # their values without replacing the tensors.
     for current, new in scale_pairs:
         if (
             not isinstance(current, torch.Tensor)
@@ -286,8 +301,13 @@ def refresh_cutedsl_standard_scales_for_weight_update(
             )
 
     with torch.no_grad():
-        for current, new in scale_pairs:
-            current.copy_(new)
+        dsts = [current for current, _ in scale_pairs]
+        srcs = [new for _, new in scale_pairs]
+        if dsts and all(t.is_cuda for t in dsts):
+            torch._foreach_copy_(dsts, srcs)
+        else:
+            for current, new in scale_pairs:
+                current.copy_(new)
 
 
 def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
@@ -377,6 +397,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             used_input_scale = _make_per_token_global_scale(used_input_scale)
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
+    layer._cutedsl_quant_info = None
 
 
 # ---------------------------------------------------------------------------
@@ -443,10 +464,6 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-
     assert runner_config.activation in (
         "silu",
         "situ",
@@ -527,13 +544,6 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     - bf16 input (SGLANG_MOE_NVFP4_DISPATCH=0): quantize with cutedsl's scale
     - FP4 input (SGLANG_MOE_NVFP4_DISPATCH=1): pass through (same fp4_quantize params)
     """
-    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
-        FlashinferCombineInput,
-    )
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-
     # Eager prefill uses all-gather, including idle ranks in a prefill batch.
     # Preserve the standard combine format so the dispatcher reduce-scatters it.
     if isinstance(dispatch_output, StandardDispatchOutput):
