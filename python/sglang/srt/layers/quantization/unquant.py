@@ -475,8 +475,11 @@ def precompile_sm107_splitk_tactics() -> bool:
     )
 
 
+_use_l4_bf16_gemv = False
+
+
 def initialize_bf16_gemm_config() -> None:
-    global _BF16_GEMM_BACKEND
+    global _BF16_GEMM_BACKEND, _use_l4_bf16_gemv
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
     global _splitk_tactic
     global _run_splitk_dense
@@ -504,9 +507,20 @@ def initialize_bf16_gemm_config() -> None:
 
     backend = Bf16GemmBackend(backend_str)
 
+    _use_l4_bf16_gemv = False
     if backend.is_gemv():
-        if torch.cuda.get_device_capability()[0] not in (9, 12):
-            raise ValueError("--bf16-gemm-backend gemv requires SM90 (Hopper) or SM12x")
+        from sglang.kernels.ops.gemm.hopper_bf16_gemv import (
+            is_l4_bf16_gemv_supported,
+        )
+
+        is_l4 = is_l4_bf16_gemv_supported()
+        _use_l4_bf16_gemv = is_l4
+        if torch.cuda.get_device_capability()[0] not in (9, 12) and not is_l4:
+            raise ValueError(
+                "--bf16-gemm-backend gemv requires SM90, SM12x or NVIDIA L4"
+            )
+        if is_l4 and get_exec().deterministic.enable_deterministic_inference:
+            raise ValueError("L4 GEMV is incompatible with deterministic inference")
 
         global _hopper_bf16_gemv, _use_hopper_bf16_gemv
         global _hopper_bf16_tiny_gemv, _use_hopper_bf16_tiny_gemv
@@ -731,6 +745,11 @@ def _bf16_gemm_dispatch_impl(
         _use_hopper_bf16_gemv is not None
         and bias is None
         and _use_hopper_bf16_gemv(m, weight.shape[0], weight.shape[1])
+        and x.device == weight.device
+        and (
+            not _use_l4_bf16_gemv
+            or (x.ndim == 2 and not x.requires_grad and not weight.requires_grad)
+        )
         # The GEMV reads x and weight with 16-byte vector loads;
         # other layouts take the cuBLAS routes below.
         and x.is_contiguous()

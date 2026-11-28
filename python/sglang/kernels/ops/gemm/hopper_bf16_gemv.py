@@ -30,6 +30,12 @@ def _is_sm12x() -> bool:
     return current_arch().is_sm(12)
 
 
+@cache_once
+def is_l4_bf16_gemv_supported() -> bool:
+    # Restrict this experimental path to the hardware actually validated.
+    return current_arch().is_sm(8, 9) and torch.cuda.get_device_name() == "NVIDIA L4"
+
+
 def _config(n: int) -> tuple[int, int, int]:
     """(rows_per_warp, k_unroll, num_warps) tuned on H200 (SM90) and
     DRAM-cold on RTX PRO 6000 (SM120), where kUnroll must stay 1 so the
@@ -55,6 +61,8 @@ def _jit_hopper_bf16_gemv_module(n: int, k: int) -> Module:
 
 
 def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
+    if current_arch().is_sm(8):
+        return is_l4_bf16_gemv_supported() and (m, n, k) == (1, 2048, 4096)
     if _is_sm12x():
         # SM12x: kUnroll==1 needs only 16B-aligned K (128 for margin);
         # 12288 <= N < 32768 stays on cuBLAS, which already saturates DRAM there.
