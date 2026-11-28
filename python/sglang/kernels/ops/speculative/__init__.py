@@ -88,6 +88,18 @@ register_kernel(
     )
 )
 
+# Checked bitwise against the stock tree sampler on SM 10.x only.
+register_kernel(
+    KernelSpec(
+        op="speculative.multi_cta_verify_sampling",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.speculative.multi_cta_verify_sampling:tree_speculative_sampling_target_only",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+    )
+)
+
 # Exactly SM90: an int8 wgmma kernel launched as a cooperative grid, tuned on
 # H100.
 register_kernel(
