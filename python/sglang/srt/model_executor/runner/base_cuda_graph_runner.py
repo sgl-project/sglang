@@ -22,7 +22,7 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.cp.cp_decode_attn_tp import can_defer_cp_decode_attn_tp
 from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
@@ -102,6 +102,15 @@ def get_batch_sizes_to_capture(
             is_deepseek_dsa(hf_config)
             and getattr(hf_config, "q_lora_rank", None) is not None
         )
+        if is_deepseek_v4(hf_config):
+            # DeepSeek-V4 decode rows use the ordinary layout (sharded over
+            # attention DP only; CP shards only context-parallel extends), and
+            # decode attention TP slices heads, not rows. V4 CP sets
+            # moe_dense_tp_size=1, which marks a gathered buffer as required,
+            # but with attention TP and DP of 1 (required by the dispatch) that
+            # gather spans one rank, so it needs no CP-width rows either.
+            decode_uses_tp_rows = True
+            gathered_buffer_required = False
     mul_base = get_cuda_graph_batch_size_alignment(
         gathered_buffer_required=gathered_buffer_required,
         include_cp_alignment=not decode_uses_tp_rows,

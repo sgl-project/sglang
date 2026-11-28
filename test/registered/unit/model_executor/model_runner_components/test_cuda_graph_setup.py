@@ -90,6 +90,84 @@ def test_cp_decode_dispatch_capture_buckets(
         )
 
 
+@pytest.mark.parametrize("width", [1, 6])
+@pytest.mark.parametrize("gathered_buffer_required", [None, False, True])
+@pytest.mark.parametrize(
+    "arch,cp_size,dispatch,overrides,expected",
+    [
+        # V4 CP sets moe_dense_tp_size=1, so its decode runners report a
+        # gathered buffer; with the dispatch active that gather spans one rank.
+        ("DeepseekV4ForCausalLM", 8, True, {}, {1: [1, 2, 4, 8], 6: [1, 2, 4, 8]}),
+        (
+            "DeepseekV4ForCausalLMDSpark",
+            8,
+            True,
+            {},
+            {1: [1, 2, 4, 8], 6: [1, 2, 4, 8]},
+        ),
+        ("DeepseekV4ForCausalLM", 8, False, {}, {1: [8], 6: [4, 8]}),
+        # The dispatch needs attn_cp_size == tp_size; at CP4 attention TP is 2,
+        # so a gathered buffer keeps its attn_tp_size * cp_size alignment.
+        ("DeepseekV4ForCausalLM", 4, True, {}, {1: [4, 8], 6: [2, 4, 8]}),
+        ("DeepseekV4ForCausalLM", 8, True, {"enable_lora": True}, {1: [8], 6: [4, 8]}),
+        (
+            "DeepseekV4ForCausalLM",
+            8,
+            True,
+            {"enable_layernorm_sp": True},
+            {1: [8], 6: [4, 8]},
+        ),
+    ],
+)
+def test_cp_decode_dispatch_capture_buckets_deepseek_v4(
+    width, gathered_buffer_required, arch, cp_size, dispatch, overrides, expected
+):
+    from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
+    from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
+        get_batch_sizes_to_capture,
+    )
+    from sglang.srt.runtime_context import get_context
+
+    # DeepSeek-V4.1 has neither q_lora_rank nor a DSA indexer config.
+    hf_config = SimpleNamespace(
+        architectures=[arch], model_type="deepseek_v41", q_lora_rank=None
+    )
+    model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config),
+        req_to_token_pool=SimpleNamespace(size=8),
+        server_args=SimpleNamespace(dllm_algorithm=None),
+    )
+    with get_context().override_server_args(
+        tp_size=8,
+        attn_cp_size=cp_size,
+        enable_prefill_cp=True,
+        enable_cp_decode_attn_tp=dispatch,
+        cp_strategy="interleave",
+        moe_dense_tp_size=1,
+        device="cuda",
+        enable_torch_compile=False,
+        enable_two_batch_overlap=False,
+        cuda_graph_config=SimpleNamespace(
+            decode=SimpleNamespace(backend="default", bs=[1, 2, 4, 8])
+        ),
+        **overrides,
+    ):
+        capture_bs, compile_bs = get_batch_sizes_to_capture(
+            model_runner, width, gathered_buffer_required=gathered_buffer_required
+        )
+        if cp_size != 8 and gathered_buffer_required is not False:
+            # Outside the dispatch the gather contract is unchanged; None
+            # resolves to required here (moe_dense_tp_size=1).
+            expected = {1: [8], 6: [4, 8]}
+        assert capture_bs == expected[width]
+        assert compile_bs == []
+        # Other users of the alignment keep the CP requirement.
+        assert (
+            get_cuda_graph_batch_size_alignment(gathered_buffer_required=False)
+            == cp_size
+        )
+
+
 def test_standard_gqa_gate_uses_pipeline_local_layer_range():
     # PP rank owns layers [23, 46), while the full model has 92 layers.
     assert has_standard_gqa_for_all_local_layers(
