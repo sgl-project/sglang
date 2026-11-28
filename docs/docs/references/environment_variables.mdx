@@ -963,7 +963,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_MESSAGE_QUEUE_BROADCASTER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the shared-memory message-queue broadcaster for inter-process tensor broadcast.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use the shared-memory message queue to broadcast Python objects between ranks.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
@@ -993,6 +993,12 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
   </tbody>
 </table>
+
+### Message queue broadcaster across Pods
+
+If tensor-parallel ranks run in separate Pods on the same host and share the host's `/dev/shm`, startup can hang when the Pods have separate network namespaces. The broadcaster uses shared-memory visibility to choose local readers, then tries to reach them over loopback.
+
+Set `SGLANG_USE_MESSAGE_QUEUE_BROADCASTER=0` on every rank in the group to bypass the queue and use PyTorch object broadcasts. You can keep the shared `/dev/shm` mount. This workaround was verified with two Pods on one host running SGLang v0.5.23, including generation and HF3FS USRBIO reads.
 
 ## PD Disaggregation — Staging Buffer (Heterogeneous TP)
 
