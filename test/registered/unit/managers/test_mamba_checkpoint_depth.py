@@ -18,6 +18,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     _MambaRadixCacheV2TrackEntry,
+    branch_checkpoint,
 )
 from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
@@ -25,6 +26,9 @@ from sglang.srt.managers.schedule_policy import (
     mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams, MatchResult
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -32,10 +36,70 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 CHUNK = 64
+
+
+class TestMatchedMambaBranchCheckpoint(CustomTestCase):
+    def test_device_prefix_selects_a_reachable_branch_checkpoint(self):
+        state = SimpleNamespace(holds_mamba=True)
+        params = MatchPrefixParams(
+            key=RadixKey(array("q")),
+            req=SimpleNamespace(kv=state),
+            cow_mamba=True,
+        )
+        component = object.__new__(MambaComponent)
+        component.cache = SimpleNamespace(enable_mamba_extra_buffer=True)
+        component.mamba_cache_chunk_size = CHUNK
+        component.mamba_checkpoint_grid = CHUNK
+        component.tree_core = SimpleNamespace(
+            page_size=8,
+            get_component_device_value=MagicMock(return_value=1),
+        )
+        result = MatchResult(
+            device_prefix_len=126736,
+            last_device_node=1,
+            last_host_node=1,
+            best_match_node=1,
+            full_kv_hit_length=133168,
+            mamba_branching_seqlen=133120,
+        )
+
+        for overrides, dcp, expected in (
+            ({}, False, 133136),
+            ({}, True, 133120),
+            ({"host_hit_length": 64}, False, 133120),
+            (
+                {"full_kv_hit_length": 126784, "mamba_branching_seqlen": None},
+                False,
+                None,
+            ),
+        ):
+            with (
+                self.subTest(overrides=overrides, dcp=dcp),
+                patch(
+                    "sglang.srt.mem_cache.unified_cache.components.mamba.get_parallel",
+                    return_value=SimpleNamespace(dcp_enabled=dcp),
+                ),
+            ):
+                matched = component.finalize_match_result_in_cache(
+                    params, result._replace(**overrides)
+                )
+                self.assertEqual(matched.device_prefix_len, result.device_prefix_len)
+                self.assertEqual(matched.mamba_branching_seqlen, expected)
+                if expected == 133136:
+                    self.assertEqual(
+                        branch_checkpoint(
+                            matched.device_prefix_len,
+                            matched.mamba_branching_seqlen,
+                            133246,
+                            CHUNK,
+                        ),
+                        expected,
+                    )
 
 
 def _prepare_extend(
