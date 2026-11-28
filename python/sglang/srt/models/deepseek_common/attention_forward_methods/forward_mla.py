@@ -30,6 +30,7 @@ from sglang.srt.layers.dcp import (
     dcp_a2a_lse_reduce,
     dcp_push_combine_fits,
     dcp_push_combine_reduce,
+    is_dsa_dcp_gathered_prefill,
 )
 from sglang.srt.layers.dcp.layout import (
     dsa_shards_index_k,
@@ -197,7 +198,13 @@ class DeepseekMLAForwardMixin:
             or mode.is_draft_extend_v2()
             # K3.1's sharded DSA prefill attends over the gathered KV instead; draft
             # extend covers ROCm's DSA draft, which shards KV like the target.
-            or (self.use_dsa and mode.is_extend() and not dsa_shards_index_k())
+            # A gathered prefix attends this rank's heads, not merged partials.
+            or (
+                self.use_dsa
+                and mode.is_extend()
+                and not dsa_shards_index_k()
+                and not is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
+            )
         )
 
     def is_dcp_q_replicate_phase(
@@ -210,12 +217,14 @@ class DeepseekMLAForwardMixin:
             return True
         # DSA extend on HIP merges owned partials like decode, so replicating
         # q_b_proj replaces the per-layer [T, H, 576] Q all-gather there too.
+        # A gathered prefix attends this rank's heads, so it needs the local Q.
         # On gfx950, Kimi-K3.1's sharded index-K prefill attends the gathered KV
         # with this rank's heads instead.
         return (
             self.use_dsa
             and _is_hip
             and mode.is_extend(include_draft_extend_v2=True)
+            and not is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
             and not (_is_gfx95_supported and dsa_shards_index_k())
         )
 
