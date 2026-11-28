@@ -211,6 +211,7 @@ class TestRestoreRecordedWhereMovesReadIt(CustomTestCase):
             forward_stream=streams.forward,
             schedule_stream=streams.schedule,
             enable_overlap=True,
+            forward_on_own_stream=True,
         )
         device = SimpleNamespace(
             current_stream=lambda: streams.current, stream=streams.on
