@@ -26,15 +26,16 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_parallel_world_size,
+    get_ulysses_parallel_rank,
+    get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.layers.attention.layer import (
-    UlyssesAttention,
-    USPAttention,
-)
-from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
+from sglang.multimodal_gen.runtime.distributed.utils import all_gather_single
+from sglang.multimodal_gen.runtime.layers.attention.layer import USPAttention
+from sglang.multimodal_gen.runtime.layers.elementwise import GatedResidual2Seg, MulAdd
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     FP32LayerNorm,
     LayerNormScaleShift,
+    LayerNormScaleShift2Seg,
     RMSNorm,
     tensor_parallel_rms_norm,
 )
@@ -43,6 +44,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -73,19 +75,24 @@ def rope_params(max_seq_len, dim, theta=10000):
     return torch.polar(torch.ones_like(freqs), freqs)
 
 
+def rope_cos_sin(freqs):
+    """Complex rotation table [b, s, 1, d/2] -> fp32 (cos, sin), each [b, s, d/2]."""
+    freqs = freqs[:, :, 0]
+    return freqs.real.float().contiguous(), freqs.imag.float().contiguous()
+
+
 def rope_apply(x, grid_sizes, freqs):
-    n = x.size(2)
-    output = []
-    for i, _ in enumerate(x):
-        seq_len = x.size(1)
-        x_i = torch.view_as_complex(
-            x[i, :seq_len].to(torch.float64).reshape(seq_len, n, -1, 2)
-        )
-        freqs_i = freqs[i, :seq_len]
-        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
-        output.append(x_i)
-    return torch.stack(output).to(dtype=x.dtype)
+    # freqs = (cos, sin) from rope_cos_sin. One rotation is shared by every head, and
+    # the interleaved (GPT-J) pairing is view_as_complex's, as in wanvideo.py.
+    cos, sin = freqs
+    if cos.shape[0] == 1:
+        return _apply_rotary_emb(x, cos[0], sin[0], is_neox_style=False)
+    return torch.cat(
+        [
+            _apply_rotary_emb(x[i : i + 1], cos[i], sin[i], is_neox_style=False)
+            for i in range(x.size(0))
+        ]
+    )
 
 
 def rope_precompute(x, grid_sizes, freqs, start=None):
@@ -156,6 +163,54 @@ def rope_precompute(x, grid_sizes, freqs, start=None):
     return output
 
 
+def ulysses_input_a2a_with_suffix(x, num_rep):
+    """[b, s_local + num_rep, h, d] -> [b, s_global + num_rep, h_local, d].
+
+    The sharded tokens are packed destination-major in one copy and received
+    straight into the output; this rank's heads of the replicated suffix fill
+    the tail. Same values and K/V order as UlyssesAttention(replicated_*),
+    without its stacked-qkv and suffix concatenations.
+    """
+    ws, rank = get_ulysses_parallel_world_size(), get_ulysses_parallel_rank()
+    group = get_sp_group().ulysses_group
+    b, s, h, d = x.shape
+    s_local, h_local = s - num_rep, h // ws
+    send = x[:, :s_local].unflatten(2, (ws, h_local)).permute(2, 0, 1, 3, 4)
+    send = send.contiguous()
+    out = x.new_empty(b, ws * s_local + num_rep, h_local, d)
+    if b == 1:
+        recv = out[:, : ws * s_local].view(ws, 1, s_local, h_local, d)
+        torch.distributed.all_to_all_single(recv, send, group=group)
+    else:
+        recv = torch.empty_like(send)
+        torch.distributed.all_to_all_single(recv, send, group=group)
+        out[:, : ws * s_local].unflatten(1, (ws, s_local)).copy_(recv.transpose(0, 1))
+    out[:, ws * s_local :] = x[:, s_local:, rank * h_local : (rank + 1) * h_local]
+    return out
+
+
+def ulysses_output_a2a_with_suffix(x, num_rep):
+    """[b, s_global + num_rep, h_local, d] -> [b, s_local + num_rep, h, d]."""
+    ws = get_ulysses_parallel_world_size()
+    group = get_sp_group().ulysses_group
+    b, s, h_local, d = x.shape
+    s_local = (s - num_rep) // ws
+    out = x.new_empty(b, s_local + num_rep, ws * h_local, d)
+    send = x[:, : ws * s_local].unflatten(1, (ws, s_local)).transpose(0, 1)
+    send = send.contiguous()
+    recv = torch.empty_like(send)
+    torch.distributed.all_to_all_single(recv, send, group=group)
+    out[:, :s_local].unflatten(2, (ws, h_local)).copy_(recv.permute(1, 2, 0, 3, 4))
+    rep = x[:, ws * s_local :].contiguous()
+    gathered = rep.new_empty((ws,) + tuple(rep.shape))
+    # all_gather concatenates along dim 0 and copy_s into the output, so hand it a
+    # (ws*b, ...) view; gathered stays 5-D for the permute below. Same storage and
+    # layout, so eager is unchanged -- but dynamo's functional path enforces the rank.
+    all_gather_single(gathered.view(-1, *rep.shape[1:]), rep, group=group)
+    out[:, s_local:].unflatten(2, (ws, h_local)).copy_(gathered.permute(1, 2, 0, 3, 4))
+    return out
+
+
 class WanSelfAttention(nn.Module):
     def __init__(
         self,
@@ -191,12 +246,6 @@ class WanSelfAttention(nn.Module):
             skip_sequence_parallel=skip_sequence_parallel,
             is_cross_attention=is_cross_attention,
         )
-        self.ulysses_attn = UlyssesAttention(
-            num_heads=self.local_num_heads,
-            head_size=self.head_dim,
-            causal=False,
-            supported_attention_backends=supported_attention_backends,
-        )
 
     def forward(self, x, seq_lens, grid_sizes, freqs, num_replicated_suffix=0):
         del seq_lens
@@ -217,32 +266,22 @@ class WanSelfAttention(nn.Module):
         v = v.view(b, s, n, d)
         q = rope_apply(q, grid_sizes, freqs)
         k = rope_apply(k, grid_sizes, freqs)
+        # Ulysses + replicated suffix: the minimal-copy exchange below. Ring and
+        # K/V-gather (--kv-gather-degree > 1) take USPAttention, which serves both.
         if (
             num_replicated_suffix > 0
             and get_sp_world_size() > 1
             and get_ring_parallel_world_size() == 1
+            and self.attn.sp_attention_mode == "ulysses"
         ):
-            q_shard, q_rep = (
-                q[:, :-num_replicated_suffix],
-                q[:, -num_replicated_suffix:],
+            q, k, v = (
+                ulysses_input_a2a_with_suffix(t, num_replicated_suffix)
+                for t in (q, k, v)
             )
-            k_shard, k_rep = (
-                k[:, :-num_replicated_suffix],
-                k[:, -num_replicated_suffix:],
+            x = self.attn.attn_impl.forward(
+                q, k, v, get_forward_context().attn_metadata
             )
-            v_shard, v_rep = (
-                v[:, :-num_replicated_suffix],
-                v[:, -num_replicated_suffix:],
-            )
-            x, x_rep = self.ulysses_attn(
-                q_shard,
-                k_shard,
-                v_shard,
-                replicated_q=q_rep,
-                replicated_k=k_rep,
-                replicated_v=v_rep,
-            )
-            x = torch.cat([x, x_rep], dim=1)
+            x = ulysses_output_a2a_with_suffix(x, num_replicated_suffix)
         else:
             x = self.attn(
                 q,
@@ -701,12 +740,13 @@ class FramePackMotioner(nn.Module):
                 ]
             ]
             motion_rope_emb = rope_precompute(
+                # one head: the rotation does not depend on it
                 motion_lat.detach().view(
                     1,
                     motion_lat.shape[1],
                     self.num_heads,
                     self.inner_dim // self.num_heads,
-                ),
+                )[:, :, :1],
                 grid_sizes + grid_sizes_2x + grid_sizes_4x,
                 self.freqs,
                 start=None,
@@ -757,6 +797,11 @@ class WanS2VAttentionBlock(WanAttentionBlock):
             eps,
             supported_attention_backends=supported_attention_backends,
         )
+        # The video tokens and the t=0 suffix are modulated with different rows of e.
+        self.norm1 = LayerNormScaleShift2Seg(dim, eps=eps, dtype=torch.float32)
+        self.norm2 = LayerNormScaleShift2Seg(dim, eps=eps, dtype=torch.float32)
+        self.self_attn_residual = GatedResidual2Seg()
+        self.mlp_residual = GatedResidual2Seg()
 
     def forward(
         self,
@@ -770,58 +815,21 @@ class WanS2VAttentionBlock(WanAttentionBlock):
         num_replicated_suffix=0,
     ):
         seg_idx = min(max(0, e[1].item()), x.size(1))
-        seg_idx = [0, seg_idx, x.size(1)]
         e = e[0]
         e = (self.modulation.float().unsqueeze(2) + e.float()).chunk(6, dim=1)
         e = [element.squeeze(1) for element in e]
-        norm_x = torch.cat(
-            [
-                self.norm1(
-                    x[:, seg_idx[i] : seg_idx[i + 1]],
-                    e[0][:, i : i + 1],
-                    e[1][:, i : i + 1],
-                )
-                for i in range(2)
-            ],
-            dim=1,
-        )
         y = self.self_attn(
-            norm_x,
+            self.norm1(x, e[0], e[1], seg_idx),
             seq_lens,
             grid_sizes,
             freqs,
             num_replicated_suffix=num_replicated_suffix,
         )
-        y = torch.cat(
-            [
-                y[:, seg_idx[i] : seg_idx[i + 1]].float() * e[2][:, i : i + 1]
-                for i in range(2)
-            ],
-            dim=1,
-        )
-        x = x + y.to(dtype=x.dtype)
+        x = self.self_attn_residual(x, y, e[2], seg_idx)
         cross = self.cross_attn(self.norm3(x), context, context_lens)
         x = x + cross
-        norm2_x = torch.cat(
-            [
-                self.norm2(
-                    x[:, seg_idx[i] : seg_idx[i + 1]],
-                    e[3][:, i : i + 1],
-                    e[4][:, i : i + 1],
-                )
-                for i in range(2)
-            ],
-            dim=1,
-        )
-        y = self.ffn(norm2_x)
-        y = torch.cat(
-            [
-                y[:, seg_idx[i] : seg_idx[i + 1]].float() * e[5][:, i : i + 1]
-                for i in range(2)
-            ],
-            dim=1,
-        )
-        x = x + y.to(dtype=x.dtype)
+        y = self.ffn(self.norm2(x, e[3], e[4], seg_idx))
+        x = self.mlp_residual(x, y, e[5], seg_idx)
         return x
 
 
@@ -1169,8 +1177,9 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             mask_input[i][:, self.original_seq_len :] = 1
         x = torch.cat(x)
         b, s, n, d = x.size(0), x.size(1), self.num_heads, self.dim // self.num_heads
+        # one head: the rotation does not depend on it
         self.pre_compute_freqs = rope_precompute(
-            x.detach().view(b, s, n, d), grid_sizes, self.freqs, start=None
+            x.detach().view(b, s, n, d)[:, :, :1], grid_sizes, self.freqs, start=None
         )
         x = [u.unsqueeze(0) for u in x]
         self.pre_compute_freqs = [u.unsqueeze(0) for u in self.pre_compute_freqs]
@@ -1292,7 +1301,7 @@ class WanModelS2V(ModelMixin, ConfigMixin):
             e=e0,
             seq_lens=seq_lens,
             grid_sizes=grid_sizes,
-            freqs=self.pre_compute_freqs,
+            freqs=rope_cos_sin(self.pre_compute_freqs),
             context=context,
             context_lens=None,
             num_replicated_suffix=condition_suffix_len if sequence_shard_enabled else 0,
