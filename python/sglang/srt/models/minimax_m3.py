@@ -392,6 +392,9 @@ class MiniMaxM3MLP(nn.Module):
         return x
 
 
+_SHARED_OVERLAP_RESERVED_SMS = 16
+
+
 class MiniMaxM3MoE(nn.Module):
     """MiniMax MoE implementation using DeepEP for Expert Parallel support."""
 
@@ -548,12 +551,14 @@ class MiniMaxM3MoE(nn.Module):
         num_tokens = hidden_states.shape[0]
         # Overlap with the router and MegaMoE in any capture. Breakable capture
         # joins forked streams before each segment ends, so a break stays correct.
-        fork_shared = (
+        # Reserve SMs independently of num_tokens so all EP ranks launch the
+        # collective MegaMoE kernel with the same SM budget even if one rank is idle.
+        reserve_shared_sms = (
             self.alt_stream is not None
             and self.shared_experts is not None
-            and num_tokens > 0
             and get_is_capture_mode()
         )
+        fork_shared = reserve_shared_sms and num_tokens > 0
         if fork_shared:
             self.alt_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.alt_stream):
@@ -589,6 +594,9 @@ class MiniMaxM3MoE(nn.Module):
             num_tokens=num_tokens,
             activation=self.experts._minimax_activation,
             activation_clamp=self.config.swiglu_limit,
+            min_reserved_num_sms=(
+                _SHARED_OVERLAP_RESERVED_SMS if reserve_shared_sms else 0
+            ),
         )
         return self._add_shared(output, shared, fork_shared)
 
