@@ -53,6 +53,7 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
     handle_int8_kv_cache_compatibility,
     handle_kv4_compatibility,
+    handle_mxfp8_kv_cache_compatibility,
     handle_nvfp4_prefill_kv_dequant_dtype,
     handle_platform_kv_cache_dtype_compatibility,
     validate_prefill_only_disable_kv_cache_args,
@@ -1717,6 +1718,52 @@ class TestPlatformKVCacheDtypeCompatibility(CustomTestCase):
             with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, flag):
                 self._resolve(
                     out_of_tree=True, declared={_PLATFORM_KV_CACHE_DTYPE}, **overrides
+                )
+
+
+class TestMxfp8KVCacheCompatibility(CustomTestCase):
+    """MXFP8 KV cache: Blackwell for any model; SM90 only for Inkling 2, whose
+    decode kernel is the only SM90 reader of MXFP8 pages."""
+
+    @staticmethod
+    def _resolve(*, sm, arch, **overrides):
+        args = ServerArgs(model_path="dummy", kv_cache_dtype="mxfp8", **overrides)
+        hf = SimpleNamespace(architectures=[arch])
+        args._model_config = SimpleNamespace(hf_config=hf)
+        with override_platform(
+            is_cuda=True,
+            device_sm=sm,
+            is_sm90=sm == 90,
+            is_sm120=sm == 120,
+            is_blackwell=sm >= 100,
+        ):
+            handle_mxfp8_kv_cache_compatibility(args)
+
+    def test_sm90_accepts_only_inkling2(self):
+        for arch in (
+            "Inkling2ForConditionalGeneration",
+            "Inkling2LoopForConditionalGeneration",
+        ):
+            with self.subTest(arch=arch):
+                self._resolve(sm=90, arch=arch)
+        with self.assertRaisesRegex(ValueError, "only Inkling 2"):
+            self._resolve(sm=90, arch="LlamaForCausalLM")
+
+    def test_blackwell_accepts_any_model_and_older_gpus_reject(self):
+        self._resolve(sm=100, arch="LlamaForCausalLM")
+        with self.assertRaisesRegex(ValueError, "requires an SM90"):
+            self._resolve(sm=80, arch="Inkling2ForConditionalGeneration")
+
+    def test_bf16_copy_path_rejects_unified_memory(self):
+        for sm in (90, 120):
+            with (
+                self.subTest(sm=sm),
+                self.assertRaisesRegex(ValueError, "--enable-unified-memory"),
+            ):
+                self._resolve(
+                    sm=sm,
+                    arch="Inkling2ForConditionalGeneration",
+                    enable_unified_memory=True,
                 )
 
 

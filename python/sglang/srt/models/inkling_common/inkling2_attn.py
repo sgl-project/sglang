@@ -25,6 +25,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.inkling_common.attn import (
     RelLogitsProj,
@@ -33,7 +39,12 @@ from sglang.srt.models.inkling_common.attn import (
 )
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
-from sglang.srt.runtime_context import get_model, get_parallel, get_platform
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_model,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.utils import get_device_core_count
 
 PADDED_DECODE_MIN_TOKENS = 8
@@ -54,6 +65,32 @@ def wave_fill_splits(tiles, sms, max_splits=128, min_fill=0.9):
         if fill > best_fill:
             best, best_fill = splits, fill
     return best
+
+
+def _worker_can_decode():
+    # A PD prefill worker decodes only after a role switch or in a decode graph capture.
+    disagg = get_disagg()
+    return not (
+        disagg.disaggregation_mode == "prefill"
+        and not disagg.enable_pd_role_switch
+        and check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+    )
+
+
+def _check_mxfp8_decode_prologue(fused_decode_prologue):
+    # SM90 and SM120 decode an MXFP8 cache only through the relative-bias decode
+    # kernel, which runs on the fused decode prologue.
+    if (
+        not fused_decode_prologue
+        and get_model().kv_cache_dtype == "mxfp8"
+        and mxfp8_kv_via_bf16(platform=get_platform())
+        and _worker_can_decode()
+    ):
+        raise ValueError(
+            f"--kv-cache-dtype mxfp8 on SM{get_platform().device_sm} needs Inkling 2's "
+            "fused decode prologue, which this attention config does not allow "
+            "(for example use_value_norm_no_gamma=false)."
+        )
 
 
 class AttentionSources(NamedTuple):
@@ -268,6 +305,7 @@ class Inkling2Attention(nn.Module):
             and self.k_sconv.use_residual
             and self.v_sconv.use_residual
         )
+        _check_mxfp8_decode_prologue(self.fused_decode_prologue)
         self.attn_padded = (
             nn.ModuleList(
                 RadixAttention(
@@ -462,7 +500,7 @@ class Inkling2Attention(nn.Module):
             "Inkling2 requires FA4 attention"
         )
         mxfp8 = get_model().kv_cache_dtype == "mxfp8"
-        fa4_mxfp8 = mxfp8 and not get_platform().is_sm120
+        fa4_mxfp8 = mxfp8 and not mxfp8_kv_via_bf16(platform=get_platform())
         sources = (
             AttentionSources(hidden_states, hidden_states, hidden_states)
             if isinstance(hidden_states, torch.Tensor)

@@ -1335,9 +1335,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 attention_backend="fa4",
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
+                kv_cache_dtype="auto",
+                speculative_algorithm=None,
                 _model_config=SimpleNamespace(quantization=quantization),
             )
-            with override_platform(is_cuda=True, device_sm=sm, is_sm120=False):
+            with override_platform(
+                is_cuda=True, device_sm=sm, is_sm90=sm == 90, is_sm120=False
+            ):
                 out = _inkling_overrides(args, hf)
             return out.get("moe_a2a_backend", a2a), out.get("disable_attn_tp_gather")
 
@@ -1352,6 +1356,50 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(backend(intermediate=1152)[0], "megamoe")
         loop = "Inkling2LoopForConditionalGeneration"
         self.assertEqual(backend(arch=loop), ("megamoe", True))
+
+    def test_inkling2_mxfp8_kv_on_sm90(self):
+        """MXFP8 KV on SM90 reads scales interleaved per 128-token page, so a bare
+        launch defaults the page size to 128, and rejects compact ragged verify;
+        BF16 on SM90, Blackwell FA4 and an explicit page size keep theirs."""
+        from sglang.srt.arg_groups.model_overrides.inkling import _inkling_overrides
+
+        def page_size(sm=90, kv_cache_dtype="mxfp8", page_size=None, spec=None):
+            hf = SimpleNamespace(architectures=["Inkling2ForConditionalGeneration"])
+            args = SimpleNamespace(
+                tool_call_parser="inkling2",
+                reasoning_parser="inkling",
+                tp_size=1,
+                moe_dp_size=1,
+                ep_size=1,
+                attn_dp_size=1,
+                moe_a2a_backend="none",
+                kv_cache_dtype=kv_cache_dtype,
+                page_size=page_size,
+                speculative_algorithm=spec,
+                swa_full_tokens_ratio=0.1,
+                mamba_full_memory_ratio=0.1,
+                mamba_radix_cache_strategy="extra_buffer",
+                disable_radix_cache=False,
+                attention_backend="fa4",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+            )
+            with override_platform(
+                is_cuda=True, device_sm=sm, is_sm90=sm == 90, is_sm120=False
+            ):
+                return _inkling_overrides(args, hf).get("page_size", page_size)
+
+        self.assertEqual(page_size(), 128)
+        self.assertIsNone(page_size(kv_cache_dtype="auto"))
+        self.assertIsNone(page_size(sm=100))
+        self.assertEqual(page_size(page_size=256), 256)
+        # The MXFP8 verify kernel gives every request the same draft count.
+        self.assertEqual(page_size(spec="DSPARK"), 128)
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override("compact"),
+            self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE"),
+        ):
+            page_size(spec="DSPARK")
 
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),

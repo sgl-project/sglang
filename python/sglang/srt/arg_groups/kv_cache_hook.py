@@ -15,7 +15,9 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
 from sglang.srt.mem_cache.platform_kv_cache_dtype import (
     registered_kv_cache_storage_dtype,
 )
@@ -104,20 +106,31 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
 
 
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
-    """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
+    """MXFP8 KV cache runs on SM100+ (Blackwell) and, for Inkling 2, on SM90
+    through a BF16 copy of the cache for prefill."""
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "mxfp8":
         return
-    if not get_platform().is_blackwell:
+    platform = get_platform()
+    if not (platform.is_blackwell or platform.is_sm90):
         raise ValueError(
-            "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
-            "block-scaled operands used by the FA4 MXFP8 attention path."
+            "--kv-cache-dtype mxfp8 requires an SM90 (Hopper) or SM100+ "
+            "(Blackwell) GPU."
         )
-    # SM120 kernels read the per-layer pools' interleaved scales; the unified
-    # pool stores them token-major.
-    if get_platform().is_sm120 and cfg.enable_unified_memory:
+    # On SM90 only Inkling 2's relative-bias decode kernel reads MXFP8 pages.
+    if platform.is_sm90:
+        architectures = model_config_of(server_args).hf_config.architectures or ()
+        if not any(arch in INKLING2_ARCHS for arch in architectures):
+            raise ValueError(
+                "--kv-cache-dtype mxfp8 on SM90 (Hopper) supports only Inkling 2 "
+                "models."
+            )
+    # The SM90 / SM120 kernels read the per-layer pools' interleaved scales; the
+    # unified pool stores them token-major.
+    if mxfp8_kv_via_bf16(platform=platform) and cfg.enable_unified_memory:
         raise ValueError(
-            "--kv-cache-dtype mxfp8 on SM120 does not support --enable-unified-memory."
+            f"--kv-cache-dtype mxfp8 on SM{platform.device_sm} does not support "
+            "--enable-unified-memory."
         )
 
 

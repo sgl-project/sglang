@@ -126,8 +126,8 @@ export const config = {
     // ----- Cards: "KV Cache Precision", "Unified Memory" -----
     flagSelects: [
       {
-        // MXFP8 K/V with per-32-element scales needs the FA4 block-scaled path
-        // on Blackwell; it runs on the static pool or with Unified Memory.
+        // MXFP8 K/V with per-32-element scales; Blackwell runs it on the static
+        // pool or with Unified Memory, H200 on the static pool only.
         id: "kvCacheDtype", title: "KV Cache Precision",
         stripPrefixes: ["--kv-cache-dtype"],
         options: [
@@ -136,7 +136,7 @@ export const config = {
             id: "mxfp8", label: "MXFP8",
             flags: ["--kv-cache-dtype mxfp8"],
             disable: { hw: ["h200", "mi350x", "mi355x", "tpu7x"] },
-            disableReason: "MXFP8 KV needs the FA4 block-scaled path on Blackwell.",
+            disableReason: "MXFP8 KV is validated only on Blackwell. H200 runs it but has not been checked with this model; AMD and TPU do not support it.",
           },
         ],
       },

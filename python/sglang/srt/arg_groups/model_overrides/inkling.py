@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+from sglang.srt.mem_cache.kv_cache_dtype import mxfp8_kv_via_bf16
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -88,25 +89,29 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             # Page size 1 left 0.5 GB after the KV pool; requests ran out of memory.
             if cfg.page_size is None:
                 overrides["page_size"] = 128
+        if mxfp8_kv_via_bf16(platform=get_platform()) and cfg.kv_cache_dtype == "mxfp8":
+            # The scales are interleaved per 128-token page.
+            if cfg.page_size is None:
+                overrides["page_size"] = 128
             # MXFP8 verify runs only on the bias decode kernel, which gives every
             # request the same draft count, not compact ragged verify's own.
-            if cfg.kv_cache_dtype == "mxfp8":
-                from sglang.srt.speculative.ragged_verify import (
-                    RaggedVerifyMode,
-                    read_ragged_verify_mode,
-                )
-                from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-                algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
-                if (
-                    algorithm.supports_ragged_verify()
-                    and read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
-                ):
-                    raise ValueError(
-                        "Inkling2 with --kv-cache-dtype mxfp8 on SM120 verifies "
-                        "every request's whole draft block; use "
-                        "SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
-                    )
+            algorithm = SpeculativeAlgorithm.from_string(cfg.speculative_algorithm)
+            if (
+                algorithm.supports_ragged_verify()
+                and read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
+            ):
+                device_sm = get_platform().device_sm
+                raise ValueError(
+                    f"Inkling2 with --kv-cache-dtype mxfp8 on SM{device_sm} verifies "
+                    "every request's whole draft block; use "
+                    "SGLANG_RAGGED_VERIFY_MODE=static or cap-accept."
+                )
     # NOTE: the full-graph prefill default is NOT set here. cuda-graph config is
     # resolved in __post_init__ before declarations are materialized, so a
     # cuda_graph_backend_prefill declared here lands too late (the breakable
