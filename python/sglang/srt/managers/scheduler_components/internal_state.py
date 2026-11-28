@@ -7,8 +7,10 @@ time; it only reads it.
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
+from sglang.srt.constants import DP_ATTENTION_CONSERVATIVENESS_SCALE
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -17,7 +19,15 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
-from sglang.srt.runtime_context import get_context, get_exec, get_parallel
+from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
+    NewTokenRatioTracker,
+)
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.server_args import compute_world_size, redact_server_args_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
@@ -175,6 +185,10 @@ class SchedulerInternalStateController:
             "pp_max_micro_batch_size": _UpdateHandler(
                 self._validate_pp_micro_batch_size, _override
             ),
+            "schedule_conservativeness": _UpdateHandler(
+                _validate_schedule_conservativeness,
+                self._apply_schedule_conservativeness,
+            ),
             "speculative_accept_threshold_single": _UpdateHandler(
                 self._validate_accept_threshold, self._apply_accept_threshold
             ),
@@ -196,6 +210,24 @@ class SchedulerInternalStateController:
                 f"Updating {key} to {value} is rejected because it is out of "
                 f"the valid range [1, {upper}]."
             )
+
+    def _apply_schedule_conservativeness(self, key: str, value: Any) -> Dict[str, Any]:
+        # Re-derive init, min and decay as at startup. An unchanged value
+        # leaves the running ratio as it is. A more conservative
+        # value raises the running ratio to at least the new init at once. A
+        # less conservative value keeps the running ratio (e.g. one a retract
+        # raised) and lets it decay, never below the new min.
+        # DP attention scales the startup flag; scale the live value the same way.
+        effective = float(value)
+        if get_parallel().attn_dp_enabled:
+            effective *= DP_ATTENTION_CONSERVATIVENESS_SCALE
+        previous = get_schedule().schedule_conservativeness
+        running = self.scheduler.new_token_ratio_tracker.current
+        tracker = NewTokenRatioTracker.from_conservativeness(effective)
+        floor = tracker.init if effective > previous else tracker.min
+        tracker.current = max(running, floor)
+        self.scheduler.new_token_ratio_tracker = tracker
+        return {key: effective}
 
     def _validate_accept_threshold(self, key: str, value: Any) -> None:
         # A relaxed threshold stops acceptance from sampling exactly from the
@@ -286,3 +318,13 @@ class _UpdateHandler:
 
 def _override(key: str, value: Any) -> Dict[str, Any]:
     return {key: value}
+
+
+def _validate_schedule_conservativeness(key: str, value: Any) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise UpdateRejected(f"{key} must be a finite number > 0, got {value!r}.")

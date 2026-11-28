@@ -30,3 +30,8 @@ def is_health_check_request(rid: Optional[str]) -> bool:
 MIS_DELIMITER_TOKEN_ID = 9999
 
 GIB_BYTES = 1073741824  # 1024**3
+
+
+# With DP attention, schedule_conservativeness is scaled by this factor, at
+# startup and for live updates through /set_internal_state.
+DP_ATTENTION_CONSERVATIVENESS_SCALE = 0.3
