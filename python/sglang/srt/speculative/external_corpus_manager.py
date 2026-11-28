@@ -8,6 +8,8 @@ import logging
 import threading
 from typing import Callable, Optional, Tuple
 
+import torch
+
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
@@ -16,6 +18,7 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
 )
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +41,33 @@ class ExternalCorpusManager:
         ] = None
         self._load_result: Optional[AddExternalCorpusReqOutput] = None
 
+    @staticmethod
+    def _all_tp_ranks_agree(local_flag: bool) -> bool:
+        """Return True only if ``local_flag`` is True on every TP rank."""
+        tp_group = get_parallel().tp_group
+        if tp_group.world_size <= 1:
+            return local_flag
+        flag = torch.tensor([int(local_flag)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN, group=tp_group.cpu_group
+        )
+        return bool(flag.item())
+
     def check_pending_load(self):
-        """Poll from the scheduler event loop. Sends response when done."""
+        """Poll from the scheduler event loop. Sends response when done.
+
+        Control requests are broadcast to every TP rank, so ``_pending_load``
+        is set in lockstep on all ranks, but the background build threads
+        finish at different times. The load is only committed (and
+        ``_pending_load`` cleared) once the thread has finished on every TP
+        rank, so the pending state stays identical across ranks and ``remove``
+        is accepted or rejected consistently.
+        """
         if self._pending_load is None:
             return
         recv_req, thread = self._pending_load
-        if thread.is_alive():
+        load_finished = not thread.is_alive()
+        if not self._all_tp_ranks_agree(load_finished):
             return
         self._pending_load = None
         thread.join()  # formal happens-before for _load_result visibility
@@ -83,11 +107,17 @@ class ExternalCorpusManager:
         thread.start()
         return None  # response sent later by check_pending_load
 
-    # FIXME(kpham-sgl): remove a corpus during a pending load is an undefined behaviour
-    # and should be explicitly prevented.
     def remove(
         self, recv_req: RemoveExternalCorpusReqInput
     ) -> RemoveExternalCorpusReqOutput:
+        # A finished thread may still have uncommitted corpus bookkeeping.
+        # _pending_load is cleared on all TP ranks in the same scheduler
+        # iteration (see check_pending_load), so this check agrees across ranks.
+        if self._pending_load is not None:
+            return RemoveExternalCorpusReqOutput(
+                success=False,
+                message="Cannot remove a corpus while a corpus load is pending.",
+            )
         try:
             self._worker.remove_external_corpus(recv_req.corpus_id)
             return RemoveExternalCorpusReqOutput(
