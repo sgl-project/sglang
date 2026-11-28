@@ -1586,14 +1586,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         arch35 = is_npu_arch35()
-        self._npu_is_v41 = any(
+        self._is_v41 = any(
             ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS for ratio in model_ratios
         )
         v4_layout = NPUDSV4KVLayout.V4_FP8 if arch35 else NPUDSV4KVLayout.V4_BF16
         self._npu_kv_row_bytes = {}
         for ratio in (0, *self.stage_owner_layers):
             layout = v4_layout
-            if self._npu_is_v41:
+            if self._is_v41:
                 if ratio == 0:
                     layout = (
                         NPUDSV4KVLayout.V41_SWA_FP8
@@ -1744,11 +1744,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def _get_npu_kv_padding_bytes(self, full_tokens: int) -> float:
         padding_bytes = 0
-        if self._npu_is_v41 or self.swa_cap_tokens is None:
+        if self._is_v41 or self.swa_cap_tokens is None:
             swa_layers = self.num_swa_layers + self._npu_dspark_draft_layers
             padding_bytes = self.page_size * self.kv_bytes * swa_layers
 
-        if self._npu_is_v41:
+        if self._is_v41:
             from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
                 DSV41_INDEX_PAGE_SIZE,
             )
