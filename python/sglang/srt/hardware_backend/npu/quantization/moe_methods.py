@@ -7,7 +7,7 @@ from torch.nn.parameter import Parameter
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import (
     NPUACLFormat,
-    get_grouped_matmul_swiglu_quant_w4a8,
+    get_grouped_matmul_swiglu_quant,
     npu_format_cast,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -588,10 +588,120 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
         )
 
 
+class _NPUInt8MoEMethod(_NPUMoEMethodBase):
+    def try_apply_fused_gmm1_swiglu(
+        self,
+        quant_info: "AscendQuantInfo",
+        hidden_states: torch.Tensor,
+        expert_tokens: Optional[torch.Tensor],
+        pertoken_scale: Optional[torch.Tensor],
+        group_list_type: int,
+        swiglu_limit: float,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        w4a8 = isinstance(self, NPUW4A8Int8MoEMethod)
+        fused = get_grouped_matmul_swiglu_quant(require_w4a8=w4a8)
+        if (
+            fused is None
+            or hidden_states.ndim != 2
+            or hidden_states.shape[0] == 0
+            or expert_tokens is None
+            or expert_tokens.ndim != 1
+            or expert_tokens.device != hidden_states.device
+            or expert_tokens.dtype != torch.int64
+            or group_list_type not in (0, 1)
+        ):
+            return None
+
+        weight = quant_info.w13_weight
+        weight_scale = quant_info.w13_weight_scale
+        if (
+            weight.dtype != (torch.int32 if w4a8 else torch.int8)
+            or weight.ndim != 3
+            or weight.device != hidden_states.device
+            or weight.storage_offset() != 0
+            or not weight.is_contiguous()
+            or weight_scale is None
+            or weight_scale.device != hidden_states.device
+        ):
+            return None
+
+        experts, k, n = weight.shape
+        if w4a8:
+            n *= 8  # Eight INT4 weights per INT32.
+        if (
+            k != hidden_states.shape[1]
+            or not 0 < k < (20000 if w4a8 else 65536)
+            or k % 16 != 0
+            or not 0 < n <= 10240
+            or n % (64 if w4a8 else 32) != 0
+            or not 0 < expert_tokens.numel() <= experts
+        ):
+            return None
+
+        bias_args = self._get_bias_args(quant_info, "w13")
+        fused_kwargs = {}
+        if w4a8:
+            if (
+                not bias_args
+                or weight_scale.dtype != torch.int64
+                or weight_scale.ndim not in (2, 3)
+                or weight_scale.shape[0] != experts
+                or weight_scale.shape[-1] != n
+            ):
+                return None
+            bias = bias_args["bias"][0]
+            num_scale_groups = weight_scale.shape[1] if weight_scale.ndim == 3 else 1
+            if (
+                num_scale_groups == 0
+                or k % (16 * num_scale_groups) != 0
+                or bias.shape != (experts, n)
+                or bias.dtype != torch.float32
+                or bias.device != hidden_states.device
+            ):
+                return None
+            fused_kwargs["weight_assist_matrix"] = bias
+        elif (
+            bias_args
+            or weight_scale.shape != (experts, n)
+            or weight_scale.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            return None
+
+        if torch.ops.npu.get_npu_format(weight) != NPUACLFormat.ACL_FORMAT_FRACTAL_NZ:
+            return None
+
+        if pertoken_scale is None:
+            if hidden_states.dtype not in (torch.float16, torch.bfloat16):
+                return None
+            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
+        else:
+            rows = hidden_states.shape[0]
+            if (
+                hidden_states.dtype != torch.int8
+                or pertoken_scale.dtype != torch.float32
+                or pertoken_scale.device != hidden_states.device
+                or pertoken_scale.shape not in ((rows,), (rows, 1))
+            ):
+                return None
+            if pertoken_scale.ndim == 2:
+                pertoken_scale = pertoken_scale.squeeze(-1)
+
+        group_list = expert_tokens.cumsum(0) if group_list_type == 1 else expert_tokens
+        return fused(
+            hidden_states,
+            weight,
+            weight_scale,
+            pertoken_scale,
+            group_list,
+            swiglu_limit,
+            **fused_kwargs,
+        )
+
+
 # ---------------------------------------------------------------------------
 #  NPUW8A8Int8MoEMethod
 # ---------------------------------------------------------------------------
-class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
+class NPUW8A8Int8MoEMethod(_NPUInt8MoEMethod):
     """W8A8 MoE – weights are int8, activations in int8."""
 
     def __init__(self):
@@ -697,7 +807,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
 # ---------------------------------------------------------------------------
 #  NPUW4A8Int8MoEMethod
 # ---------------------------------------------------------------------------
-class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
+class NPUW4A8Int8MoEMethod(_NPUInt8MoEMethod):
     """W4A8 MoE – weights are int4, activations quantized to int8."""
 
     def __init__(
@@ -711,93 +821,6 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
         self.activation_use_clip = activation_use_clip
         self.matmul = GroupedMatmul()
         self.hidden_states_quantizer = HiddenStatesDynamicQuant(quant_dtype=torch.int8)
-
-    def try_apply_fused_gmm1_swiglu(
-        self,
-        quant_info: "AscendQuantInfo",
-        hidden_states: torch.Tensor,
-        expert_tokens: Optional[torch.Tensor],
-        pertoken_scale: Optional[torch.Tensor],
-        group_list_type: int,
-        swiglu_limit: float,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        fused = get_grouped_matmul_swiglu_quant_w4a8()
-        if (
-            fused is None
-            or hidden_states.ndim != 2
-            or hidden_states.shape[0] == 0
-            or expert_tokens is None
-            or expert_tokens.ndim != 1
-            or expert_tokens.device != hidden_states.device
-            or expert_tokens.dtype != torch.int64
-            or group_list_type not in (0, 1)
-        ):
-            return None
-
-        weight = quant_info.w13_weight
-        weight_scale = quant_info.w13_weight_scale
-        bias_args = self._get_bias_args(quant_info, "w13")
-        if (
-            weight.dtype != torch.int32
-            or weight.ndim != 3
-            or weight.device != hidden_states.device
-            or weight.storage_offset() != 0
-            or not weight.is_contiguous()
-            or weight_scale is None
-            or weight_scale.dtype != torch.int64
-            or weight_scale.device != hidden_states.device
-            or weight_scale.ndim not in (2, 3)
-            or not bias_args
-        ):
-            return None
-
-        experts, k, packed_n = weight.shape
-        n = packed_n * 8  # Eight INT4 weights per INT32.
-        bias = bias_args["bias"][0]
-        num_scale_groups = weight_scale.shape[1] if weight_scale.ndim == 3 else 1
-        if (
-            k != hidden_states.shape[1]
-            or not (0 < k < 20000 and k % 16 == 0)
-            or not (0 < n <= 10240 and n % 64 == 0)
-            or not 0 < expert_tokens.numel() <= experts
-            or weight_scale.shape[0] != experts
-            or weight_scale.shape[-1] != n
-            or num_scale_groups == 0
-            or k % (16 * num_scale_groups) != 0
-            or bias.shape != (experts, n)
-            or bias.dtype != torch.float32
-            or bias.device != hidden_states.device
-            or torch.ops.npu.get_npu_format(weight)
-            != NPUACLFormat.ACL_FORMAT_FRACTAL_NZ
-        ):
-            return None
-
-        if pertoken_scale is None:
-            if hidden_states.dtype not in (torch.float16, torch.bfloat16):
-                return None
-            hidden_states, pertoken_scale = self.hidden_states_quantizer(hidden_states)
-        else:
-            rows = hidden_states.shape[0]
-            if (
-                hidden_states.dtype != torch.int8
-                or pertoken_scale.dtype != torch.float32
-                or pertoken_scale.device != hidden_states.device
-                or pertoken_scale.shape not in ((rows,), (rows, 1))
-            ):
-                return None
-            if pertoken_scale.ndim == 2:
-                pertoken_scale = pertoken_scale.squeeze(-1)
-
-        group_list = expert_tokens.cumsum(0) if group_list_type == 1 else expert_tokens
-        return fused(
-            hidden_states,
-            weight,
-            weight_scale,
-            pertoken_scale,
-            group_list,
-            swiglu_limit,
-            weight_assist_matrix=bias,
-        )
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str

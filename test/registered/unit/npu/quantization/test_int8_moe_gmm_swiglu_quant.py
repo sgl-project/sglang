@@ -1,4 +1,4 @@
-"""Dispatch contracts for clipped W4A8 GMM1 fusion."""
+"""Dispatch contracts for W8A8 and W4A8 GMM1/SwiGLU/quant fusion."""
 
 import unittest
 from types import SimpleNamespace
@@ -16,8 +16,8 @@ from sglang.srt.hardware_backend.npu.quantization import moe_methods
 from sglang.srt.layers.moe.moe_runner import ascend
 
 
-class TestW4A8Int8MoEFusion(unittest.TestCase):
-    def test_loader_requires_w4a8_binding(self):
+class TestInt8MoEFusion(unittest.TestCase):
+    def test_loader_checks_wheel_support_for_each_weight_format(self):
         def w8a8_op(x, weight, weight_scale, x_scale, group_list, swiglu_limit):
             pass
 
@@ -27,7 +27,7 @@ class TestW4A8Int8MoEFusion(unittest.TestCase):
         op_name = "sgl_grouped_matmul_swiglu_quant"
         package = SimpleNamespace()
         operators = SimpleNamespace()
-        loader = utils.get_grouped_matmul_swiglu_quant_w4a8
+        loader = utils.get_grouped_matmul_swiglu_quant
         self.addCleanup(loader.cache_clear)
         with (
             patch.dict(
@@ -39,18 +39,19 @@ class TestW4A8Int8MoEFusion(unittest.TestCase):
             ),
             patch.object(utils, "is_npu_arch35") as is_arch35,
         ):
-            for arch35, ops, op, expected in (
-                (True, [op_name], w4a8_op, None),
-                (False, [], w4a8_op, None),
-                (False, [op_name], w8a8_op, None),
-                (False, [op_name], w4a8_op, w4a8_op),
+            for arch35, ops, op, expected_w8, expected_w4 in (
+                (True, [op_name], w4a8_op, None, None),
+                (False, [], w4a8_op, None, None),
+                (False, [op_name], w8a8_op, w8a8_op, None),
+                (False, [op_name], w4a8_op, w4a8_op, w4a8_op),
             ):
                 with self.subTest(arch35=arch35, ops=ops, op=op):
                     loader.cache_clear()
                     is_arch35.return_value = arch35
                     operators.grouped_matmul_swiglu_quant = op
                     package._manifest = {"third_party": [{"ops": ops}]}
-                    self.assertIs(loader(), expected)
+                    self.assertIs(loader(require_w4a8=False), expected_w8)
+                    self.assertIs(loader(require_w4a8=True), expected_w4)
 
     def setUp(self):
         kernel = moe_methods.NPUW4A8Int8MoEMethod
@@ -86,7 +87,7 @@ class TestW4A8Int8MoEFusion(unittest.TestCase):
         self.loader = self.enterContext(
             patch.object(
                 moe_methods,
-                "get_grouped_matmul_swiglu_quant_w4a8",
+                "get_grouped_matmul_swiglu_quant",
                 return_value=self.fused,
             )
         )
@@ -124,6 +125,66 @@ class TestW4A8Int8MoEFusion(unittest.TestCase):
                 self.assertIs(out.hidden_states, self.w2.apply.return_value)
         self.w13.apply.assert_not_called()
         self.runner.activation._apply_activation.assert_not_called()
+
+    def _use_w8a8_weights(self):
+        method = moe_methods.NPUW8A8Int8MoEMethod
+        w13 = method.__new__(method)
+        w2 = method.__new__(method)
+        w13.apply = self.w13.apply
+        w2.apply = self.w2.apply
+        w13.hidden_states_quantizer = self.w13.hidden_states_quantizer
+        self.runner.config.layer.w13_kernel = w13
+        self.runner.config.layer.w2_kernel = w2
+        self.info.w13_weight = torch.empty(3, 32, 64, dtype=torch.int8)
+        self.info.w13_weight_scale = torch.ones(3, 64, dtype=torch.bfloat16)
+        self.info.w13_weight_bias = None
+        self.info.w13_scale_bias = None
+
+    def test_w8a8_fuses_with_and_without_clipping(self):
+        self._use_w8a8_weights()
+        counts = torch.tensor([2, 0, 1])
+        for limit, x, scale in (
+            (10.0, self.x, self.scale),
+            (None, self.x.to(torch.bfloat16), None),
+        ):
+            with self.subTest(limit=limit):
+                self.w13.hidden_states_quantizer.reset_mock()
+                self.runner.config.swiglu_limit = limit
+                runner_input = ascend.AscendRunnerInput(x, scale, counts, 1)
+                self.runner.run(runner_input, self.info, {})
+                args, kwargs = self.fused.call_args
+                self.loader.assert_called_with(require_w4a8=False)
+                self.assertIs(args[0], self.x)
+                self.assertIs(args[1], self.info.w13_weight)
+                self.assertIs(args[2], self.info.w13_weight_scale)
+                self.assertIs(args[3], self.scale)
+                torch.testing.assert_close(args[4], torch.tensor([2, 2, 3]))
+                self.assertEqual(args[5], limit or 0.0)
+                self.assertEqual(kwargs, {})
+                if scale is None:
+                    self.w13.hidden_states_quantizer.assert_called_once_with(x)
+                else:
+                    self.w13.hidden_states_quantizer.assert_not_called()
+                args, kwargs = self.w2.apply.call_args
+                self.assertIs(args[1], self.qact)
+                self.assertIs(args[2], counts)
+                self.assertIs(kwargs["pertoken_scale"], self.qscale)
+                self.assertEqual(kwargs["group_list_type"], 1)
+        self.w13.apply.assert_not_called()
+        self.runner.activation._apply_activation.assert_not_called()
+
+    def test_w8a8_preserves_compensated_gmm(self):
+        self._use_w8a8_weights()
+        self.info.w13_scale_bias = torch.ones(3, 64)
+        runner_input = ascend.AscendRunnerInput(
+            self.x, self.scale, torch.tensor([2, 0, 1]), 1
+        )
+        self.runner.run(runner_input, self.info, {})
+        self.fused.assert_not_called()
+        self.w13.apply.assert_called_once()
+        self.runner.activation._apply_activation.assert_called_once_with(
+            self.w13.apply.return_value
+        )
 
     def test_runner_preserves_unfused_path_for_incompatible_inputs(self):
         runner_input = ascend.AscendRunnerInput(

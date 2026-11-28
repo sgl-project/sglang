@@ -47,9 +47,9 @@ def is_npu_arch35() -> bool:
     return _is_npu_arch(3510)
 
 
-@functools.lru_cache(maxsize=1)
-def get_grouped_matmul_swiglu_quant_w4a8() -> Optional[Callable]:
-    """Find the bundled GMM operator with W4A8 compensation support."""
+@functools.lru_cache(maxsize=2)
+def get_grouped_matmul_swiglu_quant(*, require_w4a8: bool) -> Optional[Callable]:
+    """Find the bundled GMM operator for the requested weight format."""
     if is_npu_arch35():
         return None
     try:
@@ -65,9 +65,13 @@ def get_grouped_matmul_swiglu_quant_w4a8() -> Optional[Callable]:
     from sgl_kernel_npu.operators.moe import grouped_matmul_swiglu_quant
 
     # The first version of this operator only supports W8A8.
-    if "weight_assist_matrix" in signature(grouped_matmul_swiglu_quant).parameters:
-        return grouped_matmul_swiglu_quant
-    return None
+    if (
+        require_w4a8
+        and "weight_assist_matrix"
+        not in signature(grouped_matmul_swiglu_quant).parameters
+    ):
+        return None
+    return grouped_matmul_swiglu_quant
 
 
 # SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
