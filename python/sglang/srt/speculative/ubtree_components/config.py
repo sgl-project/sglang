@@ -41,6 +41,18 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return vars(value)
 
 
+def _parse_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"UBTree {name} must be an integer, got {value!r}")
+    return value
+
+
+def _parse_real(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"UBTree {name} must be a real number, got {value!r}")
+    return float(value)
+
+
 def parse_ubtree_config(config: Any) -> UBTreeConfig:
     """Parse and validate the serving subset of a DeepSpec UBTree config."""
 
@@ -48,19 +60,33 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
     metadata = _mapping(root.get("ubtree_config"))
     dflash = _mapping(root.get("dflash_config"))
 
-    block_size = int(root.get("block_size", 0) or dflash.get("block_size", 0))
+    raw_block_size = root.get("block_size")
+    if raw_block_size is None or (
+        not isinstance(raw_block_size, bool) and raw_block_size == 0
+    ):
+        raw_block_size = dflash.get("block_size", 0)
+    block_size = _parse_int(raw_block_size, "block_size")
     parsed = UBTreeConfig(
         block_size=block_size,
-        candidate_k=int(metadata.get("candidate_k", 0)),
-        tree_budget=int(metadata.get("tree_budget", 0)),
-        supertree_width=int(metadata.get("tree_supertree_width", 0)),
-        rank=int(metadata.get("rank", 0)),
-        depth_bonus=float(metadata.get("tree_depth_bonus", 0.0)),
-        factorizer_hidden_width=int(metadata.get("factorizer_hidden_width", 0)),
-        target_embedding_dim=int(
-            metadata.get("target_embedding_dim", root.get("hidden_size", 0))
+        candidate_k=_parse_int(metadata.get("candidate_k", 0), "candidate_k"),
+        tree_budget=_parse_int(metadata.get("tree_budget", 0), "tree_budget"),
+        supertree_width=_parse_int(
+            metadata.get("tree_supertree_width", 0), "tree_supertree_width"
         ),
-        depth_count=int(metadata.get("depth_condition_count", 0)),
+        rank=_parse_int(metadata.get("rank", 0), "rank"),
+        depth_bonus=_parse_real(
+            metadata.get("tree_depth_bonus", 0.0), "tree_depth_bonus"
+        ),
+        factorizer_hidden_width=_parse_int(
+            metadata.get("factorizer_hidden_width", 0), "factorizer_hidden_width"
+        ),
+        target_embedding_dim=_parse_int(
+            metadata.get("target_embedding_dim", root.get("hidden_size", 0)),
+            "target_embedding_dim",
+        ),
+        depth_count=_parse_int(
+            metadata.get("depth_condition_count", 0), "depth_condition_count"
+        ),
     )
     positive = {
         "block_size": parsed.block_size,
@@ -85,7 +111,7 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
         raise ValueError("UBTree tree_supertree_width cannot exceed candidate_k")
     vocab_size = root.get("vocab_size")
     if vocab_size is not None:
-        vocab_size_int = int(vocab_size)
+        vocab_size_int = _parse_int(vocab_size, "vocab_size")
         if vocab_size_int <= 0 or parsed.candidate_k > vocab_size_int:
             raise ValueError(
                 f"UBTree candidate_k ({parsed.candidate_k}) cannot exceed "
@@ -121,11 +147,11 @@ def parse_ubtree_config(config: Any) -> UBTreeConfig:
 
 def resolve_verify_width(config: UBTreeConfig, requested: int | None) -> int:
     """Select one fixed KDA verification shape for the process lifetime."""
-    # 49 (root plus 48 draft nodes, 3x the block-16 draft width) balances
-    # verify compute against acceptance length for released exports while
-    # widening to block_size for larger draft blocks within tree_budget.
-    default_width = min(max(49, config.block_size), config.verify_node_count)
-    width = default_width if requested is None else requested
+    width = (
+        config.verify_node_count
+        if requested is None
+        else _parse_int(requested, "verify width")
+    )
     if not config.block_size <= width <= config.verify_node_count:
         raise ValueError(
             "UBTREE --speculative-num-draft-tokens must be at least the draft "

@@ -267,12 +267,17 @@ class UBTreeWorkerV2(DFlashWorkerV2):
                 ),
             )
             if self._target_tp_rank == 0:
-                logger.info(
-                    "UBTREE draft hidden/KV commit is folded into the target verify CUDA Graph tail"
-                )
-                logger.info(
-                    "UBTREE factorized KDA accepted-path commit is folded into the target verify CUDA Graph tail"
-                )
+                if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+                    logger.info(
+                        "UBTREE draft hidden/KV and factorized KDA commits attached to eager target verify epilogue"
+                    )
+                else:
+                    logger.info(
+                        "UBTREE draft hidden/KV commit is folded into the target verify CUDA Graph tail"
+                    )
+                    logger.info(
+                        "UBTREE factorized KDA accepted-path commit is folded into the target verify CUDA Graph tail"
+                    )
         return result
 
     def _draft_tree(
@@ -417,9 +422,13 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         sampling_info = batch.sampling_info
         if sampling_info is None:
             return False
-        from sglang.srt.sampling.sampling_batch_info import adjusts_logits
+        from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 
-        if adjusts_logits(sampling_info, has_grammar=batch.has_grammar):
+        if VerifyRoute.derive(
+            sampling_info,
+            has_grammar=batch.has_grammar,
+            has_watermark=sampling_info.watermark is not None,
+        ).adjusts_logits:
             return False
         if not sampling_info.is_all_greedy and (
             sampling_info.sampling_seed is not None
@@ -527,11 +536,19 @@ class UBTreeWorkerV2(DFlashWorkerV2):
         verify_epilogue.set_armed(is_greedy)
         if not tree.preverify_staged:
             verify_epilogue.begin_tree_step(tree, prefix_lens)
+        from sglang.srt.sampling.sampling_pipeline import VerifyRoute
+
+        verify_route = VerifyRoute.derive(
+            batch.sampling_info,
+            has_grammar=batch.has_grammar,
+            has_watermark=batch.sampling_info.watermark is not None,
+        )
         verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
             verify_input,
             self.req_to_token_pool,
             batch,
             self.target_worker,
+            route=verify_route,
         )
         target_output = self.target_worker.forward_batch_generation(
             batch=None,

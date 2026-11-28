@@ -268,39 +268,56 @@ class TestUBTreeComponents(CustomTestCase):
 class TestUBTreeRuntimeConfig(CustomTestCase):
     def test_verify_width_is_fixed_and_within_checkpoint(self):
         config = replace(parse_ubtree_config(_config()), tree_budget=64)
-        self.assertEqual(resolve_verify_width(config, None), 49)
-        for width in (5, 65):
+        self.assertEqual(resolve_verify_width(config, None), 65)
+        for width in (5, 49, 65):
             with self.subTest(width=width):
                 self.assertEqual(resolve_verify_width(config, width), width)
         self.assertEqual(
             resolve_verify_width(replace(config, tree_budget=39), None), 40
         )
-        for block_size in (50, 64):
+        for block_size in (8, 16, 32):
             with self.subTest(block_size=block_size):
                 self.assertEqual(
                     resolve_verify_width(
-                        replace(config, block_size=block_size), None
+                        replace(config, block_size=block_size, tree_budget=96), None
                     ),
-                    block_size,
+                    97,
                 )
-        for width in (4, 66):
+        for width in (4, 66, 16.5, True):
             with self.subTest(width=width), self.assertRaises(ValueError):
                 resolve_verify_width(config, width)
         with self.assertRaises(ValueError):
             resolve_verify_width(replace(config, tree_budget=31), 49)
+        with self.assertRaises(ValueError):
+            resolve_verify_width(replace(config, block_size=50, tree_budget=31), None)
 
     def test_startup_rejects_draft_for_another_target_or_block_contract(self):
         with self.assertRaisesRegex(ValueError, "dflash_contract"):
             parse_ubtree_config(
                 SimpleNamespace(**vars(_config()), dflash_contract="other")
             )
-        for bonus in (float("-inf"), float("inf"), float("nan")):
+        for bonus in (float("-inf"), float("inf"), float("nan"), False):
             with self.subTest(bonus=bonus), self.assertRaisesRegex(
                 ValueError, "tree_depth_bonus"
             ):
                 bad = _config()
                 bad.ubtree_config = dict(bad.ubtree_config, tree_depth_bonus=bonus)
                 parse_ubtree_config(bad)
+        for field, value in (
+            ("candidate_k", 17.5),
+            ("tree_budget", 5.5),
+            ("rank", True),
+        ):
+            with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                ValueError, field
+            ):
+                bad = _config()
+                bad.ubtree_config = dict(bad.ubtree_config, **{field: value})
+                parse_ubtree_config(bad)
+        bad_vocab_float = _config()
+        bad_vocab_float.vocab_size = 17.5
+        with self.assertRaisesRegex(ValueError, "vocab_size"):
+            parse_ubtree_config(bad_vocab_float)
         exact_vocab = _config()
         exact_vocab.ubtree_config = dict(exact_vocab.ubtree_config, candidate_k=17)
         self.assertEqual(parse_ubtree_config(exact_vocab).candidate_k, 17)
@@ -317,7 +334,24 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
                 parse_ubtree_config(bad)
         with self.assertRaisesRegex(ValueError, "vocab_size 17 must match"):
             _run_ubtree_hook(target_vocab_size=18)
-        with self.assertRaisesRegex(ValueError, "--context-length 2048"):
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "SGLANG_IS_IN_CI": "0",
+                    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "0",
+                },
+            ),
+            self.assertRaisesRegex(ValueError, "--context-length 2048"),
+        ):
+            _run_ubtree_hook(target_context_len=4096)
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_IS_IN_CI": "1",
+                "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "0",
+            },
+        ):
             _run_ubtree_hook(target_context_len=4096)
         for bad_kwargs in (
             {"speculative_num_steps": 9},
@@ -339,6 +373,11 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
                 _run_ubtree_hook(locked=[locked])
 
     def test_builtin_identity_and_capabilities_preserve_plugin_protocol(self):
+        from sglang.srt.managers.overlap_utils import decide_needs_confidence_relay
+        from sglang.srt.runtime_context import get_context
+        from sglang.srt.speculative import spec_registry
+        from sglang.srt.speculative.spec_registry import CustomSpecAlgo
+
         algo = SpeculativeAlgorithm.from_string("ubtree")
         self.assertIs(algo, SpeculativeAlgorithm.UBTREE)
         self.assertFalse(algo.is_dflash())
@@ -347,6 +386,35 @@ class TestUBTreeRuntimeConfig(CustomTestCase):
         self.assertFalse(algo.supports_grammar_overlap())
         self.assertFalse(algo.supports_ragged_verify())
         self.assertFalse(algo.supports_prefill_shared_read_done())
+
+        class _RaggedPluginSpec(CustomSpecAlgo):
+            def supports_ragged_verify(self) -> bool:
+                return True
+
+        plugin_name = "TEST_UBTREE_RAGGED_PLUGIN"
+        try:
+            SpeculativeAlgorithm.register(
+                plugin_name,
+                supports_overlap=True,
+                spec_class=_RaggedPluginSpec,
+            )(lambda _args: object)
+            for mode in ("compact", "cap-accept"):
+                with patch.dict("os.environ", {"SGLANG_RAGGED_VERIFY_MODE": mode}):
+                    for name, expected in (
+                        ("DFLASH", True),
+                        ("DSPARK", True),
+                        ("UBTREE", False),
+                        (plugin_name, False),
+                    ):
+                        with (
+                            self.subTest(mode=mode, algorithm=name),
+                            get_context().override_server_args(
+                                speculative_algorithm=name
+                            ),
+                        ):
+                            self.assertEqual(decide_needs_confidence_relay(), expected)
+        finally:
+            spec_registry._REGISTRY.pop(plugin_name, None)
 
     def test_invalid_runtime_shapes_are_rejected(self):
         cfg = SimpleNamespace(
@@ -501,6 +569,37 @@ class TestUBTreeRequestValidation(CustomTestCase):
             self.assertIn("flashinfer", validate_ubtree_request(req))
             exec_cfg.deterministic.enable_deterministic_inference = True
             self.assertIn("deterministic", validate_ubtree_request(req))
+
+        from sglang.srt.speculative.ubtree_worker_v2 import UBTreeWorkerV2
+
+        base_info = SimpleNamespace(
+            is_all_greedy=True,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+            step_penalties=None,
+            logit_bias=None,
+            has_custom_logit_processor=False,
+            watermark=None,
+            sampling_seed=None,
+        )
+        self.assertTrue(
+            UBTreeWorkerV2._can_fold_verify_epilogue(
+                SimpleNamespace(sampling_info=base_info, has_grammar=False)
+            )
+        )
+        for bad_batch in (
+            SimpleNamespace(sampling_info=base_info, has_grammar=True),
+            SimpleNamespace(
+                sampling_info=SimpleNamespace(**(vars(base_info) | {"watermark": object()})),
+                has_grammar=False,
+            ),
+            SimpleNamespace(
+                sampling_info=SimpleNamespace(**(vars(base_info) | {"logit_bias": object()})),
+                has_grammar=False,
+            ),
+        ):
+            self.assertFalse(UBTreeWorkerV2._can_fold_verify_epilogue(bad_batch))
 
 
 class TestUBTreeLoading(CustomTestCase):

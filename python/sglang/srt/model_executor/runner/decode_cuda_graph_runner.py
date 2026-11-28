@@ -538,6 +538,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else None
         )
         self._verify_checkpoint_ids_dirty = False
+        self._reset_verify_checkpoint_ids_on_absent = False
 
         if self.require_gathered_buffer:
             assert self.require_mlp_tp_gather or self.require_attn_tp_gather
@@ -1957,7 +1958,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return
         ids = forward_batch.mamba_track_indices
         if ids is None:
-            if getattr(self, "_verify_checkpoint_ids_dirty", False):
+            if (
+                getattr(self, "_reset_verify_checkpoint_ids_on_absent", False)
+                and getattr(self, "_verify_checkpoint_ids_dirty", False)
+            ):
                 self._verify_checkpoint_ids.fill_(-1)
                 self._verify_checkpoint_ids_dirty = False
             return

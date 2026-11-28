@@ -251,6 +251,7 @@ def _select_tree_nodes_kernel(
     if depth_bonus != 0.0:
         old_depths = tl.load(super_depths + source_offsets, mask=valid, other=0)
         values += depth_bonus * old_depths.to(tl.float32)
+    values = tl.where(valid, tl.maximum(values, -3.402823466e38), -float("inf"))
 
     chosen_slots = tl.arange(0, chosen_block)
     chosen_old = tl.full((chosen_block,), max_nodes, tl.int64)
@@ -292,6 +293,7 @@ def _materialize_selected_tree_kernel(
     batch_index = tl.program_id(0)
     lanes = tl.arange(0, output_block)
     valid = lanes < selected_nodes
+    non_root = valid & (lanes > 0)
     output_offsets = batch_index * selected_nodes + lanes
     selected_old = tl.load(selected_old_ids + output_offsets, mask=valid, other=0)
     # max_nodes is not needed here: every masked selected_old is valid.
@@ -300,17 +302,17 @@ def _materialize_selected_tree_kernel(
     token = tl.where(
         lanes == 0,
         anchor,
-        tl.load(super_tokens + super_offsets, mask=valid, other=0),
+        tl.load(super_tokens + super_offsets, mask=non_root, other=0),
     )
     depth = tl.where(
         lanes == 0,
         0,
-        tl.load(super_depths + super_offsets, mask=valid, other=0),
+        tl.load(super_depths + super_offsets, mask=non_root, other=0),
     )
     parent_old = tl.where(
         lanes == 0,
         -1,
-        tl.load(super_parents + super_offsets, mask=valid, other=-1),
+        tl.load(super_parents + super_offsets, mask=non_root, other=-1),
     )
 
     low = tl.zeros((output_block,), tl.int32)

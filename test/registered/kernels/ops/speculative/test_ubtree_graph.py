@@ -643,6 +643,9 @@ def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
         has_grammar=False,
         sampling_info=SimpleNamespace(
             is_all_greedy=True,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
             step_penalties=None,
             logit_bias=None,
             has_custom_logit_processor=False,
@@ -695,7 +698,12 @@ def test_worker_commits_once_and_keeps_scheduler_outputs_alive(
     )
     worker._make_next_draft_input_decode = lambda **kwargs: SimpleNamespace(**kwargs)
     monkeypatch.setattr(
-        worker_module, "eagle_prepare_for_verify", lambda *args: (forward, graph_replay)
+        worker_module,
+        "eagle_prepare_for_verify",
+        lambda verify_input, pool, batch, target_worker, *, route: (
+            forward,
+            graph_replay,
+        ),
     )
     published = []
     result = worker.forward_batch_generation(
@@ -726,6 +734,9 @@ def test_worker_rejects_penalties_before_prefill():
         has_grammar=False,
         sampling_info=SimpleNamespace(
             is_all_greedy=True,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
             step_penalties=None,
             logit_bias={1: 1},
             has_custom_logit_processor=False,
@@ -779,6 +790,7 @@ def test_epilogue_capture_binds_verify_checkpoint_ids_and_sanitizes_nan(monkeypa
     epilogue.capture_hook(runner, out, fb, num_tokens=4)
     assert epilogue.graph_metadata(1)[3] is not None
     assert epilogue.graph_metadata(1)[3].data_ptr() == checkpoint_ids.data_ptr()
+    assert runner._reset_verify_checkpoint_ids_on_absent is True
     assert checkpoint_ids.tolist() == [-1]
     assert recorded["target_predict"].reshape(-1).tolist() == [1, 2, 3, 0]
 
@@ -787,9 +799,27 @@ def test_epilogue_capture_binds_verify_checkpoint_ids_and_sanitizes_nan(monkeypa
     )
 
     stage_buf = torch.full((4,), -1, dtype=torch.int64)
+    dflash_runner = SimpleNamespace(
+        _verify_checkpoint_ids=stage_buf,
+        _verify_checkpoint_ids_dirty=False,
+        _reset_verify_checkpoint_ids_on_absent=False,
+    )
+    DecodeCudaGraphRunner._stage_verify_checkpoint_ids(
+        dflash_runner,
+        SimpleNamespace(mamba_track_indices=torch.tensor([7, 9], dtype=torch.int64)),
+        4,
+    )
+    assert stage_buf.tolist() == [7, 9, 0, 0]
+    DecodeCudaGraphRunner._stage_verify_checkpoint_ids(
+        dflash_runner, SimpleNamespace(mamba_track_indices=None), 2
+    )
+    assert stage_buf.tolist() == [7, 9, 0, 0]
+
+    stage_buf.fill_(-1)
     stage_runner = SimpleNamespace(
         _verify_checkpoint_ids=stage_buf,
         _verify_checkpoint_ids_dirty=False,
+        _reset_verify_checkpoint_ids_on_absent=True,
     )
     DecodeCudaGraphRunner._stage_verify_checkpoint_ids(
         stage_runner, SimpleNamespace(mamba_track_indices=None), 4
@@ -954,6 +984,19 @@ def test_tree_metadata_all_widths_matches_cpu_after_replay(width):
         for bad_bonus in (float("-inf"), float("nan")):
             with pytest.raises(ValueError, match="depth_bonus"):
                 build_ubtree_batch(**proposal_args, depth_bonus=bad_bonus)
+    if width == 49:
+        extreme = build_ubtree_batch(**proposal_args, depth_bonus=-1e38)
+        assert torch.all(extreme.parent_ids[:, 1:] >= 0)
+        assert torch.all(
+            extreme.parent_ids[:, 1:] < torch.arange(1, width, device="cuda")
+        )
+        edges = list(
+            zip(
+                extreme.parent_ids[0, 1:].tolist(),
+                extreme.tokens[0, 1:].tolist(),
+            )
+        )
+        assert len(set(edges)) == width - 1
 
     parent_values = [
         [-1] + [(node - 1) // 2 for node in range(1, width)],

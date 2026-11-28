@@ -208,10 +208,12 @@ class UBTreeVerifyEpilogue:
         if num_tokens != bs * self.node_count:
             return
         track_ids = forward_batch.mamba_track_indices
-        if track_ids is None and runner._verify_checkpoint_ids is not None:
-            track_ids = runner._verify_checkpoint_ids[:bs]
-            if not (track_ids.is_cuda and torch.cuda.is_current_stream_capturing()):
-                track_ids.fill_(-1)
+        if runner._verify_checkpoint_ids is not None:
+            runner._reset_verify_checkpoint_ids_on_absent = True
+            if track_ids is None:
+                track_ids = runner._verify_checkpoint_ids[:bs]
+                if not (track_ids.is_cuda and torch.cuda.is_current_stream_capturing()):
+                    track_ids.fill_(-1)
         self._graph_metadata[bs] = (
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
