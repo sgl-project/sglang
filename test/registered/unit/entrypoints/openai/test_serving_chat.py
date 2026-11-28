@@ -677,6 +677,34 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertEqual(request.tool_choice, "auto")
 
+    def test_effective_tools_follow_changes_to_the_request(self):
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            tools=[{"type": "function", "function": {"name": "lookup"}}],
+        )
+
+        def names():
+            return [tool.function.name for tool in self.chat._effective_tools(request)]
+
+        self.assertEqual(names(), ["lookup"])
+        self.assertEqual(names(), ["lookup"])
+        request.tools = [Tool(function=Function(name="search", parameters={}))]
+        self.assertEqual(names(), ["search"])
+        request.messages.append(
+            ChatCompletionRequest(
+                model="x",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "",
+                        "tools": [{"type": "function", "function": {"name": "grep"}}],
+                    }
+                ],
+            ).messages[0]
+        )
+        self.assertEqual(names(), ["search", "grep"])
+
     @staticmethod
     def _close_event_loops():
         try:

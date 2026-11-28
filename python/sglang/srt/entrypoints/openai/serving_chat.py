@@ -665,6 +665,12 @@ class OpenAIServingChat(OpenAIServingBase):
         return "chatcmpl-"
 
     def _effective_tools(self, request: ChatCompletionRequest) -> list[Tool]:
+        # Streaming asks this for every chunk; scanning a long agent history
+        # each time makes a turn cost output length times history length.
+        key = (id(request.tools), len(request.messages))
+        memo = request._effective_tools_memo
+        if memo is not None and memo[0] == key:
+            return list(memo[1])
         tools = list(request.tools or [])
         for message in request.messages:
             if (
@@ -673,6 +679,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 and message.tools
             ):
                 tools.extend(message.tools)
+        request._effective_tools_memo = (key, tuple(tools))
         return tools
 
     def _encode_messages(
@@ -2050,12 +2057,22 @@ class OpenAIServingChat(OpenAIServingBase):
                     message, strict=history_tool_call_arguments == "strict"
                 )
 
-        prompt_ids = self._encode_messages(
-            copy.deepcopy(messages),
-            request,
-            thinking_mode,
-            tools=tools,
-            image_data=image_data,
+        # Only a custom encoder takes the messages, and it may mutate them; the
+        # copy of a long history is not free.
+        has_custom_encoder = (
+            self._encoding_adapter is not None
+            or type(self)._encode_messages is not OpenAIServingChat._encode_messages
+        )
+        prompt_ids = (
+            self._encode_messages(
+                copy.deepcopy(messages),
+                request,
+                thinking_mode,
+                tools=tools,
+                image_data=image_data,
+            )
+            if has_custom_encoder
+            else None
         )
 
         if prompt_ids is not None:

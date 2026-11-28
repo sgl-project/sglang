@@ -1037,6 +1037,9 @@ class ChatCompletionRequest(PDRoutingFields):
     # Indices of the messages the client sent a non-empty `tools` on, including
     # user messages, whose model drops the field.
     _message_tools_indices: List[int] = PrivateAttr(default_factory=list)
+    # OpenAIServingChat._effective_tools of this request, with the tools list and
+    # message count it was computed from.
+    _effective_tools_memo: Optional[tuple] = PrivateAttr(default=None)
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
