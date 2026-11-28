@@ -1113,6 +1113,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
             assert fused_rmsnorm_gated_strided_z is not None
             qkv_dim = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
+            nv_tp = self.num_v_heads // self.attn_tp_size
+            core_attn_out = core_attn_out.reshape(-1, nv_tp, self.head_v_dim)
+            if core_attn_out.shape[0] != projected_states_qkvz.shape[0]:
+                core_attn_out_pad = core_attn_out.new_zeros(
+                    (projected_states_qkvz.shape[0], nv_tp, self.head_v_dim)
+                )
+                core_attn_out_pad[: core_attn_out.shape[0]] = core_attn_out
+                core_attn_out = core_attn_out_pad
             core_attn_out = fused_rmsnorm_gated_strided_z(
                 core_attn_out.contiguous(),
                 projected_states_qkvz,

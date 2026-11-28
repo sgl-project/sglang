@@ -5,15 +5,14 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import CustomTestCase
-
-register_npu_ci(est_time=5, suite="extra-a-test-npu")
-
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_npu
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_npu_ci(est_time=5, suite="extra-a-test-npu")
 
 
 def _has_sgl_kernel_fused_gdn() -> bool:
@@ -260,6 +259,14 @@ class TestNPUFusedGDNPrefillIntegration(CustomTestCase):
         core = torch.randn((4, nv, d), device="npu", dtype=torch.bfloat16)
         y = fused_rmsnorm_gated_strided_z(core, qkvz, rms_w, qkv_dim, 1e-6)
         self.assertEqual(y.shape, (4, nv * d))
+
+        # Regression: 4D outputs from chunk_gated_delta_rule ([1, T, NV, D]) and
+        # recurrent_gated_delta_rule ([B, 1, NV, D]) reshape cleanly to [T, NV, D].
+        for core_4d in (core.view(1, 4, nv, d), core.view(4, 1, nv, d)):
+            y_4d = fused_rmsnorm_gated_strided_z(
+                core_4d.reshape(-1, nv, d).contiguous(), qkvz, rms_w, qkv_dim, 1e-6
+            )
+            torch.testing.assert_close(y_4d, y, atol=0.0, rtol=0.0)
 
 
 if __name__ == "__main__":
