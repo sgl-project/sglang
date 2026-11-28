@@ -25,7 +25,6 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
-from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
@@ -41,9 +40,26 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BumpAllocator
+from sglang.srt.utils import (
+    BumpAllocator,
+    empty_device_cache,
+    get_device_module,
+    is_cuda,
+    is_npu,
+)
 
 logger = logging.getLogger(__name__)
+
+_is_cuda = is_cuda()
+_is_npu = is_npu()
+
+
+def _clear_device_cache() -> None:
+    device_module = get_device_module()
+    empty_device_cache(device_module)
+    synchronize = getattr(device_module, "synchronize", None)
+    if synchronize is not None:
+        synchronize()
 
 
 def _get_eagle_aux_layer_count(config: PretrainedConfig) -> int:
@@ -210,21 +226,28 @@ class Eagle3MLAModel(nn.Module):
             getattr(config, "target_hidden_size", None) or config.hidden_size
         )
         self.num_aux_hidden_states = _get_eagle_aux_layer_count(config)
+        tp_size = get_parallel().tp_size
         self.fc = ColumnParallelLinear(
             target_hidden_size * self.num_aux_hidden_states,
             config.hidden_size,
             bias=getattr(config, "bias", False),
-            gather_output=False,
+            gather_output=not _is_cuda and tp_size > 1,
             quant_config=quant_config,
             prefix=add_prefix("fc", prefix),
         )
-        # Guarded multimem all-gather for the fc output; buffer covers prefill.
-        self._fc_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
-            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
-                include_prefill=True, floor=512
-            ),
-            skip_entry_sync=False,
-        )
+        # Multimem is a CUDA/NVLink optimization. Other platforms gather through
+        # the linear layer's native TP communicator (HCCL on Ascend), and TP=1
+        # needs no all-gather at all.
+        self._fc_gatherer = None
+        if _is_cuda and tp_size > 1:
+            from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+
+            self._fc_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+                max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                    include_prefill=True, floor=512
+                ),
+                skip_entry_sync=False,
+            )
 
         # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy
         # `use_aux_norm` flag. Matches the eagle3.1 layout.
@@ -292,7 +315,8 @@ class Eagle3MLAModel(nn.Module):
                     dim=-1,
                 )
             hidden_states, _ = self.fc(hidden_states)
-            hidden_states = self._fc_gatherer(hidden_states)
+            if self._fc_gatherer is not None:
+                hidden_states = self._fc_gatherer(hidden_states)
 
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
@@ -418,16 +442,14 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        _clear_device_cache()
 
     def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        _clear_device_cache()
 
     def get_hot_token_id(self):
         return self.hot_token_id
@@ -524,7 +546,10 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
         ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
         self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-        self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+        w_vc = w_vc.contiguous().transpose(1, 2)
+        if _is_npu:
+            w_vc = w_vc.contiguous()
+        self_attn.w_vc = w_vc
 
 
 EntryClass = [Eagle3DeepseekV2ForCausalLM]
