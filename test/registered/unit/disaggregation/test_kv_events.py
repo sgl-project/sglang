@@ -568,6 +568,29 @@ class TestTokenIdSuppression(unittest.TestCase):
         self._wait_for_seq(publisher, 0)
         self.assertEqual(self._decode(publisher._buffer[-1][1]).events[0].token_ids, [])
 
+    def test_factory_preserves_legacy_custom_publisher_defaults(self):
+        class LegacyPublisher:
+            def __init__(
+                self,
+                attn_dp_rank,
+                endpoint,
+                bind,
+                replay_endpoint,
+                buffer_steps,
+                hwm,
+                max_queue_size,
+                topic,
+            ):
+                self.attn_dp_rank = attn_dp_rank
+
+        name = "legacy-no-token-ids"
+        EventPublisherFactory.register_publisher(name, LegacyPublisher)
+        self.addCleanup(EventPublisherFactory._registry.pop, name)
+        config = json.dumps({"publisher": name})
+        publisher = EventPublisherFactory.create(config, attn_dp_rank=0)
+        self.assertIsInstance(publisher, LegacyPublisher)
+        self.assertEqual(publisher.attn_dp_rank, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

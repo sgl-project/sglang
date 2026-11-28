@@ -837,10 +837,13 @@ class EventPublisherFactory:
         config_dict = config.model_dump()
         # The cache event recorder uses the format. The publisher does not accept it.
         config_dict.pop("format")
+        include_token_ids = config_dict.pop("include_token_ids")
 
         kind = config_dict.pop("publisher", "null")
         if kind == "null":
             return NullEventPublisher()
+        if kind == "zmq":
+            config_dict["include_token_ids"] = include_token_ids
         try:
             constructor = cls._registry[kind]
         except KeyError as exc:
