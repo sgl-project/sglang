@@ -927,8 +927,32 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         )
 
     def _normalize_prompt_for_fast_path(self, input_text, expected_image_count: int):
-        # Non-string input (list of ints) is already in the pre-tokenized shape
-        # build_input_ids expects; only string prompts need placeholder rewriting.
+        if isinstance(input_text, list):
+            # HF processors may have already expanded each image placeholder into
+            # multiple consecutive image-pad tokens in the pre-tokenized prompt.
+            # Collapse each run within vision_start/vision_end boundaries to one
+            # image-pad token, as build_input_ids expands it again using the image grid.
+            normalized = []
+            count = 0
+            index = 0
+            while index < len(input_text):
+                token = input_text[index]
+                if token == self.IM_TOKEN_ID:
+                    if not normalized or normalized[-1] != self.vision_start_token_id:
+                        return None
+                    normalized.append(token)
+                    while index < len(input_text) and input_text[index] == token:
+                        index += 1
+                    if (
+                        index == len(input_text)
+                        or input_text[index] != self.vision_end_token_id
+                    ):
+                        return None
+                    count += 1
+                else:
+                    normalized.append(token)
+                    index += 1
+            return normalized if count == expected_image_count else None
         if not isinstance(input_text, str):
             return input_text
         native = self.mm_tokens.image_token

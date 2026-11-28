@@ -98,6 +98,7 @@ class TestFeatureIdentity(CustomTestCase):
             "cpu", base_gpu_id=0, skip_mm_pool=True
         )
         processor.vision_start_token_id, processor.vision_end_token_id = 1, 3
+        processor.IM_TOKEN_ID = 2
         processor.mm_tokens = SimpleNamespace(
             image_token_id=2, video_token_id=4, audio_token_id=5
         )
