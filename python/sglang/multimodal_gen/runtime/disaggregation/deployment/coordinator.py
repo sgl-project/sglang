@@ -46,6 +46,8 @@ class DeploymentServer:
         # running jobs own tasks; completed client jobs retain admission through a lease
         self.leases = {}
         self.jobs = {}
+        # each RPC has its own socket, so a cancel can overtake its encode request
+        self.cancelled = {}
 
     async def execute(self, request, outputs=None, role=None):
         """return result descriptors and their lease; the caller owns final release"""
@@ -175,6 +177,8 @@ class DeploymentServer:
                     job_id = message["job_id"]
                     if job_id in self.jobs or job_id in self.leases:
                         raise ValueError("Duplicate encoding job ID")
+                    if self.cancelled.pop(job_id, None) is not None:
+                        raise ValueError("Encoding job was cancelled by its client")
                     self.jobs[job_id] = asyncio.current_task()
                     try:
                         await self.admission.acquire()
@@ -204,6 +208,8 @@ class DeploymentServer:
                     if task is not None:
                         task.cancel()
                         await asyncio.gather(task, return_exceptions=True)
+                    elif job_id not in self.leases:
+                        self.cancelled[job_id] = time.monotonic()
                     await self.release_lease(job_id)
                     response = {}
                 else:
@@ -283,6 +289,12 @@ class DeploymentServer:
                 ]
                 for key in expired:
                     await self.release_lease(key)
+                now = time.monotonic()
+                self.cancelled = {
+                    key: started
+                    for key, started in self.cancelled.items()
+                    if now - started <= self.timeout
+                }
                 try:
                     frames = await asyncio.wait_for(socket.recv_multipart(), 0.2)
                 except TimeoutError:

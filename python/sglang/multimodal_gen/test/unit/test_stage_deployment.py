@@ -523,6 +523,21 @@ def test_coordinator_parallel_join_and_cleanup():
                     5,
                 )
             assert not live and not server.admission.locked()
+            # a cancel that overtakes its encode request must not leave a lease behind
+            await rpc(context, endpoint, {"method": "cancel", "job_id": "late"}, 5)
+            with pytest.raises(RuntimeError, match="cancelled"):
+                await rpc(
+                    context,
+                    endpoint,
+                    {
+                        "method": "encode",
+                        "job_id": "late",
+                        "request": Req(prompt="late"),
+                        "outputs": None,
+                    },
+                    5,
+                )
+            assert not server.leases and not server.cancelled and not live
             await server.admission.acquire()
             assert server.admission.locked()
             server.admission.release()
