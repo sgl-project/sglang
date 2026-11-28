@@ -571,6 +571,8 @@ def flashinfer_per_tensor_fp8_supported() -> bool:
 if flashinfer_per_tensor_fp8_supported():
     from flashinfer import bmm_fp8 as _raw_flashinfer_bmm_fp8
 
+    from sglang.kernels.ops.gemm.bmm_fp8_cublaslt_algos import run_with_tuned_algo
+
     @register_custom_op(
         op_name="flashinfer_bmm_fp8",
         mutates_args=[],
@@ -586,14 +588,26 @@ if flashinfer_per_tensor_fp8_supported():
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
         m, n = q_input.shape[0], weight.shape[1]
-        return _raw_flashinfer_bmm_fp8(
-            q_input.unsqueeze(0),
-            weight.unsqueeze(0),
-            x_scale.reshape(1),
-            weight_scale.reshape(1),
-            out_dtype,
-            backend="cublas",
-        ).view(m, n)
+
+        def stock() -> torch.Tensor:
+            return _raw_flashinfer_bmm_fp8(
+                q_input.unsqueeze(0),
+                weight.unsqueeze(0),
+                x_scale.reshape(1),
+                weight_scale.reshape(1),
+                out_dtype,
+                backend="cublas",
+            ).view(m, n)
+
+        out = run_with_tuned_algo(
+            q_input=q_input,
+            weight=weight,
+            x_scale=x_scale,
+            weight_scale=weight_scale,
+            out_dtype=out_dtype,
+            stock=stock,
+        )
+        return stock() if out is None else out
 
 
 def _fake_flashinfer_mxfp8_quantize(
