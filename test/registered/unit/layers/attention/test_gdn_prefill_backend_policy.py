@@ -391,6 +391,87 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         runner.hybrid_gdn_config = SimpleNamespace()
         self.assertIsNone(self.apply_policy(runner))
 
+    def capture_probe_runner(
+        self,
+        *,
+        buckets=(16, 32, 64, 8192),
+        context_len=262144,
+        pool_size=64,
+        lora_manager=None,
+    ):
+        """An SM90 runner carrying everything the graph-capture probe reads, so
+        a case exercises the probe's own conditions instead of tripping its
+        AttributeError fallback."""
+        from sglang.srt.model_executor.cuda_graph_config import (
+            CudaGraphConfig,
+            PhaseConfig,
+        )
+
+        runner = make_runner(
+            self,
+            state_dtype=torch.float32,
+            cuda_graph_config=CudaGraphConfig(
+                prefill=PhaseConfig(backend="breakable", bs=list(buckets))
+            ),
+        )
+        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
+        runner.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(
+                part_view=lambda part: SimpleNamespace(mamba_cache=cache)
+            )
+        )
+        runner.model_config.hf_text_config = SimpleNamespace(mamba_chunk_size=64)
+        runner.model_config.context_len = context_len
+        runner.req_to_token_pool = SimpleNamespace(size=pool_size)
+        runner.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        runner.lora_manager = lora_manager
+        return runner
+
+    def apply_sm90_policy(self, runner, *, buckets=(16, 32, 64, 8192)):
+        with patch(
+            "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
+            "get_prefill_num_tokens_to_capture",
+            return_value=list(buckets),
+        ):
+            return self.apply_policy(runner, capability=(9, 0), cuda_version="12.9")
+
+    def test_sm90_prefers_triton_when_the_capture_is_eligible(self):
+        with envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True):
+            self.assertIsNone(self.apply_sm90_policy(self.capture_probe_runner()))
+
+    def test_sm90_keeps_flashinfer_when_a_bucket_needs_more_rows_than_captured(self):
+        """A bucket is captured as ceil(bucket / context) synthetic requests, so
+        a short context splits a large bucket past the GDN row cap and the
+        capture would assert in GDNPrefillGraphMetadata.fill()."""
+        cases = (
+            # 8192 / 64 = 128 requests against the 64 rows the pool allows
+            ("context_splits_past_the_pool", {"context_len": 64}, 128),
+            # 8192 / 2048 = 4 requests against the 2 rows the env flag allows
+            ("env_cap_below_the_split", {"context_len": 2048}, 2),
+            ("pool_below_the_split", {"context_len": 2048, "pool_size": 2}, 128),
+        )
+        for name, runner_args, env_max_seqs in cases:
+            with (
+                self.subTest(name=name),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+                envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.override(env_max_seqs),
+            ):
+                runner = self.capture_probe_runner(**runner_args)
+                self.assertEqual(self.apply_sm90_policy(runner), "flashinfer")
+
+    def test_sm90_keeps_flashinfer_when_lora_disables_prefill_graphs(self):
+        """capture_prefill_graph() hands an uncapturable LoRA setup to the eager
+        runner, so Triton would lose its reason to be selected."""
+        for supported, expected in ((True, None), (False, "flashinfer")):
+            with (
+                self.subTest(supports_prefill_cuda_graph=supported),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+            ):
+                runner = self.capture_probe_runner(
+                    lora_manager=SimpleNamespace(supports_prefill_cuda_graph=supported)
+                )
+                self.assertEqual(self.apply_sm90_policy(runner), expected)
+
     def test_rejects_unvalidated_runtime_modes(self):
         cases = (
             ("non_triton_base", {"linear_attn_backend": "cutedsl"}),
