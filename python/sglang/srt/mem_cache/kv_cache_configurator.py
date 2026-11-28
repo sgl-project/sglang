@@ -3410,12 +3410,17 @@ class KVCacheConfigurator:
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
-        rest_memory -= self._dflash_draft_kv_ring_bytes() / (1 << 30)
+        draft_kv_ring_gb = self._dflash_draft_kv_ring_bytes() / (1 << 30)
+        rest_memory -= draft_kv_ring_gb
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
+            # The multimodal reservation and the draft KV ring come out of the
+            # budget at any fraction, so the fraction has to leave room for them
+            # as well as for the weights.
+            reserved_gb = mm_reservation_gb + draft_kv_ring_gb
             minimum_mem_fraction_static = (
-                1 - available_gpu_memory / pre_model_load_memory
+                1 - (available_gpu_memory - reserved_gb) / pre_model_load_memory
             )
             suggested_mem_fraction_static = (
                 math.ceil(minimum_mem_fraction_static * 1000) / 1000
@@ -3425,9 +3430,10 @@ class KVCacheConfigurator:
                 f"--mem-fraction-static={get_schedule().mem_fraction_static}. "
                 f"Raise --mem-fraction-static above "
                 f"{suggested_mem_fraction_static:.3f} "
-                f"(minimum viable = 1 - available/pre = "
-                f"{minimum_mem_fraction_static:.4f}). If using speculative "
-                f"decoding, draft weights are now counted."
+                f"(minimum viable = 1 - (available - reserved)/pre = "
+                f"{minimum_mem_fraction_static:.4f}, with {reserved_gb:.2f} GB "
+                f"reserved for multimodal allocations and the draft KV ring). "
+                f"If using speculative decoding, draft weights are now counted."
             )
 
         return int(rest_memory * (1 << 30))  # return in bytes
