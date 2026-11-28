@@ -1725,6 +1725,9 @@ class Envs:
     # 0 lets ElasticBuffer select its theoretical communication SM/QP counts.
     SGLANG_DEEPEP_V2_NUM_SMS = EnvInt(0)
     SGLANG_DEEPEP_V2_ENABLE_PREFILL_EXPAND = EnvBool(None)
+    # Private BF16/SM90 experiment; both switches leave the default path unchanged.
+    SGLANG_DEEPEP_V2_USE_EP_BUFFER = EnvBool(False)
+    SGLANG_DEEPEP_V2_BORROW_RECV = EnvBool(False)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)

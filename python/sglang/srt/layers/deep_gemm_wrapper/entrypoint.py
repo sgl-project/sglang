@@ -17,9 +17,16 @@ logger = logging.getLogger(__name__)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import (
-        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
-    )
+
+    try:
+        from deep_gemm.utils.layout import (
+            get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+        )
+    except ImportError:
+        # The pinned DeepGEMM 2.8.1 experiment exports this from utils.
+        from deep_gemm.utils import (
+            get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+        )
 
     def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
         """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
@@ -168,6 +175,20 @@ def grouped_gemm_nt_bf16_contig(
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+
+
+def grouped_gemm_nt_bf16_contig_gathered(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    d: torch.Tensor,
+    m_indices: torch.Tensor,
+    a_row_indices: torch.Tensor,
+):
+    # This experimental API uses native lazy JIT; ordinary GEMM precompile
+    # entries do not describe the gathered kernel or its physical A shape.
+    deep_gemm.m_grouped_bf16_gemm_nt_contiguous_gathered(
+        a, b, d, m_indices, a_row_indices
+    )
 
 
 def get_contiguous_layout_alignment(expected_m: int, num_groups: int) -> int:
