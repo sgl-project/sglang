@@ -190,7 +190,7 @@ class TestJoinerWorkerPortAdmission(CustomTestCase):
         self.assertEqual(launch.call_args.args[-1], [1002])
 
 
-class TestLocalKvEventSources(CustomTestCase):
+class TestLocalKvHintSources(CustomTestCase):
     @staticmethod
     def _source(rank, block_size=64):
         return {
@@ -200,42 +200,8 @@ class TestLocalKvEventSources(CustomTestCase):
             "block_size": block_size,
         }
 
-    def test_scheduler_reports_logical_block_size_or_no_source(self):
-        from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.managers.scheduler_components.kv_events_publisher import (
-            SchedulerKvEventsPublisher,
-        )
-
-        component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.max_total_num_tokens = 64
-        scheduler.max_req_input_len = 32
-        scheduler.startup_time = {}
-        scheduler.page_size = 64
-        scheduler.enable_hierarchical_cache = False
-        scheduler.enable_unified_cache_external_linker = False
-        scheduler.kv_events_publisher = component
-        publisher = MagicMock()
-        publisher.describe_local_source.return_value = self._source(4, 256)
-        for owned_publisher, expected in (
-            (publisher, [self._source(4, 256)]),
-            (None, []),
-        ):
-            with (
-                self.subTest(has_publisher=owned_publisher is not None),
-                get_context().override_server_args(grpc_port=50051, dcp_size=4),
-            ):
-                component.kv_event_publisher = owned_publisher
-                self.assertEqual(
-                    scheduler.get_init_info()["kv_event_sources"], expected
-                )
-        publisher.describe_local_source.assert_called_once_with(256)
-
     def test_scheduler_reports_backend_hint_sources_only_when_present(self):
         from sglang.srt.managers.scheduler import Scheduler
-        from sglang.srt.managers.scheduler_components.kv_events_publisher import (
-            SchedulerKvEventsPublisher,
-        )
         from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
         hint = {
@@ -243,19 +209,14 @@ class TestLocalKvEventSources(CustomTestCase):
             "capabilities": ["router_hint"],
             "source_control_endpoint": "tcp://worker-a:29017",
         }
-        component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
-        component.kv_event_publisher = MagicMock()
-        component.kv_event_publisher.describe_local_source.return_value = self._source(
-            0
-        )
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_total_num_tokens = 64
+        scheduler.max_req_len = 38
         scheduler.max_req_input_len = 32
         scheduler.startup_time = {}
         scheduler.page_size = 64
         scheduler.enable_hierarchical_cache = True
         scheduler.enable_unified_cache_external_linker = False
-        scheduler.kv_events_publisher = component
         for reported in (None, hint):
             with self.subTest(hint=reported is not None):
                 cache = SimpleNamespace(
@@ -269,17 +230,12 @@ class TestLocalKvEventSources(CustomTestCase):
                     BasePrefixCache.storage_kv_hint_sources(c)
                 )
                 scheduler.tree_cache = cache
-                with (
-                    get_context().override_server_args(grpc_port=None),
-                    patch.object(Scheduler, "_hicache_l3_layout", return_value={}),
-                ):
+                with patch.object(Scheduler, "_hicache_l3_layout", return_value={}):
                     info = scheduler.get_init_info()
                 if reported is None:
                     self.assertNotIn("kv_hint_sources", info)
                 else:
                     self.assertEqual(info["kv_hint_sources"], [hint])
-                # Raw event sources still need gRPC.
-                self.assertNotIn("kv_event_sources", info)
 
     def test_controller_collects_all_scheduler_sources(self):
         from sglang.srt.managers import data_parallel_controller as module
@@ -289,7 +245,6 @@ class TestLocalKvEventSources(CustomTestCase):
         controller._scheduler_init_info_lock = threading.Lock()
         controller._scheduler_init_infos = []
         controller.scheduler_procs = []
-        controller.local_kv_event_sources = []
         controller.local_kv_hint_sources = []
         controller.run_scheduler_process_func = MagicMock()
         controller.attn_replica_size = 1
@@ -300,8 +255,8 @@ class TestLocalKvEventSources(CustomTestCase):
                 recv=MagicMock(
                     return_value={
                         "max_total_num_tokens": 64,
+                        "max_req_len": 38,
                         "max_req_input_len": 32,
-                        "kv_event_sources": sources,
                         "kv_hint_sources": [
                             {
                                 "dp_rank": source["dp_rank"],
@@ -341,13 +296,10 @@ class TestLocalKvEventSources(CustomTestCase):
                 MagicMock(), MagicMock(), 0, None, [7000, 7001, 7002, 7003]
             )
         self.assertEqual(
-            controller.local_kv_event_sources, [self._source(2), self._source(3)]
-        )
-        self.assertEqual(
             [source["dp_rank"] for source in controller.local_kv_hint_sources], [2, 3]
         )
 
-    def _run_controller_process(self, *, grpc_port, hint_sources, event_sources):
+    def _run_controller_process(self, *, hint_sources):
         from sglang.srt.managers import data_parallel_controller as module
 
         controller = SimpleNamespace(
@@ -358,12 +310,10 @@ class TestLocalKvEventSources(CustomTestCase):
                 "startup_time": {},
             },
             local_kv_hint_sources=hint_sources,
-            local_kv_event_sources=event_sources,
             event_loop=MagicMock(),
         )
         pipe = MagicMock()
         with (
-            get_context().override_server_args(grpc_port=grpc_port),
             patch.object(module, "DataParallelController", return_value=controller),
             patch.object(module.setproctitle, "setproctitle"),
             patch.object(module.faulthandler, "enable"),
@@ -391,26 +341,15 @@ class TestLocalKvEventSources(CustomTestCase):
             module.run_data_parallel_controller_process(MagicMock(), MagicMock(), pipe)
         return pipe.send.call_args.args[0]
 
-    def test_controller_forwards_hint_sources_without_grpc(self):
+    def test_controller_forwards_hint_sources(self):
         """An in-process engine discovers a backend's router sources."""
         info = self._run_controller_process(
-            grpc_port=None,
-            hint_sources=[{"dp_rank": 1}, {"dp_rank": 0}],
-            event_sources=[self._source(1), self._source(0)],
+            hint_sources=[{"dp_rank": 1}, {"dp_rank": 0}]
         )
         self.assertEqual(info["kv_hint_sources"], [{"dp_rank": 0}, {"dp_rank": 1}])
-        self.assertNotIn("kv_event_sources", info)
 
     def test_controller_reply_is_unchanged_without_backend_sources(self):
-        info = self._run_controller_process(
-            grpc_port=None, hint_sources=[], event_sources=[]
-        )
-        self.assertNotIn("kv_event_sources", info)
-        self.assertNotIn("kv_hint_sources", info)
-        info = self._run_controller_process(
-            grpc_port=50051, hint_sources=[], event_sources=[]
-        )
-        self.assertEqual(info["kv_event_sources"], [])
+        info = self._run_controller_process(hint_sources=[])
         self.assertNotIn("kv_hint_sources", info)
 
 
@@ -512,7 +451,7 @@ class TestInitInfoReply(CustomTestCase):
 
     def test_router_l3_layout_is_forwarded_only_when_a_scheduler_reports_it(self):
         """The reply holds only the keys the controller names, so it must name this one."""
-        info = {"max_total_num_tokens": 64, "max_req_input_len": 32}
+        info = {"max_total_num_tokens": 64, "max_req_len": 38, "max_req_input_len": 32}
         reporting = {**info, "router_l3_layout": "layout-a"}
         self.assertEqual(
             self._reply(reporting, reporting)["router_l3_layout"], "layout-a"

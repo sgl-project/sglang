@@ -80,7 +80,7 @@ When you need to profile prefill or decode workers in PD disaggregation mode, pl
 
 ## One-Token Requests Without a Decode
 
-A prefill server samples the first output token itself. A request for at most one token (`max_new_tokens` of 0 or 1) sent straight to a prefill server with no `bootstrap_host` is answered there: no KV is transferred, and the prompt enters that server's prefix cache like any other. A request with no `bootstrap_host` that asks for more tokens is rejected with HTTP 400.
+A prefill server samples the first output token itself. A request for at most one token (`max_new_tokens` of 0 or 1) sent straight to a prefill server with no `bootstrap_host` is answered there: no KV is transferred, and the prompt enters that server's prefix cache like any other. A request with no `bootstrap_host` that asks for more tokens is rejected with HTTP 400. Such a prefill server reports `prefill_answers_alone: true` in `/server_info`, and sgl-router started with `--pd-one-token-on-prefill-only` sends one-token requests this way.
 
 ## Router Integration
 

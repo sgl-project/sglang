@@ -247,7 +247,6 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
-        self.local_kv_event_sources = []
         self.local_kv_hint_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
@@ -865,18 +864,13 @@ class DataParallelController:
             scheduler_info.append(scheduler_pipe_readers[i].recv())
 
         # Pure-DP TP groups launch concurrently. Their ready replies contain
-        # only publishers and router sources owned by schedulers on this node.
+        # only router sources owned by schedulers on this node.
         hint_sources = [
             source
             for info in scheduler_info
             for source in info.get("kv_hint_sources", [])
         ]
         with self.env_lock:
-            self.local_kv_event_sources.extend(
-                source
-                for info in scheduler_info
-                for source in info.get("kv_event_sources", [])
-            )
             # Only a storage backend owning a router source reports any.
             self.local_kv_hint_sources.extend(hint_sources)
 
@@ -886,6 +880,7 @@ class DataParallelController:
         with self._scheduler_init_info_lock:
             self._scheduler_init_infos.extend(infos)
             self.max_total_num_tokens = infos[0]["max_total_num_tokens"]
+            self.max_req_len = infos[0]["max_req_len"]
             self.max_req_input_len = infos[0]["max_req_input_len"]
             self.startup_time = aggregate_scheduler_startup_times(
                 info.get("startup_time") for info in self._scheduler_init_infos
@@ -896,6 +891,7 @@ class DataParallelController:
         with self._scheduler_init_info_lock:
             init_info = {
                 "max_total_num_tokens": self.max_total_num_tokens,
+                "max_req_len": self.max_req_len,
                 "max_req_input_len": self.max_req_input_len,
                 "startup_time": self.startup_time,
             }
@@ -1089,10 +1085,6 @@ def run_data_parallel_controller_process(
         if controller.local_kv_hint_sources:
             init_info["kv_hint_sources"] = sorted(
                 controller.local_kv_hint_sources, key=lambda source: source["dp_rank"]
-            )
-        if get_serving().grpc_port is not None:
-            init_info["kv_event_sources"] = sorted(
-                controller.local_kv_event_sources, key=lambda source: source["dp_rank"]
             )
         pipe_writer.send(init_info)
         # The primary owns routing for the expanded scheduler set.

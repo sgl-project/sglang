@@ -19,7 +19,9 @@ MAX_LEN = 8
 
 def _truncate(input_ids, preserve_last_token_id):
     req = SimpleNamespace(origin_input_ids=list(input_ids))
-    error = validate_input_length(req, MAX_LEN, True, preserve_last_token_id)
+    error = validate_input_length(
+        req, MAX_LEN, True, preserve_last_token_id, is_multimodal=False
+    )
     assert error is None
     return req.origin_input_ids
 
