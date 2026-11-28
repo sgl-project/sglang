@@ -177,7 +177,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
             **kwargs,
         )
 
-    def format_messages_v2(self, messages, pil_images, max_req_input_len=-1):
+    def format_messages_v2(self, messages, pil_images):
         """play the role of format_messages_v2 and get_images_info in the last version"""
         tokenized_data = []
         masked_tokenized_data = []  # labels
@@ -193,7 +193,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             bos=True,
             eos=True,
             cropping=len(pil_images) <= 2,
-            max_req_input_len=max_req_input_len,
         )
 
         image_index = image_token_cnt
@@ -251,7 +250,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
-        max_req_input_len: int = -1,
         **kwargs,
     ):
         """
@@ -285,7 +283,7 @@ class DeepseekVLV2Processor(ProcessorMixin):
             images_list,
             images_seq_mask,
             images_spatial_crop,
-        ) = self.format_messages_v2(conversations, images, max_req_input_len)
+        ) = self.format_messages_v2(conversations, images)
 
         assert (
             len(tokenized_str) == len(images_seq_mask) == len(masked_tokenized_str)
@@ -340,7 +338,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
-        max_req_input_len: int = -1,
         **kwargs,
     ):
         prepare = self.process_one(
@@ -350,7 +347,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
             apply_sft_format=apply_sft_format,
             inference_mode=inference_mode,
             system_prompt=system_prompt,
-            max_req_input_len=max_req_input_len,
         )
 
         return prepare
@@ -362,7 +358,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
         bos: bool = True,
         eos: bool = True,
         cropping: bool = True,
-        max_req_input_len: int = -1,
     ):
         """Tokenize text with <image> tags."""
         images_list, images_seq_mask, images_spatial_crop = [], [], []
@@ -435,12 +430,6 @@ class DeepseekVLV2Processor(ProcessorMixin):
 
         """process the last text split"""
         tokenized_sep = self.encode(text_splits[-1], bos=False, eos=False)
-        # deal with video, limit with request len
-        if max_req_input_len > -1:
-            if max_req_input_len < len(tokenized_sep) + len(tokenized_str) - 1:
-                rest = max_req_input_len - len(tokenized_sep) - 1 - 1024
-                tokenized_str = tokenized_str[:rest]
-                images_seq_mask = images_seq_mask[:rest]
         tokenized_str += tokenized_sep
         images_seq_mask += [False] * len(tokenized_sep)
 

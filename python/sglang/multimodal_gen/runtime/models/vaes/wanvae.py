@@ -17,6 +17,7 @@
 # limitations under the License.
 
 import contextvars
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from functools import partial
 
@@ -1752,6 +1753,19 @@ class AutoencoderKLWan(ParallelTiledVAE):
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return should_run_spatial_shard_parallel_decode(self.config, z)
+
+    @property
+    def checkpoint_key_filter(self) -> Callable[[str], bool] | None:
+        # Both quant convolutions are constructed even for a partial VAE.
+        skipped = tuple(
+            prefix
+            for prefix, enabled in (
+                ("encoder.", self.config.load_encoder),
+                ("decoder.", self.config.load_decoder),
+            )
+            if not enabled
+        )
+        return (lambda name: not name.startswith(skipped)) if skipped else None
 
     def clear_cache(self) -> None:
 
