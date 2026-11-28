@@ -736,7 +736,7 @@ fn has_tools_or_media(message: &Value) -> bool {
     let media = |part: &Value| {
         matches!(
             part["type"].as_str(),
-            Some("image_url" | "video_url" | "audio_url" | "input_audio")
+            Some("image_url" | "input_image" | "video_url" | "audio_url" | "input_audio")
         )
     };
     message.get("tools").is_some_and(truthy)
@@ -1575,6 +1575,13 @@ mod tests {
         )
         .err()
         .map(|reason| reason.0)
+    }
+
+    #[test]
+    fn input_image_needs_the_multimodal_worker() {
+        let messages =
+            json!([{"role":"user","content":[{"type":"input_image","image_url":"image.png"}]}]);
+        assert_eq!(unsupported(messages), Some("unsupported_chat_feature"));
     }
 
     #[test]
