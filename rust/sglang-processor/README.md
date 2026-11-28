@@ -216,8 +216,14 @@ needs no `parser` feature. `tests/reasoning_parity.rs` and the test in
 `tool_call/models/<model>.rs` and its names in that `models/mod.rs`. A detector
 that overrides the base splitting, as Kimi-K3's does, is its own `ThinkConfig`
 variant. Tool detectors get the request's tools: Qwen3-Coder's types argument
-values by their schemas. Kimi-K3's `auto` tool-call structural tag is in `openai/kimi_k3_tag.rs`;
-`tests/fixtures/openai_parity/kimi-k3.json` checks it byte for byte.
+values by their schemas. Kimi-K3's tool-call structural tags, for `auto`, for a
+`required` or named `tool_choice` over non-strict tools, and for `none` over
+declared tools, are in `openai/kimi_k3_tag.rs`;
+`tests/fixtures/openai_parity/kimi-k3.json` checks them byte for byte. The
+lowered chat path serves a forced `tool_choice` only for the `kimi_k3` tool
+parser: for the others it is `Unsupported`. The tags assume the engine's
+default `SGLANG_TOOL_STRICT_LEVEL`: the strict levels change Python's K3
+grammars, and `/server_info` does not report that environment variable.
 
 Pass-through for parsing:
 - Other reasoning parsers go through
