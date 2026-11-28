@@ -30,6 +30,7 @@ from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
+    get_lora,
     get_model,
     get_parallel,
     get_platform,
@@ -45,6 +46,9 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +325,88 @@ def attach_flashinfer_managed_autotune_cache(model_runner: ModelRunner) -> None:
         pass
 
 
+def uses_flashinfer_capture_replay(runner: DecodeCudaGraphRunner) -> bool:
+    """Whether this runner's decode capture must be served entirely by the store."""
+    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+        FullCudaGraphBackend,
+    )
+
+    mr = runner.model_runner
+    # Draft runners subclass the decode runner without its full field set, so they
+    # are ruled out before any runner field is read.
+    # FlashInfer's strict replay is single-rank only: on a miss one rank would tune
+    # while the others capture. Checked here, not inherited from the store's scope.
+    # Foundry captures or restores each shape itself; a restored graph looks nothing up.
+    return (
+        not mr.is_draft_worker
+        and get_parallel().max_world_size == 1
+        and uses_flashinfer_managed_autotune_cache()
+        and not get_foundry_adapter().enabled
+        and isinstance(runner.backend, FullCudaGraphBackend)
+        and runner.capture_forward_mode == ForwardMode.DECODE
+        and not runner.enable_torch_compile
+        and not get_exec().overlap.enable_two_batch_overlap
+        and not get_lora().enable_lora
+        and should_run_flashinfer_autotune(mr)
+    )
+
+
+def capture_with_flashinfer_replay(
+    runner: DecodeCudaGraphRunner,
+    capture: Callable[[], None],
+    forward_fn: Callable[[], object],
+    post_warmup_hook: Optional[Callable[[], None]],
+) -> None:
+    """Capture one decode shape from stored tactics, tuning any it lacks first."""
+    if not uses_flashinfer_capture_replay(runner):
+        capture()
+        return
+    from flashinfer import autotune_v2
+
+    # The process's own store, selected for these contexts only.
+    store = dict(
+        cache_root=flashinfer_managed_autotune_cache_root(),
+        cache_scope="context",
+        skip_ops=get_flashinfer_autotune_skip_ops(),
+    )
+    miss = _capture_strictly(autotune_v2, store, capture)
+    if miss is None:
+        return
+    logger.info("FlashInfer autotune: %s; tuning this decode shape.", miss)
+    # The miss raised in an eager warmup or in capture, neither of which kept a graph.
+    try:
+        with autotune_v2(mode="tune", **store):
+            forward_fn()
+    finally:
+        if post_warmup_hook is not None:
+            post_warmup_hook()
+    miss = _capture_strictly(autotune_v2, store, capture)
+    if miss is None:
+        return
+    # A bug, not an expected state; capture as without this check rather than fail.
+    logger.warning(
+        "FlashInfer autotune: %s even after tuning this decode shape; "
+        "capturing it with the default tactic.",
+        miss,
+    )
+    capture()
+
+
+def _capture_strictly(
+    autotune_v2, store: dict, capture: Callable[[], None]
+) -> Optional[RuntimeError]:
+    """Capture under strict replay; return FlashInfer's miss error instead of raising it."""
+    report = None
+    try:
+        with autotune_v2(mode="replay", strict_replay=True, **store) as report:
+            capture()
+    except RuntimeError as exc:
+        if report is None or not report.misses:
+            raise
+        return exc
+    return None
+
+
 def _autotune_tactic_sync_group(
     tp_group: GroupCoordinator,
 ) -> Optional[torch.distributed.ProcessGroup]:
@@ -580,19 +666,20 @@ def maybe_flashinfer_autotune_extend(
 ) -> None:
     """Also autotune kernels at the prefill token ceiling.
 
-    The decode-shaped autotune only covers token counts up to the decode
-    batch size, so larger prefill/extend batches fall outside the tuned
-    buckets and run flashinfer's default heuristic — which can be far
-    slower than the tuned tactic (e.g. trtllm-gen fp4 MoE is ~30% slower
-    untuned at >=8k tokens on sm100). One extra forward at the largest
-    per-rank extend token count tunes all buckets up to it.
+    The decode-shaped autotune only covers token counts up to
+    ``decode_num_tokens`` (decode or speculative verify rows), so larger
+    prefill/extend batches fall outside the tuned buckets and run flashinfer's
+    default heuristic — which can be far slower than the tuned tactic (e.g.
+    trtllm-gen fp4 MoE is ~30% slower untuned at >=8k tokens on sm100). One
+    extra forward at the largest per-rank extend token count tunes all buckets
+    up to it. A model-owned ``autotune_prefill_kernels`` hook instead receives
+    the larger of the prefill ceiling and ``decode_num_tokens``, so it also
+    covers the widest verify-row bucket.
     """
     mr = runner.model_runner
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
     # when chunked prefill is disabled.
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
-    if num_tokens <= (decode_num_tokens or 0):
-        return  # decode-shaped autotune already covered these buckets
     # DSpark's dummy forward is TARGET_VERIFY-shaped and misses large prefill GEMMs.
     prefill_autotune = getattr(mr.model, "autotune_prefill_kernels", None)
     wants_prefill_autotune = getattr(mr.model, "wants_prefill_autotune", None)
@@ -602,10 +689,14 @@ def maybe_flashinfer_autotune_extend(
         prefill_autotune = None
     if prefill_autotune is not None and mr.is_generation and not mr.is_draft_worker:
         with flashinfer_autotune_context(mr, run_lm_head=False):
-            tuned = prefill_autotune(num_tokens, dtype=mr.dtype)
+            tuned = prefill_autotune(
+                max(num_tokens, decode_num_tokens or 0), dtype=mr.dtype
+            )
         if tuned:
             return
 
+    if num_tokens <= (decode_num_tokens or 0):
+        return  # decode-shaped autotune already covered these buckets
     if not envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND.get():
         return
     if not mr.is_generation or mr.is_draft_worker:

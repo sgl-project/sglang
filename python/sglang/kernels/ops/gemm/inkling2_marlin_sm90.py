@@ -42,6 +42,8 @@ from sglang.srt.layers.quantization.utils import get_scalar_types
 _, _scalar_types = get_scalar_types()
 ROUTE_BLOCKS = 256
 GEMV_MAX_EXPERTS = 128
+# kTileK in marlin_gemv.cuh.
+GEMV_TILE_K = 16
 SWIGLU_BLOCK = 256
 
 
@@ -247,8 +249,25 @@ def uses_gemv(marlin, tokens, num_local):
     return num_local <= GEMV_MAX_EXPERTS and tokens <= (8 if nvfp4 else 2)
 
 
-def _gemv_config(tokens, width):
-    return (4, 4) if tokens <= 2 or width > 2304 else (1, 8)
+def _gemv_config(tokens, width, nvfp4=False, num_local=None):
+    if nvfp4 and tokens <= 2 and width in (1152, 2304):
+        # Tuned on H200 for the 2304-wide looped 27B experts (128 or 32 local).
+        if width == 1152:
+            splits, warps = 1, 12
+        elif num_local is not None and num_local <= 32:
+            splits, warps = 2, 12
+        else:
+            splits, warps = (2, 4) if tokens == 1 else (1, 8)
+    else:
+        splits, warps = (4, 4) if tokens <= 2 or width > 2304 else (1, 8)
+    # The kernel needs the K tiles to divide evenly over splits x warps.
+    k_tiles = width // GEMV_TILE_K
+    while k_tiles % (splits * warps):
+        if splits > 1:
+            splits //= 2
+        else:
+            warps //= 2
+    return splits, warps
 
 
 def gemv(xq, marlin, out_size, metadata, top_k, tokens, splits=None, warps=None):
@@ -260,7 +279,9 @@ def gemv(xq, marlin, out_size, metadata, top_k, tokens, splits=None, warps=None)
     rows, width = xq.shape
     out = torch.empty((rows * top_k, out_size), dtype=torch.bfloat16, device=xq.device)
     if splits is None:
-        splits, warps = _gemv_config(tokens, width)
+        splits, warps = _gemv_config(
+            tokens, width, global_scale is not None, counts.numel()
+        )
     if out_size % 64 or width % (16 * splits * warps):
         raise ValueError(
             f"Marlin MoE GEMV needs N % 64 == 0 and K % {16 * splits * warps} == 0,"

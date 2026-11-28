@@ -29,6 +29,7 @@ from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_processor
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     EncoderDispatchErrorReq,
     GenerateReqInput,
     TokenizedGenerateReqInput,
@@ -2335,6 +2336,11 @@ class MMReceiverBase(ABC):
                     waiting_req._fail_and_release(
                         recv_req.error_msg, recv_req.error_code
                     )
+                continue
+
+            if isinstance(recv_req, AbortReq):
+                self.abort_waiting_requests(recv_req)
+                new_recv_reqs.append(recv_req)
                 continue
 
             if (

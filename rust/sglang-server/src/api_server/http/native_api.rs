@@ -3629,6 +3629,65 @@ mod tests {
         assert_eq!(v["error"]["message"], "media decode failed");
     }
 
+    /// A request that ends with no output tokens (a `max_new_tokens: 0`
+    /// scoring read, or a scheduler abort before the first token) still
+    /// carries `output_ids`, empty, on every frame shape, as Python's output
+    /// dict does: the unary body, a cumulative and an incremental stream's
+    /// terminal frame, and a batch item's frame.
+    #[tokio::test]
+    async fn zero_token_finish_keeps_empty_output_ids() {
+        let zero = |rid: u64, finish_reason: serde_json::Value| {
+            ResponseItem::Done(ChunkEvent {
+                rid: Rid::from(rid.to_string()),
+                prompt_tokens: 5,
+                finish_reason: serde_json::from_value(finish_reason).unwrap(),
+                ..Default::default()
+            })
+        };
+        let length_zero = serde_json::json!({"type": "length", "length": 0});
+
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(zero(20, length_zero.clone())).await.unwrap();
+        let (mut call, timing) = timed_call(20, rx);
+        let (status, item) = drain_unary(&mut call, "20", timing).await;
+        assert_eq!(status, StatusCode::OK);
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["output_ids"], serde_json::json!([]));
+        assert_eq!(v["meta_info"]["completion_tokens"], 0);
+        assert_eq!(v["meta_info"]["finish_reason"]["length"], 0);
+
+        for (incremental, with_index) in [(false, false), (true, false), (false, true)] {
+            let (tx, rx) = mpsc::channel(8);
+            let stream = generation_event_stream(vec![timed_call(21, rx)], incremental, with_index);
+            futures::pin_mut!(stream);
+            tx.send(zero(21, length_zero.clone())).await.unwrap();
+            let v = parse(&stream.next().await.unwrap());
+            assert_eq!(
+                v["output_ids"],
+                serde_json::json!([]),
+                "{incremental} {with_index}"
+            );
+            assert_eq!(v["meta_info"]["finish_reason"]["length"], 0);
+            assert_eq!(stream.next().await.unwrap(), "[DONE]");
+        }
+
+        // An abort before any token ends the stream on a frame with no ids.
+        let abort = serde_json::json!({
+            "type": "abort",
+            "message": "aborted before the first token",
+            "status_code": 503,
+            "err_type": "ServiceUnavailable"
+        });
+        let (tx, rx) = mpsc::channel(8);
+        let stream = generation_event_stream(vec![timed_call(22, rx)], false, false);
+        futures::pin_mut!(stream);
+        tx.send(zero(22, abort.clone())).await.unwrap();
+        let v = parse(&stream.next().await.unwrap());
+        assert_eq!(v["output_ids"], serde_json::json!([]));
+        assert_eq!(v["meta_info"]["finish_reason"], abort);
+        assert_eq!(stream.next().await.unwrap(), "[DONE]");
+    }
+
     /// `incremental=true`: each frame carries this step's **delta** text/output_ids,
     /// but `meta_info.completion_tokens` stays cumulative (matching Python), and
     /// so does the cached-token split, which a scheduler abort does not carry.

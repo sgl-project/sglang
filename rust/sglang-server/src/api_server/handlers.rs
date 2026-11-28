@@ -22,6 +22,7 @@ pub(crate) use corpus::CorpusSource;
 pub use generate::{AbortEnding, Aborted};
 pub(crate) use generate::{CoreCall, PendingGeneration, recv_indexed};
 pub(crate) use handle::{CoreConfig, CoreHandle, CoreMetadata, GRACEFUL_CLOSE_TIMEOUT};
+pub(crate) use health::{VlmWarmup, VlmWarmupPrompt};
 pub(crate) use hicache::{ADMIN_KEY_MISSING, HiCacheError, HiCacheManager};
 pub(crate) use info::ElasticEpState;
 pub(crate) use parsers::{ToolSpec, parse_function_call, separate_reasoning};

@@ -191,12 +191,12 @@ def attn_tp_size_of(cfg: Any):
 def attn_dp_enabled_of(cfg: Any) -> bool:
     """`attn_dp_enabled`, computed at publish.
 
-    A scale joiner's own group can be one rank wide, but it joins an
+    An offset joiner's own group can be one rank wide, but it joins an
     attention-DP deployment and runs its DP-attention paths.
     """
-    from sglang.srt.arg_groups.model_override_base import ep_scale_joiner_of
+    from sglang.srt.arg_groups.model_override_base import ep_offset_joiner_of
 
-    return cfg.attn_dp_size > 1 or ep_scale_joiner_of(cfg)
+    return cfg.attn_dp_size > 1 or ep_offset_joiner_of(cfg)
 
 
 def num_dp_ranks_of(cfg: Any) -> int:
@@ -527,7 +527,7 @@ def is_control_broadcast_local() -> bool:
     parallel = get_parallel()
     return parallel.attn_dp_enabled and (
         parallel.enable_dp_attention_local_control_broadcast
-        or get_exec().moe.is_ep_scale_joiner
+        or get_exec().moe.is_ep_offset_joiner
     )
 
 
@@ -626,9 +626,12 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
-    # Set during prefill-graph capture by breaks that capture graphs of their own
-    # behind TP-group barriers; every DP rank must then take the same path.
-    prefill_graph_has_rank_barrier: bool = False
+    # Set during prefill-graph capture, for the shape being captured, by breaks
+    # that capture graphs of their own behind TP-group barriers.
+    prefill_graph_shape_has_rank_barrier: bool = False
+    # Set while every DP rank's prefill graph reaches those breaks this step,
+    # the only time they may capture: a rank that skips them never arrives.
+    every_rank_reaches_rank_barrier: bool = False
     # This process's slot in the target's DP sync while a draft scope narrows
     # attention; dp_gather_width() also reads it as the in-scope marker.
     scoped_gather_slot: Optional[int] = None
@@ -735,6 +738,13 @@ class ForwardFlags:
         "attn_tp_sequence_sharded": False,
         # Physical token rows in TP rank order for the current Ascend MoE call.
         "ascend_allgather_row_sizes": None,
+        # The batch of the current model forward, published by ModelRunner so
+        # the EP dispatcher can derive an Ascend allgather row layout lazily.
+        "forward_batch": None,
+        # Whether the FFN stage's MoE input is a contiguous attention-TP slice
+        # of the DP shard (True) or the gathered full shard on every rank
+        # (False). None means the stage did not declare it.
+        "moe_input_attn_tp_sliced": None,
     }
 
     # Read/written inside compiled graphs (vocab embedding, layer boundaries,

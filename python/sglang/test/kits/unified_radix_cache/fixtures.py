@@ -163,7 +163,7 @@ def build_fixture(
             size=cfg.max_num_reqs,
             mamba_size=cfg.mamba_cache_size,
             mamba_spec_state_size=cfg.max_num_reqs,
-            max_context_len=cfg.max_context_len,
+            row_width=cfg.max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
@@ -176,7 +176,7 @@ def build_fixture(
     else:
         req_to_token_pool = ReqToTokenPool(
             size=cfg.max_num_reqs,
-            max_context_len=cfg.max_context_len,
+            row_width=cfg.max_context_len,
             device=device,
             enable_memory_saver=False,
         )

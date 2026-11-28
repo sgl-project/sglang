@@ -60,6 +60,7 @@ def worker(rank, path):
             pp_size=2, pp_rank=rank, world_group=NS(cpu_group=dist.group.WORLD)
         ),
         get_schedule().override(
+            page_size=4,
             max_running_requests=128,
             mamba_full_memory_ratio=1 / 9,
             disable_overlap_schedule=False,
@@ -147,11 +148,16 @@ def _small_configurator(rank, state_counts=(6, 9)):
 
 
 def _build_storage(cfg):
+    import msgspec
+
     from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 
     return build_kv_storage(
         cfg._unified_plan,
-        cfg._unified_sized,
+        # The table's rows carry four columns of headroom past the context.
+        msgspec.structs.replace(
+            cfg._unified_sized, req_to_token_row_width=cfg.model_config.context_len + 4
+        ),
         UnifiedBuildContext(
             device="cpu",
             start_layer=0,
@@ -161,8 +167,6 @@ def _build_storage(cfg):
             need_sort=False,
             head_num=1,
             head_dim=8,
-            model_context_len=cfg.model_config.context_len,
-            req_to_token_headroom=4,
             state_cache_params=NS(layers=cfg._unified_plan.sub_pool("mamba").layer_ids),
         ),
     )

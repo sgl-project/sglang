@@ -1764,7 +1764,7 @@
                 "48": 74.04,
                 "49": 72.62
             },
-            "expected_e2e_ms": 4435.63,
+            "expected_e2e_ms": 4265.34,
             "expected_avg_denoise_ms": 73.51,
             "expected_median_denoise_ms": 74.05,
             "load_peak_vram_mb": 15292.0,
@@ -2105,7 +2105,7 @@
                 "TimestepPreparationStage": 28.98,
                 "LatentPreparationStage": 0.13,
                 "DenoisingStage": 5229.75,
-                "DecodingStage": 2888.31,
+                "DecodingStage": 5580.63,
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
@@ -2116,7 +2116,7 @@
                 "4": 1011.33,
                 "5": 1011.9
             },
-            "expected_e2e_ms": 9123.68,
+            "expected_e2e_ms": 11837.62,
             "expected_avg_denoise_ms": 871.39,
             "expected_median_denoise_ms": 1010.9,
             "load_peak_vram_mb": 40050.0,
@@ -2464,8 +2464,8 @@
             "expected_median_denoise_ms": 467.69,
             "load_peak_vram_mb": 31246.0,
             "runtime_peak_vram_mb": 37788.0,
-            "load_peak_allocated_mb": 29869.0,
-            "runtime_peak_allocated_mb": 33843.0,
+            "load_peak_allocated_mb": 33307.0,
+            "runtime_peak_allocated_mb": 36430.0,
             "estimated_full_test_time_s": 90.0
         },
         "wan2_2_t2v_a14b_lora_2gpu": {
@@ -3481,6 +3481,44 @@
             "runtime_peak_allocated_mb": 57274.0,
             "estimated_full_test_time_s": 60
         },
+        "lingbot_video_moe_ti2v": {
+            "stages_ms": {
+                "InputValidationStage": 60.5,
+                "LingBotVideoImageConditioningStage": 325.14,
+                "LingBotVideoTextEncodingStage": 1196.96,
+                "LatentPreparationStage": 0.26,
+                "TimestepPreparationStage": 1.82,
+                "LingBotVideoDenoisingStage": 3815.02,
+                "DecodingStage": 246.69,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 262.18,
+                "1": 215.11,
+                "2": 214.52,
+                "3": 215.54,
+                "4": 213.82,
+                "5": 215.08,
+                "6": 214.74,
+                "7": 217.05,
+                "8": 212.92,
+                "9": 213.22,
+                "10": 213.48,
+                "11": 210.29
+            },
+            "expected_e2e_ms": 5854.3,
+            "expected_load_ms": 39659.69,
+            "expected_avg_denoise_ms": 218.16,
+            "expected_median_denoise_ms": 214.63,
+            "load_peak_vram_mb": 136.0,
+            "runtime_peak_vram_mb": 66752.0,
+            "warmup_peak_vram_mb": 6300.0,
+            "load_peak_allocated_mb": 113.49,
+            "runtime_peak_allocated_mb": 66470.65,
+            "load_peak_host_anon_mb": 47248.48,
+            "runtime_peak_host_anon_mb": 47248.48,
+            "estimated_full_test_time_s": 127.8
+        },
         "lingbot_video_moe_t2v": {
             "expected_load_ms": 25467.49,
             "stages_ms": {
@@ -3696,7 +3734,7 @@
             "expected_load_ms": 34366.19,
             "stages_ms": {},
             "denoise_step_ms": {},
-            "expected_e2e_ms": 1077.99,
+            "expected_e2e_ms": 702.01,
             "expected_avg_denoise_ms": 0.0,
             "expected_median_denoise_ms": 0.0,
             "estimated_full_test_time_s": 50.0
@@ -3758,7 +3796,7 @@
             "expected_median_denoise_ms": 2332.99,
             "load_peak_vram_mb": 45428.0,
             "runtime_peak_vram_mb": 63312.0,
-            "load_peak_allocated_mb": 3330.01,
+            "load_peak_allocated_mb": 3486.25,
             "runtime_peak_allocated_mb": 18182.98,
             "estimated_full_test_time_s": 150.0
         },
@@ -4089,6 +4127,59 @@
             "runtime_peak_allocated_mb": 48227.33,
             "estimated_full_test_time_s": 80,
             "warmup_peak_vram_mb": 50028.0
+        },
+        "magi2_preview_t2va_ep4_4gpu_h100": {
+            "stages_ms": {
+                "Magi2InputStage": 0.02,
+                "Magi2ImageEncodingStage": 0.01,
+                "Magi2TextEncodingStage": 13535.15,
+                "Magi2LatentPreparationStage": 0.14,
+                "Magi2TimestepPreparationStage": 3.36,
+                "Magi2PackingStage": 2.66,
+                "Magi2DenoisingStage": 21068.27,
+                "Magi2DecodingStage": 3375.09,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 41379.15,
+            "expected_load_ms": 120694.54,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "load_peak_vram_mb": 65878.0,
+            "runtime_peak_vram_mb": 77862.0,
+            "warmup_peak_vram_mb": 64134.0,
+            "load_peak_allocated_mb": 65129.63,
+            "runtime_peak_allocated_mb": 76677.74,
+            "load_peak_host_anon_mb": 2895.4,
+            "runtime_peak_host_anon_mb": 2895.4,
+            "estimated_full_test_time_s": 268.0
+        },
+        "magi2_two_stage_t2va_ep4_4gpu_h100": {
+            "stages_ms": {
+                "Magi2InputStage": 0.02,
+                "Magi2ImageEncodingStage": 0.01,
+                "Magi2TextEncodingStage": null,
+                "Magi2LatentPreparationStage": null,
+                "Magi2TimestepPreparationStage": null,
+                "Magi2PackingStage": null,
+                "Magi2DenoisingStage": null,
+                "Magi2StageHandoffStage": null,
+                "Magi2DecodingStage": null,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {},
+            "expected_e2e_ms": 117481.68,
+            "expected_load_ms": null,
+            "expected_avg_denoise_ms": 0.0,
+            "expected_median_denoise_ms": 0.0,
+            "load_peak_vram_mb": null,
+            "runtime_peak_vram_mb": 63186.0,
+            "warmup_peak_vram_mb": null,
+            "load_peak_allocated_mb": null,
+            "runtime_peak_allocated_mb": null,
+            "load_peak_host_anon_mb": null,
+            "runtime_peak_host_anon_mb": null,
+            "estimated_full_test_time_s": 420.0
         }
     }
 }

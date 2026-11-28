@@ -95,6 +95,7 @@ from sglang.srt.disaggregation.utils import (
     state_indices_per_entry,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
@@ -244,7 +245,7 @@ class DecodeReqToTokenPool:
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         pre_alloc_size: int,
@@ -256,12 +257,11 @@ class DecodeReqToTokenPool:
         self.size = size
         # +1 padding row at index 0; see ReqToTokenPool for rationale.
         self._alloc_size = size + pre_alloc_size + 1
-        self.max_context_len = max_context_len
         self.device = device
         self.pre_alloc_size = pre_alloc_size
         with memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len),
+                (self._alloc_size, row_width),
                 dtype=torch.int32,
                 device=device,
             )
@@ -272,6 +272,11 @@ class DecodeReqToTokenPool:
         # inheriting ReqToTokenPool.alloc, which bumps it.
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
+
+    @property
+    def row_width(self) -> int:
+        """See ReqToTokenPool.row_width."""
+        return self.req_to_token.shape[1]
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -334,7 +339,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         cache_params: Mamba2CacheParams,
@@ -355,11 +360,12 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        max_verify_batch_size: Optional[int] = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
             size=size,
-            max_context_len=max_context_len,
+            row_width=row_width,
             device=device,
             enable_memory_saver=enable_memory_saver,
             pre_alloc_size=pre_alloc_size,
@@ -394,9 +400,16 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         else:
             effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
+        # In-transfer reqs never verify, so the scratch only needs padded verify rows;
+        # ReplaySSM-spec rings and PP-spec stable rows index it by req_pool_idx.
+        mamba_spec_state_size = (
+            size if max_verify_batch_size is None else max_verify_batch_size
+        )
+        if enable_linear_replayssm_spec or pp_spec_stable_rows_enabled():
+            mamba_spec_state_size = max(mamba_spec_state_size, size + pre_alloc_size)
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
-            mamba_spec_state_size=size + pre_alloc_size,
+            mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
@@ -4270,6 +4283,9 @@ class SchedulerDisaggregationDecodeMixin:
             batch.seq_lens.record_stream(self.forward_stream)
         else:
             batch.process_prebuilt(self.future_map)
+        if self.spec_algorithm.is_ngram() and self.draft_worker is not None:
+            # No extend ran here, so the decode corpus has none of the prompt yet.
+            self.draft_worker.insert_prompt_tails(batch)
         return batch
 
     def _nonblocking_admit_in_scope(self: Scheduler, batch: ScheduleBatch) -> bool:
@@ -4462,10 +4478,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        self.sampler_params_pool.write(new_batch.reqs)
         # Replays the prefill node's output token into the penalty history.
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
+        self.sampling_params_pool.write(new_batch.reqs)
         return new_batch
 
     def _start_host_restores(self: Scheduler) -> None:
