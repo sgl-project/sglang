@@ -1174,7 +1174,8 @@ def act_and_mul_kernel(
     OutDtype = down_input.dtype.element_ty
 
     half_hidden_size = hidden_size // 2
-    pid = tl.program_id(0)
+    # Row offsets can exceed int32 in long-context MoE prefill.
+    pid = tl.program_id(0).to(tl.int64)
 
     if HAS_EXPERT_FILTER:
         expert_id = tl.load(expert_ids_ptr + pid // expert_step)
