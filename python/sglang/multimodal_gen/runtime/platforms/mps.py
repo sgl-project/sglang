@@ -18,6 +18,23 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _recommended_working_set_size() -> int:
+    """Return Metal's recommended GPU working-set limit in bytes."""
+    getter = getattr(torch.mps, "recommended_max_memory", None)
+    if not callable(getter):
+        raise RuntimeError(
+            "The SGLang MPS diffusion platform requires "
+            "torch.mps.recommended_max_memory()"
+        )
+    total = int(getter())
+    if total <= 0:
+        raise RuntimeError(
+            "torch.mps.recommended_max_memory() returned a non-positive Metal "
+            "working-set limit; refusing to size GPU memory from raw system RAM"
+        )
+    return total
+
+
 class MpsPlatform(Platform):
     _enum = PlatformEnum.MPS
     device_name: str = "mps"
@@ -53,14 +70,15 @@ class MpsPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-
-        return psutil.virtual_memory().total
+        # Metal's working-set limit, not total system RAM, bounds GPU residency.
+        return _recommended_working_set_size()
 
     @classmethod
     def get_current_memory_usage(
         cls, device: torch.types.Device | None = None
     ) -> float:
-        return 0.0
+        # Driver allocation includes resident cached MPS buffers.
+        return float(torch.mps.driver_allocated_memory())
 
     @classmethod
     def get_available_gpu_memory(
@@ -70,12 +88,15 @@ class MpsPlatform(Platform):
         empty_cache: bool = True,
         cpu_group: Any = None,
     ) -> float:
-
         if empty_cache:
             torch.mps.empty_cache()
 
-        # For MPS, available memory is essentially the system available memory
-        free_memory = psutil.virtual_memory().available
+        # Bound free memory by host RAM and Metal's remaining working-set headroom.
+        total_gpu_memory = _recommended_working_set_size()
+        metal_headroom = max(
+            0, total_gpu_memory - int(torch.mps.driver_allocated_memory())
+        )
+        free_memory = min(psutil.virtual_memory().available, metal_headroom)
 
         if distributed:
             import torch.distributed as dist
