@@ -1,3 +1,5 @@
+import gc
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -6,6 +8,16 @@ import torch
 
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import (
     FullXPUGraphBackend,
+)
+from sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch import (
+    _ACTIVE_GRAPH_FINALIZERS,
+    _GRAPH_SCRATCHPAD_STATE,
+    patch_sgl_kernel_scratchpad_buffers,
+    register_graph_scratchpad_owner,
+    reset_sgl_kernel_graph_scratchpads,
+    safe_get_gdn_workspace,
+    safe_get_moe_ws,
+    unregister_graph_scratchpad_owner,
 )
 from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
@@ -263,6 +275,321 @@ class TestXPUGraphMetadata(CustomTestCase):
                     ),
                 ):
                     PrefillCudaGraphRunner(_FakeModelRunner())
+
+    def test_sgl_kernel_scratchpad_custom_op_schema(self):
+        """Verify that scratchpad custom ops are registered with symbolic SymInt schemas."""
+        patch_sgl_kernel_scratchpad_buffers()
+        self.assertIn("SymInt[]", str(torch.ops.sgl_xpu.get_moe_ws_op.default._schema))
+        self.assertIn(
+            "SymInt nbytes", str(torch.ops.sgl_xpu.get_gdn_ws_op.default._schema)
+        )
+
+    def test_sgl_kernel_scratchpad_owner_refcount_and_gc(self):
+        """Verify multi-instance owner reference counting, idempotent unregister, and GC cleanup."""
+        gc.collect()
+        saved_finalizers = dict(_ACTIVE_GRAPH_FINALIZERS)
+        _ACTIVE_GRAPH_FINALIZERS.clear()
+        reset_sgl_kernel_graph_scratchpads()
+
+        def _restore():
+            reset_sgl_kernel_graph_scratchpads()
+            _ACTIVE_GRAPH_FINALIZERS.clear()
+            _ACTIVE_GRAPH_FINALIZERS.update(saved_finalizers)
+
+        self.addCleanup(_restore)
+
+        class DummyOwner:
+            pass
+
+        owner1 = DummyOwner()
+        owner2 = DummyOwner()
+        register_graph_scratchpad_owner(owner1)
+        register_graph_scratchpad_owner(owner2)
+        self.assertIn(id(owner1), _ACTIVE_GRAPH_FINALIZERS)
+        self.assertIn(id(owner2), _ACTIVE_GRAPH_FINALIZERS)
+
+        # Populate dummy cache
+        _GRAPH_SCRATCHPAD_STATE["moe_cache"]["test_key"] = torch.empty(1)
+
+        # Discarding one owner does NOT clear containers
+        unregister_graph_scratchpad_owner(owner1)
+        self.assertNotIn(id(owner1), _ACTIVE_GRAPH_FINALIZERS)
+        self.assertIn(id(owner2), _ACTIVE_GRAPH_FINALIZERS)
+        self.assertEqual(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 1)
+
+        # Idempotent unregister on already-unregistered owner is a no-op
+        unregister_graph_scratchpad_owner(owner1)
+        self.assertEqual(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 1)
+
+        # Discarding all owners triggers reset
+        unregister_graph_scratchpad_owner(owner2)
+        self.assertEqual(len(_ACTIVE_GRAPH_FINALIZERS), 0)
+        self.assertTrue(all(len(c) == 0 for c in _GRAPH_SCRATCHPAD_STATE.values()))
+
+        # Idempotent unregister on empty finalizers does not falsely crash or reset non-empty cache
+        _GRAPH_SCRATCHPAD_STATE["moe_cache"]["test_key2"] = torch.empty(1)
+        unregister_graph_scratchpad_owner(owner2)
+        unregister_graph_scratchpad_owner(DummyOwner())
+        self.assertEqual(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 1)
+        _GRAPH_SCRATCHPAD_STATE["moe_cache"].clear()
+
+        # Implicit GC of last owner (without explicit unregister) also triggers reset
+        owner3 = DummyOwner()
+        register_graph_scratchpad_owner(owner3)
+        _GRAPH_SCRATCHPAD_STATE["moe_cache"]["test_key3"] = torch.empty(1)
+        self.assertGreater(len(_GRAPH_SCRATCHPAD_STATE["moe_cache"]), 0)
+        del owner3
+        gc.collect()
+        self.assertEqual(len(_ACTIVE_GRAPH_FINALIZERS), 0)
+        self.assertTrue(all(len(c) == 0 for c in _GRAPH_SCRATCHPAD_STATE.values()))
+
+    def test_sgl_kernel_scratchpad_dual_compatibility_and_recursion_guard(self):
+        """Verify dual compatibility bypass when _XPU_GRAPH_SAFE=True and self-patch recursion guard."""
+        import sglang.srt.hardware_backend.xpu.xpu_scratchpad_patch as xpu_sp_patch
+
+        def orig_moe_fn(*a, **kw):
+            return None
+
+        def orig_gdn_fn(*a, **kw):
+            return None
+
+        mock_moe = SimpleNamespace(
+            _XPU_GRAPH_SAFE=True,
+            _get_moe_ws=orig_moe_fn,
+        )
+        mock_gdn = SimpleNamespace(
+            _XPU_GRAPH_SAFE=False,
+            _get_gdn_workspace=orig_gdn_fn,
+        )
+        mock_pkg = SimpleNamespace(moe=mock_moe, gdn_attn=mock_gdn)
+        saved_orig_moe = xpu_sp_patch._orig_moe_ws
+        saved_orig_gdn = xpu_sp_patch._orig_gdn_ws
+
+        try:
+            with patch.dict(
+                sys.modules,
+                {
+                    "sgl_kernel": mock_pkg,
+                    "sgl_kernel.moe": mock_moe,
+                    "sgl_kernel.gdn_attn": mock_gdn,
+                },
+            ):
+                patch_sgl_kernel_scratchpad_buffers()
+                # _XPU_GRAPH_SAFE=True on moe leaves it untouched without blocking gdn
+                self.assertIs(mock_moe._get_moe_ws, orig_moe_fn)
+                self.assertFalse(getattr(mock_moe, "_xpu_graph_safe_ws_patched", False))
+                self.assertIs(mock_gdn._get_gdn_workspace, safe_get_gdn_workspace)
+                self.assertTrue(getattr(mock_gdn, "_xpu_graph_safe_ws_patched", False))
+
+                # Self-patch guard: resetting _xpu_graph_safe_ws_patched must not bind
+                # _orig_gdn_ws to safe_get_gdn_workspace
+                mock_gdn._xpu_graph_safe_ws_patched = False
+                patch_sgl_kernel_scratchpad_buffers()
+                self.assertIs(xpu_sp_patch._orig_gdn_ws, orig_gdn_fn)
+                self.assertIsNot(xpu_sp_patch._orig_gdn_ws, safe_get_gdn_workspace)
+                self.assertIsNot(xpu_sp_patch._orig_moe_ws, safe_get_moe_ws)
+        finally:
+            xpu_sp_patch._orig_moe_ws = saved_orig_moe
+            xpu_sp_patch._orig_gdn_ws = saved_orig_gdn
+
+    def test_sgl_kernel_scratchpad_realloc_safety_under_graph(self):
+        """Verify that sgl_kernel internal scratchpad buffers (MoE and GDN)
+        are graph-safe, memory-efficient, and fully compatible under XPU Graph execution:
+        1. Capture state (stream capturing): all graphs and layers share a single
+           dedicated graph workspace buffer (reused via narrow slice).
+        2. Capture expansion (small -> large capture): retired buffers are retained
+           so earlier captured graph pointers remain valid.
+        3. GDN workspace coverage: small -> large capture retains retired GDN buffers.
+        4. Real GPU replay test: verifies that graph execution accurately reads and writes
+           tensors through the shared workspace and matches eager ground truth.
+        """
+        # Isolate active finalizer / scratchpad state from prior tests in this process.
+        gc.collect()
+        saved_finalizers = dict(_ACTIVE_GRAPH_FINALIZERS)
+        _ACTIVE_GRAPH_FINALIZERS.clear()
+        reset_sgl_kernel_graph_scratchpads()
+
+        def _restore_scratchpad_test_state():
+            reset_sgl_kernel_graph_scratchpads()
+            _ACTIVE_GRAPH_FINALIZERS.clear()
+            _ACTIVE_GRAPH_FINALIZERS.update(saved_finalizers)
+
+        self.addCleanup(_restore_scratchpad_test_state)
+        patch_sgl_kernel_scratchpad_buffers()
+
+        try:
+            import sgl_kernel.gdn_attn as sk_gdn
+            import sgl_kernel.moe as sk_moe
+        except ImportError:
+            self.skipTest("sgl_kernel not available")
+
+        if not torch.xpu.is_available():
+            self.skipTest("torch.xpu not available")
+
+        device = torch.device("xpu:0")
+        pool = torch.xpu.graph_pool_handle()
+
+        # 1. Under graph capture (large to small): all graphs share ONE workspace
+        if hasattr(sk_moe, "_get_moe_ws"):
+            g4 = torch.xpu.XPUGraph()
+            with torch.xpu.graph(g4, pool=pool):
+                buf_g4 = sk_moe._get_moe_ws(
+                    "test_shared_ws", (4, 128), torch.bfloat16, device
+                )
+
+            g1 = torch.xpu.XPUGraph()
+            with torch.xpu.graph(g1, pool=pool):
+                buf_g1 = sk_moe._get_moe_ws(
+                    "test_shared_ws", (1, 128), torch.bfloat16, device
+                )
+
+            # Both graphs must share the exact same underlying buffer pointer under our patch
+            if not getattr(sk_moe, "_XPU_GRAPH_SAFE", False):
+                self.assertEqual(buf_g4.data_ptr(), buf_g1.data_ptr())
+
+        # 2. Under graph capture (small to large): expansion retains retired buffer
+        if hasattr(sk_moe, "_get_moe_ws"):
+            g_expand_small = torch.xpu.XPUGraph()
+            with torch.xpu.graph(g_expand_small, pool=pool):
+                buf_small = sk_moe._get_moe_ws(
+                    "test_expand_ws", (1, 64), torch.bfloat16, device
+                )
+            ptr_small = buf_small.data_ptr()
+
+            g_expand_large = torch.xpu.XPUGraph()
+            with torch.xpu.graph(g_expand_large, pool=pool):
+                buf_large = sk_moe._get_moe_ws(
+                    "test_expand_ws", (16, 64), torch.bfloat16, device
+                )
+            ptr_large = buf_large.data_ptr()
+            if not getattr(sk_moe, "_XPU_GRAPH_SAFE", False):
+                self.assertNotEqual(ptr_small, ptr_large)
+                retired_moe = _GRAPH_SCRATCHPAD_STATE["moe_retired"]
+                self.assertTrue(any(b.data_ptr() == ptr_small for b in retired_moe))
+
+        # 3. GDN workspace expansion retains retired GDN buffers
+        if hasattr(sk_gdn, "_get_gdn_workspace"):
+            g_gdn1 = torch.xpu.XPUGraph()
+            with torch.xpu.graph(g_gdn1, pool=pool):
+                gdn_ws1 = sk_gdn._get_gdn_workspace(1024, device)
+            ptr_gdn1 = gdn_ws1.data_ptr()
+
+            g_gdn2 = torch.xpu.XPUGraph()
+            with torch.xpu.graph(g_gdn2, pool=pool):
+                gdn_ws2 = sk_gdn._get_gdn_workspace(8192, device)
+            ptr_gdn2 = gdn_ws2.data_ptr()
+            if not getattr(sk_gdn, "_XPU_GRAPH_SAFE", False):
+                self.assertNotEqual(ptr_gdn1, ptr_gdn2)
+                retired_gdn = _GRAPH_SCRATCHPAD_STATE["gdn_retired"]
+                self.assertTrue(any(b.data_ptr() == ptr_gdn1 for b in retired_gdn))
+
+        # 4. Real GPU execution & replay correctness under expansion + eager shock
+        from sgl_kernel import fused_experts
+
+        E, hidden, inter, topk = 8, 256, 512, 2
+        torch.manual_seed(42)
+
+        # Test M=1 input and ground truth
+        a_in1 = torch.randn((1, hidden), dtype=torch.bfloat16, device=device)
+        w1 = torch.randn((E, 2 * inter, hidden), dtype=torch.bfloat16, device=device)
+        w2 = torch.randn((E, hidden, inter), dtype=torch.bfloat16, device=device)
+        score1 = torch.softmax(
+            torch.randn((1, E), dtype=torch.float32, device=device), dim=-1
+        )
+        topk_w1, topk_i1 = torch.topk(score1, topk)
+        expected_out1 = fused_experts(a_in1, w1, w2, topk_w1, topk_i1.int()).clone()
+
+        # Capture M=1 small graph
+        replay_graph1 = torch.xpu.XPUGraph()
+        with torch.xpu.graph(replay_graph1, pool=pool):
+            graph_out1 = fused_experts(a_in1, w1, w2, topk_w1, topk_i1.int())
+
+        # Test M=16 input and ground truth (triggers capture expansion)
+        a_in16 = torch.randn((16, hidden), dtype=torch.bfloat16, device=device)
+        score16 = torch.softmax(
+            torch.randn((16, E), dtype=torch.float32, device=device), dim=-1
+        )
+        topk_w16, topk_i16 = torch.topk(score16, topk)
+        expected_out16 = fused_experts(a_in16, w1, w2, topk_w16, topk_i16.int()).clone()
+
+        # Capture M=16 expanded graph
+        replay_graph16 = torch.xpu.XPUGraph()
+        with torch.xpu.graph(replay_graph16, pool=pool):
+            graph_out16 = fused_experts(a_in16, w1, w2, topk_w16, topk_i16.int())
+
+        # Simulate large eager allocation (512 tokens)
+        a_eager = torch.randn((512, hidden), dtype=torch.bfloat16, device=device)
+        score_e = torch.softmax(
+            torch.randn((512, E), dtype=torch.float32, device=device), dim=-1
+        )
+        topk_we, topk_ie = torch.topk(score_e, topk)
+        fused_experts(a_eager, w1, w2, topk_we, topk_ie.int())
+
+        # Replay both graphs and assert numeric correctness
+        replay_graph1.replay()
+        torch.xpu.synchronize()
+        self.assertTrue(torch.allclose(graph_out1, expected_out1, atol=1e-2, rtol=1e-2))
+
+        replay_graph16.replay()
+        torch.xpu.synchronize()
+        self.assertTrue(
+            torch.allclose(graph_out16, expected_out16, atol=1e-2, rtol=1e-2)
+        )
+
+        # Verify dynamic torch.compile fullgraph execution with SymInt shapes
+        if (
+            hasattr(sk_moe, "_get_moe_ws")
+            and hasattr(sk_gdn, "_get_gdn_workspace")
+            and not getattr(sk_moe, "_XPU_GRAPH_SAFE", False)
+            and not getattr(sk_gdn, "_XPU_GRAPH_SAFE", False)
+        ):
+
+            def _compiled_ws_fn(x: torch.Tensor) -> int:
+                m = x.shape[0]
+                moe_ws = sk_moe._get_moe_ws(
+                    "test_dyn_ws", (m * 2, 16), x.dtype, x.device
+                )
+                gdn_ws = sk_gdn._get_gdn_workspace(m * 64, x.device)
+                return moe_ws.shape[0] + gdn_ws.shape[0]
+
+            compiled_ws = torch.compile(_compiled_ws_fn, dynamic=True, fullgraph=True)
+            self.assertEqual(
+                compiled_ws(torch.empty((4, 8), dtype=torch.bfloat16, device=device)),
+                4 * 2 + 4 * 64,
+            )
+            self.assertEqual(
+                compiled_ws(torch.empty((7, 8), dtype=torch.bfloat16, device=device)),
+                7 * 2 + 7 * 64,
+            )
+
+        # Verify torch.compile + XPUGraph joint capture & replay across 2 back-to-back layers
+        from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import (
+            register_fake_ops,
+        )
+        from sglang.srt.utils import register_xpu_device_properties_for_dynamo
+
+        register_fake_ops()
+        register_xpu_device_properties_for_dynamo()
+
+        def _two_layer_compiled_moe(x, w1_p, w2_p, tw, ti):
+            h = fused_experts(x, w1_p, w2_p, tw, ti)
+            return fused_experts(h, w1_p, w2_p, tw, ti)
+
+        compiled_two_layer = torch.compile(_two_layer_compiled_moe, dynamic=False)
+        expected_joint = compiled_two_layer(
+            a_in16, w1, w2, topk_w16, topk_i16.int()
+        ).clone()
+
+        joint_graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(joint_graph, pool=pool):
+            joint_out = compiled_two_layer(a_in16, w1, w2, topk_w16, topk_i16.int())
+
+        # Trigger large eager compiled run to ensure graph workspace stays isolated
+        compiled_two_layer(a_eager, w1, w2, topk_we, topk_ie.int())
+
+        joint_graph.replay()
+        torch.xpu.synchronize()
+        self.assertTrue(torch.allclose(joint_out, expected_joint, atol=1e-2, rtol=1e-2))
 
     def test_full_xpu_graph_backend_retains_capture_inputs_and_cleans_up(self):
         from contextlib import nullcontext
