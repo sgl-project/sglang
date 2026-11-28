@@ -3632,7 +3632,7 @@ class Scheduler(
             )
             return
 
-        if self.spec_algorithm.is_dflash_family():
+        if self.spec_algorithm.uses_block_verify():
             error_msg = validate_dflash_request(
                 req,
                 self.enable_overlap,

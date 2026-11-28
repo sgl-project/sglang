@@ -18,6 +18,7 @@ SGLang provides several speculative decoding options, including EAGLE-2/EAGLE-3,
 - [Multi Token Prediction](#multi-token-prediction)
 - [UNO decoding](#uno-decoding)
 - [DFlash Decoding](#dflash-decoding)
+- [DFly2 on GLM-5.3-Flash](#dfly2-on-glm-53-flash)
 - [Standalone Speculative Decoding (Small Draft Model)](#standalone-speculative-decoding-small-draft-model)
 - [Speculative Decoding V2 (Overlap Scheduler)](#speculative-decoding-v2-overlap-scheduler)
 - [Ngram Speculative Decoding](#ngram-speculative-decoding)
@@ -694,6 +695,28 @@ Both keys default to `0`, so a checkpoint whose config lost them builds no convo
 
 ---
 
+## DFly2 on GLM-5.3-Flash
+
+Use `--speculative-algorithm DFLY` with the [AngelSlim DFly2 B6 checkpoint](https://huggingface.co/AngelSlim/GLM-5.3-Flash-DFly2-B6). The draft reuses the target's paged KV latents and KPool4 selections. B6 proposes five candidates per verification round.
+
+The following example serves the NVFP4 target with a BF16 draft on two NVIDIA Blackwell GPUs.
+
+```bash
+sglang serve \
+    --model-path nv-community/GLM-5.3-Flash-NVFP4 \
+    --disable-multimodal \
+    --tp 2 --ep 2 \
+    --quantization modelopt_fp4 \
+    --kv-cache-dtype fp8_e4m3 \
+    --dsa-prefill-backend trtllm --dsa-decode-backend trtllm \
+    --speculative-algorithm DFLY \
+    --speculative-draft-model-path AngelSlim/GLM-5.3-Flash-DFly2-B6 \
+    --speculative-draft-model-quantization unquant \
+    --speculative-moe-runner-backend triton
+```
+
+DFly2 reads the verify width from the draft checkpoint. To use ReplaySSM for committing accepted KDA states, set `--enable-linear-replayssm-spec --linear-attn-decode-backend triton`.
+
 ## Standalone Speculative Decoding (Small Draft Model)
 
 Besides EAGLE/MTP, SGLang also supports **token-level speculative decoding** using a smaller **draft model**. Enable it with `--speculative-algorithm STANDALONE` and provide a draft model via `--speculative-draft-model-path`.
@@ -941,7 +964,7 @@ Below is a comprehensive list of all speculative decoding parameters available i
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-algorithm</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>str</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>UNO</code>, <code>DFLASH</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Algorithm to use: <code>UNO</code>, <code>DFLASH</code>, <code>DFLY</code>, <code>EAGLE</code>, <code>EAGLE3</code>, <code>STANDALONE</code>, <code>NGRAM</code>, <code>NEXTN</code> (alias of <code>EAGLE</code>)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--speculative-draft-model-path</code></td>

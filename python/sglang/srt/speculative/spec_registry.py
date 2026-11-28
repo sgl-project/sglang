@@ -91,6 +91,12 @@ class CustomSpecAlgo:
     def is_dflash_family(self) -> bool:
         return False
 
+    def is_dfly(self) -> bool:
+        return False
+
+    def uses_block_verify(self) -> bool:
+        return self.is_dflash_family()
+
     def is_standalone(self) -> bool:
         return False
 

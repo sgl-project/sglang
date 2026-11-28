@@ -521,10 +521,11 @@ def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
 
 def spec_need_hidden_states() -> bool:
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
-    # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
+    # DFLASH, DSPARK, DFLY and multi_layer_eagle don't relay hidden states
+    # through FutureMap.
     # TODO(lsyin): also skip when step == 1.
     spec = get_spec()
-    if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
+    if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK", "DFLY"):
         return False
     return not spec.enable_multi_layer_eagle
 
@@ -1483,7 +1484,7 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
             mamba_track_grid(batch.tree_cache.page_size),
             max_speculative_num_draft_tokens(),
         )
-    if batch.spec_algorithm.is_dflash_family():
+    if batch.spec_algorithm.uses_block_verify():
         batch.spec_info.prepare_for_decode(batch)
     elif batch.spec_algorithm.is_uno():
         from sglang.srt.speculative.uno_info import UnoDraftInput

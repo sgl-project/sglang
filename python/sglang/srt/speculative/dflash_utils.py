@@ -1249,13 +1249,22 @@ def build_speculative_verify_target_probs(
     return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
+def commit_accept(candidates, accept_len, bonus_tokens):
+    """Build the committed block: drafted tokens shifted left, with bonus at
+    the accept boundary. Returns ``(out_tokens, commit_lens)``."""
+    out_tokens = torch.empty_like(candidates, dtype=torch.int64)
+    out_tokens[:, :-1].copy_(candidates[:, 1:])
+    out_tokens[:, -1].fill_(0)
+    out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus_tokens[:, None])
+    return out_tokens, accept_len.to(torch.int32) + 1
+
+
 def validate_dflash_request(
     req: Req, enable_overlap: bool, bound_runtime: bool
 ) -> Optional[str]:
     """bound_runtime is the same on every rank, so every rank rejects alike."""
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-
     if bound_runtime and uses_penalty(req.sampling_params):
         return (
             "DFLASH speculative decoding with the megakernel decode runtime does "
