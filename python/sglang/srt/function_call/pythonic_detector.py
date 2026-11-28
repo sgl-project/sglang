@@ -237,6 +237,12 @@ class PythonicDetector(BaseFormatDetector):
             }
         elif isinstance(val, ast.List):
             return [self._get_parameter_value(v) for v in val.elts]
+        elif isinstance(val, ast.UnaryOp) and isinstance(val.op, (ast.USub, ast.UAdd)):
+            # Python parses -5 as USub applied to 5, not as a negative constant.
+            inner = self._get_parameter_value(val.operand)
+            if isinstance(inner, (int, float)) and not isinstance(inner, bool):
+                return -inner if isinstance(val.op, ast.USub) else inner
+            raise ValueError("Cannot apply a sign to a non-numeric value")
         else:
             raise ValueError("Tool call arguments must be literals")
 
