@@ -49,6 +49,7 @@ from sglang.srt.models.inkling_common.inkling2_moe import (
 from sglang.srt.models.inkling_common.inkling2_norm import RMSNorm
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
+from sglang.srt.multimodal.mm_utils import get_dp_encoder_lb_assignment
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -584,6 +585,60 @@ class Inkling2CausalLLM(nn.Module):
         return state
 
 
+def _encode_images_data_parallel(
+    *,
+    visual: nn.Module,
+    items: list[MultimodalDataItem],
+    grids: torch.Tensor,
+    hidden_size: int,
+    group,
+    device: torch.device,
+) -> torch.Tensor:
+    world_size, rank = group.world_size, group.rank_in_group
+    image_tokens = [int(h) * int(w) for _, h, w in grids.tolist()]
+    order, counts, load = get_dp_encoder_lb_assignment(
+        sizes=image_tokens, num_gpus=world_size
+    )
+    # Each rank's images, in the order it packs them into its gather shard.
+    shards = [order[sum(counts[:r]) : sum(counts[: r + 1])] for r in range(world_size)]
+    capacity = max(load)
+    local = torch.zeros((capacity, hidden_size), device=device, dtype=torch.bfloat16)
+    pixels = [
+        image
+        for item in items
+        for image in item.feature.split(
+            [
+                int(h) * int(w)
+                for _, h, w in item.model_specific_data["vision_grid_thw"].tolist()
+            ]
+        )
+    ]
+    row = 0
+    for i in shards[rank]:
+        # One image per forward keeps the per-image path's peak memory;
+        # a rank's whole share in one forward ran out of memory on MI300X.
+        out = visual(
+            pixels[i].to(device=device, dtype=torch.bfloat16), grids[i : i + 1]
+        )
+        if out.shape != (image_tokens[i], hidden_size):
+            raise ValueError("Vision encoder output does not match image token count")
+        local[row : row + out.shape[0]] = out
+        row += out.shape[0]
+    gathered = torch.empty(
+        (world_size * capacity, hidden_size), device=device, dtype=torch.bfloat16
+    )
+    group.all_gather_into_tensor(gathered, local)
+    start = [0] * len(image_tokens)
+    for r, shard in enumerate(shards):
+        offset = r * capacity
+        for i in shard:
+            start[i] = offset
+            offset += image_tokens[i]
+    return torch.cat(
+        [gathered[start[i] : start[i] + n] for i, n in enumerate(image_tokens)]
+    )
+
+
 class Inkling2ForConditionalGeneration(nn.Module):
     fall_back_to_pt_during_load = False
     allow_patterns_overrides = ["model*.safetensors"]
@@ -630,6 +685,11 @@ class Inkling2ForConditionalGeneration(nn.Module):
             self.visual = Inkling2VisionEncoder(
                 config.vision_config, config.text_config.hidden_size
             )
+        self.dp_vision_encode = (
+            self.visual is not None
+            and get_mm().mm_enable_dp_encoder
+            and get_parallel().attn_tp_group.world_size > 1
+        )
         self.mm_pattern = MultiModalityDataPaddingPatternMultimodalTokens()
 
     @property
@@ -659,6 +719,15 @@ class Inkling2ForConditionalGeneration(nn.Module):
         num_patches = int(grids.prod(dim=1).sum())
         group = get_parallel().attn_tp_group
         param = next(self.visual.parameters())
+        if self.dp_vision_encode:
+            return _encode_images_data_parallel(
+                visual=self.visual,
+                items=items,
+                grids=grids,
+                hidden_size=self.text_config.hidden_size,
+                group=group,
+                device=param.device,
+            )
         if group.rank_in_group == 0:
             patches = torch.cat([item.feature for item in items]).to(
                 device=param.device, dtype=torch.bfloat16

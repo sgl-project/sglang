@@ -351,6 +351,37 @@ def test_cross_request_image_batching_by_backend(monkeypatch, backend):
     encoder.assert_not_called()
 
 
+@pytest.mark.parametrize("dp_vision_encode", [True, False])
+def test_hip_batches_only_a_data_parallel_inkling2_encoder(
+    monkeypatch, dp_vision_encode
+):
+    """On HIP the cross-request batch reaches Inkling2 only when its encoder is data-parallel."""
+    monkeypatch.setattr(mm_schedule, "_is_hip", True)
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = _make_items()[:2]
+    calls = []
+
+    class Inkling2ForConditionalGeneration:
+        def __init__(self):
+            self.dp_vision_encode = dp_vision_encode
+
+        def get_image_feature(self, batch):
+            calls.append(batch)
+            return _encoder_tensor(batch)
+
+    embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+        Inkling2ForConditionalGeneration().get_image_feature,
+        items,
+        [0, 1, 2],
+        [0, 0],
+        [TOTAL_LEN, TOTAL_LEN],
+        [[item.offsets[0]] for item in items],
+        torch.zeros(2 * TOTAL_LEN, dtype=torch.long),
+    )
+    torch.testing.assert_close(embedding, _encoder_tensor(items), rtol=0, atol=0)
+    assert calls == ([items] if dp_vision_encode else [[item] for item in items])
+
+
 def test_full_mismatched_cache_entry_is_reencoded(caplog):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
