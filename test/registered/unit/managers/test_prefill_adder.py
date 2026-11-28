@@ -1381,7 +1381,7 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_token_allocator.available_size.return_value = 100000
         self.mock_tree_cache.supports_mamba.return_value = False
 
-        def admit(cap_tokens, align, prefix_len, retracted):
+        def admit(cap_tokens, align, prefix_len, session_turn):
             with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(cap_tokens):
                 cap = InputLogprobChunkCap.for_batch(4096)
             adder = self.create_adder(
@@ -1394,9 +1394,17 @@ class TestPrefillAdder(CustomTestCase):
                 prefix_len + 128, rid=f"lp_{cap_tokens}_{align}_{prefix_len}"
             )
             req.prefix_len = prefix_len
-            req.is_retracted = retracted
             req.return_logprob, req.logprob_start_len = True, prefix_len
             req.origin_input_ids = req.full_untruncated_fill_ids
+            if session_turn:
+                # A retracted streaming turn, set up for admission as the
+                # scheduler does it, before the cap sees it.
+                req.is_retracted = True
+                req.session = SimpleNamespace(streaming=True)
+                req.is_dllm.return_value = False
+                req.multimodal_inputs = None
+                req.positional_embed_overrides = None
+                Req.init_next_round_input(req)
             cap.add_one_req(
                 adder, req, has_chunked_req=False, truncation_align_size=align
             )
@@ -1422,7 +1430,8 @@ class TestPrefillAdder(CustomTestCase):
         #  first chunk admitted). With replay, a request is a 256-token prefix hit
         # under a radix cache; under a disabled one ("off") only a fresh prompt;
         # with streaming sessions on a disabled cache, a retracted turn that
-        # re-enters its 256-token session prefix.
+        # re-enters its 256-token session prefix: it returns no input logprobs,
+        # so the cap neither limits it nor reserves its replay.
         cases = (
             (False, None, False, "radix", 32, []),
             (False, None, False, "radix", 64, [64]),
@@ -1436,8 +1445,7 @@ class TestPrefillAdder(CustomTestCase):
             (False, None, True, "off", 32, []),
             (False, None, True, "off", 64, [64]),
             (True, None, True, "off", 1, [1]),
-            (False, None, True, "session", 128, []),
-            (False, None, True, "session", 192, [64]),
+            (False, None, True, "session", 64, [128]),
         )
         for exact, align, replay, cache, cap_tokens, admitted in cases:
             override = get_context().override_server_args(

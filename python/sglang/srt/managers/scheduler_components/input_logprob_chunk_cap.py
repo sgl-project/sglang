@@ -59,12 +59,19 @@ class InputLogprobChunkCap:
         hit's encoder replay rows (`PrefillAdder.max_replay_len`) also take chunk
         room ahead of its extend. A cap below the replay rows plus that step cuts
         an input-logprob prompt longer than the cap to zero tokens, and the
-        request would wait in the queue forever."""
+        request would wait in the queue forever.
+
+        A request the cap applies to finds a prefix only in a cache that shares
+        prefixes: a streaming-session turn, which can re-enter its prefix with
+        the cache disabled, returns no input logprobs (`Req.init_next_round_input`
+        sets its `logprob_start_len` to -1 before admission)."""
         cap = cls.for_batch(chunked_prefill_size).room
         align = truncation_align_size or 1
         if not exact_chunk_fill:
             align = math.lcm(page_size, align)
-        replay = PrefillAdder.max_replay_len(tree_cache)
+        replay = (
+            PrefillAdder.max_replay_len() if tree_cache.supports_prefix_sharing() else 0
+        )
         if cap is None or cap >= replay + align:
             return
         page_note = "" if exact_chunk_fill else f"page size {page_size}, "
