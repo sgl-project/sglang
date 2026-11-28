@@ -29,6 +29,7 @@ from .scoring import (
     dense_prefill_topk,
     get_deep_gemm_prefill_data,
     prefill_requests,
+    prefill_topk_indices,
     score_tiles,
     select_decode,
     select_prefill_block_ids,
@@ -304,8 +305,11 @@ class DenseBlocksBackend:
                         ),
                     )
                 )
-                idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
-                write_prefill(inputs, request, chunk, idx)
+                # The fused selection masks score columns in place, so the block ids
+                # above have to be taken first.
+                write_prefill(
+                    inputs, request, chunk, prefill_topk_indices(request, chunk)
+                )
         width = max((ids.shape[1] for _, ids in picked), default=0)
         blocks = torch.full(
             (inputs.positions.shape[0], width),
