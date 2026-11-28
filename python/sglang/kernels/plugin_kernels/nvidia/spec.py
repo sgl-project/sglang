@@ -21,10 +21,11 @@ import torch
 
 if TYPE_CHECKING:
     from sglang.srt.kernel_plugins.nvidia.binding import PreparationView
+    from sglang.srt.sampling.logit_bias import LogitBiasRows
     from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 
 # bumped on any breaking change to the contracts in this module
-MEGAKERNEL_API_VERSION = 3
+MEGAKERNEL_API_VERSION = 4
 
 # the sglang.srt.plugins entry point that registers the specs
 ENTRY_POINT = "nvidia_megakernel"
@@ -260,7 +261,7 @@ class VerifySamplingView(msgspec.Struct, frozen=True):
     top_ps: torch.Tensor
     min_ps: torch.Tensor
     step_penalties: Optional[VerifyPenaltiesView]
-    logit_bias: Optional[torch.Tensor]
+    logit_bias: Optional[LogitBiasRows]
     sampling_seed: Optional[torch.Tensor]
     is_all_greedy: bool
     need_top_k_sampling: bool

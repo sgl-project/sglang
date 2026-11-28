@@ -1,6 +1,7 @@
 """Each request's sampling state, one table entry per request slot, addressed by
 its `req_pool_idx`: its sampler params (temperature, top_p, top_k, min_p), its
-penalty index, its seed, and the watermark algorithm's per-request values.
+penalty index, its seed, where its logit_bias entries are, and the watermark
+algorithm's per-request values.
 
 - `write` fills a request's entry at each admission; a launch reads its rows with
   one `gather`, so a step with no admission copies none of them to the device.
@@ -21,6 +22,7 @@ import numpy as np
 import torch
 
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.sampling.logit_bias import LogitBiasRows, LogitBiasStore
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -52,6 +54,8 @@ class SamplingRows(NamedTuple):
     step_penalties: Optional[StepPenalties]
     # The watermark policy, None unless some row is a candidate.
     watermark: Optional[WatermarkRows]
+    # The rows' logit_bias entries, None unless some row has a logit_bias.
+    logit_bias: Optional[LogitBiasRows]
 
     @classmethod
     def empty(cls, device) -> SamplingRows:
@@ -77,6 +81,7 @@ class SamplingRows(NamedTuple):
             ),
             step_penalties=None,
             watermark=None,
+            logit_bias=None,
         )
 
 
@@ -86,10 +91,21 @@ class SamplingParamsTable:
     `SamplingParamsPool` writes them at admission."""
 
     # One row per field, floats as fp32 bits and int64 values as (low, high)
-    # int32 halves: one int32 gather reads them all, top_k exact.
-    TEMPERATURE, TOP_P, TOP_K, MIN_P, PENALTY_INDEX, SEED_LO, SEED_HI = range(7)
+    # int32 halves: one int32 gather reads them all, top_k exact. The logit_bias
+    # offset and count locate the request's run in `LogitBiasStore`.
+    (
+        TEMPERATURE,
+        TOP_P,
+        TOP_K,
+        MIN_P,
+        PENALTY_INDEX,
+        SEED_LO,
+        SEED_HI,
+        LOGIT_BIAS_OFFSET,
+        LOGIT_BIAS_COUNT,
+    ) = range(9)
     # The first of the watermark algorithm's fields, which end the table.
-    WATERMARK = 7
+    WATERMARK = 9
 
     def __init__(self, num_rows: int, device):
         self.num_watermark_fields = num_watermark_fields()
@@ -125,6 +141,7 @@ class SamplingParamsTable:
 class SamplingParamsPool:
     def __init__(self, num_rows: int, device):
         self.table = SamplingParamsTable(num_rows, device)
+        self.logit_bias_store = LogitBiasStore(num_rows, device)
         self.top_ks_host = np.full(num_rows, TOP_K_ALL, dtype=np.int64)
         self.uses_top_p_host = np.zeros(num_rows, dtype=bool)
         self.uses_min_p_host = np.zeros(num_rows, dtype=bool)
@@ -145,6 +162,17 @@ class SamplingParamsPool:
         self.uses_min_p_host[slots] = [p.min_p > 0 for p in params]
         self.has_seed_host[slots] = [p.sampling_seed is not None for p in params]
         self.penalty_indices_host[slots] = penalty_indices
+        store = self.logit_bias_store
+        moved = store.write(slots, [r.logit_bias_entries for r in reqs])
+        if moved.size:
+            # A compaction moved these slots' runs: rewrite their offsets.
+            host_moved = np.stack([moved, store.offsets_host[moved]])
+            moved_values = async_h2d_tensor(
+                torch.from_numpy(host_moved.astype(np.int32)), self.table.values.device
+            )
+            self.table.values[self.table.LOGIT_BIAS_OFFSET].index_copy_(
+                0, moved_values[0].long(), moved_values[1]
+            )
 
         # The table's fields, then the slots in a last row: one copy writes them.
         host_values = np.empty(
@@ -162,6 +190,8 @@ class SamplingParamsPool:
         host_values[self.table.SEED_LO : self.table.SEED_HI + 1] = (
             seeds.view(np.int32).reshape(-1, 2).T
         )
+        host_values[self.table.LOGIT_BIAS_OFFSET] = store.offsets_host[slots]
+        host_values[self.table.LOGIT_BIAS_COUNT] = store.counts_host[slots]
         if self.table.num_watermark_fields:
             candidates, values = zip(*(watermark_pool_values(r) for r in reqs))
             self.watermark_candidates_host[slots] = candidates
@@ -213,6 +243,11 @@ class SamplingParamsPool:
             ),
             watermark=build_watermark_rows(
                 values[self.table.WATERMARK :], self.watermark_candidates_host[slots]
+            ),
+            logit_bias=self.logit_bias_store.gather(
+                slots,
+                values[self.table.LOGIT_BIAS_OFFSET],
+                values[self.table.LOGIT_BIAS_COUNT],
             ),
         )
 

@@ -916,7 +916,7 @@ class Req(ReqDllmMixin):
 
     @cached_property
     def logit_bias_entries(self) -> Optional[LogitBiasEntries]:
-        """sampling_params.logit_bias parsed at the first launch, None without
+        """sampling_params.logit_bias parsed at the first admission, None without
         one; the request's sampling_params no longer change once it is admitted."""
         if self.sampling_params.logit_bias is None:
             return None

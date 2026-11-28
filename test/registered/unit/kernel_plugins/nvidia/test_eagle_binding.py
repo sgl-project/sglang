@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.sampling.logit_bias import LogitBiasRows
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
 from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
@@ -945,7 +946,11 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             top_ps=torch.full((1,), 0.9),
             min_ps=torch.zeros(1),
             step_penalties=None,
-            logit_bias=torch.zeros(1, 4),
+            logit_bias=LogitBiasRows(
+                rows=torch.zeros(0, dtype=torch.int64),
+                token_ids=torch.zeros(0, dtype=torch.int64),
+                values=torch.zeros(0),
+            ),
             sampling_seed=None,
             is_all_greedy=False,
             need_top_k_sampling=False,

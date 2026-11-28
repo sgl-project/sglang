@@ -8,7 +8,11 @@ import numpy as np
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from sglang.srt.sampling.logit_bias import LogitBiasEntries, build_logit_bias
+from sglang.srt.sampling.logit_bias import (
+    LogitBiasEntries,
+    LogitBiasStore,
+    apply_logit_bias,
+)
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import (
@@ -72,6 +76,32 @@ def _step_penalties(reqs, device):
     return build_step_penalties(reqs, _admitted_pool(reqs, device))
 
 
+def _write_logit_bias(reqs, store):
+    """Write each request to the slot of its index; returns the gather's inputs: the
+    slots, and their offsets and counts as the table holds them."""
+    slots = np.arange(len(reqs))
+    store.write(slots.tolist(), [r.logit_bias_entries for r in reqs])
+    device = store.entries.device
+    return (
+        slots,
+        torch.tensor(store.offsets_host[slots], dtype=torch.int32, device=device),
+        torch.tensor(store.counts_host[slots], dtype=torch.int32, device=device),
+    )
+
+
+def _applied_logit_bias(store, slots, offsets, counts):
+    """The gathered entries added to zero logits."""
+    rows = store.gather(slots, offsets, counts)
+    logits = torch.zeros(len(counts), VOCAB_SIZE, device=counts.device)
+    apply_logit_bias(logits, SimpleNamespace(logit_bias=rows))
+    return logits
+
+
+def _logit_bias(reqs, device, store=None):
+    store = store or LogitBiasStore(len(reqs), device)
+    return _applied_logit_bias(store, *_write_logit_bias(reqs, store))
+
+
 class _SamplingMetadataTestBase(CustomTestCase):
     device = "cpu"
 
@@ -123,7 +153,7 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
             _req(logit_bias={}),
             _req(logit_bias={"0": 0, "2": -1.25}),
         ]
-        logit_bias = build_logit_bias(reqs, vocab_size=VOCAB_SIZE, device=self.device)
+        logit_bias = _logit_bias(reqs, self.device)
         expected = torch.zeros(len(reqs), VOCAB_SIZE)
         expected[0, 0], expected[0, 31], expected[0, 1] = -100, 100, 3
         expected[3, 2] = -1.25
@@ -131,6 +161,8 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
 
     def test_logit_bias_matches_a_dense_build(self):
         rng = random.Random(0)
+        # One store across the batches, so slots are rewritten and runs compacted.
+        store = LogitBiasStore(8, self.device)
         for _ in range(100):
             reqs = []
             expected = torch.zeros(rng.randint(1, 8), VOCAB_SIZE)
@@ -148,28 +180,31 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
                 reqs.append(_req(logit_bias=bias))
                 for key, value in bias.items():
                     expected[row, int(key)] = value
-            logit_bias = build_logit_bias(
-                reqs, vocab_size=VOCAB_SIZE, device=self.device
-            )
-            if any(r.logit_bias_entries is not None for r in reqs):
-                self.assert_device_tensor(logit_bias, expected, torch.float32)
-            else:
-                self.assertIsNone(logit_bias)
+            logit_bias = _logit_bias(reqs, self.device, store)
+            self.assert_device_tensor(logit_bias, expected, torch.float32)
         with self.assertRaises(IndexError):
-            build_logit_bias(
-                [_req(logit_bias={str(VOCAB_SIZE): 1.0})],
-                vocab_size=VOCAB_SIZE,
-                device=self.device,
-            )
+            _logit_bias([_req(logit_bias={str(VOCAB_SIZE): 1.0})], self.device)
 
-    def test_logit_bias_is_none_without_any_bias(self):
-        """Once its last biased request finished, a running batch used to keep a
-        zero [bs, vocab] bias, which kept the bias-free fast paths off."""
-        self.assertIsNone(
-            build_logit_bias(
-                [_req(), _req()], vocab_size=VOCAB_SIZE, device=self.device
-            )
-        )
+    def test_logit_bias_adds_to_every_row_of_a_request(self):
+        """A verify's rows_per_request rows of one request all take its entries,
+        added in fp32 and rounded once to the logits dtype."""
+        reqs = [
+            _req(logit_bias={"3": 0.3, "5": -2.0}),
+            _req(),
+            _req(logit_bias={"0": 1}),
+        ]
+        store = LogitBiasStore(len(reqs), self.device)
+        rows = store.gather(*_write_logit_bias(reqs, store))
+        logits = torch.randn(len(reqs) * 4, VOCAB_SIZE, device=self.device)
+        logits = logits.to(torch.bfloat16)
+        dense = torch.zeros(len(reqs), VOCAB_SIZE, device=self.device)
+        dense[0, 3], dense[0, 5], dense[2, 0] = 0.3, -2.0, 1.0
+        expected = logits.clone()
+        expected.unflatten(0, (-1, 4)).add_(dense[:, None, :])
+
+        apply_logit_bias(logits, SimpleNamespace(logit_bias=rows), rows_per_request=4)
+
+        self.assertTrue(torch.equal(logits, expected))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -206,15 +241,23 @@ class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
         self.assertEqual(copies.numels, [])
         self.assertEqual(step.batch_indices.tolist(), [0, 2])
 
-    def test_logit_bias_never_copies_a_dense_row(self):
+    def test_logit_bias_admission_copies_only_the_entries(self):
         reqs = [_req(logit_bias={"1": 2, "31": -1}), _req(), _req(logit_bias={})]
+        store = LogitBiasStore(len(reqs), self.device)
         with _H2DCopies() as copies:
-            logit_bias = build_logit_bias(
-                reqs, vocab_size=VOCAB_SIZE, device=self.device
-            )
+            store.write([0, 1, 2], [r.logit_bias_entries for r in reqs])
         torch.cuda.synchronize()
-        self.assertEqual(len(copies.numels), 1)
-        self.assertLess(max(copies.numels), VOCAB_SIZE)
+        # The first write compacts the empty store: no live run to move.
+        self.assertEqual(copies.numels, [4])
+
+    def test_logit_bias_step_copies_nothing(self):
+        reqs = [_req(logit_bias={"1": 2, "31": -1}), _req(), _req(logit_bias={})]
+        store = LogitBiasStore(len(reqs), self.device)
+        gather_inputs = _write_logit_bias(reqs, store)
+        with _H2DCopies() as copies:
+            logit_bias = _applied_logit_bias(store, *gather_inputs)
+        torch.cuda.synchronize()
+        self.assertEqual(copies.numels, [])
         expected = torch.zeros(len(reqs), VOCAB_SIZE)
         expected[0, 1], expected[0, 31] = 2, -1
         self.assert_device_tensor(logit_bias, expected, torch.float32)
