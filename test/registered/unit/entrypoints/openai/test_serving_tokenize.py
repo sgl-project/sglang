@@ -131,23 +131,39 @@ class TestTokenizeFormattingOptions(CustomTestCase):
 
 
 class TestDetokenize(CustomTestCase):
-    def test_out_of_vocab_ids_are_rejected(self):
+    def setUp(self):
+        super().setUp()
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
         tm = Mock(tokenizer=_tokenizer(), model_config=Mock(vocab_size=len(WORDS)))
-        serving = OpenAIServingDetokenize(tm)
+        self.serving = OpenAIServingDetokenize(tm)
 
-        def detokenize(tokens):
-            request = DetokenizeRequest(tokens=tokens)
-            return asyncio.run(
-                serving._handle_non_streaming_request(request, request, None)
-            )
+    def _detokenize(self, tokens, **kwargs):
+        request = DetokenizeRequest(tokens=tokens, **kwargs)
+        return asyncio.run(
+            self.serving._handle_non_streaming_request(request, request, None)
+        )
 
-        self.assertEqual(detokenize(_ids("hi hello")).text, "hi hello")
+    def test_flat_and_batched_tokens(self):
+        for tokens, expected in (
+            ([], ""),
+            ([[]], [""]),
+            (_ids("hi hello"), "hi hello"),
+            ([_ids("hi hello")], ["hi hello"]),
+            ([[], _ids("<bos> hi")], ["", "hi"]),
+        ):
+            with self.subTest(tokens=tokens):
+                self.assertEqual(self._detokenize(tokens).text, expected)
+        self.assertEqual(
+            self._detokenize([_ids("<bos> hi")], skip_special_tokens=False).text,
+            ["<bos> hi"],
+        )
+
+    def test_out_of_vocab_ids_are_rejected(self):
         for tokens in ([len(WORDS)], [[8], [2**40]]):
             with self.subTest(tokens=tokens):
-                self.assertEqual(detokenize(tokens).status_code, 400)
+                self.assertEqual(self._detokenize(tokens).status_code, 400)
 
 
 if __name__ == "__main__":
