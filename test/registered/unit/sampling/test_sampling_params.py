@@ -157,6 +157,65 @@ class TestSamplingParamsVerify(CustomTestCase):
                     custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: value}
                 ).verify(self.VOCAB_SIZE)
 
+    def test_custom_params_non_dict_rejected(self):
+        """verify() must reject a custom_params that is not an object.
+
+        A list, string, or number reaches the scheduler, where the msgpack
+        decode raises ValidationError and the uocr page-guard processor
+        calls .get() on it -- crashing the scheduler instead of a 400.
+        """
+        for value in ([1], "x", 7):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "custom_params"),
+            ):
+                self._make(custom_params=value).verify(self.VOCAB_SIZE)
+
+    def test_custom_params_deeply_nested_value_rejected(self):
+        """CustomParamValue allows at most one level of list/dict nesting."""
+        for value in (
+            {"a": {"b": {"c": 1}}},
+            {"a": [{"b": 1}]},
+            {"a": {"b": [1]}},
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "custom_params"),
+            ):
+                self._make(custom_params=value).verify(self.VOCAB_SIZE)
+
+    def test_custom_params_non_finite_float_rejected(self):
+        """NaN/inf are not JSON-safe and cannot survive the IPC round-trip."""
+        for value in (
+            {"a": float("nan")},
+            {"a": float("inf")},
+            {"a": [1, float("nan")]},
+            {"a": {"b": float("inf")}},
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "custom_params"),
+            ):
+                self._make(custom_params=value).verify(self.VOCAB_SIZE)
+
+    def test_custom_params_non_string_key_rejected(self):
+        with self.assertRaisesRegex(ValueError, "custom_params"):
+            self._make(custom_params={1: "x"}).verify(self.VOCAB_SIZE)
+
+    def test_custom_params_valid_values_pass(self):
+        """Scalars, lists of scalars, and dicts of scalars are accepted."""
+        for value in (
+            None,
+            {},
+            {"thinking_budget": 3},
+            {"tag": "allowed", "flag": True, "ratio": 0.5, "count": 2},
+            {"ids": [1, 2, 3]},
+            {"cfg": {"a": 1, "b": "x"}},
+            {"empty_list": [], "empty_dict": {}},
+        ):
+            with self.subTest(value=value):
+                self._make(custom_params=value).verify(self.VOCAB_SIZE)
+
     def test_negative_temperature_raises(self):
         """Test that verify() rejects negative temperature (must be >= 0)."""
         sp = self._make(temperature=-0.5)
