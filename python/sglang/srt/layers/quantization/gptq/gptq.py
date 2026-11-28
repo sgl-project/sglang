@@ -99,6 +99,9 @@ class _CheckpointTensorManifest:
                 weight_modules.add(name.removesuffix(".weight"))
             elif name.endswith(".qweight"):
                 qweight_modules.add(name.removesuffix(".qweight"))
+            elif name.endswith((".experts.gate_up_proj", ".experts.down_proj")):
+                # Qwen3.5 stores stacked experts as bare parameters, no ``.weight``.
+                weight_modules.add(name)
         return cls(weight_modules, qweight_modules)
 
     def __deepcopy__(self, memo: dict[int, Any]) -> _CheckpointTensorManifest:
@@ -202,6 +205,42 @@ class _GPTQCheckpointMixin:
         return get_dynamic_override(
             self, layer_name=prefix
         ) is False or self.is_checkpoint_module_unquantized(prefix)
+
+    def _expert_module_state(self, name: str, *, stacked: bool) -> Optional[str]:
+        # With a manifest the checkpoint decides; None means it lacks this name.
+        manifest = getattr(self, "_checkpoint_tensor_manifest", None)
+        if manifest is not None:
+            return manifest.classify_module(name)
+        if get_dynamic_override(self, layer_name=name) is False:
+            return "dense"
+        return None if stacked else "quantized"
+
+    def is_fused_moe_unquantized(self, prefix: str, num_experts: int = 1) -> bool:
+        # Exclusion rules and manifests name each expert's projections
+        # (``<prefix>.<id>.gate_proj``) or the stacked tensors
+        # (``<prefix>.gate_up_proj``), never the bare fused prefix: a rule such as
+        # ``-:^(?!.*\.experts\.).*`` matches the prefix while keeping those quantized.
+        states = {}
+        for expert_id in range(num_experts):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                name = f"{prefix}.{expert_id}.{proj}"
+                state = self._expert_module_state(name, stacked=False)
+                if state is not None:
+                    states[name] = state
+        for proj in ("gate_up_proj", "down_proj"):
+            name = f"{prefix}.{proj}"
+            state = self._expert_module_state(name, stacked=True)
+            if state is not None:
+                states[name] = state
+        dense = [name for name, state in states.items() if state == "dense"]
+        if dense and len(dense) != len(states):
+            quantized = next(n for n, state in states.items() if state != "dense")
+            raise ValueError(
+                f"Detected mixed dense and quantized tensors for fused MoE "
+                f"'{prefix}' (dense: '{dense[0]}', quantized: '{quantized}'). "
+                "All experts of a fused MoE must share the same precision."
+            )
+        return bool(dense)
 
     def _resolve_unquantized_linear_method(
         self, layer: torch.nn.Module, prefix: str
@@ -665,6 +704,16 @@ class GPTQMarlinConfig(_GPTQCheckpointMixin, QuantizationConfig):
         )
 
         if isinstance(layer, FusedMoE):
+            if self.is_fused_moe_unquantized(
+                prefix, layer.num_experts - layer.num_fused_shared_experts
+            ):
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedFusedMoEMethod,
+                )
+
+                return UnquantizedFusedMoEMethod(
+                    layer.use_flashinfer_trtllm_moe, layer.use_deep_gemm
+                )
             return GPTQMarlinMoEMethod(self)
         handled, unquant_method = self._resolve_unquantized_linear_method(layer, prefix)
         if handled:

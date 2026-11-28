@@ -18,6 +18,7 @@ from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.gptq.gptq import (
     CPUGPTQConfig,
     GPTQAscendConfig,
@@ -25,6 +26,7 @@ from sglang.srt.layers.quantization.gptq.gptq import (
     GPTQLinearMethod,
     GPTQMarlinConfig,
     GPTQMarlinLinearMethod,
+    GPTQMarlinMoEMethod,
 )
 from sglang.srt.layers.quantization.gptq.schemes import (
     GPTQAscendLinearScheme,
@@ -35,7 +37,10 @@ from sglang.srt.layers.quantization.marlin_utils import (
     verify_marlin_supports_layer,
 )
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config, MoeWNA16Method
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.layers.quantization.utils import (
     _DYNAMIC_FUSED_SHARDS,
     _FALLBACK_FUSED_SHARDS,
@@ -56,14 +61,26 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeForConditionalGeneration,
 )
-from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet, Qwen3NextForCausalLM
+from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
+from sglang.srt.models.qwen3_next import (
+    Qwen3GatedDeltaNet,
+    Qwen3NextForCausalLM,
+    Qwen3NextModel,
+)
+from sglang.srt.models.qwen3_next_mtp import Qwen3NextForCausalLMMTP
 from sglang.srt.models.utils import WeightsMapper
-from sglang.srt.runtime_context import SpawnRanks, get_parallel, publish, reset_context
+from sglang.srt.runtime_context import (
+    SpawnRanks,
+    get_context,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _make_gptq_marlin_config(dynamic=None, packed_modules_mapping=None):
@@ -1141,7 +1158,9 @@ class TestQwen35GdnGptqUnquantFallback(CustomTestCase):
                 "lm_head": False,
             }
         )
-        mock_moe = SimpleNamespace(__class__=FusedMoE)
+        mock_moe = SimpleNamespace(
+            __class__=FusedMoE, num_experts=1, num_fused_shared_experts=0
+        )
         with patch(
             "sglang.srt.layers.moe.fused_moe_triton.layer.FusedMoE", SimpleNamespace
         ):
@@ -1195,6 +1214,360 @@ class TestQwen35GdnGptqUnquantFallback(CustomTestCase):
                 }
             )
         self.assertFalse(awq_cfg.uses_checkpoint_tensor_manifest)
+
+
+class TestQwen35GptqMoeUnquantFallback(CustomTestCase):
+    """A fused MoE the checkpoint excludes via ``dynamic`` is built dense and loadable."""
+
+    def setUp(self):
+        override = get_context().override_server_args(device="cpu")
+        override.install()
+        self.addCleanup(override.restore)
+        self.enterContext(
+            get_parallel().override(
+                tp_group=None,
+                attn_tp_group=None,
+                attn_tp_rank=0,
+                tp_rank=0,
+                moe_ep_rank=0,
+                moe_tp_rank=0,
+            )
+        )
+
+    @staticmethod
+    def _moe(quant_config, prefix):
+        return FusedMoE(
+            num_experts=2,
+            hidden_size=256,
+            intermediate_size=256,
+            layer_id=0,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    @staticmethod
+    def _moe_wna16_gptq(dynamic):
+        return MoeWNA16Config.from_config(
+            {
+                "quant_method": "gptq",
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "desc_act": False,
+                "dynamic": dynamic,
+            }
+        )
+
+    def test_excluded_moe_is_built_unquantized(self):
+        dynamic = {"-:.*mtp.*": {}}
+        for name, cfg, quantized_cls in (
+            ("marlin", _make_gptq_marlin_config(dynamic=dynamic), GPTQMarlinMoEMethod),
+            ("moe_wna16", self._moe_wna16_gptq(dynamic), MoeWNA16Method),
+        ):
+            with self.subTest(config=name):
+                excluded = self._moe(cfg, "mtp.layers.0.mlp.experts")
+                self.assertIsInstance(excluded.quant_method, UnquantizedFusedMoEMethod)
+                names = {n for n, _ in excluded.named_parameters()}
+                self.assertIn("w13_weight", names)
+                self.assertNotIn("w13_qweight", names)
+                kept = self._moe(cfg, "model.layers.3.mlp.experts")
+                self.assertIsInstance(kept.quant_method, quantized_cls)
+                self.assertIn("w13_qweight", {n for n, _ in kept.named_parameters()})
+
+    def test_exclusion_is_not_mtp_specific(self):
+        cfg = _make_gptq_marlin_config(dynamic={r"-:.*\.layers\.0\..*": {}})
+        self.assertIsInstance(
+            self._moe(cfg, "model.layers.0.mlp.experts").quant_method,
+            UnquantizedFusedMoEMethod,
+        )
+        self.assertIsInstance(
+            self._moe(cfg, "model.layers.1.mlp.experts").quant_method,
+            GPTQMarlinMoEMethod,
+        )
+
+    def test_mtp_draft_loads_excluded_moe_experts(self):
+        dynamic = {"-:.*mtp.*": {}}
+        for name, cfg in (
+            ("marlin", _make_gptq_marlin_config(dynamic=dynamic)),
+            ("moe_wna16", self._moe_wna16_gptq(dynamic)),
+        ):
+            with self.subTest(config=name):
+                moe = self._moe(cfg, "mtp.layers.0.mlp.experts")
+                module = _make_dummy_loader_module(
+                    moe, prefix="model.layers.0.mlp.experts"
+                )
+                module.config.num_experts = 2
+                weights = [
+                    (
+                        f"mtp.layers.0.mlp.experts.{expert}.{proj}.weight",
+                        torch.full((256, 256), value),
+                    )
+                    for expert in range(2)
+                    for proj, value in (
+                        ("gate_proj", 1.0),
+                        ("up_proj", 2.0),
+                        ("down_proj", 3.0),
+                    )
+                ]
+                Qwen3_5ForCausalLMMTP.load_weights(module, weights)
+                params = dict(moe.named_parameters())
+                self.assertIn("w13_weight", params)
+                torch.testing.assert_close(
+                    params["w13_weight"][0, :256], torch.full((256, 256), 1.0)
+                )
+                torch.testing.assert_close(
+                    params["w13_weight"][0, 256:], torch.full((256, 256), 2.0)
+                )
+                torch.testing.assert_close(
+                    params["w2_weight"][0], torch.full((256, 256), 3.0)
+                )
+
+    @staticmethod
+    def _gate_qweight_shard():
+        # GPTQ checkpoint layout: (hidden // 8 packed int4 per int32, intermediate)
+        return torch.full((32, 256), 7, dtype=torch.int32)
+
+    def _assert_qwen3_loader_fills_qweight(self, moe, load_weights, name):
+        params = dict(moe.named_parameters())
+        self.assertIn("w13_qweight", params)
+        self.assertNotIn("w13_weight", params)
+        qweight = params["w13_qweight"]
+        qweight.zero_()
+        module = _make_dummy_loader_module(moe, prefix="model.layers.0.mlp.experts")
+        module.config.num_experts = 2
+        with get_parallel().override(tp_group=SimpleNamespace(device=qweight.device)):
+            load_weights(module, [(name, self._gate_qweight_shard())])
+        self.assertTrue(bool((qweight != 0).any()))
+
+    def test_dynamic_rule_matching_only_the_bare_experts_prefix_keeps_them_quantized(
+        self,
+    ):
+        dynamic = {r"-:^(?!.*\.experts\.).*": {}}
+        for name, cfg, quantized_cls in (
+            ("marlin", _make_gptq_marlin_config(dynamic=dynamic), GPTQMarlinMoEMethod),
+            ("moe_wna16", self._moe_wna16_gptq(dynamic), MoeWNA16Method),
+        ):
+            with self.subTest(config=name):
+                moe = self._moe(cfg, "model.layers.0.mlp.experts")
+                self.assertIsInstance(moe.quant_method, quantized_cls)
+                self._assert_qwen3_loader_fills_qweight(
+                    moe,
+                    Qwen3NextForCausalLM.load_weights,
+                    "model.layers.0.mlp.experts.0.gate_proj.qweight",
+                )
+
+    def test_dynamic_rule_excluding_expert_projections_builds_dense_experts(self):
+        dynamic = {r"-:.*\.experts\..*": {}}
+        for name, cfg in (
+            ("marlin", _make_gptq_marlin_config(dynamic=dynamic)),
+            ("moe_wna16", self._moe_wna16_gptq(dynamic)),
+        ):
+            with self.subTest(config=name):
+                moe = self._moe(cfg, "model.layers.0.mlp.experts")
+                self.assertIsInstance(moe.quant_method, UnquantizedFusedMoEMethod)
+
+    @staticmethod
+    def _qwen3_next_config():
+        config = Qwen3NextConfig(
+            vocab_size=256,
+            hidden_size=256,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            shared_expert_intermediate_size=256,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            num_experts=2,
+            num_experts_per_tok=1,
+        )
+        config.full_attention_interval = 1
+        return config
+
+    def test_qwen3_next_draft_follows_the_mtp_checkpoint_prefix(self):
+        self.enterContext(
+            get_parallel().override(pp_group=SimpleNamespace(is_last_rank=False))
+        )
+        self.enterContext(
+            patch(
+                "sglang.srt.models.qwen3_next.get_rope",
+                return_value=torch.nn.Identity(),
+            )
+        )
+        dynamic = {r"-:model\.layers\.0\..*": {}}
+        self.enterContext(
+            patch(
+                "sglang.srt.layers.quantization.marlin_utils.get_device_capability",
+                return_value=(8, 0),
+            )
+        )
+        self.enterContext(
+            patch("sglang.srt.layers.quantization.marlin_utils._is_cuda", True)
+        )
+        for name, cfg in (("marlin", _make_gptq_marlin_config(dynamic=dynamic)),):
+            with self.subTest(config=name):
+                target = Qwen3NextModel(self._qwen3_next_config(), cfg, prefix="model")
+                self.assertIsInstance(
+                    target.layers[0].mlp.experts.quant_method,
+                    UnquantizedFusedMoEMethod,
+                )
+                draft = Qwen3NextForCausalLMMTP(self._qwen3_next_config(), cfg)
+                names = {n for n, _ in draft.named_parameters()}
+                self.assertTrue(any("experts.w13_qweight" in n for n in names))
+                self.assertTrue(any("qkv_proj.qweight" in n for n in names))
+                self.assertTrue(
+                    any("shared_expert.gate_up_proj.qweight" in n for n in names)
+                )
+                qweight = dict(draft.named_parameters())[
+                    next(n for n in names if "experts.w13_qweight" in n)
+                ]
+                qweight.zero_()
+                with get_parallel().override(
+                    tp_group=SimpleNamespace(device=qweight.device)
+                ):
+                    Qwen3NextForCausalLMMTP.load_weights(
+                        draft,
+                        [
+                            (
+                                "mtp.layers.0.mlp.experts.0.gate_proj.qweight",
+                                self._gate_qweight_shard(),
+                            )
+                        ],
+                    )
+                self.assertTrue(bool((qweight != 0).any()))
+
+    def test_experts_with_mixed_precision_in_the_checkpoint_are_rejected(self):
+        prefix = "model.layers.0.mlp.experts"
+        tensors = [
+            f"{prefix}.{e}.{p}.{kind}"
+            for e, kind in ((0, "qweight"), (1, "weight"))
+            for p in ("gate_proj", "up_proj", "down_proj")
+        ]
+        for name, cfg in (
+            ("marlin", _make_gptq_marlin_config()),
+            ("moe_wna16", self._moe_wna16_gptq({})),
+        ):
+            with self.subTest(config=name):
+                cfg.set_checkpoint_tensor_names(tensors)
+                with self.assertRaisesRegex(ValueError, "mixed dense and quantized"):
+                    self._moe(cfg, prefix)
+
+    def test_exclusion_cannot_make_a_tensor_the_checkpoint_lacks_dense(self):
+        prefix = "model.layers.0.mlp.experts"
+        per_expert = [
+            f"{prefix}.{e}.{p}.qweight"
+            for e in range(2)
+            for p in ("gate_proj", "up_proj", "down_proj")
+        ]
+        stacked = [f"{prefix}.gate_up_proj.qweight", f"{prefix}.down_proj.qweight"]
+        for layout, tensors, rule in (
+            ("per_expert", per_expert, r"-:.*experts\.(gate_up|down)_proj.*"),
+            ("stacked", stacked, r"-:.*experts\.\d+\..*"),
+        ):
+            for name, make_cfg in (
+                ("marlin", _make_gptq_marlin_config),
+                ("moe_wna16", self._moe_wna16_gptq),
+            ):
+                with self.subTest(config=name, layout=layout):
+                    cfg = make_cfg({rule: {}})
+                    cfg.set_checkpoint_tensor_names(tensors)
+                    self.assertIsInstance(
+                        self._moe(cfg, prefix).quant_method,
+                        (GPTQMarlinMoEMethod, MoeWNA16Method),
+                    )
+
+    def test_stacked_expert_tensors_decide_the_layout(self):
+        prefix = "model.layers.0.mlp.experts"
+        for name, make_cfg in (
+            ("marlin", _make_gptq_marlin_config),
+            ("moe_wna16", lambda: self._moe_wna16_gptq({})),
+        ):
+            for kind, expected in (
+                ("weight", UnquantizedFusedMoEMethod),
+                ("qweight", (GPTQMarlinMoEMethod, MoeWNA16Method)),
+            ):
+                with self.subTest(config=name, stacked=kind):
+                    cfg = make_cfg()
+                    cfg.set_checkpoint_tensor_names(
+                        [f"{prefix}.gate_up_proj.{kind}", f"{prefix}.down_proj.{kind}"]
+                    )
+                    self.assertIsInstance(self._moe(cfg, prefix).quant_method, expected)
+
+    def test_qwen3_5_mtp_loads_suffixless_stacked_experts_as_dense(self):
+        """Suffixless stacked MTP expert tensors load into dense parameters."""
+        prefix = "mtp.layers.0.mlp.experts"
+        tensors = [f"{prefix}.gate_up_proj", f"{prefix}.down_proj"]
+        for name, make_cfg in (
+            ("marlin", _make_gptq_marlin_config),
+            ("moe_wna16", self._moe_wna16_gptq),
+        ):
+            with self.subTest(config=name):
+                cfg = make_cfg({"-:.*mtp.*": {}})
+                cfg.set_checkpoint_tensor_names(tensors)
+                moe = self._moe(cfg, prefix)
+                self.assertIsInstance(moe.quant_method, UnquantizedFusedMoEMethod)
+                module = _make_dummy_loader_module(
+                    moe, prefix="model.layers.0.mlp.experts"
+                )
+                module.config.num_experts = 2
+                Qwen3_5ForCausalLMMTP.load_weights(
+                    module,
+                    [
+                        (f"{prefix}.gate_up_proj", torch.full((2, 512, 256), 1.0)),
+                        (f"{prefix}.down_proj", torch.full((2, 256, 256), 3.0)),
+                    ],
+                )
+                params = dict(moe.named_parameters())
+                torch.testing.assert_close(
+                    params["w13_weight"], torch.full((2, 512, 256), 1.0)
+                )
+                torch.testing.assert_close(
+                    params["w2_weight"], torch.full((2, 256, 256), 3.0)
+                )
+
+    def test_manifest_layout_wins_over_an_exclusion_matching_only_the_runtime_alias(
+        self,
+    ):
+        """A rule matching only the runtime alias keeps manifest-quantized experts quantized."""
+        tensors = [
+            f"model.layers.0.mlp.experts.{e}.{p}.qweight"
+            for e in range(2)
+            for p in ("gate_proj", "up_proj", "down_proj")
+        ]
+        for name, make_cfg, quantized_cls in (
+            ("marlin", _make_gptq_marlin_config, GPTQMarlinMoEMethod),
+            ("moe_wna16", self._moe_wna16_gptq, MoeWNA16Method),
+        ):
+            with self.subTest(config=name):
+                cfg = make_cfg({r"-:.*language_model.*": {}})
+                cfg.set_checkpoint_tensor_names(tensors)
+                moe = self._moe(cfg, "model.language_model.layers.0.mlp.experts")
+                self.assertIsInstance(moe.quant_method, quantized_cls)
+                self._assert_qwen3_loader_fills_qweight(
+                    moe,
+                    Qwen3NextForCausalLM.load_weights,
+                    "model.layers.0.mlp.experts.0.gate_proj.qweight",
+                )
+
+    def test_moe_wna16_awq_moe_does_not_run_the_gptq_probe(self):
+        with patch(
+            "sglang.srt.layers.quantization.moe_wna16.get_device_capability",
+            return_value=(8, 0),
+        ):
+            cfg = MoeWNA16Config.from_config(
+                {
+                    "quant_method": "awq",
+                    "bits": 4,
+                    "group_size": 128,
+                    "zero_point": True,
+                    "modules_to_not_convert": ["visual"],
+                }
+            )
+        with patch.object(
+            MoeWNA16Config, "is_linear_unquantized", side_effect=AssertionError
+        ):
+            moe = self._moe(cfg, "model.layers.3.mlp.experts")
+        self.assertIsInstance(moe.quant_method, MoeWNA16Method)
 
 
 if __name__ == "__main__":

@@ -205,6 +205,12 @@ class MoeWNA16Config(QuantizationConfig):
             return gptq_config.is_linear_unquantized(prefix)
         return super().is_linear_unquantized(prefix)
 
+    def is_fused_moe_unquantized(self, prefix: str, num_experts: int = 1) -> bool:
+        gptq_config = self._get_gptq_config()
+        return gptq_config is not None and gptq_config.is_fused_moe_unquantized(
+            prefix, num_experts
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -233,6 +239,12 @@ class MoeWNA16Config(QuantizationConfig):
             else:
                 raise ValueError("moe_wna16 only support gptq and awq.")
         elif isinstance(layer, FusedMoE):
+            if self.is_fused_moe_unquantized(
+                prefix, layer.num_experts - layer.num_fused_shared_experts
+            ):
+                return UnquantizedFusedMoEMethod(
+                    layer.use_flashinfer_trtllm_moe, layer.use_deep_gemm
+                )
             return MoeWNA16Method(self)
         return None
 
