@@ -122,14 +122,13 @@ class ContextBoundaryTests(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "greedy"):
             select_eager_phase(worker, self.batch(idle=True))
 
-    def test_independent_admission_exposes_exact_context_and_respects_actual_kv_capacity(
+    def test_admission_exposes_exact_context_and_respects_actual_kv_capacity(
         self,
     ):
         context = 1048576
-        for mode, capacity, expected in [
-            ("shared", context + 128, context - 1),
-            ("hybrid", context + 128, context),
-            ("hybrid", 65536, 65536),
+        for capacity, expected in [
+            (context + 128, context),
+            (65536, 65536),
         ]:
             config = SimpleNamespace(context_len=context)
             runner = SimpleNamespace(
@@ -140,7 +139,7 @@ class ContextBoundaryTests(CustomTestCase):
                 spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
                 max_running_requests=1,
                 forward_stream=None,
-                req_to_token_pool=SimpleNamespace(size=1, max_context_len=context + 64),
+                req_to_token_pool=SimpleNamespace(size=1, row_width=context + 64),
                 token_to_kv_pool=SimpleNamespace(size=capacity),
             )
             worker = SimpleNamespace(
@@ -152,8 +151,8 @@ class ContextBoundaryTests(CustomTestCase):
             )
             with (
                 patch(
-                    "sglang.srt.managers.tp_worker.get_spec",
-                    return_value=SimpleNamespace(speculative_draft_kv_layout=mode),
+                    "sglang.srt.managers.tp_worker.compute_num_reserved_tokens",
+                    return_value=0,
                 ),
                 patch(
                     "sglang.srt.managers.tp_worker.get_schedule",
@@ -172,7 +171,7 @@ class ContextBoundaryTests(CustomTestCase):
             ):
                 info = TpModelWorker.get_worker_info(worker)
             self.assertEqual(info[4], expected)
-            self.assertEqual(info[5], expected - 5)
+            self.assertEqual(info[5], expected - 6)
 
 
 if __name__ == "__main__":

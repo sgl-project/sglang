@@ -52,6 +52,10 @@ class _Req:
         self.beam_group = None
         self.token_indices_to_pool = None
 
+    @property
+    def seqlen(self):
+        return len(self.origin_input_ids) + len(self.output_ids)
+
     def init_next_round_input(self, tree_cache=None, **_):
         pass
 

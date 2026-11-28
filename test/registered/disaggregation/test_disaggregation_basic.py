@@ -28,9 +28,10 @@ from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE3,
+    DEFAULT_TARGET_MODEL_NGRAM,
 )
 
-register_cuda_ci(est_time=584, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=740, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -457,6 +458,69 @@ class TestDisaggregationMooncakeSpec(
         print(f"Evaluation metrics: {metrics}")
 
         self.assertGreater(metrics["score"], 0.74)
+
+
+class TestDisaggregationNgram(SpecGrammarKit, PDDisaggregationServerBase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_TARGET_MODEL_NGRAM
+        spec_args = [
+            "--speculative-algorithm",
+            "NGRAM",
+            "--speculative-num-draft-tokens",
+            "16",
+            "--cuda-graph-max-bs-decode",
+            "8",
+        ]
+        cls.extra_prefill_args = spec_args
+        cls.extra_decode_args = spec_args
+        cls.launch_all()
+
+    def test_decode_continues_from_the_prefill_first_token(self):
+        # PD prefill samples the first token and NGRAM drafts from the decode's
+        # token history, so a dropped or repeated first token shows in the text.
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": "Count from 1 to 30: 1, 2, 3,",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 48},
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        out = response.json()
+        self.assertTrue(
+            out["text"].lstrip().startswith("4, 5, 6, 7, 8, 9, 10"), out["text"]
+        )
+        self.assertGreater(out["meta_info"]["spec_verify_ct"], 0)
+
+    def test_decode_drafts_a_copy_of_the_prompt(self):
+        # The decode worker runs no extend, so only a prompt seeded into its corpus
+        # at admission can draft this copy; otherwise accept length stays near 1.
+        words = (
+            "amber falcon river quartz lantern meadow copper violet harbor thistle "
+            "marble orchid canyon ember glacier pepper walnut saddle compass velvet "
+            "anchor blossom cobalt dragon eclipse fountain granite hammock island "
+            "jasmine kettle lagoon mirror nectar oyster pillow quiver rocket sapphire "
+            "timber umbrella vessel willow yarrow zephyr bridge candle desert engine "
+            "forest garden hollow ivory jungle kernel ladder magnet needle office "
+            "palace quarry ribbon spindle temple unicorn valley wagon xylophone "
+            "yonder zenith apron basket castle dolphin emerald feather goblet helmet "
+            "iguana jacket kitten locket mantle napkin oracle parrot quilt rabbit"
+        )
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": f"Copy the word list exactly.\nWord list: {words}\nCopy:",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 96},
+            },
+            timeout=120,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        meta_info = response.json()["meta_info"]
+        accept_length = meta_info["completion_tokens"] / meta_info["spec_verify_ct"]
+        self.assertGreater(accept_length, 2.0, meta_info)
 
 
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):

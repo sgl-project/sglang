@@ -125,6 +125,9 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "OpenAiEmbeddingResponse" => {
                 check::<api::OpenAiEmbeddingResponse>(&name, input, canonical)
             }
+            "OpenAiClassifyResponse" => {
+                check::<api::OpenAiClassifyResponse>(&name, input, canonical)
+            }
             "OpenAiScoreRequest" => check::<api::OpenAiScoreRequest>(&name, input, canonical),
             "OpenAiScoreResponse" => check::<api::OpenAiScoreResponse>(&name, input, canonical),
             "OpenAiRerankRequest" => check::<api::OpenAiRerankRequest>(&name, input, canonical),

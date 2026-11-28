@@ -148,6 +148,9 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor
     custom_mask: torch.Tensor
     mask_indptr: torch.Tensor
+    # Gemma 4 image masks apply only to sliding-window layers. Generic masks
+    # (including speculative trees and DiffusionGemma) apply to every layer.
+    custom_mask_sliding_layers_only: bool = False
     # Every window rail of the forward, keyed by the sub-pool its window layers
     # read (`TritonAttnBackend.window_lengths`).
     windows: Dict[str, WindowRail] = field(default_factory=dict)
@@ -1802,6 +1805,14 @@ class TritonAttnBackend(AttentionBackend):
         )
         return True
 
+    def _custom_mask_for_layer(self, layer):
+        metadata = self.forward_metadata
+        if metadata.custom_mask_sliding_layers_only and (
+            layer.sliding_window_size is None or layer.sliding_window_size < 0
+        ):
+            return None, None
+        return metadata.custom_mask, metadata.mask_indptr
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1947,6 +1958,8 @@ class TritonAttnBackend(AttentionBackend):
                 aux_tensors=aux_tensors,
             )
 
+        custom_mask, mask_indptr = self._custom_mask_for_layer(layer)
+
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             bidirectional_extend = (
@@ -1989,7 +2002,7 @@ class TritonAttnBackend(AttentionBackend):
             and k_descale == 1.0
             and v_descale == 1.0
             and not logits_soft_cap
-            and self.forward_metadata.custom_mask is None
+            and custom_mask is None
             and not (
                 self.use_sliding_window_kv_pool
                 and self.kv_layers.route(layer.layer_id).sub_pool
@@ -2033,9 +2046,9 @@ class TritonAttnBackend(AttentionBackend):
                 self.forward_metadata.qo_indptr,
                 kv_indptr,
                 kv_indices,
-                self.forward_metadata.custom_mask,
+                custom_mask,
                 causal,
-                self.forward_metadata.mask_indptr,
+                mask_indptr,
                 self.forward_metadata.max_extend_len,
                 k_descale,
                 v_descale,
@@ -2062,9 +2075,9 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
-            self.forward_metadata.custom_mask,
+            custom_mask,
             causal,
-            self.forward_metadata.mask_indptr,
+            mask_indptr,
             self.forward_metadata.max_extend_len,
             k_descale,
             v_descale,
@@ -2429,6 +2442,8 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        custom_mask, mask_indptr = self._custom_mask_for_layer(layer)
+
         # Call unified kernel
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2442,8 +2457,8 @@ class TritonAttnBackend(AttentionBackend):
             unified_kv_indices,
             prefix_lens,
             self.forward_metadata.max_extend_len,
-            custom_mask=self.forward_metadata.custom_mask,
-            mask_indptr=self.forward_metadata.mask_indptr,
+            custom_mask=custom_mask,
+            mask_indptr=mask_indptr,
             sm_scale=layer.scaling,
             logit_cap=logits_soft_cap,
             is_causal=causal,

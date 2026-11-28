@@ -506,7 +506,7 @@ the observation schema, action layout, and sampling defaults.
 | `GET /v1/actions/metadata` | Discover the served policy's observation schema, action shape, defaults, and capabilities. |
 | `WS /v1/actions/realtime` | Send successive action requests using the msgpack WebSocket protocol. |
 
-See the [VLA cookbook](/cookbook/vla/intro) for Pi0.5, FLUX 3 Action, and
+See the [Action Models cookbook](/cookbook/vla/intro) for Pi0.5, FLUX 3 Action, and
 Praxis-1 recipes, or [Cosmos3 policy and inverse dynamics](/cookbook/diffusion/Cosmos/Cosmos3#action-generation)
 for world-model action generation. Supported inputs, session behavior, and
 transports depend on the policy; consult its metadata and recipe before use.
@@ -528,7 +528,7 @@ Loads one or more LoRA adapters and applies them to the model. Both static merge
 
 Each adapter must have a complete LoRA A/B pair for at least one layer on its selected target. Other layers may be unmatched. If any adapter has no match, the request is rejected and the previous adapters remain active. This also applies when reusing a cached nickname on a different target.
 
-When `merge_mode` is omitted, the request inherits the server's `--lora-merge-mode`. The default policy, `auto`, merges regular weights but uses dynamic LoRA for FSDP-sharded weights, supported quantized or AMX-packed weights that cannot merge in place, and updates estimated to lose more than 50% of their norm to merge rounding. These rules also apply to multiple adapters. Forcing `merge` fails for weights that cannot merge in place; `dynamic` leaves the base weights unchanged and adds the adapters' updates during each forward pass.
+When `merge_mode` is omitted, the request inherits the server's `--lora-merge-mode`. The default policy, `auto`, merges regular weights but uses dynamic LoRA for FSDP-sharded weights, supported quantized or AMX-packed weights that cannot merge in place, and updates estimated to lose more than 50% of their norm to merge rounding. These rules also apply to multiple adapters. Forcing `merge` fails for weights that cannot merge in place; `dynamic` leaves the base weights unchanged and adds the adapters' updates during each forward pass. Dynamic LoRA does not retain a separate copy of the base weights. You can still switch to `merge` later: the layer keeps the original weights only while merged so that unmerging restores them exactly.
 
 **Endpoint:** `POST /v1/set_lora`
 

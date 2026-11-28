@@ -10,7 +10,7 @@ import { DiffusionLogo } from '/src/snippets/diffusion/logo.jsx';
 
 <DiffusionLogo />
 
-SGLang Diffusion supports image, video, audio, and action generation. Choose a recipe by output modality: media and realtime/world models are listed below, while dedicated robot action policies are grouped in the [VLA cookbook](/cookbook/vla/intro).
+SGLang Diffusion supports image, video, audio, and action generation. Choose a recipe by output modality: media and realtime/world models are listed below, while dedicated robot action policies are grouped in the [Action Models cookbook](/cookbook/vla/intro).
 
 For action generation, start with the [action API](/docs/sglang-diffusion/api/openai_api#action-generation-sglang-extension) and the model-specific recipe. [Cosmos3](/cookbook/diffusion/Cosmos/Cosmos3) covers both media generation and robot policy modes.
 

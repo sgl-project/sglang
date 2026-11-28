@@ -79,11 +79,12 @@ class Schedule(msgspec.Struct):
         int,
         Arg(
             help=(
-                "The maximum number of tokens in a prefill batch. The real bound "
-                "will be the maximum of this value and the model's maximum "
-                "context length." + f"\n\n{human_readable_int.__doc__}"
+                "The maximum number of tokens in a prefill batch. Automatically "
+                "raised to at least the resolved chunked prefill size."
+                + f"\n\n{human_readable_int.__doc__}"
             ),
             type_parser=human_readable_int,
+            resolvable=True,
         ),
     ] = 16384
     prefill_max_requests: A[

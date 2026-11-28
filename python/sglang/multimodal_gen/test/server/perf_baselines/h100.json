@@ -3481,6 +3481,44 @@
             "runtime_peak_allocated_mb": 57274.0,
             "estimated_full_test_time_s": 60
         },
+        "lingbot_video_moe_ti2v": {
+            "stages_ms": {
+                "InputValidationStage": 60.5,
+                "LingBotVideoImageConditioningStage": 325.14,
+                "LingBotVideoTextEncodingStage": 1196.96,
+                "LatentPreparationStage": 0.26,
+                "TimestepPreparationStage": 1.82,
+                "LingBotVideoDenoisingStage": 3815.02,
+                "DecodingStage": 246.69,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 262.18,
+                "1": 215.11,
+                "2": 214.52,
+                "3": 215.54,
+                "4": 213.82,
+                "5": 215.08,
+                "6": 214.74,
+                "7": 217.05,
+                "8": 212.92,
+                "9": 213.22,
+                "10": 213.48,
+                "11": 210.29
+            },
+            "expected_e2e_ms": 5854.3,
+            "expected_load_ms": 39659.69,
+            "expected_avg_denoise_ms": 218.16,
+            "expected_median_denoise_ms": 214.63,
+            "load_peak_vram_mb": 136.0,
+            "runtime_peak_vram_mb": 66752.0,
+            "warmup_peak_vram_mb": 6300.0,
+            "load_peak_allocated_mb": 113.49,
+            "runtime_peak_allocated_mb": 66470.65,
+            "load_peak_host_anon_mb": 47248.48,
+            "runtime_peak_host_anon_mb": 47248.48,
+            "estimated_full_test_time_s": 127.8
+        },
         "lingbot_video_moe_t2v": {
             "expected_load_ms": 25467.49,
             "stages_ms": {
@@ -3758,7 +3796,7 @@
             "expected_median_denoise_ms": 2332.99,
             "load_peak_vram_mb": 45428.0,
             "runtime_peak_vram_mb": 63312.0,
-            "load_peak_allocated_mb": 3330.01,
+            "load_peak_allocated_mb": 3486.25,
             "runtime_peak_allocated_mb": 18182.98,
             "estimated_full_test_time_s": 150.0
         },
