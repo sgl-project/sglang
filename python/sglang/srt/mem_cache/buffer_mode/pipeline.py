@@ -211,6 +211,9 @@ def validate_buffer_only_stack(
                 f"indices_from_pool={spec.indices_from_pool}."
             )
         source_size = source.host_pool.logical_size
+        if isinstance(source.host_pool, PageInterleaveHostPool):
+            # A KV-sharded source's sidecars address its owner-local rows.
+            source_size = source.host_pool.size
         sidecar_size = sidecar.host_pool.logical_size
         if sidecar_size < source_size:
             raise ValueError(

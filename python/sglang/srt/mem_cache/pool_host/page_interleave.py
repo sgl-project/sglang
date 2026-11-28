@@ -16,7 +16,7 @@ logical host capacity grows with the shard group, like the device's.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -103,3 +103,12 @@ class PageInterleaveHostPool:
             self.placement.local_index(host_indices[owned]),
             self.placement.local_index(device_owned),
         )
+
+    def owned_storage_pages(
+        self, host_indices: torch.Tensor
+    ) -> Tuple[List[int], torch.Tensor]:
+        """This rank's pages of a storage batch: their positions in the batch
+        and their local host rows, whole pages in batch order."""
+        mask = self.placement.local_mask(host_indices, self.shard_rank)
+        pages = torch.nonzero(mask[:: self.page_size]).squeeze(1).tolist()
+        return pages, self.placement.local_index(host_indices[mask])
