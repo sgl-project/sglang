@@ -374,9 +374,11 @@ class KimiK3JsonAnswerDetector(KimiK3Detector):
 
     def __init__(self, after_thinking: bool = False):
         super().__init__()
-        # As the answer grammar lays it out, the opener follows the first think
-        # closer when the output thinks first, and starts the output otherwise.
+        # As the answer grammar lays it out, the opener starts the output or,
+        # when the output thinks first, follows the first think closer; that
+        # thinking is unconstrained, so it may also be skipped.
         self._after_thinking = after_thinking
+        self._start_checked = False
         self._answer_opener_seen = False
 
     def _emit_normal_text(self, limit: int | None = None) -> str:
@@ -398,9 +400,11 @@ class KimiK3JsonAnswerDetector(KimiK3Detector):
             self._sent_normal_idx = end
         if self._answer_opener_seen or not pending:
             return pending
-        if not self._after_thinking:
-            self._answer_opener_seen = True
-            return pending.removeprefix(RESPONSE_OPEN)
+        if not self._start_checked:
+            self._start_checked = True
+            if pending.startswith(RESPONSE_OPEN) or not self._after_thinking:
+                self._answer_opener_seen = True
+                return pending.removeprefix(RESPONSE_OPEN)
         idx = pending.find(THINK_CLOSE)
         if idx == -1:
             return pending

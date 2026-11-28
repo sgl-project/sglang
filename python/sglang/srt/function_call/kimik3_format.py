@@ -76,8 +76,12 @@ THINK_THEN_RESPONSE = THINK_CLOSE + RESPONSE_OPEN
 def response_opener_idx(text: str, after_thinking: bool) -> int:
     """Where the response channel's own opener starts in `text`, or -1; an
     opener anywhere else is quoted text."""
+    # Thinking comes through the reasoning parser's grammar wrapper unconstrained,
+    # so the output may skip it and start with the opener too.
+    if text.startswith(RESPONSE_OPEN):
+        return 0
     if not after_thinking:
-        return 0 if text.startswith(RESPONSE_OPEN) else -1
+        return -1
     idx = text.find(THINK_CLOSE)
     if idx == -1:
         return -1

@@ -149,6 +149,7 @@ class FunctionCallParser:
         answer_excludes_calls: bool = False,
         json_answer_channel: bool = False,
         json_answer_after_thinking: bool = False,
+        unconstrained_thinking: bool = False,
     ):
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
@@ -157,6 +158,9 @@ class FunctionCallParser:
         # keep_thinking_before_calls dropped only on a turn that answers.
         self._thinking_end = thinking_end
         self._keep_thinking_before_calls = keep_thinking_before_calls
+        # A reasoning parser's grammar wrapper leaves the thinking unconstrained,
+        # so it also ends the block at an earlier call marker, as the parser does.
+        self._calls_end_thinking = bool(thinking_end) and unconstrained_thinking
         # The grammar makes a turn either start with a tool call or answer
         # without any, so an answer is never parsed for calls.
         self._answer_excludes_calls = answer_excludes_calls or bool(thinking_end)
@@ -221,6 +225,9 @@ class FunctionCallParser:
         rest, which alone is parsed for tool calls."""
         if not self._thinking_end:
             return "", text
+        call = self._call_in_thinking(text)
+        if call != -1:
+            return text[:call] if self._keep_thinking_before_calls else "", text[call:]
         thinking, end, answer = text.partition(self._thinking_end)
         if not self._keep_thinking_before_calls:
             return "", answer
@@ -236,10 +243,20 @@ class FunctionCallParser:
         if not self._answer_excludes_calls:
             return False
         if self._thinking_end:
+            if self._call_in_thinking(text) != -1:
+                return False
             _, end, text = text.partition(self._thinking_end)
             if not end:
                 return True
         return not self._starts_with_call(text)
+
+    def _call_in_thinking(self, text: str) -> int:
+        # Where a call marker ends the thinking block before its end marker, or -1.
+        if not self._calls_end_thinking:
+            return -1
+        call = text.find(self.detector.bot_token)
+        end = text.find(self._thinking_end)
+        return call if call != -1 and (end == -1 or call < end) else -1
 
     def _starts_with_call(self, text: str) -> bool:
         return text.lstrip().startswith(self.detector.bot_token)
@@ -357,10 +374,21 @@ class FunctionCallParser:
             return chunk_text, None
         if self._stream_phase == "thinking":
             text = self._thinking_tail + chunk_text
+            call = self._call_in_thinking(text)
+            if call != -1:
+                self._thinking_tail = ""
+                self._stream_phase = None
+                thinking = "".join(self._held_thinking) + text[:call]
+                self._held_thinking = []
+                return thinking if self._keep_thinking_before_calls else "", text[call:]
             end = text.find(self._thinking_end)
             if end == -1:
                 # Keep what may be the start of a marker split across chunks.
-                self._thinking_tail = text[-(len(self._thinking_end) - 1) :]
+                markers = [self._thinking_end]
+                if self._calls_end_thinking:
+                    markers.append(self.detector.bot_token)
+                tail = max(map(len, markers)) - 1
+                self._thinking_tail = text[-tail:]
                 if self._keep_thinking_before_calls:
                     self._held_thinking.append(
                         text[: len(text) - len(self._thinking_tail)]

@@ -3313,7 +3313,8 @@ class ServingChatTestCase(CustomTestCase):
     def test_glm_json_answer_with_reasoning_parser_parses_calls_by_turn(self):
         """With --reasoning-parser glm45, a JSON answer quoting the call marker
         stays an answer, streamed or not, separated or not; unseparated
-        reasoning stays ahead of a call and is dropped from a JSON answer."""
+        reasoning stays ahead of a call and is dropped from a JSON answer, and
+        a call ends it without </think>, as glm45 reads it."""
         self.chat.tool_call_parser = "glm47"
         self.chat.reasoning_parser = "glm45"
         self.template_manager.reasoning_config = ReasoningToggleConfig(
@@ -3337,6 +3338,13 @@ class ServingChatTestCase(CustomTestCase):
                 False,
                 None,
                 ("", "Plan.</think>", [("read_file", {"path": "note.txt"})]),
+            ),
+            (call, False, None, ("", "", [("read_file", {"path": "note.txt"})])),
+            (
+                "Plan." + call,
+                False,
+                None,
+                ("", "Plan.", [("read_file", {"path": "note.txt"})]),
             ),
             # Unseparated reasoning is skipped as without a reasoning parser.
             ('Plan.</think>{"word": "hi"}', False, None, ("", '{"word": "hi"}', [])),
@@ -3479,9 +3487,9 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_kimi_k3_json_answer_opener_only_at_the_channel_boundary(self):
         """The answer grammar opens the answer at the start of the output, or
-        right after the first think closer when the request thinks; an opener or
-        think closer anywhere else, in the thinking or quoted in the JSON, is
-        text."""
+        right after the first think closer when the request thinks, though the
+        unconstrained thinking may be skipped; an opener or think closer anywhere
+        else, in the thinking or quoted in the JSON, is text."""
         self.chat.tool_call_parser = "kimi_k3"
         opener, closer = "<|open|>response<|sep|>", "<|close|>response<|sep|>"
         think_close = "<|close|>think<|sep|>"
@@ -3501,6 +3509,7 @@ class ServingChatTestCase(CustomTestCase):
                 "Plan." + think_close + quoted_pair + ending,
                 "Plan." + think_close + quoted_pair,
             ),
+            (True, opener + quoted_pair + ending, quoted_pair),
             # No thinking: the prompt opened the channel or the output opens it.
             (False, quoted + ending, quoted),
             (False, quoted_pair + ending, quoted_pair),
@@ -3525,6 +3534,30 @@ class ServingChatTestCase(CustomTestCase):
                         **self._json_answer_fields(),
                     )
                     self.assertEqual(served, ("", content, []))
+
+    def test_kimi_k3_json_answer_after_another_reasoning_parser(self):
+        """Once another reasoning parser has separated the reasoning, the Kimi-K3
+        answer starts the text the tool parser gets, so its opener is dropped."""
+        self.chat.tool_call_parser = "kimi_k3"
+        self.chat.reasoning_parser = "qwen3"
+        self.template_manager.reasoning_config = ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=True
+        )
+        answer = '{"word": "hi"}'
+        raw = (
+            "Plan.</think><|open|>response<|sep|>"
+            + answer
+            + "<|close|>response<|sep|><|close|>message<|sep|>"
+        )
+        for stream, incremental in ((False, False), (True, False), (True, True)):
+            with self.subTest(stream=stream, incremental=incremental):
+                served = self._served(
+                    self._stopped_on_token(raw, 1),
+                    stream,
+                    incremental=incremental,
+                    **self._json_answer_fields(),
+                )
+                self.assertEqual(served, ("Plan.", answer, []))
 
     def test_kimi_k3_json_answer_parser_frees_without_the_collector(self):
         """A JSON-answer Kimi-K3 parser holds no reference cycle: with the

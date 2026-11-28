@@ -1851,6 +1851,10 @@ class OpenAIServingChat(OpenAIServingBase):
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
         xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
+        # That prefix is unconstrained, and unseparated it reaches the tool parser.
+        request._response_parser_unconstrained_thinking = (
+            bool(self.reasoning_parser) and not request.separate_reasoning
+        )
         tool_call_constraint = None
         tool_call_constraint_covers_answer = False
         template_tool_parser = None
@@ -1946,9 +1950,11 @@ class OpenAIServingChat(OpenAIServingBase):
                         and request.separate_reasoning
                     )
                 )
-                # Thinking reaches the output only through the reasoning parser's
-                # grammar wrapper, which follows the request's thinking mode.
-                request._response_parser_answer_after_thinking = thinking_mode
+                # A separating reasoning parser hands over the text after the
+                # thinking, where the answer grammar starts.
+                request._response_parser_answer_after_thinking = thinking_mode and not (
+                    self.reasoning_parser and request.separate_reasoning
+                )
                 if tool_call_constraint is None:
                     tool_call_constraint = parser.get_structure_constraint(
                         request.tool_choice,
@@ -3242,6 +3248,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     json_answer_after_thinking=(
                         request._response_parser_answer_after_thinking
                     ),
+                    unconstrained_thinking=(
+                        request._response_parser_unconstrained_thinking
+                    ),
                 )
 
             # Extract prompt_token_ids if requested
@@ -3463,6 +3472,7 @@ class OpenAIServingChat(OpenAIServingBase):
         response_unwrapped: bool = False,
         json_answer_channel: bool = False,
         json_answer_after_thinking: bool = False,
+        unconstrained_thinking: bool = False,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -3482,6 +3492,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 thinking_end=thinking_end,
                 keep_thinking_before_calls=keep_thinking_before_calls,
                 answer_excludes_calls=answer_excludes_calls,
+                unconstrained_thinking=unconstrained_thinking,
             )
             answers = parser.answers_without_calls(text)
             thinking, text = parser.split_thinking(text)
@@ -3999,6 +4010,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     json_answer_channel=request._response_parser_json_answer_channel,
                     json_answer_after_thinking=(
                         request._response_parser_answer_after_thinking
+                    ),
+                    unconstrained_thinking=(
+                        request._response_parser_unconstrained_thinking
                     ),
                 )
 

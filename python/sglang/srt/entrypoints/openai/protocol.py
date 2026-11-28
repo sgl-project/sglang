@@ -988,6 +988,9 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_json_answer_channel: bool = PrivateAttr(default=False)
     # The output thinks before that answer.
     _response_parser_answer_after_thinking: bool = PrivateAttr(default=False)
+    # The thinking in the output came through a reasoning parser's grammar
+    # wrapper, unconstrained, and no reasoning parser takes it out.
+    _response_parser_unconstrained_thinking: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
 
