@@ -556,6 +556,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.pixel_norm_silu",
+        KernelBackend.TRITON,
+        "norm.pixel_norm_silu_bitexact:pixel_norm_silu",
+        _CUDA,
+    ),
+    (
         "diffusion.vdn_delta_factors",
         KernelBackend.JIT,
         "attention.vdn_delta_factors_jit:vdn_delta_factors",
@@ -768,6 +774,8 @@ _EXPORTS: dict[str, str] = {
     "is_channels_last_dense": "norm.channel_rmsnorm_silu_nhwc_jit",
     "bias_residual_add": "norm.bias_residual_add_jit",
     "can_use_bias_residual_add": "norm.bias_residual_add_jit",
+    "can_use_pixel_norm_silu": "norm.pixel_norm_silu_bitexact",
+    "pixel_norm_silu": "norm.pixel_norm_silu_bitexact",
     "can_use_fused_rmsnorm_modulation": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
     "fused_rmsnorm_scale_shift_bitexact": "norm.rmsnorm_scale_shift_bitexact",

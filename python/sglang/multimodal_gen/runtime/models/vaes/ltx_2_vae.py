@@ -14,6 +14,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.embeddings import PixArtAlphaCombinedTimestepSizeEmbeddings
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
+from sglang.kernels.ops.diffusion import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_vae_encode
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
@@ -31,6 +32,35 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     ParallelTiledVAE,
     can_install_spatial_shard_parallel_decode,
     should_run_spatial_shard_parallel_decode,
+)
+from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+if current_platform.is_cuda():
+    try:
+        from sglang.kernels.ops.diffusion import (
+            can_use_conv_bias_epilogue,
+            can_use_pixel_norm_silu,
+            conv_bias_epilogue,
+            pixel_norm_silu,
+        )
+    except ImportError:  # pragma: no cover
+        conv_bias_epilogue = None
+        can_use_conv_bias_epilogue = None
+        pixel_norm_silu = None
+        can_use_pixel_norm_silu = None
+else:
+    conv_bias_epilogue = None
+    can_use_conv_bias_epilogue = None
+    pixel_norm_silu = None
+    can_use_pixel_norm_silu = None
+
+logger = init_logger(__name__)
+
+# Bit-exact by construction; the gate only catches a platform whose aten
+# dispatch differs from the one the kernel replays.
+_NORM_SILU_FUSION = BitExactFusionGate(
+    "LTX video VAE pixel norm + SiLU", per_signature=True
 )
 
 
@@ -85,6 +115,19 @@ class PerChannelRMSNorm(nn.Module):
         # Normalize by the root-mean-square (RMS).
         rms = torch.sqrt(mean_sq + self.eps)
         return x / rms
+
+
+def _norm_chain_conv_dtype(x: torch.Tensor) -> Optional[torch.dtype]:
+    """Dtype a conv reads ``silu(norm(x))`` in when the norm chain runs in fp32.
+
+    Under autocast ``pow`` promotes ``x`` to fp32 and the conv casts the fp32
+    activation to the autocast dtype. Without autocast only an fp32 ``x`` keeps
+    the chain in fp32.
+    """
+    if torch.is_autocast_enabled(x.device.type):
+        dtype = torch.get_autocast_dtype(x.device.type)
+        return dtype if dtype in (torch.bfloat16, torch.float16) else None
+    return torch.float32 if x.dtype == torch.float32 else None
 
 
 # Like LTXCausalConv3d, but whether causal inference is performed can be specified at runtime
@@ -160,17 +203,174 @@ class LTX2VideoCausalConv3d(nn.Module):
             )
         return out
 
+    def _norm_silu_temporal_pad(
+        self,
+        hidden_states: torch.Tensor,
+        norm: nn.Module,
+        causal: bool,
+        conv_cache: Optional[dict],
+        cache_key: Optional[str],
+    ) -> Optional[torch.Tensor]:
+        """``silu(norm(hidden_states))`` written straight into this conv's
+        temporally padded channels_last_3d input, in the dtype the conv reads.
+
+        Bit-identical to the eager norm -> SiLU -> pad -> autocast cast chain:
+        the fp32 activation is rounded once either way. ``None`` when the fused
+        kernel does not apply.
+        """
+        if (
+            pixel_norm_silu is None
+            or type(norm) is not PerChannelRMSNorm
+            or norm.channel_dim != 1
+            or not hidden_states.is_cuda
+        ):
+            return None
+        out_dtype = _norm_chain_conv_dtype(hidden_states)
+        sig = (
+            hidden_states.dtype,
+            out_dtype,
+            hidden_states.is_contiguous(memory_format=torch.channels_last_3d),
+        )
+        if out_dtype is None or not _NORM_SILU_FUSION.can_attempt(sig):
+            return None
+
+        time_kernel_size = self.kernel_size[0]
+        if causal:
+            left, right = time_kernel_size - 1, 0
+        else:
+            left = right = (time_kernel_size - 1) // 2
+        use_cache = (
+            causal and conv_cache is not None and cache_key is not None and left > 0
+        )
+        b, c, t, h, w = hidden_states.shape
+        padded = torch.empty(
+            (b, c, t + left + right, h, w),
+            dtype=out_dtype,
+            device=hidden_states.device,
+            memory_format=torch.channels_last_3d,
+        )
+        body = padded[:, :, left : left + t]
+        if not can_use_pixel_norm_silu(hidden_states, norm.eps, body):
+            return None
+        try:
+            pixel_norm_silu(hidden_states, norm.eps, body)
+        except Exception as exc:
+            _NORM_SILU_FUSION.on_exception(exc, logger=logger)
+            return None
+        if not _NORM_SILU_FUSION.is_verified(sig):
+            reference = F.silu(norm(hidden_states)).to(out_dtype)
+            accepted = _NORM_SILU_FUSION.accept_or_fallback(
+                body, reference, sig=sig, logger=logger
+            )
+            if accepted is not body:
+                return None
+
+        if left:
+            prev = conv_cache.get(cache_key) if use_cache else None
+            padded[:, :, :left].copy_(body[:, :, :1] if prev is None else prev)
+        if right:
+            padded[:, :, left + t :].copy_(body[:, :, -1:])
+        if use_cache:
+            conv_cache[cache_key] = padded[:, :, -left:].detach().clone()
+        return padded
+
+    def _conv_bias_residual(
+        self,
+        hidden_states: torch.Tensor,
+        use_channels_last_pad: bool,
+        residual: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """``conv(hidden_states) [+ residual]`` on the temporally padded input.
+
+        cuDNN does not fuse the bias: aten adds it with a broadcast ``add_``
+        that is not vectorised on channels_last_3d outputs. Run the conv without
+        bias and apply bias (and residual) in one pass with aten's arithmetic.
+        """
+        conv = self.conv
+        if type(conv) is not nn.Conv3d:
+            out = conv(hidden_states)
+            return out if residual is None else out + residual
+
+        reflect = (
+            use_channels_last_pad
+            and hidden_states.is_cuda
+            and conv.padding_mode == "reflect"
+        )
+        if reflect:
+            # reflection_pad3d converts NCDHW inputs to contiguous storage, even
+            # when cuDNN will immediately convert them back to channels-last.
+            # In NDHWC order, reflect H/W and leave C unpadded to keep that layout.
+            _, height_pad, width_pad = conv.padding
+            hidden_states = F.pad(
+                hidden_states.permute(0, 2, 3, 4, 1),
+                (0, 0, width_pad, width_pad, height_pad, height_pad),
+                mode="reflect",
+            ).permute(0, 4, 1, 2, 3)
+
+        def run(bias: Optional[torch.Tensor]) -> torch.Tensor:
+            if reflect:
+                return F.conv3d(
+                    hidden_states,
+                    conv.weight,
+                    bias,
+                    conv.stride,
+                    0,
+                    conv.dilation,
+                    conv.groups,
+                )
+            return conv._conv_forward(hidden_states, conv.weight, bias)
+
+        bias = conv.bias
+        if (
+            conv_bias_epilogue is None
+            or bias is None
+            or not hidden_states.is_cuda
+            or not torch.backends.cudnn.enabled
+            or torch.compiler.is_compiling()
+        ):
+            out = run(bias)
+            return out if residual is None else out + residual
+
+        # The conv output is a temporary this call owns: finish it in place,
+        # like aten's bias ``add_``, instead of holding a second full output.
+        out = run(None)
+        if residual is not None and can_use_conv_bias_epilogue(out, bias, residual):
+            return conv_bias_epilogue(out, bias, residual, inplace=True)
+        if can_use_conv_bias_epilogue(out, bias):
+            out = conv_bias_epilogue(out, bias, inplace=True)
+        else:
+            # Same ops aten runs inside conv3d: bias cast to the activation
+            # dtype (autocast), fp32 add, one rounding.
+            out = out.add_(bias.to(out.dtype).view(1, -1, 1, 1, 1))
+        return out if residual is None else out + residual
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         causal: bool = True,
         conv_cache: Optional[dict] = None,
         cache_key: Optional[str] = None,
+        *,
+        norm: Optional[nn.Module] = None,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """``norm``: the conv input is ``silu(norm(hidden_states))``.
+        ``residual``: added to the conv output."""
         time_kernel_size = self.kernel_size[0]
         use_channels_last_pad = (
             hidden_states.dim() == 5 and self._weight_is_channels_last_3d()
         )
+
+        if norm is not None:
+            if use_channels_last_pad and type(self.conv) is nn.Conv3d:
+                padded = self._norm_silu_temporal_pad(
+                    hidden_states, norm, causal, conv_cache, cache_key
+                )
+                if padded is not None:
+                    return self._conv_bias_residual(
+                        padded, use_channels_last_pad, residual
+                    )
+            hidden_states = F.silu(norm(hidden_states))
 
         if causal:
             left, right = time_kernel_size - 1, 0
@@ -233,33 +433,7 @@ class LTX2VideoCausalConv3d(nn.Module):
                     )
                 hidden_states = torch.concatenate(parts, dim=2)
 
-        if (
-            use_channels_last_pad
-            and hidden_states.is_cuda
-            and type(self.conv) is nn.Conv3d
-            and self.conv.padding_mode == "reflect"
-        ):
-            # reflection_pad3d converts NCDHW inputs to contiguous storage, even
-            # when cuDNN will immediately convert them back to channels-last.
-            # In NDHWC order, reflect H/W and leave C unpadded to keep that layout.
-            _, height_pad, width_pad = self.conv.padding
-            hidden_states = F.pad(
-                hidden_states.permute(0, 2, 3, 4, 1),
-                (0, 0, width_pad, width_pad, height_pad, height_pad),
-                mode="reflect",
-            ).permute(0, 4, 1, 2, 3)
-            return F.conv3d(
-                hidden_states,
-                self.conv.weight,
-                self.conv.bias,
-                self.conv.stride,
-                0,
-                self.conv.dilation,
-                self.conv.groups,
-            )
-
-        hidden_states = self.conv(hidden_states)
-        return hidden_states
+        return self._conv_bias_residual(hidden_states, use_channels_last_pad, residual)
 
 
 def _make_spatial_parallel_conv3d(conv: nn.Conv3d) -> SpatialParallelConv3d:
@@ -379,23 +553,32 @@ class LTX2VideoResnetBlock3d(nn.Module):
         cache_key: Optional[str] = None,
     ) -> torch.Tensor:
         hidden_states = inputs
+        # Without timestep conditioning each conv reads ``silu(norm(x))``
+        # directly, so the conv can take the pair as a fused prologue.
+        norm_in_conv = (
+            self.scale_shift_table is None
+            and type(self.nonlinearity) is nn.SiLU
+            and (self.dropout.p == 0.0 or not self.training)
+        )
 
-        hidden_states = self.norm1(hidden_states)
+        if not norm_in_conv:
+            hidden_states = self.norm1(hidden_states)
 
-        if self.scale_shift_table is not None:
-            temb = (
-                temb.unflatten(1, (4, -1))
-                + self.scale_shift_table[None, ..., None, None, None]
-            )
-            shift_1, scale_1, shift_2, scale_2 = temb.unbind(dim=1)
-            hidden_states = hidden_states * (1 + scale_1) + shift_1
+            if self.scale_shift_table is not None:
+                temb = (
+                    temb.unflatten(1, (4, -1))
+                    + self.scale_shift_table[None, ..., None, None, None]
+                )
+                shift_1, scale_1, shift_2, scale_2 = temb.unbind(dim=1)
+                hidden_states = hidden_states * (1 + scale_1) + shift_1
 
-        hidden_states = self.nonlinearity(hidden_states)
+            hidden_states = self.nonlinearity(hidden_states)
         hidden_states = self.conv1(
             hidden_states,
             causal=causal,
             conv_cache=conv_cache,
             cache_key=None if cache_key is None else f"{cache_key}.conv1",
+            norm=self.norm1 if norm_in_conv else None,
         )
 
         if self.per_channel_scale1 is not None:
@@ -411,18 +594,30 @@ class LTX2VideoResnetBlock3d(nn.Module):
                 + (spatial_noise * self.per_channel_scale1)[None, :, None, ...]
             )
 
-        hidden_states = self.norm2(hidden_states)
+        if not norm_in_conv:
+            hidden_states = self.norm2(hidden_states)
 
-        if self.scale_shift_table is not None:
-            hidden_states = hidden_states * (1 + scale_2) + shift_2
+            if self.scale_shift_table is not None:
+                hidden_states = hidden_states * (1 + scale_2) + shift_2
 
-        hidden_states = self.nonlinearity(hidden_states)
-        hidden_states = self.dropout(hidden_states)
+            hidden_states = self.nonlinearity(hidden_states)
+            hidden_states = self.dropout(hidden_states)
+
+        if self.norm3 is not None:
+            inputs = self.norm3(inputs.movedim(1, -1)).movedim(-1, 1)
+
+        if self.conv_shortcut is not None:
+            inputs = self.conv_shortcut(inputs)
+
+        # conv2 folds its bias and the residual add into one pass, unless noise
+        # is injected in between.
         hidden_states = self.conv2(
             hidden_states,
             causal=causal,
             conv_cache=conv_cache,
             cache_key=None if cache_key is None else f"{cache_key}.conv2",
+            norm=self.norm2 if norm_in_conv else None,
+            residual=inputs if self.per_channel_scale2 is None else None,
         )
 
         if self.per_channel_scale2 is not None:
@@ -437,14 +632,8 @@ class LTX2VideoResnetBlock3d(nn.Module):
                 hidden_states
                 + (spatial_noise * self.per_channel_scale2)[None, :, None, ...]
             )
+            hidden_states = hidden_states + inputs
 
-        if self.norm3 is not None:
-            inputs = self.norm3(inputs.movedim(1, -1)).movedim(-1, 1)
-
-        if self.conv_shortcut is not None:
-            inputs = self.conv_shortcut(inputs)
-
-        hidden_states = hidden_states + inputs
         return hidden_states
 
 
@@ -1363,7 +1552,9 @@ class LTX2VideoDecoder3d(nn.Module):
                 cache_key=_ck(f"up_blocks.{i}"),
             )
 
-        hidden_states = self.norm_out(hidden_states)
+        norm_in_conv = self.time_embedder is None and type(self.conv_act) is nn.SiLU
+        if not norm_in_conv:
+            hidden_states = self.norm_out(hidden_states)
 
         if self.time_embedder is not None:
             temb = self.time_embedder(
@@ -1378,12 +1569,14 @@ class LTX2VideoDecoder3d(nn.Module):
             shift, scale = temb.unbind(dim=1)
             hidden_states = hidden_states * (1 + scale) + shift
 
-        hidden_states = self.conv_act(hidden_states)
+        if not norm_in_conv:
+            hidden_states = self.conv_act(hidden_states)
         hidden_states = self.conv_out(
             hidden_states,
             causal=causal,
             conv_cache=conv_cache,
             cache_key=_ck("conv_out"),
+            norm=self.norm_out if norm_in_conv else None,
         )
 
         p = self.patch_size
@@ -1556,7 +1749,11 @@ class LTX23VideoDecoder3d(nn.Module):
             else:
                 hidden_states = up_block(hidden_states, causal=causal)
 
-        hidden_states = self.norm_out(hidden_states)
+        norm_in_conv = (self.time_embedder is None or temb is None) and type(
+            self.conv_act
+        ) is nn.SiLU
+        if not norm_in_conv:
+            hidden_states = self.norm_out(hidden_states)
 
         if self.time_embedder is not None and temb is not None:
             temb = self.time_embedder(
@@ -1571,8 +1768,13 @@ class LTX23VideoDecoder3d(nn.Module):
             shift, scale = temb.unbind(dim=1)
             hidden_states = hidden_states * (1 + scale) + shift
 
-        hidden_states = self.conv_act(hidden_states)
-        hidden_states = self.conv_out(hidden_states, causal=causal)
+        if not norm_in_conv:
+            hidden_states = self.conv_act(hidden_states)
+        hidden_states = self.conv_out(
+            hidden_states,
+            causal=causal,
+            norm=self.norm_out if norm_in_conv else None,
+        )
 
         p = self.patch_size
         p_t = self.patch_size_t

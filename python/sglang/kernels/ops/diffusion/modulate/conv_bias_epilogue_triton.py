@@ -21,7 +21,10 @@ Two entry points, both exact replicas of the aten arithmetic:
 ``bias`` may be fp32 while ``x`` is half precision (the autocast case); it is
 cast to ``x.dtype`` first, which is what autocast does before calling the conv.
 Layout: the output is ``empty_like(x)`` so it keeps ``x``'s dense
-channels_last(_3d) strides, exactly like the in-place aten ``add_``.
+channels_last(_3d) strides, exactly like the in-place aten ``add_``. With
+``inplace=True`` the result is written back into ``x`` (each element depends
+only on the same index of its inputs), so a caller that owns ``x`` keeps the
+memory footprint of aten's ``add_`` as well.
 
 Verified (``torch.equal`` vs aten): ``[1, 96, 4, 480, 832]``,
 ``[1, 192, 4, 240, 416]``, ``[1, 384, 2, 120, 208]``, ``[1, 384, 1, 60, 104]``
@@ -130,10 +133,13 @@ def conv_bias_epilogue(
     x: torch.Tensor,
     bias: torch.Tensor,
     residual: torch.Tensor | None = None,
+    *,
+    inplace: bool = False,
 ) -> torch.Tensor:
     """``x.dtype(x + bias)`` or ``x.dtype(x.dtype(x + bias) + residual)`` on a
-    dense channels_last tensor, bit-exact vs aten. Raises on unsupported input;
-    guard with :func:`can_use_conv_bias_epilogue`."""
+    dense channels_last tensor, bit-exact vs aten. ``inplace=True`` writes the
+    result into ``x`` and returns it instead of allocating a new tensor. Raises
+    on unsupported input; guard with :func:`can_use_conv_bias_epilogue`."""
     if not can_use_conv_bias_epilogue(x, bias, residual):
         raise ValueError(
             "unsupported input for conv_bias_epilogue: needs a CUDA dense "
@@ -142,7 +148,7 @@ def conv_bias_epilogue(
         )
     # Same cast autocast applies to the bias before the conv call.
     bias = bias.reshape(-1).to(x.dtype).contiguous()
-    out = torch.empty_like(x)
+    out = x if inplace else torch.empty_like(x)
     total = out.numel()
     BLOCK = 4096
     grid = (triton.cdiv(total, BLOCK),)

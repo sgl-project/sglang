@@ -63,6 +63,30 @@ def test_conv_bias_epilogue_matches_aten(x_dtype, bias_dtype, shape):
     assert out_res.stride() == x.stride()
     assert torch.equal(out_res, ref_res)
 
+    # inplace=True writes the same values back into x.
+    x_res = x.clone()
+    assert conv_bias_epilogue(x_res, bias, h, inplace=True) is x_res
+    assert torch.equal(x_res, ref_res)
+    assert conv_bias_epilogue(x, bias, inplace=True) is x
+    assert torch.equal(x, ref)
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_conv_bias_epilogue_inplace_allocates_no_output(with_residual):
+    # A caller that owns the conv output keeps the footprint of aten's add_.
+    x = _dense((1, 96, 2, 30, 52), torch.bfloat16)
+    bias = torch.randn(96, device=DEVICE, dtype=torch.float32)
+    h = _dense(x.shape, x.dtype) if with_residual else None
+    conv_bias_epilogue(x.clone(), bias, h, inplace=True)  # compile
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    held = torch.cuda.memory_allocated()
+    conv_bias_epilogue(x, bias, h, inplace=True)
+    torch.cuda.synchronize()
+    x_bytes = x.numel() * x.element_size()
+    assert torch.cuda.max_memory_allocated() - held < x_bytes // 2
+
 
 @torch.no_grad()
 def test_conv_bias_epilogue_equals_conv_with_bias():
