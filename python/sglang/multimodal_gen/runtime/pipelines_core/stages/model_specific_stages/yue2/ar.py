@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import os
 import time
 
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -51,12 +52,32 @@ class Yue2ARStage(PipelineStage):
                 model, [token_prefixes(request, tokenizer)] if cfg_scale == 1
                 else [token_prefixes(request, tokenizer), negative],
                 song_token_budget(generation_config.abc, generation_config.semantic))
-            try:
-                abc_ids, semantic_ids, timing, fed_codec = generate_song_tokens(
+            def _generate():
+                return generate_song_tokens(
                     model, session, tokenizer, request,
                     abc_sampling=generation_config.abc,
                     semantic_sampling=generation_config.semantic,
                     cfg_scale=cfg_scale, negative_prefix_ids=negative)
+
+            # SGLANG_YUE2_PROFILE=/path/trace.json dumps a CPU+CUDA chrome trace
+            # of the whole AR stage (debug only, never set in production).
+            profile_path = os.environ.get("SGLANG_YUE2_PROFILE", "")
+            try:
+                if profile_path:
+                    from torch.profiler import (
+                        ProfilerActivity,
+                        profile as torch_profile,
+                    )
+
+                    with torch_profile(
+                        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                        record_shapes=True,
+                    ) as prof:
+                        abc_ids, semantic_ids, timing, fed_codec = _generate()
+                    prof.export_chrome_trace(profile_path)
+                    logger.info("YuE2 AR profile written to %s", profile_path)
+                else:
+                    abc_ids, semantic_ids, timing, fed_codec = _generate()
             except Exception:
                 default_session_pool.release(session)
                 raise

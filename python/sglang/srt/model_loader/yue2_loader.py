@@ -39,6 +39,18 @@ class Yue2Runtime:
         ).to(device)
         model.eval()
 
+        # ROCm: route batch-1 bf16 decode linears through the JIT GEMV
+        # (SGLANG_YUE2_JIT_GEMV=1). No-op on CUDA or when disabled.
+        from sglang.srt.models.yue2.gemv_amdgpu import patch_linear_modules
+
+        patched = patch_linear_modules(model)
+        if patched:
+            import logging
+
+            logging.getLogger(__name__).info(
+                "YuE2 JIT GEMV enabled on %d bf16 linear layers", patched
+            )
+
         vae_config = YuE2VAEConfig.from_pretrained(str(vae_dir), local_files_only=True)
         vae = YuE2VAE(vae_config)
         from safetensors.torch import load_file

@@ -24,12 +24,27 @@ from .protocol import ABC_END, CODEC_OFFSET, CODEC_SIZE, EOD, MUSIC_END
 
 _IN_TREE = None
 _PIP = None
+_AMDGPU = None
 
 
-# NOTE (yiakwy) : deepseek-select is slightly fast than extended flash-float-jit-kernel in this workload
 def _load_topk_backend():
-    """Prefer the in-tree JIT DeepSelect wrapper, fall back to the pip package."""
-    global _IN_TREE, _PIP
+    """Prefer the in-tree JIT wrapper for the current device.
+
+    On ROCm the flash-float radix topk (``fast_topk_amdgpu``) replaces
+    DeepSelect: DeepSelect's JIT only builds for SM 9.0/10.0/10.3. CUDA keeps
+    the original DeepSelect preference order.
+    """
+    global _IN_TREE, _PIP, _AMDGPU
+    if torch.version.hip is not None:
+        if _AMDGPU is None:
+            try:
+                from sglang.kernels.ops import fast_topk_amdgpu as module
+
+                _AMDGPU = module if module.is_deepselect_supported() else False
+            except Exception:
+                _AMDGPU = False
+        if _AMDGPU is not False:
+            return _AMDGPU
     if _IN_TREE is None:
         try:
             from sglang.kernels.ops import deep_select as module

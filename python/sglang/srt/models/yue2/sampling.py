@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request-local sampling, preserving mode-specific historical arithmetic."""
 from __future__ import annotations
+import logging
 import os
 import time
 import torch
@@ -84,6 +85,8 @@ def _decode_loop(*, step_fn, logits_pair, sampling, phase, cfg_scale, sampler, g
     conditional, unconditional = logits_pair
     history, first, eos = [], None, False
     end = ABC_END if phase == "abc" else MUSIC_END
+    step_log = os.environ.get("SGLANG_YUE2_STEP_LOG", "0") == "1"
+    t_prev = None
     for step in range(sampling.max_tokens):
         if cancelled is not None and cancelled():
             raise InterruptedError(f"Cancelled during {phase}")
@@ -92,6 +95,12 @@ def _decode_loop(*, step_fn, logits_pair, sampling, phase, cfg_scale, sampler, g
         next_id = _sample_next(sampler, logits, sampling, phase, history, history_buf, step,
                                generator, device, legacy_off)
         token = int(next_id.item())
+        if step_log:
+            now = time.perf_counter()
+            if t_prev is not None:
+                logging.getLogger(__name__).info(
+                    "YuE2 %s step %d wall %.1f ms", phase, step, (now - t_prev) * 1e3)
+            t_prev = now
         if sampler is not None:
             history_buf[len(history)] = next_id.reshape(-1)[0]
         if first is None:
@@ -118,6 +127,10 @@ def _decode_loop(*, step_fn, logits_pair, sampling, phase, cfg_scale, sampler, g
               "sampler": "deepselect" if sampler is not None else "reference"}
 
     fed = len(history) - (0 if eos else 1)
+    if step_log:
+        logging.getLogger(__name__).info(
+            "YuE2 %s timing %s", phase,
+            {k: (round(v, 3) if isinstance(v, float) else v) for k, v in timing.items()})
     return history, timing, (not eos), max(fed, 0)
 
 

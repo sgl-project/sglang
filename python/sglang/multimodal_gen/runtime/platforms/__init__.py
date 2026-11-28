@@ -129,7 +129,16 @@ def rocm_platform_plugin() -> str | None:
         finally:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
-        logger.debug("ROCm platform is unavailable: %s", e)
+        logger.debug("ROCm platform is unavailable via amdsmi: %s", e)
+        # amdsmi needs the amdgpu kernel driver. Paravirtualized setups (WSL's
+        # /dev/dxg passthrough) have no amdgpu module while ROCm torch still
+        # sees the device, so fall back to torch's own HIP probe.
+        try:
+            import torch
+
+            is_rocm = torch.version.hip is not None and torch.cuda.is_available()
+        except Exception:
+            is_rocm = False
 
     return _BUILTIN_PLATFORM_QUALNAMES["rocm"] if is_rocm else None
 

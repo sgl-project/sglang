@@ -78,7 +78,8 @@ class GraphAR:
     ``prefill()`` predicts the first token. At most ``max_tokens-1`` calls to
     ``step(token)`` predict the remaining tokens. Returned graph logits share
     output storage and remain valid until the next step. ``capture=False`` is
-    an eager diagnostic path for CPU/tiny-model correctness checks.
+    an eager diagnostic path on CUDA and the default sliced-attention path on
+    ROCm (see ``eager_decode``).
     """
     def __init__(self, model, prefixes, max_tokens, *, capture=True, attention_backend="auto",
                  fuse_projections=False, sampler=None):
@@ -107,6 +108,7 @@ class GraphAR:
         if capture and self.device.type != "cuda":
             raise ValueError("CUDA graphs require a CUDA model; capture=False is for diagnostics")
         self.prefixes = [[int(token) for token in prefix] for prefix in prefixes]
+        self.prefix_lengths = [len(prefix) for prefix in self.prefixes]
         self.max_tokens, self.branches = int(max_tokens), len(prefixes)
         self.capacity = max(map(len, prefixes)) + self.max_tokens
         self.capture, self.graph, self.output = capture, None, None
@@ -119,12 +121,27 @@ class GraphAR:
         # accepts GPU effective lengths; the public masked SDPA can select a
         # much slower math kernel. Keep a cuDNN/public-SDPA fallback explicit.
         if attention_backend == "auto":
-            attention_backend = "flash" if flash else "cudnn" if fused and torch.backends.cudnn.is_available() else "sdpa"
+            if torch.version.hip is not None:
+                # gfx1151: variable-length flash/cuDNN paths are not validated;
+                # the AMDGPU port uses the masked SDPA fallback only for graph
+                # capture and runs the length-sliced eager path elsewhere.
+                attention_backend = "sdpa"
+            else:
+                attention_backend = "flash" if flash else "cudnn" if fused and torch.backends.cudnn.is_available() else "sdpa"
         if attention_backend == "flash" and not flash:
             raise ValueError("Pinned PyTorch variable-length CUDA FlashAttention is unavailable")
         if attention_backend == "cudnn" and not (fused and torch.backends.cudnn.is_available()):
             raise ValueError("cuDNN attention requires a supported CUDA dtype/head dimension")
         self.attention_backend = attention_backend
+        # The capacity-wide SDPA mask costs ~30x an unmasked call on ROCm's
+        # math fallback, so the HIP/sdpa decode slices KV to the used length
+        # instead and skips capture (replay is worth ~0 there anyway).
+        eager_mode = os.environ.get("SGLANG_YUE2_EAGER_DECODE", "auto")
+        self.eager_decode = eager_mode == "1" or (
+            eager_mode == "auto" and torch.version.hip is not None
+            and self.attention_backend == "sdpa")
+        if self.eager_decode:
+            self.capture = False
         self.ready, self.closed, self.steps = False, False, 0
         # Sequence-major layout makes the packed FA view contiguous without
         # copying all cached keys at each decode step.
@@ -162,17 +179,52 @@ class GraphAR:
         self.sampler = sampler
         self.step_mode = sampler is not None
 
+    def _decode_used(self):
+        """KV slice lengths for the next eager decode, or None for the mask."""
+        if self.attention_backend == "flash":
+            return None
+        return [length + self.steps + 1 for length in self.prefix_lengths]
+
+    def _sdpa_decode(self, q, keys, values, visible, used):
+        """Decode attention over exactly the visible KV slots.
+
+        ``used`` is one length per branch (CFG prefixes can differ) or None to
+        fall back to the capacity-wide mask. The per-branch loop only runs for
+        CFG when the two prefixes have different lengths.
+        """
+        enable_gqa = self.model.config.num_attention_heads != self.model.config.num_key_value_heads
+        if used is None:
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2),
+                attn_mask=visible, is_causal=False, enable_gqa=enable_gqa).transpose(1, 2)
+        lengths = list(used) if isinstance(used, (list, tuple)) else [used] * q.shape[0]
+        if min(lengths) == max(lengths):
+            return F.scaled_dot_product_attention(
+                q.transpose(1, 2), keys[:, : lengths[0]].transpose(1, 2),
+                values[:, : lengths[0]].transpose(1, 2),
+                is_causal=False, enable_gqa=enable_gqa).transpose(1, 2)
+        out = [
+            F.scaled_dot_product_attention(
+                q[b:b + 1].transpose(1, 2), keys[b:b + 1, :u].transpose(1, 2),
+                values[b:b + 1, :u].transpose(1, 2),
+                is_causal=False, enable_gqa=enable_gqa)
+            for b, u in enumerate(lengths)
+        ]
+        return torch.cat(out, dim=0).transpose(1, 2)
+
     @torch.inference_mode()
-    def _decode(self):
+    def _decode(self, used=None):
         if self.use_fused_kernels:
-            return self._decode_fused()
+            return self._decode_fused(used=used)
         backbone = self.model.model
         cos, sin = backbone.rotary_emb(self.positions[:, None])
         x = backbone.embed_tokens(self.tokens)
         visible = None
-        if self.attention_backend != "flash":
+        if used is None and self.attention_backend != "flash":
             visible = (self.key_positions[None, :] <= self.positions[:, None])[:, None, None, :]
-        used_lengths = (self.positions + 1).to(torch.int32)
+        used_lengths = None
+        if self.attention_backend == "flash":
+            used_lengths = (self.positions + 1).to(torch.int32)
         config = self.model.config
         slots = self.positions[:, None, None, None].expand(
             self.branches, 1, config.num_key_value_heads, config.head_dim)
@@ -194,6 +246,8 @@ class GraphAR:
             values.scatter_(1, slots, v)
             # All allocated slots are present, but only each branch's completed
             # prefix and the current token are visible. Future slots never leak.
+            # When the host knows that length, slice it away instead of masking:
+            # the capacity-wide mask is the slowest op in the whole decode.
             if self.attention_backend == "flash":
                 # seqused_k hides each branch's unfilled slots; FA3's varlen
                 # entrypoint honours it too (no custom mask needed).
@@ -205,13 +259,9 @@ class GraphAR:
             elif self.attention_backend == "cudnn":
                 from torch.nn.attention import SDPBackend, sdpa_kernel
                 with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-                    h = F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2),
-                            attn_mask=visible, is_causal=False,
-                            enable_gqa=config.num_attention_heads != config.num_key_value_heads).transpose(1, 2)
+                    h = self._sdpa_decode(q, keys, values, visible, used)
             else:
-                h = F.scaled_dot_product_attention(q.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2),
-                            attn_mask=visible, is_causal=False,
-                            enable_gqa=config.num_attention_heads != config.num_key_value_heads).transpose(1, 2)
+                h = self._sdpa_decode(q, keys, values, visible, used)
             x = x + layer.self_attn.o_proj(h.reshape(self.branches, 1, -1))
             normalized = layer.post_attention_layernorm(x)
             if self.fused_weights:
@@ -224,7 +274,7 @@ class GraphAR:
         return output
 
     @torch.inference_mode()
-    def _decode_fused(self):
+    def _decode_fused(self, used=None):
         """Decode with SGLang fused kernels: fused_add_rmsnorm, fused QKV +
         gate/up GEMMs, fused per-head q/k RMSNorm + NeoX RoPE, fused SiLU-mul.
 
@@ -244,9 +294,11 @@ class GraphAR:
             residual.view(B, H), backbone.layers[0].input_layernorm.weight, eps
         ).view(B, 1, H)
         visible = None
-        if self.attention_backend != "flash":
+        if used is None and self.attention_backend != "flash":
             visible = (self.key_positions[None, :] <= self.positions[:, None])[:, None, None, :]
-        used_lengths = (self.positions + 1).to(torch.int32)
+        used_lengths = None
+        if self.attention_backend == "flash":
+            used_lengths = (self.positions + 1).to(torch.int32)
         slots = self.positions[:, None, None, None].expand(B, 1, HKV, HD)
         last = len(backbone.layers) - 1
         for index, (layer, keys, values) in enumerate(zip(backbone.layers, self.keys, self.values)):
@@ -270,15 +322,9 @@ class GraphAR:
             elif self.attention_backend == "cudnn":
                 from torch.nn.attention import SDPBackend, sdpa_kernel
                 with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
-                    h = F.scaled_dot_product_attention(
-                        q.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2),
-                        attn_mask=visible, is_causal=False, enable_gqa=HQ != HKV,
-                    ).transpose(1, 2)
+                    h = self._sdpa_decode(q, keys, values, visible, used)
             else:
-                h = F.scaled_dot_product_attention(
-                    q.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2),
-                    attn_mask=visible, is_causal=False, enable_gqa=HQ != HKV,
-                ).transpose(1, 2)
+                h = self._sdpa_decode(q, keys, values, visible, used)
             attn = layer.self_attn.o_proj(h.reshape(B, 1, -1)).view(B, H)
             sgl_kernel.fused_add_rmsnorm(
                 attn, residual.view(B, H), layer.post_attention_layernorm.weight, eps)
@@ -366,7 +412,7 @@ class GraphAR:
         else:
             self.tokens.copy_(torch.tensor([[int(token)]], device=self.device,
                                            dtype=torch.long))
-        result = self._decode()
+        result = self._decode(used=self._decode_used())
         self.steps += 1
         return result
 
@@ -412,7 +458,7 @@ class GraphAR:
             self.graph.replay()
             result = self.output
         else:
-            result = self._decode()
+            result = self._decode(used=self._decode_used())
         self.steps += 1
         return result
 
@@ -428,15 +474,15 @@ class GraphAR:
         self.closed = True
 
     def reopen(self, prefixes, max_tokens):
-        """Reset a pooled session for a new request without recapturing.
+        """Reset a pooled session for a new request without reallocating.
 
-        The captured graph topology only depends on (branches, capacity), so
-        reusing a session only needs fresh buffers: the prefix tail token,
-        RoPE positions, and the per-request step budget. Stale KV slots beyond
-        the new prefix are never read: flash honours ``seqused_k`` and the
-        masked backends apply the ``visible`` mask, and prefill overwrites
-        slots ``0..len(prefix)-1`` while the first decode overwrites the next
-        slot before it becomes visible.
+        Buffers only depend on (branches, capacity), so reusing a session only
+        needs fresh prefix state: the prefix tail token, RoPE positions, the
+        per-request step budget, and the per-branch visible lengths.
+        Stale KV slots beyond the new prefix are never read: flash honours
+        ``seqused_k`` and the sliced/masked backends stop at the visible
+        length. Prefill overwrites slots ``0..len(prefix)-1`` while the first
+        decode overwrites the next slot before it becomes visible.
         """
         if self.closed:
             raise RuntimeError("reopen requires an open session")
@@ -446,6 +492,7 @@ class GraphAR:
         if needed > self.capacity:
             raise ValueError("Pooled session capacity exceeded")
         self.prefixes = [[int(token) for token in prefix] for prefix in prefixes]
+        self.prefix_lengths = [len(prefix) for prefix in self.prefixes]
         self.max_tokens = int(max_tokens)
         self.steps = 0
         self.ready = False
@@ -459,11 +506,12 @@ class GraphAR:
 
 
 class GraphSessionPool:
-    """Process-wide pool of captured AR decode graphs, keyed by (branches, capacity).
+    """Process-wide pool of AR decode sessions, keyed by (branches, capacity).
 
-    Capturing one decode graph costs ~35 ms; the pool amortizes it across
-    requests. Sessions are borrowed for the whole request (AR phases and the
-    NAR stage's KV reuse) and returned via :meth:`release`.
+    On CUDA a session caches a captured decode graph (~35 ms to build) across
+    requests; on ROCm's sliced eager path it caches the KV buffers instead.
+    Sessions are borrowed for the whole request (AR phases and the NAR stage's
+    KV reuse) and returned via :meth:`release`.
     """
 
     def __init__(self, bucket: int = 256, max_sessions_per_key: int = 4):

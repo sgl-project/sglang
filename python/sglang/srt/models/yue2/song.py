@@ -34,17 +34,23 @@ def generate_song_tokens(model, session, tokenizer, request: SongRequest, *,
     feeds the remainder plus ``MUSIC_END``. The session is left open with the
     full AR KV (prefix + codec + MUSIC_END) resident.
     """
+    import logging
+
     if (cfg_scale == 1.0 and request.cot != "off"
             and os.environ.get("SGLANG_YUE2_STEP_GRAPH", "1") == "1"
+            and not getattr(session, "eager_decode", False)
             and session.device.type == "cuda"):
         try:
             return _generate_song_tokens_step_graph(
                 model, session, tokenizer, request,
                 abc_sampling=abc_sampling, semantic_sampling=semantic_sampling,
                 cancelled=cancelled, on_token=on_token)
-        except _StepGraphUnavailable:
-            pass
+        except _StepGraphUnavailable as exc:
+            logging.getLogger(__name__).info("YuE2 step graph unavailable: %s", exc)
 
+    logging.getLogger(__name__).info(
+        "YuE2 AR path=looped fast_sampler=%s available=%s",
+        use_fast_sampler, fast_sampler_available())
     return _generate_song_tokens_looped(
         model, session, tokenizer, request,
         abc_sampling=abc_sampling, semantic_sampling=semantic_sampling,
@@ -224,6 +230,16 @@ def _generate_song_tokens_looped(model, session, tokenizer, request: SongRequest
     start = time.perf_counter()
     logits = session.prefill()
     execution, attention = "cuda_graph", session.attention_backend
+    if os.environ.get("SGLANG_YUE2_STEP_LOG", "0") == "1":
+        import logging
+
+        logging.getLogger(__name__).info(
+            "YuE2 session backend=%s eager=%s slices=%s graph=%s branches=%d capacity=%d "
+            "prefix_tokens=%d semantic_sampler=%s",
+            session.attention_backend, getattr(session, "eager_decode", None),
+            session.prefix_lengths, session.graph is not None, session.branches,
+            session.capacity, len(prefix),
+            "reference" if (request.cot == "off" or not fast) else "amdgpu")
 
     def branch(logits):
         return logits[:1], logits[1:] if cfg_scale != 1 else None
