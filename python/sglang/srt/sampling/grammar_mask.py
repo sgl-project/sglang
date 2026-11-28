@@ -1,8 +1,8 @@
-"""The grammar sampling plugin: masks each grammar request's logits row to the
+"""The grammar mask stage: masks each grammar request's logits row to the
 tokens its grammar allows.
 
 Its step state is `SamplingBatchInfo.grammars`, set at each launch from the
-step's requests. The mask is built when the grammar slot runs, from the grammar
+step's requests. The mask is built when the stage runs, from the grammar
 objects' state at that point. The scheduler owns everything around it:
 
 - Host-side matching: it advances each grammar over the sampled tokens.

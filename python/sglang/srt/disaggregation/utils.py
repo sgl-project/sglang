@@ -1860,8 +1860,7 @@ def get_kv_transfer_buf_infos(storage: KVStorage | StaticKVStorage):
 
 
 def _wire_state_type(state_type) -> Enum:
-    # A plan names a state type by its wire value; a static pool's
-    # hardware-specific component (Ascend's) arrives as its own enum member.
+    # Plans use wire strings, while static pools supply enum members.
     from sglang.srt.disaggregation.base.conn import StateType
 
     return state_type if isinstance(state_type, Enum) else StateType(state_type)

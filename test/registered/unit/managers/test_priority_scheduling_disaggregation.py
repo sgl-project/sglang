@@ -1034,7 +1034,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
         scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.penalty_status_pool = idle_penalty_status_pool()
-        scheduler.sampler_params_pool = MagicMock()
+        scheduler.sampling_params_pool = MagicMock()
         scheduler.enable_priority_scheduling = False
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0
@@ -1044,6 +1044,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.model_config = MagicMock()
         scheduler.enable_overlap = enable_overlap
         scheduler.spec_algorithm = MagicMock()
+        scheduler.draft_worker = None
         scheduler.max_running_requests = 1
         scheduler.future_map = MagicMock()
         scheduler.policy = MagicMock()

@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any, Optional, Protocol, Sequence
 from torch import Tensor
 
 if TYPE_CHECKING:
-    import torch
-
     from sglang.srt.arg_groups.fields.exec_ import ExecFeatures
     from sglang.srt.arg_groups.model_override_base import ResolvingConfig
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -25,7 +23,7 @@ if TYPE_CHECKING:
 
 class WatermarkRows(Protocol):
     """One step's per-row watermark policy, built by the scheduler at each
-    launch from the step's requests.
+    launch from the step's rows of ``SamplingParamsPool``.
 
     Exists only if at least one row is a candidate (enabled and top_k > 1); the
     batch carries None otherwise. Only the algorithm's own engine reads its
@@ -34,7 +32,7 @@ class WatermarkRows(Protocol):
 
 
 @dataclass(frozen=True)
-class SampleStep:
+class SampleWatermarkOutput:
     # What the stock sampler must sample with.
     sampling_info: SamplingBatchInfo
     # The pre-watermark logits, iff the caller asked to keep them for logprobs.
@@ -49,7 +47,7 @@ class SampleStep:
 class SampleWatermark(Protocol):
     """One ordinary sampling step's watermark, bound to its forward batch."""
 
-    def apply(self, logits: Tensor, *, keep_logits: bool) -> SampleStep: ...
+    def apply(self, logits: Tensor, *, keep_logits: bool) -> SampleWatermarkOutput: ...
 
     def commit(self, token_ids: Tensor) -> None: ...
 
@@ -130,14 +128,19 @@ class WatermarkAdapter(Protocol):
         device: str,
     ) -> WatermarkEngine: ...
 
-    def build_rows(
-        self,
-        requests: Sequence[Req],
-        *,
-        features: ExecFeatures,
-        device: torch.device | str,
-    ) -> Optional[WatermarkRows]:
-        """The batch's rows, or None when no request is a candidate."""
+    # How many int32 fields of `SamplingParamsPool` the algorithm keeps per request.
+    NUM_POOL_FIELDS: int
+
+    def pool_values(
+        self, request: Req, *, features: ExecFeatures
+    ) -> tuple[bool, Sequence[int]]:
+        """Whether the request is a candidate (enabled and top_k > 1), and its
+        NUM_POOL_FIELDS int32 values, written to the pool at admission."""
+        ...
+
+    def build_rows(self, values: Tensor, candidates_host: list[bool]) -> WatermarkRows:
+        """The batch's rows from its gathered [NUM_POOL_FIELDS, bs] values;
+        called only when some row is a candidate."""
         ...
 
     def request_enabled(

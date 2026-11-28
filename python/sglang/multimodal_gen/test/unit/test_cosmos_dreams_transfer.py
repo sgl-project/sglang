@@ -351,6 +351,11 @@ class TestTransferFramesAndHistory(unittest.TestCase):
     def test_missing_video_has_no_fps(self):
         self.assertIsNone(read_video_fps("/nonexistent/control.mp4"))
 
+    def test_url_is_never_probed_for_fps(self):
+        with mock.patch("imageio.v3.immeta") as immeta:
+            self.assertIsNone(read_video_fps("https://example.com/control.mp4"))
+        immeta.assert_not_called()
+
     def test_synthetic_control_matches_warmup_request(self):
         frames = synthetic_control_frames(num_frames=17, height=480, width=832)
         self.assertEqual(tuple(frames.shape), (3, 17, 480, 832))
