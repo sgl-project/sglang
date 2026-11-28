@@ -1080,9 +1080,7 @@ class Pi05CoreModel(nn.Module):
         vlm_config = get_gemma_variant_config(config.paligemma_variant)
         action_config = get_gemma_variant_config(config.action_expert_variant)
         precision = (
-            "bfloat16"
-            if config.materialize_dtype in ("bf16", "bfloat16")
-            else "float32"
+            "bfloat16" if torch.get_default_dtype() == torch.bfloat16 else "float32"
         )
         self.paligemma_with_expert = PaliGemmaWithExpertModel(
             vlm_config,
