@@ -65,6 +65,13 @@ class MiniMaxH3ReleaseMetadata:
     stochastic_sampling: bool = False
     # LoRA adapter applied at load, relative to the model dir
     lora_adapter: str | None = None
+    # trained sigma knots of a distilled release that are not whole timesteps,
+    # unshifted, descending in (0, 1]; the loop ends at sigma 0. Exclusive
+    # with dmd_denoising_steps.
+    raw_sigmas: tuple[float, ...] | None = None
+    # "vae" decodes the final latents; "dwd" predicts the frames from the last
+    # step's features with the DiT's pixel head instead (decoder-free)
+    video_output: str = "vae"
 
     @classmethod
     def from_model_index(
@@ -151,15 +158,43 @@ class MiniMaxH3ReleaseMetadata:
                     "strictly decreasing integers in (0, 1000]"
                 )
             dmd_steps = tuple(dmd_steps)
+        raw_sigmas = raw.get("raw_sigmas")
+        if raw_sigmas is not None:
+            if dmd_steps is not None:
+                raise ValueError(
+                    "model_index.json._minimax_h3 takes dmd_denoising_steps or "
+                    "raw_sigmas, not both"
+                )
+            if (
+                not isinstance(raw_sigmas, list)
+                or not raw_sigmas
+                or any(
+                    isinstance(sigma, bool)
+                    or not isinstance(sigma, (int, float))
+                    or not 0.0 < float(sigma) <= 1.0
+                    for sigma in raw_sigmas
+                )
+                or any(left <= right for left, right in zip(raw_sigmas, raw_sigmas[1:]))
+            ):
+                raise ValueError(
+                    "model_index.json._minimax_h3.raw_sigmas must be strictly "
+                    "decreasing numbers in (0, 1]"
+                )
+            raw_sigmas = tuple(float(sigma) for sigma in raw_sigmas)
+        video_output = raw.get("video_output", "vae")
+        if video_output not in ("vae", "dwd"):
+            raise ValueError(
+                "model_index.json._minimax_h3.video_output must be 'vae' or 'dwd'"
+            )
         stochastic_sampling = raw.get("stochastic_sampling", False)
         if not isinstance(stochastic_sampling, bool):
             raise ValueError(
                 "model_index.json._minimax_h3.stochastic_sampling must be a boolean"
             )
-        if stochastic_sampling and dmd_steps is None:
+        if stochastic_sampling and dmd_steps is None and raw_sigmas is None:
             raise ValueError(
                 "model_index.json._minimax_h3.stochastic_sampling requires "
-                "dmd_denoising_steps"
+                "dmd_denoising_steps or raw_sigmas"
             )
         lora_adapter = raw.get("lora_adapter")
         if lora_adapter is not None and (
@@ -183,6 +218,8 @@ class MiniMaxH3ReleaseMetadata:
             pdd_fused_heads=pdd_fused_heads,
             stochastic_sampling=stochastic_sampling,
             lora_adapter=lora_adapter,
+            raw_sigmas=raw_sigmas,
+            video_output=video_output,
         )
         for task in metadata.tasks:
             if canonical_minimax_h3_task(task) != task:
@@ -207,6 +244,15 @@ class MiniMaxH3ReleaseMetadata:
     @property
     def is_image(self) -> bool:
         return self.partition == MINIMAX_H3_IMAGE_PARTITION
+
+    @property
+    def num_trained_steps(self) -> int | None:
+        """DiT forwards a distilled release was trained for; None if any."""
+        if self.dmd_denoising_steps is not None:
+            return len(self.dmd_denoising_steps)
+        if self.raw_sigmas is not None:
+            return len(self.raw_sigmas)
+        return None
 
     @property
     def sigma_shift_scales(self) -> dict[str, float] | None:

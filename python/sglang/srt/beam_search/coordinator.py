@@ -72,6 +72,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.selection_cuda_graph import TrieSelectionGraphCache
@@ -206,8 +207,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"beam_width or raise --max-running-requests."
             )
 
-        # Effective generation budget: keep prompt + budget + member margin
-        # within the row width so member-side length can never truncate first.
+        # Effective generation budget: keep budget + member margin within the
+        # scheduler's context clamp so member-side length can never truncate first.
         prompt_len = len(req.origin_input_ids)
         max_new_tokens = min(
             (
@@ -215,7 +216,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 if user_params.max_new_tokens is not None
                 else 1 << 30
             ),
-            self.max_req_len - prompt_len - 1 - MEMBER_LENGTH_MARGIN,
+            self.max_req_len - prompt_len - MEMBER_LENGTH_MARGIN,
         )
         if max_new_tokens < 1:
             return (
@@ -387,7 +388,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         if final:
             # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
             # slot still needs a token so an overshoot step has a valid input.
-            self._stash_next_tokens([req.kv.req_pool_idx], next_tokens[:1])
+            rows = async_h2d(
+                [req.kv.req_pool_idx],
+                dtype=torch.int64,
+                device=self.req_to_token_pool.device,
+            )
+            self._stash_next_tokens(rows, next_tokens[:1])
             return
         self._spawn_member_rows(group, req)
         req.output_ids.append(0)  # length placeholder; DAG owns history
@@ -424,11 +430,9 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         )
         group.member_rows = member_rows
         group.member_rows_cpu = member_rows_cpu
-        leader_row = torch.tensor(
-            [leader.kv.req_pool_idx],
-            dtype=torch.int64,
-            pin_memory=torch.device(device).type == "cuda",
-        ).to(device, non_blocking=True)
+        leader_row = async_h2d(
+            [leader.kv.req_pool_idx], dtype=torch.int64, device=device
+        )
         group.all_rows = torch.cat([leader_row, member_rows])
 
     def select_and_relay_decode(
@@ -659,11 +663,5 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             group.clear_staged()
             self._num_live_groups -= 1
 
-    def _stash_next_tokens(self, rows, tokens) -> None:
-        # Accepts GPU tensors (decode path, no D2H) or host lists (prefill).
-        device = self.req_to_token_pool.device
-        if not torch.is_tensor(rows):
-            rows = torch.tensor(rows, dtype=torch.int64, device=device)
-        if not torch.is_tensor(tokens):
-            tokens = torch.tensor(tokens, dtype=torch.int64, device=device)
+    def _stash_next_tokens(self, rows: torch.Tensor, tokens: torch.Tensor) -> None:
         self.future_map.stash(rows, RelayPayload(bonus_tokens=tokens))

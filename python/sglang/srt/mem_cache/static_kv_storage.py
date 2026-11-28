@@ -742,6 +742,10 @@ class StaticKVStorage:
             )
         return tuple(usage)
 
+    def kv_bytes_usage(self, full_tokens: int, swa_tokens: int) -> None:
+        # Static pools are sized one by one, not out of one byte budget.
+        return None
+
     # -- what a PD peer registers --
 
     def view(self, sub_pool: str) -> Any:
@@ -876,19 +880,20 @@ class _StaticStateEntries(msgspec.Struct, frozen=True, kw_only=True):
 
 def _static_owner_region(token_to_kv_pool) -> Region:
     """The KV entries a static pool registers."""
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         ptrs, lens, item_lens = token_to_kv_pool.get_sparse_kv_buf_infos()
     else:
         ptrs, lens, item_lens = token_to_kv_pool.get_contiguous_buf_infos()
-    # A pool wrapping one token KV view (its other layers hold state), or a
-    # MiniMax sparse pool whose main KV holds only its sparse layers, reports
+    # Wrapped pools, MiniMax sparse pools, and NPU MLA/DSV4 pools report
     # per-entry layer ids for the peers to pair by.
     layer_ids = (
         token_to_kv_pool.get_kv_layer_ids()
         if token_to_kv_pool.layer_router.wrapped_view() is not None
-        or isinstance(token_to_kv_pool, MiniMaxSparseKVPool)
+        or isinstance(token_to_kv_pool, (MiniMaxSparseKVPool, NPUMLATokenToKVPool))
+        or (is_npu() and _is_dsv4_npu(token_to_kv_pool))
         else ()
     )
     return Region(
@@ -1017,11 +1022,15 @@ def _static_state_entries(
                 router.view(IdSpaceKind.SLIDING_WINDOW), MHATokenToKVPool
             ):
                 swa_kv_layout = router.view(IdSpaceKind.SLIDING_WINDOW).kv_cache_layout
+            swa_layer_ids = None
+            if is_npu() and _is_dsv4_npu(token_to_kv_pool):
+                swa_layer_ids = token_to_kv_pool.get_swa_state_layer_ids()
             add(
                 StateType.SWA,
                 data_ptrs,
                 data_lens,
                 item_lens,
+                layer_ids=swa_layer_ids,
                 kv_layout=swa_kv_layout,
                 # Read when asked, as the window's view was: not every pool
                 # with window state keeps a window pool of its own.
@@ -1098,7 +1107,12 @@ def _static_state_entries(
             )
             # Hybrid DSA pools keep their index cache and kpool tail in the
             # full-attention sub-pool rather than in the Mamba state above.
-            if getattr(token_to_kv_pool, "use_dsa", False):
+            # Ascend registers index-K alongside K/V in its KV entry groups.
+            # Registering it again as DSA state gives split ranks a different
+            # state schema from decode (including ranks owning no layers).
+            if getattr(token_to_kv_pool, "use_dsa", False) and not isinstance(
+                token_to_kv_pool.full_kv_pool, NPUMLATokenToKVPool
+            ):
                 dsa_pool = token_to_kv_pool.full_kv_pool
                 dsa_ptrs, dsa_lens, dsa_item_lens = dsa_pool.get_state_buf_infos()
                 tail_ptrs, tail_lens, tail_item_lens = (
@@ -1210,26 +1224,14 @@ def _static_state_entries(
                     add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
 
     if is_npu() and _is_dsv4_npu(token_to_kv_pool):
-        from sglang.srt.disaggregation.ascend.conn import AscendStateType
-
         c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
         if c128_ptrs:
             add(
-                AscendStateType.DSV4_C128,
+                StateType.DSV4_C128,
                 c128_ptrs,
                 c128_lens,
                 c128_item_lens,
-            )
-
-        # Register C4 state by row on both A3 and Ascend 950 so prefill and
-        # decode can pair logical positions even when their ring sizes differ.
-        c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
-        if c4_ptrs:
-            add(
-                AscendStateType.DSV4_C4_STATE,
-                c4_ptrs,
-                c4_lens,
-                c4_item_lens,
+                layer_ids=token_to_kv_pool.get_c128_layer_ids(),
             )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
