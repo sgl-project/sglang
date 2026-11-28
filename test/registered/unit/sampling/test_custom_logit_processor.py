@@ -34,6 +34,7 @@ from sglang.srt.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     SamplingFacts,
 )
+from sglang.srt.sampling.sampling_params_pool import SamplingRows
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -129,7 +130,10 @@ class TestCustomLogitProcessorRows(CustomTestCase):
                     "sglang.srt.sampling.sampling_batch_info.get_exec",
                     return_value=exec_context,
                 ):
-                    info.set_step_state(reqs)
+                    # No seeds, penalties, or watermark.
+                    rows = SamplingRows(**dict.fromkeys(SamplingRows._fields))
+                    rows = rows._replace(facts=SamplingFacts())
+                    info.set_step_state(reqs, rows)
                 logits = torch.full((3, 4), -1.0)
                 apply_custom_logit_processor(logits, info)
                 want = [float(rid) if rid in opted_in else -1.0 for rid in order]

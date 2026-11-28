@@ -181,7 +181,7 @@ class TestSamplerParams(_PoolTestCase):
         self.assertEqual(rest.facts.max_top_k, 20)
 
     def test_rows_fields_are_sampling_batch_info_fields(self):
-        """set_rows sets the rows by name and copy_for_forward copies only
+        """set_step_state sets the rows by name and copy_for_forward copies only
         dataclass fields, so a SamplingRows field SamplingBatchInfo does not
         declare would not reach the forward."""
         fields = {f.name for f in dataclasses.fields(SamplingBatchInfo)}
@@ -262,23 +262,6 @@ class TestPenaltyIndices(_PoolTestCase):
         self.assertEqual(step.penalty_indices.dtype, torch.int64)
         self.assertEqual(step.kinds, 5)
         self.assertIsNone(_gather(pool, [1, 4], penalty_pool).step_penalties)
-
-    def test_set_rows_reads_the_step_penalties_from_the_pool(self):
-        penalty_pool = PenaltyStatusPool(vocab_size=8, device=DEVICE)
-        req = _req(2)
-        req.sampling_params.frequency_penalty = 0.5
-        req.sampling_params.presence_penalty = 0.0
-        req.sampling_params.repetition_penalty = 1.0
-        req.sampling_params.min_new_tokens = 0
-        penalty_pool.alloc([req])
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
-        pool.write([req, _req(3)])
-        info = SamplingBatchInfo(vocab_size=8, device=DEVICE)
-
-        info.set_rows(_gather(pool, [3, 2], penalty_pool))
-
-        self.assertEqual(info.step_penalties.batch_indices.tolist(), [1])
-        self.assertEqual(info.step_penalties.penalty_indices.tolist(), [0])
 
     def test_unchanged_batch_takes_each_steps_penalties(self):
         """A gather over the same slots builds the step's penalties from the counts

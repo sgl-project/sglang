@@ -5518,6 +5518,20 @@ class Scheduler(
         self._on_step_forward_recorded(forward_done)
         return forward_done
 
+    def _set_sampling_step_state(self, batch: ScheduleBatch) -> None:
+        """Set the batch's sampling state for its launch, from its slots' rows of
+        the sampling params pool and from its requests."""
+        # A beam tail's member rows follow the requests' rows; they take no params.
+        num_reqs = len(batch.reqs)
+        batch.sampling_info.set_step_state(
+            batch.reqs,
+            self.sampling_params_pool.gather(
+                batch.req_pool_indices[:num_reqs],
+                batch.req_pool_indices_cpu[:num_reqs],
+                self.penalty_status_pool,
+            ),
+        )
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -5550,16 +5564,7 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            # A beam tail's member rows follow the requests' rows; they take no params.
-            num_reqs = len(batch.reqs)
-            batch.sampling_info.set_rows(
-                self.sampling_params_pool.gather(
-                    batch.req_pool_indices[:num_reqs],
-                    batch.req_pool_indices_cpu[:num_reqs],
-                    self.penalty_status_pool,
-                )
-            )
-            batch.sampling_info.set_step_state(batch.reqs)
+            self._set_sampling_step_state(batch)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).

@@ -263,6 +263,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                 scheduler._prepare_mlx_launch = MethodType(
                     mixin._prepare_mlx_launch, scheduler
                 )
+                scheduler._set_sampling_step_state = Mock()
                 scheduler._finalize_mlx_pending_job = MethodType(
                     mixin._finalize_mlx_pending_job, scheduler
                 )

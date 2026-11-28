@@ -85,33 +85,30 @@ class SamplingFacts(msgspec.Struct, frozen=True):
 
 @dataclasses.dataclass
 class SamplingBatchInfo:
-    vocab_size: int
+    """One launch's sampling inputs, grouped by writer: apart from the constants
+    and the forward-time ids, `set_step_state` writes every field at each launch."""
 
-    # The sampler params, set by the scheduler at each launch (set_rows).
+    # Constants, set at construction.
+    vocab_size: int
+    device: str = "cuda"
+
+    # The rows gathered by slot from `SamplingParamsPool`, in batch order.
     temperatures: Optional[torch.Tensor] = None
     top_ps: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     min_ps: Optional[torch.Tensor] = None
-    # The param facts from set_rows, then the stage facts from set_step_state,
-    # which follows it at each launch.
-    facts: SamplingFacts = SamplingFacts()
-
-    # Hashed request ids for the KV canary's token oracle; set in ForwardBatch.
-    rids_int: Optional[torch.Tensor] = None
-    bootstrap_room_ids_int: Optional[torch.Tensor] = None
-
-    # Set by the scheduler at each launch (set_rows).
-    step_penalties: Optional[StepPenalties] = None
-
-    # Set by the scheduler at each launch (set_step_state).
-    custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
-    custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
-
-    # Set by the scheduler at each launch (set_rows).
     # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor] = None
+    step_penalties: Optional[StepPenalties] = None
+    # Per-row watermark policy, None unless some row is a watermark candidate.
+    watermark: Optional[WatermarkRows] = None
 
-    # Set by the scheduler at each launch (set_step_state).
+    # The stages' inputs, built from the step's requests.
+    logit_bias: Optional[torch.Tensor] = None
+    # The step's grammar objects, None when no request has one (see grammar_mask.py).
+    grammars: Optional[List[Optional[BaseGrammarObject]]] = None
+    custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
+    custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
     # Rows of the requests that return sampling masks, and each support-mode row's
     # index among them; None when no row has one. They limit capture to those rows.
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
@@ -119,28 +116,22 @@ class SamplingBatchInfo:
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
-    # Per-row watermark policy, None unless some row is a watermark candidate;
-    # set by the scheduler at each launch (set_rows).
-    watermark: Optional[WatermarkRows] = None
+    # The facts over the rows and the stages' inputs, built last.
+    facts: SamplingFacts = SamplingFacts()
 
-    # Device
-    device: str = "cuda"
+    # Hashed request ids for the KV canary's token oracle; ForwardBatch.init_new
+    # sets them, and its padding extends them.
+    rids_int: Optional[torch.Tensor] = None
+    bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
-    # Set by the scheduler at each launch (set_step_state).
-    logit_bias: Optional[torch.Tensor] = None
-    # The step's grammar objects, None when no request has one (see grammar_mask.py).
-    grammars: Optional[List[Optional[BaseGrammarObject]]] = None
-
-    def set_rows(self, rows: SamplingRows) -> None:
-        """Set the step's state read from its rows of `SamplingParamsPool`: the
-        sampler params, the per-row seeds, the penalties, and the watermark rows."""
+    def set_step_state(self, reqs: List[Req], rows: SamplingRows) -> None:
+        """Set one launch's state: the rows gathered from `SamplingParamsPool`; the
+        stages' inputs built from the step's requests (logit_bias, the grammars,
+        the custom logit processors, and the sampling-mask rows); then the facts,
+        the rows' param facts plus the stage facts."""
         for name, value in zip(rows._fields, rows):
             setattr(self, name, value)
 
-    def set_step_state(self, reqs: List[Req]) -> None:
-        """Build the stages' step state from the step's requests: logit_bias, the
-        grammars, the custom logit processors, and the sampling-mask rows; then
-        the stage facts, over it and the rows `set_rows` set."""
         self.logit_bias = build_logit_bias(
             reqs, vocab_size=self.vocab_size, device=self.device
         )
