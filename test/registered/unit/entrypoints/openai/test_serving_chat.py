@@ -312,6 +312,64 @@ class TestChatTemplateCache(CustomTestCase):
         )
         self.assertEqual(self.tokenizer_manager.tokenizer.encode.call_count, 3)
 
+    def test_cache_is_namespaced_by_cache_salt(self):
+        """Like the radix cache, a salted request never reuses another salt's render."""
+        for cache_salt in ("tenant-a", "tenant-a", ["tenant-a"], "tenant-b", None):
+            self._render(cache_salt=cache_salt)
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            3,
+        )
+
+    def test_the_segment_cache_gets_the_cache_salt(self):
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.encode_rendered_prompt",
+            return_value=[11, 12],
+        ) as encode:
+            for cache_salt in ("tenant-a", ["tenant-a"], "", None):
+                self._render(use_cache=False, cache_salt=cache_salt)
+
+        salts = [call.kwargs["cache_salt"] for call in encode.call_args_list]
+        self.assertEqual(salts[0], salts[1])
+        self.assertIsNotNone(salts[0])
+        self.assertEqual(salts[2:], [None, None])
+
+    def test_a_list_salt_keeps_its_element_boundaries(self):
+        """["a", "b"] must not share a namespace with the string "a\\0b"."""
+        for cache_salt in (["a", "b"], "a\0b", ["a\0b"], ["a", "b"]):
+            self._render(cache_salt=cache_salt)
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            2,
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.encode_rendered_prompt",
+            return_value=[11, 12],
+        ) as encode:
+            for cache_salt in (["a", "b"], "a\0b"):
+                self._render(use_cache=False, cache_salt=cache_salt)
+        salts = [call.kwargs["cache_salt"] for call in encode.call_args_list]
+        self.assertNotEqual(salts[0], salts[1])
+
+    def test_a_long_salt_is_not_kept_in_the_cache_keys(self):
+        cache_salt = "s" * (1 << 20)
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.encode_rendered_prompt",
+            return_value=[11, 12],
+        ) as encode:
+            self._render(cache_salt=cache_salt)
+            self._render(cache_salt=cache_salt)
+
+        self.assertEqual(
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_count,
+            1,
+        )
+        (render_key,) = self.chat._chat_template_cache
+        self.assertLess(len(render_key), 1024)
+        self.assertLessEqual(len(encode.call_args.kwargs["cache_salt"]), 64)
+
     def test_cache_key_tracks_tokenizer_chat_template_updates(self):
         self.tokenizer_manager.tokenizer.chat_template = "template-v1"
         self._render()

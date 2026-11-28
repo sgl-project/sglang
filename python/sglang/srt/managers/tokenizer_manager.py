@@ -843,6 +843,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             tokenizer=self.tokenizer, is_generation=self.is_generation
         )
 
+        # Build the long chat prompt encoder now, off the request path: the
+        # first long prompts would otherwise wait for it.
+        from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
+            prebuild_in_background,
+        )
+
+        prebuild_in_background(self.tokenizer)
+
     def _validate_cuda_vmm_feature_transport_support(self) -> None:
         if get_mm().mm_feature_transport != "cuda_vmm":
             return

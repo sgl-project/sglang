@@ -22,14 +22,24 @@ Any configuration where that argument does not hold falls back to the original
 encode: slow or wrapped tokenizers, specials added by the post-processor,
 post-processors that can rewrite sequence ids, lstrip / rstrip / single_word
 added tokens, pre-tokenizers that treat the first piece of a sequence
-differently (Metaspace), split_special_tokens, and truncation or padding left
-enabled on the backend.
+differently (Metaspace), and split_special_tokens.
+
+The pieces are encoded on a private copy of the backend. The HF encode sets the
+shared backend's padding, truncation and encode_special_tokens on every call
+(a multimodal processor call with padding=True leaves padding on), and
+``encode_batch`` applies whatever is set when it starts: on the shared backend,
+a call from another thread between the gates and ``encode_batch`` could pad
+the pieces. Nothing configures the copy, which has padding and truncation off
+like the HF encode of a single text.
 
 ``encode_prompt_segments`` serves renderers that hand over the prompt as
 segments with their special tokens on their own. Those are the cut points, so
 the prompt is not scanned and no length threshold applies, and the ids of the
 text between them are cached per tokenizer: text that recurs across requests,
-like the system prompt, the tool list and earlier turns, is encoded once.
+like the system prompt, the tool list and earlier turns, is encoded once. Like
+the radix cache, the cache is namespaced by the request's cache_salt, so a
+salted request never hits text that another salt encoded. A BPE model with
+dropout samples its merges on every encode, so it never uses the cache.
 
 Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.
 """
@@ -38,9 +48,11 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 import weakref
+from array import array
 from collections import OrderedDict
 from itertools import chain
 
@@ -53,9 +65,17 @@ logger = logging.getLogger(__name__)
 _MIN_CHUNK_CHARS = 2048
 _MAX_CHUNKS = 64
 
-# Per tokenizer; a text longer than the entry limit is encoded but not kept.
-_SEGMENT_CACHE_MAX_TOKENS = 1 << 20
-_SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 8
+# Per tokenizer, counting the bytes of each entry's key text and its ids: a
+# text can encode to no ids at all, so a token count would not bound the
+# memory. An entry over the entry limit is encoded but not kept.
+_SEGMENT_CACHE_MAX_BYTES = 64 << 20
+_SEGMENT_CACHE_MAX_ENTRY_BYTES = _SEGMENT_CACHE_MAX_BYTES // 8
+# The dict slot, the LRU links and the key tuple of one entry, roughly.
+_SEGMENT_CACHE_ENTRY_OVERHEAD = 256
+# A new text is kept as the list of ints encode_batch returned (a list slot
+# and an int object per id); only a text that is used again is converted to a
+# uint32 array, 4 bytes per id.
+_LIST_ID_BYTES = 28
 
 # Pre-tokenizers that act on each piece independently of its position in the
 # sequence. Metaspace (prepend_scheme="first") and anything unknown are not.
@@ -87,6 +107,10 @@ _INTRA_CUT = re.compile(r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z])")
 
 _plans = weakref.WeakKeyDictionary()
 _segment_encoders = weakref.WeakKeyDictionary()
+# One build per tokenizer: the first long prompts of a burst arrive together,
+# and the build (parsing the backend, copying it) takes up to about a second.
+_build_lock = threading.RLock()
+_MISSING = object()
 # None: not yet checked; False: encode_batch consumed only one CPU (rayon
 # disabled, e.g. after a fork). The PID prevents inheriting the parent's result.
 _parallel_pid = os.getpid()
@@ -179,7 +203,8 @@ def _build_plan(tokenizer):
     if getattr(tokenizer, "split_special_tokens", False):
         return None
     try:
-        cfg = json.loads(backend.to_str())
+        serialized = backend.to_str()
+        cfg = json.loads(serialized)
     except Exception:
         return None
     if not _pre_tokenizer_safe(cfg.get("pre_tokenizer")):
@@ -199,6 +224,14 @@ def _build_plan(tokenizer):
     intra = _INTRA_CUT if _intra_cut_safe(cfg) else None
     if pattern is None and npattern is None and intra is None:
         return None
+    # The private copy the pieces are encoded on (see the module docstring).
+    try:
+        backend = type(backend).from_str(serialized)
+    except Exception:
+        return None
+    backend.no_padding()
+    backend.no_truncation()
+    backend.encode_special_tokens = False
     pp = backend.post_processor
     specials_added = pp.num_special_tokens_to_add(False) if pp is not None else 0
     return backend, specials_added, pattern, npattern, intra
@@ -211,8 +244,10 @@ def _plan_for(tokenizer):
         pass
     except TypeError:
         return _build_plan(tokenizer)
-    plan = _build_plan(tokenizer)
-    _plans[tokenizer] = plan
+    with _build_lock:
+        plan = _plans.get(tokenizer, _MISSING)
+        if plan is _MISSING:
+            plan = _plans[tokenizer] = _build_plan(tokenizer)
     return plan
 
 
@@ -256,6 +291,14 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
     return chunks
 
 
+def _encode_batch(backend, texts):
+    """``backend.encode_batch`` without the character offsets, which only the
+    ids are read from: the same ids, with less work in the pool and on the
+    calling thread (building and freeing the offsets)."""
+    encode = getattr(backend, "encode_batch_fast", None) or backend.encode_batch
+    return encode(texts, add_special_tokens=False)
+
+
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
     global _parallel_ok, _parallel_pid
@@ -276,12 +319,8 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     if plan is None:
         return tokenizer.encode(text, **encode_kwargs)
     backend, specials_added, pattern, npattern, intra = plan
-    if encode_kwargs.get("add_special_tokens", True) and specials_added:
-        return tokenizer.encode(text, **encode_kwargs)
-    if (
-        backend.truncation is not None
-        or backend.padding is not None
-        or backend.encode_special_tokens
+    if (encode_kwargs.get("add_special_tokens", True) and specials_added) or getattr(
+        tokenizer, "split_special_tokens", False
     ):
         return tokenizer.encode(text, **encode_kwargs)
     chunks = split_prompt(text, pattern, npattern, intra)
@@ -291,7 +330,7 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     check = _parallel_ok is None
     if check:
         w0, c0 = time.perf_counter(), time.process_time()
-    encodings = backend.encode_batch(chunks, add_special_tokens=False)
+    encodings = _encode_batch(backend, chunks)
     if check:
         wall, cpu = time.perf_counter() - w0, time.process_time() - c0
         # Rayon worker CPU adds up well beyond wall time. Serial stays near 1.0;
@@ -334,8 +373,16 @@ class _SegmentEncoder:
         self.max_cut_len = max(map(len, self.raw_ids), default=0)
         self.cuts = {}
         self.lock = threading.Lock()
+        # Two LRU segments under one byte budget. A text enters `probation` as
+        # the list encode_batch returned; one that is used again moves to
+        # `cache` as a uint32 array. Eviction empties `probation` first, so
+        # prompts whose text never recurs do not pay for the conversion and
+        # do not push out text that does recur.
         self.cache = OrderedDict()
-        self.cached_tokens = 0
+        self.probation = OrderedDict()
+        # Key -> _InFlightEncode of the call that is encoding the text now.
+        self.in_flight = {}
+        self.cached_bytes = 0
 
     def cut_id(self, segment):
         token_id = self.raw_ids.get(segment)
@@ -346,7 +393,7 @@ class _SegmentEncoder:
             cuts = self.cuts[segment] = _cuts_at(segment, self.added_tokens)
         return token_id if cuts else None
 
-    def encode(self, segments):
+    def encode(self, segments, cache_salt=None):
         layout, run = [], []
         for segment in segments:
             if len(segment) <= self.max_cut_len:
@@ -355,34 +402,82 @@ class _SegmentEncoder:
                     if run:
                         layout.append("".join(run))
                         run = []
-                    layout.append(token_id)
+                    layout.append((token_id,))
                     continue
             if segment:
                 run.append(segment)
         if run:
             layout.append("".join(run))
+        return self._encode_layout(layout, cache_salt)
 
-        texts = [item for item in layout if isinstance(item, str)]
+    def encode_text(self, text, cache_salt=None):
+        """``encode`` of a whole rendered prompt, cut at its added tokens in one
+        pass: the text between two cut points cannot hold a whole added token,
+        or the scan would have matched it there."""
+        layout, start = [], 0
+        for m in self.pattern.finditer(text):
+            token_id = self.cut_id(m.group())
+            if token_id is None:
+                continue
+            if m.start() > start:
+                layout.append(text[start : m.start()])
+            layout.append((token_id,))
+            start = m.end()
+        if start < len(text):
+            layout.append(text[start:])
+        return self._encode_layout(layout, cache_salt)
+
+    def _encode_layout(self, layout, cache_salt):
+        """Ids of `layout`: texts, and 1-tuples holding the id of a cut point."""
         known = {}
-        with self.lock:
-            for text in texts:
-                ids = self.cache.get(text)
+        texts = [item for item in layout if isinstance(item, str)]
+        while texts:
+            # Distinct texts encode in parallel; a text another call is already
+            # encoding is waited for, not encoded again.
+            own, waits = self._claim(texts, known, cache_salt)
+            if own:
+                encoded = {}
+                try:
+                    encoded = self._encode(own, cache_salt)
+                finally:
+                    self._publish(own, encoded, cache_salt)
+                known.update(encoded)
+            for text, pending in waits.items():
+                pending.done.wait()
+                ids = pending.ids.get(text)
                 if ids is not None:
-                    self.cache.move_to_end(text)
                     known[text] = ids
-        missing = list(dict.fromkeys(text for text in texts if text not in known))
-        if missing:
-            known.update(self._encode(missing))
+            # Left only if the encode waited for raised: encode them here.
+            texts = [text for text in waits if text not in known]
 
-        ids = []
-        for item in layout:
-            if isinstance(item, str):
-                ids.extend(known[item])
-            else:
-                ids.append(item)
-        return ids
+        # Texts map to their ids; a cut point is a 1-tuple of its id.
+        return list(chain.from_iterable(map(known.get, layout, layout)))
 
-    def _encode(self, texts):
+    def _claim(self, texts, known, cache_salt):
+        """Copy the cached ids of `texts` into `known`. Of the rest, return the
+        texts this call must encode (now claimed, once each) and
+        {text: _InFlightEncode} of those another call is encoding."""
+        own, waits, claim = [], {}, None
+        with self.lock:
+            for text in dict.fromkeys(texts):
+                key = (cache_salt, text)
+                ids = self.cache.get(key)
+                if ids is not None:
+                    self.cache.move_to_end(key)
+                    known[text] = ids
+                elif (ids := self.probation.get(key)) is not None:
+                    known[text] = ids
+                    self._promote(key, ids)
+                elif key in self.in_flight:
+                    waits[text] = self.in_flight[key]
+                else:
+                    if claim is None:
+                        claim = _InFlightEncode()
+                    self.in_flight[key] = claim
+                    own.append(text)
+        return own, waits
+
+    def _encode(self, texts, cache_salt):
         min_chars = envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
         chunks, counts = [], []
         for text in texts:
@@ -393,25 +488,91 @@ class _SegmentEncoder:
             )
             chunks.extend(pieces)
             counts.append(len(pieces))
-        encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
+        encodings = _encode_batch(self.backend, chunks)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
-            encoded[text] = tuple(
-                chain.from_iterable(e.ids for e in encodings[start : start + count])
-            )
+            if count == 1:
+                encoded[text] = encodings[start].ids
+            else:
+                encoded[text] = list(
+                    chain.from_iterable(e.ids for e in encodings[start : start + count])
+                )
             start += count
-
-        with self.lock:
-            for text, ids in encoded.items():
-                if (
-                    text not in self.cache
-                    and len(ids) <= _SEGMENT_CACHE_MAX_ENTRY_TOKENS
-                ):
-                    self.cache[text] = ids
-                    self.cached_tokens += len(ids)
-            while self.cached_tokens > _SEGMENT_CACHE_MAX_TOKENS:
-                self.cached_tokens -= len(self.cache.popitem(last=False)[1])
         return encoded
+
+    def _promote(self, key, ids):
+        """Move a reused text from `probation` to `cache`, packed. Caching is
+        best effort: if packing fails, the text stays in `probation`."""
+        try:
+            packed = array("I", ids)
+        except Exception:
+            self.probation.move_to_end(key)
+            return
+        del self.probation[key]
+        self.cached_bytes += _entry_bytes(key, packed) - _entry_bytes(key, ids)
+        self.cache[key] = packed
+
+    def _publish(self, texts, encoded, cache_salt):
+        """Cache the ids of the claimed `texts` and release their claims, in one
+        step under the lock, so a text is always cached, in flight or unclaimed.
+        If the encode raised, `encoded` is empty and the waiters get no ids.
+        Caching is best effort: the claims are released and the waiters woken
+        even if caching fails."""
+        with self.lock:
+            claim = self.in_flight[(cache_salt, texts[0])]
+            try:
+                for text in texts:
+                    self._cache_new(text, encoded.get(text), cache_salt)
+                while self.cached_bytes > _SEGMENT_CACHE_MAX_BYTES:
+                    lru = self.probation if self.probation else self.cache
+                    self.cached_bytes -= _entry_bytes(*lru.popitem(last=False))
+            finally:
+                for text in texts:
+                    self.in_flight.pop((cache_salt, text), None)
+                claim.ids = encoded
+                claim.done.set()
+
+    def _cache_new(self, text, ids, cache_salt):
+        if ids is None:
+            return
+        key = (cache_salt, text)
+        if key in self.cache or key in self.probation:
+            return
+        size = _entry_bytes(key, ids)
+        lru = self.probation
+        if size > _SEGMENT_CACHE_MAX_ENTRY_BYTES:
+            # Too big as a list: keep it packed, if that fits.
+            try:
+                ids = array("I", ids)
+            except Exception:
+                return
+            lru, size = self.cache, _entry_bytes(key, ids)
+        if size <= _SEGMENT_CACHE_MAX_ENTRY_BYTES:
+            lru[key] = ids
+            self.cached_bytes += size
+
+
+class _InFlightEncode:
+    """One call's encode of the texts it claimed; `ids` ({text: ids}, empty if
+    the encode raised) is set before `done`."""
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.ids = {}
+
+
+def _samples_merges(backend):
+    """BPE dropout samples the merges on every encode: cached ids would hand
+    one sample to every later request."""
+    return bool(getattr(backend.model, "dropout", None))
+
+
+def _entry_bytes(key, ids):
+    cache_salt, text = key
+    size = sys.getsizeof(text) + sys.getsizeof(ids) + _SEGMENT_CACHE_ENTRY_OVERHEAD
+    if isinstance(ids, list):
+        size += _LIST_ID_BYTES * len(ids)
+    return size if cache_salt is None else size + sys.getsizeof(cache_salt)
 
 
 def _segment_encoder_for(tokenizer):
@@ -421,27 +582,148 @@ def _segment_encoder_for(tokenizer):
         pass
     except TypeError:
         return None
-    plan = _plan_for(tokenizer)
-    encoder = None if plan is None else _SegmentEncoder(plan)
-    _segment_encoders[tokenizer] = encoder
+    # One encoder per tokenizer, or requests would split its cache.
+    with _build_lock:
+        encoder = _segment_encoders.get(tokenizer, _MISSING)
+        if encoder is _MISSING:
+            plan = _plan_for(tokenizer)
+            encoder = None if plan is None else _SegmentEncoder(plan)
+            _segment_encoders[tokenizer] = encoder
     return encoder
 
 
-def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
-    """Drop-in for ``parallel_prompt_encode(tokenizer, "".join(segments),
-    encode_kwargs)``."""
-    encode_kwargs = encode_kwargs or {}
-    encoder = None
-    if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get() and not (
+def prebuild_in_background(tokenizer):
+    """Build the tokenizer's plan and segment encoder on a daemon thread, so the
+    first long prompts after startup do not pay for it. A prompt that arrives
+    during the build waits for it under the build lock; if the build fails,
+    the first prompt builds lazily as before. Returns the thread, or None."""
+    if tokenizer is None or not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get():
+        return None
+
+    def build():
+        try:
+            _segment_encoder_for(tokenizer)
+        except Exception:
+            logger.debug("parallel_prompt_encode: prebuild failed", exc_info=True)
+
+    thread = threading.Thread(target=build, name="prompt-encode-prebuild", daemon=True)
+    thread.start()
+    return thread
+
+
+def _usable_segment_encoder(tokenizer, encode_kwargs):
+    """The tokenizer's segment encoder, or None where its ids could differ from
+    ``tokenizer.encode(text, **encode_kwargs)``."""
+    if not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get() or (
         set(encode_kwargs) - {"add_special_tokens"}
     ):
-        encoder = _segment_encoder_for(tokenizer)
+        return None
+    encoder = _segment_encoder_for(tokenizer)
     if (
         encoder is None
         or (encode_kwargs.get("add_special_tokens", True) and encoder.specials_added)
-        or encoder.backend.truncation is not None
-        or encoder.backend.padding is not None
-        or encoder.backend.encode_special_tokens
+        or getattr(tokenizer, "split_special_tokens", False)
+        or _samples_merges(encoder.backend)
     ):
+        return None
+    return encoder
+
+
+def encode_prompt_segments(tokenizer, segments, encode_kwargs=None, cache_salt=None):
+    """Drop-in for ``parallel_prompt_encode(tokenizer, "".join(segments),
+    encode_kwargs)``. Cached ids are shared only between requests with the same
+    ``cache_salt``."""
+    encode_kwargs = encode_kwargs or {}
+    encoder = _usable_segment_encoder(tokenizer, encode_kwargs)
+    if encoder is None:
         return parallel_prompt_encode(tokenizer, "".join(segments), encode_kwargs)
-    return encoder.encode(segments)
+    return encoder.encode(segments, cache_salt)
+
+
+class _RenderedPromptChecks:
+    """Per tokenizer: prompts that passed the check against a whole encode,
+    checks still running, and whether a check found a mismatch (terminal)."""
+
+    def __init__(self):
+        self.passed = 0
+        self.running = 0
+        self.failed = False
+
+
+_rendered_prompt_checks = weakref.WeakKeyDictionary()
+_rendered_prompt_checks_lock = threading.Lock()
+_RENDERED_PROMPT_CHECKS = 2
+
+
+def _rendered_checks(tokenizer):
+    """The tokenizer's check state; call with the lock held."""
+    try:
+        state = _rendered_prompt_checks.get(tokenizer)
+        if state is None:
+            state = _rendered_prompt_checks[tokenizer] = _RenderedPromptChecks()
+        return state
+    except TypeError:
+        # Nothing can be remembered for it, so every prompt is checked.
+        return _RenderedPromptChecks()
+
+
+def _rendered_split_failed(tokenizer):
+    try:
+        state = _rendered_prompt_checks.get(tokenizer)
+    except TypeError:
+        return False
+    return state is not None and state.failed
+
+
+def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None):
+    """Encode a rendered chat prompt, splitting it at added (special) tokens so
+    the text between them goes through the segment cache; earlier turns of a
+    conversation are then encoded once. Prompts are checked against a whole
+    encode, and return it, until enough checks passed; a mismatch disables the
+    split for good, also for prompts already split but not yet returned. After
+    that no new check starts, and prompts return the whole encode until the
+    checks still running finish, so no split ids are returned while a check
+    that could still fail is in flight."""
+    encode_kwargs = encode_kwargs or {}
+    encoder = None
+    if (
+        isinstance(text, str)
+        and len(text) >= envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+        and not _rendered_split_failed(tokenizer)
+    ):
+        encoder = _usable_segment_encoder(tokenizer, encode_kwargs)
+    # Only prompts the segment encoder serves are checked: a fallback compared
+    # with the whole encode would count as a pass without testing the split.
+    # The encoder gated here encodes them, so none can fall back after this.
+    if encoder is None or encoder.pattern is None:
+        return parallel_prompt_encode(tokenizer, text, encode_kwargs)
+    ids = encoder.encode_text(text, cache_salt)
+    with _rendered_prompt_checks_lock:
+        state = _rendered_checks(tokenizer)
+        check = not state.failed and state.passed < _RENDERED_PROMPT_CHECKS
+        # Checks stop starting once enough passed, so `running` drains; the
+        # split ids are used only when no check that could still fail runs.
+        whole = state.failed or (not check and state.running > 0)
+        if check:
+            state.running += 1
+    if whole:
+        return tokenizer.encode(text, **encode_kwargs)
+    if not check:
+        return ids
+    matched = None
+    try:
+        expected = tokenizer.encode(text, **encode_kwargs)
+        matched = list(ids) == list(expected)
+    finally:
+        with _rendered_prompt_checks_lock:
+            state.running -= 1
+            if matched:
+                state.passed += 1
+            elif matched is False:
+                state.failed = True
+    if not matched:
+        logger.error(
+            "encode_rendered_prompt: segment-cached ids differ from a whole encode for %s; using the whole encode from now on.",
+            type(tokenizer).__name__,
+        )
+    return expected

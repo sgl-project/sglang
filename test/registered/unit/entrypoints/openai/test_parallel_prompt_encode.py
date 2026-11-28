@@ -18,6 +18,7 @@ comparisons do not depend on it.
 
 import random
 import sys
+import threading
 import unittest
 import unittest.mock
 import weakref
@@ -514,27 +515,96 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
         self.assertIsNone(ppe._plan_for(unsafe))
         self._assert_original_encode(unsafe)
 
-    def test_backend_state_that_rewrites_the_ids_falls_back(self):
-        """These three live on the backend, not in the plan, so the helper has
-        to look at them per call.
+    def test_split_special_tokens_set_after_the_plan_falls_back(self):
+        """The HF encode reads it on every call, so the helper does too."""
+        tokenizer = _tokenizer()
+        self.assertIsNotNone(ppe._plan_for(tokenizer))
+        tokenizer.split_special_tokens = True
+        self._assert_original_encode(tokenizer, ({},))
 
-        The mutation is applied after the wrapper is built (it copies the
-        backend), and each case gets one call: falling back runs
-        `tokenizer.encode`, which clears the backend's truncation and padding.
-        """
-        cases = {
-            "truncation": lambda b: b.enable_truncation(50),
-            "padding": lambda b: b.enable_padding(length=64),
-            "encode_special_tokens": lambda b: setattr(
-                b, "encode_special_tokens", True
+
+_SHARED_BACKEND_SETTINGS = {
+    "truncation": lambda b: b.enable_truncation(50),
+    "padding": lambda b: b.enable_padding(length=64),
+    "padding to the longest": lambda b: b.enable_padding(),
+    "encode_special_tokens": lambda b: setattr(b, "encode_special_tokens", True),
+}
+
+
+class TestSharedBackendSettings(_EncodeCase):
+    """The HF encode sets padding, truncation and encode_special_tokens on the
+    shared backend on every call (a multimodal processor call with
+    padding=True leaves padding on), and resets them for a plain encode. The
+    pieces are encoded on a private copy, so whatever another caller leaves
+    there, or sets while a prompt is being split, cannot reach the ids."""
+
+    threshold = 4096
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, ppe, "_segment_encoders", ppe._segment_encoders)
+        ppe._segment_encoders = weakref.WeakKeyDictionary()
+        self._set_min_chars(self.threshold)
+        self.text = "the quick brown fox jumps over the lazy dog\n" * 300
+        self.segments = ["<|user|>", self.text, "<|assistant|>"]
+
+    def _assert_same_ids(self, ids, expected):
+        # Not assertEqual: its diff of two long id lists takes minutes.
+        mismatch = next(
+            (i for i, (a, b) in enumerate(zip(ids, expected)) if a != b),
+            min(len(ids), len(expected)),
+        )
+        self.assertTrue(
+            list(ids) == list(expected),
+            f"{len(ids)} vs {len(expected)} ids, first difference at {mismatch}",
+        )
+
+    def _encoders(self):
+        return {
+            "parallel_prompt_encode": lambda t: ppe.parallel_prompt_encode(
+                t, "".join(self.segments), {}
+            ),
+            "encode_prompt_segments": lambda t: list(
+                ppe.encode_prompt_segments(t, self.segments, {})
             ),
         }
-        for name, mutate in cases.items():
-            with self.subTest(name):
+
+    def test_settings_left_on_the_shared_backend_do_not_reach_the_ids(self):
+        for setting, mutate in _SHARED_BACKEND_SETTINGS.items():
+            for name, encode in self._encoders().items():
+                with self.subTest(setting=setting, path=name):
+                    tokenizer = _tokenizer()
+                    self.assertIsNotNone(ppe._plan_for(tokenizer))
+                    mutate(tokenizer._tokenizer)
+                    with unittest.mock.patch.object(
+                        ppe, "split_prompt", wraps=ppe.split_prompt
+                    ) as split:
+                        ids = encode(tokenizer)
+                    self.assertEqual(split.call_count, 1)
+                    # The HF encode resets the setting before it encodes.
+                    self._assert_same_ids(ids, tokenizer.encode("".join(self.segments)))
+
+    def test_padding_set_by_another_thread_mid_split_does_not_reach_the_ids(self):
+        """Padding turned on after the gates and before `encode_batch` (here
+        from inside `split_prompt`, standing in for a multimodal processor call
+        on the event loop) used to pad the shorter pieces with pad ids."""
+        for name, encode in self._encoders().items():
+            with self.subTest(path=name):
                 tokenizer = _tokenizer()
-                mutate(tokenizer._tokenizer)
-                self.assertIsNotNone(ppe._plan_for(tokenizer))
-                self._assert_original_encode(tokenizer, ({},))
+                expected = tokenizer.encode("".join(self.segments))
+                split = ppe.split_prompt
+
+                def split_then_pad(*args, **kwargs):
+                    tokenizer._tokenizer.enable_padding(pad_id=0)
+                    return split(*args, **kwargs)
+
+                with unittest.mock.patch.object(
+                    ppe, "split_prompt", side_effect=split_then_pad
+                ) as patched:
+                    ids = encode(tokenizer)
+                self.assertEqual(patched.call_count, 1)
+                self.assertIsNotNone(tokenizer._tokenizer.padding)
+                self._assert_same_ids(ids, expected)
 
 
 class TestGatesAndArgumentAllowlist(_EncodeCase):
@@ -587,6 +657,26 @@ class TestGatesAndArgumentAllowlist(_EncodeCase):
     def test_a_process_with_serial_encode_batch_stays_on_the_original_encode(self):
         ppe._parallel_ok = False
         self._assert_original(self.text, None)
+
+
+class TestEncodeBatchWithoutOffsets(CustomTestCase):
+    def test_the_offset_free_encode_is_used_when_the_backend_has_it(self):
+        fast = unittest.mock.Mock(spec=["encode_batch", "encode_batch_fast"])
+        self.assertIs(
+            ppe._encode_batch(fast, ["a"]), fast.encode_batch_fast.return_value
+        )
+        fast.encode_batch_fast.assert_called_once_with(["a"], add_special_tokens=False)
+        fast.encode_batch.assert_not_called()
+        old = unittest.mock.Mock(spec=["encode_batch"])
+        self.assertIs(ppe._encode_batch(old, ["a"]), old.encode_batch.return_value)
+
+    def test_it_gives_the_ids_encode_batch_gives(self):
+        backend = Tokenizer.from_str(_safe_backend_json())
+        texts = [t for t in _EDGE_TEXTS if t] + _fuzz_texts()[:200]
+        self.assertEqual(
+            [e.ids for e in ppe._encode_batch(backend, texts)],
+            [e.ids for e in backend.encode_batch(texts, add_special_tokens=False)],
+        )
 
 
 def _fuzz_segments():
@@ -659,6 +749,158 @@ class TestPromptSegments(_EncodeCase):
             [["hello world"], ["fresh text"]],
         )
 
+    def _hold_encode_of(self, held_text):
+        """Patch `_SegmentEncoder._encode`: the encode of `held_text` sets
+        `entered`, then waits for `proceed`."""
+        entered, proceed = threading.Event(), threading.Event()
+        self.addCleanup(proceed.set)
+        encode = ppe._SegmentEncoder._encode
+
+        def held_encode(encoder, texts, cache_salt):
+            if held_text in texts:
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return encode(encoder, texts, cache_salt)
+
+        patch = unittest.mock.patch.object(
+            ppe._SegmentEncoder, "_encode", autospec=True, side_effect=held_encode
+        )
+        return patch, entered, proceed
+
+    def _run_in_thread(self, results, tokenizer, text):
+        def run():
+            results.append(
+                list(ppe.encode_prompt_segments(tokenizer, ["<|user|>", text]))
+            )
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        return thread
+
+    def test_concurrent_first_prompts_build_one_plan_and_encoder(self):
+        """The first long prompts of a burst arrive together: one of them
+        builds the plan (it copies the backend) while the others wait for it,
+        and all of them share one encoder and so one cache."""
+        tokenizer = _tokenizer()
+        build = ppe._build_plan
+        entered, proceed = threading.Event(), threading.Event()
+        self.addCleanup(proceed.set)
+        calls = []
+
+        def held_build(tok):
+            calls.append(tok)
+            if len(calls) == 1:
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return build(tok)
+
+        encoders = []
+
+        def run():
+            encoders.append(ppe._segment_encoder_for(tokenizer))
+
+        with unittest.mock.patch.object(ppe, "_build_plan", side_effect=held_build):
+            first = threading.Thread(target=run)
+            first.start()
+            self.assertTrue(entered.wait(10))
+            second = threading.Thread(target=run)
+            second.start()
+            # Without the lock the second request builds its own plan now.
+            second.join(1)
+            proceed.set()
+            first.join(10)
+            second.join(10)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(encoders), 2)
+        self.assertIsNotNone(encoders[0])
+        self.assertIs(encoders[0], encoders[1])
+
+    def test_prebuild_builds_the_encoder_before_the_first_prompt(self):
+        """The startup prebuild leaves the first long prompt nothing to build."""
+        tokenizer = _tokenizer()
+        thread = ppe.prebuild_in_background(tokenizer)
+        self.assertIsNotNone(thread)
+        thread.join(10)
+        self.assertIsNotNone(ppe._segment_encoders.get(tokenizer))
+        text = "<|user|>" + "hello world " * 40 + "<|assistant|>"
+        with unittest.mock.patch.object(
+            ppe, "_build_plan", side_effect=AssertionError("built on the request")
+        ):
+            self.assertEqual(
+                ppe.encode_prompt_segments(tokenizer, ["<|user|>", text]),
+                tokenizer.encode("<|user|>" + text),
+            )
+
+    def test_prebuild_is_off_with_the_switch_and_swallows_failures(self):
+        tokenizer = _tokenizer()
+        with envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(False):
+            self.assertIsNone(ppe.prebuild_in_background(tokenizer))
+        self.assertIsNone(ppe.prebuild_in_background(None))
+        with unittest.mock.patch.object(
+            ppe, "_build_plan", side_effect=RuntimeError("broken")
+        ):
+            ppe.prebuild_in_background(tokenizer).join(10)
+        # Nothing was kept, so the first prompt builds it as before.
+        self.assertNotIn(tokenizer, ppe._segment_encoders)
+        self.assertIsNotNone(ppe._segment_encoder_for(tokenizer))
+
+    def test_distinct_long_texts_encode_concurrently(self):
+        """A long text being encoded must not hold off the encode of a different
+        long text: cold prompts of distinct conversations encode in parallel."""
+        self._set_min_chars(64)
+        first, second = "hello world " * 50, "the quick brown fox " * 50
+        # Its own tokenizer: a retried attempt must not share an encoder with
+        # threads the failed attempt left blocked.
+        tokenizer = _tokenizer()
+        patch, entered, proceed = self._hold_encode_of(first)
+        first_ids, second_ids = [], []
+        with patch:
+            first_thread = self._run_in_thread(first_ids, tokenizer, first)
+            self.assertTrue(entered.wait(10))
+            self._run_in_thread(second_ids, tokenizer, second).join(5)
+            self.assertEqual(second_ids, [tokenizer.encode("<|user|>" + second)])
+            proceed.set()
+            first_thread.join()
+        self.assertEqual(first_ids, [tokenizer.encode("<|user|>" + first)])
+
+    def test_a_text_being_encoded_is_waited_for_not_encoded_again(self):
+        """Concurrent requests that share a missing history encode it once: the
+        later ones wait for the encode in flight and take its ids."""
+        self._set_min_chars(64)
+        text = "hello world " * 50
+        tokenizer = _tokenizer()
+        patch, entered, proceed = self._hold_encode_of(text)
+        found_in_flight = threading.Semaphore(0)
+        claim = ppe._SegmentEncoder._claim
+
+        def observed_claim(encoder, texts, known, cache_salt):
+            own, waits = claim(encoder, texts, known, cache_salt)
+            if waits:
+                found_in_flight.release()
+            return own, waits
+
+        results = []
+        with (
+            patch as encode,
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder,
+                "_claim",
+                autospec=True,
+                side_effect=observed_claim,
+            ),
+        ):
+            threads = [self._run_in_thread(results, tokenizer, text)]
+            self.assertTrue(entered.wait(10))
+            threads += [self._run_in_thread(results, tokenizer, text) for _ in range(2)]
+            for _ in threads[1:]:
+                self.assertTrue(found_in_flight.acquire(timeout=10))
+            self.assertEqual(results, [])
+            proceed.set()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(encode.call_count, 1)
+        self.assertEqual(results, [tokenizer.encode("<|user|>" + text)] * 3)
+
     def test_long_text_between_cut_points_is_split(self):
         self._set_min_chars(4096)
         long_text = "the quick brown fox jumps over the lazy dog\n" * 300
@@ -689,6 +931,28 @@ class TestPromptSegments(_EncodeCase):
         ):
             self._assert_segments_match_encode(tokenizer, segments)
 
+    def test_bpe_dropout_never_uses_the_cache(self):
+        # Dropout samples the merges on every encode: a cached sample would be
+        # handed to every later request.
+        tokenizer = _tokenizer(lambda b: setattr(b.model, "dropout", 0.5))
+        self.assertEqual(tokenizer._tokenizer.model.dropout, 0.5)
+        segments = ["<|user|>", "the quick brown fox " * 20, "<|assistant|>"]
+        text = "".join(segments)
+        with (
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder,
+                "encode",
+                side_effect=AssertionError("segment cache used"),
+            ),
+            unittest.mock.patch.object(
+                ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
+            ) as fallback,
+        ):
+            for _ in range(2):
+                ids = ppe.encode_prompt_segments(tokenizer, segments)
+                self.assertEqual(tokenizer.decode(ids), text)
+        self.assertEqual(fallback.call_count, 2)
+
     def _assert_falls_back(self, tokenizer, segments, encode_kwargs):
         with (
             unittest.mock.patch.object(
@@ -714,38 +978,522 @@ class TestPromptSegments(_EncodeCase):
                 {"truncation": False},
             ),
         }
-        for name, mutate in {
-            "truncation": lambda b: b.enable_truncation(50),
-            "padding": lambda b: b.enable_padding(length=64),
-            "encode_special_tokens": lambda b: setattr(
-                b, "encode_special_tokens", True
-            ),
-        }.items():
-            tokenizer = _tokenizer()
-            mutate(tokenizer._tokenizer)
-            cases[name] = (tokenizer, {})
+        split_special = _tokenizer()
+        self.assertIsNotNone(ppe._segment_encoder_for(split_special))
+        split_special.split_special_tokens = True
+        cases["split_special_tokens"] = (split_special, {})
         for name, (tokenizer, encode_kwargs) in cases.items():
             with self.subTest(name):
                 self._assert_falls_back(tokenizer, segments, encode_kwargs)
         with envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(False):
             self._assert_falls_back(self.tokenizer, segments, {})
 
-    def test_the_cache_keeps_to_its_token_budget(self):
+    def _assert_within_byte_budget(self, encoder, budget):
+        self.assertLessEqual(encoder.cached_bytes, budget)
+        self.assertEqual(
+            encoder.cached_bytes,
+            sum(
+                ppe._entry_bytes(*entry)
+                for lru in (encoder.cache, encoder.probation)
+                for entry in lru.items()
+            ),
+        )
+
+    def test_the_cache_keeps_to_its_byte_budget(self):
         with (
-            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_TOKENS", 40),
-            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_TOKENS", 20),
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_BYTES", 4096),
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_BYTES", 1024),
         ):
             for i in range(30):
                 self._assert_segments_match_encode(
                     self.tokenizer, ["<|user|>", f"turn {i} hello world"], ({},)
                 )
             self._assert_segments_match_encode(
-                self.tokenizer, ["<|user|>", "hello world " * 30], ({},)
+                self.tokenizer, ["<|user|>", "hello world " * 100], ({},)
             )
         encoder = ppe._segment_encoder_for(self.tokenizer)
-        self.assertLessEqual(encoder.cached_tokens, 40)
-        self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
-        self.assertNotIn("hello world " * 30, encoder.cache)
+        self._assert_within_byte_budget(encoder, 4096)
+        self.assertNotIn((None, "hello world " * 100), encoder.cache)
+        self.assertNotIn((None, "hello world " * 100), encoder.probation)
+
+    def test_a_text_is_packed_only_once_it_is_used_again(self):
+        """A prompt whose text never recurs must not pay for the uint32 copy:
+        new text waits in `probation` as the list encode_batch returned, and
+        only a reused text moves to the packed cache."""
+        once, again = "the quick brown fox " * 20, "hello world " * 20
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        with unittest.mock.patch.object(ppe, "array", wraps=ppe.array) as pack:
+            self._assert_segments_match_encode(
+                self.tokenizer, ["<|user|>", once, "<|assistant|>", again], ({},)
+            )
+            # The helper encodes twice; the second call reuses both texts.
+            self.assertEqual(pack.call_count, 2)
+            pack.reset_mock()
+            self._assert_segments_match_encode(
+                self.tokenizer, ["<|user|>", "new text"], ({},)
+            )
+        self.assertEqual(pack.call_count, 1)
+        self.assertIsInstance(encoder.cache[(None, once)], ppe.array)
+        self.assertEqual(list(encoder.probation), [])
+        self._assert_within_byte_budget(encoder, ppe._SEGMENT_CACHE_MAX_BYTES)
+
+    def test_a_failed_pack_still_releases_the_claim(self):
+        """Caching is best effort: if packing ids raises (e.g. MemoryError), the
+        call still returns its ids and leaves no claim behind, or the next
+        request for that text would wait for it forever."""
+        big, other = "hello world " * 40, "the quick brown fox " * 5
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        failing = unittest.mock.patch.object(ppe, "array", side_effect=MemoryError)
+        # Publish: a new text over the entry limit as a list is packed.
+        with (
+            failing,
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_BYTES", 2048),
+        ):
+            ids = ppe.encode_prompt_segments(self.tokenizer, ["<|user|>", big])
+        self.assertEqual(ids, self.tokenizer.encode(f"<|user|>{big}"))
+        self.assertEqual(encoder.in_flight, {})
+        # Claim: a reused text is packed while other texts are being claimed.
+        ppe.encode_prompt_segments(self.tokenizer, ["<|user|>", other])
+        with failing:
+            ids = ppe.encode_prompt_segments(
+                self.tokenizer, ["<|user|>", other, "<|assistant|>", "new text"]
+            )
+        self.assertEqual(
+            ids, self.tokenizer.encode(f"<|user|>{other}<|assistant|>new text")
+        )
+        self.assertEqual(encoder.in_flight, {})
+        self.assertIn((None, other), encoder.probation)
+        self._assert_within_byte_budget(encoder, ppe._SEGMENT_CACHE_MAX_BYTES)
+
+    def test_new_text_is_evicted_before_text_that_recurred(self):
+        reused, budget = "hello world " * 20, 6000
+        with unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_BYTES", budget):
+            for _ in range(2):
+                self._assert_segments_match_encode(
+                    self.tokenizer, ["<|user|>", reused], ({},)
+                )
+            for i in range(30):
+                self.assertEqual(
+                    ppe.encode_prompt_segments(
+                        self.tokenizer, ["<|user|>", f"one-off prompt {i} " * 10]
+                    ),
+                    self.tokenizer.encode(f"<|user|>{f'one-off prompt {i} ' * 10}"),
+                )
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        self.assertIn((None, reused), encoder.cache)
+        self.assertLess(len(encoder.probation), 30)
+        self._assert_within_byte_budget(encoder, budget)
+
+    def test_text_that_encodes_to_no_ids_still_counts_against_the_budget(self):
+        # WhitespaceSplit drops whitespace: each of these texts has no ids, so
+        # a token budget would keep every one of them.
+        tokenizer = _tokenizer(
+            lambda b: setattr(b, "pre_tokenizer", pre_tokenizers.WhitespaceSplit())
+        )
+        with (
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_BYTES", 8192),
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_BYTES", 2048),
+        ):
+            for i in range(100):
+                self.assertEqual(tokenizer.encode(" " * (200 + i)), [])
+                self._assert_segments_match_encode(
+                    tokenizer, ["<|user|>", " " * (200 + i)], ({},)
+                )
+            # A single text over the entry limit is not kept either.
+            self._assert_segments_match_encode(
+                tokenizer, ["<|user|>", " " * 4096], ({},)
+            )
+        encoder = ppe._segment_encoder_for(tokenizer)
+        self._assert_within_byte_budget(encoder, 8192)
+        self.assertLess(len(encoder.cache) + len(encoder.probation), 100)
+        self.assertNotIn((None, " " * 4096), encoder.cache)
+        self.assertNotIn((None, " " * 4096), encoder.probation)
+
+
+class TestRenderedPrompt(_EncodeCase):
+    """`encode_rendered_prompt` cuts a rendered chat prompt at its added tokens
+    and sends the text between them through the segment cache."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("_segment_encoders", "_rendered_prompt_checks"):
+            self.addCleanup(setattr, ppe, name, getattr(ppe, name))
+            setattr(ppe, name, weakref.WeakKeyDictionary())
+        self.tokenizer = _tokenizer()
+        self._no_min_chars()
+
+    def _assert_rendered_matches(self, text, kwargs_variants=_ALL_KWARGS):
+        for encode_kwargs in kwargs_variants:
+            for _ in range(2):  # the second call reads the cache
+                self.assertEqual(
+                    list(
+                        ppe.encode_rendered_prompt(self.tokenizer, text, encode_kwargs)
+                    ),
+                    self.tokenizer.encode(text, **encode_kwargs),
+                    f"{encode_kwargs} on {text[:60]!r}",
+                )
+
+    def test_ids_equal_one_encode_of_the_prompt(self):
+        for text in _EDGE_TEXTS + ["".join(s) for s in _fuzz_segments()]:
+            self._assert_rendered_matches(text)
+        self.assertFalse(ppe._rendered_checks(self.tokenizer).failed)
+
+    def test_earlier_turns_are_encoded_once(self):
+        history = "hello world " * 40
+        first = f"<|user|>{history}<|assistant|><think>plan</think>answer"
+        second = f"{first}<|user|>next question<|assistant|>"
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "_encode",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder._encode,
+        ) as encode:
+            self._assert_rendered_matches(first, ({},))
+            self._assert_rendered_matches(second, ({},))
+        encoded = [text for call in encode.call_args_list for text in call.args[1]]
+        self.assertEqual(len(encoded), len(set(encoded)), encoded)
+        self.assertIn(history, encoded)
+        self.assertIn("next question", encoded)
+
+    def test_the_cache_is_namespaced_by_cache_salt(self):
+        # Like the radix cache: a salted request never hits text another salt
+        # (or an unsalted request) encoded, so its latency cannot reveal it.
+        text = "<|user|>" + "hello world " * 40 + "<|assistant|>"
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "_encode",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder._encode,
+        ) as encode:
+            for cache_salt in (None, "tenant-a", "tenant-b", "tenant-a", None):
+                self.assertEqual(
+                    list(
+                        ppe.encode_rendered_prompt(
+                            self.tokenizer, text, {}, cache_salt=cache_salt
+                        )
+                    ),
+                    self.tokenizer.encode(text),
+                )
+        self.assertEqual(
+            [call.args[2] for call in encode.call_args_list],
+            [None, "tenant-a", "tenant-b"],
+        )
+
+    def test_only_the_first_prompts_are_checked_against_a_whole_encode(self):
+        # The plan refuses a tokenizer whose encode is patched: build it first.
+        self.assertIsNotNone(ppe._plan_for(self.tokenizer)[2])
+        with unittest.mock.patch.object(
+            self.tokenizer, "encode", wraps=self.tokenizer.encode
+        ) as whole:
+            for i in range(2 * ppe._RENDERED_PROMPT_CHECKS):
+                ppe.encode_rendered_prompt(self.tokenizer, f"<|user|>turn {i}")
+        self.assertEqual(whole.call_count, ppe._RENDERED_PROMPT_CHECKS)
+
+    def test_prompts_the_split_does_not_serve_are_not_counted_as_checks(self):
+        """A prompt that falls back to the whole encode (here it asks for the
+        BOS the post-processor adds) must not use up the checks, or the first
+        prompts that are split would return their ids unchecked."""
+        tokenizer = _tokenizer(_post_processor_adds_bos)
+        # The plan refuses a tokenizer whose encode is patched: build it first.
+        self.assertIsNotNone(ppe._segment_encoder_for(tokenizer))
+        with unittest.mock.patch.object(
+            tokenizer, "encode", wraps=tokenizer.encode
+        ) as whole:
+            for i in range(ppe._RENDERED_PROMPT_CHECKS):
+                ppe.encode_rendered_prompt(
+                    tokenizer, f"<|user|>turn {i}", {"add_special_tokens": True}
+                )
+            whole.reset_mock()
+            text = "<|user|>split<|assistant|>"
+            ids = ppe.encode_rendered_prompt(
+                tokenizer, text, {"add_special_tokens": False}
+            )
+        whole.assert_called_once_with(text, add_special_tokens=False)
+        self.assertEqual(ids, tokenizer.encode(text, add_special_tokens=False))
+
+    def test_every_counted_check_compared_ids_of_the_segment_encoder(self):
+        """A setting another thread makes between the gate and the split (here
+        padding, as a multimodal processor call leaves it) must not turn the
+        prompt into a fallback whose whole encode is compared with itself and
+        counted as a passed check."""
+        tokenizer = _tokenizer()
+        self.assertIsNotNone(ppe._segment_encoder_for(tokenizer))
+        gate = ppe._usable_segment_encoder
+
+        def gate_then_pad(*args):
+            encoder = gate(*args)
+            tokenizer._tokenizer.enable_padding(pad_id=0)
+            return encoder
+
+        text = "<|user|>" + "hello world " * 40 + "<|assistant|>"
+        expected = tokenizer.encode(text)
+        with (
+            unittest.mock.patch.object(
+                ppe, "_usable_segment_encoder", side_effect=gate_then_pad
+            ),
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder,
+                "encode_text",
+                autospec=True,
+                side_effect=ppe._SegmentEncoder.encode_text,
+            ) as split,
+        ):
+            ids = ppe.encode_rendered_prompt(tokenizer, text)
+        self.assertEqual(ids, expected)
+        state = ppe._rendered_checks(tokenizer)
+        self.assertEqual(state.passed, 1)
+        self.assertEqual(split.call_count, state.passed)
+
+    def test_a_mismatch_switches_the_tokenizer_to_the_whole_encode(self):
+        text = "<|user|>hello world<|assistant|>"
+        expected = self.tokenizer.encode(text)
+        with (
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder, "encode_text", return_value=[0]
+            ),
+            self.assertLogs(ppe.logger, "ERROR"),
+        ):
+            self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
+        self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "encode_text",
+            side_effect=AssertionError("split taken"),
+        ):
+            self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
+
+    def _split_returning_wrong_ids_for(self, wrong, entered=None, proceed=None):
+        """A segment encoder that returns [0] for the prompt `wrong`, after
+        signalling `entered` and waiting for `proceed`."""
+        split = ppe._SegmentEncoder.encode_text
+
+        def fake(encoder, text, *args):
+            if text != wrong:
+                return split(encoder, text, *args)
+            if entered is not None:
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return [0]
+
+        return unittest.mock.patch.object(
+            ppe._SegmentEncoder, "encode_text", autospec=True, side_effect=fake
+        )
+
+    def test_a_concurrent_pass_does_not_overwrite_a_mismatch(self):
+        good, bad = "<|user|>good<|assistant|>", "<|user|>bad<|assistant|>"
+        ppe.encode_rendered_prompt(self.tokenizer, "<|user|>warm up")  # 1 passed
+        whole = self.tokenizer.encode
+        entered, proceed = threading.Event(), threading.Event()
+
+        def slow_whole_encode(text, **kwargs):
+            if text == good:
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return whole(text, **kwargs)
+
+        results = {}
+        with (
+            unittest.mock.patch.object(
+                self.tokenizer, "encode", side_effect=slow_whole_encode
+            ),
+            self._split_returning_wrong_ids_for(bad),
+            self.assertLogs(ppe.logger, "ERROR"),
+        ):
+            # `good` is being checked when `bad` finds its mismatch.
+            thread = threading.Thread(
+                target=lambda: results.update(
+                    good=ppe.encode_rendered_prompt(self.tokenizer, good)
+                )
+            )
+            thread.start()
+            self.assertTrue(entered.wait(10))
+            results["bad"] = ppe.encode_rendered_prompt(self.tokenizer, bad)
+            proceed.set()
+            thread.join()
+        self.assertEqual(results, {"good": whole(good), "bad": whole(bad)})
+        self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "encode_text",
+            side_effect=AssertionError("split taken"),
+        ):
+            self.assertEqual(
+                ppe.encode_rendered_prompt(self.tokenizer, good), whole(good)
+            )
+
+    def test_prompts_in_flight_when_a_mismatch_is_found_return_the_whole_encode(self):
+        late, bad = "<|user|>late<|assistant|>", "<|user|>bad<|assistant|>"
+        ppe.encode_rendered_prompt(self.tokenizer, "<|user|>warm up")  # 1 passed
+        entered, proceed = threading.Event(), threading.Event()
+        results = {}
+        with self.assertLogs(ppe.logger, "ERROR"):
+            # `late` is split (wrongly) before `bad` is checked and returns after.
+            with self._split_returning_wrong_ids_for(late, entered, proceed):
+                thread = threading.Thread(
+                    target=lambda: results.update(
+                        late=ppe.encode_rendered_prompt(self.tokenizer, late)
+                    )
+                )
+                thread.start()
+                self.assertTrue(entered.wait(10))
+            with self._split_returning_wrong_ids_for(bad):
+                results["bad"] = ppe.encode_rendered_prompt(self.tokenizer, bad)
+            proceed.set()
+            thread.join()
+        self.assertEqual(
+            results,
+            {"late": self.tokenizer.encode(late), "bad": self.tokenizer.encode(bad)},
+        )
+
+    def test_split_ids_wait_for_every_running_check(self):
+        """Once enough checks passed, a prompt must not return split ids while a
+        check of the same ids is still running and can find a mismatch."""
+        self.assertIsNotNone(ppe._plan_for(self.tokenizer)[2])
+        whole = self.tokenizer.encode
+        bad = "<|user|>bad<|assistant|>"
+        goods = [
+            f"<|user|>good {i}<|assistant|>" for i in range(ppe._RENDERED_PROMPT_CHECKS)
+        ]
+        # Only the first whole encode of each prompt is held.
+        held = {text: (threading.Event(), threading.Event()) for text in goods + [bad]}
+        for _, proceed in held.values():
+            self.addCleanup(proceed.set)
+        gates = dict(held)
+
+        def held_whole_encode(text, **kwargs):
+            gate = gates.pop(text, None)
+            if gate is not None:
+                gate[0].set()
+                self.assertTrue(gate[1].wait(10))
+            return whole(text, **kwargs)
+
+        results = {}
+
+        def run(text):
+            results[text] = list(ppe.encode_rendered_prompt(self.tokenizer, text))
+
+        threads = {t: threading.Thread(target=run, args=(t,)) for t in goods + [bad]}
+        with (
+            unittest.mock.patch.object(
+                self.tokenizer, "encode", side_effect=held_whole_encode
+            ),
+            self._split_returning_wrong_ids_for(bad),
+            self.assertLogs(ppe.logger, "ERROR"),
+        ):
+            for text in goods + [bad]:
+                threads[text].start()
+                self.assertTrue(held[text][0].wait(10))
+            for text in goods:
+                held[text][1].set()
+                threads[text].join()
+            state = ppe._rendered_checks(self.tokenizer)
+            self.assertEqual(state.passed, ppe._RENDERED_PROMPT_CHECKS)
+            # A repeat of `bad` gets the same wrong ids its running check holds.
+            repeat = list(ppe.encode_rendered_prompt(self.tokenizer, bad))
+            held[bad][1].set()
+            threads[bad].join()
+        self.assertEqual(repeat, whole(bad))
+        self.assertEqual(results, {text: whole(text) for text in goods + [bad]})
+        self.assertTrue(state.failed)
+
+    def test_overlapping_requests_do_not_keep_the_checks_running(self):
+        # A burst where every request overlaps a running check: once enough
+        # checks passed no new one starts, so the running ones drain and later
+        # prompts take the split ids.
+        self.assertIsNotNone(ppe._plan_for(self.tokenizer)[2])
+        whole = self.tokenizer.encode
+        burst = [f"<|user|>burst {i}<|assistant|>" for i in range(4)]
+        held = {text: (threading.Event(), threading.Event()) for text in burst}
+        for _, proceed in held.values():
+            self.addCleanup(proceed.set)
+        compared = []
+
+        def held_whole_encode(text, **kwargs):
+            compared.append(text)
+            if text in held:
+                entered, proceed = held[text]
+                entered.set()
+                self.assertTrue(proceed.wait(10))
+            return whole(text, **kwargs)
+
+        results = {}
+
+        def run(text):
+            results[text] = list(ppe.encode_rendered_prompt(self.tokenizer, text))
+
+        threads = {text: threading.Thread(target=run, args=(text,)) for text in burst}
+        with unittest.mock.patch.object(
+            self.tokenizer, "encode", side_effect=held_whole_encode
+        ):
+            for text in burst:
+                threads[text].start()
+                self.assertTrue(held[text][0].wait(10))
+            state = ppe._rendered_checks(self.tokenizer)
+            self.assertEqual(state.running, len(burst))
+            for text in burst[: ppe._RENDERED_PROMPT_CHECKS]:
+                held[text][1].set()
+                threads[text].join()
+            # The rest of the burst is still comparing: a new prompt takes the
+            # whole encode without starting another check.
+            running = len(burst) - ppe._RENDERED_PROMPT_CHECKS
+            self.assertEqual(state.running, running)
+            later = "<|user|>later<|assistant|>"
+            self.assertEqual(
+                list(ppe.encode_rendered_prompt(self.tokenizer, later)), whole(later)
+            )
+            self.assertEqual(state.running, running)
+            for text in burst[ppe._RENDERED_PROMPT_CHECKS :]:
+                held[text][1].set()
+                threads[text].join()
+            latest = "<|user|>latest<|assistant|>"
+            self.assertEqual(
+                list(ppe.encode_rendered_prompt(self.tokenizer, latest)),
+                whole(latest),
+            )
+            self.assertNotIn(latest, compared)
+        self.assertEqual(results, {text: whole(text) for text in burst})
+        self.assertEqual(state.running, 0)
+        self.assertFalse(state.failed)
+
+    def test_gates_use_parallel_prompt_encode(self):
+        text = "<|user|>" + "hello world " * 50 + "<|assistant|>"
+        cases = {"no plan": (_tokenizer(_metaspace), 0, True)}
+        cases["below the char threshold"] = (self.tokenizer, len(text) + 1, True)
+        cases["env switch off"] = (self.tokenizer, 0, False)
+        for name, (tokenizer, min_chars, enabled) in cases.items():
+            with (
+                self.subTest(name),
+                envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(min_chars),
+                envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(enabled),
+                unittest.mock.patch.object(
+                    ppe._SegmentEncoder,
+                    "encode_text",
+                    side_effect=AssertionError("split"),
+                ),
+                unittest.mock.patch.object(
+                    ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
+                ) as fallback,
+            ):
+                ids = ppe.encode_rendered_prompt(tokenizer, text)
+                fallback.assert_called_once()
+                self.assertEqual(ids, tokenizer.encode(text))
+
+    def test_bpe_dropout_is_not_split_or_checked(self):
+        tokenizer = _tokenizer(lambda b: setattr(b.model, "dropout", 0.5))
+        text = "<|user|>" + "the quick brown fox " * 20 + "<|assistant|>"
+        with (
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder, "encode_text", side_effect=AssertionError("split")
+            ),
+            unittest.mock.patch.object(
+                ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
+            ) as fallback,
+        ):
+            for _ in range(2):
+                ids = ppe.encode_rendered_prompt(tokenizer, text)
+                self.assertEqual(tokenizer.decode(ids), text)
+        self.assertEqual(fallback.call_count, 2)
+        self.assertFalse(ppe._rendered_checks(tokenizer).failed)
 
 
 if __name__ == "__main__":

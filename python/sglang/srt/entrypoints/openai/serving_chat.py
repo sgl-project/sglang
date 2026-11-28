@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import time
@@ -53,7 +54,7 @@ from sglang.srt.entrypoints.openai import (
 )
 from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     encode_prompt_segments,
-    parallel_prompt_encode,
+    encode_rendered_prompt,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentTextPart,
@@ -168,6 +169,19 @@ class _ClosingStreamingResponse(StreamingResponse):
             await super().stream_response(send)
         finally:
             await self.body_iterator.aclose()
+
+
+def _cache_salt_key(cache_salt: str | list[str] | None) -> str | None:
+    """The namespace of the chat render and segment caches for a request's
+    cache_salt; None (shared) when unsalted. Equal salts give equal keys. A
+    one-element list is its element, as for a single prompt in the engine;
+    longer lists keep their element boundaries (repr is injective over str and
+    list[str]). The digest keeps a long salt out of the cache keys."""
+    if isinstance(cache_salt, list) and len(cache_salt) == 1:
+        cache_salt = cache_salt[0]
+    if not cache_salt:
+        return None
+    return hashlib.sha256(repr(cache_salt).encode()).hexdigest()
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -2209,6 +2223,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     encode_kwargs=encode_kwargs,
                     use_cache=is_multimodal,
                     add_generation_prompt=add_generation_prompt is not False,
+                    cache_salt=request.cache_salt,
                 )
             except Exception:
                 # If the first attempt fails, try with flat function-only format.
@@ -2226,6 +2241,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         encode_kwargs=encode_kwargs,
                         use_cache=is_multimodal,
                         add_generation_prompt=add_generation_prompt is not False,
+                        cache_salt=request.cache_salt,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
@@ -2272,7 +2288,12 @@ class OpenAIServingChat(OpenAIServingBase):
         encode_kwargs: Dict[str, Any],
         use_cache: bool,
         add_generation_prompt: bool = True,
+        cache_salt: str | list[str] | None = None,
     ) -> tuple[List[int], Optional[str]]:
+        # Like the radix cache, the render and segment caches below share
+        # entries only between requests with the same cache_salt: a hit from
+        # another tenant's request would show in this request's latency.
+        cache_salt = _cache_salt_key(cache_salt)
         cache_key = None
         if use_cache:
             try:
@@ -2289,6 +2310,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         template_kwargs,
                         encode_kwargs,
                         add_generation_prompt,
+                        cache_salt,
                     ),
                 )
             except TypeError:
@@ -2324,7 +2346,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             if segments is not None:
                 prompt_ids = encode_prompt_segments(
-                    self.tokenizer_manager.tokenizer, segments, encode_kwargs
+                    self.tokenizer_manager.tokenizer,
+                    segments,
+                    encode_kwargs,
+                    cache_salt=cache_salt,
                 )
             else:
                 rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
@@ -2335,8 +2360,11 @@ class OpenAIServingChat(OpenAIServingBase):
                     return_dict=False,
                     **template_kwargs,
                 )
-                prompt_ids = parallel_prompt_encode(
-                    self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
+                prompt_ids = encode_rendered_prompt(
+                    self.tokenizer_manager.tokenizer,
+                    rendered_prompt,
+                    encode_kwargs,
+                    cache_salt=cache_salt,
                 )
         decoded_prompt = (
             self.tokenizer_manager.tokenizer.decode(prompt_ids)
