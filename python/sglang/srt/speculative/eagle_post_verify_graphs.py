@@ -19,7 +19,6 @@ from sglang.kernels.ops.memory.small_field_copy import SmallFieldCopyPlan
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
-from sglang.srt.sampling.sampling_batch_info import adjusts_logits
 from sglang.srt.speculative.eagle_worker_common import (
     STOCK_SPECULATIVE_RUNTIME_HOOKS,
     make_post_verify_io,
@@ -27,6 +26,7 @@ from sglang.srt.speculative.eagle_worker_common import (
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,7 @@ class EaglePostVerifyGraphs:
         self,
         *,
         batch: ScheduleBatch,
+        route: VerifyRoute,
         verify_input: Any,
         logits_output: Any,
         can_run_cuda_graph: bool,
@@ -75,7 +76,7 @@ class EaglePostVerifyGraphs:
         support (compact_verify_max_top_k), None for the dense branch."""
         self.join()
         key = self._key(
-            batch, verify_input, logits_output, can_run_cuda_graph, max_top_k
+            batch, route, verify_input, logits_output, can_run_cuda_graph, max_top_k
         )
         if key is None:
             return None
@@ -120,6 +121,7 @@ class EaglePostVerifyGraphs:
     def _key(
         self,
         batch: ScheduleBatch,
+        route: VerifyRoute,
         verify_input: Any,
         logits_output: Any,
         can_run_cuda_graph: bool,
@@ -134,7 +136,7 @@ class EaglePostVerifyGraphs:
             or verify_input.topk != 1
             or batch.hisparse_coordinator is not None
             or verify_input.draft_probs is not None
-            or adjusts_logits(info, has_grammar=batch.has_grammar)
+            or route.adjusts_logits
             # the replayed sampling view carries no seeds and no min-p
             or info.sampling_seed is not None
             or info.need_min_p_sampling

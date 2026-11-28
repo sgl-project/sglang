@@ -303,7 +303,7 @@ class DiffusionSamplingParams:
 
     # inputs and conditioning
     prompt: str | None = None  # text prompt for generation
-    image_path: Path | str | None = None  # input image/video for editing (Path or URL)
+    image_path: Path | str | list[Path | str] | None = None  # local paths or URLs
 
     # duration
     seconds: int = 1  # for video: duration in seconds
@@ -331,6 +331,7 @@ class DiffusionSamplingParams:
     # Additional request-level parameters (e.g. enable_teacache, enable_upscaling, …)
     # merged directly into the OpenAI extra_body dict.
     extras: dict = field(default_factory=dict)
+    expect_rgba_layers: bool = False
 
 
 @dataclass(frozen=True)
@@ -352,6 +353,7 @@ class DiffusionTestCase:
     run_models_api_check: bool = True
     expected_model_id: str | None = None
     run_t2v_input_reference_check: bool = True
+    min_input_first_frame_psnr: float | None = None
     run_lora_basic_api_check: bool = False
     run_lora_dynamic_load_check: bool = False
     run_lora_dynamic_switch_check: bool = False
@@ -856,6 +858,7 @@ MULTI_FRAME_I2I_sampling_params = DiffusionSamplingParams(
     num_frames=4,
     direct_url_test=True,
     output_format="png",
+    expect_rgba_layers=True,
 )
 
 T2V_PROMPT = "A curious raccoon"
@@ -963,6 +966,13 @@ SANA_WM_TI2V_CI_sampling_params = DiffusionSamplingParams(
     output_size="384x640",
     num_frames=17,
     extras={"num_inference_steps": 12, "seed": 0, "guidance_scale": 4.5},
+)
+
+LINGBOT_VIDEO_TI2V_CI_sampling_params = replace(
+    LINGBOT_VIDEO_T2V_CI_sampling_params,
+    image_path="https://raw.githubusercontent.com/Robbyant/lingbot-video/dd5c231e793406c6a8893e9e4307008a9c2adfe4/assets/cases/ti2v/example_4/first_frame.png",
+    output_size="320x192",
+    direct_url_test=True,
 )
 
 LONGLIVE2_T2V_CI_sampling_params = replace(
