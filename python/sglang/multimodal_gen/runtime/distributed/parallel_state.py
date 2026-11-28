@@ -669,6 +669,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     dp_size: int = 1,
     distributed_init_method: str = "env://",
     dist_timeout: int | None = None,
+    pp_size: int = 1,
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -710,6 +711,7 @@ def maybe_init_distributed_environment_and_model_parallel(
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,
         sequence_parallel_degree=sp_size,
+        pipeline_parallel_degree=pp_size,
     )
 
 
@@ -854,6 +856,11 @@ def get_ring_ctx() -> tuple[int, int]:
     if not model_parallel_is_initialized():
         return 1, 0
     return get_ring_parallel_world_size(), get_ring_parallel_rank()
+
+
+def get_pp_group() -> GroupCoordinator:
+    assert _PP is not None, "pipeline model parallel group is not initialized"
+    return _PP
 
 
 # CFG

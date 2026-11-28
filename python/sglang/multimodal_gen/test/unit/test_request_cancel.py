@@ -924,7 +924,7 @@ def test_idle_scheduler_drains_cancellations(monkeypatch):
     scheduler.receiver.recv_multipart.side_effect = zmq.Again
     scheduler._socket_lock = threading.Lock()
     scheduler.server_args = SimpleNamespace(
-        comfyui_mode=False, sp_degree=1, enable_cfg_parallel=False, tp_size=1
+        comfyui_mode=False, sp_degree=1, enable_cfg_parallel=False, tp_size=1, pp_size=1
     )
     try:
         _deliver_cancel(publisher.publish, listener, "ready")

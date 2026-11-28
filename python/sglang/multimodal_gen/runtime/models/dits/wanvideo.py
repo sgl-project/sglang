@@ -28,6 +28,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
     sequence_model_parallel_all_gather,
 )
+from sglang.multimodal_gen.runtime.distributed.pipeline_parallel import (
+    run_stage_blocks,
+)
 from sglang.multimodal_gen.runtime.layers.attention import (
     MinimalA2AAttnOp,
     UlyssesAttention_VSA,
@@ -1376,6 +1379,7 @@ _TEXT_KV_STATE = "wan_text_kv"
 class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = [is_block]
     _compile_conditions = [is_block]
+    _pp_layers = "blocks"
     param_names_mapping = WanVideoConfig().param_names_mapping
     reverse_param_names_mapping = WanVideoConfig().reverse_param_names_mapping
     lora_param_names_mapping = WanVideoConfig().lora_param_names_mapping
@@ -1811,16 +1815,20 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     **text_kv_kwargs[-1],
                 )
             else:
-                for block, kv_kwargs in zip(self.blocks, text_kv_kwargs):
-                    hidden_states = block(
-                        hidden_states,
+                hidden_states = run_stage_blocks(
+                    self,
+                    self.blocks,
+                    hidden_states,
+                    lambda index, block, hidden: block(
+                        hidden,
                         encoder_hidden_states,
                         timestep_proj,
                         freqs_cis,
                         rope_cos_sin_cache=rope_cos_sin_cache,
                         complex_freqs=complex_freqs,
-                        **kv_kwargs,
-                    )
+                        **text_kv_kwargs[index],
+                    ),
+                )
             # if teacache is enabled, we need to cache the original hidden states
             if self.enable_teacache:
                 self.maybe_cache_states(hidden_states, original_hidden_states)

@@ -26,6 +26,10 @@ from torch.distributed.fsdp import (
 from torch.nn.modules.module import _IncompatibleKeys
 
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
+from sglang.multimodal_gen.runtime.distributed.pipeline_parallel import (
+    owned_by_other_stage,
+    prune_pipeline_stage,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -326,6 +330,8 @@ def maybe_load_fsdp_model(
     model = initialize_model(
         model_cls, init_params, default_torch_dtype, torch.device("meta")
     )
+    if getattr(model, "_pp_layers", None) is not None:
+        prune_pipeline_stage(model)
 
     # Check if we should use FSDP
     use_fsdp = fsdp_inference
@@ -672,6 +678,8 @@ def load_model_from_full_model_state_dict(
         meta_sharded_param = meta_sd.get(target_param_name)
 
         if meta_sharded_param is None:
+            if owned_by_other_stage(model, target_param_name):
+                continue
             # For FSDP models, ensure all ranks process parameters consistently
             if strict or is_fsdp_model:
                 raise ValueError(

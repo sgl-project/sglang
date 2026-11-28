@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
+    get_pp_group,
     get_ring_parallel_rank,
     get_ring_parallel_world_size,
     get_tp_group,
@@ -326,6 +327,8 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
+        self.pp_group = get_pp_group()
+        self.pp_cpu_group = self.pp_group.cpu_group
         self._realtime_sessions = RealtimeSessionCache(max_sessions=1)
         self.memory_occupation: MemoryOccupationController | None = None
         self._async_output_save = (
@@ -471,6 +474,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             dp_size=self.server_args.dp_size,
             distributed_init_method=rendezvous_addr.to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
+            pp_size=self.server_args.pp_size,
         )
 
         from sglang.srt.runtime_context import get_context, publish

@@ -373,6 +373,8 @@ class ServerArgs(DisaggServerArgsMixin):
     node_rank: int = 0
     dist_init_addr: str | None = None
     tp_size: Optional[int] = None
+    # DiT blocks split across stages; each stage keeps its own tp/sp/cfg layout
+    pp_size: int = 1
     sp_degree: Optional[int] = None
     # sequence parallelism
     ulysses_degree: Optional[int] = None
@@ -1759,7 +1761,12 @@ class ServerArgs(DisaggServerArgsMixin):
             if auto_cfg_parallel_degree < 1:
                 self.enable_cfg_parallel = False
             else:
-                cfg_group_size = self.dp_size * self.tp_size * auto_cfg_parallel_degree
+                cfg_group_size = (
+                    self.dp_size
+                    * self.tp_size
+                    * max(1, self.pp_size)
+                    * auto_cfg_parallel_degree
+                )
                 if (
                     self.performance_mode != "manual"
                     and deployment_config.auto_enable_cfg_parallel
@@ -1794,9 +1801,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if self.cfg_parallel_degree is None:
             self.cfg_parallel_degree = 2 if self.enable_cfg_parallel else 1
 
-        # adjust sp_degree: allocate all remaining GPUs after TP and DP
+        # adjust sp_degree: allocate all remaining GPUs after TP, PP and DP
         if self.sp_degree is None:
-            num_gpus_per_group = self.dp_size * self.tp_size
+            num_gpus_per_group = self.dp_size * self.tp_size * max(1, self.pp_size)
             if self.enable_cfg_parallel:
                 num_gpus_per_group *= self.cfg_parallel_degree
             if self.num_gpus % num_gpus_per_group == 0:
@@ -2599,6 +2606,16 @@ class ServerArgs(DisaggServerArgsMixin):
             type=int,
             default=None,
             help="The tensor parallelism size. Defaults to 1 if not specified.",
+        )
+        parser.add_argument(
+            "--pp-size",
+            type=int,
+            default=ServerArgs.pp_size,
+            help=(
+                "Pipeline parallel stages for the DiT. Each stage builds and loads "
+                "a contiguous share of the DiT blocks; text encoders and VAEs stay "
+                "replicated. Only DiTs that declare pipeline support accept > 1."
+            ),
         )
         parser.add_argument(
             "--sp-degree",
@@ -4345,13 +4362,32 @@ class ServerArgs(DisaggServerArgsMixin):
                 "disaggregated roles scale by adding role instances instead"
             )
 
-        num_gpus_per_group = self.dp_size * self.tp_size
+        if self.pp_size < 1:
+            raise ValueError("--pp-size must be a natural number")
+        if self.pp_size > 1:
+            unsupported = [
+                flag
+                for flag, enabled in (
+                    ("--dit-layerwise-offload", self.dit_layerwise_offload),
+                    ("--use-fsdp-inference", self.use_fsdp_inference),
+                    ("--enable-breakable-cuda-graph", self.enable_breakable_cuda_graph),
+                    ("--cache-dit-config", self.cache_dit_config),
+                )
+                if enabled
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"--pp-size > 1 does not yet support {', '.join(unsupported)}"
+                )
+
+        num_gpus_per_group = self.dp_size * self.tp_size * self.pp_size
         if self.enable_cfg_parallel:
             num_gpus_per_group *= self.cfg_parallel_degree
 
         if self.num_gpus % num_gpus_per_group != 0:
             raise ValueError(
                 f"num_gpus ({self.num_gpus}) must be divisible by (dp_size * tp_size"
+                f"{' * pp_size' if self.pp_size > 1 else ''}"
                 f"{f' * {self.cfg_parallel_degree}' if self.enable_cfg_parallel else ''}"
                 f") = {num_gpus_per_group}"
             )

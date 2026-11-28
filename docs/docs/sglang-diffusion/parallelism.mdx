@@ -9,7 +9,7 @@ different dimension of the DiT forward pass, which is exactly why they can be
 combined: the total GPU count is the product of the degrees,
 
 ```text
-num_gpus = cfg_parallel_degree × tp_size × sp_degree
+num_gpus = cfg_parallel_degree × tp_size × sp_degree × pp_size
 sp_degree = ulysses_degree × ring_degree
 ```
 
@@ -28,6 +28,7 @@ axis with their own knob), and the [CLI reference](./api/cli).
 | Ulysses SP | sequence outside attention ↔ heads inside it | two all-to-alls per attention | `--ulysses-degree` |
 | Ring SP | sequence rows inside attention | neighbor-only K/V rotation, overlapped with compute | `--ring-degree` |
 | K/V-gather CP | sequence rows inside attention | one K/V all-gather per attention | `--kv-gather-degree` |
+| Pipeline parallel (PP) | DiT blocks across stages | one residual-stream send per stage boundary per forward, plus one output broadcast | `--pp-size` |
 | Data parallel | requests | none between replicas | `--dp-size` |
 
 Two strategies compose when they split different dimensions. TP and Ulysses
@@ -96,7 +97,7 @@ mis-mapped layout stays numerically correct and silently loses the performance
   `UlyssesAttention` layer, now down to one user (Wan's VSA sparse-attention
   variant) that has no softmax LSE to merge and can't gain ring support
   without a different kernel.
-- The launcher checks that `num_gpus` is divisible by `dp_size × tp_size`
+- The launcher checks that `num_gpus` is divisible by `dp_size × tp_size × pp_size`
   (× `cfg_parallel_degree` with CFG parallel) and by `sp_degree`, and that
   `sp_degree = ulysses_degree × ring_degree` (or equals `kv_gather_degree`);
   leave `--sp-degree` unset to have it derived so the degrees multiply to
@@ -164,6 +165,7 @@ to least cross-node friendly:
 | --- | --- | --- | --- |
 | Data parallel | none between replicas | zero on the request path | **Best.** Replicas only share startup init and control-op fan-out; no fast interconnect needed at all. |
 | CFG parallel | one branch-combine | one latent-sized exchange, once | **Good candidate.** Once per step, small payload, naturally deadline-tolerant. Unmeasured across nodes so far. |
+| Pipeline parallel | point-to-point at stage boundaries | one residual-stream shard per boundary per forward, plus the output | **Good candidate.** Each rank sends only its own sequence shard to the same slot of the next stage, so Ulysses and TP stay inside a node. Same-node-validated so far. |
 | K/V-gather CP | one K/V all-gather per attention | (R−1)/R of K/V, one unoverlapped burst | **Between Ulysses and ring:** only K/V moves (queries never do), but the burst cannot hide behind compute — prefer ring across nodes, gather at small degrees within one. |
 | Ring SP | neighbor-only K/V rotation | K/V ÷ ring_degree, (R−1) hops, overlapped with attention tiles | **Designed for it.** The mechanism now covers most models' joint attention (see Constraints). Actually crossing nodes end-to-end is validated for MiniMax H3 (Ulysses intra-node × ring across, net positive and growing with sequence length); other models' ring support is same-node-validated so far. |
 | Ulysses SP | all-to-all | full q/k/v activations, twice per attention, every layer | **Keep intra-node.** All-to-all needs full-bisection bandwidth; across nodes it becomes R² flows with receiver incast. |
@@ -202,6 +204,31 @@ mean profitable:
   constraint either).
 - **TP beyond 2 ranks** rarely improves image-DiT latency: the per-block
   all-reduce grows with rank count faster than the GEMM savings.
+
+## Pipeline parallelism
+
+`--pp-size P` splits the DiT's repeated blocks into `P` contiguous, near-equal
+stages. Each stage builds and loads only its own blocks, so the DiT weights per
+GPU shrink to roughly `1/P` (embeddings and the output head stay on every stage).
+Text encoders and VAEs are not split. Within a stage, TP, SP and CFG parallelism
+work as before, and the rank layout keeps a stage's SP group contiguous, so with
+a node-major mapping SP stays inside a node while stages cross nodes.
+
+Every stage runs the prologue (embeddings) locally; the residual stream crosses
+each boundary rank to rank, and the last stage's output is broadcast back to the
+other stages. A single forward therefore runs the stages one after another. With
+serial CFG, the conditional and unconditional forwards of a step overlap: the
+first stage starts the second branch while later stages finish the first.
+
+Splitting the blocks does not change any per-block computation, so outputs match
+`--pp-size 1` with the same TP/SP layout. Compare like for like: on several GPUs
+the launcher may also fold text encoders (`--encoder-parallel`) and decode the
+VAE in parallel, which change outputs independently of PP.
+
+A DiT opts in by naming its block list (`_pp_layers`) and running that list
+through `run_stage_blocks`; Wan2.1 and Wan2.2 do today, and other DiTs refuse
+`--pp-size > 1`. PP does not yet combine with `--dit-layerwise-offload`, FSDP
+inference, breakable CUDA graphs or Cache-DiT.
 
 ## Data parallelism
 
