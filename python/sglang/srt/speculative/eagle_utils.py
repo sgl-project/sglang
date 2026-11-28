@@ -5,8 +5,6 @@ import logging
 import math
 from contextlib import contextmanager
 from functools import partial
-from importlib import import_module
-from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
@@ -22,6 +20,7 @@ from sglang.kernels.ops.speculative.verify_sampling import (
     chain_speculative_sampling_triton,
     tree_speculative_sampling_target_only,
 )
+from sglang.kernels.plugin_kernels.nvidia.spec import ShardedLogitsView
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
@@ -32,7 +31,7 @@ from sglang.srt.layers.sampling_renorm import (
     top_p_renorm_prob,
 )
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import decode_alloc_targets
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.sharded_verify import (
     VocabShard,
@@ -53,14 +52,13 @@ from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
-    from sglang.srt.constrained.base_grammar_backend import GrammarMask
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.sampling.watermarking.interface import VerifyWatermark
+    from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -70,14 +68,7 @@ _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
 _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 
-# The binding defaults probe this explicit capability once instead of relying on
-# exception handling in the hot path.  Runtime itself remains independent of the
-# optional binding contract.
-LOCAL_KEYS_SUPPORTED = True
 LocalKeysFn = Callable[[Any], Optional[torch.Tensor]]
-_provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
-_ShardedLogitsView = getattr(_provider_spec, "ShardedLogitsView", None)
-_VocabShardView = getattr(_provider_spec, "VocabShardView", None)
 
 logger = logging.getLogger(__name__)
 
@@ -471,6 +462,8 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
+    *,
+    route: VerifyRoute,
 ):
     # Imports must stay lazy (import-cycle safety) but only need to resolve
     # once, not on every decode cycle of this hot path.
@@ -563,6 +556,7 @@ def eagle_prepare_for_verify(
         return_hidden_states_before_norm=False,
         spec_mrope_positions=verify_input.prepared_mrope_positions,
         iteration_ids=verify_input.iteration_ids,
+        verify_route=route,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -725,47 +719,6 @@ def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
     return max(top_ks)
 
 
-def _local_key_view(
-    *,
-    logits: torch.Tensor,
-    vocab_shard: VocabShard,
-    temperatures: Optional[torch.Tensor],
-    seeds: Optional[torch.Tensor],
-    splits: int,
-) -> Any:
-    """Build the canonical provider view when binding is installed.
-
-    Runtime-only trees deliberately do not define or import provider contracts.
-    A structural fallback keeps local runtime tests useful without creating an
-    ordering dependency between the two PRs.
-    """
-    shard = (
-        _VocabShardView(
-            start=vocab_shard.start,
-            valid=vocab_shard.valid,
-            vocab_size=vocab_shard.vocab_size,
-        )
-        if _VocabShardView is not None
-        else SimpleNamespace(
-            start=vocab_shard.start,
-            valid=vocab_shard.valid,
-            vocab_size=vocab_shard.vocab_size,
-        )
-    )
-    fields = dict(
-        values=logits,
-        shard=shard,
-        temperatures=temperatures,
-        seeds=seeds,
-        splits=splits,
-    )
-    return (
-        _ShardedLogitsView(**fields)
-        if _ShardedLogitsView is not None
-        else SimpleNamespace(**fields)
-    )
-
-
 def _sharded_tokens(
     logits: torch.Tensor,
     vocab_shard: VocabShard,
@@ -790,9 +743,9 @@ def _sharded_tokens(
     # remains identical to every other rank.
     splits = key_splits(logits.shape[-1])
     keys = local_keys(
-        _local_key_view(
-            logits=logits,
-            vocab_shard=vocab_shard,
+        ShardedLogitsView(
+            values=logits,
+            shard=vocab_shard,
             temperatures=temperatures,
             seeds=seeds,
             splits=splits,
@@ -817,32 +770,25 @@ def _sharded_tokens(
 def _sharded_sampling_applies(
     *,
     verify_input: EagleVerifyInput,
-    batch: ScheduleBatch,
-    grammar_mask: Optional[GrammarMask],
-    watermark: bool,
-    has_custom_logit_processor: bool,
-    has_local_keys: bool = False,
+    verify: VerifyStep,
+    has_local_keys: bool,
 ) -> bool:
     """Whether this verify can consume vocabulary-sharded logits directly.
 
     Greedy rows are bitwise-preserving and dispatch automatically. Temperature-only
     rows require a local key policy; a policy that declines returns to the stock
     gathered path before sampling. Anything that reads or edits full logits also
-    stays on the stock gathered path.
+    stays on the stock gathered path. A padded CUDA-graph replay keeps the shards
+    whatever the route says, so this gate still gathers them.
     """
-    info = batch.sampling_info
     return (
         _is_cuda
         and verify_input.tree_topk == 1
         and sampling_allows_vocab_shards(
-            info,
-            # Not adjusts_logits: info may be the provider's VerifySamplingView.
-            adjusts_logits=grammar_mask is not None
-            or watermark
-            or has_custom_logit_processor
-            or info.step_penalties is not None
-            or info.logit_bias is not None,
-            return_logprob=batch.return_logprob,
+            verify.batch.sampling_info,
+            adjusts_logits=verify.route.adjusts_logits,
+            need_truncated_sampling=verify.route.need_truncated_sampling,
+            return_logprob=verify.batch.return_logprob,
             has_local_keys=has_local_keys,
         )
         and spec_allows_vocab_shards(get_spec())
@@ -851,51 +797,42 @@ def _sharded_sampling_applies(
 
 def eagle_sample(
     verify_input: EagleVerifyInput,
-    batch: ScheduleBatch,
+    verify: VerifyStep,
     logits_output: LogitsProcessorOutput,
-    grammar_mask: Optional[GrammarMask] = None,
-    uno_target_max_top_k: Optional[int] = None,
     *,
-    watermark: Optional[VerifyWatermark] = None,
+    uno_target_max_top_k: Optional[int] = None,
     simulated_acc_len: Optional[torch.Tensor] = None,
     simulated_acc_len_rng: Optional[torch.Generator] = None,
     sparse_bonus_argmax: bool = False,
     local_keys: Optional[LocalKeysFn] = None,
-    has_custom_logit_processor: bool = False,
 ):
     """
-    Verify and find accepted tokens based on logits output and batch
-    (which contains spec decoding information). simulated_acc_len: the injected
-    acceptance length already drawn on the host, as a device int64 [1], so a CUDA
-    graph can replay the injection. simulated_acc_len_rng: the generator to draw
-    it from here otherwise (the global CPU RNG when None). sparse_bonus_argmax: an
-    injected acceptance's bonus is the target argmax on the compact top-k branch
-    too, as on the dense one.
+    Verify and find accepted tokens based on logits output and the verify step:
+    its batch (which contains spec decoding information), the route the shard
+    gate reads, and the stages (`VerifyStep.adjust`). simulated_acc_len: the
+    injected acceptance length already drawn on the host, as a device int64 [1],
+    so a CUDA graph can replay the injection. simulated_acc_len_rng: the
+    generator to draw it from here otherwise (the global CPU RNG when None).
+    sparse_bonus_argmax: an injected acceptance's bonus is the target argmax on
+    the compact top-k branch too, as on the dense one.
     """
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.speculative.target_verify import adjust_verify_logits
     from sglang.srt.utils.async_probe import sanitize_nan_logits
 
+    batch = verify.batch
     device = batch.device
-    is_idle = getattr(batch, "is_idle", None)
-    if is_idle is None:
-        is_idle = batch.forward_mode.is_idle()
-    if is_idle:
+    if batch.forward_mode.is_idle():
         predict = torch.empty(0, dtype=torch.int32, device=device)
         num_correct_drafts = torch.empty(0, dtype=torch.int32, device=device)
         accept_index = torch.empty(0, dtype=torch.int32, device=device)
         return predict, num_correct_drafts, accept_index
 
     bs = len(batch.seq_lens)
-    sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
     vocab_shard = logits_output.next_token_logits_vocab_shard
     if vocab_shard is not None and not _sharded_sampling_applies(
         verify_input=verify_input,
-        batch=batch,
-        grammar_mask=grammar_mask,
-        watermark=watermark is not None,
-        has_custom_logit_processor=has_custom_logit_processor,
+        verify=verify,
         has_local_keys=local_keys is not None,
     ):
         next_token_logits = gather_full_logits(
@@ -907,27 +844,9 @@ def eagle_sample(
     sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    adjust_verify_logits(
-        next_token_logits,
-        sampling_info=sampling_info,
-        grammar_mask=grammar_mask,
-        draft_tokens=candidates,
-        next_child=verify_input.retrieve_next_token,
-        next_sibling=verify_input.retrieve_next_sibling,
-        has_custom_logit_processor=has_custom_logit_processor,
+    next_token_logits, sampling_info = verify.adjust(
+        next_token_logits, candidates, tree=verify_input
     )
-    if watermark is not None:
-        next_token_logits, sampling_info = watermark.apply(
-            next_token_logits,
-            sampling_info=sampling_info,
-            req_pool_indices=batch.req_pool_indices,
-            draft_tokens=verify_input.draft_token,
-            positions=verify_input.positions,
-            draft_token_num=verify_input.draft_token_num,
-            custom_mask=verify_input.custom_mask,
-            # compute_spec_logprobs reads logits_output after verify.
-            keep_logits=batch.return_logprob,
-        )
 
     return _tree_accept(
         verify_input=verify_input,
@@ -938,7 +857,7 @@ def eagle_sample(
         sampling_info=sampling_info,
         candidates=candidates,
         uno_target_max_top_k=uno_target_max_top_k,
-        watermark=watermark is not None,
+        watermark=verify.watermark is not None,
         simulated_acc_len=simulated_acc_len,
         simulated_acc_len_rng=simulated_acc_len_rng,
         sparse_bonus_argmax=sparse_bonus_argmax,
@@ -1426,17 +1345,17 @@ def _verify_outputs(
 def eagle_prepare_for_decode(batch: ScheduleBatch):
     batch.maybe_evict_swa()
 
-    cur_kv_lens, nxt_kv_lens, num_needed_tokens = decode_alloc_lens(
+    allocated_lens, target_lens, num_new_tokens = decode_alloc_targets(
         batch.reqs, page_size=batch.token_to_kv_pool_allocator.page_size
     )
     for r in batch.reqs:
         r.decode_batch_idx += 1
 
-    cur_kv_lens_cpu = torch.tensor(cur_kv_lens, dtype=torch.int32, device="cpu")
-    nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens, dtype=torch.int32, device="cpu")
+    cur_kv_lens_cpu = torch.tensor(allocated_lens, dtype=torch.int32, device="cpu")
+    nxt_kv_lens_cpu = torch.tensor(target_lens, dtype=torch.int32, device="cpu")
 
     # Mirrorless opt-out: publish the host-side max of the page-aligned
-    # kv_allocated_len (>= committed + alloc reserve, so it upper-bounds
+    # kv_allocated_len (>= committed + decode-ahead, so it upper-bounds
     # every length attention can read next round) for the NPU backend's
     # D2H-free block-table gather sizing.
     if batch.seq_lens_cpu is None:
@@ -1461,6 +1380,6 @@ def eagle_prepare_for_decode(batch: ScheduleBatch):
         cur_kv_lens_cpu=cur_kv_lens_cpu,
         nxt_kv_lens=nxt_kv_lens,
         nxt_kv_lens_cpu=nxt_kv_lens_cpu,
-        num_needed_tokens=num_needed_tokens,
+        num_needed_tokens=num_new_tokens,
         batch=batch,
     )

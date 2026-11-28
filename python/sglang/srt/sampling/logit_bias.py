@@ -1,4 +1,4 @@
-"""The logit_bias sampling plugin: a dense [bs, vocab] additive bias, built at
+"""The logit_bias stage: a dense [bs, vocab] additive bias, built at
 each launch from the step's requests."""
 
 from __future__ import annotations

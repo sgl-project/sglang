@@ -68,7 +68,8 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, adjusts_logits
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
@@ -152,7 +153,6 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     simulated_acc_len_generator,
 )
-from sglang.srt.speculative.target_verify import TargetVerify, adjust_verify_logits
 from sglang.srt.utils import (
     async_h2d,
     is_cuda,
@@ -902,17 +902,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         processors[0].defer_verify_gather = True
         return processors[0]
 
-    def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
+    def _can_skip_verify_logits(self, verify: VerifyStep) -> bool:
         """The accept reads only the target argmax: the vocab shards stay ungathered."""
-        if batch.return_logprob:
+        if verify.batch.return_logprob or verify.route.adjusts_logits:
             return False
+        sampling_info = verify.batch.sampling_info
         if sampling_info is None:
-            return not batch.has_grammar and self._selector_sample is None
-        if (
-            adjusts_logits(sampling_info, has_grammar=batch.has_grammar)
-            # A sampling mask is captured from the full target distribution.
-            or sampling_info.sampling_mask_batch_indices is not None
-        ):
+            return self._selector_sample is None
+        # A sampling mask is captured from the full target distribution.
+        if sampling_info.sampling_mask_batch_indices is not None:
             return False
         if sampling_info.is_all_greedy:
             return self._selector_sample is None
@@ -1045,15 +1043,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "device graph capture.",
                     type(current_platform).__name__,
                 )
-            if _is_npu and target_dp_enabled and capture_decode_cuda_graph:
-                # Idle DP ranks skip the draft step and cannot join a shared replay;
-                # CUDA avoids this by keying the draft's graphs on the local batch size.
-                capture_decode_cuda_graph = False
-                if self._target_tp_rank == 0:
-                    logger.warning(
-                        "Disable DFLASH draft cuda graph because dp attention "
-                        "is enabled (draft runs eager)."
-                    )
             if (is_cuda() or is_gfx95_supported()) and capture_decode_cuda_graph:
                 available_mem = self._tp_sync.available_memory_gb(
                     SpecTpSyncSite.DFLASH_MEM,
@@ -1509,8 +1498,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if mask.dtype != torch.bool:
             mask = mask.to(torch.bool)
 
-        table_width = int(req_to_token.shape[1])
-        if table_width <= 0:
+        req_to_token_row_width = int(req_to_token.shape[1])
+        if req_to_token_row_width <= 0:
             if bool(mask.any().item()):
                 raise RuntimeError(
                     f"{context} req_to_token table is empty but gather mask is non-empty."
@@ -3137,13 +3126,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                         batch, self._target_worker, defer_metadata_init=True
                     )
                 )
+                # Zero-row idle batch. NPU: mark ready so replay re-plans via
+                # prepare_replay's recompute branch instead of from the empty
+                # seq_lens. CUDA: leave unmarked so replay takes the full
+                # planning path (the marked flag means pre-planned there).
                 if _is_npu:
-                    # Matches the active ranks, which go eager when any DP rank is idle.
-                    idle_verify_forward_batch.can_run_decode_cuda_graph = False
-                    idle_can_run_cuda_graph = False
                     idle_verify_forward_batch.mark_forward_metadata_ready()
-                # On CUDA every rank pads to max(original_global_num_tokens_cpu), so
-                # the idle rank replays the active ranks' graph with zero real rows.
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
@@ -3550,6 +3538,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if batch.hisparse_coordinator is not None:
             batch.hisparse_coordinator.prepare_spec_verify(batch)
         sampling_info = batch.sampling_info
+        verify = self.target_worker.model_runner.sampling_pipeline.plan_verify(
+            batch, watermark_full_mask=False
+        )
 
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
@@ -3594,19 +3585,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             batch.seq_lens_cpu = seq_lens_cpu_backup
             batch.seq_lens_sum = seq_lens_sum_backup
 
-            # Idle-DP guard (NPU): an eager idle rank's raw counts and a replaying rank's
-            # padded bucket disagree on DP-gather offsets, so any idle rank forces eager.
-            if (
-                _is_npu
-                and get_parallel().attn_dp_enabled
-                and verify_forward_batch.original_global_num_tokens_cpu is not None
-                and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
-            ):
-                verify_forward_batch.can_run_decode_cuda_graph = False
-
-            # Mixed-round guard: an extend rank's raw token counts disagree with
-            # the verify batch's spec-scaled counts on the DP-gather layout; run
-            # eager, symmetric with the idle guard above.
+            # Mixed-round guard: an extend rank's raw counts disagree with the
+            # verify batch's spec-scaled counts on the DP-gather layout; run
+            # eager (idle ranks are rejected by the same bucket check).
             if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
                 verify_forward_batch.can_run_decode_cuda_graph = False
 
@@ -3627,7 +3608,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if target_lp is not None and target_lp.is_deferred_shard(
             logits_output.next_token_logits
         ):
-            if self._can_skip_verify_logits(batch, sampling_info):
+            if self._can_skip_verify_logits(verify):
                 target_predict = target_lp.deferred_argmax(
                     logits_output.next_token_logits
                 )
@@ -3637,22 +3618,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                     logits_output.next_token_logits
                 )
 
-        verify = TargetVerify.prepare(
-            batch,
-            logits_output=logits_output,
-            grammar_tree=grammar_tree,
-            grammar_barrier=grammar_barrier,
-            watermark_engine=None,
-            watermark_full_mask=False,
+        verify.build_grammar_mask(
+            grammar_tree, logits_output=logits_output, barrier=grammar_barrier
         )
         if sampling_info is not None and target_predict is None:
-            adjust_verify_logits(
-                logits_output.next_token_logits,
-                sampling_info=sampling_info,
-                grammar_mask=verify.grammar_mask,
-                draft_tokens=draft_tokens,
-                has_custom_logit_processor=sampling_info.has_custom_logit_processor,
-            )
+            # In place: DFlash refuses the watermark, the one stage that returns
+            # new logits.
+            verify.adjust(logits_output.next_token_logits, draft_tokens)
 
         candidates = draft_tokens
         (
@@ -3673,9 +3645,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
         verify.commit(
-            batch,
+            VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
             logits_output=logits_output,
-            accept=VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
         )
         if self._acceptance_estimator is not None and SIMULATE_ACC_LEN <= 0:
             self._observe_acceptance(

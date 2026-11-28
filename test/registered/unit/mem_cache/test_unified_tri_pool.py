@@ -22,6 +22,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import msgspec
 import torch
 
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -853,7 +854,7 @@ class TestTriFactorySizing(_PoolTestCase):
             swa_max_total_num_tokens=32,
             max_mamba_cache_size=20,
             model_context_len=16,
-            req_to_token_headroom=4,
+            req_to_token_row_width=20,
             max_num_reqs=4,
             enable_memory_saver=False,
             enable_mamba_extra_buffer=False,
@@ -921,7 +922,7 @@ class TestTriFactorySizing(_PoolTestCase):
     def test_mamba_lazy_checkpoint_cleanup(self):
         from types import SimpleNamespace
 
-        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.runtime_context import get_parallel, get_schedule
 
         for tri_pool in (False, True):
             for lazy in (False, True):
@@ -968,8 +969,8 @@ class TestTriFactorySizing(_PoolTestCase):
                             # Spec off: no draft region to fuse.
                             _fused_draft_decision=lambda: None,
                             _fused_draft_for_pool_factory=lambda decision: None,
-                            _unified_request_rows=lambda *, has_state: (
-                                cfg.KVCacheConfigurator._unified_request_rows(
+                            _unified_pre_alloc_rows=lambda *, has_state: (
+                                cfg.KVCacheConfigurator._unified_pre_alloc_rows(
                                     configurator, has_state=has_state
                                 )
                             ),
@@ -988,6 +989,7 @@ class TestTriFactorySizing(_PoolTestCase):
                         # either top-level flag forwarding must break cleanup.
                         with (
                             get_parallel().override(attn_dcp_size=1, attn_tp_size=1),
+                            get_schedule().override(page_size=1),
                             patch.object(
                                 cfg,
                                 "get_exec",
@@ -1045,7 +1047,14 @@ class TestTriFactorySizing(_PoolTestCase):
                                 )
                             ).token_to_kv_pool_allocator.storage
                             configurator._unified_plan = planned.plan
-                            configurator._unified_sized = planned.sized
+                            # The runner's table rows are the model context plus
+                            # headroom wide, not the factory's 20.
+                            configurator._unified_sized = msgspec.structs.replace(
+                                planned.sized,
+                                req_to_token_row_width=cfg.get_req_to_token_row_width(
+                                    model.context_len
+                                ),
+                            )
                             storage = cfg.KVCacheConfigurator._init_unified_pools(
                                 configurator,
                                 sizes=SimpleNamespace(
@@ -1379,6 +1388,7 @@ class TestTriFactorySizing(_PoolTestCase):
                 **self._factory_kwargs(
                     unified_total_bytes=1024,  # << ctx * e_f alone
                     model_context_len=100_000,
+                    req_to_token_row_width=100_004,
                     sliding_window_size=64,
                 )
             )

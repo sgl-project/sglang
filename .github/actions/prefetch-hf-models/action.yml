@@ -15,14 +15,27 @@ inputs:
 runs:
   using: composite
   steps:
+    # Some self-hosted runners default to Python 3.10. The pinned prefetch
+    # dependencies require 3.11 or newer.
+    - name: Set up Python for model prefetch
+      id: prefetch-python
+      if: inputs.repo-ids != ''
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        update-environment: false
+
     # No token here. -I and --isolated: no PR checkout on sys.path, and no
     # user site, PYTHON*, pip config, or PIP_* left on the persistent runner.
     - name: Install prefetch dependencies
       if: inputs.repo-ids != ''
       shell: bash
       working-directory: ${{ runner.temp }}
+      env:
+        PREFETCH_PYTHON: ${{ steps.prefetch-python.outputs.python-path }}
       run: |
-        python3 -I -m pip install --isolated --disable-pip-version-check --quiet \
+        export LD_LIBRARY_PATH="${PREFETCH_PYTHON%/bin/*}/lib"
+        "$PREFETCH_PYTHON" -I -m pip install --isolated --disable-pip-version-check --quiet \
           --no-cache-dir --no-deps --only-binary=:all: --index-url https://pypi.org/simple \
           --target "$RUNNER_TEMP/hf-prefetch" \
           -r "$GITHUB_ACTION_PATH/../../../scripts/ci/utils/prefetch_requirements.txt"
@@ -33,8 +46,10 @@ runs:
       shell: bash
       working-directory: ${{ runner.temp }}
       env:
+        PREFETCH_PYTHON: ${{ steps.prefetch-python.outputs.python-path }}
         HF_TOKEN: ${{ inputs.hf-token }}
         REPO_IDS: ${{ inputs.repo-ids }}
       run: |
-        PYTHONPATH="$RUNNER_TEMP/hf-prefetch" python3 -S \
+        export LD_LIBRARY_PATH="${PREFETCH_PYTHON%/bin/*}/lib"
+        PYTHONPATH="$RUNNER_TEMP/hf-prefetch" "$PREFETCH_PYTHON" -S \
           "$GITHUB_ACTION_PATH/../../../scripts/ci/utils/prefetch_hf_models.py"

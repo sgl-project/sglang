@@ -404,7 +404,7 @@ class ReqToTokenPool:
     def __init__(
         self,
         size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
     ):
@@ -416,18 +416,22 @@ class ReqToTokenPool:
         # +1 padding row at index 0: cuda-graph padded batches default
         # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
         self._alloc_size = size + 1
-        # The row width: the model context plus room for over-allocation and
-        # drafts. A speculative step can read past the model context, so
-        # attention tables indexed by KV position are sized to this width.
-        self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
+                (self._alloc_size, row_width), dtype=torch.int32, device=device
             )
         self.free_slots = list(range(1, self._alloc_size))
         self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
         self._aux_cache: Any = None
+
+    @property
+    def row_width(self) -> int:
+        """The KV positions a row holds; the builders size it to the model
+        context plus room for over-allocation and drafts. A speculative step
+        can read past the model context, so attention tables indexed by KV
+        position are sized to this width."""
+        return self.req_to_token.shape[1]
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -1434,7 +1438,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         size: int,
         mamba_size: int,
         mamba_spec_state_size: int,
-        max_context_len: int,
+        row_width: int,
         device: str,
         enable_memory_saver: bool,
         cache_params: BaseLinearStateParams,
@@ -1458,7 +1462,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
     ):
         super().__init__(
             size=size,
-            max_context_len=max_context_len,
+            row_width=row_width,
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
@@ -4497,8 +4501,9 @@ class HybridLinearKVPool(KVCache):
         """Global layer ids aligned with the full-attention KV buffers."""
         layer_ids = list(self.full_attention_layer_id_mapping)
         if self.use_mla and _is_npu and layer_ids:
-            data_ptrs, _, _ = self.get_contiguous_buf_infos()
-            return layer_ids * (len(data_ptrs) // len(layer_ids))
+            # The child numbers compact full-attention layers; transfer peers
+            # pair entries by model layer, including owned-only CP shards.
+            return [layer_ids[i] for i in self.full_kv_pool.get_kv_layer_ids()]
         return layer_ids if self.use_mla else layer_ids * 2
 
     def get_state_buf_infos(self):
@@ -4655,6 +4660,9 @@ class HybridLinearKVPool(KVCache):
         k_scale: float = 1.0,
         v_scale: float = 1.0,
         dcp_kv_mask: Optional[torch.Tensor] = None,
+        *,
+        cp_gathered_full: bool = False,
+        cp_gathered_chunk: bool = False,
     ):
         # Write-location info lives in the metadata (`KVWriteLoc`). `full_loc` is the
         # unified pool's pre-translated PHYSICAL loc (None for a static pool, where
@@ -4680,11 +4688,20 @@ class HybridLinearKVPool(KVCache):
             # MLA pools whose set_kv_buffer takes no layer_id_override (the
             # FP4 and NPU ones) address the layer by `layer.layer_id`.
             with self._transfer_id_context(layer):
+                cp_kwargs = (
+                    dict(
+                        cp_gathered_full=cp_gathered_full,
+                        cp_gathered_chunk=cp_gathered_chunk,
+                    )
+                    if cp_gathered_full or cp_gathered_chunk
+                    else {}
+                )
                 self.full_kv_pool.set_kv_buffer(
                     layer,
                     write_loc,
                     cache_k,
                     cache_v,
+                    **cp_kwargs,
                 )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
@@ -6650,9 +6667,17 @@ class MiniMaxSparseKVPool(KVCache):
             layer_ids=sorted(self.sparse_layer_id_mapping)
         )
 
+    def get_kv_layer_ids(self) -> list[int]:
+        """Global layer id of each get_sparse_kv_buf_infos() entry (K, then V)."""
+        return sorted(self.sparse_layer_id_mapping) * 2
+
     def get_dense_kv_state_buf_infos(self):
         # Dense KV uses logical device slots, independently of sparse host slots.
         return self._get_layer_kv_buf_infos(layer_ids=sorted(self._dense_layer_ids))
+
+    def get_dense_kv_state_layer_ids(self) -> list[int]:
+        """Global layer id of each get_dense_kv_state_buf_infos() entry (K, then V)."""
+        return sorted(self._dense_layer_ids) * 2
 
     def _get_layer_kv_buf_infos(self, *, layer_ids):
         buffers = [self.get_key_buffer(layer_id) for layer_id in layer_ids] + [
@@ -6662,6 +6687,12 @@ class MiniMaxSparseKVPool(KVCache):
             [buffer.data_ptr() for buffer in buffers],
             [buffer.nbytes for buffer in buffers],
             [buffer[0].nbytes * self.page_size for buffer in buffers],
+        )
+
+    def get_index_k_state_layer_ids(self) -> list[int]:
+        """Global layer id of each get_index_k_state_buf_infos() entry."""
+        return sorted(
+            self.index_k_layer_id_mapping, key=self.index_k_layer_id_mapping.get
         )
 
     def get_index_k_state_buf_infos(self):

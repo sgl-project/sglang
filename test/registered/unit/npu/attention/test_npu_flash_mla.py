@@ -10,9 +10,9 @@ import torch
 
 # Load Transformers before mocking torch_npu so package discovery sees a real spec.
 import sglang.srt.hf_transformers  # noqa: F401
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_npu_ci(est_time=3, suite="extra-a-test-npu")
 
 for name in (
     "torch_npu",
@@ -58,6 +58,8 @@ def backend():
     obj.q_head_num_padding = None
     obj.req_to_token = torch.arange(1024).view(2, 512)
     obj.req_to_token_pool = SimpleNamespace(req_to_token=obj.req_to_token)
+    obj.max_kv_len = 512
+    obj.max_num_pages = 4
     obj.graph_metadata = {"block_tables": torch.empty(2, 4, dtype=torch.int32)}
     obj.flash_mla_mask = torch.ones(16, 16, dtype=torch.int8).triu(1)
     obj.flash_mla_metadata = Mock(side_effect=lambda **kw: kw["cache_seqlens"].clone())
@@ -366,7 +368,7 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         kv_cache_dtype=torch.bfloat16,
         kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
         req_to_token_pool=SimpleNamespace(
-            max_context_len=512, req_to_token=torch.zeros(2, 512)
+            row_width=512, req_to_token=torch.zeros(2, 512)
         ),
         token_to_kv_pool=object(),
         use_mla_backend=not is_draft,
