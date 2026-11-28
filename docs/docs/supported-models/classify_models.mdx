@@ -63,8 +63,8 @@ POST /v1/classify
 - `model`: The model used for classification
 - `data`: Array of classification results
   - `index`: Index of the result
-  - `label`: Predicted class label
-  - `probs`: Array of probabilities for each class
+  - `label`: Predicted class label, or one label per input token for token classifiers
+  - `probs`: Array of probabilities for each class, or one such array per input token for token classifiers
   - `num_classes`: Total number of classes
 - `usage`: Token usage information
   - `prompt_tokens`: Number of input tokens
@@ -77,6 +77,24 @@ POST /v1/classify
 When the model's `config.json` sets `"problem_type": "multi_label_classification"`, `/v1/classify` applies an elementwise sigmoid to the logits and returns an independent probability for each class in `probs`. These probabilities do not need to sum to one. For example, logits `[2.0, 2.0]` produce approximately `[0.880797, 0.880797]`, so both classes can be positive.
 
 `label` remains the top-scoring class for response compatibility. To select multiple labels, apply your chosen thresholds to the complete `probs` vector. Models with another or unspecified `problem_type` continue to use softmax.
+
+### Token classification
+
+When every declared architecture ends in `ForTokenClassification`, the checkpoint is treated as a token classifier. If the served model returns one row of class scores per input token, `/v1/classify` returns one prediction per token:
+
+- `probs` has shape `[num_tokens, num_classes]`, with one row per input token, including special tokens added by the tokenizer, and one column per label in `id2label`. Each row uses softmax, or an elementwise sigmoid for multi-label models as described above.
+- `label` lists the top-scoring class for each token. For multi-label models, apply your thresholds to each row of `probs`.
+
+```json Config
+{
+  "index": 0,
+  "label": ["B-PER", "O"],
+  "probs": [[0.880797, 0.119203], [0.182426, 0.817574]],
+  "num_classes": 2
+}
+```
+
+SGLang does not yet include a model implementation for token classification heads, and the Transformers backend does not load them. These checkpoints also need `--is-embedding` at launch. Without it, they are served as generation models and `/v1/classify` returns `400 Bad Request`. In embedding mode, scores without one row per input token and one column per label return `500 Internal Server Error` instead of a result for the whole input.
 
 ## Example Usage
 
@@ -137,7 +155,7 @@ The classification API works with any classification model supported by SGLang, 
 The API returns appropriate HTTP status codes and error messages:
 
 - `400 Bad Request`: Invalid request format or missing required fields
-- `500 Internal Server Error`: Server-side processing error
+- `500 Internal Server Error`: Server-side processing error, including model scores that do not match the model's classification task or its `id2label` labels
 
 Error response format:
 ```json Config

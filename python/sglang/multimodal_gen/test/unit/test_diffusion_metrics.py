@@ -66,7 +66,9 @@ def test_scheduler_counts_original_requests_and_cleans_up(
 ):
     collector, registry = metrics
     scheduler = Scheduler.__new__(Scheduler)
-    scheduler.server_args = SimpleNamespace(pipeline_config=PipelineConfig())
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=PipelineConfig(), stage_role=None
+    )
     scheduler.worker = SimpleNamespace(release_cache_if_idle=Mock())
     scheduler._async_output_save = False
     scheduler._inflight_finalizes = deque()
@@ -276,7 +278,7 @@ assert r.get_sample_value('sglang:diffusion_num_queue_reqs', {'role':'monolithic
 assert r.get_sample_value('sglang:diffusion_num_queue_reqs', {'role':'monolithic','replica':'1'}) == 2
 assert r.get_sample_value('sglang:diffusion_num_queue_reqs', {'role':'decoder','replica':'0'}) == 0
 assert b'sglang:diffusion_requests_total' in generate_latest(r)
-args = SimpleNamespace(enable_metrics=True, api_key=None, admin_api_key=None,
+args = SimpleNamespace(enable_metrics=True, media_gateway_key_file=None, api_key=None, admin_api_key=None,
     pipeline_config=SimpleNamespace(
     supports_action_endpoint=lambda: False, supports_openpi_endpoint=lambda: False))
 app = create_app(args)

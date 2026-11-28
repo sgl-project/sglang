@@ -45,6 +45,7 @@ class KernelBackend(str, Enum):
     CUTE_DSL = "cute_dsl"
     FLYDSL = "flydsl"  # FlyDSL MLIR compiler (device=HIP, gfx950)
     HELION = "helion"
+    TLX = "tlx"  # Triton Low-Level Extensions: facebookexperimental/triton, or Triton + the uTLX plugin
     KDA = "KDA"  # Kernel Design Agents generated implementation
     CAKE = "cake"  # Cake-generated implementation, distributed by FlashInfer
     PLUGIN = "plugin"  # out-of-tree kernel library (plugin_kernels)

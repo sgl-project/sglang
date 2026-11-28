@@ -7,7 +7,7 @@ metatags:
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
 
-<DiffusionModelTags tags={["video", "T2V / I2V / TI2V", "MoE", "720p @ 24 fps", "cinematic motion"]} />
+<DiffusionModelTags tags={["video", "T2V / I2V / TI2V / S2V", "MoE", "720p @ 24 fps", "cinematic motion"]} />
 
 import { Deployment } from '/src/snippets/_deployment.jsx';
 import { config } from '/src/snippets/configs/Wan/wan22.jsx';
@@ -103,6 +103,29 @@ SAMPLING_ARGS=(
 
 sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
 
+```
+
+#### Speech-to-video (offline)
+
+[Wan2.2-S2V-14B](https://huggingface.co/Wan-AI/Wan2.2-S2V-14B) animates a
+reference image using a speech recording. The native pipeline generates one clip
+per request. It needs a componentized checkpoint: for the original Wan weights,
+configure a trusted [model overlay](/docs/sglang-diffusion/api/cli#overlay-repos-for-non-diffusers-models).
+The following example pins both the overlay and the source weights:
+
+```bash
+export SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY='{
+  "Wan-AI/Wan2.2-S2V-14B": {
+    "overlay_repo_id": "MickJ/Wan2.2-S2V-14B-overlay",
+    "overlay_revision": "355f9aed1ad0d43447ffd05cdb5ede3926c05cd6",
+    "source_revision": "dab4e9c55bbe4c8c4d03db1c2c98c7f0ac9c454b"
+  }
+}'
+sglang generate \
+  --model-path Wan-AI/Wan2.2-S2V-14B --backend sglang \
+  --prompt "A speaker addressing the camera" \
+  --image-path portrait.png --audio-path speech.wav \
+  --save-output
 ```
 
 ### 4.2 Advanced Usage

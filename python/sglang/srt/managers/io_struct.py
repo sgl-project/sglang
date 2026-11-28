@@ -2071,6 +2071,8 @@ class ClearHiCacheReqOutput(BaseReq, kw_only=True):
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+    # Internal PP relay: PP0 asks the stages of this DP replica to vote.
+    pp_probe: bool = False
 
 
 class FlushCacheReqOutput(BaseReq, kw_only=True):
@@ -2137,6 +2139,15 @@ class DetachHiCacheStorageReqInput(BaseReq, kw_only=True):
 
 
 class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
+class UpdateCacheLinkerReqInput(BaseReq, kw_only=True):
+    attach: bool
+
+
+class UpdateCacheLinkerReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 
@@ -2244,7 +2255,8 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
 class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     """Internal IPC request for updating model weights from serialized tensors."""
 
-    # Serialized named tensors, normalized to raw MultiprocessingSerializer
+    # Serialized named tensors, one per engine rank in world-rank order
+    # (tp_size * pp_rank + tp_rank), normalized to raw MultiprocessingSerializer
     # bytes before scheduler IPC. Python Engine callers construct this field
     # with bytes directly. FastAPI HTTP callers send base64 strings because JSON
     # has no bytes type; the Annotated Base64Bytes marker is used only by the
@@ -2581,13 +2593,19 @@ class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     # DPC capacity and worker activation use logical DP slots.
     slot_offset: int = 0
     slot_count: int = 0
+    direction: str = "grow"  # "grow" adds DPC routing slots; "shrink" removes them.
     error: Optional[str] = None
+
+
+class ElasticDrainClearReq(BaseReq, kw_only=True):
+    """Tell the DPC to route to the retiring slots again: the shrink is off."""
 
 
 class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     """Request to scale EP by changing the effective EP size (dp_attention mode)."""
 
     new_ep_size: int
+    operation_id: Optional[str] = None  # Caller tag echoed by /is_scaling_elastic_ep.
 
 
 class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
@@ -2597,6 +2615,16 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     new_ep_size: int = 0
     pending_ep_size: Optional[int] = None
     scale_phase: str = "idle"
+    required_ep_size: Optional[int] = None  # Width a waiting recover joiner sized for.
+    retry_when_joiner_announces: bool = False  # No joiner announced yet; resend later.
+
+
+class ElasticControlOutput(BaseReq, kw_only=True):
+    """A control reply stamped with its sender's DP rank, so a fan-out that narrows
+    mid-call can drop the replies retirees sent and wait on the survivors."""
+
+    sender_dp_rank: int
+    payload: PickleWrapper
 
 
 class GetInternalStateReq(BaseReq, kw_only=True):
@@ -2830,9 +2858,9 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
     # The PEFT adapter_config.json, already JSON — a tighter type would only add
     # decode strictness with no benefit.
     config_dict: Dict[str, Any]
-    # One serialized copy of the adapter tensors per TP rank; each rank
-    # deserializes only its own copy. Same normalization conventions as
-    # UpdateWeightsFromTensorReqInput.serialized_named_tensors.
+    # One serialized copy of the adapter tensors per engine rank; each rank
+    # deserializes only its own copy. Same order and normalization conventions
+    # as UpdateWeightsFromTensorReqInput.serialized_named_tensors.
     serialized_named_tensors: Annotated[List[bytes], Base64Bytes()]
     pinned: bool = False
     added_tokens_config: Optional[Dict[str, int]] = None
@@ -3015,12 +3043,12 @@ def msgpack_decode(data: bytes) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
 
 
-def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0):
+    """Return enqueue completion for async sockets; sync sockets return None."""
     if _USE_PICKLE_IPC:
-        socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
-        return
+        return socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
 
-    socket.send(msgpack_encode(obj), flags=flags)
+    return socket.send(msgpack_encode(obj), flags=flags)
 
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:

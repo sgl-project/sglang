@@ -1484,3 +1484,118 @@ def test_comfyui_h3_rejects_bcg_with_offload_before_cuda_capture():
     )
     with pytest.raises(ValueError, match="copy-stream events"):
         MiniMaxH3ComfyUIStepStage.verify_input(None, SimpleNamespace(), args)
+
+
+def test_comfyui_h3_run_dit_captures_and_replays_same_bcg_signature(monkeypatch):
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.model_padders.minimax_h3 import (
+        live_packed_prompt,
+    )
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        _signature_kwargs,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.comfyui_step import (
+        MiniMaxH3ComfyUIRunState,
+        MiniMaxH3ComfyUIStepStage,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        MiniMaxH3DenoisingStage,
+    )
+
+    class _DummyMiniMaxH3DiTModel(torch.nn.Module):
+        pass
+
+    class _RecordingRunner:
+        def __init__(self):
+            self.entries = {}
+            self.captures = 0
+            self.replays = 0
+            self.misses = 0
+            self.captured_kwargs = []
+            self.replay_text_lens = []
+
+        def capture(self, **kwargs):
+            branch = live_packed_prompt.get()
+            assert branch is not None
+            key = _signature_kwargs(kwargs)
+            if key in self.entries:
+                return True
+            self.entries[key] = kwargs
+            self.captures += 1
+            self.captured_kwargs.append(kwargs)
+            return True
+
+        def __call__(self, **kwargs):
+            branch = live_packed_prompt.get()
+            assert branch is not None
+            key = _signature_kwargs(kwargs)
+            if key not in self.entries:
+                self.misses += 1
+                raise AssertionError("BCG replay missed the graph just captured")
+            self.replays += 1
+            self.replay_text_lens.append(branch.text_len)
+            return torch.zeros(1), torch.zeros(1)
+
+    model = _DummyMiniMaxH3DiTModel()
+    runner = _RecordingRunner()
+    denoise_stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+    denoise_stage._maybe_get_bcg_runner = lambda _m: runner
+    monkeypatch.setattr(
+        MiniMaxH3DenoisingStage, "_bcg_text_buckets", staticmethod(lambda: (64, 128))
+    )
+
+    step_stage = MiniMaxH3ComfyUIStepStage.__new__(MiniMaxH3ComfyUIStepStage)
+    step_stage.transformer = model
+    step_stage._cache_stage = denoise_stage
+
+    video, audio, context, timestep, sample_sigmas = _t2va_tensors()
+    batch = SimpleNamespace(enable_spectrum=False, is_warmup=False)
+
+    def _make_state_and_fk(text_len: int):
+        ctx = torch.randn(1, text_len, context.shape[-1])
+        inputs = comfyui_payload_to_branch_inputs(
+            video,
+            audio,
+            ctx,
+            minimax_payload={},
+            sample_sigmas=sample_sigmas,
+            timestep=timestep,
+        )
+        fk, branch = build_step_forward_kwargs(inputs, device=torch.device("cpu"))
+        state = MiniMaxH3ComfyUIRunState(
+            branch=branch,
+            used=inputs["used"],
+            orig_video_shape=inputs["orig_video_shape"],
+            padded_video_shape=inputs["padded_video_shape"],
+            sample_sigmas=sample_sigmas,
+        )
+        return state, inputs, fk
+
+    state, inputs, fk0 = _make_state_and_fk(8)
+    assert "local_embedding_layout" in fk0
+    step_stage._run_dit(batch, fk0, state)
+    assert live_packed_prompt.get() is None
+    assert runner.captures == 1
+    assert runner.replays == 1
+    assert runner.misses == 0
+    captured = runner.captured_kwargs[0]
+    assert captured["packed_seq_params"].get("bcg_live_bounds") is True
+    assert "local_embedding_layout" not in captured
+    assert "adaln_timestep_bits" not in captured
+
+    # Second step on the same run reuses the branch metadata and hits the graph.
+    state.steps_done = 1
+    fk1, _ = build_step_forward_kwargs(
+        inputs, branch=state.branch, device=torch.device("cpu")
+    )
+    step_stage._run_dit(batch, fk1, state)
+    assert runner.captures == 1
+    assert runner.replays == 2
+    assert len(state.packed_branches) == 1
+
+    # Different prompt length in the same bucket still hits the same graph.
+    state2, _inputs2, fk2 = _make_state_and_fk(12)
+    step_stage._run_dit(batch, fk2, state2)
+    assert runner.captures == 1
+    assert runner.replays == 3
+    assert runner.replay_text_lens == [8, 8, 12]
+    assert live_packed_prompt.get() is None

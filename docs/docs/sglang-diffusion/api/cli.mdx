@@ -21,13 +21,11 @@ export SGLANG_DIFFUSION_MODEL_OVERLAY_REGISTRY='{
     "overlay_revision": "main"
   }
 }'
-
-sglang generate \
-  --model-path Wan-AI/Wan2.2-S2V-14B \
-  --config configs/wan_s2v.yaml
 ```
 
-The overlay repo should be a complete diffusers-style/componentized repo
+Use a trusted overlay: it can run a custom materializer when preparing the model.
+See the [Wan2.2 speech-to-video example](/cookbook/diffusion/Wan/Wan2.2#speech-to-video-offline)
+for a pinned overlay and a complete offline generation command.
 
 You can also pass the overlay repo itself as `--model-path` if it contains `_overlay/overlay_manifest.json`.
 
@@ -131,6 +129,13 @@ This isolation does not make untrusted pickle safe or recover from GPU failures.
 
 ### Disaggregated serving
 
+Experimental [stage deployments](/docs/sglang-diffusion/disaggregation/stage-deployments) place named stage groups from a JSON file instead of the preset roles below. Do not combine the two.
+
+- `--stage-deployment {JSON_PATH}`: stage contracts and named role placement. Without a worker selector, launches the coordinator and existing generation API.
+- `--stage-node {NAME}`: launch all worker processes assigned to this node, using their declared server arguments.
+- `--stage-role {NAME}` and `--stage-endpoint {TCP_ENDPOINT}`: launch one named worker using its own CLI arguments instead of the node launcher.
+- `--disagg-max-slots-per-instance {N}`: retained results per stage worker and coordinator request capacity (default: 8).
+
 - `--disagg-role {monolithic|encoder|prompt_encoder|image_encoder|denoiser|decoder|server}`: select the stages run by this process. `monolithic` is the default; the split `prompt_encoder` and `image_encoder` roles currently support FLUX.3 Image.
 - `--disagg-server-addr {TCP_ENDPOINT}`: head scheduler endpoint used by workers for registration and result routing.
 - `--encoder-urls {ENDPOINTS}`: combined encoder pool on the head. For split encoding, replace it with both `--prompt-encoder-urls` and `--image-encoder-urls`; do not mix the two topologies.
@@ -169,9 +174,18 @@ pipeline's registered module name:
 | Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
 | Select component precision | `--component-precisions.<component> {DTYPE}` | — | Use a loader-supported exact parameter and execution dtype |
-| Direct-load an eligible component | `--component-direct-gpu-weight-loading.<component>` | None | Use that component's audited direct-GPU loader; it must stay resident |
+| Direct-load an eligible component | `--component-direct-gpu-weight-loading.<component>` | None | Set `false` to force normal loading or `true` to request direct GPU loading for a resident component. |
 | Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
 | Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
+
+On a single NVIDIA B200, the native MiniMax-H3 video VAE and Wan2.1 480p
+T2V/I2V VAEs automatically load local FP32 weights through a CPU file mapping,
+uploading each tensor into its parameter storage. CPU/layerwise offload, FSDP,
+component overrides and other devices keep their existing defaults. An explicit
+`SGLANG_USE_RUNAI_MODEL_STREAMER=1` leaves automatic mmap loading off.
+For another supported resident CUDA VAE, select the same reader explicitly with
+`SGLANG_USE_RUNAI_MODEL_STREAMER=0` and
+`--component-direct-gpu-weight-loading.vae true` (use the actual component name).
 
 For example, pair any replacement text-encoder configuration with a separate
 single-file checkpoint as follows:
@@ -234,10 +248,69 @@ families and examples.
 
 ### Request logging
 
-- `--log-requests`: Log user-facing fields of all requests (default: `False`). The verbosity is decided by `--log-requests-level`.
-- `--log-requests-level &#123;0|1|2|3&#125;`: Verbosity level for request logging (default: `2`). 0: Log metadata (request id). 1: Log metadata and sampling config (seed, steps, guidance, resolution, frames, fps, ...). 2: Log metadata, sampling config and prompt (truncated to 2 KiB). 3: Log metadata, sampling config and full prompt.
-- `--log-requests-format &#123;text|json&#125;`: Format for request logging (default: `text`). `text` is human-readable; `json` outputs structured JSON lines.
-- `--log-requests-target &#123;TARGET...&#125;`: Target(s) for request logging. Use `stdout` for console output and/or directory path(s) for file output. Can specify multiple targets, e.g., `--log-requests-target stdout /my/log/dir`.
+Request logging is **off by default**. To enable it, pass `--log-requests`.
+`--log-requests-level` controls which fields are included; setting a level alone
+does not enable logging. This is independent of the server's `--log-level`.
+
+| Request log level | What is recorded |
+| --- | --- |
+| `0` (default) | Request IDs, with latency and error status on completion. |
+| `1` | Level 0 plus sampling parameters, including the seed, resolution and step count. |
+| `2` | Level 1 plus prompt and negative prompt. For text longer than 2,048 characters, only the first and last 1,024 are kept. |
+| `3` | Level 2 with full prompt text. |
+
+No level includes raw embeddings. For production, leave request logging off or
+use level 0. To record the seed without the prompt on synthetic test requests,
+pass `--log-requests --log-requests-level 1`.
+Choose `--log-requests-format text|json` (default: `text`) and
+`--log-requests-target` (e.g. `stdout` or a log directory) as needed.
+
+### Private media serving
+
+**What the server enforces.** By default, callers of the same HTTP worker share
+its media jobs. For example, two clients of `GET /v1/videos` see the same job
+list. This is intended for one trusted service, not unrelated customers.
+
+With `--media-gateway-key-file /run/secrets/media-gateway-key`, each job belongs
+to the tenant identified by the gateway. If tenant A creates a video, tenant B
+cannot list, retrieve, download or delete it through this API. Looking up A's ID
+returns the same 404 as an unknown ID. Clients in the *same* tenant still share
+jobs. Records are local to the worker process: route follow-up requests to the
+replica that created the job.
+
+**What the deployer must configure.** The worker authenticates the gateway, not
+end users. On every HTTP replica and on the gateway, mount the same random
+32-byte key encoded as 64 hex digits. The gateway must authenticate the caller,
+strip incoming `X-SGLang-Gateway-Key` and `X-SGLang-Tenant` headers, and set its
+own key and stable tenant ID (1–128 letters, digits, underscores or hyphens).
+Keep the key out of logs, use TLS, restrict worker access to the gateway, and
+roll replicas on key rotation.
+
+Only the OpenAI image, video and mesh routes are exposed in this mode, plus
+unauthenticated health and liveness probes. Publish only the routes you need;
+keep scheduler, admin, profiling, metrics and realtime endpoints private.
+The listener accepts sampling options and media uploads, not client-selected
+paths, remote media URLs, diagnostics or backend-specific kwargs. Set limits
+on upload size, decoded dimensions, runtime and concurrency at ingress.
+Tenant checks do not protect direct access to stored files or cloud URLs:
+restrict storage access separately. Use separate deployments and credentials
+for mutually untrusted workloads unless the other data and control paths are isolated.
+
+**What is retained.** Tenant isolation controls *who* can access a job, not *how
+long* its data exists.
+
+- **Synchronous images:** With `--input-save-path "" --output-path ""`, cloud
+  upload disabled and `response_format="b64_json"`, the image API returns the
+  generated image in the response without saving an output file. Uploaded edit
+  inputs may use temporary storage during the request. The worker still keeps
+  job metadata in memory.
+- **Async video and mesh:** Successful delivery requires a persistent output
+  directory or a successful cloud upload. Deleting the API job removes its
+  record, not the published files, objects or backups. Configure their lifetimes
+  in your storage system.
+- **Outside the worker:** Disable request-body capture in gateways, traces and
+  error reporting. Keep buckets private. `Cache-Control: private, no-store`
+  is not access control or an end-to-end zero-retention guarantee.
 
 ## Configuration Files
 
@@ -476,6 +549,33 @@ native NVIDIA CUDA serving. It is disabled by default. See
 [Asynchronous output saving](/docs/sglang-diffusion/performance-optimization#asynchronous-output-saving)
 for an example, eligible requests, and the response latency and memory tradeoffs.
 
+### Temporary media
+
+For ephemeral media, set `TMPDIR` to an existing, writable, absolute directory
+private to the service instance. The HTTP temporary media helper, remote video
+loader and Wan S2V input downloads use that directory or fail; they do not
+silently switch volumes. Wan S2V no longer caches downloads between requests.
+For repeated offline runs, pass a local file you own. Explicitly configured
+input and output directories and cloud objects are persistent, not scratch.
+
+Request cleanup cannot run after a process is killed. Let the supervisor own
+the scratch volume; do not sweep a shared directory while another replica
+might still be using it. For example, in a systemd template service:
+
+```ini
+[Service]
+RuntimeDirectory=sgld-media-%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+Environment=TMPDIR=/run/sgld-media-%i
+```
+
+[systemd](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#RuntimeDirectoryPreserve=)
+removes the directory when the unit stops. On Kubernetes, a per-Pod
+[`emptyDir`](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir)
+survives container restarts and is removed when the Pod is removed. Neither
+mechanism expires objects in external storage or guarantees secure erasure.
+
 ### Graceful shutdown
 
 Set `--http-graceful-shutdown-timeout 30` to allow up to 30 seconds for open HTTP
@@ -550,6 +650,37 @@ outstanding scheduler requests fail, and new POST requests are rejected with
 `503`. The hung request is not aborted; remove the instance from routing and
 restart the whole server. `--scheduler-rpc-timeout` is a different bound: it
 fails one caller's wait, queue time included, and leaves `/health` unchanged.
+
+### Client media URLs
+
+Requests can name input media by HTTP(S) URL (`image_path`, `video_path`,
+`input_reference`, `control_path`, model-specific condition URIs, and so on).
+The server downloads them under the same policy and flags as the LLM server
+(see [Server Arguments](/docs/advanced_features/server_arguments)):
+
+- A media host that resolves to a private, loopback, or link-local address
+  (such as `169.254.169.254`) is rejected, on the first URL and on every
+  redirect. Pass `--allow-private-media-hosts` to fetch media from a private
+  network.
+- `--allowed-media-domains HOST [HOST ...]` restricts media URLs to these exact
+  hostnames; an allowlisted host may resolve to a private address.
+- `--media-url-max-file-size-mb` caps one download. The default is `512`
+  (videos), larger than the LLM server's `64`; `0` disables the limit.
+- `--media-url-timeout` is the time budget of one download, redirects and
+  body included. A download stops when it runs out, even when the server
+  sends the body slowly.
+
+Media downloads connect directly to the checked origin address, never through
+a proxy: when the server environment sets an HTTP(S) proxy, include trusted
+media origins in `NO_PROXY`, or their downloads fail.
+
+The request-level check covers `image_path`, `video_path`, `video_url`,
+`input_reference`, `reference_url`, and `control_path`: other schemes such as
+`file:` or `ftp:`, and FFmpeg protocol strings such as `subfile,...:http:...`,
+are rejected with HTTP 400. Local paths and `data:` URLs are not governed by
+these flags. MiniMax-H3 `conditions[].uri` is not covered by that check: it
+still accepts local `file:`, `data:`, and tar URIs, while its http(s) URIs go
+through the same policy and flags as above.
 
 ### Cloud Storage
 

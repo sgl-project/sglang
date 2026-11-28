@@ -54,7 +54,6 @@ def _is_context_error_message(message: str) -> bool:
     return any(
         marker in message
         for marker in (
-            "longer than the model's context length",
             "exceeds the model's maximum context length",
             "Multimodal prompt is too long after expanding multimodal tokens",
             "exceeds the maximum allowed length",
