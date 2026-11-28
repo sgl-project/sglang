@@ -129,6 +129,7 @@ VERIFY_FULL_LOGITS = "full_logits"
 VERIFY_LOGITS_VARIANTS = (VERIFY_VOCAB_SHARDS, VERIFY_FULL_LOGITS)
 
 _GFX1250_LMHEAD = None
+_GFX115_LMHEAD = None
 
 
 def _gfx1250_lmhead_applies(x: torch.Tensor, w: torch.Tensor) -> bool:
@@ -148,6 +149,26 @@ def _gfx1250_lmhead_applies(x: torch.Tensor, w: torch.Tensor) -> bool:
     from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import applies, wide_applies
 
     return applies(x, w) or wide_applies(x, w)
+
+
+def _gfx115_lmhead_applies(x: torch.Tensor, w: torch.Tensor) -> bool:
+    """gfx115x: the same split-K Triton FP32-output head. It must stay at or below
+    the 64-row Triton path, since the 65..512-row tiles lmhead_fp32 picks are
+    FlyDSL kernels that only exist for gfx1250."""
+    global _GFX115_LMHEAD
+    if _GFX115_LMHEAD is None:
+        try:
+            enabled = os.environ.get("SGLANG_ROCM_GFX115_LMHEAD", "1") == "1"
+            _GFX115_LMHEAD = enabled and (
+                "gfx115" in torch.cuda.get_device_properties(x.device).gcnArchName
+            )
+        except Exception:
+            _GFX115_LMHEAD = False
+    if not _GFX115_LMHEAD or x.shape[0] > 64:
+        return False
+    from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import applies
+
+    return applies(x, w)
 
 
 class SamplingMaskStatus(IntEnum):
@@ -1461,6 +1482,15 @@ class LogitsProcessor(nn.Module):
                     )
 
                     logits = lmhead_fp32(hidden_states, lm_head.weight)
+                elif _gfx115_lmhead_applies(hidden_states, lm_head.weight):
+                    # gfx115x: hipBLASLt's FP32-output pick is slow at decode
+                    # widths too; the same split-K Triton head writes the caller's
+                    # buffer when one is given.
+                    from sglang.kernels.ops.gemm.lmhead_splitk_fp32 import (
+                        lmhead_fp32,
+                    )
+
+                    logits = lmhead_fp32(hidden_states, lm_head.weight, out=out)
                 else:
                     logits = torch.mm(
                         hidden_states,

@@ -1,8 +1,9 @@
-"""FP32-output LM head for small M on gfx1250: logits[M, N] = X_bf16 @ W_bf16.T with FP32 accumulate.
+"""FP32-output LM head for small M on gfx1250 and gfx115x: logits[M, N] = X_bf16 @ W_bf16.T with FP32 accumulate.
 
 hipBLASLt picks a large-tile kernel for the Muse TP8 head (M <= 128, N 25256, K 8192, out_dtype fp32) that is
 far from bandwidth-bound at decode widths. This split-K Triton GEMM masks N (25256 has no power-of-two tile), writes FP32 partials and
 sums them in a fixed order; it differs from the hipBLASLt FP32 output only in the K summation order.
+gfx115x takes only the Triton tile below 65 rows; the FlyDSL wide/mid paths are gfx1250-only.
 """
 
 import torch
@@ -119,17 +120,27 @@ def wide_applies(x: torch.Tensor, w: torch.Tensor) -> bool:
 
 
 def lmhead_fp32(
-    x: torch.Tensor, w: torch.Tensor, cfg=None, out_dtype=torch.float32
+    x: torch.Tensor, w: torch.Tensor, cfg=None, out_dtype=torch.float32, out=None
 ) -> torch.Tensor:
-    """``x @ w.T`` with FP32 accumulate, stored as ``out_dtype`` (FP32 for the head, BF16 for the DFlash candidates)."""
+    """``x @ w.T`` with FP32 accumulate, stored as ``out_dtype`` (FP32 for the head, BF16 for the DFlash candidates).
+
+    ``out``, when given, is the caller's buffer of that dtype and shape; the result is written into it.
+    """
     m, k = x.shape
     n = w.shape[0]
+    if out is not None:
+        assert out.dtype == out_dtype and tuple(out.shape) == (m, n), (
+            out.shape,
+            out.dtype,
+        )
     if m > MAX_M:
+        assert out is None
         assert out_dtype == torch.float32 and wide_applies(x, w)
         from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16
 
         return gemm_a16w16(x, w, dtype=torch.float32, **_WIDE_CONFIG)
     if cfg is None and m > 64:
+        assert out is None
         from aiter.ops.flydsl.gemm_a16w16_gfx1250 import gemm_a16w16
 
         return gemm_a16w16(x, w, dtype=out_dtype, **_MID_CONFIG)
@@ -138,7 +149,11 @@ def lmhead_fp32(
     # Row tile: optional 6th entry; 64 by default (larger M then re-reads the weight once per 64-row tile).
     bm = cfg[5] if len(cfg) > 5 else min(_bm(m), 64)
     if sk == 1:
-        y = torch.empty((m, n), device=x.device, dtype=out_dtype)
+        y = (
+            out
+            if out is not None
+            else torch.empty((m, n), device=x.device, dtype=out_dtype)
+        )
         _lmhead_partial[(triton.cdiv(n, bn), triton.cdiv(m, bm), 1)](
             x, w, y, m, n, k, bm, bn, bk, 1, num_warps=warps, num_stages=stages
         )
@@ -147,6 +162,10 @@ def lmhead_fp32(
     _lmhead_partial[(triton.cdiv(n, bn), triton.cdiv(m, bm), sk)](
         x, w, p, m, n, k, bm, bn, bk, sk, num_warps=warps, num_stages=stages
     )
-    y = torch.empty((m, n), device=x.device, dtype=out_dtype)
+    y = (
+        out
+        if out is not None
+        else torch.empty((m, n), device=x.device, dtype=out_dtype)
+    )
     _lmhead_sum[(triton.cdiv(m * n, 1024),)](p, y, m * n, sk, 1024, num_warps=4)
     return y
