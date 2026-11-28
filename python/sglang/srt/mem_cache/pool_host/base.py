@@ -867,7 +867,8 @@ class HostKVCache(abc.ABC):
         if need_size > len(self.free_slots):
             self._merge_release_slots()
 
-        select_index = self.free_slots[:need_size]
+        # Ownership prevents retained indices from pinning old free-list storage.
+        select_index = self.free_slots[:need_size].clone()
         self.free_slots = self.free_slots[need_size:]
 
         assert not self.slot_used[select_index].any(), (

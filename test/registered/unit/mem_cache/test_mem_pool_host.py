@@ -537,6 +537,17 @@ class TestHostKVCache(CustomTestCase):
 
 class TestLazyHostPoolRelease(CustomTestCase):
     @staticmethod
+    def _make_index_pool():
+        pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        pool.size = 8
+        pool.page_size = 1
+        pool.dcp_size = 1
+        pool.device = "cpu"
+        pool.lock = threading.RLock()
+        pool.clear()
+        return pool
+
+    @staticmethod
     def _make_mamba_pool():
         pool = MambaPoolHost.__new__(MambaPoolHost)
         pool.size = 8
@@ -612,6 +623,28 @@ class TestLazyHostPoolRelease(CustomTestCase):
         self.assertTrue(torch.equal(pool.alloc(4), torch.tensor([0, 1, 2, 3])))
         self.assertEqual(pool.num_release_slots, 0)
         self.assertEqual(pool.release_slots, [])
+
+    def test_retained_indices_do_not_pin_old_free_list_storage(self):
+        for make_pool in (self._make_index_pool, self._make_mamba_pool):
+            with self.subTest(allocator=make_pool.__name__):
+                pool = make_pool()
+                retained = pool.alloc(1)
+                rest = pool.alloc(7)
+                pool.free(rest[:3])
+                pool.free(rest[3:])
+                del rest
+
+                recycled = pool.alloc(7)  # Rebuilds free_slots with torch.cat.
+                self.assertIsNotNone(recycled)
+                self.assertEqual(pool.num_release_slots, 0)
+
+                self.assertEqual(retained.tolist(), [0])
+                self.assertEqual(recycled.tolist(), [1, 2, 3, 4, 5, 6, 7])
+                self.assertEqual(pool.available_size(), 0)
+                self.assertEqual(
+                    retained.untyped_storage().nbytes(),
+                    retained.numel() * retained.element_size(),
+                )
 
     def test_mamba_pool_lazy_release(self):
         self._assert_lazy_release(self._make_mamba_pool())
