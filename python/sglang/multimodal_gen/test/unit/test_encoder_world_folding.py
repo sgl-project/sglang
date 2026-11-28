@@ -328,3 +328,42 @@ def test_parallel_folding_mode_defaults_none():
     assert TextEncoderConfig().parallel_folding_mode is None
     assert ImageEncoderConfig().parallel_folding_mode is None
     assert T5Config().parallel_folding_mode is None
+
+
+def _nested_enc(text_config):
+    # a multimodal checkpoint (Gemma 4, Qwen-VL): the language model's heads and
+    # MLP width live in a nested text_config, only hidden_size at the top level
+    enc = TextEncoderConfig()
+    enc.hidden_size = 3840
+    enc.text_config = text_config
+    return enc
+
+
+def test_dims_read_from_nested_text_config():
+    gemma4 = dict(hidden_size=3840, num_attention_heads=16, intermediate_size=15360)
+    for text_config in (gemma4, SimpleNamespace(**gemma4)):
+        enc = _nested_enc(text_config)
+        assert _base_mod._encoder_dims(enc) == (3840, 16, 15360)
+        assert _encoder_dims_divide(enc, 2) is True
+        assert _encoder_dims_divide(enc, 4) is True
+        assert _encoder_dims_divide(enc, 3) is False
+
+
+def test_top_level_dims_win_over_nested_text_config():
+    enc = _enc(4096, 32, 8192)
+    enc.text_config = dict(num_attention_heads=6, intermediate_size=10)
+    assert _base_mod._encoder_dims(enc) == (4096, 32, 8192)
+
+
+def test_explicit_fold_keeps_an_encoder_with_nested_dims(monkeypatch):
+    monkeypatch.setattr(
+        _base_mod,
+        "get_folding_tp_group",
+        lambda config: SimpleNamespace(world_size=2),
+    )
+    enc = _nested_enc(
+        dict(hidden_size=3840, num_attention_heads=16, intermediate_size=15360)
+    )
+    enc.parallel_folding_mode = "replica"
+    finalize_encoder_folding(enc, "fold")
+    assert enc.parallel_folding_mode == "replica"
