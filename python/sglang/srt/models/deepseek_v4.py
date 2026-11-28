@@ -2546,8 +2546,15 @@ class MQALayer(MqaAttentionBase):
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
             if _is_hip:
-                q, q_lora, fuse_q_rope = _hip.compute_q_b(
-                    self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
+                q, q_lora, fuse_q_rope, self._hip_q_rope_freqs = _hip.compute_q_b(
+                    self,
+                    q_lora,
+                    q_for_wqb,
+                    positions,
+                    q_out,
+                    unified,
+                    use_cp,
+                    forward_batch,
                 )
             else:
                 q = self._compute_q_b(q_for_wqb, positions, q_out)
@@ -2867,6 +2874,7 @@ class MQALayer(MqaAttentionBase):
                 q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink(kernel_num_heads)
 
+        q_rope_freqs = None
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
@@ -2909,6 +2917,7 @@ class MQALayer(MqaAttentionBase):
             )
             kv = None
         else:
+            self._hip_q_rope_freqs = None
             q, kv = self._forward_prepare(
                 x,
                 positions,
@@ -2920,6 +2929,8 @@ class MQALayer(MqaAttentionBase):
                 k_nope_out=k_nope,
                 k_rope_out=k_rope,
             )
+            # set by _forward_prepare when q comes back unroped for the attention to rope
+            q_rope_freqs, self._hip_q_rope_freqs = self._hip_q_rope_freqs, None
 
         if unified_fp8_prefill and is_cp_active(forward_batch):
             # kv is the packed noPE half the fused prefill store left on the kv slot.
@@ -2985,6 +2996,7 @@ class MQALayer(MqaAttentionBase):
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+                assert q_rope_freqs is None, "the breakable-graph op takes a roped q"
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                     # TRT-LLM returns BF16 even with FP8 queries.
@@ -3020,6 +3032,7 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                     # HIP only, for the same reason as rope_kwargs above
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
+                    **({} if q_rope_freqs is None else {"q_rope_freqs": q_rope_freqs}),
                 )
             o = o[:, tp_slice, :]
         o = self._project_wo_a(

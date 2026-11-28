@@ -106,7 +106,7 @@ class TestDeepseekV4CPKVStore(unittest.TestCase):
             _is_hip=True,
             _is_npu=False,
             # CPU CI never imports the ROCm helpers.
-            _hip=SimpleNamespace(compute_q_b=lambda *_: (q, None, False)),
+            _hip=SimpleNamespace(compute_q_b=lambda *_: (q, None, False, None)),
         ) as materialize:
             returned_q, returned_kv = layer._forward_prepare(
                 torch.zeros(2, 4), torch.arange(2), _PREFILL, object()

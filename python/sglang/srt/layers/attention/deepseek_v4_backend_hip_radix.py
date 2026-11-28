@@ -56,6 +56,7 @@ from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
     combined_to_csr,
     opus_sparse_prefill,
 )
+from sglang.kernels.ops.attention.dsv4.q_rope_quant_hip import rope_q_inplace
 from sglang.kernels.ops.attention.dsv4.swapab_gluon_hip import swapab_attention
 from sglang.kernels.plugin_kernels.amd.spec import StepMetadata
 from sglang.srt.environ import envs
@@ -101,6 +102,7 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     _apply_inverse_rope,
     flash_mla_with_kvcache_entrypoint,
     hip_attn_kv_splits,
+    hip_kv_layout_interleaved,
     resolve_hip_flashmla_backend,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
@@ -3294,10 +3296,13 @@ class DeepseekV4HipRadixBackend(
         k_rope: Optional[torch.Tensor] = None,
         inv_rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         wo_a_quant_freqs: Optional[torch.Tensor] = None,
+        q_rope_freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **_,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """inv_rope=(freqs_real, positions) has the kernel apply the inverse RoPE
-        to the last freqs_real.shape[-1] dims of every output head."""
+        to the last freqs_real.shape[-1] dims of every output head. q_rope_freqs, the same
+        pair: q arrives unroped; the V4.1 interleaved aiter_sparse route ropes it inside its
+        q quant, any other route ropes it in place first."""
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
             return q.new_empty(q.shape[0], q.shape[1], layer.v_head_dim)
 
@@ -3313,6 +3318,16 @@ class DeepseekV4HipRadixBackend(
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_triton,
         )
+
+        if q_rope_freqs is not None and not (
+            not is_unified_kv_triton()
+            and isinstance(core_attn_metadata, DSV4AttnMetadata)
+            and not self._opus_prefill_applies(q, forward_batch, compress_ratio)
+            and resolve_hip_flashmla_backend() == "aiter_sparse"
+            and hip_kv_layout_interleaved()
+        ):
+            rope_q_inplace(q, *q_rope_freqs)
+            q_rope_freqs = None
 
         if is_unified_kv_triton():
             o = self._forward_unified_kv(
@@ -3417,6 +3432,7 @@ class DeepseekV4HipRadixBackend(
             backend = resolve_hip_flashmla_backend()
             if (
                 backend == "aiter_sparse"
+                and q_rope_freqs is None
                 and 0 < q.shape[0] <= SWAPAB_MAX_BATCH
                 and q.shape[1:] == (1, SWAPAB_NUM_HEADS, SWAPAB_HEAD_DIM)
                 and q.dtype == torch.bfloat16
@@ -3476,6 +3492,14 @@ class DeepseekV4HipRadixBackend(
             )
             if inv_rope is not None:
                 input_dict["inv_rope"] = inv_rope
+            if q_rope_freqs is not None:
+                input_dict["q_rope_freqs"] = q_rope_freqs
+            if backend == "aiter_sparse" and hip_kv_layout_interleaved():
+                if core_attn_metadata._aiter_sparse_masked_indices is None:
+                    core_attn_metadata._aiter_sparse_masked_indices = {}
+                input_dict["csr_cache"] = (
+                    core_attn_metadata._aiter_sparse_masked_indices
+                )
             o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
 
             o = o.squeeze(1)
