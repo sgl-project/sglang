@@ -37,9 +37,9 @@ class ProcessorEntry:
 
 
 class SamplingFacts(msgspec.Struct, frozen=True):
-    """Facts over one launch's sampler params, derived once from the host side of
-    `SamplingParamsPool` (`gather`); the fast-path gates read them here. The
-    defaults describe a sampled batch with no truncation."""
+    """Facts over one launch's sampler params, derived from the host side of
+    `SamplingParamsPool` in `gather`. The defaults describe a sampled batch with
+    no truncation."""
 
     # Every row is greedy (top_k 1); `SamplingRows.empty` sets it for no rows.
     all_greedy: bool = False
@@ -55,7 +55,6 @@ class SamplingFacts(msgspec.Struct, frozen=True):
 
     @property
     def truncates(self) -> bool:
-        """Whether some row truncates its distribution with top-k, top-p, or min-p."""
         return self.need_top_k or self.need_top_p or self.need_min_p
 
 
