@@ -376,6 +376,15 @@ class TestGlm45Detector(CustomTestCase):
     def setUp(self):
         self.detector = Glm45Detector()
 
+    def test_strict_thinking_excludes_every_glm_eos_token(self):
+        """Strict thinking must mask all GLM stop tokens inside <think>.
+
+        GLM models stop on <|endoftext|>, <|user|> and <|observation|>;
+        sampling an unmasked one ends the request mid-thought.
+        """
+        for token in ("<|endoftext|>", "<|user|>", "<|observation|>"):
+            self.assertIn(token, self.detector.think_excluded_tokens)
+
     def test_detect_and_parse_multiple_tool_calls_find(self):
         """
         Test that find() finds the FIRST occurrence of tool_start_token.
