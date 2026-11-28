@@ -40,6 +40,108 @@ def next_layer():
 
 
 class TestIndependentStageConstruction(CustomTestCase):
+    def test_cp_transport_accepts_only_the_declared_kda_source_sum(self):
+        from sglang.srt.layers.cp.moe_fp8_transport import cp_moe_row_transport
+
+        parallel = fixture.parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=4,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+        )
+        with fixture.planning(parallel, dsa_cp=True):
+            variant = BatchVariant.CONTEXT_PARALLEL
+            attention = declare_attn(tp_group=factories.SumGroup.TP)
+            ffn = declare_ffn(sparse=True, row_transport=cp_moe_row_transport())
+            attn_flow = factories._resolve_stage(
+                attention, variant, factories._stack_arrival(variant), following=ffn
+            )
+            arrival = factories._arrival(attention, attn_flow, variant)
+            flow = factories._resolve_stage(ffn, variant, arrival)
+            self.assertEqual(flow.contract.input.layout, arrival.residual)
+            self.assertNotEqual(arrival.produced.layout, arrival.residual)
+            self.assertIs(arrival.produced.group, factories.SumGroup.ATTN_CP)
+            # Also compile entry/exit moves, not only the row facts. The entry
+            # must reduce-scatter the KDA partial before binding local rows.
+            build_stages(
+                (attention, fixture.Norm()),
+                (
+                    replace(ffn, row_transport=cp_moe_row_transport(lambda *args: None)),
+                    fixture.Norm(),
+                ),
+                terminal=True,
+            )
+            # Do not admit a row transition whose required sum is absent or
+            # names a different communicator.
+            for group in (None, factories.SumGroup.ATTN_TP):
+                invalid = arrival._replace(
+                    produced=msgspec.structs.replace(arrival.produced, group=group)
+                )
+                with self.assertRaisesRegex(NotImplementedError, "source rows"):
+                    factories._resolve_stage(ffn, variant, invalid)
+
+    def test_compute_owned_cp_gather_preserves_output_sum(self):
+        from sglang.srt.layers.cp.moe_fp8_transport import cp_moe_row_transport
+
+        # The boundary selects the variant; the transport declares the full
+        # compute rows while keeping residual and returned output on source rows.
+        parallel = fixture.parallel_of(
+            attn_dp=1,
+            attn_tp=1,
+            attn_cp=4,
+            enable_prefill_cp=True,
+            enable_cp_tp_group_sharing=True,
+        )
+        with fixture.planning(parallel, dsa_cp=True):
+            baseline = declare_ffn(sparse=True, exit_rows=factories.ExitRows.ATTENTION)
+            deferred = replace(baseline, row_transport=cp_moe_row_transport())
+            for variant in (BatchVariant.ORDINARY, BatchVariant.CONTEXT_PARALLEL):
+                normal = factories._resolve_stage(baseline, variant, None)
+                rows = deferred.row_transport.rows[variant]
+                arrival = factories._stack_arrival(variant)
+                actual = factories._resolve_stage(deferred, variant, arrival)
+                self.assertEqual(
+                    actual.contract.output.group, normal.contract.output.group
+                )
+                self.assertEqual(actual.during, rows.source)
+                self.assertEqual(actual.returned, normal.returned)
+                self.assertEqual(actual.contract.input.layout, rows.source)
+                self.assertFalse(actual.contract.input.gathered_by_compute)
+                self.assertEqual(rows.compute, normal.contract.input.layout)
+                if variant is BatchVariant.CONTEXT_PARALLEL:
+                    self.assertIn(
+                        factories.TokenAxis.ATTN_CP,
+                        rows.source.sharded,
+                    )
+                    self.assertNotIn(factories.TokenAxis.ATTN_CP, rows.compute.sharded)
+                    self.assertIsNotNone(actual.contract.output.group)
+                else:
+                    self.assertEqual(rows.source, rows.compute)
+            # Neighbour facts retain contracts, not live model bindings.
+            self.assertEqual(
+                facts_of(deferred).row_transport.rows, deferred.row_transport.rows
+            )
+            self.assertIsNone(facts_of(deferred).row_transport.bind)
+
+    def test_cp_fp8_bindings_do_not_share_layer_ids(self):
+        from sglang.srt.layers.cp.moe_fp8_transport import CpMoeFp8Binding
+
+        first = SimpleNamespace(
+            layer_id=0, _compute_cp_moe_fp8_transport_enabled=lambda: (True, "ok")
+        )
+        second = SimpleNamespace(
+            layer_id=0,
+            _compute_cp_moe_fp8_transport_enabled=lambda: (False, "fallback"),
+        )
+        a, b = CpMoeFp8Binding(first), CpMoeFp8Binding(second)
+        self.assertIs(a.layer, first)
+        self.assertIs(b.layer, second)
+        self.assertTrue(a.eligibility[0])
+        self.assertFalse(b.eligibility[0])
+        first._compute_cp_moe_fp8_transport_enabled = lambda: (False, "changed")
+        self.assertTrue(a.eligibility[0])
+
     def test_active_variant_without_a_bound_path_never_falls_back(self):
         from sglang.srt.layers.layer_boundary import construction
         from sglang.test.boundary_fixtures import stub_plan

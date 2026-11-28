@@ -1844,20 +1844,30 @@ class DeepseekV2MoE(nn.Module):
         return self._moe_quant_once
 
     def _compute_moe_quant_once_enabled(self) -> Tuple[bool, str]:
-        """Returns (eligible, reason); reason names the first failing check."""
-        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
-        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
+        """Eligibility of the separate shared/routed quantize-once feature."""
+        if not envs.SGLANG_OPT_MOE_QUANT_ONCE.get():
+            return False, "env off"
+        eligible, reason = self._compute_routed_moe_prequant_enabled()
+        if not eligible:
+            return eligible, reason
+        eligible, reason = self._compute_shared_moe_prequant_enabled()
+        if not eligible:
+            return eligible, reason
+        runner = self.experts.quant_method.runner
+        if not runner.runner_backend.is_triton():
+            return False, "quantize-once requires the triton MoE runner"
+        if runner.fused_func is None:
+            return False, "triton fused func unavailable"
+        return True, "ok"
+
+    def _compute_shared_moe_prequant_enabled(self) -> Tuple[bool, str]:
+        """Whether the separate shared expert can consume group-128 FP8."""
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
         from sglang.srt.layers.quantization.fp8_utils import (
             cutlass_w8a8_block_fp8_linear_with_fallback,
             deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
 
-        if not envs.SGLANG_OPT_MOE_QUANT_ONCE.get():
-            return False, "env off"
-        if not _is_cuda:
-            return False, "not CUDA"
-        if self._enable_a2a_moe or self._fuse_shared_experts_inside_sbo:
-            return False, "a2a MoE or SBO shared-expert fusion"
         # Shared-expert side: fp8 block-128 weights served by a w8a8 linear
         # backend taught to accept a pre-quantized (q, scale) tuple: cutlass
         # or deepgemm (fp32 scales only, i.e. not UE8M0/Blackwell).
@@ -1884,8 +1894,17 @@ class DeepseekV2MoE(nn.Module):
         else:
             backend_name = getattr(linear_fn, "__name__", type(linear_fn).__name__)
             return False, f"w8a8 linear backend {backend_name} unsupported"
-        # Routed side: standard dispatcher + triton fused func with dynamic
-        # per-token-group-128 fp8 activation quant.
+        return True, "ok"
+
+    def _compute_routed_moe_prequant_enabled(self) -> Tuple[bool, str]:
+        """Shared routed-side checks, independent of either feature's opt-in."""
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatcher
+        from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+
+        if not _is_cuda:
+            return False, "not CUDA"
+        if self._enable_a2a_moe or self._fuse_shared_experts_inside_sbo:
+            return False, "a2a MoE or SBO shared-expert fusion"
         experts = self.experts
         if not isinstance(experts, FusedMoE):
             return False, "experts not FusedMoE"
@@ -1898,16 +1917,52 @@ class DeepseekV2MoE(nn.Module):
             return False, "experts weight block size != [128, 128]"
         # Fp8MoEMethod only sets .runner for runner backends it drives itself.
         runner = getattr(quant_method, "runner", None)
-        if runner is None or not runner.runner_backend.is_triton():
-            return False, "MoE runner backend not triton"
-        if runner.fused_func is None or runner.lora_enabled:
-            return False, "triton fused func unavailable (or LoRA enabled)"
+        if runner is None:
+            return False, "quantization method has no prequantized MoE runner"
+        if runner.lora_enabled:
+            return False, "MoE LoRA enabled"
         if not isinstance(experts.dispatcher, StandardDispatcher):
             return False, "dispatcher not StandardDispatcher"
         if experts.moe_runner_config.apply_router_weight_on_input:
             return False, "apply_router_weight_on_input"
         if experts.w13_input_scale is not None:
             return False, "static w13 input scale"
+        return True, "ok"
+
+    def _compute_cp_moe_fp8_transport_enabled(self) -> Tuple[bool, str]:
+        """CP transport eligibility, separate from SGLANG_OPT_MOE_QUANT_ONCE."""
+        if (
+            self.is_nextn
+            or self.reduce_results
+            or self.moe_ep_size != 1
+            or getattr(self, "is_hash", False)
+            or self.gate.e_score_correction_bias_vl is not None
+            or get_exec().moe.enable_eplb
+        ):
+            return False, "CP transport requires a standard, unreduced EP=1 target MoE"
+        eligible, reason = self._compute_routed_moe_prequant_enabled()
+        if not eligible:
+            return eligible, reason
+        if self.num_fused_shared_experts != 1:
+            eligible, reason = self._compute_shared_moe_prequant_enabled()
+            if not eligible:
+                return eligible, reason
+        runner = self.experts.quant_method.runner
+        if runner.runner_backend.is_triton():
+            if runner.fused_func is None:
+                return False, "triton fused func unavailable"
+        elif runner.runner_backend.is_deep_gemm():
+            from sglang.srt.layers import deep_gemm_wrapper
+            from sglang.srt.layers.moe.moe_runner import deep_gemm_sm120
+
+            if (
+                torch.cuda.get_device_capability() != (9, 0)
+                or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                or not deep_gemm_sm120.use_swizzle()
+            ):
+                return False, "CP DeepGEMM prequant requires SM90 and FP32 scales"
+        else:
+            return False, "CP transport requires triton or deep_gemm"
         return True, "ok"
 
     def _maybe_quant_moe_input_once(

@@ -697,7 +697,22 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             rows.decode_group, SumGroup
         ):
             raise TypeError("operand transport requires a declared decode SumGroup")
-        if rows.source != arrival.produced.layout or rows.returned != rows.source:
+        # Full-TP KDA leaves a CP sum on gathered rows. The ordinary entry
+        # planner can complete it onto the unchanged source residual before
+        # binding the compute transport. Permit only that exact CP transition;
+        # unrelated row changes or incomplete sums still fail validation.
+        cp_sum_to_source = (
+            variant is BatchVariant.CONTEXT_PARALLEL
+            and arrival.produced.always_partial
+            and arrival.produced.group is SumGroup.ATTN_CP
+            and arrival.residual == rows.source
+            and TokenAxis.ATTN_CP in rows.source.sharded
+            and arrival.produced.layout
+            == Layout(rows.source.sharded - {TokenAxis.ATTN_CP})
+        )
+        if (
+            rows.source != arrival.produced.layout and not cp_sum_to_source
+        ) or rows.returned != rows.source:
             raise NotImplementedError("compute transport must return its source rows")
         declaration = StageContract(
             InputContract(rows.source, read=stage.read),

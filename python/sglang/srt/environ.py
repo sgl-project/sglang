@@ -1748,6 +1748,9 @@ class Envs:
     # standard dispatcher, and the triton MoE runner; falls back silently
     # otherwise.
     SGLANG_OPT_MOE_QUANT_ONCE = EnvBool(False)
+    # GLM interleaved CP: route/quantize local rows before gathering the FP8
+    # payload. Resolved once per model; unsupported layers retain BF16 transport.
+    SGLANG_CP_MOE_FP8_TRANSPORT = EnvBool(False)
 
     # ===================================================================
     # DeepGEMM Mega MoE

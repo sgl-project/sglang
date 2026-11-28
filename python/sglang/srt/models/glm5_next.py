@@ -29,6 +29,11 @@ from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.cp.moe_fp8_transport import (
+    CpMoeFp8Binding,
+    cp_moe_row_transport,
+    resolve_cp_moe_fp8_transport,
+)
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     PLAIN_RESIDUAL_OPS,
@@ -42,6 +47,7 @@ from sglang.srt.layers.layer_boundary import (
     get_attn_tp_context,
     is_dense_ffn_fully_dp,
 )
+from sglang.srt.layers.layer_boundary.contracts import ExitRows
 from sglang.srt.layers.layer_boundary.residual import access as residual_access
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
@@ -770,6 +776,7 @@ class Glm5NextDecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        cp_moe_fp8_transport: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -888,7 +895,21 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 is_last_layer=terminal,
             ).residual_ops()
-        attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn, mhc=mhc)
+        self.cp_moe_transport = (
+            CpMoeFp8Binding(self.mlp)
+            if cp_moe_fp8_transport
+            and isinstance(self.mlp, Glm5NextMoE)
+            and not is_nextn
+            else None
+        )
+        attn, ffn = self.stage_facts(
+            config,
+            layer_id,
+            is_nextn=is_nextn,
+            mhc=mhc,
+            cp_moe_fp8_transport=cp_moe_fp8_transport,
+            cp_moe_bind=self.cp_moe_transport,
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 attn,
@@ -903,7 +924,16 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
     @classmethod
-    def stage_facts(cls, config, layer_id, *, is_nextn=False, mhc=None):
+    def stage_facts(
+        cls,
+        config,
+        layer_id,
+        *,
+        is_nextn=False,
+        mhc=None,
+        cp_moe_fp8_transport=False,
+        cp_moe_bind=None,
+    ):
         """The attention and FFN stages the layer at ``layer_id`` declares:
         the model's shared declaration function (see make_layers), which the
         layer declares itself with. The config selects the residual: a plain
@@ -930,6 +960,12 @@ class Glm5NextDecoderLayer(nn.Module):
                 ),
                 read=residual.ffn_readout,
                 update=residual.ffn_update,
+                row_transport=cp_moe_row_transport(cp_moe_bind)
+                if cp_moe_fp8_transport
+                and cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn)
+                and not is_nextn
+                else None,
+                exit_rows=ExitRows.ATTENTION if cp_moe_fp8_transport else None,
             ),
         )
 
@@ -1084,6 +1120,17 @@ class Glm5NextDecoderLayer(nn.Module):
             )
             return self.ffn_boundary.finish(hidden_states, forward_batch), topk_indices
 
+        # The boundary already selected the batch variant and bound exactly
+        # one transport. Do not re-derive CP activity here.
+        if self.ffn_boundary.declaration.row_transport is not None:
+            invocation = self.ffn_boundary.transport_context(forward_batch)
+            with self.ffn_boundary.exit(forward_batch) as output:
+                hidden_states = invocation.forward(
+                    forward_batch, gemm_output_zero_allocator
+                )
+                hidden_states = output.finish(hidden_states)
+            return (hidden_states, topk_indices)
+
         if (
             isinstance(self.mlp, Glm5NextMoE)
             and not self.mlp.experts.moe_runner_config.inplace
@@ -1190,6 +1237,9 @@ class Glm5NextModel(nn.Module):
             else None
         )
 
+        # Keep stack facts and live layers on one model-local decision. Draft
+        # layers constructed independently keep the default (disabled) path.
+        cp_moe_fp8_transport = resolve_cp_moe_fp8_transport()
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Glm5NextDecoderLayer(
@@ -1198,9 +1248,12 @@ class Glm5NextModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=self.alt_stream,
+                cp_moe_fp8_transport=cp_moe_fp8_transport,
             ),
             prefix=add_prefix("layers", prefix),
-            stage_facts=lambda idx: Glm5NextDecoderLayer.stage_facts(config, idx),
+            stage_facts=lambda idx: Glm5NextDecoderLayer.stage_facts(
+                config, idx, cp_moe_fp8_transport=cp_moe_fp8_transport
+            ),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
