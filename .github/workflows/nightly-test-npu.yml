@@ -96,15 +96,15 @@ jobs:
             echo "ref=${{ inputs.ref }}" >> $GITHUB_OUTPUT
           fi
           JOB_FILTER="$(echo "${JOB_FILTER}" | tr -d '[:space:]')"
-          # TEMP (validation only): PR runs validate the three PR1 cases on B050.
+          # TEMP (validation only): PR runs validate the three PR1 cases on B060.
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             JOB_FILTER="nightly-acc-test-4-npu-a5,temp-pr1-acc-16-npu-a3,temp-pr1-glm53-mix-a3"
           fi
           echo "job_filter=${JOB_FILTER:-all}" | tee -a $GITHUB_OUTPUT
           if [ -z "${{ inputs.image_a3 }}" ]; then
-            # TEMP (validation only): PR runs use the B050 A3 image.
+            # TEMP (validation only): PR runs use the B060 A3 image.
             if [ "${{ github.event_name }}" = "pull_request" ]; then
-              echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050" >> $GITHUB_OUTPUT
+              echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B060" >> $GITHUB_OUTPUT
             else
               echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.2.0-a3" >> $GITHUB_OUTPUT
             fi
@@ -112,9 +112,9 @@ jobs:
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a5 }}" ]; then
-            # TEMP (validation only): PR runs use the B050 A5 image.
+            # TEMP (validation only): PR runs use the B060 A5 image.
             if [ "${{ github.event_name }}" = "pull_request" ]; then
-              echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B050" >> $GITHUB_OUTPUT
+              echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B060" >> $GITHUB_OUTPUT
             else
               echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.2.0-950" >> $GITHUB_OUTPUT
             fi
@@ -361,7 +361,7 @@ jobs:
        run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   # TEMP (validation only): PR1 DSV4-Flash-w8a8 8P x 2 (TP16 / attn-DP16) GPQA
-  # with the breakable prefill graph enabled, on the B050 A3 image.
+  # with the breakable prefill graph enabled, on the B060 A3 image.
   temp-pr1-acc-16-npu-a3:
     name: temp-pr1-acc-16-npu-a3
     if: ${{ github.event_name == 'pull_request' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',temp-pr1-acc-16-npu-a3,')) }}
@@ -380,7 +380,7 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   # TEMP (validation only): PR1 GLM-5.3-w8a8 16P two-node PD-mix GPQA with the
-  # breakable prefill graph enabled, on the B050 A3 image.
+  # breakable prefill graph enabled, on the B060 A3 image.
   temp-pr1-glm53-mix-a3:
     name: temp-pr1-glm53-mix-a3
     if: ${{ github.event_name == 'pull_request' && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',temp-pr1-glm53-mix-a3,')) }}
