@@ -52,7 +52,10 @@ def test_image_release_keeps_sharded_vision() -> None:
 
 
 @pytest.mark.parametrize("switch", [True, False])
-def test_encoder_builds_the_tower_its_config_selects(monkeypatch, switch) -> None:
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_encoder_builds_the_tower_its_config_selects(
+    monkeypatch, switch, tp_size
+) -> None:
     built = {}
 
     class RecordingModel(nn.Module):
@@ -68,8 +71,12 @@ def test_encoder_builds_the_tower_its_config_selects(monkeypatch, switch) -> Non
     arch.image_token_id = 1
     arch.video_token_id = 2
 
-    minimax_h3_qwen3vl.MiniMaxH3Qwen3VLEncoder(config)
+    with get_parallel().override(tp_size=tp_size, tp_rank=0, tp_group=None):
+        encoder = minimax_h3_qwen3vl.MiniMaxH3Qwen3VLEncoder(config)
 
+    assert ("model.visual.deepstack_merger_list" in encoder.layer_names) == (
+        switch and tp_size > 1
+    )
     assert built["vision_replicated"] is switch
 
 
