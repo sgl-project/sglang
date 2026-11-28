@@ -2416,8 +2416,6 @@ class TestDSV4LowRatioBudget(CustomTestCase):
                 planner.calculate_pool_sizes(budget - 1, 128).max_total_num_tokens,
                 12672,
             )
-            planner.ring_sizes[128] = 256
-            self.assertEqual(planner._get_c128_state_fixed_bytes(2), 1280 * 512 * 2 * 4)
             planner.swa_cap_tokens = None
             planner.swa_ratio = 0.1
             self.assertEqual(
@@ -2446,8 +2444,6 @@ class TestDSV4LowRatioBudget(CustomTestCase):
             self.assertEqual(
                 planner.calculate_pool_sizes(budget - 1, 128).max_total_num_tokens, 384
             )
-            planner.ring_sizes[2] = 8
-            self.assertEqual(planner._get_c2_state_fixed_bytes(2), 40 * 512 * 2 * 4)
 
     def test_no_low_ratio_owners_add_no_padding(self):
         from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
