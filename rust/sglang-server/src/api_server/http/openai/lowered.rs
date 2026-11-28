@@ -115,7 +115,7 @@ impl OpenAiChat {
             model: ChatModel {
                 context_length: Some(server_args.model_config.context_len),
                 generation_config,
-                ..ChatModel::for_formatter(formatter)
+                ..super::chat::served_chat_model(Some(formatter), server_args)
             },
             tokenizer,
             pieces,

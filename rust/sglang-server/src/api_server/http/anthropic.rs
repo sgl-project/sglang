@@ -158,6 +158,134 @@ mod tests {
         assert_eq!(json["error"]["type"], "invalid_request_error");
     }
 
+    /// `/v1/messages` decodes on its own, so Gemma 4's markers must survive
+    /// for its reasoning parser to split the thinking block from the text.
+    #[tokio::test]
+    async fn gemma4_messages_keep_reasoning_markers() {
+        use crate::api_server::http::openai::test_utils::{GEMMA4_STRIPPED, gemma4_marker_state};
+
+        for (model_type, expected) in [
+            (
+                "gemma4",
+                serde_json::json!([
+                    {"type": "thinking", "thinking": "Check the calculation."},
+                    {"type": "text", "text": "The answer is 4."},
+                ]),
+            ),
+            (
+                "llama",
+                serde_json::json!([{"type": "text", "text": GEMMA4_STRIPPED}]),
+            ),
+        ] {
+            let state = gemma4_marker_state(model_type, Some("gemma4"), |_| {});
+            let (status, body) = post(
+                state,
+                "/v1/messages",
+                r#"{"model": "model", "max_tokens": 8, "messages": [{"role": "user", "content": "What is 2 + 2?"}]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let content: Vec<serde_json::Value> = json["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|block| {
+                    let mut block = block.clone();
+                    block.as_object_mut().unwrap().remove("signature");
+                    block
+                })
+                .collect();
+            assert_eq!(
+                serde_json::Value::from(content),
+                expected,
+                "{model_type}: {body}"
+            );
+        }
+    }
+
+    /// After a `tool_result`, a Gemma 4 template can leave the thought channel
+    /// open in the prompt; the streamed thinking block must still split off,
+    /// and a forced tool call must wait for the channel to close.
+    #[tokio::test]
+    async fn gemma4_stream_separates_thinking_after_tool_result() {
+        use crate::api_server::http::openai::test_utils::gemma4_tool_reply_state;
+
+        let call = r#"[{"name": "lookup", "parameters": {}}]"#;
+        // (tool_choice, generated, text, tool_use, stop_reason)
+        for (tool_choice, generated, text, tool_use, stop_reason) in [
+            (
+                None,
+                "Check the result.<channel|>Done.",
+                "Done.",
+                None,
+                "end_turn",
+            ),
+            (
+                Some(serde_json::json!({"type": "any"})),
+                &*format!("Check the result.<channel|>{call}"),
+                "",
+                Some("lookup"),
+                "tool_use",
+            ),
+        ] {
+            let (state, submitted) = gemma4_tool_reply_state(generated);
+            let mut body = serde_json::json!({
+                "model": "model", "max_tokens": 8, "stream": true,
+                "thinking": {"type": "enabled", "budget_tokens": 1024},
+                "messages": [
+                    {"role": "user", "content": "Check my booking."},
+                    {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "call_1", "name": "lookup", "input": {}}
+                    ]},
+                    {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "call_1", "content": "Confirmed."}
+                    ]},
+                ],
+            });
+            if let Some(tool_choice) = &tool_choice {
+                body["tools"] = serde_json::json!([{
+                    "name": "lookup",
+                    "input_schema": {"type": "object", "properties": {}},
+                }]);
+                body["tool_choice"] = tool_choice.clone();
+            }
+            let (status, body) = post(state, "/v1/messages", &body.to_string()).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let events: Vec<serde_json::Value> = body
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect();
+            let delta_text = |kind: &str, key: &str| -> String {
+                events
+                    .iter()
+                    .filter(|event| event["delta"]["type"] == kind)
+                    .filter_map(|event| event["delta"][key].as_str())
+                    .collect()
+            };
+            let case = format!("tool_choice={tool_choice:?}: {body}");
+            assert_eq!(
+                delta_text("thinking_delta", "thinking"),
+                "Check the result.",
+                "{case}"
+            );
+            assert_eq!(delta_text("text_delta", "text"), text, "{case}");
+            let tool_name = events.iter().find_map(|event| {
+                (event["content_block"]["type"] == "tool_use")
+                    .then(|| event["content_block"]["name"].as_str())
+                    .flatten()
+            });
+            assert_eq!(tool_name, tool_use, "{case}");
+            let stop = events
+                .iter()
+                .find_map(|event| event["delta"]["stop_reason"].as_str());
+            assert_eq!(stop, Some(stop_reason), "{case}");
+            // Python's thinking mode: the grammar waits for the channel to close.
+            assert_eq!(*submitted.lock().unwrap(), [true], "{case}");
+        }
+    }
+
     /// The streamed form is SSE with the event name on each frame, in the
     /// Anthropic order.
     #[tokio::test]

@@ -23,8 +23,8 @@ use tonic::{Code, Status};
 use super::core::{CoreError, ReceivedAs};
 use super::handlers::{CoreCall, CoreHandle};
 use super::http::openai::chat::{
-    OutputParsing, SamplingDefaults, chat_sampling, prepare_chat_prompt, starts_in_reasoning,
-    unary_chat_response,
+    OutputParsing, SamplingDefaults, chat_sampling, prepare_chat_prompt, served_chat_model,
+    starts_in_reasoning, unary_chat_response,
 };
 use super::http::openai::pd_routing::PDRoutingFields;
 use super::http::openai::{ChatFormatter, unix_seconds_u32};
@@ -1178,6 +1178,11 @@ impl Responses<'_> {
         if let Some(schema) = plan.json_schema.clone() {
             sampling.json_schema = Some(schema);
         }
+        if served_chat_model(Some(formatter), self.server_args)
+            .keeps_special_tokens(reasoning_parser.as_deref())
+        {
+            sampling.skip_special_tokens = false;
+        }
         let starts_in_reasoning =
             starts_in_reasoning(reasoning_parser.as_deref(), rendered.prompt.as_str());
         let routing = PDRoutingFields {
@@ -1210,6 +1215,8 @@ impl Responses<'_> {
             bootstrap_room: routing.bootstrap.bootstrap_rooms[0],
             routed_dp_rank: routing.routed_dp_rank,
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
+            // The grammar starts after the open reasoning, as on the chat route.
+            require_reasoning: starts_in_reasoning,
             ..Default::default()
         };
         let call = self

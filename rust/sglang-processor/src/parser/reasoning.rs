@@ -8,6 +8,13 @@ use dynamo_parsers::reasoning::{
 
 use crate::think::{ReasoningOptions, ThinkDetector, think_config};
 
+pub const GEMMA4_REASONING_START: &str = "<|channel>thought\n";
+
+/// The `--reasoning-parser` names that select Dynamo's Gemma 4 parser.
+pub fn is_gemma4_reasoning_parser(name: &str) -> bool {
+    matches!(name, "gemma4" | "gemma-4")
+}
+
 /// Build the parser a Python `--reasoning-parser` name selects. Names Dynamo
 /// does not know fall back to its non-forced basic parser.
 fn build_reasoning_parser(server_name: &str) -> ReasoningParserWrapper {
@@ -36,8 +43,14 @@ impl Backend {
             return Self::Sglang(ThinkDetector::new(config, options));
         }
         let mut parser = build_reasoning_parser(name);
-        if let Some(force_reasoning) = options.force_reasoning {
-            parser.set_in_reasoning(force_reasoning);
+        match (name, options.force_reasoning) {
+            (name, Some(true)) if is_gemma4_reasoning_parser(name) => {
+                // Dynamo's Gemma 4 parser does not implement set_in_reasoning.
+                // Feed the already-rendered opener to seed its streaming state.
+                parser.parse_reasoning_streaming_incremental(GEMMA4_REASONING_START, &[]);
+            }
+            (_, Some(force_reasoning)) => parser.set_in_reasoning(force_reasoning),
+            _ => {}
         }
         Self::Dynamo(Mutex::new(parser))
     }
@@ -62,7 +75,15 @@ pub fn split_reasoning<T: Copy + TryInto<u32>>(
         Backend::Sglang(mut detector) => detector.parse(text),
         Backend::Dynamo(parser) => {
             let mut parser = parser.into_inner().unwrap_or_else(PoisonError::into_inner);
-            let split = parser.detect_and_parse_reasoning(text, &u32_ids(token_ids));
+            // The one-shot parse ignores the seeded streaming state, so a forced
+            // Gemma 4 split sees the rendered opener as the stream does.
+            let text = match options.force_reasoning {
+                Some(true) if is_gemma4_reasoning_parser(name) => {
+                    std::borrow::Cow::Owned(format!("{GEMMA4_REASONING_START}{text}"))
+                }
+                _ => std::borrow::Cow::Borrowed(text),
+            };
+            let split = parser.detect_and_parse_reasoning(&text, &u32_ids(token_ids));
             (split.reasoning_text, split.normal_text)
         }
     }
@@ -170,6 +191,45 @@ mod tests {
         let mut plain = ReasoningStreamSplitter::new(None, ReasoningOptions::default());
         assert_eq!(plain.split("plain", NO_IDS), ("".into(), "plain".into()));
         assert_eq!(plain.finish(), ("".into(), "".into()));
+    }
+
+    #[test]
+    fn forced_gemma4_unary_split_matches_streaming() {
+        // After a tool reply the prompt opens the thought channel, so the output
+        // starts inside it, with or without the closing marker.
+        let forced = ReasoningOptions {
+            force_reasoning: Some(true),
+            ..Default::default()
+        };
+        for (text, expected) in [
+            (
+                "Let me check the booking status and",
+                ("Let me check the booking status and", ""),
+            ),
+            (
+                "Check the result.<channel|>Done.",
+                ("Check the result.", "Done."),
+            ),
+        ] {
+            let unary = split_reasoning(Some("gemma4"), &forced, text, NO_IDS);
+            let mut splitter = ReasoningStreamSplitter::new(Some("gemma4"), forced.clone());
+            let (reasoning, normal) = splitter.split(text, NO_IDS);
+            let (tail_reasoning, tail_normal) = splitter.finish();
+            let streamed = (reasoning + &tail_reasoning, normal + &tail_normal);
+            let expected = (expected.0.to_owned(), expected.1.to_owned());
+            assert_eq!(unary, expected, "unary: {text}");
+            assert_eq!(streamed, expected, "streamed: {text}");
+        }
+        // Without the forced state the channel must open in the output.
+        assert_eq!(
+            split_reasoning(
+                Some("gemma4"),
+                &ReasoningOptions::default(),
+                "Done.",
+                NO_IDS
+            ),
+            (String::new(), "Done.".into())
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use super::core::{CoreError, ReceivedAs};
 use super::handlers::{CoreCall, CoreHandle};
 use super::http::openai::chat::{
     OutputParsing, SamplingDefaults, chat_event_stream, chat_sampling, prepare_chat_prompt,
-    starts_in_reasoning, unary_chat_response,
+    served_chat_model, starts_in_reasoning, unary_chat_response,
 };
 use super::http::openai::pd_routing::PDRoutingFields;
 use super::http::openai::{ChatFormatter, ChatTemplateKwargs, unix_seconds_u32};
@@ -676,6 +676,11 @@ impl Anthropic<'_> {
         if let Some(top_k) = request.top_k {
             sampling.top_k = top_k;
         }
+        if served_chat_model(Some(formatter), self.server_args)
+            .keeps_special_tokens(reasoning_parser.as_deref())
+        {
+            sampling.skip_special_tokens = false;
+        }
         let routing = PDRoutingFields {
             bootstrap_host: request.bootstrap_host,
             bootstrap_port: request.bootstrap_port,
@@ -698,6 +703,8 @@ impl Anthropic<'_> {
             bootstrap_room: routing.bootstrap.bootstrap_rooms[0],
             routed_dp_rank: routing.routed_dp_rank,
             disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
+            // The grammar starts after the open reasoning, as on the chat route.
+            require_reasoning: starts_in_reasoning,
             ..Default::default()
         };
         let call = self
