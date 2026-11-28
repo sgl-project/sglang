@@ -522,7 +522,9 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_schedule,
     get_serving,
+    get_spec,
     publish,
 )
 
@@ -2566,6 +2568,20 @@ def _execute_server_warmup(server_args: ServerArgs):
                 verify=ssl_verify,
             )
             assert res.status_code == 200, f"{res.text}"
+            if (
+                envs.SGLANG_WARMUP_SERVING_SHAPES.get()
+                and request_name == "/generate"
+                and get_spec().speculative_algorithm is not None
+                and not get_serving().skip_tokenizer_init
+                and get_parallel().num_dp_ranks == 1
+            ):
+                _warmup_serving_shapes(
+                    url=url + request_name,
+                    headers=headers,
+                    ssl_verify=ssl_verify,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    max_batch=min(get_schedule().max_running_requests or 1, 8),
+                )
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:
@@ -2603,6 +2619,44 @@ def _execute_server_warmup(server_args: ServerArgs):
         return False
 
     return success
+
+
+def _warmup_serving_shapes(
+    *, url: str, headers: dict, ssl_verify, timeout: float, max_batch: int
+) -> None:
+    """SGLANG_WARMUP_SERVING_SHAPES: one sampled request, then ``max_batch`` concurrent
+    sampled requests of staggered lengths (the decode batch steps down from max_batch
+    to 1), so the sampled post-verify graphs and the eager kernels of every such batch
+    size run before the server reports ready."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def post(max_new_tokens: int) -> None:
+        res = requests.post(
+            url,
+            json={
+                "text": "The capital city of France is",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "top_p": 0.95,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                },
+            },
+            headers=headers,
+            timeout=timeout,
+            verify=ssl_verify,
+        )
+        assert res.status_code == 200, f"{res.text}"
+
+    post(8)
+    if max_batch > 1:
+        with ThreadPoolExecutor(max_batch) as pool:
+            list(pool.map(post, [16 + 16 * i for i in range(max_batch)]))
+    logger.info(
+        "Warm-up ran the serving shapes: sampled, up to %d concurrent requests "
+        "(SGLANG_WARMUP_SERVING_SHAPES)",
+        max_batch,
+    )
 
 
 def _tokenizer_worker_gc_callback(worker_id: int, gc_threshold) -> Callable[[], None]:

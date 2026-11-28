@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner.replay_prep_warmup import warm_replay_prep
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_entry
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -638,6 +639,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+            # The replay's draft metadata prep at this batch size, once now (replay_prep_warmup)
+            if warm_replay_prep(
+                "draft decode",
+                num_seqs,
+                lambda: self.draft_attn_backend.init_forward_metadata_out_graph(
+                    SimpleNamespace(**vars(forward_batch), num_padding=0)
+                ),
+            ):
+                self._warmed_replay_bs.add(num_seqs)
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         parent_list, top_scores_index, draft_tokens, draft_probs = (

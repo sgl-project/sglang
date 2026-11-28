@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.runner.replay_prep_warmup import warm_replay_prep
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -603,6 +604,48 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )
+            # The replay's draft-extend metadata prep at this batch size, once now
+            # (replay_prep_warmup)
+            if warm_replay_prep(
+                "draft extend",
+                bs,
+                lambda: self.draft_extend_attn_backend.init_forward_metadata_out_graph(
+                    self._replay_fb_view(forward_batch, bs=bs, raw_bs=bs, num_tokens=num_tokens)
+                ),
+            ):
+                self._warmed_replay_bs.add(bs)
+
+    def _replay_fb_view(self, forward_batch, *, bs: int, raw_bs: int, num_tokens: int):
+        """The ForwardBatch view the draft-extend replay metadata prep reads."""
+        from types import SimpleNamespace
+
+        buffers = self.buffers
+        seq_lens_sum = forward_batch.seq_lens_sum
+        if seq_lens_sum is not None:
+            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
+        return SimpleNamespace(
+            batch_size=bs,
+            forward_mode=self.forward_mode,
+            ragged_verify_layout=None,
+            input_ids=getattr(forward_batch, "input_ids", None),
+            req_pool_indices=buffers.req_pool_indices,
+            seq_lens=buffers.seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            # Mirror absence must survive replay (stale buffer defeats None-guards).
+            seq_lens_cpu=(
+                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
+            ),
+            max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
+            encoder_lens=None,
+            out_cache_loc=buffers.out_cache_loc[:num_tokens],
+            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
+            iteration_ids=forward_batch.iteration_ids,
+            iteration_cols=forward_batch.iteration_cols,
+            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
+            # Virtual input stays separate from the backend's physical buffer.
+            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
+            spec_info=forward_batch.spec_info,
+        )
 
     def execute(self, forward_batch: ForwardBatch, select_index: torch.Tensor):
         assert forward_batch.out_cache_loc is not None
@@ -722,33 +765,8 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
-        from types import SimpleNamespace
-
-        seq_lens_sum = forward_batch.seq_lens_sum
-        if seq_lens_sum is not None:
-            seq_lens_sum = seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value
-        fb_view = SimpleNamespace(
-            batch_size=bs,
-            forward_mode=self.forward_mode,
-            ragged_verify_layout=None,
-            input_ids=getattr(forward_batch, "input_ids", None),
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
-            seq_lens_sum=seq_lens_sum,
-            # Mirror absence must survive replay (stale buffer defeats None-guards).
-            seq_lens_cpu=(
-                None if forward_batch.seq_lens_cpu is None else buffers.seq_lens_cpu
-            ),
-            max_seq_len_host=getattr(forward_batch, "max_seq_len_host", None),
-            encoder_lens=None,
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
-            iteration_ids=forward_batch.iteration_ids,
-            iteration_cols=forward_batch.iteration_cols,
-            out_cache_loc_dsv4=getattr(forward_batch, "out_cache_loc_dsv4", None),
-            # Virtual input stays separate from the backend's physical buffer.
-            mamba_track_indices=track_indices(buffers.mamba_track_indices, bs),
-            spec_info=forward_batch.spec_info,
+        fb_view = self._replay_fb_view(
+            forward_batch, bs=bs, raw_bs=raw_bs, num_tokens=num_tokens
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
 

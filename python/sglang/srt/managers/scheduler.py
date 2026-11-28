@@ -7561,6 +7561,13 @@ def run_scheduler_process(
         if scheduler.server_args.ep_join_mode in ("recover", "scale"):
             get_context().override("elastic_ep.joined", ep_join_mode=None)
 
+        # Graphs are captured: a Triton module load from here on syncs first (replay_prep_warmup)
+        from sglang.srt.model_executor.runner.replay_prep_warmup import (
+            arm_lazy_load_guard,
+        )
+
+        arm_lazy_load_guard()
+
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 
