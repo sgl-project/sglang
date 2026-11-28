@@ -44,7 +44,7 @@ def save_recurrent_state(
     if not _HOOKS or mamba_pool is None:
         return None
     cache = mamba_pool.mamba_cache
-    if cache.replayssm_d is not None:
+    if cache.replayssm_g is not None:
         raise RuntimeError(
             "A replayed CUDA graph step restores the conv, temporal and slot side states, "
             "not ReplaySSM rings"

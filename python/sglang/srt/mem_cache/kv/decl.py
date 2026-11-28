@@ -387,29 +387,35 @@ def with_state_replay(
                 f"{min_len} (16 and the draft tokens), got {length}"
             )
     dtype = geometry.conv_dtype if replay.speculative else geometry.temporal_dtype
-    ring = [
-        TensorPartDecl(
-            name="replayssm_d",
-            shape=(hv, length, value_dim),
-            dtype=dtype,
-            layer_ids=layer_ids,
-            slice_axis=0,
-        ),
-        TensorPartDecl(
-            name="replayssm_k",
-            shape=(replay.key_heads, length, key_dim),
-            dtype=dtype,
-            layer_ids=layer_ids,
-            slice_axis=0,
-        ),
+    ring = []
+    if not (replay.speculative and replay.is_kda):
+        ring.extend(
+            (
+                TensorPartDecl(
+                    name="replayssm_d",
+                    shape=(hv, length, value_dim),
+                    dtype=dtype,
+                    layer_ids=layer_ids,
+                    slice_axis=0,
+                ),
+                TensorPartDecl(
+                    name="replayssm_k",
+                    shape=(replay.key_heads, length, key_dim),
+                    dtype=dtype,
+                    layer_ids=layer_ids,
+                    slice_axis=0,
+                ),
+            )
+        )
+    ring.append(
         TensorPartDecl(
             name="replayssm_g",
             shape=(hv, length, key_dim) if replay.is_kda else (hv, length),
             dtype=torch.float32,
             layer_ids=layer_ids,
             slice_axis=0,
-        ),
-    ]
+        )
+    )
     if replay.speculative and (replay.is_kda or dtype != torch.float32):
         ring.extend(
             (
