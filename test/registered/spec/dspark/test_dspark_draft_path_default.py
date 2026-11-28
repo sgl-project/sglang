@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _resolve_dspark_lm_head_dtype,
@@ -102,6 +102,98 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         self.assertEqual(
             resolution_result(server_args, "speculative_num_draft_tokens"), 6
         )
+
+    def test_bundled_checkpoint_keeps_an_explicit_draft_revision(self):
+        for draft_revision, expected in ((None, "target"), ("draft", "draft")):
+            with self.subTest(draft_revision=draft_revision):
+                server_args = _make_dspark_server_args(
+                    model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+                )
+                server_args.revision = "target"
+                server_args.speculative_draft_model_revision = draft_revision
+                _handle_dspark(server_args)
+                self.assertEqual(
+                    resolution_result(server_args, "speculative_draft_model_revision"),
+                    expected,
+                )
+
+    def test_modelscope_rejects_another_revision_for_a_bundled_draft(self):
+        for revision, draft_revision, raises in (
+            ("target", "target", False),
+            ("target", "draft", True),
+            (None, "master", False),
+            (None, "draft", True),
+        ):
+            with self.subTest(revision=revision, draft_revision=draft_revision):
+                server_args = _make_dspark_server_args(
+                    model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+                )
+                server_args.revision = revision
+                server_args.speculative_draft_model_revision = draft_revision
+                declare_resolution(
+                    server_args, "_handle_modelscope_paths", model_path="/ms/snapshot"
+                )
+                with envs.SGLANG_USE_MODELSCOPE.override(True):
+                    if raises:
+                        with self.assertRaisesRegex(ValueError, "local download"):
+                            _handle_dspark(server_args)
+                    else:
+                        _handle_dspark(server_args)
+
+    def test_modelscope_check_reads_the_resolution_not_the_disk(self):
+        # A cold download can create the raw path after ModelScope resolved it.
+        with tempfile.TemporaryDirectory() as raw_path:
+            server_args = _make_dspark_server_args(
+                model_path=raw_path, hf_config=_bundled_hf_config()
+            )
+            server_args.revision = "target"
+            server_args.speculative_draft_model_revision = "draft"
+            server_args._raw_input = {"model_path": raw_path}
+            declare_resolution(
+                server_args, "_handle_modelscope_paths", model_path="/ms/snapshot"
+            )
+            with (
+                envs.SGLANG_USE_MODELSCOPE.override(True),
+                self.assertRaisesRegex(ValueError, "local download"),
+            ):
+                _handle_dspark(server_args)
+
+    def test_modelscope_accepts_another_revision_for_a_local_checkpoint(self):
+        for hf_config in (_bundled_hf_config(), _plain_hf_config()):
+            with (
+                self.subTest(bundled=hasattr(hf_config, "dspark_block_size")),
+                tempfile.TemporaryDirectory() as ckpt,
+            ):
+                os.makedirs(os.path.join(ckpt, "dspark"))
+                with open(os.path.join(ckpt, "dspark", "config.json"), "w") as f:
+                    f.write("{}")
+                server_args = _make_dspark_server_args(
+                    model_path=ckpt, hf_config=hf_config
+                )
+                server_args.revision = "target"
+                server_args.speculative_draft_model_revision = "draft"
+                with envs.SGLANG_USE_MODELSCOPE.override(True):
+                    _handle_dspark(server_args)
+
+    def test_dspark_subfolder_probe_uses_the_draft_revision(self):
+        for draft_revision, expected in ((None, "target"), ("draft", "draft")):
+            with self.subTest(draft_revision=draft_revision):
+                server_args = _make_dspark_server_args(
+                    model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
+                )
+                server_args.revision = "target"
+                server_args.speculative_draft_model_revision = draft_revision
+                with (
+                    patch(
+                        f"{_HOOK}._target_checkpoint_dspark_subfolder",
+                        return_value=None,
+                    ) as probe,
+                    self.assertRaisesRegex(
+                        ValueError, "--speculative-draft-model-path"
+                    ),
+                ):
+                    _handle_dspark(server_args)
+                self.assertEqual(probe.call_args.args[1], expected)
 
     def test_plain_target_without_draft_path_raises(self):
         server_args = _make_dspark_server_args(

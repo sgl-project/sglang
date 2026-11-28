@@ -618,6 +618,52 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
+# The hooks that download a --model-path repo ID at --revision before the
+# spec handlers run, with the revision of their hub for an unset --revision.
+_TARGET_DOWNLOAD_DEFAULT_REVISIONS = {
+    "_resolve_hf_gguf_model_path": "main",
+    "_handle_modelscope_paths": "master",
+}
+
+
+def _target_download_default_revision(server_args: ServerArgs) -> Optional[str]:
+    """These hooks keep a local --model-path as it is, so their declaration
+    changes the path only for a repo ID. Later hooks, for example expert_pack,
+    can change the path again."""
+    model_path = (getattr(server_args, "_raw_input", None) or {}).get(
+        "model_path", server_args.model_path
+    )
+    for source, declared in getattr(server_args, "_resolved_overrides", None) or ():
+        if "model_path" not in declared:
+            continue
+        if (
+            source in _TARGET_DOWNLOAD_DEFAULT_REVISIONS
+            and declared["model_path"] != model_path
+        ):
+            return _TARGET_DOWNLOAD_DEFAULT_REVISIONS[source]
+        model_path = declared["model_path"]
+    return None
+
+
+def _check_bundled_draft_revision(server_args: ServerArgs) -> None:
+    """A hook has downloaded a --model-path repo ID at --revision, and a
+    bundled draft loads from that local path."""
+    default_revision = _target_download_default_revision(server_args)
+    if default_revision is None:
+        return
+    cfg = resolving_view(server_args)
+    revision = cfg.speculative_draft_model_revision
+    target_revision = cfg.revision or default_revision
+    if revision not in (None, target_revision):
+        raise ValueError(
+            f"--speculative-draft-model-revision {revision!r} differs from the "
+            f"target revision {target_revision!r}. A bundled draft loads from the "
+            "local download of --model-path at the target revision. Pass the same "
+            "value to --revision, or download the draft revision to a local "
+            "directory and pass it with --speculative-draft-model-path."
+        )
+
+
 _DSPARK_DRAFT_SUBFOLDER = "dspark"
 
 
@@ -742,19 +788,24 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "_handle_dspark",
                 speculative_draft_model_path=cfg.model_path,
             )
-            declare_resolution(
-                server_args,
-                "_handle_dspark",
-                speculative_draft_model_revision=cfg.revision,
-            )
+            _check_bundled_draft_revision(server_args)
+            if cfg.speculative_draft_model_revision is None:
+                declare_resolution(
+                    server_args,
+                    "_handle_dspark",
+                    speculative_draft_model_revision=cfg.revision,
+                )
             logger.info(
                 "DSpark draft weights are bundled in the target checkpoint; "
                 "defaulting --speculative-draft-model-path to --model-path (%s).",
                 cfg.model_path,
             )
         elif draft_dir := _target_checkpoint_dspark_subfolder(
-            cfg.model_path, cfg.revision, cfg.download_dir
+            cfg.model_path,
+            cfg.speculative_draft_model_revision or cfg.revision,
+            cfg.download_dir,
         ):
+            _check_bundled_draft_revision(server_args)
             declare_resolution(
                 server_args,
                 "_handle_dspark",
@@ -1337,11 +1388,13 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "_handle_eagle_family",
                 speculative_draft_model_path=cfg.model_path,
             )
-            declare_resolution(
-                server_args,
-                "_handle_eagle_family",
-                speculative_draft_model_revision=cfg.revision,
-            )
+            _check_bundled_draft_revision(server_args)
+            if cfg.speculative_draft_model_revision is None:
+                declare_resolution(
+                    server_args,
+                    "_handle_eagle_family",
+                    speculative_draft_model_revision=cfg.revision,
+                )
         else:
             if model_arch not in [
                 "MistralLarge3ForCausalLM",
