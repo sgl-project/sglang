@@ -13,6 +13,7 @@ The table holds on XPU because MLATokenToKVPoolHost gates can_use_jit on
 preceding each transfer_kv_* call never fires here.
 """
 
+import os
 import shutil
 import tempfile
 import unittest
@@ -26,10 +27,13 @@ from sglang.test.hicache_xpu_common import (
     complete,
     launch_server,
     load_back_tokens,
+    nixl_posix_config,
+    nixl_posix_unavailable_reason,
     prime_cache,
     resolve_base_url,
     shared_prefix_len,
     wait_load_back_tokens,
+    wait_storage_settled,
 )
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
@@ -109,12 +113,18 @@ def tearDownModule():
 
 
 class _MlaKernelServer(CustomTestCase):
-    """One MLA HiCache server with a host tier only, plus the scenario it runs."""
+    """One MLA HiCache server, plus the scenario it runs.
+
+    NIXL-POSIX storage backs the host tier when it can run here; otherwise the
+    server is host-only and the L1<->L2 kernels are still covered.
+    """
 
     model = None
     io_backend = None
     mem_layout = None
     process = None
+    tmp_dir = None
+    storage_skip_reason = None
 
     @classmethod
     def setUpClass(cls):
@@ -124,6 +134,22 @@ class _MlaKernelServer(CustomTestCase):
             )
         cls.base_url = resolve_base_url()
         cls.model = _model_dir
+        cls.tmp_dir = tempfile.mkdtemp(
+            prefix=f"hc_xpu_mla_{cls.io_backend}_{cls.mem_layout}_"
+        )
+        cls.storage_dir = os.path.join(cls.tmp_dir, "storage")
+        os.makedirs(cls.storage_dir, exist_ok=True)
+        cls.storage_skip_reason = nixl_posix_unavailable_reason()
+        storage_args = []
+        env_extra = None
+        if cls.storage_skip_reason is None:
+            storage_args = [
+                "--hicache-storage-backend",
+                "nixl",
+                "--hicache-storage-backend-extra-config",
+                nixl_posix_config(),
+            ]
+            env_extra = {"SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR": cls.storage_dir}
         cls.process = launch_server(
             cls.model,
             cls.base_url,
@@ -148,22 +174,26 @@ class _MlaKernelServer(CustomTestCase):
                 cls.io_backend,
                 "--hicache-mem-layout",
                 cls.mem_layout,
+                *storage_args,
                 "--enable-cache-report",
                 "--enable-metrics",
             ],
+            env_extra=env_extra,
         )
 
     @classmethod
     def tearDownClass(cls):
         if cls.process is not None:
             terminate_and_kill_process_tree(cls.process)
+        if cls.tmp_dir is not None:
+            shutil.rmtree(cls.tmp_dir, ignore_errors=True)
 
     def test_offload_reload_round_trip(self):
-        """Evict a long prefix to the host tier, reload it, and compare greedily.
+        """Evict a long prefix to host/storage, reload it, and compare greedily.
 
-        One method rather than several: the cached-token assertions are only
-        meaningful after the eviction has run, and unittest orders methods
-        alphabetically, not causally.
+        One method rather than several: the storage-file and cached-token
+        assertions are only meaningful after the eviction has run, and unittest
+        orders methods alphabetically, not causally.
         """
         # 444 + 8 x 128 tokens overflow the 1024-token device pool, forcing a reload.
         prefix = "The history of computing is a long and fascinating story. " * 40
@@ -224,9 +254,15 @@ class _MlaKernelServer(CustomTestCase):
             out2,
             out1,
             f"{tag} reloaded continuation diverged after {spl} chars "
-            f"(first={out1!r} reloaded={out2!r}) -> the host round trip "
+            f"(first={out1!r} reloaded={out2!r}) -> host/storage round trip "
             f"corrupted the KV",
         )
+        if self.storage_skip_reason is None:
+            self.assertGreater(
+                wait_storage_settled(self.storage_dir),
+                0,
+                f"{tag} no NIXL storage files written -> host<->storage tier idle",
+            )
 
 
 @unittest.skipUnless(XPU_AVAILABLE, "Intel XPU not available")
