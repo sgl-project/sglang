@@ -305,12 +305,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         mask_dtype: torch.dtype,
         sliding_layers_only: bool = True,
     ):
-        """Prepare bidirectional attention masks for image tokens.
+        """Prepare bidirectional attention masks for vision tokens.
 
-        Gemma 4 uses bidirectional attention for image soft tokens
-        during prefill. Following the HF implementation, bidirectional attention
-        is only enabled within each individual image group (same-item
-        tokens), not across items, and only for checkpoints with
+        During prefill, each image span receives bidirectional attention.
+        Triton also opens each video frame's span, following the HF mask.
+        This applies to checkpoints with
         ``use_bidirectional_attention == "vision"``; E2B/E4B keep it causal.
         Triton and XPU scope image attention to sliding-window layers when
         ``sliding_layers_only`` (HF Gemma 4 keeps full-attention layers causal;
@@ -329,6 +328,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return
         attn_backend = get_attn_backend()
         prefill_backend = getattr(attn_backend, "prefill_backend", attn_backend)
+        is_triton = isinstance(prefill_backend, TritonAttnBackend)
+        if not is_triton and not forward_batch.contains_image_inputs():
+            return
         if getattr(prefill_backend, "fa_impl_ver", None) == 4 or getattr(
             prefill_backend, "fa3_upgrades_to_fa4", False
         ):
@@ -385,7 +387,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 )
                 prefill_backend.bidirectional_sliding_layers_only = sliding_layers_only
                 return
-        if not isinstance(prefill_backend, TritonAttnBackend):
+        if not is_triton:
             logger.warning_once(
                 "Bidirectional attention for image tokens requires TritonAttnBackend. "
                 "Falling back to causal attention, which may degrade image quality."
@@ -398,7 +400,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             forward_batch.batch_size + 1, dtype=torch.int64, device=input_ids.device
         )
 
-        split_images = []
+        split_spans = []
 
         for i in range(forward_batch.batch_size):
             extend_seq_len = forward_batch.extend_seq_lens[i]
@@ -413,49 +415,31 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             bidirectional_attn_mask.fill_(1)
             bidirectional_attn_mask = bidirectional_attn_mask.tril(diagonal=prefix_len)
 
-            # HF only enables bidirectional attention for image tokens,
-            # not video or audio (see create_causal_mask_mapping).
             mm_inputs = forward_batch.mm_inputs[i]
             if mm_inputs is not None:
                 for mm_item in mm_inputs.mm_items:
-                    if mm_item.is_image():
-                        for im_begin, im_end in mm_item.offsets:
-                            # Note(kpham-sgl): We only apply bidirectional attention when the image token span
-                            # is fully contained in the extend window. Otherwise, we silently fall back to
-                            # causal attention.
-                            # FIXME(kpham-sgl): This is a hack to work around the fact that the image token span
-                            # might not be fully contained in the extend window during chunked prefill.
-                            # We should fix this by properly making chunked prefill mask aware.
-                            if (
-                                im_begin >= prefix_len
-                                and im_end < prefix_len + extend_seq_len
-                            ):
-                                bidirectional_attn_mask[
-                                    im_begin - prefix_len : im_end + 1 - prefix_len,
-                                    im_begin : im_end + 1,
-                                ] = 1
-                            elif (
-                                im_end >= prefix_len
-                                and im_begin < prefix_len + extend_seq_len
-                            ):
-                                split_images.append((i, im_begin, im_end))
+                    if not (mm_item.is_image() or mm_item.is_video()):
+                        continue
+                    for begin, end in mm_item.offsets:
+                        if begin >= prefix_len and end < prefix_len + extend_seq_len:
+                            bidirectional_attn_mask[
+                                begin - prefix_len : end + 1 - prefix_len,
+                                begin : end + 1,
+                            ] = 1
+                        elif end >= prefix_len and begin < prefix_len + extend_seq_len:
+                            # A vision span split across chunks stays causal.
+                            split_spans.append((i, begin, end))
 
             bidirectional_attn_masks_list.append(bidirectional_attn_mask.flatten())
             bidirectional_attn_mask_indptr[i + 1] = (
                 bidirectional_attn_mask_indptr[i] + bidirectional_attn_mask.nelement()
             )
-        if split_images:
-            num_split_images = len(split_images)
+        if split_spans:
             logger.warning_once(
-                f"{num_split_images} images are split across chunk boundaries. "
-                "Below are the first 5 images that are split across chunk boundaries: "
-            )
-            for i, im_begin, im_end in split_images[:5]:
-                logger.warning_once(
-                    f"Image {i}:{im_begin}-{im_end} is split across chunk boundaries.\n",
-                )
-            logger.warning_once(
-                "Those images will receive causal attention. Disable chunked prefill (--chunked-prefill-size=-1) for full bidirectional attention.",
+                f"{len(split_spans)} vision spans are split across chunk boundaries. "
+                f"First 5 split spans (batch, begin, end): {split_spans[:5]}. "
+                "Those spans will receive causal attention. Disable chunked "
+                "prefill (--chunked-prefill-size=-1) for full bidirectional attention."
             )
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
@@ -682,12 +666,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
             per_layer_inputs = self.get_per_layer_inputs(ple_ids)
 
-        # Prepare bidirectional attention masks for image tokens during prefill.
+        # Prepare bidirectional attention masks for vision tokens during prefill.
         # mm_inputs is preserved on every PP rank up to the first-rank embed
         # routine, so each rank's attn_backend can install the mask locally.
-        if (
-            forward_batch.forward_mode == ForwardMode.EXTEND
-            and forward_batch.contains_image_inputs()
+        if forward_batch.forward_mode == ForwardMode.EXTEND and (
+            forward_batch.contains_image_inputs()
+            or forward_batch.contains_video_inputs()
         ):
             self.prepare_attn_masks(
                 forward_batch,

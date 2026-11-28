@@ -1,5 +1,6 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -10,10 +11,14 @@ from sglang.srt.layers.attention.triton_backend import (
     WindowRail,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -282,8 +287,6 @@ def test_gemma4_image_mask_layer_scope(deterministic, sliding_layers_only):
     DiffusionGemma explicitly opts out of the sliding-only restriction.
     Exercise the real model mask producer and both backend dispatch paths.
     """
-    from unittest.mock import patch
-
     from sglang.srt.models import gemma4_mm
 
     recorded = []
@@ -352,6 +355,57 @@ def test_gemma4_image_mask_layer_scope(deterministic, sliding_layers_only):
             assert mask is None
             assert indptr is None
         assert backend.forward_metadata.custom_mask is image_mask
+
+
+class TestGemma4VideoMask(CustomTestCase):
+    def test_prefill_applies_bidirectional_attention_per_video_frame(self):
+        """Frame tokens attend within each frame while text and audio stay causal."""
+        from sglang.srt.models import gemma4_mm
+
+        cls = gemma4_mm.Gemma4ForConditionalGeneration
+        model = cls.__new__(cls)
+        torch.nn.Module.__init__(model)
+        model.pp_group = SimpleNamespace(is_first_rank=False, is_last_rank=False)
+        model.language_model = torch.nn.Identity()
+        model.config = SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention="vision")
+        )
+        ids = torch.arange(9)
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=ids,
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([9]),
+            out_cache_loc=torch.arange(9),
+            seq_lens_sum=9,
+            extend_seq_lens=torch.tensor([9]),
+            extend_prefix_lens=torch.tensor([0]),
+            mm_inputs=[
+                MultimodalInputs(
+                    mm_items=[
+                        MultimodalDataItem(
+                            modality=Modality.VIDEO, offsets=[(1, 2), (4, 5)]
+                        ),
+                        MultimodalDataItem(modality=Modality.AUDIO, offsets=[(7, 8)]),
+                    ]
+                )
+            ],
+        )
+        backend = _make_extend_backend(1, deterministic=False)
+        with (
+            patch.object(gemma4_mm, "get_attn_backend", return_value=backend),
+            patch.object(gemma4_mm, "general_mm_embed_routine"),
+        ):
+            model(ids, torch.arange(9), batch)
+
+        expected = torch.ones((9, 9), dtype=torch.bool).tril()
+        expected[1, 2] = True
+        expected[4, 5] = True
+        metadata = backend.forward_metadata
+        self.assertIsNotNone(metadata.custom_mask)
+        torch.testing.assert_close(metadata.custom_mask.view(9, 9), expected)
+        self.assertTrue(metadata.custom_mask_sliding_layers_only)
 
 
 if __name__ == "__main__":
