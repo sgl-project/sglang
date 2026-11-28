@@ -1,7 +1,8 @@
 //! Prompt generation, ported from `python/sglang/benchmark/datasets/`.
 //!
 //! The `random`, `random-ids` and `sharegpt` samplers are here; they are the
-//! ones a large-batch run uses. Sampling is seeded, so a run reproduces
+//! ones a large-batch run uses (`timed-trace` lives in `timed_trace.rs`).
+//! Sampling is seeded, so a run reproduces
 //! itself, but it does not reproduce the Python script's selection: the two
 //! use different random number generators, so the same `--seed` draws
 //! different prompts. Totals and distributions match; individual prompts do
@@ -34,16 +35,20 @@ pub struct DatasetRow {
     /// Always 0 here: this port has no image datasets. The field exists so the
     /// reported totals keep the Python script's shape.
     pub vision_prompt_len: usize,
+    /// Arrival time in seconds for trace replay; `None` for the sampled
+    /// datasets, which are paced by `--request-rate`.
+    pub timestamp: Option<f64>,
 }
 
 impl DatasetRow {
-    fn new(prompt: Prompt, prompt_len: usize, output_len: usize) -> Self {
+    pub(crate) fn new(prompt: Prompt, prompt_len: usize, output_len: usize) -> Self {
         Self {
             prompt,
             prompt_len,
             output_len,
             text_prompt_len: prompt_len,
             vision_prompt_len: 0,
+            timestamp: None,
         }
     }
 }
@@ -56,8 +61,8 @@ pub fn needs_corpus(name: DatasetName) -> bool {
 
 /// Build the request set for `--dataset-name`. `corpus` is the ShareGPT path
 /// when [`needs_corpus`] asked for one.
-/// `tokenizer` may be absent only for `random-ids` with `--tokenize-prompt
-/// --vocab-size`, the one combination that reads nothing from it.
+/// `tokenizer` may be absent only where `--vocab-size` replaces it: the
+/// token-id datasets, which read nothing else from it.
 pub fn load(
     args: &Args,
     tokenizer: Option<&Tokenizer>,
@@ -72,6 +77,7 @@ pub fn load(
             let corpus = corpus.context("the sharegpt dataset needs a corpus path")?;
             sample_sharegpt(args, required(tokenizer)?, corpus, &mut rng)?
         }
+        DatasetName::TimedTrace => crate::timed_trace::load(args, tokenizer)?,
     };
     anyhow::ensure!(
         !rows.is_empty(),
@@ -251,9 +257,10 @@ fn load_sharegpt_pairs(path: &Path, rng: &mut StdRng) -> Result<Vec<(String, Str
     Ok(pairs)
 }
 
-fn required(tokenizer: Option<&Tokenizer>) -> Result<&Tokenizer> {
+pub(crate) fn required(tokenizer: Option<&Tokenizer>) -> Result<&Tokenizer> {
     tokenizer.context(
-        "this dataset needs a tokenizer; --vocab-size only covers random-ids with --tokenize-prompt",
+        "this dataset needs a tokenizer; --vocab-size only covers the token-id datasets \
+         (random-ids with --tokenize-prompt, timed-trace)",
     )
 }
 

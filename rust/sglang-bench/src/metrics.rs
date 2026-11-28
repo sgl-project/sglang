@@ -6,6 +6,8 @@
 //! An empty sample reports 0 where the Python script writes `x or 0`, and NaN
 //! for the end-to-end latencies, which it does not guard.
 
+use serde_json::Value;
+
 use crate::args::{Args, Backend};
 use crate::request::RequestOutput;
 
@@ -113,6 +115,8 @@ impl Summary {
 #[derive(Debug)]
 pub struct BenchmarkMetrics {
     pub completed: usize,
+    /// The Python `--cache-report` totals over the successful requests.
+    pub cache: CacheReport,
     pub total_input: usize,
     pub total_input_text: usize,
     pub total_input_vision: usize,
@@ -140,6 +144,56 @@ pub struct BenchmarkMetrics {
 /// Fold the per-request outputs into the reported metrics. `retokenized_lens`
 /// is parallel to `outputs` and already 0 for failures; pass all zeros when
 /// re-tokenization is disabled.
+/// Prefix-cache hits summed as the Python `--cache-report` sums them: over
+/// successful requests, by tier where the server reported tiers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CacheReport {
+    pub total_prompt_tokens: usize,
+    pub total_cached_tokens: usize,
+    pub device: usize,
+    pub host: usize,
+    pub storage: usize,
+    pub storage_backend: Option<String>,
+    pub has_details: bool,
+}
+
+impl CacheReport {
+    pub fn hit_rate_pct(&self) -> f64 {
+        if self.total_prompt_tokens == 0 {
+            return 0.0;
+        }
+        self.total_cached_tokens as f64 / self.total_prompt_tokens as f64 * 100.0
+    }
+
+    fn from_outputs(outputs: &[RequestOutput]) -> Self {
+        let mut report = Self::default();
+        for output in outputs.iter().filter(|output| output.success) {
+            report.total_prompt_tokens += output.prompt_len;
+            report.total_cached_tokens += output.cached_tokens.unwrap_or(0);
+            let Some(details) = output
+                .cached_tokens_details
+                .as_ref()
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            report.has_details = true;
+            let tier = |name: &str| details.get(name).and_then(Value::as_u64).unwrap_or(0) as usize;
+            report.device += tier("device");
+            report.host += tier("host");
+            let storage = tier("storage");
+            if storage > 0 {
+                report.storage += storage;
+                report.storage_backend = details
+                    .get("storage_backend")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+        }
+        report
+    }
+}
+
 pub fn calculate(
     outputs: &[RequestOutput],
     retokenized_lens: &[usize],
@@ -177,6 +231,7 @@ pub fn calculate(
 
     BenchmarkMetrics {
         completed,
+        cache: CacheReport::from_outputs(outputs),
         total_input,
         total_input_text,
         total_input_vision,
@@ -325,7 +380,44 @@ pub fn print_report(
     println!("{:<40} {:<10.2}", "P95 ITL (ms):", metrics.itl.p95);
     println!("{:<40} {:<10.2}", "P99 ITL (ms):", metrics.itl.p99);
     println!("{:<40} {:<10.2}", "Max ITL (ms):", metrics.max_itl_ms);
+    if args.cache_report {
+        print_cache_report(&metrics.cache);
+    }
     println!("{}", "=".repeat(50));
+}
+
+/// The `Cache Hit Details` block, as the Python script prints it.
+fn print_cache_report(cache: &CacheReport) {
+    let storage_label = || match &cache.storage_backend {
+        Some(name) => format!("  Storage ({name}):"),
+        None => "  Storage:".to_owned(),
+    };
+    println!("{:-^50}", "Cache Hit Details");
+    println!(
+        "{:<40} {:<10}",
+        "Total prompt tokens:", cache.total_prompt_tokens
+    );
+    println!(
+        "{:<40} {:<10}",
+        "Total cached tokens:", cache.total_cached_tokens
+    );
+    let by_tier = cache.has_details && cache.total_cached_tokens > 0;
+    if by_tier {
+        println!("{:<40} {:<10}", "  Device:", cache.device);
+        println!("{:<40} {:<10}", "  Host:", cache.host);
+        if cache.storage > 0 {
+            println!("{:<40} {:<10}", storage_label(), cache.storage);
+        }
+    }
+    println!("{:<40} {:.1}%", "Cache hit rate:", cache.hit_rate_pct());
+    if by_tier {
+        let pct = |tokens: usize| tokens as f64 / cache.total_cached_tokens as f64 * 100.0;
+        println!("{:<40} {:.1}%", "  Device:", pct(cache.device));
+        println!("{:<40} {:.1}%", "  Host:", pct(cache.host));
+        if cache.storage > 0 {
+            println!("{:<40} {:.1}%", storage_label(), pct(cache.storage));
+        }
+    }
 }
 
 fn print_family(heading: &str, label: &str, summary: &Summary) {
@@ -485,6 +577,21 @@ pub fn result_json(
             "max_concurrent_requests",
             serde_json::json!(metrics.max_concurrent_requests),
         );
+        if args.cache_report {
+            let cache = &metrics.cache;
+            put(
+                "cache_report",
+                serde_json::json!({
+                    "total_prompt_tokens": cache.total_prompt_tokens,
+                    "total_cached_tokens": cache.total_cached_tokens,
+                    "cache_hit_rate_pct": (cache.hit_rate_pct() * 100.0).round() / 100.0,
+                    "device_cached_tokens": cache.has_details.then_some(cache.device),
+                    "host_cached_tokens": cache.has_details.then_some(cache.host),
+                    "storage_cached_tokens": (cache.storage > 0).then_some(cache.storage),
+                    "storage_backend": cache.storage_backend,
+                }),
+            );
+        }
     }
     let mut result = serde_json::Value::Object(object);
 
@@ -502,6 +609,28 @@ pub fn result_json(
         };
         for (key, value) in details {
             result.insert(key.clone(), value.clone());
+        }
+        if args.cache_report {
+            // The Python columns: an unreported request counts as 0 hits and
+            // null details.
+            result.insert(
+                "cached_tokens".to_owned(),
+                serde_json::json!(
+                    outputs
+                        .iter()
+                        .map(|o| o.cached_tokens.unwrap_or(0))
+                        .collect::<Vec<_>>()
+                ),
+            );
+            result.insert(
+                "cached_tokens_details".to_owned(),
+                serde_json::json!(
+                    outputs
+                        .iter()
+                        .map(|o| o.cached_tokens_details.clone())
+                        .collect::<Vec<_>>()
+                ),
+            );
         }
     }
     result
@@ -529,6 +658,28 @@ pub fn reports_server_info(backend: Backend) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hits are summed over successful requests only and split by tier as
+    /// the Python script does; a request that reported nothing adds 0.
+    #[test]
+    fn cache_report_sums_successful_requests_by_tier() {
+        let mut hit = output(0.1, vec![0.01], 0.2, 2);
+        hit.cached_tokens = Some(8);
+        hit.cached_tokens_details = Some(serde_json::json!({"device": 6, "host": 2, "storage": 0}));
+        let mut failed = output(0.1, vec![], 0.2, 1);
+        failed.success = false;
+        failed.cached_tokens = Some(100);
+        let silent = output(0.1, vec![0.01], 0.2, 2);
+
+        let metrics = calculate(&[hit, failed, silent], &[0, 0, 0], 1.0);
+        let cache = &metrics.cache;
+        assert_eq!(cache.total_prompt_tokens, 20);
+        assert_eq!(cache.total_cached_tokens, 8);
+        assert_eq!((cache.device, cache.host, cache.storage), (6, 2, 0));
+        assert!(cache.has_details);
+        assert_eq!(cache.storage_backend, None);
+        assert!((cache.hit_rate_pct() - 40.0).abs() < 1e-9);
+    }
 
     fn output(ttft: f64, itl: Vec<f64>, latency: f64, output_len: usize) -> RequestOutput {
         RequestOutput {

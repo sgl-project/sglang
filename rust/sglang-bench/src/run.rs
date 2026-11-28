@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 use crate::args::{Args, Protocol};
 use crate::dataset::DatasetRow;
 use crate::request::{GrpcClient, RequestOutput, RequestTemplate};
-use crate::{dataset, hf, metrics, request};
+use crate::{dataset, hf, metrics, request, timed_trace};
 
 /// aiohttp's benchmark session allows 6 hours for one request; a long
 /// generation under heavy load legitimately takes minutes, and a shorter
@@ -119,6 +119,12 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
         None
     };
     let rows = dataset::load(&args, tokenizer.as_ref(), corpus.as_deref())?;
+    // A trace supplies the arrivals; every other dataset is paced by
+    // --request-rate inside `dispatch`.
+    let schedule = args
+        .dataset_name
+        .is_timed_trace()
+        .then(|| timed_trace::arrival_offsets(&rows));
 
     let template = RequestTemplate {
         api: args.backend.api(),
@@ -172,8 +178,21 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
         args.max_concurrency
             .map_or_else(|| "unbounded".to_owned(), |limit| limit.to_string())
     );
+    if let Some(offsets) = &schedule {
+        let last = offsets.iter().copied().fold(0.0, f64::max);
+        println!("Arrivals follow the trace timestamps; the last request is sent at {last:.1}s.");
+    }
     let started = Instant::now();
-    let outputs = dispatch(&http, &template, &rows, &args, request_rate, base).await;
+    let outputs = dispatch(
+        &http,
+        &template,
+        &rows,
+        &args,
+        request_rate,
+        schedule.as_deref(),
+        base,
+    )
+    .await;
     let duration_s = started.elapsed().as_secs_f64();
 
     if args.profile && server.grpc.is_none() {
@@ -212,13 +231,15 @@ async fn run(args: Args, worker_threads: usize) -> Result<serde_json::Value> {
 /// Arrivals are paced on this task while the requests themselves run as
 /// independent tasks, so a slow response never delays the next arrival. The
 /// outputs come back in request order, which the per-request result columns
-/// rely on.
+/// rely on. With a `schedule`, each request waits for its offset from the
+/// dispatch start instead of a Poisson gap.
 async fn dispatch(
     http: &reqwest::Client,
     template: &RequestTemplate,
     rows: &[DatasetRow],
     args: &Args,
     request_rate: f64,
+    schedule: Option<&[f64]>,
     base: Instant,
 ) -> Vec<RequestOutput> {
     let permits = args
@@ -229,7 +250,13 @@ async fn dispatch(
 
     let mut rng = StdRng::seed_from_u64(args.seed ^ 0x5eed);
     let mut handles = Vec::with_capacity(rows.len());
-    for row in rows {
+    let start = tokio::time::Instant::now();
+    for (index, row) in rows.iter().enumerate() {
+        if let Some(offsets) = schedule {
+            // An absolute deadline, so one late dispatch does not shift the
+            // rest of the schedule.
+            tokio::time::sleep_until(start + Duration::from_secs_f64(offsets[index])).await;
+        }
         let (http, template, row) = (http.clone(), template.clone(), row.clone());
         let permits = permits.clone();
         let completed = completed.clone();
@@ -245,7 +272,7 @@ async fn dispatch(
             output
         }));
 
-        if request_rate.is_finite() {
+        if schedule.is_none() && request_rate.is_finite() {
             // Poisson arrivals: exponential gaps with mean 1/rate. Sampled
             // from the uniform inverse CDF, since the gap distribution is the
             // only random draw this loop makes.
