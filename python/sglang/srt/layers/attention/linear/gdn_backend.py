@@ -1110,6 +1110,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # boundaries (None unless --enable-linear-replayssm). When present the
         # kernel folds the ring into temporal[slot] on the snapshot steps.
         replayssm_force_flush = self.forward_metadata.replayssm_force_flush
+        # Request-row decode ring rows (None: the ring is keyed by state slot).
+        replayssm_ring_indices = self.forward_metadata.replayssm_ring_indices
         replayssm_d = layer_cache.replayssm_d
         replayssm_k = layer_cache.replayssm_k
         replayssm_g = layer_cache.replayssm_g
@@ -1285,6 +1287,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
+                replayssm_ring_indices=replayssm_ring_indices,
             )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id

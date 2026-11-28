@@ -811,10 +811,19 @@ class MambaPool:
                         )
                 # GDN speculative replay is request-lifetime scratch, indexed by
                 # request row. KDA stays on every mamba slot unless host-only
-                # checkpoints index its ring by request row too.
+                # checkpoints index its ring by request row too. The opt-in GDN
+                # decode ring (SGLANG_OPT_REPLAYSSM_DECODE_REQUEST_RING) also
+                # follows request rows: only running requests decode.
                 self.replayssm_request_ring = bool(
-                    enable_linear_replayssm_spec
-                    and (not cache_params.is_kda or replayssm_request_ring)
+                    (
+                        enable_linear_replayssm_spec
+                        and (not cache_params.is_kda or replayssm_request_ring)
+                    )
+                    or (
+                        replayssm_request_ring
+                        and enable_linear_replayssm
+                        and not cache_params.is_kda
+                    )
                 )
                 num_slots = (
                     spec_state_size + 1 if self.replayssm_request_ring else size + 1
@@ -1081,9 +1090,9 @@ class MambaPool:
             # IS_KDA path + the g_cache layout). Read by the backend metadata to
             # decide the per-K (KDA) vs scalar (GDN) flush/advance handling.
             self.replayssm_is_kda = bool(_replayssm_on and cache_params.is_kda)
-            # Decode ReplaySSM remains keyed by persistent mamba slots.
+            # Decode ReplaySSM cursors have one entry per ring row.
             self.replayssm_write_pos = (
-                torch.zeros((size + 1,), dtype=torch.int32, device=device)
+                torch.zeros((num_slots,), dtype=torch.int32, device=device)
                 if enable_linear_replayssm
                 else None
             )
@@ -1244,9 +1253,13 @@ class MambaPool:
         comply: COW copies radix checkpoints; a ``checkpoint`` copies an
         active slot only during prefill (ring empty); ``checkpoint``
         caps the donate to the last flush boundary. The dst cursor is reset to 0
-        (the copied checkpoint has no pending ring entries).
+        (the copied checkpoint has no pending ring entries); the request-row
+        ring has no slot cursor, so nothing is checked or reset.
         """
-        if self.replayssm_write_pos is not None and self.debug_memory_pool:
+        slot_cursor = (
+            self.replayssm_write_pos is not None and not self.replayssm_request_ring
+        )
+        if slot_cursor and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
             assert bool((src_wp == 0).all().item()), (
@@ -1271,7 +1284,7 @@ class MambaPool:
                     :, src_indices
                 ]
             self._copy_temporal_slots(src_indices=src_indices, dst_indices=dst_indices)
-        if self.replayssm_write_pos is not None:
+        if slot_cursor:
             self.replayssm_write_pos[dst_indices] = 0
         for sibling in self._slot_siblings:
             sibling.copy_slots(src_indices, dst_indices)

@@ -1015,7 +1015,9 @@ class MambaComponent(TreeComponent):
             # its key length. page_size is asserted == 1, so no realign.
             if is_finished:
                 storage, sub_pool = self._state()
-                cache_len -= storage.settle_replay(sub_pool, req.kv.mamba_pool_idx)
+                cache_len -= storage.settle_replay(
+                    sub_pool, req.kv.mamba_pool_idx, row=req.kv.req_pool_idx
+                )
 
         if is_finished:
             if cache_len is None:

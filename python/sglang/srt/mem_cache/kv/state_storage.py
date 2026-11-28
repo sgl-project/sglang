@@ -164,8 +164,14 @@ class StateStorage:
                 req.kv.mamba_pool_idx = mid
                 req.kv.mamba_needs_clear = True
             # A zero write_pos empties the ReplaySSM ring;
-            # decode then reads only the checkpoint written by prefill.
-            if needing and self.pool.replayssm_write_pos is not None:
+            # decode then reads only the checkpoint written by prefill. The
+            # request-row decode ring keeps its cursor on the row instead,
+            # restarted by `reset_request_rows`.
+            if (
+                needing
+                and self.pool.replayssm_write_pos is not None
+                and not self.pool.replayssm_request_ring
+            ):
                 self.pool.replayssm_write_pos.index_fill_(
                     0, self.slots.translate(mids).to(torch.int64), 0
                 )
@@ -206,16 +212,27 @@ class StateStorage:
         return self.own_state is None or self.own_state.backs_up_state
 
     def reset_request_rows(self, rows: List[int], *, device) -> None:
-        """Restart the speculative ReplaySSM cursors of ``rows``, which start a
-        new request; on the forward stream (`RowResets`). Static pools only: a
-        unified pool resets them with the rest of its request memory."""
-        write_pos = self.pool.replayssm_spec_write_pos
-        if write_pos is None:
+        """Restart the request-keyed ReplaySSM cursors of ``rows``, which start
+        a new request; on the forward stream (`RowResets`): the speculative
+        cursors, and the decode cursor under the request-row decode ring. Static
+        pools only: a unified pool resets them with the rest of its request
+        memory."""
+        spec_write_pos = self.pool.replayssm_spec_write_pos
+        # Pools without a decode ring (e.g. MLX auxiliary state) carry no flag.
+        decode_write_pos = (
+            self.pool.replayssm_write_pos
+            if getattr(self.pool, "replayssm_request_ring", False)
+            else None
+        )
+        if spec_write_pos is None and decode_write_pos is None:
             return
         indices = async_h2d(rows, dtype=torch.int64, device=device)
-        write_pos.index_fill_(0, indices, 0)
-        self.pool.replayssm_cache_base.index_fill_(0, indices, 0)
-        self.pool.replayssm_is_flush.index_fill_(0, indices, 0)
+        if spec_write_pos is not None:
+            spec_write_pos.index_fill_(0, indices, 0)
+            self.pool.replayssm_cache_base.index_fill_(0, indices, 0)
+            self.pool.replayssm_is_flush.index_fill_(0, indices, 0)
+        if decode_write_pos is not None:
+            decode_write_pos.index_fill_(0, indices, 0)
 
     def alloc_ping_pong_buffer(self, table, req: Req) -> bool:
         """Return False if slots are exhausted. Lazy mode starts with one slot

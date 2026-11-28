@@ -402,6 +402,13 @@ def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) ->
     return dcp_size // execution_width
 
 
+def replayssm_decode_request_ring() -> bool:
+    """Whether the GDN decode ReplaySSM ring is keyed by request row."""
+    return envs.SGLANG_OPT_REPLAYSSM_DECODE_REQUEST_RING.get() and bool(
+        get_exec().mamba.enable_linear_replayssm
+    )
+
+
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -1729,7 +1736,8 @@ class KVCacheConfigurator:
             ),
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
-            ),
+            )
+            or (replayssm_decode_request_ring() and self.hybrid_gdn_config is not None),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
             max_verify_batch_size=max_verify_batch_size(max_num_reqs),
         )
@@ -1800,7 +1808,8 @@ class KVCacheConfigurator:
             ),
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
-            ),
+            )
+            or (replayssm_decode_request_ring() and self.hybrid_gdn_config is not None),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
         return req_to_token_pool

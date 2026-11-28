@@ -423,8 +423,11 @@ def handle_linear_attn_backend(server_args: Any):
     # default). The extra_buffer strategy donates the track snapshot via
     # `donate_mamba_ping_pong_slot` with a separate ping-pong slot swap that
     # does NOT route through MambaPool.copy_from, so the ReplaySSM ring
-    # cursor of the donated/kept slot would not be reset there. Handling
-    # that donation path is a follow-up; for now require no_buffer.
+    # cursor of the donated/kept slot would not be reset there. The GDN
+    # request-row ring (SGLANG_OPT_REPLAYSSM_DECODE_REQUEST_RING) keeps the
+    # cursor on the request row instead, so it is allowed with extra_buffer (the
+    # decode kernel already force-flushes on the radix track boundary); KDA and
+    # the per-slot ring still require no_buffer.
     if cfg.enable_linear_replayssm:
         if decode not in {"triton", "helion"}:
             raise ValueError(
@@ -433,12 +436,16 @@ def handle_linear_attn_backend(server_args: Any):
                 f"--linear-attn-decode-backend={decode!r}."
             )
 
-        if mamba_extra_buffer_of(resolved_view(server_args)):
+        request_row_ring = (
+            envs.SGLANG_OPT_REPLAYSSM_DECODE_REQUEST_RING.get()
+            and not uses_kda_attention(model_config_of(server_args).hf_config)
+        )
+        if mamba_extra_buffer_of(resolved_view(server_args)) and not request_row_ring:
             raise ValueError(
                 "--enable-linear-replayssm requires --mamba-radix-cache-strategy "
-                "no_buffer (the default); the extra_buffer ping-pong "
-                "donation path is not yet supported (follow-up). Got "
-                f"--mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
+                "no_buffer; the extra_buffer ping-pong donation path is only "
+                "supported for GDN with SGLANG_OPT_REPLAYSSM_DECODE_REQUEST_RING=1. "
+                f"Got --mamba-radix-cache-strategy={cfg.mamba_radix_cache_strategy!r}."
             )
         if cfg.disaggregation_mode != "null":
             # The disaggregated decode pool (HybridMambaDecodeReqToTokenPool)
@@ -454,6 +461,15 @@ def handle_linear_attn_backend(server_args: Any):
             raise ValueError(
                 "--linear-replayssm-cache-len must be >= 1, got "
                 f"{cfg.linear_replayssm_cache_len}."
+            )
+        # Not validated with host offload / load-back of mamba slots, and unified
+        # memory declares the decode ring on the state slot.
+        if envs.SGLANG_OPT_REPLAYSSM_DECODE_REQUEST_RING.get() and (
+            cfg.enable_hierarchical_cache or cfg.enable_unified_memory
+        ):
+            raise ValueError(
+                "SGLANG_OPT_REPLAYSSM_DECODE_REQUEST_RING does not support "
+                "--enable-hierarchical-cache or --enable-unified-memory yet."
             )
 
     # ReplaySSM spec-verify (Part B of #28511): linear-chain target verify via

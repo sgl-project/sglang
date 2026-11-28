@@ -371,6 +371,95 @@ class TestLinearReplaySSMDecode(CustomTestCase):
         exercises the ``write_pos == L-1`` flush boundary on every step."""
         self._run_one(dict(B=4, H=4, HV=8, K=128, V=128), L=1, dtype=torch.float32)
 
+    # ---- request-row ring (replay_indices) ----
+    def _run_ring_layout(self, is_kda, dtype, L=8, num_steps=40):
+        """Same decode through a slot-keyed and a request-row-keyed ring
+        (``replay_indices``): outputs and checkpoints must be bit-identical.
+        Slot ids and ring rows differ, and unused ring rows hold NaN so any
+        mis-indexed read poisons the output."""
+        from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
+            fused_recurrent_linear_replayssm_decode,
+        )
+
+        device = "cuda"
+        B, H, HV, K, V = 4, 4, 8, 128, 128
+        num_slots, num_rows = 10, 6
+        state_idx = torch.tensor([7, 2, 9, 4], device=device, dtype=torch.int32)
+        ring_rows = torch.tensor([3, 1, 5, 2], device=device, dtype=torch.int32)
+        scale = K**-0.5
+        A_log = (torch.randn(HV, device=device, dtype=torch.float32) * 0.3).contiguous()
+        dt_shape = (HV, K) if is_kda else (HV,)
+        dt_bias = (
+            torch.randn(*dt_shape, device=device, dtype=torch.float32) * 0.1
+        ).contiguous()
+        sg = torch.Generator(device=device).manual_seed(7)
+        init = torch.randn(
+            num_slots, HV, V, K, generator=sg, device=device, dtype=torch.float32
+        )
+        slot_state, row_state = init.clone(), init.clone()
+
+        def rings(n, fill):
+            g_shape = (n, HV, L, K) if is_kda else (n, HV, L)
+            return (
+                torch.full((n, HV, L, V), fill, device=device, dtype=dtype),
+                torch.full((n, H, L, K), fill, device=device, dtype=dtype),
+                torch.full(g_shape, fill, device=device, dtype=torch.float32),
+            )
+
+        slot_ring = rings(num_slots, 0.0)
+        row_ring = rings(num_rows, float("nan"))
+        for t in row_ring:
+            t[ring_rows.long()] = 0
+
+        write_pos = torch.zeros(B, device=device, dtype=torch.int32)
+        for step in range(num_steps):
+            mixed_qkv, a, b = _build_inputs(
+                B, H, HV, K, V, dtype, device, seed=3000 + step, is_kda=is_kda
+            )
+            force_flush = torch.full(
+                (B,), int(step in (10, 27)), device=device, dtype=torch.int32
+            )
+            outs = []
+            for state, (d, k, g), replay in (
+                (slot_state, slot_ring, None),
+                (row_state, row_ring, ring_rows),
+            ):
+                out = mixed_qkv.new_empty(B, 1, HV, V)
+                fused_recurrent_linear_replayssm_decode(
+                    mixed_qkv=mixed_qkv,
+                    a=a,
+                    b=b,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    initial_state=state,
+                    d_cache=d,
+                    k_cache=k,
+                    g_cache=g,
+                    out=out,
+                    ssm_state_indices=state_idx,
+                    write_pos=write_pos.clone(),
+                    force_flush=force_flush,
+                    use_qk_l2norm_in_kernel=True,
+                    is_kda=is_kda,
+                    replay_indices=replay,
+                )
+                outs.append(out)
+            self.assertFalse(torch.isnan(outs[1]).any().item(), f"step {step}")
+            self.assertTrue(torch.equal(outs[0], outs[1]), f"step {step}")
+            flushed = (write_pos == L - 1) | (force_flush != 0)
+            write_pos = torch.where(
+                flushed, torch.zeros_like(write_pos), (write_pos + 1) % L
+            )
+
+        self.assertTrue(torch.equal(slot_state, row_state))
+
+    def test_request_row_ring_matches_slot_ring(self):
+        for is_kda in (False, True):
+            for dtype in (torch.float32, torch.bfloat16):
+                with self.subTest(is_kda=is_kda, dtype=str(dtype)):
+                    self._run_ring_layout(is_kda, dtype)
+
 
 if __name__ == "__main__":
     unittest.main()
