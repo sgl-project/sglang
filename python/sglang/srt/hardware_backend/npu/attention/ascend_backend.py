@@ -1970,7 +1970,7 @@ class AscendAttnBackend(AttentionBackend):
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
         if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-            return self._forward_packed_sparse(
+            return self._forward_fp8_sparse(
                 q_nope,
                 q_pe,
                 k_nope,
@@ -2035,7 +2035,7 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out[:, :num_q_heads] if head_padding else attn_out
 
-    def _forward_packed_sparse(
+    def _forward_fp8_sparse(
         self,
         q_nope,
         q_pe,
@@ -2050,6 +2050,7 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv = actual_seq_lengths_kv.to(
             device=q_nope.device, dtype=torch.int32
         )
+
         if self.qk_rope_head_dim == 0:
             from sgl_kernel_npu.operators.attention import (
                 kv_quant_sparse_flash_attention,
@@ -2057,7 +2058,6 @@ class AscendAttnBackend(AttentionBackend):
 
             if packed_kv.dtype == torch.float8_e4m3fn:
                 packed_kv = packed_kv.view(torch.uint8)
-            # The indexer supplies causal indices for the packed operator.
             return kv_quant_sparse_flash_attention(
                 query=q_nope,
                 query_rope=q_pe,
@@ -2070,7 +2070,7 @@ class AscendAttnBackend(AttentionBackend):
                 return_softmax_lse=False,
             )[0]
 
-        # The pool hands back the packed record in its storage dtype.
+        # A packed pool hands back its K buffer in the record's one-byte dtype.
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
             key=packed_kv,
@@ -2325,7 +2325,7 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # The pool decides the layout: k_nope is then the packed record.
             if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
-                attn_out = self._forward_packed_sparse(
+                attn_out = self._forward_fp8_sparse(
                     q_nope,
                     q_pe,
                     k_nope,

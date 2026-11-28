@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -849,18 +849,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_cache_dim = kv_cache_dim if self.dsa_kv_cache_store_c8 else kv_lora_rank
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_c8 else qk_rope_head_dim
 
-        # --indexer-kv-cache-dtype opts into a quantized indexer K cache
-        if (
-            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
-            and get_memory().enable_hierarchical_cache
-            and dtype not in (torch.bfloat16, torch.int8)
-        ):
-            raise ValueError(
-                "A quantized indexer cache with --enable-hierarchical-cache "
-                "requires an INT8 indexer with BF16 or INT8 main KV."
-            )
-        # The recipe applies wherever the main KV does not already quantize the
-        # indexer: the arch35 FP8 record does, the INT8 record does not.
+        if dtype == torch.int8 and indexer_quant_mode is None:
+            indexer_quant_mode = QUANT_MODE_TOKEN_INT8
         self.indexer_kv_store_int8 = (
             indexer_quant_mode == QUANT_MODE_TOKEN_INT8
             and index_head_dim is not None

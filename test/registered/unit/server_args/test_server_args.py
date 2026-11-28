@@ -3555,11 +3555,10 @@ class TestInt8KvCacheCompatibility(CustomTestCase):
                 self._check(arch="Qwen3ForCausalLM")
             self._check()
 
-    def test_the_reader_rope_width_and_compute_dtype_are_required(self):
+    def test_compute_dtype_is_required(self):
         with override_platform(is_npu=True):
             self._check(arch="Glm5NextForConditionalGeneration", qk_rope_head_dim=0)
-            with self.assertRaisesRegex(ValueError, "qk_rope_head_dim=32"):
-                self._check(qk_rope_head_dim=32)
+            self._check(qk_rope_head_dim=32)
             with self.assertRaisesRegex(ValueError, "bfloat16 model dtype"):
                 self._check(dtype=torch.float16)
 

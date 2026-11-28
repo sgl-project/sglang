@@ -25,9 +25,6 @@ from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
 
-# RoPE width the native sparse attention kernel reads from the packed record.
-_INT8_KV_ROPE_HEAD_DIM = 64
-
 _NVFP4_PREFILL_BACKEND = {
     "fp8_e4m3": "flashinfer",
     "nvfp4": "trtllm_mha",
@@ -184,13 +181,6 @@ def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
             "--kv-cache-dtype int8 stores the packed DSA MLA record, which only "
             "DSA sparse attention reads back; "
             f"{hf_config.architectures[0]} is not a DSA model. Use "
-            "--kv-cache-dtype bf16 or auto."
-        )
-    if model_config.qk_rope_head_dim not in (0, _INT8_KV_ROPE_HEAD_DIM):
-        raise ValueError(
-            "--kv-cache-dtype int8 needs a DSA model with qk_rope_head_dim "
-            f"0 or {_INT8_KV_ROPE_HEAD_DIM}; this model has "
-            f"qk_rope_head_dim={model_config.qk_rope_head_dim}. Use "
             "--kv-cache-dtype bf16 or auto."
         )
     if model_config.dtype != torch.bfloat16:
@@ -412,7 +402,7 @@ def handle_kv4_compatibility(server_args: Any) -> None:
 
 
 def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
-    """Check the DSA indexer INT8 cache recipe.
+    """Check the DSA lightning-indexer INT8 cache recipe.
 
     npu_quant_lightning_indexer is a CANN op, so an explicitly requested
     indexer recipe only makes sense on Ascend NPU and on a model that
@@ -423,15 +413,6 @@ def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
 
     if cfg.indexer_kv_cache_dtype is None:
         return
-
-    if cfg.enable_hierarchical_cache and not (
-        cfg.indexer_kv_cache_dtype == "int8" and get_platform().is_npu
-    ):
-        raise ValueError(
-            f"--indexer-kv-cache-dtype={cfg.indexer_kv_cache_dtype} is not "
-            "supported with --enable-hierarchical-cache. Disable hierarchical "
-            "cache or use the default BF16 indexer cache."
-        )
 
     if not get_platform().is_npu:
         raise RuntimeError(

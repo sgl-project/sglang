@@ -497,6 +497,11 @@ def _get_topk_npu(
             pool.index_k_scale_dtype,
             kpool_query=True,
         )
+        if quant_mode == 2:
+            # PI requires positive descales, including padding rows.
+            query_descale = torch.where(
+                query_descale > 0, query_descale, torch.ones_like(query_descale)
+            )
         indexer_kwargs = dict(
             q_descale=query_descale,
             k_descale=pool.get_index_k_scale_buffer(layer_id),

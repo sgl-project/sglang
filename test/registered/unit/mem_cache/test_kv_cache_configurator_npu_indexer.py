@@ -106,6 +106,8 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
             (None, torch.bfloat16, 1, 256),
             (None, torch.bfloat16, 4, 64),
             ("int8", torch.bfloat16, 1, 130),
+            (None, torch.int8, 1, 130),
+            (None, torch.int8, 4, 33),
             ("int8", torch.bfloat16, 4, 33),
             (None, torch.float8_e4m3fn, 1, 132),
             (None, torch.float8_e4m3fn, 4, 33),
@@ -250,8 +252,8 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
 
     def test_int8_mode_with_kpool_stores_int8_pooled_keys(self):
         pool = self._build_pool(
-            torch.bfloat16,
-            indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
+            torch.int8,
+            kv_cache_dim=512 + 512 // 128 * 4 + 64 * 2,
             index_kpool=4,
         )
         self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
@@ -261,6 +263,26 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
             pool.index_k_scale_buffer.shape,
             (*pool.index_k_buffer.shape[:-2], 1),
         )
+
+    def test_kpool_bf16_accepts_int8_indexer_recipe(self):
+        pool = self._build_pool(
+            torch.bfloat16,
+            indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
+            index_kpool=4,
+        )
+        self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
+
+    def test_int8_main_defaults_lightning_indexer_to_int8(self):
+        for hierarchical in (False, True):
+            with self.subTest(hierarchical=hierarchical):
+                pool = self._build_pool(
+                    torch.int8,
+                    kv_cache_dim=512 + 512 // 128 * 4 + 64 * 2,
+                    hierarchical=hierarchical,
+                )
+                self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+                self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
 
     def test_resolve_indexer_quant_mode(self):
         self.assertIsNone(resolve_indexer_quant_mode(None, torch.bfloat16))

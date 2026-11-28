@@ -44,27 +44,19 @@ per-128-element FP32 scales; 656 bytes per layer for a 512-rank latent instead
 of 1152 in BF16), which the NPU sparse attention kernel reads back directly.
 The DSA indexer K cache stays BF16 by default; add
 `--indexer-kv-cache-dtype int8` to store it as INT8 as well, under that
-recipe's own restrictions. On Ascend, INT8 index caches can use HiCache
-with BF16 or INT8 main KV, both for the standard LightningIndexer
-(`index_kpool=1`, including DeepSeek-V3.2) and the KPool indexer.
-Combine `--kv-cache-dtype int8`, `--indexer-kv-cache-dtype int8` and
-`--enable-hierarchical-cache` to enable HiCache with both caches quantized.
-The host cache preserves the packed MLA record, INT8 indexer keys and FP16
-indexer scales.
-Packed INT8 main KV supports speculative decoding,
-prefill context parallelism and HiCache.
-For RoPE64 models, `SGLANG_NPU_USE_MLAPO` enables MLAProlog writes during decode.
-This requires dynamic INT8 QKV-A and Q-B projection weights. A RoPE64 draft with
-BF16 weights needs `--speculative-draft-kv-cache-dtype bf16` when using MLAProlog.
-A non-DSA draft keeps its KV cache in the compute dtype.
+recipe's own restrictions (no HiCache). The record is the one `fp8_e4m3`
+stores on arch35, so `int8` supports what that path supports, including a
+speculative draft model, prefill context parallelism and HiCache.
+With `SGLANG_NPU_USE_MLAPO`, MLAProlog writes the record during decode; this
+needs dynamic INT8 QKV-A and Q-B projection weights, so a draft model with BF16
+weights needs `--speculative-draft-kv-cache-dtype bf16`. A draft that is not a
+DSA model cannot read the record and keeps its KV cache in the compute dtype.
 
 `--kv-cache-dtype int8` is rejected at startup on other platforms, for non-DSA
-models and on arch35 NPUs (use `fp8_e4m3` there). The sparse attention readers
-require a BF16 query and a model with a RoPE head dimension of 0 or 64.
-NoPE models such as GLM-5.3-Flash use a 528-byte record with 512 INT8 latent
-values followed by four FP32 scales. Use an A2/A3 `sgl-kernel-npu` build with
-INT8 RoPE0 support in `kv_quant_sparse_flash_attention` and run with
-`SGLANG_NPU_USE_MLAPO` unset.
+models and on arch35 NPUs (use `fp8_e4m3` there). The kernel reading the record
+takes a 64-wide RoPE, and the record keeps its RoPE in BF16 next to a BF16
+query, so a DSA model with another `qk_rope_head_dim` and a `--dtype` other
+than `bfloat16` are rejected as well.
 It is also rejected
 with `--dcp-size` above 1 (the DCP read of the packed record is wired for
 `fp8_e4m3` on arch35 only), with `--enable-dsa-cache-layer-split` and, like
