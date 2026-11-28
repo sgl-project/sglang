@@ -54,6 +54,7 @@ def make_xqa_backend(monkeypatch):
                 kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN
             )
         )
+        self.runner_ids = SimpleNamespace(is_fused_draft=False)
 
     monkeypatch.setattr(
         trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
