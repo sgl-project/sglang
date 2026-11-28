@@ -110,6 +110,7 @@ BACKEND_METHODS: Dict[KernelBackend, str] = {
     KernelBackend.CUTE_DSL: "forward_cute_dsl",
     KernelBackend.FLYDSL: "forward_flydsl",
     KernelBackend.HELION: "forward_helion",
+    KernelBackend.TLX: "forward_tlx",
     KernelBackend.KDA: "forward_kda",
     KernelBackend.CAKE: "forward_cake",
     KernelBackend.PLUGIN: "forward_plugin",
@@ -125,7 +126,9 @@ _METHOD_BACKEND_LABELS: Dict[str, str] = {
 
 # best -> fallback. ``torch_compile`` is deliberately absent: auto-selection
 # must never trigger a surprise compilation in a serving process; force it
-# explicitly when wanted. Per-op priority overrides this (see BaseFusedOp).
+# explicitly when wanted. ``tlx`` is absent too: it needs facebookexperimental/triton
+# or the uTLX plugin, which capabilities cannot express. Per-op priority overrides
+# this (see BaseFusedOp).
 DEFAULT_PRIORITY: Tuple[KernelBackend, ...] = (
     KernelBackend.KDA,
     KernelBackend.CAKE,
@@ -469,6 +472,9 @@ class BaseFusedOp(nn.Module, ABC):
 
     def forward_helion(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no helion backend")
+
+    def forward_tlx(self, *args, **kwargs):
+        raise NotImplementedError(f"{self._op_label()}: no TLX backend")
 
     def forward_kda(self, *args, **kwargs):
         raise NotImplementedError(f"{self._op_label()}: no KDA backend")

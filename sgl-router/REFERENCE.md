@@ -490,8 +490,18 @@ flags make it cheaper:
 
 On a ~69K-token DeepSeek-V4 chat, `hf` encodes in ~40 ms, `fast` in ~4 ms, and
 a new turn on a cached history in ~0.2 ms. The DeepSeek fixtures check every
-case under `hf`, `fast`, and `fast` with L1. Startup logs report the resolved
-backend and cache state. `/metrics` exposes only
+case under `hf`, `fast`, and `fast` with L1.
+
+DeepSeek-V4 and V4.1 chats render in `sglang_processor`, whose own HF checkpoint
+tokenizer would encode them past both flags. With the L1 cache or `fast`, the
+router's tokenizer encodes the rendered segments instead (control tokens with
+the added vocabulary, message text without it), so each segment of at least 128
+bytes is cached and a new turn encodes only its new segments. At startup the
+router encodes a set of probe chats both ways and keeps the processor's encode
+if any id differs, logging the first difference. Chats with images always take
+the processor's multimodal path.
+
+Startup logs report the resolved backend and cache state. `/metrics` exposes only
 `sgl_router_tokenizer_l1_tokens_total{source="cached"|"encoded"}` to measure
 how much tokenization work the cache reuses.
 

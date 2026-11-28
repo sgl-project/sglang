@@ -612,6 +612,14 @@ def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.
     return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
 
 
+def rows_where(mask: torch.Tensor, count: int) -> torch.Tensor:
+    """The indices of the 1-D ``mask``'s True entries, ascending. The caller knows
+    their ``count`` on the host, so unlike ``nonzero`` this never syncs."""
+    if count == mask.numel():
+        return torch.arange(count, device=mask.device)
+    return torch.argsort(mask.logical_not().to(torch.uint8), stable=True)[:count]
+
+
 def async_h2d_stack(
     tensors: List[torch.Tensor], *, device: torch.device
 ) -> torch.Tensor:
@@ -976,7 +984,20 @@ def get_cpu_memory_capacity():
 def get_xpu_memory_capacity():
     try:
         if torch.xpu.is_available():
-            return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            try:
+                return torch.xpu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+            except RuntimeError:
+                # mem_get_info() relies on Level Zero Sysman, which is unavailable
+                # in some environments (e.g. WSL2 GPU-PV). Fall back to the Level
+                # Zero core API, mirroring get_available_gpu_memory().
+                logger.warning(
+                    "torch.xpu.mem_get_info() failed; falling back to "
+                    "get_device_properties().total_memory for XPU memory capacity."
+                )
+                device_props = torch.xpu.get_device_properties(
+                    torch.xpu.current_device()
+                )
+                return device_props.total_memory // 1024 // 1024  # unit: MB
         raise ValueError("No GPU memory values found.")
     except AttributeError:
         raise RuntimeError("torch.xpu is not available.")
