@@ -333,6 +333,8 @@ def _muse_verify_attention(
         return False
     # Splits were tuned at 2 KV heads per rank (TP8); more KV heads (TP4: 4) divide them to keep the CTA count.
     kv_scale = max(1, num_kv_heads // 2)
+    # The FlyDSL kernels read int32 lengths: the per-forward copy saves each layer its own cast.
+    seqused_fly = seqused_k if seqused_k_i32 is None else seqused_k_i32
     if num_kv_heads == 2 and _is_gfx1250_device():
         # gfx1250 (wave32): Triton configs tuned at the TP8 verify shapes (8K context) for 4 / 16 / 64 requests.
         # Above 16 requests (random pages) the KV-head-pair kernel with FP8 QK/PV runs the sliding layers, and full
@@ -399,7 +401,7 @@ def _muse_verify_attention(
         ):
             _defer_or_merged(
                 swa_verify_flydsl(
-                    q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                    q, k, v, out, seqused_fly, block_table, softmax_scale, k_descale, v_descale,
                     window=sliding_window, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
                 ),
                 v_descale,
@@ -448,7 +450,7 @@ def _muse_verify_attention(
             )
         _defer_or_merged(
             (gqa_verify_flydsl_balanced if balanced else gqa_verify_flydsl)(
-                q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
+                q, k, v, out, seqused_fly, block_table, softmax_scale, k_descale, v_descale,
                 defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
             ),
             v_descale,

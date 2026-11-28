@@ -45,6 +45,7 @@ from sglang.kernels.ops.gemm.fp8_prefill_gemm import (
 from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
     fp8_gemm,
     fp8_gemm_applies,
+    fp8_gemm_serves,
 )
 from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
     quantize_weight as quantize_fp8w_weight,
@@ -56,6 +57,7 @@ from sglang.kernels.ops.gemm.router_gemm_fp32 import (
     router_gemv_fp32,
     router_gemv_fp32_supported,
 )
+from sglang.kernels.ops.gemm.stream_small_m_gemm import stream_launch
 from sglang.kernels.ops.gemm.unpool_gemm_norm_residual import (
     unpool_gemm_norm_residual,
     unpool_gemm_norm_residual_tlx,
@@ -96,6 +98,7 @@ from sglang.srt.rocm_muse_spark.attention_kv_write import (
     FUSED_QKV_CACHE,
     QK_ROPE_CACHE,
     qk_norm_rope_kv_write,
+    qkv_fp8_norm_rope_kv_write,
     qkv_proj_norm_rope_kv_write,
 )
 from sglang.srt.rocm_muse_spark.expert_placement import ExpertPlacement
@@ -417,11 +420,13 @@ _USE_FUSED_QK_NORM = (
 # shares the joint router-pooler shape [4608, 8192] and stays on hipBLASLt.)
 _ROWMAJOR_LINEAR_SHAPES = ((8192, 2048), (8192, 1024))  # O-proj at TP4 / TP8
 # Unquantized linear layers with an FP8 weight copy: the TP4 QKV (+ gate) projection, fed the per-row FP8 copy of
-# the attention input that the previous FFN boundary kernel writes (decode / verify up to 128 rows).
+# the attention input that the previous FFN boundary kernel writes (decode / verify up to 128 rows; verify batches
+# up to SGLANG_ROCM_MUSE_DENSE_FP8_MAX_ROWS rows where the FP8 small-M GEMM has a launch for the row count).
 _FP8W_LINEAR_SHAPES = ((4608, 8192), (2304, 8192))  # QKV at TP4 / TP8
 # The dense FP8 weight copies are gfx950-only; gfx1250 runs the BF16 weights.
 _DENSE_FP8 = envs.SGLANG_ROCM_MUSE_DENSE_FP8.get() and not mxfp4_moe._is_gfx1250()
 _FP8_MAX_ROWS = 128
+_FP8_QKV_MAX_ROWS = envs.SGLANG_ROCM_MUSE_DENSE_FP8_MAX_ROWS.get()
 # Verify-SP MoE finalize pushing its rows into the reduce-scatter's slots (sp_push_target) up to this many bytes of
 # rows: faster at 128 rows on gfx1250 TP8; at 512 rows the Triton finalize's remote stores are slower than the RS
 # kernel's batched pushes, so wide batches keep finalize + RS.
@@ -496,6 +501,16 @@ _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY.get()
 _TLX_BOUNDARY_NORM = envs.SGLANG_USE_TLX_BOUNDARY_NORM.get()
 # FP32 router logits on tlx.ops.router_gemm, ahead of the GEMV / tuned / torch paths it beats at every M.
 _TLX_ROUTER_GEMM = envs.SGLANG_USE_TLX_ROUTER_GEMM.get()
+# Rows whose unpooler runs on the weight-streaming GEMM inside the fused FFN-boundary path, which then also covers
+# those of them above 16.
+_STREAM_GEMM_MIN_ROWS = max(envs.SGLANG_ROCM_MUSE_STREAM_GEMM_MIN_ROWS.get(), 1)
+_STREAM_GEMM_MAX_ROWS = min(envs.SGLANG_ROCM_MUSE_STREAM_GEMM_MAX_ROWS.get(), 32)
+
+
+def _stream_unpool_rows(rows: int) -> bool:
+    return _STREAM_GEMM_MIN_ROWS <= rows <= _STREAM_GEMM_MAX_ROWS
+
+
 # Device memory left for the KV pool, CUDA graphs and activations beside both MXFP4 expert layouts; below it
 # the experts keep only the a4w4 preshuffled copy. Arbitrary, not tuned.
 _A4W4_RESERVE_BYTES = 64 << 30
@@ -811,6 +826,22 @@ class MuseSpark1xAttention(nn.Module):
             if FUSED_QKV_CACHE and QK_ROPE_CACHE and _USE_FUSED_QK_NORM
             else None
         )
+        if (
+            projected is None
+            and x_fp8 is not None
+            and FUSED_QKV_CACHE
+            and QK_ROPE_CACHE
+            and _USE_FUSED_QK_NORM
+            and fp8_gemm_applies(x_fp8[0], self.qkv_proj.small_m_fp8_weight)
+        ):
+            # The FP8 small-M projection's split-K partials feed the same epilogue, which applies the scales.
+            projected = qkv_fp8_norm_rope_kv_write(
+                self,
+                positions,
+                x_fp8,
+                self.qkv_proj.small_m_fp8_weight,
+                forward_batch,
+            )
         if projected is not None:
             q, k, v, o_gate = projected
             kv_written = True
@@ -1722,8 +1753,17 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 x_fp8=ffn_input_fp8,
             )
             ffn_boundary._ensure_cached_weights(torch.bfloat16)
-            if _TLX_BOUNDARY_NORM and unpool_gemm_norm_residual_tlx_supported(
-                expert_output, self.mlp.post_expert_proj.weight
+            stream_cfg = (
+                stream_launch(8192, 4096, expert_output.shape[0])
+                if _stream_unpool_rows(expert_output.shape[0])
+                else None
+            )
+            if (
+                stream_cfg is None
+                and _TLX_BOUNDARY_NORM
+                and unpool_gemm_norm_residual_tlx_supported(
+                    expert_output, self.mlp.post_expert_proj.weight
+                )
             ):
                 next_attn_input, stream = unpool_gemm_norm_residual_tlx(
                     expert_output,
@@ -1753,6 +1793,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 split_k=4,
                 pre_bf16=pre_norm_dtype is torch.bfloat16,
                 num_warps=16,
+                stream_cfg=stream_cfg,
             )
             return stream, next_attn_input, None
         ffn_output = (
@@ -1780,7 +1821,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
             and (
                 (
                     sp is None
-                    and 0 < ffn_output.shape[0] <= _FP8_MAX_ROWS
+                    and self._verify_qkv_fp8_rows(ffn_output.shape[0])
                     and (
                         forward_batch.forward_mode.is_decode()
                         or forward_batch.forward_mode.is_target_verify()
@@ -1809,6 +1850,17 @@ class MuseSpark1xDecoderLayer(nn.Module):
     def self_attn_input_norm(self, stream: torch.Tensor) -> torch.Tensor:
         return self.self_attn.pre_attn_norm(stream).to(torch.bfloat16)
 
+    def _verify_qkv_fp8_rows(self, rows: int) -> bool:
+        """Decode / verify widths at which the FFN boundary writes the per-row FP8 copy of the next attention
+        input: up to 128 rows, and up to SGLANG_ROCM_MUSE_DENSE_FP8_MAX_ROWS where the next layer's QKV
+        projection (this layer's shape) has an FP8 launch for the row count."""
+        return 0 < rows <= _FP8_MAX_ROWS or (
+            rows <= _FP8_QKV_MAX_ROWS
+            and fp8_gemm_serves(
+                rows, getattr(self.self_attn.qkv_proj, "small_m_fp8_weight", None)
+            )
+        )
+
     def _pooler_fp8_weight(self):
         proj = self.mlp.pre_expert_proj
         return None if proj is None else proj.small_m_fp8_weight
@@ -1824,14 +1876,15 @@ class MuseSpark1xDecoderLayer(nn.Module):
     def _can_fuse_unpool_boundary(
         self, x: torch.Tensor, boundary: FusedPostNormResidualPreNorm | None
     ) -> bool:
-        """Unpooler + FFN boundary fusion: MoE layers at up to 16 rows (replicated unpooler, any TP)."""
+        """Unpooler + FFN boundary fusion: MoE layers at up to 16 rows, or at the weight-streaming unpooler's rows
+        (replicated unpooler, any TP)."""
         if not self.is_moe_layer or boundary is None:
             return False
         proj = self.mlp.post_expert_proj
         return (
             proj is not None
             and proj.bias is None
-            and 0 < x.shape[0] <= 16
+            and (0 < x.shape[0] <= 16 or _stream_unpool_rows(x.shape[0]))
             and x.dtype == torch.bfloat16
             and x.shape[1] == 8192
             and x.is_contiguous()

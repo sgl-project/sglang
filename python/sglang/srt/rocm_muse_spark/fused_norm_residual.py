@@ -47,6 +47,9 @@ def _fused_norm_residual_config(
         post_norm_is_input_scale=post_norm_is_input_scale,
     )
     extra = fused_op_tuning.split_extra(cfg, ("num_warps", "num_stages"))
+    warps = envs.SGLANG_ROCM_MUSE_NORM_RESIDUAL_WARPS.get()
+    if warps > 0 and num_tokens <= 512:
+        return warps, cfg["num_stages"], extra
     return cfg["num_warps"], cfg["num_stages"], extra
 
 

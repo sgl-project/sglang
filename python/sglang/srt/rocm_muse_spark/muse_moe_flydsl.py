@@ -140,6 +140,16 @@ def _pick_flydsl_config(M: int, topk: int, E: int, mxfp4: bool) -> dict:
             # climbs. Halving the re-reads is worth 5-9% from M=256 up; below
             # M=64 the narrower weight stream matters more and this loses.
             cfg["GEMM2_BLOCK_N"] = 256
+    if not mxfp4 and E == 64 and 128 < M <= 512:
+        # Verify batches of 17..64 requests at EP4 (64 local experts): an expert draws a handful of rows, so the
+        # launch is weight streaming like the 33..64-row one, not the prefill tile M * topk > 1024 selects. K is
+        # summed in the same order, so the output is bit-identical.
+        cfg.update(
+            BLOCK_M=32,
+            BLOCK_N=64,
+            GEMM1_FLYDSL_K_UNROLL=2,
+            GEMM2_FLYDSL_K_UNROLL=4,
+        )
     return cfg
 
 

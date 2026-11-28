@@ -11,6 +11,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
+from sglang.kernels.ops.gemm.stream_small_m_gemm import (
+    StreamConfig,
+    stream_gemm_partials,
+)
 
 
 @triton.jit
@@ -70,21 +74,28 @@ def unpool_gemm_norm_residual(
     split_k: int = 4,
     pre_bf16: bool = False,
     num_warps: int = 16,
+    stream_cfg: StreamConfig | None = None,
 ):
-    """Return (next layer's normalized attention input BF16 [M, H], updated FP32 stream [M, H])."""
+    """Return (next layer's normalized attention input BF16 [M, H], updated FP32 stream [M, H]).
+    ``stream_cfg``: take the partials from the weight-streaming GEMM with that launch."""
     m, k = x.shape
     h = weight.shape[0]
     assert x.dtype == weight.dtype == torch.bfloat16
     assert x.is_contiguous() and weight.is_contiguous() and stream.is_contiguous()
     assert k == 4096 and h == 8192 and 0 < m <= 64
     assert stream.dtype == torch.float32 and stream.shape == (m, h)
+    if stream_cfg is not None:
+        split_k = stream_cfg.sk
     assert split_k in (2, 4, 8)
-    partial = torch.empty((split_k, m, h), dtype=torch.float32, device=x.device)
     output = torch.empty((m, h), dtype=torch.bfloat16, device=x.device)
     new_stream = torch.empty_like(stream)
-    bf16_splitk_gemm_partials(
-        x, weight, partial, block_n=block_n, block_k=block_k, split_k=split_k
-    )
+    if stream_cfg is not None:
+        partial = stream_gemm_partials(x, weight, h, k, stream_cfg)
+    else:
+        partial = torch.empty((split_k, m, h), dtype=torch.float32, device=x.device)
+        bf16_splitk_gemm_partials(
+            x, weight, partial, block_n=block_n, block_k=block_k, split_k=split_k
+        )
     _unpool_reduce_boundary[(m,)](
         partial,
         stream,

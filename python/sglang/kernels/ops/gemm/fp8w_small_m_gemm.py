@@ -18,8 +18,9 @@ from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import _bm
 F8 = torch.float8_e4m3fn
 F8_MAX = 448.0
 MIN_M = 17
-MAX_M = 128
+MAX_M = 512
 # (N, K, BM) -> (BN, BK, SK, warps, stages), tuned on MI355X (bench_fp8_rowmajor.py / bench_fp8w_v2.py).
+# The BM 256 / 512 buckets append (M tile, XCD map), see _fp8_rowmajor_partial.
 CONFIGS = {
     (4608, 8192, 32): (128, 256, 4, 8, 3),
     (4608, 8192, 64): (128, 256, 4, 8, 3),
@@ -37,7 +38,12 @@ CONFIGS = {
     (2304, 8192, 32): (64, 256, 4, 8, 3),
     (2304, 8192, 64): (64, 256, 4, 8, 3),
     (2304, 8192, 128): (64, 256, 4, 4, 3),
+    # TP4 QKV at 129..512 rows (verify batches of 17..64 requests).
+    (4608, 8192, 256): (128, 128, 4, 16, 3, 256, 0),
+    (4608, 8192, 512): (128, 128, 2, 16, 3, 256, 1),
 }
+# (N, K, BM) -> (elements per program, warps) of the scaled sum where it is not 512 / 4.
+SUM_BLOCK = {(4608, 8192, 256): (1024, 4)}
 
 
 @triton.jit
@@ -52,10 +58,23 @@ def _fp8_rowmajor_partial(
     BN: tl.constexpr,
     BK: tl.constexpr,
     SK: tl.constexpr,
+    XCD_MAP: tl.constexpr = 0,
 ):
-    pn, pk = tl.program_id(0), tl.program_id(1)
+    # Programs (N tile, K slice, M tile); BM is the M tile. XCD_MAP 1 re-deals the (N tile, K slice) pairs so that
+    # each of the 8 XCDs reads one K slice of the activation; the map is a bijection, so the partials do not change.
+    pid0, pid1, pm = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    G0: tl.constexpr = N // BN
+    if XCD_MAP == 1 and (G0 * SK) % 8 == 0:
+        PER: tl.constexpr = G0 * SK // 8
+        hw = pid0 + G0 * pid1
+        lin = (hw % 8) * PER + hw // 8
+        pn = lin % G0
+        pk = lin // G0
+    else:
+        pn = pid0
+        pk = pid1
     KT_PER: tl.constexpr = K // BK // SK
-    m = tl.arange(0, BM)
+    m = pm * BM + tl.arange(0, BM)
     kk = tl.arange(0, BK)
     n = pn * BN + tl.arange(0, BN)
     bp = W + n[None, :].to(tl.int64) * K + (pk * KT_PER * BK + kk)[:, None]
@@ -110,28 +129,50 @@ def fp8_gemm_applies(xq: torch.Tensor, fp8_weight) -> bool:
     return (*wq.shape, _bm(xq.shape[0])) in CONFIGS and wq.shape[1] == xq.shape[1]
 
 
-def fp8_gemm(xq: torch.Tensor, xs: torch.Tensor, fp8_weight) -> torch.Tensor:
-    """``(xq * xs) @ (wq * ws).T`` in BF16 from the per-row-quantized activation and ``quantize_weight(W)``."""
-    wq, ws = fp8_weight
+def fp8_gemm_serves(rows: int, fp8_weight) -> bool:
+    """Whether ``fp8_gemm`` has a tuned launch for ``rows`` rows of this ``quantize_weight(W)``: tells a producer
+    whether the per-row FP8 copy of its output will be read."""
+    return (
+        fp8_weight is not None
+        and MIN_M <= rows <= MAX_M
+        and (*fp8_weight[0].shape, _bm(rows)) in CONFIGS
+    )
+
+
+def fp8_gemm_partials(xq: torch.Tensor, fp8_weight) -> torch.Tensor:
+    """FP32 split-K partials ``[SK, m, n]`` of ``xq @ wq.T`` (codes only: the consumer applies both scales)."""
+    wq = fp8_weight[0]
     m, k = xq.shape
     n = wq.shape[0]
-    bn, bk, sk, warps, stages = CONFIGS[(n, k, _bm(m))]
+    bm = _bm(m)
+    bn, bk, sk, warps, stages, *wide = CONFIGS[(n, k, bm)]
+    tile_m, xcd_map = wide or (bm, 0)
     p = torch.empty((sk, m, n), device=xq.device, dtype=torch.float32)
-    _fp8_rowmajor_partial[(n // bn, sk)](
+    _fp8_rowmajor_partial[(n // bn, sk, triton.cdiv(m, tile_m))](
         xq,
         wq,
         p,
         m,
         n,
         k,
-        _bm(m),
+        tile_m,
         bn,
         bk,
         sk,
+        xcd_map,
         num_warps=warps,
         num_stages=stages,
         matrix_instr_nonkdim=16,
     )
+    return p
+
+
+def fp8_gemm(xq: torch.Tensor, xs: torch.Tensor, fp8_weight) -> torch.Tensor:
+    """``(xq * xs) @ (wq * ws).T`` in BF16 from the per-row-quantized activation and ``quantize_weight(W)``."""
+    ws = fp8_weight[1]
+    p = fp8_gemm_partials(xq, fp8_weight)
+    sk, m, n = p.shape
     y = torch.empty((m, n), device=xq.device, dtype=torch.bfloat16)
-    _sum_scaled[(triton.cdiv(m * n, 512),)](p, xs, ws, y, m, n, sk, 512, num_warps=4)
+    b, w = SUM_BLOCK.get((n, xq.shape[1], _bm(m)), (512, 4))
+    _sum_scaled[(triton.cdiv(m * n, b),)](p, xs, ws, y, m, n, sk, b, num_warps=w)
     return y
