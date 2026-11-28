@@ -5695,10 +5695,22 @@ class AiterAttnBackend(AttentionBackend):
             if (
                 self.use_triton_unified_attention
                 and not forward_batch.forward_mode.is_draft_extend_v2()
+                and (
+                    # A sliding-window KV pool forces unified attention on (see
+                    # __init__): those models keep it for extend, which also
+                    # serves their dedicated extend kernels.
+                    self.use_sliding_window_kv_pool
+                    # unified_attention has no head_dim cap; route extend through
+                    # it only where CK cannot run (Gemma-4's 512-wide
+                    # full-attention layers hit the CK `head dimension at most
+                    # 256` assert). For head_dim <= 256 the CK paged
+                    # batch_prefill below is much faster than the Triton unified
+                    # kernel on prefill-sized Q.
+                    or layer.qk_head_dim > 256
+                    or layer.v_head_dim > 256
+                )
             ):
-                # unified_attention has no head_dim cap; route extend through it
-                # so Gemma-4's 512-wide full-attention layers don't hit the CK
-                # `head dimension at most 256` assert.
+                # target_verify takes unified above regardless.
                 #
                 # draft_extend_v2 is excluded: topk<=1 already took the graph-safe
                 # unified block above, so reaching here means topk>1, which the PR
