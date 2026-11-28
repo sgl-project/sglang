@@ -133,6 +133,7 @@ class GenerationBatchResult:
     # to validate that skipped output is never consumed.
     skipped_output_comm: bool = False
     pp_failed_load_rids: tuple[str, ...] = ()
+    pp_linker_load_rids: tuple[str, ...] = ()
 
     # For output processing
     extend_input_len_per_req: Optional[List[int]] = None
