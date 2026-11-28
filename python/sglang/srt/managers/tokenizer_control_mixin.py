@@ -497,10 +497,17 @@ class TokenizerControlMixin:
 
     def _staged_serving_state_error(self: TokenizerManager, obj) -> Optional[str]:
         # the reader lock gave up exclusivity; serving-state mutations need the writer lock
-        if self._weight_update_staged_session and (
+        if not (
             obj.flush_cache or obj.abort_all_requests or obj.weight_version is not None
         ):
+            return None
+        if self._weight_update_staged_session:
             return "a staged adapter session cannot change serving state"
+        if self._weight_update_uses_staging:
+            # generation continues on the live weights until end_weight_update, which takes the version
+            return (
+                "a use_staging session changes serving state only at end_weight_update"
+            )
         return None
 
     async def begin_weight_update(
@@ -509,12 +516,17 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         staged = not obj.sync_base and bool(self._pending_lora_publications)
+        # use_staging leaves the live weights alone until the scheduler installs the update between two
+        # forward steps, so it shares the engine with generation too
         success, message = await self._weight_update_session_call(
-            self.begin_weight_update_communicator, obj, staged=staged
+            self.begin_weight_update_communicator,
+            obj,
+            staged=staged or obj.use_staging,
         )
         if success:
             self._weight_update_session_open = True
             self._weight_update_staged_session = staged
+            self._weight_update_uses_staging = obj.use_staging
             self._weight_update_pending_version = None
         return success, message
 
@@ -534,10 +546,14 @@ class TokenizerControlMixin:
         success, message = await self._weight_update_session_call(
             self.end_weight_update_communicator,
             obj,
-            staged=self._weight_update_staged_session,
+            staged=self._weight_update_staged_session
+            or self._weight_update_uses_staging,
         )
         self._weight_update_session_open = False
         self._weight_update_staged_session = False
+        self._weight_update_uses_staging = False
+        if obj.weight_version is not None:
+            self._weight_update_pending_version = obj.weight_version
         if success and not obj.abort:
             self._update_weight_version_if_provided(self._weight_update_pending_version)
         self._weight_update_pending_version = None
@@ -667,7 +683,8 @@ class TokenizerControlMixin:
         success, message = await self._weight_update_session_call(
             self.update_weights_from_tensor_communicator,
             obj,
-            staged=self._weight_update_staged_session,
+            staged=self._weight_update_staged_session
+            or self._weight_update_uses_staging,
         )
         if success and obj.flush_cache and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()

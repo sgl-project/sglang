@@ -4,6 +4,7 @@ import enum
 import importlib
 import importlib.util
 import logging
+import os
 import time
 from typing import List
 
@@ -163,6 +164,50 @@ def register_memory_region_nixl(model, nixl_agent, gpu_id):
         [(address, size, gpu_id, "") for address, size in weight_blocks], "VRAM"
     )
     return weight_mr_dict, registration
+
+
+def register_memory_region_mori(model, mori_engine, gpu_id):
+    """Registers the weight blocks with `mori_engine`; returns the weight table and (address, size, MemoryDesc) per
+    block."""
+    from mori.io import MemoryLocationType
+
+    _assert_mori_can_register_torch_memory()
+    weight_mr_dict, weight_blocks = _collect_weight_blocks(model)
+    return weight_mr_dict, [
+        (
+            addr,
+            size,
+            mori_engine.register_memory(addr, size, gpu_id, MemoryLocationType.GPU),
+        )
+        for addr, size in weight_blocks
+    ]
+
+
+def register_weight_staging_mori(staging, mori_engine, gpu_id):
+    """Registers a runner's staging region with `mori_engine`, in place of its live weights; returns the region's
+    one (address, size, MemoryDesc) block."""
+    from mori.io import MemoryLocationType
+
+    _assert_mori_can_register_torch_memory()
+    address, size = staging.buffer.data_ptr(), staging.buffer.nbytes
+    memory_desc = mori_engine.register_memory(
+        address, size, gpu_id, MemoryLocationType.GPU
+    )
+    return [(address, size, memory_desc)]
+
+
+def _assert_mori_can_register_torch_memory():
+    alloc_conf = ",".join(
+        os.environ.get(name, "")
+        for name in (
+            "PYTORCH_ALLOC_CONF",
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "PYTORCH_HIP_ALLOC_CONF",
+        )
+    )
+    # MoRI cannot register expandable-segment (VMM) memory, and aborts the process trying
+    if "expandable_segments:true" in alloc_conf.replace(" ", "").lower():
+        raise RuntimeError(f"MoRI cannot register weights allocated with {alloc_conf}")
 
 
 def _collect_weight_blocks(model):

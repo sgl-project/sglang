@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import gc
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     get_model_loader,
@@ -81,6 +83,23 @@ def _unsupported_derived_weight_cache_error(
             "Online weight updates are not supported while the HPC-Ops "
             "bf16xfp32 GEMM optimization is enabled: the cached weight "
             "split would keep serving the old weights."
+        )
+    return None
+
+
+def _staged_tensor_load_error(model: torch.nn.Module) -> Optional[str]:
+    """A tensor load runs the model's own loader. For some models that loader also recomputes state derived from
+    the weights, outside the parameters (post_load_weights, the buffer of GemmaRMSNorm). Loaded into the staging
+    region, the parameters stay staged while that state is live at once: the model would generate with old
+    weights and new derived state until the install, and keep the new derived state if the update is aborted.
+    Peers that write the staging region by address are fine: the derived state is recomputed after the install."""
+    if hasattr(model, "post_load_weights") or any(
+        isinstance(module, GemmaRMSNorm) for module in model.modules()
+    ):
+        return (
+            f"{type(model).__name__} recomputes state derived from its weights when it loads them, so "
+            "update_weights_from_tensor cannot fill the staging region for it; use an update that pauses the "
+            "engine, or write the staging region by address"
         )
     return None
 
@@ -181,6 +200,7 @@ class WeightUpdater:
     ) -> tuple[bool, str]:
         """Update engine weights in-place from the disk."""
         self._assert_weight_cache_inactive("update_weights_from_disk")
+        self.live_weights_change()
         error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error
@@ -310,13 +330,35 @@ class WeightUpdater:
         )
         return bucket.reconstruct_tensors()
 
-    def begin_weight_update(self: WeightUpdater) -> None:
+    def begin_weight_update(self: WeightUpdater, *, use_staging: bool = False) -> None:
+        if use_staging:
+            # peers write the staging region; the live weights stay as they are, and in use, until end
+            self._assert_published_storage_unmoved()
+            self._staging().mirror_live()
+            return
+        self.live_weights_change()
         DefaultModelLoader.restore_weights_before_loading(
             self.get_model(), torch.device(self.device)
         )
         self._assert_published_storage_unmoved()
 
-    def end_weight_update(self: WeightUpdater, *, run_post_load: bool) -> None:
+    def end_weight_update(
+        self: WeightUpdater,
+        *,
+        run_post_load: bool,
+        use_staging: bool = False,
+        abort: bool = False,
+    ) -> None:
+        if use_staging:
+            if abort:
+                # the live weights were never written, so there is nothing to finalize
+                self._staging().discard()
+                return
+            self._assert_published_storage_unmoved()
+            DefaultModelLoader.restore_weights_before_loading(
+                self.get_model(), torch.device(self.device)
+            )
+            self._staging().commit()
         if run_post_load:
             post_load_weights(self.get_model())
         else:
@@ -329,8 +371,13 @@ class WeightUpdater:
     def _assert_published_storage_unmoved(self: WeightUpdater) -> None:
         """Peers write weight updates straight into the addresses this rank published at startup (p2p), so a
         weight-update session must leave every published parameter's storage where it was."""
+        transporter = self.get_model_runner().remote_instance_weight_transporter
+        # with a staging region peers write its slots, and its commit copies into the live parameters by the
+        # views taken at allocation: those are the addresses that must still hold
         published_weight_info = (
-            self.get_model_runner().remote_instance_weight_transporter.weight_info
+            transporter.weight_info
+            if transporter.staging is None
+            else transporter.staging.live_info
         )
         # nothing published: nobody writes by address
         if published_weight_info is None:
@@ -352,6 +399,18 @@ class WeightUpdater:
             "a weight-update session moved published parameters, so peer writes would land in freed memory: "
             f"{', '.join(moved[:5])} ({len(moved)} in all)"
         )
+
+    def has_weight_staging(self: WeightUpdater) -> bool:
+        return self._staging() is not None
+
+    def live_weights_change(self: WeightUpdater) -> None:
+        """Called by everything that writes the live weights in place. The staging region then no longer mirrors
+        them, and a later staged update that fills only some slots would install stale bytes from the others."""
+        if self._staging() is not None:
+            self._staging().discard()
+
+    def _staging(self: WeightUpdater):
+        return self.get_model_runner().remote_instance_weight_transporter.staging
 
     def load_weights_from_distributed(
         self: WeightUpdater, named_tensors: List[Tuple[str, torch.Tensor]]
@@ -376,8 +435,12 @@ class WeightUpdater:
         self: WeightUpdater,
         named_tensors: List[Tuple[str, Union[torch.Tensor, LocalSerializedTensor]]],
         load_format: Optional[str] = None,
+        use_staging: bool = False,
     ):
+        """`use_staging` loads into the staging region; the live weights change at end_weight_update."""
         error = _unsupported_derived_weight_cache_error(self.get_model())
+        if error is None and use_staging:
+            error = _staged_tensor_load_error(self.get_model())
         if error is not None:
             return False, error
 
@@ -403,24 +466,49 @@ class WeightUpdater:
                 for name, tensor in named_tensors
             ]
 
-        if load_format == "flattened_bucket":
-            self._update_weights_from_flattened_bucket(
-                flattened_tensor_bucket_dict=named_tensors
-            )
-        elif load_format == "direct":
-            _model_load_weights_direct(self.get_model(), named_tensors)
-        elif load_format in self.custom_weight_loaders:
-            custom_loader = dynamic_import(load_format)
-            custom_loader(self.get_model(), named_tensors)
-        elif load_format is None:
-            self.get_model().load_weights(named_tensors)
-        else:
-            raise NotImplementedError(f"Unknown load_format={load_format}")
+        # the staging region holds parameters only: a buffer the loader writes would be live at once, and stay
+        # after an abort. Loaders take named_buffers(), non-persistent ones included.
+        # shortcut: sees a buffer written in place, not one replaced by a new tensor (no loader does that), and a
+        # buffer holding NaN always counts as changed.
+        buffers_before = (
+            [
+                (name, buffer, buffer.clone())
+                for name, buffer in self.get_model().named_buffers()
+            ]
+            if use_staging
+            else []
+        )
+        with self._staging().receiving_loads() if use_staging else nullcontext():
+            if load_format == "flattened_bucket":
+                self._update_weights_from_flattened_bucket(
+                    flattened_tensor_bucket_dict=named_tensors
+                )
+            elif load_format == "direct":
+                _model_load_weights_direct(self.get_model(), named_tensors)
+            elif load_format in self.custom_weight_loaders:
+                custom_loader = dynamic_import(load_format)
+                custom_loader(self.get_model(), named_tensors)
+            elif load_format is None:
+                self.get_model().load_weights(named_tensors)
+            else:
+                raise NotImplementedError(f"Unknown load_format={load_format}")
         # Tensors deserialized from CUDA IPC handles alias storage owned by the
         # sender, who may free or reuse it as soon as this call returns. The
         # loads above only enqueue device-to-device copies, so wait for them
         # before handing control back.
         device_module.synchronize()
+        written = [
+            name
+            for name, buffer, before in buffers_before
+            if not torch.equal(buffer, before)
+        ]
+        if written:
+            for _, buffer, before in buffers_before:
+                buffer.copy_(before)
+            return False, (
+                f"the loader changed the buffers {written[:3]} ({len(written)} in all), which have no slot in "
+                "the staging region; they were put back. Use an update that pauses the engine for this model"
+            )
         return True, "Success"
 
     def _update_weights_from_flattened_bucket(
@@ -456,6 +544,7 @@ class WeightUpdater:
     def update_weights_from_ipc(self: WeightUpdater, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
         self._assert_weight_cache_inactive("update_weights_from_ipc")
+        self.live_weights_change()
         error = _unsupported_derived_weight_cache_error(self.get_model())
         if error is not None:
             return False, error

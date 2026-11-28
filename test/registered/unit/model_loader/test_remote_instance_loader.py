@@ -1,15 +1,28 @@
 """Unit tests for RemoteInstanceModelLoader construction - no server, no weights."""
 
+import importlib.util
+import os
+import sys
 import unittest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 import sglang.srt.model_loader.loader as loader_mod
+import sglang.srt.model_loader.remote_instance_weight_loader_utils as utils_mod
+from sglang.srt.arg_groups.model_path_hook import (
+    _assert_mori_seed_usable,
+    _assert_weight_update_staging_usable,
+)
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.model_executor.model_runner_components.weight_staging import (
+    WeightStaging,
+)
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
+    register_memory_region_mori,
+    register_weight_staging_mori,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -114,6 +127,162 @@ class TestRemoteInstanceTransferEngineRole(CustomTestCase):
                             device_config=SimpleNamespace(device="cpu"),
                         )
                 self.assertEqual(queried, [("http://127.0.0.1:30000", 1, role)])
+
+
+class TestMoriSeed(CustomTestCase):
+    def _cfg(self, **overrides):
+        return SimpleNamespace(
+            **{
+                "remote_instance_weight_loader_start_seed_via_transfer_engine": False,
+                "remote_instance_weight_loader_start_seed_via_nixl": False,
+                "load_format": "auto",
+                "remote_instance_weight_loader_backend": "nccl",
+                "enable_memory_saver": False,
+                **overrides,
+            }
+        )
+
+    def test_unusable_setups_are_refused_at_startup(self):
+        """Each would start without publishing MoRI weights, or abort inside MoRI."""
+        cases = {
+            "set one seed transport": dict(
+                remote_instance_weight_loader_start_seed_via_nixl=True
+            ),
+            "cannot seed weights loaded over transfer_engine": dict(
+                load_format="remote_instance",
+                remote_instance_weight_loader_backend="transfer_engine",
+            ),
+            "cannot seed weights loaded over modelexpress": dict(
+                load_format="remote_instance",
+                remote_instance_weight_loader_backend="modelexpress",
+            ),
+            "--enable-memory-saver": dict(enable_memory_saver=True),
+        }
+        with patch.object(importlib.util, "find_spec", lambda name: object()):
+            _assert_mori_seed_usable(self._cfg())
+            for message, overrides in cases.items():
+                with self.subTest(message), self.assertRaisesRegex(ValueError, message):
+                    _assert_mori_seed_usable(self._cfg(**overrides))
+        with patch.object(importlib.util, "find_spec", lambda name: None):
+            with self.assertRaisesRegex(ValueError, "needs the mori package"):
+                _assert_mori_seed_usable(self._cfg())
+
+    def _register(self, env, registered):
+        engine = SimpleNamespace(
+            register_memory=lambda *args: (
+                registered.append(args) or f"desc{len(registered)}"
+            )
+        )
+        mori_io = ModuleType("mori.io")
+        mori_io.MemoryLocationType = SimpleNamespace(GPU="GPU")
+        blocks = [(0x1000, 64), (0x9000, 32)]
+        with (
+            patch.dict(sys.modules, {"mori": ModuleType("mori"), "mori.io": mori_io}),
+            patch.dict(os.environ, env, clear=True),
+            patch.object(
+                utils_mod,
+                "_collect_weight_blocks",
+                lambda model: ({"w": (1, 2, 3)}, blocks),
+            ),
+        ):
+            return register_memory_region_mori(None, engine, 5)
+
+    def test_each_weight_block_is_registered_as_gpu_memory(self):
+        registered = []
+        weights, published = self._register({}, registered)
+
+        self.assertEqual(weights, {"w": (1, 2, 3)})
+        self.assertEqual(registered, [(0x1000, 64, 5, "GPU"), (0x9000, 32, 5, "GPU")])
+        self.assertEqual(published, [(0x1000, 64, "desc1"), (0x9000, 32, "desc2")])
+
+    def test_expandable_segments_are_refused_before_registering_anything(self):
+        """MoRI cannot register VMM memory, and aborts the process trying."""
+        for name in (
+            "PYTORCH_ALLOC_CONF",
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "PYTORCH_HIP_ALLOC_CONF",
+        ):
+            with self.subTest(name):
+                registered = []
+                with self.assertRaisesRegex(RuntimeError, "expandable_segments"):
+                    self._register({name: "expandable_segments:True"}, registered)
+                self.assertEqual(registered, [])
+
+    def test_the_staging_region_is_registered_as_one_gpu_block_in_place_of_the_weights(
+        self,
+    ):
+        registered = []
+        engine = SimpleNamespace(
+            register_memory=lambda *args: registered.append(args) or "desc"
+        )
+        mori_io = ModuleType("mori.io")
+        mori_io.MemoryLocationType = SimpleNamespace(GPU="GPU")
+        model = torch.nn.Linear(3, 2)
+        staging = WeightStaging.allocate(model)
+        with (
+            patch.dict(sys.modules, {"mori": ModuleType("mori"), "mori.io": mori_io}),
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            blocks = register_weight_staging_mori(staging, engine, 5)
+
+        address, size = staging.buffer.data_ptr(), staging.buffer.nbytes
+        self.assertEqual(registered, [(address, size, 5, "GPU")])
+        self.assertEqual(blocks, [(address, size, "desc")])
+        live = {param.data_ptr() for param in model.parameters()}
+        for slot_address, numel, element_size in staging.slot_info.values():
+            self.assertNotIn(slot_address, live)
+            self.assertTrue(
+                address <= slot_address
+                and slot_address + numel * element_size <= address + size
+            )
+
+    def test_the_staging_flag_is_refused_where_live_weights_would_be_written_or_repacked(
+        self,
+    ):
+        cfg = lambda **overrides: SimpleNamespace(  # noqa: E731
+            **{
+                "remote_instance_weight_loader_start_seed_via_transfer_engine": False,
+                "remote_instance_weight_loader_start_seed_via_nixl": False,
+                "load_format": "auto",
+                "remote_instance_weight_loader_backend": "transfer_engine",
+                "quantization": None,
+                "speculative_algorithm": None,
+                "enable_dp_attention_local_control_broadcast": False,
+                "tokenizer_worker_num": 1,
+                **overrides,
+            }
+        )
+        _assert_weight_update_staging_usable(cfg())
+        for seed in ("transfer_engine", "nixl"):
+            with (
+                self.subTest(seed),
+                self.assertRaisesRegex(ValueError, "only the MoRI seed"),
+            ):
+                _assert_weight_update_staging_usable(
+                    cfg(
+                        **{f"remote_instance_weight_loader_start_seed_via_{seed}": True}
+                    )
+                )
+        # loading from a remote instance over the transfer engine publishes the live weights too
+        with self.assertRaisesRegex(ValueError, "only the MoRI seed"):
+            _assert_weight_update_staging_usable(cfg(load_format="remote_instance"))
+        with self.assertRaisesRegex(ValueError, "--quantization fp8"):
+            _assert_weight_update_staging_usable(cfg(quantization="fp8"))
+        for override, option in (
+            ({"speculative_algorithm": "EAGLE"}, "--speculative-algorithm"),
+            (
+                {"enable_dp_attention_local_control_broadcast": True},
+                "--enable-dp-attention-local-control-broadcast",
+            ),
+            ({"tokenizer_worker_num": 2}, "--tokenizer-worker-num above 1"),
+        ):
+            with (
+                self.subTest(option),
+                self.assertRaisesRegex(
+                    ValueError, f"not supported together with {option}"
+                ),
+            ):
+                _assert_weight_update_staging_usable(cfg(**override))
 
 
 if __name__ == "__main__":

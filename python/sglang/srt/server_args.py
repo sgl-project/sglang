@@ -522,6 +522,7 @@ class ServerArgs:
                 self
             ).remote_instance_weight_loader_start_seed_via_transfer_engine
             or resolving_view(self).remote_instance_weight_loader_start_seed_via_nixl
+            or resolving_view(self).remote_instance_weight_loader_start_seed_via_mori
             or self.enable_engine_info_bootstrap
         )
 
@@ -530,6 +531,7 @@ class ServerArgs:
         return (
             self.remote_instance_weight_loader_use_transfer_engine()
             or resolving_view(self).remote_instance_weight_loader_start_seed_via_nixl
+            or resolving_view(self).remote_instance_weight_loader_start_seed_via_mori
             or self.enable_engine_info_bootstrap
         )
 

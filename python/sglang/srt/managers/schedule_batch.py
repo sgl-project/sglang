@@ -2101,6 +2101,11 @@ class Req(ReqDllmMixin):
             self.weight_version_events = truncate_weight_version_events(
                 self.weight_version_events, num_kept_tokens=self.send_token_offset
             )
+        else:
+            # a version change just before may have counted the queued output this retraction drops
+            self.weight_version_events = truncate_weight_version_events(
+                self.weight_version_events, num_kept_tokens=len(self.output_ids)
+            )
 
     def _mamba_pool_needing_backup(self, req_to_token_pool, allocator):
         if allocator.get_kvcache().cpu_copy_carries_mamba:
