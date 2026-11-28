@@ -87,9 +87,8 @@ class SamplingRows(NamedTuple):
 
 class SamplingParamsTable:
     """Each request slot's sampling state on the device, one column per slot,
-    addressed by its `req_pool_idx`. The model runner builds its
-    `SamplingParamsPool` before any graph capture: a graph reads its columns by
-    slot index, and the pool writes them at admission."""
+    addressed by its `req_pool_idx`: a graph reads its columns by slot index, and
+    `SamplingParamsPool` writes them at admission."""
 
     # One row per field, floats as fp32 bits and int64 values as (low, high)
     # int32 halves: one int32 gather reads them all, top_k exact.
@@ -109,10 +108,8 @@ class SamplingParamsTable:
         floats[self.TOP_P] = 1.0
         self.values[self.TOP_K] = TOP_K_ALL
         self.values[self.PENALTY_INDEX] = -1
-        # Slot 0 is the request table's padding slot: a graph's padded rows read it,
-        # and no request is written to it. Greedy (top_k 1 at temperature 1, as a
-        # greedy request is normalized), so those discarded rows draft by argmax
-        # instead of sampling.
+        # Slot 0 is the padding slot: a graph's padded rows read it and no request
+        # is written to it; top_k 1 makes those discarded rows draft by argmax.
         self.values[self.TOP_K, 0] = 1
 
     def temperatures(self, slots: torch.Tensor) -> torch.Tensor:
@@ -224,7 +221,6 @@ class SamplingParamsPool:
 
 
 def _join_seed_halves(lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
-    """[n] int64 seeds from their int32 halves."""
     return torch.stack((lo, hi), dim=1).view(torch.int64).view(-1)
 
 

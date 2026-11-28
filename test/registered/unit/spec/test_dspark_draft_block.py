@@ -190,7 +190,6 @@ def _folded_draft_model():
 
 
 def _table(num_rows, device) -> SamplingParamsTable:
-    """A sampling table without watermark fields."""
     with patch.object(sp_pool, "num_watermark_fields", return_value=0):
         return SamplingParamsTable(num_rows, device)
 
@@ -264,7 +263,6 @@ class TestMegakernelDraftSampler(CustomTestCase):
 
 
 def _admit(pool, slot, *, temperature, top_k):
-    """Writes a request's sampling params into its slot, as admission does."""
     with patch.object(sp_pool, "_deterministic", return_value=False):
         pool.write(
             [
