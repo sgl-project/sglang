@@ -19,9 +19,13 @@ try:
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         _conv_multi_eligible,
         _require_entry_contiguous_dst,
+        _state_multi_eligible,
+        _state_multi_word,
         fused_conv_window_scatter_multi,
         fused_conv_window_scatter_with_mask,
         fused_mamba_state_scatter_with_mask,
+        fused_state_scatter_multi,
+        int32_scatter_rows,
         scatter_mamba_states_after_mtp_verify,
     )
 
@@ -31,6 +35,8 @@ except Exception as e:  # pragma: no cover
     fused_conv_window_scatter_multi = None
     fused_conv_window_scatter_with_mask = None
     fused_mamba_state_scatter_with_mask = None
+    fused_state_scatter_multi = None
+    int32_scatter_rows = None
     scatter_mamba_states_after_mtp_verify = None
     _FUSED_IMPORT_ERROR = e
 
@@ -540,6 +546,94 @@ class TestFusedConvWindowScatterMulti(CustomTestCase):
 
     def test_multi_type_with_track_set(self):
         self._run(num_types=2, n2=4)
+
+
+@unittest.skipUnless(DEVICE == "cuda", "the multi-pair state scatter is a CUDA launch")
+class TestFusedStateScatterMulti(CustomTestCase):
+    """The multi-pair state scatter against indexing: each copy word width, entries
+    of several 1024-word blocks with a partial last one, the bounds and the second row
+    set (source row = the row's position within its own set)."""
+
+    LAYERS, SLOTS, BATCH, STEPS = 2, 8, 6, 3
+
+    def _pair(self, entry, dtype, gen):
+        src = torch.randint(
+            0,
+            100,
+            (self.LAYERS, self.BATCH, self.STEPS, *entry),
+            device=DEVICE,
+            generator=gen,
+        ).to(dtype)
+        dst = torch.zeros((self.LAYERS, self.SLOTS, *entry), dtype=dtype, device=DEVICE)
+        return dst, src
+
+    def _check(self, pairs, dst1, step1, dst2=None, step2=None):
+        expect = [dst.clone() for dst, _ in pairs]
+        for exp, (dst, src) in zip(expect, pairs):
+            for dsts, steps in ((dst1, step1), (dst2, step2)):
+                if steps is None:
+                    continue
+                for row, (d, s) in enumerate(zip(dsts.tolist(), steps.tolist())):
+                    if 0 <= d < dst.shape[1] and 0 <= s < src.shape[2]:
+                        exp[:, d] = src[:, row, s]
+        self.assertTrue(_state_multi_eligible(pairs))
+        fused_state_scatter_multi(pairs, dst1, step1, dst2, step2)
+        torch.cuda.synchronize()
+        for i, (exp, (got, _)) in enumerate(zip(expect, pairs)):
+            self.assertTrue(torch.equal(got, exp), f"pair {i}")
+
+    def _rows(self, values):
+        return torch.tensor(values, device=DEVICE, dtype=torch.int64)
+
+    def test_each_word_width(self):
+        gen = torch.Generator(device=DEVICE).manual_seed(3)
+        dst1, step1 = self._rows([3, 1, 5, 6, 0, 2]), self._rows([0, 1, 2, 1, 0, 2])
+        # entry bytes 8 / 4 / 6 / 3 -> 8- / 4- / 2- / 1-byte words
+        for entry, dtype, word in (
+            ((4,), torch.bfloat16, 8),
+            ((2,), torch.bfloat16, 4),
+            ((3,), torch.bfloat16, 2),
+            ((3,), torch.uint8, 1),
+        ):
+            with self.subTest(entry=entry, dtype=dtype):
+                pairs = [self._pair(entry, dtype, gen)]
+                self.assertEqual(_state_multi_word(pairs), word)
+                self._check(pairs, dst1, step1)
+
+    def test_multi_block_entries_bounds_and_second_row_set(self):
+        gen = torch.Generator(device=DEVICE).manual_seed(4)
+        # no slot, slot past the pool, rejected step, step past the window
+        dst1, step1 = self._rows([3, -1, 9, 1, 5, 6]), self._rows([0, 1, 2, -1, 3, 2])
+        # disjoint from the first set's slots
+        dst2, step2 = self._rows([0, 2, 4]), self._rows([1, -1, 2])
+        # 8-byte words: 1025 per entry, 2 blocks with a partial last one;
+        # 2-byte words (an 8190-byte entry): 4100 and 4095 per entry, 5 and 4 blocks
+        for entries, word in (
+            ([((2, 2050), torch.bfloat16), ((5,), torch.int64)], 8),
+            ([((2, 2050), torch.bfloat16), ((3, 1365), torch.bfloat16)], 2),
+        ):
+            with self.subTest(word=word):
+                pairs = [self._pair(entry, dtype, gen) for entry, dtype in entries]
+                self.assertEqual(_state_multi_word(pairs), word)
+                self._check(pairs, dst1, step1, dst2, step2)
+
+    def test_mixed_dtypes_are_not_eligible(self):
+        gen = torch.Generator(device=DEVICE).manual_seed(5)
+        dst, src = self._pair((4,), torch.bfloat16, gen)
+        self.assertFalse(_state_multi_eligible([(dst, src.half())]))
+
+    def test_int32_scatter_rows(self):
+        dst = torch.arange(8, device=DEVICE)[::2]
+        steps = self._rows([1, -1, 0, 2])
+        for src, rows in (
+            (None, [0, 1, 2, 3]),
+            (self._rows([3, 2, 1, 0]), [3, 2, 1, 0]),
+        ):
+            got = int32_scatter_rows(dst, steps, src)
+            for tensor, values in zip(got, ([0, 2, 4, 6], [1, -1, 0, 2], rows)):
+                self.assertEqual(tensor.dtype, torch.int32)
+                self.assertTrue(tensor.is_contiguous())
+                self.assertEqual(tensor.tolist(), values)
 
 
 @unittest.skipUnless(
