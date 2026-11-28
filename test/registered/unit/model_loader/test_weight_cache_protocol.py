@@ -5,7 +5,8 @@ These cover the pure-Python logic that the GPU end-to-end test
 (test_weight_cache_daemon.py) cannot exercise cheaply:
 
   - length-prefixed socket framing (send_msg/recv_msg) over socketpair()
-  - CacheConfig compatibility matching / (de)serialization
+  - LoadSpec: its sections, builder, digests and schema validation
+  - the LoadSpec comparison between a daemon and its engines
   - quant-config hashing and method-name extraction
   - daemon spawn configuration and socket/ready path derivation
   - the IPC quantization allowlist (the gate that keeps silently-wrong
@@ -17,17 +18,28 @@ process, so they run in the fast CPU suite and would catch a regression
 in any of these branches before it reaches the expensive GPU path.
 """
 
+import contextlib
 import os
 import socket
 import struct
+import tempfile
+import threading
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
+import msgspec
 import torch
+from transformers import PretrainedConfig
 
+from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.weight_cache.config import build_load_spec, path_checkpoint_id
+from sglang.srt.weight_cache.daemon import WeightCacheDaemon
+from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 from sglang.srt.weight_cache.protocol import (
-    CacheConfig,
     UnsupportedQuantForIPCError,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
@@ -38,9 +50,11 @@ from sglang.srt.weight_cache.protocol import (
     get_socket_path,
     hash_quant_config,
     is_ipc_quant_supported,
+    load_spec_mismatches,
     recv_msg,
     send_msg,
 )
+from sglang.srt.weight_cache.schema import LoadSpec
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
     TorchIpcTransportBackend,
@@ -52,33 +66,52 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _make_cache_config(**overrides) -> CacheConfig:
-    base = dict(
-        model_path="/models/demo",
-        model_arch="LlamaForCausalLM",
-        tp_size=2,
-        tp_rank=0,
-        pp_size=1,
-        pp_rank=0,
-        dp_size=1,
-        ep_size=1,
-        moe_dp_size=1,
-        moe_dp_rank=0,
-        moe_ep_rank=0,
-        attn_dp_size=1,
-        enable_dp_lm_head=False,
-        attn_cp_size=1,
-        moe_dense_tp_size=None,
-        moe_a2a_backend="none",
-        quant_method="",
-        quant_config_hash="",
-        dtype="torch.float16",
-        revision="",
-        device_capability="8.0",
-        torch_version="2.5.1",
+def _model_config(
+    *,
+    hf_config=None,
+    model_path="m",
+    revision=None,
+    quantization=None,
+    dtype=torch.float32,
+):
+    return SimpleNamespace(
+        hf_config=PretrainedConfig() if hf_config is None else hf_config,
+        model_path=model_path,
+        revision=revision,
+        quantization=quantization,
+        dtype=dtype,
     )
-    base.update(overrides)
-    return CacheConfig(**base)
+
+
+@contextlib.contextmanager
+def _runtime_context(*, tp_size=2, tp_rank=0, **server_args):
+    with (
+        get_context().override_server_args(tp_size=tp_size, **server_args),
+        get_parallel().override(
+            tp_rank=tp_rank,
+            pp_rank=0,
+            moe_dp_rank=0,
+            moe_ep_rank=0,
+            moe_dp_group=SimpleNamespace(world_size=1),
+        ),
+    ):
+        yield
+
+
+def _make_load_spec(
+    model_config=None, *, checkpoint_id="rev1", draft_model_idx=None, **context
+):
+    with _runtime_context(**context):
+        return build_load_spec(
+            model_config or _model_config(),
+            checkpoint_id=checkpoint_id,
+            device=torch.device("cpu"),
+            draft_model_idx=draft_model_idx,
+        )
+
+
+def _make_message(**overrides):
+    return msgspec.to_builtins(msgspec.structs.replace(_make_load_spec(), **overrides))
 
 
 class TestProtocolFraming(CustomTestCase):
@@ -162,36 +195,266 @@ class TestTransportBackend(CustomTestCase):
             b.close()
 
 
-class TestCacheConfig(CustomTestCase):
-    def test_identical_configs_match(self):
-        self.assertTrue(_make_cache_config().matches(_make_cache_config()))
+class TestLoadSpec(CustomTestCase):
+    def test_fields_in_section_order(self):
+        self.assertEqual(
+            LoadSpec.__struct_fields__,
+            (
+                # Model config.
+                *("checkpoint_id", "model_arch", "hf_config_hash", "dtype"),
+                "draft_model_idx",
+                # Quantization config.
+                *("quant_method", "quant_config_hash"),
+                # Parallel config: the layout.
+                *("tp_size", "pp_size", "dp_size", "ep_size", "moe_dp_size"),
+                *("attn_dp_size", "attn_cp_size", "moe_cp_size", "moe_dense_tp_size"),
+                "enable_dp_lm_head",
+                # Parallel config: this rank's shard.
+                *("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"),
+                # Expert placement config.
+                *("ep_num_redundant_experts", "enable_eplb", "init_expert_location"),
+                # Kernel config.
+                *("moe_a2a_backend", "moe_runner_backend", "fp4_gemm_runner_backend"),
+                *("fp8_gemm_runner_backend", "bf16_gemm_backend"),
+                *("flashinfer_cutedsl_swap_ab", "enable_fp32_lm_head"),
+                # Environment.
+                *("device_capability", "torch_version"),
+            ),
+        )
 
-    def test_any_field_difference_breaks_match(self):
-        base = _make_cache_config()
+    def test_wire_schema_round_trips_and_rejects_unknown_fields(self):
+        spec = _make_load_spec()
+        wire = msgspec.json.encode(spec)
+        self.assertEqual(msgspec.json.decode(wire, type=LoadSpec), spec)
+        with self.assertRaisesRegex(msgspec.ValidationError, "model_path"):
+            msgspec.convert({**msgspec.to_builtins(spec), "model_path": "m"}, LoadSpec)
+        with self.assertRaises(AttributeError):
+            spec.dtype = "torch.float16"
+
+    def test_every_model_and_quantization_field_changes_both_digests(self):
+        base = _make_load_spec()
+        quant_config = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+        other = _make_load_spec(
+            _model_config(
+                hf_config=PretrainedConfig(
+                    architectures=["OtherModel"], quantization_config=quant_config
+                ),
+                dtype=torch.bfloat16,
+                quantization="fp8",
+            ),
+            checkpoint_id="rev2",
+            draft_model_idx=1,
+        )
+        self.assertEqual(other.model_arch, "OtherModel")
+        self.assertEqual(other.dtype, "torch.bfloat16")
+        self.assertEqual(other.quant_method, "fp8")
+        self.assertEqual(other.quant_config_hash, hash_quant_config(quant_config))
+        self.assertEqual(other.draft_model_idx, 1)
+        # Change each field in isolation. Several inputs change the HF hash too.
+        fields = LoadSpec.__struct_fields__
+        for field in fields[: fields.index("tp_size")]:  # model and quantization
+            with self.subTest(field=field):
+                self.assertNotEqual(getattr(base, field), getattr(other, field))
+                changed = msgspec.structs.replace(
+                    base, **{field: getattr(other, field)}
+                )
+                for include_rank in (True, False):
+                    self.assertNotEqual(
+                        base.digest(include_rank=include_rank),
+                        changed.digest(include_rank=include_rank),
+                    )
+
+    def test_staged_checkpoint_keeps_the_spec(self):
+        base = _make_load_spec()
+        staged = _make_load_spec(
+            _model_config(
+                hf_config=PretrainedConfig(name_or_path="/tmp/staging"),
+                model_path="/tmp/staging",
+                revision="release-alias",
+            )
+        )
+        self.assertEqual(base, staged)
+        overridden = _make_load_spec(
+            _model_config(hf_config=PretrainedConfig(hidden_size=128))
+        )
+        self.assertNotEqual(base.hf_config_hash, overridden.hf_config_hash)
+
+    def test_checkpoint_id_is_required(self):
+        with self.assertRaisesRegex(ValueError, "checkpoint ID"):
+            _make_load_spec(checkpoint_id="")
+
+    def test_daemon_checkpoint_id_names_the_requested_path_and_revision(self):
+        for revision, expected in ((None, "/m"), ("v2", "/m@v2")):
+            with get_context().override_server_args(model_path="/m", revision=revision):
+                self.assertEqual(path_checkpoint_id(), expected)
+
+    def test_parallel_config_comes_from_the_runtime_context(self):
+        spec = _make_load_spec(tp_size=4, tp_rank=3)
+        self.assertEqual((spec.tp_size, spec.tp_rank), (4, 3))
+        self.assertEqual((spec.pp_size, spec.pp_rank), (1, 0))
+
+    def test_moe_backends_come_from_the_published_config(self):
+        # A dense model's engine never initializes the MoE flags; the daemon does.
+        spec = _make_load_spec(moe_runner_backend="triton")
+        self.assertEqual(spec.moe_runner_backend, "triton")
+        self.assertEqual(get_moe_runner_backend().value, "auto")
+
+    def test_rank_changes_only_the_shard_digest(self):
+        spec = _make_load_spec()
+        for field in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
+            with self.subTest(field=field):
+                peer = msgspec.structs.replace(spec, **{field: 1})
+                self.assertNotEqual(spec.digest(), peer.digest())
+                self.assertEqual(
+                    spec.digest(include_rank=False), peer.digest(include_rank=False)
+                )
+
+    def test_shared_load_settings_change_both_digests(self):
+        spec = _make_load_spec()
+        for other in (
+            _make_load_spec(tp_size=4),
+            msgspec.structs.replace(spec, flashinfer_cutedsl_swap_ab=True),
+            msgspec.structs.replace(spec, fp4_gemm_runner_backend="flashinfer_trtllm"),
+        ):
+            self.assertNotEqual(spec.digest(), other.digest())
+            self.assertNotEqual(
+                spec.digest(include_rank=False), other.digest(include_rank=False)
+            )
+
+
+class TestLoadSpecMismatches(CustomTestCase):
+    def test_identical_specs_match(self):
+        self.assertEqual(load_spec_mismatches(_make_message(), _make_message()), {})
+
+    def test_any_field_difference_is_reported(self):
+        base = _make_message()
         for field, value in (
+            ("checkpoint_id", "/models/other"),
+            ("hf_config_hash", "changed"),
+            ("dtype", "torch.bfloat16"),
+            ("quant_method", "fp8"),
+            ("quant_config_hash", "changed"),
             ("tp_rank", 1),
-            ("moe_dp_rank", 1),
             ("moe_ep_rank", 1),
             ("attn_dp_size", 2),
             ("moe_dense_tp_size", 1),
             ("moe_a2a_backend", "mooncake"),
-            ("dtype", "torch.bfloat16"),
-            ("quant_method", "fp8"),
-            ("model_path", "/models/other"),
-            ("revision", "v2"),
-            ("device_capability", "9.0"),
-            ("torch_version", "2.4.0"),
+            ("fp8_gemm_runner_backend", "cutlass"),
+            ("device_capability", "0.0"),
+            ("torch_version", "0.0.0"),
         ):
-            self.assertFalse(
-                base.matches(_make_cache_config(**{field: value})),
-                msg=f"{field} difference should break match",
+            with self.subTest(field=field):
+                other = {**base, field: value}
+                self.assertEqual(
+                    load_spec_mismatches(base, other), {field: (base[field], value)}
+                )
+
+    def test_missing_extra_and_older_fields_are_reported(self):
+        base = _make_message()
+        missing = dict(base)
+        del missing["moe_dense_tp_size"]  # None on both sides by .get()
+        self.assertEqual(
+            load_spec_mismatches(base, missing), {"moe_dense_tp_size": (None, None)}
+        )
+        extra = {**base, "new_field": 1}
+        self.assertEqual(load_spec_mismatches(base, extra), {"new_field": (None, 1)})
+        # An older engine sends the flat CacheConfig.
+        older = {"model_path": "m", "revision": "", "tp_rank": 0}
+        self.assertIn("checkpoint_id", load_spec_mismatches(base, older))
+
+    def test_daemon_serves_only_a_matching_engine(self):
+        daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
+        daemon.gpu_id = 0
+        daemon.config = _make_message()
+        daemon.state_entries = {}
+        daemon.preloaded_weights_bytes = 0
+        daemon.transport_backend = mock.Mock(name="torch_ipc")
+        for engine_config, served in (
+            (_make_message(tp_rank=1), False),
+            (_make_message(), True),
+        ):
+            with self.subTest(served=served):
+                a, b = socket.socketpair()
+                try:
+                    send_msg(b, {"type": "fetch_state", "config": engine_config})
+                    daemon._handle_connection(a)
+                    send = daemon.transport_backend.send_fetch_state_response
+                    self.assertEqual(send.called, served)
+                    if not served:
+                        response = recv_msg(b)
+                        self.assertEqual(response["status"], "mismatch")
+                        self.assertEqual(response["daemon_config"], daemon.config)
+                finally:
+                    a.close()
+                    b.close()
+
+
+class TestEngineFetchesFromTheDaemon(CustomTestCase):
+    """The engine's request and its handling of the reply, over a real socket."""
+
+    def _fetch(self, daemon_config, *, handle_connection=None):
+        daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
+        daemon.gpu_id = 0
+        daemon.config = daemon_config
+        daemon.state_entries = {}
+        daemon.preloaded_weights_bytes = 0
+        daemon.transport_backend = TorchIpcTransportBackend()
+        loader = WeightCacheModelLoader(LoadConfig(load_format=LoadFormat.IPC_CACHE))
+        with tempfile.TemporaryDirectory() as tmp:
+            loader.socket_path = os.path.join(tmp, "daemon.sock")
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(loader.socket_path)
+            server.listen(1)
+            server.settimeout(10)  # a fetch that never connects ends the thread
+
+            def serve():
+                conn, _ = server.accept()
+                with conn:
+                    (handle_connection or daemon._handle_connection)(conn)
+
+            thread = threading.Thread(target=serve, daemon=True)
+            thread.start()
+            try:
+                with _runtime_context():
+                    return loader._fetch_from_cache(
+                        _model_config(), SimpleNamespace(device=torch.device("cpu"))
+                    )
+            finally:
+                thread.join(10)
+                server.close()
+
+    def _daemon_config(self, **overrides):
+        with _runtime_context():
+            checkpoint_id = path_checkpoint_id()
+        spec = _make_load_spec(checkpoint_id=checkpoint_id)
+        return msgspec.to_builtins(msgspec.structs.replace(spec, **overrides))
+
+    def test_a_matching_daemon_serves_the_engine(self):
+        result = self._fetch(self._daemon_config())
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["config"], self._daemon_config())
+
+    def test_a_mismatch_raises_with_daemon_and_engine_values(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._fetch(self._daemon_config(tp_rank=1))
+        self.assertIn("Daemon config mismatch", str(ctx.exception))
+        self.assertIn("'tp_rank': (1, 0)", str(ctx.exception))
+
+    def test_rejects_a_wrong_rank_reply_before_receiving_storage(self):
+        wrong_rank = self._daemon_config(tp_rank=1)
+
+        def serve_wrong_rank(conn):
+            recv_msg(conn)
+            TorchIpcTransportBackend().send_fetch_state_response(
+                conn, config=wrong_rank, entries={}, pid=1
             )
 
-    def test_dict_round_trip(self):
-        cfg = _make_cache_config(quant_method="fp8", quant_config_hash="abc123")
-        restored = CacheConfig.from_dict(cfg.to_dict())
-        self.assertTrue(cfg.matches(restored))
-        self.assertEqual(cfg.to_dict(), restored.to_dict())
+        with mock.patch.object(
+            TorchIpcTransportBackend, "recv_fetch_state_response"
+        ) as receive:
+            with self.assertRaisesRegex(RuntimeError, "tp_rank"):
+                self._fetch(wrong_rank, handle_connection=serve_wrong_rank)
+        receive.assert_not_called()
 
 
 class TestQuantConfigHashing(CustomTestCase):
