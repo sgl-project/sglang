@@ -1,6 +1,7 @@
-"""Gemma4 PLE variants under pipeline parallelism refuse CUDA graphs."""
+"""Gemma4 pipeline-parallel capability and CUDA graph checks."""
 
 import argparse
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,6 +10,7 @@ from transformers import Gemma4TextConfig
 
 from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
 from sglang.srt.models import gemma4_causal
+from sglang.srt.models.gemma4_unified import Gemma4UnifiedForConditionalGeneration
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -89,6 +91,13 @@ class TestGemma4PipelinePleGate(CustomTestCase):
     def test_default_graphs_reject_pp(self):
         with self.assertRaisesRegex(ValueError, "per-layer-input"):
             self._build_second_stage_model([])
+
+
+class TestGemma4UnifiedPipelineParallel(CustomTestCase):
+    def test_forward_advertises_pipeline_parallel_inputs(self):
+        """The runner needs a named parameter to pass activations between stages."""
+        signature = inspect.signature(Gemma4UnifiedForConditionalGeneration.forward)
+        self.assertIn("pp_proxy_tensors", signature.parameters)
 
 
 if __name__ == "__main__":
