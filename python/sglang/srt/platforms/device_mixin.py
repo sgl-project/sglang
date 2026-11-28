@@ -25,16 +25,20 @@ Method status annotations:
 """
 
 import enum
+import os
 import random
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cached_property
-from typing import NamedTuple, Optional
+from typing import TYPE_CHECKING, Mapping, NamedTuple, Optional
 
 import numpy as np
 import torch
 
 from sglang.srt.environ import envs
+
+if TYPE_CHECKING:
+    from sglang.srt.weight_cache.protocol import QuantIpcSupport
 
 
 class PlatformEnum(enum.Enum):
@@ -164,6 +168,87 @@ class DeviceMixin:
     def get_device_total_memory(self, device_id: int = 0) -> int:
         """[Active] Get total device memory in bytes."""
         raise NotImplementedError
+
+    def memory_reserved(self, device_id: int = 0) -> int:
+        """[Active] Bytes the caching allocator holds for this device.
+
+        Routed through ``torch.accelerator`` so it follows whichever device
+        torch was built for. Never defaulted to 0: the weight cache daemon
+        differences this across a load, and a 0 reads as "nothing was
+        allocated". Override where a device's allocator is not reachable here.
+        """
+        return int(torch.accelerator.memory_reserved(device_id))
+
+    # ---- Weight cache ----
+
+    def weight_cache_transports(self) -> tuple[str, ...]:
+        """[Active] Weight-cache transport names this device can serve.
+
+        Empty means the daemon refuses to start here. The default reproduces
+        the platform gate the daemon applied before this was a capability, so a
+        device opts in by overriding rather than by being added to a condition
+        inside the daemon. Which of the declared transports is used is still
+        resolved by ``weight_cache.transport``.
+        """
+        if self.is_cuda_alike():
+            return ("vmm_fd", "torch_ipc")
+        if self.is_npu():
+            return ("torch_ipc",)
+        return ()
+
+    def weight_cache_quant_support(self) -> "Mapping[str, QuantIpcSupport]":
+        """[Active] Quantization methods this device verified for weight sharing.
+
+        Keyed by ``quant_method``; a method absent from the mapping fails
+        closed, and an entry gates dense and MoE checkpoints separately. The
+        default is the set verified over CUDA IPC, which is what every platform
+        applied before this was a capability, so a device narrows it by
+        overriding rather than by being added to a condition inside the gate.
+        """
+        from sglang.srt.weight_cache.protocol import CUDA_IPC_QUANT_SUPPORT
+
+        return CUDA_IPC_QUANT_SUPPORT
+
+    def validate_weight_cache_allocator(self) -> None:
+        """[Active] Reject an allocator config whose memory cannot be exported.
+
+        Called by the daemon before it touches the device, so a configuration
+        that would break the handle export fails with an actionable message
+        instead of partway through it. The default carries the CUDA
+        expandable-segments check.
+
+        XPU does not override this yet: which torch-xpu allocator
+        configurations yield Level-Zero-exportable memory is unestablished, and
+        cannot be settled before the Level Zero IPC helpers land.
+        """
+        for var in ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF"):
+            conf = os.environ.get(var, "")
+            for field in conf.split(","):
+                key, _, value = field.partition(":")
+                if (
+                    key.strip() == "expandable_segments"
+                    and value.strip().lower() == "true"
+                ):
+                    raise RuntimeError(
+                        f"[WeightCacheDaemon] {var} sets expandable_segments:True, "
+                        f"which is incompatible with CUDA IPC weight sharing: the "
+                        f"expandable-segments allocator hands out memory that cannot "
+                        f"be exported via _share_cuda_, so the IPC handle export "
+                        f"would fail mid-way. Unset expandable_segments for the "
+                        f"weight cache daemon process (it can stay enabled for the "
+                        f"engine itself), or use --weight-cache-transport vmm_fd."
+                    )
+
+    def weight_cache_env_stamp(self) -> dict[str, str]:
+        """[Active] Extra identity for the weight cache compatibility fingerprint.
+
+        Merged into ``compute_env_stamp``. A device whose post-processing or
+        kernel selection varies with its architecture or driver stack adds the
+        discriminating fields here. Raise when a required field is unavailable;
+        an empty value would make two different devices compare equal. The
+        default adds nothing, leaving other platforms' fingerprints unchanged.
+        """
+        return {}
 
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None

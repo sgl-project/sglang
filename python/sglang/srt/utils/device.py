@@ -490,9 +490,19 @@ def get_available_gpu_memory(
 
         if empty_cache:
             empty_device_cache(torch.xpu)
-        used_memory = torch.xpu.memory_allocated(gpu_id)
         total_gpu_memory = torch.xpu.get_device_properties(gpu_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
+        allocator_free = total_gpu_memory - torch.xpu.memory_allocated(gpu_id)
+        try:
+            # The allocator figure alone counts only what this process got
+            # through torch, so it reads another process's weights, and the
+            # Level Zero mappings the weight cache's vmm_fd transport makes
+            # outside the caching allocator, as free. min() adds those without
+            # trusting a driver that reports total as free.
+            free_gpu_memory = min(torch.xpu.mem_get_info(gpu_id)[0], allocator_free)
+        except RuntimeError:
+            # mem_get_info needs Level Zero Sysman, which some environments do
+            # not expose (WSL2 GPU-PV, sgl-project/sglang#52059).
+            free_gpu_memory = allocator_free
 
     elif device == "hpu":
         num_gpus = torch.hpu.device_count()

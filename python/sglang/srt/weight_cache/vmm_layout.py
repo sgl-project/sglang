@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """Packing layout for the ``vmm_fd`` weight cache transport.
 
-The daemon copies its final tensors into a few large CUDA VMM allocations and
-the engine maps those allocations into its own address space. Every distinct
-storage becomes one *slot*: a byte range at an aligned offset inside one
-allocation. A tensor is described relative to its slot the same way torch
-describes it relative to its storage (``storage_offset``, ``shape``,
-``stride``), so tensors that shared a storage in the daemon (tied weights,
-transposes, slices, dtype views) share one storage again in the engine.
+The daemon copies its final tensors into a few large VMM allocations -- CUDA
+``cuMemCreate`` or Level Zero ``zePhysicalMemCreate`` -- and the engine maps
+those allocations into its own address space. Every distinct storage becomes one
+*slot*: a byte range at an aligned offset inside one allocation. A tensor is
+described relative to its slot the same way torch describes it relative to its
+storage (``storage_offset``, ``shape``, ``stride``), so tensors that shared a
+storage in the daemon (tied weights, transposes, slices, dtype views) share one
+storage again in the engine.
 
-Planning and validation use torch metadata. Slots retain their source storages
-until packing copies and releases them. These paths are also tested on CPU.
+Planning and validation use torch metadata, so this module is device-neutral and
+shared by every platform's ``vmm_fd`` backend. Slots retain their source
+storages until packing copies and releases them. These paths are also tested on
+CPU.
 """
 
 from __future__ import annotations
@@ -23,7 +26,23 @@ import torch
 
 # The CUDA caching allocator hands out blocks aligned to 512 bytes. Slots use
 # the same alignment, so a packed tensor keeps the alignment it was loaded with.
+# Level Zero's device page size is larger (64 KiB or 2 MiB on Arc Pro B60), but
+# that bounds whole allocations, not the slots inside one.
 SLOT_ALIGNMENT = 512
+
+# Wire format of the layout a daemon sends with a vmm_fd fetch_state response.
+# Bump when the meaning of an entry field or of ``allocation_sizes`` changes, so
+# an engine refuses a layout it would otherwise misread rather than mapping it.
+# Version 1 is the format #46953 shipped; a daemon that predates the field sends
+# nothing and is read as version 1.
+LAYOUT_VERSION = 1
+SUPPORTED_LAYOUT_VERSIONS = (1,)
+
+# Entry and allocation sizes end up in a ``size_t`` driver argument, where
+# ctypes truncates an out-of-range value modulo 2**64 without complaining. Bound
+# every wire integer well below that, at the signed 64-bit range torch itself
+# uses for sizes and strides.
+MAX_WIRE_INT = (1 << 63) - 1
 
 
 @dataclasses.dataclass
@@ -200,16 +219,73 @@ def plan_vmm_pack(
     return VmmPackPlan(alloc_sizes=alloc_sizes, slots=slots, entries=entries)
 
 
+def check_layout_version(version: Any) -> int:
+    """Validate the layout version a daemon reported; returns it.
+
+    ``None`` means the daemon predates the field, which is version 1.
+    """
+    if version is None:
+        return 1
+    # _is_int first: 1.0 and True both compare equal to version 1.
+    if not _is_int(version) or version not in SUPPORTED_LAYOUT_VERSIONS:
+        raise ValueError(
+            f"vmm_fd layout version {version!r} is not one this engine reads "
+            f"({', '.join(str(v) for v in SUPPORTED_LAYOUT_VERSIONS)}). The "
+            f"daemon and the engine run different sglang versions; restart the "
+            f"daemon from this build."
+        )
+    return int(version)
+
+
+def check_layout_device(device_type: Any, local_device_type: str) -> None:
+    """Refuse a layout packed for another device type.
+
+    ``vmm_fd`` is one wire contract with a driver-specific implementation on each
+    side, and a handle from one driver means nothing to another. ``None`` means
+    the daemon predates the field, where CUDA was the only implementation.
+    """
+    if device_type is None:
+        return
+    if device_type != local_device_type:
+        raise ValueError(
+            f"vmm_fd layout was packed on a {device_type!r} device but this "
+            f"engine runs on {local_device_type!r}; its allocation handles "
+            f"cannot be imported here."
+        )
+
+
+def _validate_entry_names(entries: Any) -> None:
+    """The entries must be a mapping of distinct tensor names.
+
+    A pickled payload can carry any object here, including a sequence of pairs
+    whose names repeat, which would silently drop a tensor when read as a dict.
+    """
+    if not isinstance(entries, Mapping):
+        raise ValueError(
+            f"vmm_fd entries must be a mapping of tensor name to layout, got "
+            f"{type(entries).__name__}"
+        )
+    names = list(entries)
+    if not all(isinstance(name, str) for name in names):
+        raise ValueError("vmm_fd entry names must all be strings")
+    if len(set(names)) != len(names):
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        raise ValueError(f"vmm_fd entries repeat the tensor name(s) {duplicates}")
+
+
 def validate_vmm_layout(
     entries: Mapping[str, Mapping[str, Any]], alloc_sizes: Any
 ) -> None:
     """Check a received layout before any memory is mapped.
 
     Every slot must lie inside its allocation, every tensor inside its slot,
-    and two different slots must not overlap. Raises ValueError otherwise.
+    and two different slots must not overlap. Page alignment of the allocation
+    sizes is a driver property, so each platform's backend checks that itself.
+    Raises ValueError otherwise.
     """
+    _validate_entry_names(entries)
     if not isinstance(alloc_sizes, (list, tuple)) or not all(
-        _is_int(size) and size > 0 for size in alloc_sizes
+        _is_int(size) and 0 < size <= MAX_WIRE_INT for size in alloc_sizes
     ):
         raise ValueError(f"invalid vmm_fd allocation sizes: {alloc_sizes!r}")
 
@@ -231,7 +307,9 @@ def validate_vmm_layout(
             and 0 <= alloc_index < len(alloc_sizes)
             and offset >= 0
             and nbytes >= 0
-            and storage_offset >= 0
+            # An empty view needs no bytes, so nothing below would bound a
+            # storage_offset that overflows the driver's size_t.
+            and 0 <= storage_offset <= MAX_WIRE_INT
             and offset % SLOT_ALIGNMENT == 0
             and offset + nbytes <= alloc_sizes[alloc_index]
         ):
@@ -245,7 +323,7 @@ def validate_vmm_layout(
             isinstance(shape, (list, tuple))
             and isinstance(stride, (list, tuple))
             and len(shape) == len(stride)
-            and all(_is_int(v) and v >= 0 for v in (*shape, *stride))
+            and all(_is_int(v) and 0 <= v <= MAX_WIRE_INT for v in (*shape, *stride))
             and isinstance(is_param, bool)
         ):
             raise ValueError(

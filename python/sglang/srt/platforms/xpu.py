@@ -1,7 +1,8 @@
 """XPU device operations for the SRT platform layer."""
 
+import functools
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 import torch
 
@@ -12,7 +13,38 @@ from sglang.srt.platforms.device_mixin import (
 )
 from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 
+if TYPE_CHECKING:
+    from sglang.srt.weight_cache.protocol import QuantIpcSupport
+
 logger = logging.getLogger(__name__)
+
+
+def _sgl_kernel_xpu_version() -> str:
+    """Installed sglang-kernel-xpu version, or "" when the package is absent."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("sglang-kernel-xpu")
+    except PackageNotFoundError:
+        return ""
+
+
+@functools.lru_cache(maxsize=None)
+def _weight_cache_vmm_unsupported_reason() -> Optional[str]:
+    """Why Level Zero VMM weight sharing is unavailable here, or None if it works.
+
+    Probed rather than read off driver versions, because the Level Zero loader
+    exports every VMM symbol whether or not the driver behind it implements
+    dma-buf export of a physical allocation. Cached: the probe builds a Level
+    Zero context and one allocation, and the answer cannot change in a process.
+    """
+    try:
+        from sglang.srt.utils.xpu_vmm_utils import vmm_unsupported_reason
+
+        return vmm_unsupported_reason()
+    except Exception as exc:
+        # The loader itself may be missing, which is an answer, not a crash.
+        return f"{type(exc).__name__}: {exc}"
 
 
 class XpuDeviceMixin(DeviceMixin):
@@ -24,6 +56,75 @@ class XpuDeviceMixin(DeviceMixin):
 
     def get_device_total_memory(self, device_id: int = 0) -> int:
         return int(torch.xpu.get_device_properties(device_id).total_memory)
+
+    def memory_reserved(self, device_id: int = 0) -> int:
+        return int(torch.xpu.memory_reserved(device_id))
+
+    def weight_cache_transports(self) -> tuple[str, ...]:
+        """``vmm_fd`` when this driver can share Level Zero physical memory.
+
+        Only vmm_fd: ``torch_ipc`` pickles a tensor through torch
+        multiprocessing, and torch-xpu registers no storage reducer, so an XPU
+        tensor fails with ``_share_fd_: only available on CPU`` until
+        pytorch/pytorch#191725 lands.
+
+        The driver is probed rather than assumed, because the Level Zero spec
+        documents dma-buf export for ``zeMemAlloc*`` allocations only, not for
+        the ``zePhysicalMemCreate`` ones this transport shares; where a driver
+        cannot do it, the daemon must refuse to start rather than fail partway
+        through an export.
+        """
+        reason = _weight_cache_vmm_unsupported_reason()
+        if reason is not None:
+            logger.info(
+                "[weight_cache] XPU declares no weight-cache transport: Level "
+                "Zero virtual memory with dma-buf export is unavailable (%s).",
+                reason,
+            )
+            return ()
+        return ("vmm_fd",)
+
+    def weight_cache_quant_support(self) -> "Mapping[str, QuantIpcSupport]":
+        """Unquantized dense BF16 only, verified against a disk load.
+
+        The CUDA table is not inherited. Block-wise FP8 is verified there for
+        CUDA IPC, and nothing establishes that the Level Zero vmm_fd manifest
+        carries what an XPU FP8 post-process leaves behind, so it stays absent
+        and a quantized checkpoint is refused rather than mapped with numerics
+        nobody checked. MoE checkpoints are refused too, until one has been
+        compared with real weights.
+        """
+        from sglang.srt.weight_cache.protocol import XPU_VMM_QUANT_SUPPORT
+
+        return XPU_VMM_QUANT_SUPPORT
+
+    def weight_cache_env_stamp(self) -> dict[str, str]:
+        """Architecture, driver and kernel-package identity for the weight cache.
+
+        Read from ``torch.xpu.get_device_capability`` rather than the optional
+        ``sgl_kernel.query_device`` op that ``get_device_capability`` below
+        uses: that op is absent from some sgl-kernel-xpu builds, and a missing
+        value would leave two XPU generations comparing equal.
+        """
+        device_id = torch.xpu.current_device()
+        caps = torch.xpu.get_device_capability(device_id)
+        stamp = {
+            "xpu_architecture": str(caps.get("architecture", "")),
+            "xpu_device_id": str(caps.get("device_id", "")),
+            "xpu_driver_version": str(caps.get("driver_version", "")),
+            "sgl_kernel_xpu_version": _sgl_kernel_xpu_version(),
+        }
+        missing = sorted(key for key, value in stamp.items() if not value)
+        if missing:
+            raise RuntimeError(
+                f"[weight_cache] XPU environment stamp is incomplete: {missing} "
+                f"could not be determined on device {device_id}. The weight cache "
+                f"fingerprint needs them to tell XPU generations and driver stacks "
+                f"apart; without them a cache built elsewhere would look "
+                f"compatible. Check that torch.xpu sees the device and that "
+                f"sglang-kernel-xpu is installed."
+            )
+        return stamp
 
     def get_current_memory_usage(
         self, device: Optional["torch.device"] = None

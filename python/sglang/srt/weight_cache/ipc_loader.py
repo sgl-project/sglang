@@ -33,6 +33,7 @@ from .protocol import (
     get_quant_method_name,
     get_socket_path,
     hash_quant_config,
+    is_moe_checkpoint,
     recv_msg,
     send_msg,
 )
@@ -89,8 +90,8 @@ _LOADED_MODEL_TRANSPORTS: List[WeightCacheTransportBackend] = []
 
 class WeightCacheModelLoader(BaseModelLoader):
     """Load model weights from a Weight Cache Daemon through the transport the
-    daemon serves: CUDA IPC handles (torch_ipc) or CUDA VMM allocations passed
-    as file descriptors (vmm_fd).
+    daemon serves: CUDA IPC handles (torch_ipc) or VMM allocations passed as
+    file descriptors (vmm_fd).
 
     In daemon mode (weight_cache_mode="daemon"), the engine and daemon share
     the same GPU. Falling back to disk loading would cause OOM because both
@@ -150,7 +151,12 @@ class WeightCacheModelLoader(BaseModelLoader):
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
         quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
-        check_ipc_quant_support(quant_method, engine_quant_config, where="client")
+        check_ipc_quant_support(
+            quant_method,
+            engine_quant_config,
+            where="client",
+            is_moe=is_moe_checkpoint(model_config),
+        )
 
         # Try to fetch state from daemon
         cache_data = self._fetch_from_cache(model_config, device_config)
