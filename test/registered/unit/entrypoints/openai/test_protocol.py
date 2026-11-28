@@ -516,6 +516,30 @@ class TestChatCompletionRequest(CustomTestCase):
         )
         self.assertNotIn("json_schema", sampling_params)
 
+    def test_legacy_response_format_malformed_schema_raises_validation_error(self):
+        """Malformed schema in legacy response_format must raise ValidationError (HTTP 400)."""
+        for malformed in (True, "{}", [1]):
+            with self.subTest(schema=malformed), self.assertRaises(ValidationError):
+                ChatCompletionRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hi"}],
+                    response_format={"type": "json_schema", "schema": malformed},
+                )
+
+        # Non-model-field strict property or non-dict properties must not crash
+        for schema in (
+            {"type": "object", "properties": {"strict": True}},
+            {"properties": ["strict"]},
+            {"properties": "strict"},
+        ):
+            with self.subTest(schema=schema):
+                req = ChatCompletionRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": "hi"}],
+                    response_format={"type": "json_schema", "schema": schema},
+                )
+                self.assertIsNotNone(req.response_format)
+
     def test_zero_output_limits_preserve_precedence(self):
         """An explicit zero completion limit must survive request conversion."""
         for params, expected in (
