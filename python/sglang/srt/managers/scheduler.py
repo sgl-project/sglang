@@ -2642,6 +2642,7 @@ class Scheduler(
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )
+        self.weight_updater.share_load_rejections()
 
     def init_lora_drainer(self) -> None:
         if get_lora().lora_drain_wait_threshold > 0.0:

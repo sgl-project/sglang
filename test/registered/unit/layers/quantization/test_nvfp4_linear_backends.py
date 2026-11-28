@@ -9,11 +9,19 @@ import unittest
 from unittest import mock
 
 import torch
-from flashinfer import fp4_quantize
+from flashinfer import SfLayout, fp4_quantize, nvfp4_quantize
 
+from sglang.srt.environ import envs
+from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.quantization import fp4_utils
 from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
+from sglang.srt.layers.quantization.nvfp4_online import (
+    NVFP4_MAX,
+    NvFp4OnlineConfig,
+    NvFp4OnlineLinearMethod,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.layer_ut_utils import (
@@ -42,6 +50,12 @@ SHAPES = [
 ]
 
 ACT_SCALE = 1.0 / (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX)
+
+ONLINE_SHAPES = [
+    (64, 256, 512),
+    (5, 160, 512),
+    (128, 1024, 1024),
+]
 
 
 def _make_quantized_layer(n: int, k: int):
@@ -115,6 +129,47 @@ def _make_merged_layer(n_half: int, k: int):
     return layer, torch.cat(dequants, dim=0)
 
 
+def _cutedsl_backend():
+    return mock.patch.object(
+        fp4_utils,
+        "FP4_GEMM_RUNNER_BACKEND",
+        Fp4GemmRunnerBackend("flashinfer_cutedsl"),
+    )
+
+
+def _dense_only_config():
+    config = NvFp4OnlineConfig()
+    config.set_quantize_dense_linears(False)
+    return config
+
+
+def _make_online_layer(n: int, k: int):
+    layer = make_tp1_column_parallel_linear(NvFp4OnlineConfig(), n, k)
+    w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
+    load_linear_weights(layer, weight=w)
+    return layer
+
+
+def _online_reference(layer, x: torch.Tensor) -> torch.Tensor:
+    x_q, x_sf, per_token_scale = nvfp4_quantize(
+        x,
+        torch.full((1,), 1.0 / NVFP4_MAX, dtype=torch.float32, device=x.device),
+        sfLayout=SfLayout.layout_128x4,
+        per_token_activation=True,
+        backend="cute-dsl",
+    )
+    x_dequant = dequantize_nvfp4_to_dtype(
+        x_q, x_sf, (1.0 / per_token_scale).reshape(-1, 1), torch.float32
+    )
+    w_dequant = dequantize_nvfp4_to_dtype(
+        layer.weight.data,
+        layer.weight_scale.data,
+        1.0 / layer.weight_scale_2.data,
+        torch.float32,
+    )
+    return x_dequant @ w_dequant.T
+
+
 @unittest.skipIf(get_device_sm() < 100, "NVFP4 dense GEMM backends require SM100+")
 class TestNvFp4LinearBackends(CustomTestCase):
     @classmethod
@@ -156,6 +211,116 @@ class TestNvFp4LinearBackends(CustomTestCase):
             x = torch.randn((16, 512), device="cuda", dtype=torch.bfloat16) / 10
             out, _ = layer(x)
             self._assert_matches(layer, x, out, w_dequant)
+
+    def test_online_per_token_activation_scale(self):
+        torch.manual_seed(7)
+        with _cutedsl_backend():
+            for m, n, k in ONLINE_SHAPES:
+                with self.subTest(shape=(m, n, k)):
+                    layer = _make_online_layer(n, k)
+                    layer.quant_method.process_weights_after_loading(layer)
+                    # packed weights refuse online updates
+                    self.assertIsNotNone(layer._derived_weight_cache_error)
+
+                    decades = torch.logspace(-2, 2, m, device="cuda")
+                    x = (torch.randn((m, k), device="cuda") / 10 * decades[:, None]).to(
+                        torch.bfloat16
+                    )
+                    out, _ = layer(x)
+
+                    ref = _online_reference(layer, x)
+                    assert_output_close(self, out, ref)
+                    row_err = (out.float() - ref).norm(dim=1) / ref.norm(dim=1)
+                    self.assertLess(row_err.max().item(), 0.02)
+
+    def test_online_cuda_graph_matches_eager(self):
+        # M=1 is the bs=1 decode graph: mm_fp4 takes its scalar-alpha path there.
+        torch.manual_seed(7)
+        with _cutedsl_backend():
+            layer = _make_online_layer(1024, 1024)
+            layer.quant_method.process_weights_after_loading(layer)
+            for m in (1, 2, 8):
+                with self.subTest(m=m):
+                    x = torch.randn((m, 1024), device="cuda", dtype=torch.bfloat16)
+                    for _ in range(2):
+                        layer(x)
+                    torch.cuda.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        out, _ = layer(x)
+                    x.copy_(torch.randn_like(x))
+                    graph.replay()
+                    eager, _ = layer(x)
+                    torch.testing.assert_close(out, eager)
+
+    def test_online_moe_model_keeps_dense_linears(self):
+        with _cutedsl_backend():
+            layer = make_tp1_column_parallel_linear(_dense_only_config(), 256, 512)
+            self.assertIsInstance(layer.quant_method, UnquantizedLinearMethod)
+            self.assertIsNone(getattr(layer, "_derived_weight_cache_error", None))
+            with envs.SGLANG_NVFP4_ONLINE_DENSE_LINEAR.override(True):
+                config = _dense_only_config()
+            layer = make_tp1_column_parallel_linear(config, 256, 512)
+            self.assertIsInstance(layer.quant_method, NvFp4OnlineLinearMethod)
+
+            # ModelOpt checkpoint metadata goes through from_config; the loader
+            # applies the MoE decision afterwards.
+            config = NvFp4OnlineConfig.from_config({"quant_method": "modelopt"})
+            config.set_quantize_dense_linears(False)
+            layer = make_tp1_column_parallel_linear(config, 256, 512)
+            self.assertIsInstance(layer.quant_method, UnquantizedLinearMethod)
+
+    def test_online_rejects_non_cutedsl_backend(self):
+        for backend in ("flashinfer_cutlass", "flashinfer_trtllm", "marlin"):
+            with (
+                self.subTest(backend=backend),
+                mock.patch.object(
+                    fp4_utils, "FP4_GEMM_RUNNER_BACKEND", Fp4GemmRunnerBackend(backend)
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "flashinfer_cutedsl"):
+                    make_tp1_column_parallel_linear(NvFp4OnlineConfig(), 256, 512)
+
+    def test_online_unsupported_shards_stay_in_source_precision(self):
+        torch.manual_seed(7)
+        # N or K not a multiple of 32 (e.g. Gemma 3n AltUp K=4), or FP32 weights.
+        cases = [
+            (48, 512, torch.bfloat16),
+            (256, 4, torch.bfloat16),
+            (256, 512, torch.float32),
+        ]
+        with _cutedsl_backend():
+            for n, k, dtype in cases:
+                with self.subTest(n=n, k=k, dtype=dtype):
+                    layer = ColumnParallelLinear(
+                        input_size=k,
+                        output_size=n,
+                        bias=False,
+                        params_dtype=dtype,
+                        quant_config=NvFp4OnlineConfig(),
+                        prefix="model.layers.0.mlp.up_proj",
+                        parallel_group="replicated",
+                    ).cuda()
+                    w = torch.randn((n, k), device="cuda", dtype=dtype) / 10
+                    # The layer picks the same loader in serving.
+                    layer.weight.weight_loader(layer.weight, w)
+                    layer.quant_method.process_weights_after_loading(layer)
+                    self.assertEqual(layer.weight.dtype, dtype)
+                    # source-precision layers still reload
+                    self.assertIsNone(
+                        getattr(layer, "_derived_weight_cache_error", None)
+                    )
+                    x = torch.randn((8, k), device="cuda", dtype=dtype)
+                    out, _ = layer(x)
+                    assert_output_close(self, out, x.float() @ w.float().T)
+
+    def test_online_ignores_fused_layer_name(self):
+        prefix = "model.layers.0.mlp.gate_up_proj"
+        with _cutedsl_backend(), envs.SGLANG_FP4_IGNORED_LAYERS.override(prefix):
+            config = NvFp4OnlineConfig()
+            layer = make_tp1_column_parallel_linear(config, 256, 512, prefix=prefix)
+        self.assertIsInstance(layer.quant_method, UnquantizedLinearMethod)
+        self.assertIsNone(getattr(layer, "_derived_weight_cache_error", None))
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")

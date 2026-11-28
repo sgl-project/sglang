@@ -31,6 +31,7 @@ from sglang.srt.distributed.communication_op import (
     control_request_all_gather_object,
     control_request_barrier,
 )
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -66,6 +67,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     assert_empty,
 )
 from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    _unsupported_derived_weight_cache_error,
     unwrap_local_serialized_tensors,
 )
 from sglang.srt.model_executor.weight_checker import overall_checksum
@@ -142,9 +144,35 @@ class SchedulerWeightUpdaterManager:
     _session: Optional[_WeightUpdateSession] = None
     _plugin_state: Dict[str, Any] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
+    # role -> why some rank's runner of that role refuses in-place loads. Shared
+    # across every rank at startup: a pipeline stage may hold no refusing layer,
+    # or no draft at all under PP speculation, and must still refuse with the rest.
+    _startup_rejections: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.tp_cpu_group = get_parallel().tp_group.cpu_group
+
+    def share_load_rejections(self) -> None:
+        """Collective over every rank; the scheduler calls it once at startup."""
+        local: Dict[str, str] = {}
+        for role, runner in self._select_runners():
+            if role not in local:
+                reason = _unsupported_derived_weight_cache_error(
+                    runner.weight_updater.get_model()
+                )
+                if reason is not None:
+                    local[role] = reason
+        per_rank = [local]
+        if torch.distributed.is_initialized():
+            world = get_world_group()
+            if world.world_size > 1:
+                per_rank = [None] * world.world_size
+                torch.distributed.all_gather_object(
+                    per_rank, local, group=world.cpu_group
+                )
+        for rejections in per_rank:
+            for role, reason in rejections.items():
+                self._startup_rejections.setdefault(role, reason)
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -185,7 +213,16 @@ class SchedulerWeightUpdaterManager:
             self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            runners = self._select_runners()
+            # Reject before any runner writes, so a draft that cannot reload
+            # does not leave the target on new weights.
+            rejection = self._first_load_rejection(runners, "update_weights_from_disk")
+            if rejection is not None:
+                logger.error(rejection)
+                return UpdateWeightFromDiskReqOutput(
+                    success=False, message=rejection, num_paused_requests=0
+                )
+            for role, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_disk(
                     recv_req.model_path,
                     recv_req.load_format,
@@ -228,6 +265,19 @@ class SchedulerWeightUpdaterManager:
         if "draft" in roles and self.draft_worker is not None:
             runners += self.draft_worker.weight_update_runners()
         return runners
+
+    def _first_load_rejection(
+        self, runners: List[Tuple[str, Any]], op: str, selector: str = "all"
+    ) -> Optional[str]:
+        """The first startup-determined, rank-uniform reason a runner refuses ``op``."""
+        for role in _parse_runner_selector(selector):
+            if role in self._startup_rejections:
+                return self._startup_rejections[role]
+        for _, runner in runners:
+            rejection = runner.weight_updater.load_rejection(op)
+            if rejection is not None:
+                return rejection
+        return None
 
     def update_weights_from_distributed(
         self,
@@ -332,7 +382,13 @@ class SchedulerWeightUpdaterManager:
             self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
-            for role, runner in self._select_runners():
+            runners = self._select_runners()
+            rejection = self._first_load_rejection(runners, "update_weights_from_ipc")
+            if rejection is not None:
+                logger.error(rejection)
+                control_request_barrier()
+                return UpdateWeightsFromIPCReqOutput(success=False, message=rejection)
+            for role, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_ipc(
                     recv_req
                 )
@@ -379,14 +435,15 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
-        from sglang.srt.model_executor.model_runner_components.weight_updater import (
-            _unsupported_derived_weight_cache_error,
-        )
-
         runners = self._select_runners(recv_req.selector)
         # Restoring packed weights already mutates storage. Check every runner
         # before touching any of them, including sessions used by P2P/RDMA
         # writers which bypass update_weights_from_tensor/distributed.
+        for role in _parse_runner_selector(recv_req.selector):
+            if role in self._startup_rejections:
+                return BeginWeightUpdateReqOutput(
+                    success=False, message=self._startup_rejections[role]
+                )
         for _, runner in runners:
             error = _unsupported_derived_weight_cache_error(
                 runner.weight_updater.get_model()
@@ -444,10 +501,11 @@ class SchedulerWeightUpdaterManager:
         runners = self._select_runners(recv_req.selector)
         # The load-side guards, before the transport runs: they are startup-determined and
         # rank-uniform, and a transport that writes parameters itself never reaches a load.
-        for _, runner in runners:
-            rejection = runner.weight_updater.load_rejection("plugin_weight_update")
-            if rejection is not None:
-                return PluginWeightUpdateReqOutput(success=False, message=rejection)
+        rejection = self._first_load_rejection(
+            runners, "plugin_weight_update", recv_req.selector
+        )
+        if rejection is not None:
+            return PluginWeightUpdateReqOutput(success=False, message=rejection)
         context = PluginWeightUpdateContext(
             runners=runners,
             tp_rank=get_parallel().tp_rank,

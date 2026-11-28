@@ -73,6 +73,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.model_loader.utils import _is_moe_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
@@ -427,8 +428,27 @@ def _modelopt_quant_section(config: dict) -> dict:
     return config
 
 
-# TODO(woosuk): Move this to other place.
 def get_quant_config(
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    packed_modules_mapping: Dict[str, List[str]],
+    remap_prefix: Dict[str, str] | None = None,
+) -> QuantizationConfig:
+    quant_config = _get_quant_config(
+        model_config, load_config, packed_modules_mapping, remap_prefix
+    )
+    # nvfp4_online keeps an MoE model's dense linears in source precision.
+    # Apply this on every path, including ModelOpt checkpoint metadata that
+    # reaches NvFp4OnlineConfig.from_config (e.g. an MoE MTP draft).
+    if getattr(quant_config, "is_nvfp4_online", False):
+        quant_config.set_quantize_dense_linears(
+            not _is_moe_model(model_config, model_config.hf_config.architectures)
+        )
+    return quant_config
+
+
+# TODO(woosuk): Move this to other place.
+def _get_quant_config(
     model_config: ModelConfig,
     load_config: LoadConfig,
     packed_modules_mapping: Dict[str, List[str]],
@@ -538,6 +558,8 @@ def get_quant_config(
                 online_scheme=model_config.quantization,
                 hf_config=model_config.hf_config,
             )
+        if model_config.quantization == "nvfp4_online":
+            return quant_cls(packed_modules_mapping=packed_modules_mapping)
         return quant_cls()
 
     config_files = glob.glob(os.path.join(hf_folder, "*.json"))

@@ -14,20 +14,27 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.parameter import ModelWeightParameter
+from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
+    FP4_GEMM_ALIGNMENT,
     ModelOptFp4Config,
     ModelOptNvFp4FusedMoEMethod,
     ModelOptQuantConfig,
+    fp4_gemm,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import (
+    _module_path_match,
     is_layer_skipped,
     per_tensor_dequantize,
 )
+from sglang.srt.layers.utils.common import copy_or_rebind_param
 from sglang.srt.utils.common import temp_set_env
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,16 @@ def _nvfp4_weight_quantization_scope():
                 _nvfp4_weight_quantization_env.close()
 
 
+NVFP4_MAX = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
+
+_DENSE_LINEAR_WEIGHT_UPDATE_ERROR = (
+    "Online weight updates are not supported while --quantization nvfp4_online "
+    "converts dense linear layers: their weights are packed to NVFP4 at load "
+    "time and cannot take checkpoint-format tensors. Restart the server to load "
+    "new weights."
+)
+
+
 class NvFp4OnlineConfig(ModelOptQuantConfig):
     """Load-time NVFP4 expert weights with online activation handling.
 
@@ -63,8 +80,9 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
     default. With `SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1`, the flashinfer_cutedsl
     and flashinfer_megamoe backends keep activations in BF16. Use `modelopt_fp4`
     for per-tensor FP32 activation scales or serialized NVFP4 checkpoints.
-    This path converts BF16/FP16/FP8 MoE expert weights as they load; dense
-    layers retain their source precision or quantization.
+    This path converts BF16/FP16/FP8 MoE expert weights as they load, and BF16/FP16
+    dense linear weights for dense models (MoE models opt in with
+    SGLANG_NVFP4_ONLINE_DENSE_LINEAR).
     """
 
     # Marker consumed by the ModelOpt FP4 layout and the model loader. Serialized
@@ -122,6 +140,29 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         self.activation_scheme = activation_scheme
         self.weight_block_size = weight_block_size
         self.use_mxfp8 = use_mxfp8
+        self.set_quantize_dense_linears(True)
+
+    def set_quantize_dense_linears(self, quantize_dense_linears: bool) -> None:
+        """Dense models convert their linears; MoE models opt in by env."""
+        self.quantize_dense_linears = (
+            quantize_dense_linears or envs.SGLANG_NVFP4_ONLINE_DENSE_LINEAR.get()
+        )
+
+    def converts_dense_linears(self) -> bool:
+        return (
+            self.use_per_token_activation
+            and self.quantize_dense_linears
+            and not self.is_checkpoint_fp8_serialized
+        )
+
+    def _is_fp4_ignored(self, prefix: str) -> bool:
+        # is_layer_skipped matches a fused layer only through its shard names,
+        # so also accept the fused name itself (e.g. mlp.gate_up_proj).
+        return any(
+            _module_path_match(ignored, prefix) for ignored in self.fp4_ignored_layers
+        ) or is_layer_skipped(
+            prefix, self.fp4_ignored_layers, self.packed_modules_mapping
+        )
 
     @classmethod
     def get_name(cls) -> str:
@@ -170,6 +211,12 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
                 return UnquantizedLinearMethod()
+            if self._is_fp4_ignored(prefix):
+                if self.is_checkpoint_fp8_serialized:
+                    return Fp8LinearMethod(self)
+                return UnquantizedLinearMethod()
+            if self.converts_dense_linears():
+                return NvFp4OnlineLinearMethod()
             if self.is_checkpoint_fp8_serialized:
                 return Fp8LinearMethod(self)
             return UnquantizedLinearMethod()
@@ -179,14 +226,154 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
             ) or self.is_layer_excluded(prefix)
             if source_layer_ignored and not self.use_per_token_activation:
                 return None
-            if is_layer_skipped(
-                prefix, self.fp4_ignored_layers, self.packed_modules_mapping
-            ):
+            if self._is_fp4_ignored(prefix):
                 if self.is_checkpoint_fp8_serialized and not source_layer_ignored:
                     return Fp8MoEMethod(self)
                 return None
             return ModelOptNvFp4OnlineFusedMoEMethod(self, prefix)
         return None
+
+
+class NvFp4OnlineLinearMethod(LinearMethodBase):
+    """Converts a dense linear to NVFP4 at load time.
+
+    Activations get one FP32 scale per token, which the FP4 GEMM applies as a
+    per-row alpha; only the FlashInfer cute-dsl epilogue does that. Shards the
+    FP4 GEMM cannot serve (N or K not a multiple of FP4_GEMM_ALIGNMENT, or a
+    non-BF16/FP16 weight such as an FP32 router) stay in source precision.
+    """
+
+    def __init__(self) -> None:
+        backend = get_fp4_gemm_runner_backend()
+        if not backend.is_flashinfer_cutedsl():
+            raise ValueError(
+                "--quantization nvfp4_online converts dense linear layers with "
+                "per-token activation scales, which only --fp4-gemm-backend "
+                f"flashinfer_cutedsl (or auto) supports; got {backend.value}. "
+                "For MoE models, unset SGLANG_NVFP4_ONLINE_DENSE_LINEAR to keep "
+                "dense linears in source precision."
+            )
+        self.fallback = UnquantizedLinearMethod()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        layer.nvfp4_online_quantized = (
+            params_dtype in (torch.bfloat16, torch.float16)
+            and sum(output_partition_sizes) % FP4_GEMM_ALIGNMENT == 0
+            and input_size_per_partition % FP4_GEMM_ALIGNMENT == 0
+        )
+        if not layer.nvfp4_online_quantized:
+            self.fallback.create_weights(
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+            return
+        # Packed [N, K/2] weights cannot take checkpoint-format [N, K] tensors
+        # again. The scheduler shares this across all ranks at startup, so
+        # pipeline stages without a packed layer refuse too.
+        layer._derived_weight_cache_error = _DENSE_LINEAR_WEIGHT_UPDATE_ERROR
+        layer.register_parameter(
+            "weight",
+            ModelWeightParameter(
+                data=torch.empty(
+                    sum(output_partition_sizes),
+                    input_size_per_partition,
+                    dtype=params_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=extra_weight_attrs.get("weight_loader"),
+            ),
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not layer.nvfp4_online_quantized:
+            self.fallback.process_weights_after_loading(layer)
+            return
+
+        from flashinfer import NVFP44Over6Config, SfLayout, nvfp4_quantize
+
+        weight = layer.weight.data
+        # Same weight recipe as the MoE expert path.
+        nvfp4_4over6_config = NVFP44Over6Config(
+            e4m3_max=448, err_mode="MSE", err_use_fast_math=True
+        )
+        weight_amax = weight.abs().nan_to_num().amax().float()
+        weight_scale_2 = torch.where(
+            weight_amax > 0, weight_amax / NVFP4_MAX, torch.ones_like(weight_amax)
+        )
+        with _nvfp4_weight_quantization_scope():
+            weight_fp4, weight_scale = nvfp4_quantize(
+                weight,
+                1.0 / weight_scale_2,
+                sfLayout=SfLayout.layout_128x4,
+                backend="cute-dsl",
+                nvfp4_4over6=nvfp4_4over6_config,
+            )
+
+        copy_or_rebind_param(layer, "weight", weight_fp4)
+        copy_or_rebind_param(layer, "weight_scale", weight_scale)
+        copy_or_rebind_param(layer, "weight_scale_2", weight_scale_2.reshape(1))
+        copy_or_rebind_param(
+            layer,
+            "input_global_scale_inv",
+            torch.full(
+                (1,), 1.0 / NVFP4_MAX, dtype=torch.float32, device=weight.device
+            ),
+        )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not layer.nvfp4_online_quantized:
+            return self.fallback.apply(layer, x, bias)
+
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        out_features = layer.weight.shape[0]
+        x_2d = x.reshape(-1, x.shape[-1])
+        x_fp4, x_scale, alpha = nvfp4_quantize(
+            x_2d,
+            layer.input_global_scale_inv,
+            sfLayout=SfLayout.layout_128x4,
+            per_token_activation=True,
+            backend="cute-dsl",
+            out_scale=layer.weight_scale_2,
+            # With one row, mm_fp4 takes its scalar-alpha path, which in
+            # FlashInfer < 0.7.6 reads alpha before griddepcontrol.wait; under
+            # PDL in a CUDA graph (bs=1 decode) the GEMM then writes zeros.
+            # Fixed upstream in flashinfer-ai/flashinfer#7288; drop this once
+            # the pin reaches 0.7.6.
+            enable_pdl=False if x_2d.shape[0] == 1 else None,
+        )
+        out = fp4_gemm(
+            x_fp4,
+            layer.weight.T,
+            x_scale,
+            layer.weight_scale.T,
+            alpha,
+            x.dtype,
+            out_features,
+        )
+        if bias is not None:
+            out = out + bias
+        return out.view(*x.shape[:-1], out_features)
 
 
 class _ModelOptFp4OnlineConfig(NvFp4OnlineConfig):
