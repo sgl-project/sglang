@@ -529,6 +529,16 @@ def _http_session(trust_env: bool) -> requests.Session:
     return session
 
 
+def _warmup_prefixes(input_ids: List[List[int]], prefix_len: int) -> List[List[int]]:
+    def prefix(ids):
+        return ids if len(ids) <= prefix_len else ids[:prefix_len]
+
+    # A fixed-prompt batch can share the truncated prefix as well as the full prompt.
+    if input_ids and all(ids is input_ids[0] for ids in input_ids):
+        return [prefix(input_ids[0])] * len(input_ids)
+    return [prefix(ids) for ids in input_ids]
+
+
 def _warmup_cache(
     url: str,
     input_ids: List[List[int]],
@@ -561,10 +571,7 @@ def _warmup_cache(
         f"Warming up cache with {cache_hit_rate * 100:.1f}% hit rate "
         f"({cached_token_len} tokens per request)"
     )
-    cache_warmup_input_ids = [
-        ids if len(ids) <= cached_token_len else ids[:cached_token_len]
-        for ids in input_ids
-    ]
+    cache_warmup_input_ids = _warmup_prefixes(input_ids, cached_token_len)
 
     if backend == "vllm":
         cache_warmup_payload = {

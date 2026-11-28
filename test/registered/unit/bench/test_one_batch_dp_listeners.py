@@ -281,14 +281,18 @@ class TestDpListenerSplit(CustomTestCase):
 
     def test_warmup_truncates_only_rows_longer_than_the_prefix(self):
         rows = [[1], [2, 3], [4, 5, 6]]
-        with patch.object(one_batch_server, "_http_session") as http_session:
-            one_batch_server._warmup_cache("http://localhost", rows, 2, 1.0)
-        post = http_session.return_value.__enter__.return_value.post
-        warmed = post.call_args.kwargs["json"]["input_ids"]
+        warmed = one_batch_server._warmup_prefixes(rows, 2)
         self.assertEqual(warmed, [[1], [2, 3], [4, 5]])
         self.assertIs(warmed[0], rows[0])
         self.assertIs(warmed[1], rows[1])
         self.assertEqual(rows[2], [4, 5, 6])
+
+    def test_fixed_prompt_shares_one_partial_warmup_prefix(self):
+        prompt = [1, 2, 3, 4]
+        warmed = one_batch_server._warmup_prefixes([prompt] * 3, 2)
+        self.assertEqual(warmed, [[1, 2]] * 3)
+        self.assertTrue(all(ids is warmed[0] for ids in warmed))
+        self.assertEqual(prompt, [1, 2, 3, 4])
 
     def test_batch_spreads_over_listeners(self):
         delay = 0.5
