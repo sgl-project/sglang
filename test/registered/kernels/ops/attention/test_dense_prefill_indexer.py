@@ -24,7 +24,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     scoring,
     sparse_table,
 )
-from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
+from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs, RowShard
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -533,6 +533,203 @@ class TestDensePrefillIndexer(CustomTestCase):
                     gathers,
                     [3 + context, rows * 16 if context >= 32 else 3 + context],
                 )
+
+    @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
+    def test_hopper_candidate_row_shards_gather_logical_positions(self):
+        # Shares can split a request, be empty, and have different physical
+        # slot layouts. Gathering physical IDs or dropping a final partial
+        # share silently corrupts the next attention/consumer layer.
+        from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
+
+        world = 4
+        for context, fast, signed, tied in (
+            (15, True, False, False),
+            (25, True, False, False),
+            (65, True, False, False),
+            (65, False, False, False),
+            (65, False, True, False),
+            (15, True, True, True),
+        ):
+            with self.subTest(context=context, fast=fast, signed=signed, tied=tied):
+                cases = [(3, 5), (6, context)]
+                source = make_inputs(cases, zero_queries=tied)
+                consumer = make_inputs(cases, zero_queries=tied, seed=29)
+                source["topk"] = consumer["topk"] = 8
+                consumer["kv"] = source["kv"]
+                if signed:
+                    # Real head weights are unconstrained. Center their scores
+                    # across heads to exercise cancellation near the cutoff.
+                    for fixture in (source, consumer):
+                        fixture["weights"] -= fixture["weights"].mean(1, keepdim=True)
+                data = prefill_data(source)
+                rows = data.num_rows
+                packed_k = source["kv"]
+                indexer = SimpleNamespace(
+                    index_topk=8, queries=lambda q, f: q, head_weights=lambda x: x
+                )
+                indexer.scores = lambda q, k, w: DeepseekV41Indexer.scores(
+                    indexer, q, k, w
+                )
+
+                def run(rank, shard):
+                    perm = (data.k_slots + 3 * rank) % data.k_slots.numel()
+                    pool_k = tuple(torch.empty_like(t) for t in packed_k)
+                    for dst, src in zip(pool_k, packed_k):
+                        dst[perm] = src
+                    bf_k = dequant_fp4(*pool_k).to(torch.bfloat16)
+                    backend = dense_blocks.DenseBlocksBackend(
+                        token_to_kv_pool=SimpleNamespace(
+                            get_low_ratio_index_k_fp4=lambda _, s: tuple(
+                                t[s] for t in pool_k
+                            ),
+                            get_low_ratio_index_k_dequant=lambda _, s: bf_k[s],
+                        ),
+                        req_to_token=torch.empty(0, device="cuda"),
+                        candidate_topk_blocks=2,
+                        candidate_block_size=8,
+                        use_deep_gemm_publish=True,
+                        use_deep_gemm_consume=False,
+                        use_sm90_deep_gemm_consume=fast,
+                    )
+
+                    def operands(fixture):
+                        q = (
+                            dequant_fp4(
+                                fixture["q"][0].view(-1, 64), fixture["q"][1].view(-1)
+                            )
+                            .to(torch.bfloat16)
+                            .view(rows, 32, 128)
+                        )
+                        raw = torch.empty(
+                            (rows + 2, 8), device="cuda", dtype=torch.int32
+                        )
+                        return PrefillInputs(
+                            indexer=indexer,
+                            layer_id=0,
+                            compress_ratio=1,
+                            freqs_cis=torch.empty((context, 0), device="cuda"),
+                            x=fixture["weights"].to(torch.bfloat16),
+                            q_lora=q,
+                            positions=data.compress_lens.long() - 1,
+                            req_rows=None,
+                            req_pool_indices=torch.arange(len(cases), device="cuda"),
+                            k_slots=perm,
+                            index_plans={},
+                            kv_page_table=torch.empty(0, device="cuda"),
+                            seq_lens_cpu=data.lens_per_request,
+                            rows_per_request=data.rows_per_request,
+                            rows_per_request_device=torch.tensor(
+                                data.rows_per_request, device="cuda"
+                            ),
+                            out_raw_indices=raw,
+                            out_page_indices=torch.empty_like(raw),
+                            row_shard=shard,
+                        )
+
+                    def check_slots(inp):
+                        raw = inp.out_raw_indices[:rows]
+                        cols = (raw + data.request_starts[:, None]).clamp_min(0)
+                        torch.testing.assert_close(
+                            inp.out_page_indices[:rows],
+                            torch.where(raw >= 0, perm[cols], -1).to(torch.int32),
+                        )
+                        self.assertTrue((inp.out_page_indices[rows:] == -1).all())
+                        return raw.clone()
+
+                    src = operands(source)
+                    with patch.object(
+                        scoring,
+                        "_index_q_and_weights",
+                        return_value=(*source["q"], source["weights"]),
+                    ):
+                        metadata = backend.publish_prefill(src)
+                    source_raw = check_slots(src)
+                    dst = operands(consumer)
+                    with patch.object(
+                        scoring,
+                        "_index_q_and_weights",
+                        return_value=(*consumer["q"], consumer["weights"]),
+                    ):
+                        backend.consume_prefill(dst, metadata)
+                    return source_raw, metadata.blocks, check_slots(dst)
+
+                expect_src, expect_blocks, expect_dst = run(0, None)
+
+                def flattened(raw):
+                    return torch.where(raw >= 0, raw + data.request_starts[:, None], -1)
+
+                # The source sends flattened logical columns and block IDs;
+                # the non-compact all-block or torch consumer sends raw positions.
+                expected = (
+                    flattened(expect_src),
+                    expect_blocks,
+                    flattened(expect_dst) if fast and context > 16 else expect_dst,
+                )
+                captures = [[] for _ in range(world)]
+
+                class Group:
+                    def __init__(self, rank, replay=None):
+                        self.rank = rank
+                        self.replay = replay
+                        self.call = 0
+
+                    def all_gather_into_tensor(self, out, local):
+                        if self.replay is None:
+                            captures[self.rank].append(local.clone())
+                            out.fill_(-1)
+                            out[:rows].copy_(expected[self.call])
+                        else:
+                            out.copy_(self.replay[self.call])
+                        self.call += 1
+
+                def row_shard(rank, group):
+                    return RowShard(group=group, rank=rank, world=world, row_align=4)
+
+                for rank in range(world):
+                    group = Group(rank)
+                    run(rank, row_shard(rank, group))
+                    self.assertEqual(group.call, len(expected))
+                gathered = [
+                    torch.cat([c[i] for c in captures]) for i in range(len(expected))
+                ]
+                if tied:
+                    # Every score is zero and all visible blocks are selected.
+                    # Ties may choose different valid IDs; compare score values
+                    # and uniqueness, not arbitrary tie-breaking order/IDs.
+                    self.assert_topk(source, gathered[0][:rows], dense_scores(source))
+                    self.assert_topk(
+                        consumer, flattened(gathered[2][:rows]), dense_scores(consumer)
+                    )
+                    torch.testing.assert_close(
+                        gathered[1][:rows].sort(-1).values,
+                        expect_blocks.sort(-1).values,
+                    )
+                else:
+                    for got, want in zip(gathered, expected):
+                        torch.testing.assert_close(
+                            got[:rows].sort(-1).values, want.sort(-1).values
+                        )
+                for rank in range(world):
+                    group = Group(rank, gathered)
+                    got = run(rank, row_shard(rank, group))
+                    if signed:
+                        self.assert_topk(
+                            source, flattened(got[0]), dense_scores(source)
+                        )
+                    if tied:
+                        self.assert_topk(
+                            consumer, flattened(got[2]), dense_scores(consumer)
+                        )
+                        torch.testing.assert_close(
+                            got[1].sort(-1).values, expect_blocks.sort(-1).values
+                        )
+                    else:
+                        for actual, want in zip(
+                            got, (expect_src, expect_blocks, expect_dst)
+                        ):
+                            torch.testing.assert_close(
+                                actual.sort(-1).values, want.sort(-1).values
+                            )
 
     @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
     def test_hopper_scores_match_the_fp4_operands(self):
