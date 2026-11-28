@@ -341,6 +341,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     """
 
     _use_draft_input_embeds = False
+    static_deepstack_embeds: Optional[torch.Tensor] = None
     _fa4_prefill = False
     _backend_can_run_prefill_cuda_graph = None
     # The backend's batch-dependent check, judged from a ScheduleBatch for the DP vote.
@@ -754,6 +755,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ),
                 None,
             )
+            num_deepstack = getattr(model_runner.model, "num_deepstack_embeddings", 0)
+            if (
+                model_runner.model_config.hf_config.model_type
+                in ("qwen3_vl", "qwen3_vl_moe")
+                and num_deepstack > 0
+                and "input_deepstack_embeds" in params
+                and self.pp_size == 1
+                and not self.enable_cp_bcg_capture
+                and not model_runner.is_draft_worker
+            ):
+                self.static_deepstack_embeds = torch.zeros(
+                    (self.max_num_tokens, input_embeds_hidden_size * num_deepstack),
+                    dtype=model_runner.dtype,
+                    device=self.device,
+                )
 
         # DCP extend attention reads KV through a gather buffer in attn_dcp_metadata.
         self._dcp_extend_active = get_parallel().attn_dcp_size > 1 and hasattr(
@@ -987,6 +1003,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
+                if self.static_deepstack_embeds is not None:
+                    kwargs["input_deepstack_embeds"] = self.static_deepstack_embeds[
+                        :num_tokens
+                    ]
                 if pp_proxy_tensors is not None:
                     input_ids = None
                     for embeds_name in ("input_embeds", "inputs_embeds"):
@@ -2436,6 +2456,33 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             : ie.shape[0]
         ].copy_(ie)
 
+    def _fill_deepstack_embeds(
+        self,
+        live: Optional[torch.Tensor],
+        raw_num_tokens: int,
+        static_num_tokens: int,
+    ) -> None:
+        """Supply the captured body with this batch's visual features."""
+        assert self.static_deepstack_embeds is not None
+        target = self.static_deepstack_embeds[:static_num_tokens]
+        if live is None:
+            target.zero_()
+            return
+        if (
+            live.ndim != 2
+            or not raw_num_tokens <= live.shape[0] <= static_num_tokens
+            or live.shape[1] != target.shape[1]
+            or live.dtype != target.dtype
+            or live.device != target.device
+        ):
+            raise ValueError(
+                f"Incompatible DeepStack embeddings: got {live.shape}, {live.dtype}, "
+                f"{live.device}; expected {raw_num_tokens}–{static_num_tokens} rows "
+                f"of width {target.shape[1]}, {target.dtype}, {target.device}"
+            )
+        target[:raw_num_tokens].copy_(live[:raw_num_tokens])
+        target[raw_num_tokens:].zero_()
+
     def _pack_qwen_bcg_hc_output(self, output):
         if self._qwen_bcg_hc_sidechannel:
             # Replay cannot repeat the model's Python assignment of HC state.
@@ -2482,6 +2529,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 and self.buffer_registry.has_slot("input_embeds")
             ):
                 self._fill_input_embeds_slot(args, layer_kwargs, static_num_tokens)
+            if self.static_deepstack_embeds is not None:
+                self._fill_deepstack_embeds(
+                    layer_kwargs.get("input_deepstack_embeds"),
+                    raw_num_tokens,
+                    static_num_tokens,
+                )
             hs = self.backend.replay(shape_key, static_forward_batch, **kwargs)
             hs = self._restore_qwen_bcg_hc_output(hs)
             return _slice_output_rows(hs, raw_num_tokens) if full_path else hs

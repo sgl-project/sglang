@@ -88,7 +88,13 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
 )
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
-from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_mm,
+    get_model,
+    get_parallel,
+    get_serving,
+)
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu, round_up
 
 _is_npu = is_npu()
@@ -366,6 +372,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        use_bounded_cuda_graph: bool = False,
     ) -> None:
         super().__init__()
         self.pp_group = get_parallel().pp_group
@@ -380,6 +387,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.spatial_merge_unit = self.spatial_merge_size**2
         self.temporal_patch_size = vision_config.temporal_patch_size
         self.use_data_parallel = use_data_parallel
+        self.use_bounded_cuda_graph = use_bounded_cuda_graph
         # layer indexes of which layer's output should be deep-stacked
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.disable_merger_proj = getattr(vision_config, "disable_merger_proj", False)
@@ -929,7 +937,17 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         token_cu_seqlens = np.concatenate(
             [np.zeros(1, dtype=np.int32), token_cu_seqlens]
         )
+        return self._forward_vision_blocks(
+            x, token_cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
+        )
 
+    def _forward_vision_blocks(
+        self,
+        x: torch.Tensor,
+        token_cu_seqlens: np.ndarray,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+    ) -> torch.Tensor:
         # ---- pre-compute attention metadata once for all layers ----
         packed_indptrs = None
         flashinfer_sequence_lengths = None
@@ -1041,22 +1059,31 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_sin,
         ) = self._prepare_graph_inputs(x, grid_thw)
         attention_layout_key = (tuple(cu_seqlens.tolist()), None)
-        if not isinstance(cu_seqlens, torch.Tensor):
-            cu_seqlens = torch.tensor(cu_seqlens, device=x.device, dtype=torch.int32)
-        else:
-            cu_seqlens = cu_seqlens.to(device=x.device, dtype=torch.int32)
-        cu_seqlens = cu_seqlens.contiguous()
+        if self.use_bounded_cuda_graph and not self.graph_runners.admit_tp_layout(
+            x.shape[0], attention_layout_key
+        ):
+            # Match both positional interpolation and the graph's rotary workspace
+            # dtype. Keeping FP32 sin/cos only on misses changes the encoder output
+            # when the same layout is later captured with encoder-dtype buffers.
+            return self._forward_vision_blocks(
+                x,
+                cu_seqlens.numpy(),
+                rotary_pos_emb_cos.to(dtype=self.graph_runners.dtype),
+                rotary_pos_emb_sin.to(dtype=self.graph_runners.dtype),
+            )
 
-        return self.graph_runners.run(
+        embeddings = self.graph_runners.run(
             x=x,
             position_embeddings=None,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=cu_seqlens.to(device=x.device, dtype=torch.int32).contiguous(),
             cu_window_seqlens=None,
             output_indices=None,
             attention_layout_key=attention_layout_key,
         )
+        # Packed groups and the embedding cache can keep views past the next replay.
+        return embeddings.clone() if self.use_bounded_cuda_graph else embeddings
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
@@ -1274,6 +1301,9 @@ def check_not_image_generation_head(name: str) -> None:
 
 class Qwen3VLForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
+    # Inherited by models that reuse this image entry and vision tower. A model
+    # replacing that contract can opt out independently of its model_type.
+    supports_tp_image_preprocessing = True
 
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
@@ -1300,6 +1330,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         super().__init__()
         self.pp_group = get_parallel().pp_group
         self.quant_config = quant_config
+        self.tp_image_preprocessing_enabled = (
+            envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get()
+            and self.supports_tp_image_preprocessing
+        )
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
@@ -1323,6 +1357,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 prefix=add_prefix("model.visual", prefix),
                 use_data_parallel=self.use_data_parallel,
+                use_bounded_cuda_graph=self.tp_image_preprocessing_enabled,
             )
 
         # TODO: make it more elegant
@@ -1425,10 +1460,77 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             _require_vision(self)
         return pad_mm_tokens(input_ids, mm_inputs)
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+    def get_image_feature(
+        self, items: List[MultimodalDataItem]
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         _require_vision(self)
+        if envs.SGLANG_QWEN_VL_TP_IMAGE_PREPROCESS.get() and getattr(
+            self, "tp_image_preprocessing_enabled", False
+        ):
+            from sglang.srt.multimodal.qwen_vl_tp_preprocess import (
+                DEFERRED_IMAGE_PATCH_WIDTH_KEY,
+            )
+
+            needs_preprocessing = [
+                DEFERRED_IMAGE_PATCH_WIDTH_KEY in item.model_specific_data
+                for item in items
+            ]
+            if any(needs_preprocessing):
+                return self._encode_tp_image_features(items, needs_preprocessing)
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         return self._get_visual_feature(items, image_grid_thw)
+
+    def _encode_tp_image_features(
+        self, items: List[MultimodalDataItem], needs_preprocessing: List[bool]
+    ) -> List[torch.Tensor]:
+        from sglang.srt.multimodal.qwen_vl_tp_preprocess import encode_tp_images
+
+        deferred_items = [
+            item for item, deferred in zip(items, needs_preprocessing) if deferred
+        ]
+        preprocessed_items = [
+            item for item, deferred in zip(items, needs_preprocessing) if not deferred
+        ]
+        mm_config = get_mm().mm_process_config or {}
+        deferred_embeddings = iter(
+            encode_tp_images(
+                deferred_items,
+                self.visual,
+                self._get_tp_image_processor,
+                mm_config.get("image", {}),
+                self.visual.device,
+                self.visual.dtype,
+                get_parallel().tp_group,
+            )
+        )
+        preprocessed_embeddings = iter(())
+        if preprocessed_items:
+            grids = torch.cat(
+                [item.image_grid_thw for item in preprocessed_items], dim=0
+            )
+            embeddings = self._get_visual_feature(preprocessed_items, grids)
+            token_counts = [
+                item.offsets[0][1] - item.offsets[0][0] + 1
+                for item in preprocessed_items
+            ]
+            preprocessed_embeddings = iter(embeddings.split(token_counts, dim=0))
+        return [
+            next(deferred_embeddings if deferred else preprocessed_embeddings)
+            for deferred in needs_preprocessing
+        ]
+
+    def _get_tp_image_processor(self):
+        serving = get_serving()
+        model = get_model()
+        return cached_get_processor(
+            serving.tokenizer_path,
+            tokenizer_mode=serving.tokenizer_mode,
+            trust_remote_code=model.trust_remote_code,
+            revision=model.revision,
+            image_processor_backend=get_mm().image_processor_backend,
+            tokenizer_backend=serving.tokenizer_backend,
+            model_name=model.model_path,
+        ).image_processor
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         _require_vision(self)

@@ -1,7 +1,8 @@
-"""CPU coverage for chunked-prefix Full prefill CUDA-graph state."""
+"""CPU coverage for prefill CUDA-graph state."""
 
 import threading
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -926,6 +927,64 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
             counter.complete(0, layer)
         waiter.join(timeout=5)
         self.assertFalse(waiter.is_alive())
+
+
+class TestPrefillCudaGraphRunnerDeepStack(CustomTestCase):
+    def test_replay_refreshes_visual_features_and_clears_unused_rows(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.static_deepstack_embeds = torch.full((8, 3), -1.0)
+        runner.is_dsv41_model = runner._qwen_bcg_hc_sidechannel = False
+        runner._prefill_forward_context = MagicMock(return_value=nullcontext())
+        runner.buffer_registry = SimpleNamespace(has_slot=lambda name: False)
+        runner.layer_model = MagicMock()
+        runner.backend = SimpleNamespace(
+            replay=lambda *args, **kwargs: runner.static_deepstack_embeds[:4].clone()
+        )
+        model = MagicMock()
+        runner.model_runner = SimpleNamespace(
+            pp_group=SimpleNamespace(is_first_rank=True), model=model
+        )
+        batch = SimpleNamespace(
+            input_ids=None,
+            positions=None,
+            mm_input_embeds=None,
+            attn_tp_sequence_sharded=False,
+        )
+
+        for full in (False, True):
+            runner._is_full_backend = full
+            for live, raw, expected in (
+                (torch.ones(3, 3), 3, [1, 1, 1, 0]),
+                (torch.full((4, 3), 2.0), 2, [2, 2, 0, 0]),
+                (None, 3, [0, 0, 0, 0]),
+            ):
+                with self.subTest(full=full, raw=raw, visual=live is not None):
+                    layer_kwargs = (
+                        {} if live is None else {"input_deepstack_embeds": live}
+                    )
+                    model.forward.side_effect = lambda *args: (
+                        runner.layer_model.forward(**layer_kwargs)
+                    )
+                    output = runner._execute_body_capture(
+                        batch, batch, 4, raw, ShapeKey(size=4)
+                    )
+                    target = torch.tensor(expected, dtype=torch.float).view(4, 1)
+                    torch.testing.assert_close(
+                        runner.static_deepstack_embeds[:4], target.expand(4, 3)
+                    )
+                    torch.testing.assert_close(
+                        output, target[: output.shape[0]].expand_as(output)
+                    )
+
+            model.forward.side_effect = lambda *args: runner.layer_model.forward(
+                input_deepstack_embeds=torch.ones(4, 1)
+            )
+            with (
+                patch.object(runner.backend, "replay") as replay,
+                self.assertRaisesRegex(ValueError, "Incompatible DeepStack embeddings"),
+            ):
+                runner._execute_body_capture(batch, batch, 4, 3, ShapeKey(size=4))
+            replay.assert_not_called()
 
 
 class TestPrefillCudaGraphRunnerBodyTables(CustomTestCase):

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from contextlib import nullcontext
 from typing import Dict, Hashable, List, Optional, Tuple
 
@@ -25,6 +26,14 @@ import torch.nn as nn
 
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.runtime_context import get_parallel
+
+logger = logging.getLogger(__name__)
+
+# Bound graph memory for Qwen3-VL's dynamic TP image groups. Each captured
+# layout retains a private graph pool as well as its input and output buffers.
+_TP_GRAPH_CAPACITY = 8
+_TP_GRAPH_MAX_PATCHES = 8192
+_TP_GRAPH_PENDING_CAPACITY = 4 * _TP_GRAPH_CAPACITY
 
 
 class ViTCudaGraphRunner:
@@ -53,6 +62,7 @@ class ViTCudaGraphRunner:
         self.block_ws: Dict[Hashable, torch.Tensor] = {}
         self.block_graphs: Dict[Hashable, torch.cuda.CUDAGraph] = {}
         self.block_output: Dict[Hashable, torch.Tensor] = {}
+        self._pending_tp_layouts: Dict[Hashable, None] = {}
 
         # captured seqlens buffers (addresses must be stable for cuda-graph replay)
         self.cu_full_len: Dict[Hashable, torch.Tensor] = {}
@@ -87,6 +97,27 @@ class ViTCudaGraphRunner:
         self._attn_backend: Optional[str] = getattr(
             self._attn, "qkv_backend_name", None
         )
+
+    def admit_tp_layout(self, num_patches: int, attention_layout_key: Hashable) -> bool:
+        """Capture repeated layouts after all TP ranks form the same packed batch."""
+        key = (num_patches, attention_layout_key)
+        if key in self.block_graphs:
+            return True
+        if (
+            num_patches > _TP_GRAPH_MAX_PATCHES
+            or len(self.block_graphs) >= _TP_GRAPH_CAPACITY
+            or self._attn_backend not in ("triton_attn", "fa3", "fa4")
+        ):
+            return False
+        pending = self._pending_tp_layouts
+        if key in pending:
+            del pending[key]
+            logger.info("Capturing TP ViT CUDA graph for %d patches", num_patches)
+            return True
+        if len(pending) >= _TP_GRAPH_PENDING_CAPACITY:
+            del pending[next(iter(pending))]
+        pending[key] = None
+        return False
 
     @property
     def device(self) -> torch.device:
