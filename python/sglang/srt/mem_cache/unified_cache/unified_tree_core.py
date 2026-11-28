@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     _dfs_weight_order,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.evict_policy import to_eviction_priority_key
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -510,6 +511,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(
             params.eviction_policy.lower(), params.eviction_policy_config
+        )
+        # With --schedule-low-priority-values-first, lower request priority
+        # values are more urgent; begin_insert stores the negated value as
+        # the node's eviction key so the smallest-first heap evicts the least
+        # urgent prefix first. Only the priority policy reads node.priority.
+        self._negate_priority_on_insert = (
+            params.eviction_policy.lower() == "priority"
+            and params.schedule_low_priority_values_first
         )
         # The node _tlru_* lens are read only by TLRUStrategy.get_priority;
         # every other policy skips the per-insert bookkeeping entirely.
@@ -1317,6 +1326,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         priority = params.priority
         if priority is None:
             priority = 0
+        # Store the eviction sort key, not the raw request priority: with
+        # --schedule-low-priority-values-first the key is the negated value,
+        # so the existing max() propagation and root sentinel stay correct
+        # in both directions (see to_eviction_priority_key).
+        priority = to_eviction_priority_key(priority, self._negate_priority_on_insert)
         self._touch_node(self.root_node)
         self.root_node.priority = max(self.root_node.priority, priority)
         if len(key) == 0:

@@ -33,7 +33,10 @@ from sglang.srt.mem_cache.events import (
     event_namespace_seed,
     mm_routing_spans,
 )
-from sglang.srt.mem_cache.evict_policy import StateCostStrategy
+from sglang.srt.mem_cache.evict_policy import (
+    StateCostStrategy,
+    to_eviction_priority_key,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -107,6 +110,20 @@ def _tlru_float_config(native_bindings, threshold, next_prompt_estimate):
             threshold, 0.0, integer_estimate=next_prompt_estimate
         )
     return native_bindings.TlruFloatConfig(threshold, float(next_prompt_estimate))
+
+
+def _to_native_priority(priority: Optional[int], negate: bool) -> int:
+    """Normalize an insert priority for the native core (i64).
+
+    ``None`` means 0; with ``--schedule-low-priority-values-first`` the
+    stored value is the negated eviction key (see to_eviction_priority_key).
+    The negation is clamped to the i64 range so ``-(-2**63)`` cannot
+    overflow the binding.
+    """
+    if priority is None:
+        priority = 0
+    priority = to_eviction_priority_key(priority, negate)
+    return min(max(priority, -(2**63 - 1)), 2**63 - 1)
 
 
 def _radix_key_buffer(key: RadixKey) -> array:
@@ -526,6 +543,16 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         # configured eviction parameters to the native strategy.
         eviction_strategy = get_eviction_strategy(
             params.eviction_policy, params.eviction_policy_config
+        )
+        # With --schedule-low-priority-values-first, lower request priority
+        # values are more urgent; begin_insert stores the negated value as
+        # the node's eviction key so the native smallest-first heap evicts
+        # the least urgent prefix first. Only the priority policy reads
+        # node.priority; the native max() propagation and root sentinel are
+        # unchanged (see to_eviction_priority_key in evict_policy.py).
+        self._negate_priority_on_insert = (
+            params.eviction_policy.lower() == "priority"
+            and params.schedule_low_priority_values_first
         )
         tlru_tail_budget = 0
         tlru_float_config = None
@@ -985,7 +1012,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 swa_evicted_seqlen=params.get_evicted_seqlen(self.slot_id(TREE_WINDOW)),
                 swa_branching_seqlen=params.swa_branching_seqlen,
                 inserted_len=params.inserted_len,
-                priority=0 if params.priority is None else params.priority,
+                priority=_to_native_priority(
+                    params.priority, self._negate_priority_on_insert
+                ),
                 track_adopted_ranges=params.track_adopted_ranges,
                 rotation_base=params.rotation_base,
             )
