@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -262,8 +263,9 @@ class TestDecodeLocalPrefillScheduler(CustomTestCase):
         self.assertEqual(joining, 3)
 
     def test_abort_releases_kv_only_for_transferred_requests(self):
-        """A queued local request owns no KV; a transferred one owns its row and
-        pages and keeps them in the cache."""
+        """A queued local request owns no KV and ends its cache attempt (a
+        storage prefetch) like an aggregated request; a transferred one owns
+        its row and pages and keeps them in the cache."""
         scheduler = self._scheduler()
         scheduler.waiting_queue = IndexedReqList(
             ListKind.WAITING, abort=scheduler._abort_waiting
@@ -298,6 +300,9 @@ class TestDecodeLocalPrefillScheduler(CustomTestCase):
         self.assertEqual([c.args[0] for c in release.call_args_list], [transferred])
         self.assertTrue(release.call_args.kwargs["checkpoint"])
         self.assertEqual(send_abort_output.call_count, 2)
+        scheduler.tree_cache.finish.assert_called_once_with(
+            local.cache_request_handle, CacheRequestOutcome.ABORT
+        )
 
     def test_pause_requeues_local_requests_for_local_prefill(self):
         """A retracted local request has no prefill peer to rebootstrap with; a
@@ -467,6 +472,7 @@ class TestDecodeLocalPrefillMemory(CustomTestCase):
             get_recent_cache_hit_rate=lambda: 0.0,
             get_chunked_req=lambda: None,
             get_waiting_storage_span=None,
+            get_storage_metrics_collector=None,
             get_disagg_decode_prealloc_queue=lambda: prealloc,
             pool_stats_observer=SimpleNamespace(
                 get_pool_stats=lambda: SimpleNamespace(

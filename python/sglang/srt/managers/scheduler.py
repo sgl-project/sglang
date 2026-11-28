@@ -6854,9 +6854,13 @@ class Scheduler(
                 # the sender before that KV is freed.
                 self.release_prefill_sender(req, abort_sender=True)
             # Without the initiator's reason the tokenizer falls back to a
-            # generic abort message.
+            # generic abort message. A transferred request keeps its KV in the
+            # cache; one this decode server prefills itself holds none yet and
+            # ends its cache attempt like an aggregated request.
             self.request_retirer.abort(
-                req, finished_reason=recv_req.finished_reason, checkpoint=is_decode
+                req,
+                finished_reason=recv_req.finished_reason,
+                checkpoint=is_decode and not req.disagg_local_prefill,
             )
             logger.debug(f"Abort queued request. {req.rid=}")
 
