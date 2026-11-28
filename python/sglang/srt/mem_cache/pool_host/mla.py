@@ -369,7 +369,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_mapping_lengths(self) -> list[int]:
         if self.page_stride_bytes != self.page_bytes:
             return [self.page_num * self.page_stride_bytes]
-        if self.layout != "page_first_kv_split" or self._native_buffers is None:
+        if (
+            self.layout not in ("page_first_kv_split", "layer_first_kv_split")
+            or self._native_buffers is None
+        ):
             return super().get_mapping_lengths()
         native = self._native_buffers
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
@@ -450,10 +453,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             # becomes a 5-D zero-element empty tensor.
             native = self._native_buffers
             base_dims = (self.layer_num, self.page_num, self.page_size, 1)
+            index_page_size = (
+                native.index_k.shape[2]
+                if native.index_k is not None
+                else self.page_size
+            )
             indexer_dims = (
                 len(native.index_layer_indices),
                 self.page_num,
-                self.page_size,
+                index_page_size,
                 1,
             )
             return self._init_kv_split_buffer(
@@ -1283,7 +1291,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         fails outright on URAN/memfabric transfers).
         """
         buffers = [self.kv_buffer]
-        if self.layout == "page_first_kv_split":
+        if self.layout in ("page_first_kv_split", "layer_first_kv_split"):
             # FP8 DSA packs V into K; the host V mirror holds no valid data.
             if not getattr(self, "dsa_kv_cache_store_fp8", False):
                 buffers.append(getattr(self, "v_buffer", None))
@@ -1296,7 +1304,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         """Return local buffer pointers and byte sizes for logical storage pages."""
         if self.layout == "page_unified":
             return self._page_unified_buffer_meta(indices)
-        if self.dcp_size > 1 and self.layout == "page_first_kv_split":
+        if self.dcp_size > 1 and self.layout in (
+            "page_first_kv_split",
+            "layer_first_kv_split",
+        ):
             raise NotImplementedError(
                 "DCP L3 zero-copy storage does not support split KV buffers."
             )
@@ -1304,6 +1315,25 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ptr_list = []
         kv_buffer_data_ptr = self.kv_buffer.data_ptr()
         indices = indices.tolist()
+        if self.layout == "layer_first_kv_split":
+            # Match the page-first object order: all K layers, then V, indexer K and scales.
+            segments = []
+            for buf in self.get_hybrid_pool_buffer():
+                base = buf.data_ptr()
+                page_bytes = buf.stride(1) * buf.element_size()
+                layer_stride = buf.stride(0) * buf.element_size()
+                segments.extend(
+                    (base + layer * layer_stride, page_bytes)
+                    for layer in range(buf.shape[0])
+                )
+
+            pages = [index // self.page_size for index in indices[:: self.page_size]]
+            for page in pages:
+                for base, size in segments:
+                    ptr_list.append(base + page * size)
+            element_size_list = [size for _, size in segments] * len(pages)
+            return ptr_list, element_size_list
+
         if self.layout == "page_first_kv_split":
             k_buffer_data_ptr = self.k_buffer.data_ptr()
             v_buffer_data_ptr = self.v_buffer.data_ptr()
