@@ -52,7 +52,13 @@ from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.step3_vl import get_abs_pos
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.utils import cdiv, cpu_has_amx_support, get_compiler_backend, is_cpu
+from sglang.srt.utils import (
+    cdiv,
+    cpu_has_amx_support,
+    get_compiler_backend,
+    is_cpu,
+    is_npu,
+)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -551,19 +557,28 @@ class Attention(nn.Module):
             return (rel_h_chunk + rel_w_chunk).view(B, heads, e - s, k_h * k_w)
 
         if bias_bytes <= self._REL_POS_BIAS_MAX_BYTES:
-            return torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=bias_for(0, q_len)
-            )
+            return _attn_with_bias(q, k, v, bias_for(0, q_len))
 
         n_chunks = cdiv(bias_bytes, self._REL_POS_BIAS_MAX_BYTES)
         q_chunk = max(self._REL_POS_MIN_Q_CHUNK, cdiv(q_len, n_chunks))
         out = torch.empty_like(q)
         for s in range(0, q_len, q_chunk):
             e = min(s + q_chunk, q_len)
-            out[:, :, s:e] = torch.nn.functional.scaled_dot_product_attention(
-                q[:, :, s:e], k, v, attn_mask=bias_for(s, e)
-            )
+            out[:, :, s:e] = _attn_with_bias(q[:, :, s:e], k, v, bias_for(s, e))
         return out
+
+
+def _attn_with_bias(q, k, v, bias):
+    """SDPA on other devices; npu_fusion_attention with the bias folded into pse."""
+    if q.device.type != "npu":
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=bias)
+
+    import torch_npu
+
+    scale = 1.0 / (q.shape[-1] ** 0.5)
+    return torch_npu.npu_fusion_attention(
+        q, k, v, q.shape[1], "BNSD", pse=bias / scale, scale=scale, keep_prob=1.0
+    )[0]
 
 
 def window_partition(
@@ -1010,9 +1025,17 @@ class NoTPAttention(torch.nn.Module):
         return output
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def quick_gelu(x):
+def _quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
+
+
+# TorchAir captures these on one stream and refuses to replay on another, which
+# the Ascend prefill path does; keep the elementwise op eager there.
+quick_gelu = (
+    _quick_gelu
+    if is_npu()
+    else torch.compile(dynamic=True, backend=get_compiler_backend())(_quick_gelu)
+)
 
 
 class NoTPFeedForward(nn.Module):

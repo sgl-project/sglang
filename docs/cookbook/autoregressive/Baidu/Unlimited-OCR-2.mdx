@@ -59,6 +59,15 @@ The Apple Silicon recipe was tested on an **M5 MacBook Pro with 16 GB unified me
 The additional NVIDIA platforms are starting recipes marked **Not Verified**. H200 TP1 and B200 TP1/TP2 have passed service checks with a smaller per-page output budget and bounded concurrency/CUDA-graph sizes; these exact 8,000-token/page recipes remain unverified. H100, B300, GB200 and GB300 have not been tested for this model here.
 </Note>
 
+<Note>
+**Ascend NPU (experimental).** The `unlimited_ocr_v2` backend also runs on CANN. SGLang selects the NPU paged KV pool and a torch DASH attention path on its own, so the recipe needs no extra backend flag. Two settings matter:
+
+- Pass `--cuda-graph-max-bs-decode` explicitly; without it the decode graph captures a batch far larger than the service uses.
+- Prefill graphs are not supported: the sparse prefill has host-side control flow that cannot be captured. Leave `--cuda-graph-backend-prefill` at its default.
+
+`--max-prefill-tokens 2048` is the tested value. The NPU path is functional but not yet tuned; see the pull request for the measured throughput and accuracy.
+</Note>
+
 import { Deployment } from "/src/snippets/_deployment.jsx";
 import { config } from "/src/snippets/configs/baidu/unlimited-ocr-2.jsx";
 
