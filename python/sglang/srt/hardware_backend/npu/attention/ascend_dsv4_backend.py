@@ -696,6 +696,19 @@ class CompressorAscendBackendMixin:
         compressor._fused_wgate_w = w[split:]
         compressor._fused_norm_weight_fp32 = compressor.norm.weight.to(torch.float32)
 
+    @staticmethod
+    def _cp_gather_covers_live_rows(forward_batch: ForwardBatch) -> bool:
+        """Whether this step's store rows cover every live page the layer reads.
+
+        True only when the batch carries no cached prefix: the CP gather then
+        produces the whole layer's live rows and the split pool can seed its
+        scratch locally (patch-write), skipping the get-time broadcast. With a
+        prefix, the prefix pages exist only in the owning rank's pool, so they
+        still need the (kicked or synchronous) broadcast.
+        """
+        prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+        return prefix_lens is not None and all(int(n) == 0 for n in prefix_lens)
+
     def _compressor_epilog_npu(
         self,
         compressor,
@@ -778,6 +791,7 @@ class CompressorAscendBackendMixin:
             kv,
             kv_scale,
             compressor.is_in_indexer,
+            cp_gathered_full=self._cp_gather_covers_live_rows(forward_batch),
         )
 
     # ---- V4 verify rows (c4/c128 only; V4.1 plans its own) ------------------
@@ -4437,6 +4451,44 @@ class DeepseekV4AscendAttnBackend(
         if self._dsv4_compress_ratios:
             self._build_npu_compress_metadata(forward_batch)
 
+        self._inject_layer_split_live_pages(forward_batch, fm)
+
+    def _inject_layer_split_live_pages(self, forward_batch, fm) -> None:
+        """Hand the current forward's live page sets to a layer-split pool."""
+        set_live_pages = getattr(self.token_to_kv_pool, "set_live_pages", None)
+        if set_live_pages is None or forward_batch.forward_mode.is_idle():
+            return
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_cache_layer_split import (
+            KIND_C4,
+            KIND_C128,
+            KIND_SWA,
+            compute_broadcast_pages,
+        )
+
+        pages_by_kind = {KIND_SWA: fm.swa_page_table}
+        for ratio in (4, 128):
+            page_table = getattr(fm, f"c{ratio}_page_table", None)
+            if page_table is not None:
+                pages_by_kind[KIND_C4 if ratio == 4 else KIND_C128] = page_table
+
+        pool = self.token_to_kv_pool
+        locs = {
+            KIND_SWA: self.get_swa_out_cache_loc(forward_batch),
+            KIND_C4: getattr(fm, "c4_loc", None),
+            KIND_C128: getattr(fm, "c128_loc", None),
+        }
+        page_sizes = {
+            KIND_SWA: pool.swa_kv_pool.page_size,
+            KIND_C4: pool.c4_kv_pool.page_size,
+            KIND_C128: pool.c128_kv_pool.page_size,
+        }
+        broadcast_by_kind = {
+            kind: compute_broadcast_pages(pages, locs[kind], page_sizes[kind])
+            for kind, pages in pages_by_kind.items()
+            if pages is not None
+        }
+        set_live_pages(pages_by_kind, broadcast_by_kind)
+
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ) -> ForwardMetadata:
@@ -4926,6 +4978,7 @@ class DeepseekV4AscendAttnBackend(
             layer_id=layer_id,
             loc=swa_loc,
             cache=swa_k,
+            cp_gathered_full=self._cp_gather_covers_live_rows(forward_batch),
         )
 
     # ---- shared eager seq scalars ---------------------------------------------

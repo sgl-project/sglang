@@ -963,6 +963,15 @@ def _write_tail_source_kv_on_capture(layer, x, positions) -> None:
     get_attn_backend().tail_source_kv_layer_id = layer.layer_id
 
 
+def maybe_prefetch_next_layer_kv(
+    forward_batch: ForwardBatch, next_layer_id: int
+) -> None:
+    """One-layer-ahead KV owner-broadcast under cache layer-split."""
+    maybe = getattr(get_token_to_kv_pool(), "maybe_prefetch_next_layer", None)
+    if maybe is not None:
+        maybe(next_layer_id, forward_batch)
+
+
 # The captured tail reads this layer id to skip the source layer's compressor,
 # so the id is also set while the graph captures.
 bcg_deepseek_v4_write_tail_source_kv = eager_on_graph(
@@ -4412,6 +4421,10 @@ class DeepseekV4Model(nn.Module):
                 if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            # Layer-split prefetch: kick layer i+1's owner-broadcast before
+            # this layer's compute so it overlaps the whole layer (attention
+            # included). No-op unless the layer-split pool is active.
+            maybe_prefetch_next_layer_kv(forward_batch, i + 1)
             with ctx:
                 if _is_cuda:
                     hidden_states = self.layers[i](
@@ -4773,6 +4786,11 @@ class DeepseekV4Model(nn.Module):
                     mhc_stream_mean(
                         completed, out=dspark_aux_hidden_states.slot(completed[:, 0])
                     )
+                # Layer-split prefetch (loop-body tail, matching the hc-pre
+                # loop): layer i's reads consumed kick(i), and kick(i+1) issued
+                # here overlaps the next layer's head kernels. No-op unless the
+                # layer-split pool is active.
+                maybe_prefetch_next_layer_kv(forward_batch, i + 1)
             if _is_cuda:
                 hidden_states = residual_batch.read_output(
                     hidden_states, forward_batch, hc_boundary.FinalRead(), None

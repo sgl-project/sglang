@@ -2174,6 +2174,7 @@ class KVCacheConfigurator:
         # follows the same fixed ring ownership as GPU. Do not replace the
         # configurator's C4-SWA/C128-request budgets with a paged allocator
         # estimate: arch22 cache_mode=2 consumes explicit flat state_locs.
+        layer_shard_kwargs = {}
         if _is_npu:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
                 DSV4NPUTokenToKVPool,
@@ -2186,6 +2187,18 @@ class KVCacheConfigurator:
                 # pool generation instead of relying on ``compression_ratios``
                 # having been emptied to ``[0] * layers`` above.
                 kv_layout_kwargs = {"npu_window_generation": "v4"}
+            from sglang.srt.layers.cp.utils import get_dsv4_cp_layer_shard_info
+
+            shard_rank, shard_size = get_dsv4_cp_layer_shard_info(self)
+            if shard_rank is not None:
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_cache_layer_split import (
+                    LayerSplitDSV4NPUTokenToKVPool,
+                )
+
+                pool_cls = LayerSplitDSV4NPUTokenToKVPool
+                layer_shard_kwargs = dict(
+                    layer_shard_rank=shard_rank, layer_shard_size=shard_size
+                )
         else:
             pool_cls = DeepSeekV4TokenToKVPool
             kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
@@ -2243,6 +2256,7 @@ class KVCacheConfigurator:
             full_size=full_max_total_num_tokens,
             **({"is_draft_worker": self.is_draft_worker} if not _is_npu else {}),
             **kv_layout_kwargs,
+            **layer_shard_kwargs,
         )
         if not self.is_draft_worker:
             # Fresh rows include beam slots and PD preallocation. Reused rows

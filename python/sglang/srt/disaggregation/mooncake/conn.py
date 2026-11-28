@@ -1137,6 +1137,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             or info.requires_dcp_relayout
             # `_validate_envelope_kv_layout` checks the unified-memory envelope.
             or get_memory().enable_unified_memory
+            or get_parallel().enable_dsa_cache_layer_split
             # TP-sliced MHA (`send_kvcache_slice`) has a different stride by design.
             or not (
                 self.is_mla_backend

@@ -195,6 +195,37 @@ def get_glm_dsa_cp_layer_shard_info(
     return get_parallel().attn_cp_rank, shard_size
 
 
+def is_dsv4_cache_layer_split_enabled(model_runner: "ModelRunner") -> bool:
+    """Whether DSV4 KV cache layers are sharded across CP ranks.
+
+    Layer split is a prefill-CP-only optimization for the compressed-KV
+    (DeepSeek-V4 family) pools. Draft workers keep the full cache.
+    """
+    from sglang.srt.configs.model_config import uses_compressed_kv_attention
+
+    return (
+        not model_runner.is_draft_worker
+        and get_parallel().enable_dsa_cache_layer_split
+        and not model_runner.use_mla_backend
+        and uses_compressed_kv_attention(model_runner.model_config.hf_config)
+    )
+
+
+def get_dsv4_cp_layer_shard_info(
+    model_runner: "ModelRunner",
+) -> Tuple[Optional[int], int]:
+    """Return ``(layer_shard_rank, layer_shard_size)`` for the DSV4 KV pool.
+
+    ``(None, 1)`` disables sharding (feature off or only one CP rank).
+    """
+    if not is_dsv4_cache_layer_split_enabled(model_runner):
+        return None, 1
+    shard_size = get_parallel().attn_cp_size
+    if shard_size <= 1:
+        return None, 1
+    return get_parallel().attn_cp_rank, shard_size
+
+
 def get_glm_dsa_layer_split_effective_num_layers(
     model_runner: "ModelRunner", num_layers: int
 ) -> int:
