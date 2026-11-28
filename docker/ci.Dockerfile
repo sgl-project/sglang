@@ -38,8 +38,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # The checkout is bind-mounted, not baked in: each job installs its own. With no
-# GPU in the build, GDRCopy is forced and a libcuda stub lets verify_imports load
-# deep_ep; env.sh is emptied because the build wrote that stub into it.
+# GPU in the build, GDRCopy is forced, a libcuda stub lets the CUDA libraries
+# load, and SGLANG_CI_IMAGE_BUILD has verify_imports check that deep_ep is
+# installed rather than import it (it refuses to without a device); env.sh is
+# emptied because the build wrote that stub into it.
 # The venv path and the removed caches belong to the install script, and no job
 # reads the removed ones (CI stages download prebuilt Rust extensions).
 # Group 0 shares UID 1001's rights for runners that pick another UID, and /opt
@@ -48,7 +50,7 @@ RUN --mount=type=bind,source=.,target=/sgl-src,rw \
     mkdir -p /tmp/cuda-stub \
     && ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/cuda-stub/libcuda.so.1 \
     && cd /sgl-src \
-    && IS_BLACKWELL=${IS_BLACKWELL} INSTALL_GDRCOPY=1 LD_LIBRARY_PATH=/tmp/cuda-stub \
+    && IS_BLACKWELL=${IS_BLACKWELL} INSTALL_GDRCOPY=1 SGLANG_CI_IMAGE_BUILD=1 LD_LIBRARY_PATH=/tmp/cuda-stub \
         bash scripts/ci/cuda/ci_install_dependency.sh \
     && : > /opt/sglang-ci-py3.12/env.sh \
     && rm -rf /tmp/cuda-stub "${XDG_CACHE_HOME}/uv" /root/.cache "${SGLANG_CACHE_DIR}" \
