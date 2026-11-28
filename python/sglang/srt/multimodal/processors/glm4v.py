@@ -1,16 +1,25 @@
 import asyncio
 import json
 import math
-from typing import List, Tuple, Union
+import re
+from dataclasses import dataclass, replace
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from PIL import Image
+from transformers import BaseImageProcessor
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
-from sglang.srt.multimodal.media_io import GLM_MEDIA_CONFIG_KEYS
+from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
+from sglang.srt.multimodal.media_artifacts.base import (
+    MediaArtifactCacheMixin,
+    MediaArtifactInput,
+)
+from sglang.srt.multimodal.media_io import GLM_MEDIA_CONFIG_KEYS, smart_to_rgb
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -30,6 +39,24 @@ try:
     from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 except ImportError:
     Glm5NextForConditionalGeneration = None
+
+# Tokenizer settings that drop or add text tokens once HF merges them into its
+# own text kwargs, so the artifact path cannot reproduce the full path's
+# sequence by expanding the image token of the prompt it was given. A plain
+# max_length is not one of them: published checkpoints carry it, and the full
+# path passes padding=True, which leaves it inert without truncation.
+TEXT_LAYOUT_TOKENIZER_KWARGS = ("truncation", "padding", "pad_to_multiple_of")
+
+
+def tokenizer_sets_text_layout(init_kwargs) -> bool:
+    return (
+        bool(init_kwargs.get("truncation"))
+        or init_kwargs.get("padding") == "max_length"
+        # The full path's own padding=True is what makes this one bite, so a
+        # saved padding of False does not switch it off.
+        or init_kwargs.get("pad_to_multiple_of") not in (None, 1)
+    )
+
 
 GLM_VIDEO_DEFAULT_FPS = 2.0
 GLM_VIDEO_DEFAULT_MAX_FRAMES = 2048
@@ -505,7 +532,39 @@ def _passthrough_video_metadata(video, video_config):
     return _glm_video_metadata(num_frames, fps, num_frames / fps, range(num_frames))
 
 
-class Glm4vImageProcessor(SGLangBaseProcessor):
+@dataclass(frozen=True)
+class Glm4vImagePreprocessArtifact:
+    """Prompt-independent GLM-V processor output for one image."""
+
+    content_digest: str
+    artifact_key: str
+    feature_hash: int
+    # [t, h, w] encoder grid; always one image, so t is 1.
+    grid_thw: tuple[int, int, int]
+    feature: Optional[torch.Tensor]
+
+    @property
+    def has_feature(self) -> bool:
+        return self.feature is not None
+
+    def cache_value(self) -> "Glm4vImagePreprocessArtifact":
+        """Keep CPU processor outputs but never retain a CUDA tensor."""
+        if self.feature is None or self.feature.device.type == "cpu":
+            return self
+        return replace(self, feature=None)
+
+    def cache_size_items(self) -> tuple:
+        return (
+            self.content_digest,
+            self.artifact_key,
+            self.feature_hash,
+            self.grid_thw,
+            self.feature,
+        )
+
+
+class Glm4vImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
+    artifact_modality = Modality.IMAGE
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
     models = [
@@ -543,6 +602,13 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             # Note: For GLM4v videos, it uses the video token before tokenization but uses image token after tokenization
             video_token_id=self.IM_TOKEN_ID,
         ).build(_processor)
+
+        # _merge_kwargs feeds these tokenizer settings into the full path's text
+        # kwargs. The artifact path tokenizes before it expands the image token,
+        # and truncating around that expansion is not the same sequence.
+        self._tokenizer_sets_text_layout = tokenizer_sets_text_layout(
+            self._tokenizer.init_kwargs
+        )
 
     def get_mm_item_offsets(
         self,
@@ -597,7 +663,219 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 
+    def snapshot_media_source(self, source, modality):
+        # The shared PIL identity hashes raw pixels, not EXIF orientation, which
+        # smart_to_rgb applies below. Convert a decoded image before it is
+        # hashed, or two orientations of one pixel buffer share a cache key.
+        if isinstance(source, Image.Image):
+            source = smart_to_rgb(source)
+        return super().snapshot_media_source(source, modality)
+
+    def decode_media_snapshot(self, snapshot, modality):
+        # The RGB conversion _load_single_item applies, so a cached artifact is
+        # built from the same pixels the full path would preprocess.
+        return smart_to_rgb(super().decode_media_snapshot(snapshot, modality))
+
+    def prepare_artifact_batch(
+        self,
+        entries: List[MediaArtifactInput],
+        *,
+        processor=None,
+    ) -> List[Glm4vImagePreprocessArtifact]:
+        """Preprocess image cache misses without retaining prompt-specific state."""
+        if not entries:
+            return []
+
+        processor, _ = self._resolve_processor(processor)
+        image_kwargs = dict(self.image_config or {})
+        processor_device = None
+        if (
+            isinstance(processor.image_processor, BaseImageProcessor)
+            and not self.disable_fast_image_processor
+        ):
+            processor_device = self._fast_image_processor_device(processor)
+            if processor_device is not None:
+                image_kwargs["device"] = processor_device
+
+        with self._temporary_fast_processor_cuda_pool(processor_device):
+            result = processor.image_processor(
+                images=[entry.media for entry in entries],
+                return_tensors="pt",
+                **image_kwargs,
+            )
+            features = result["pixel_values"]
+            if not isinstance(features, torch.Tensor):
+                raise TypeError("GLM-V image processor must return pixel_values")
+            image_grid_thw = torch.as_tensor(result["image_grid_thw"], dtype=torch.long)
+            if self.mm_preprocess_cache.enabled or not self.keep_mm_features_on_device:
+                features = features.cpu()
+            # A CUDA tensor that outlives the pool strands its GPU blocks.
+            del result
+
+        if image_grid_thw.shape != (len(entries), 3):
+            raise ValueError(
+                "GLM-V image processor returned an invalid image_grid_thw shape: "
+                f"{tuple(image_grid_thw.shape)}"
+            )
+        patch_counts = image_grid_thw.prod(dim=1).tolist()
+        if sum(patch_counts) != features.shape[0]:
+            raise ValueError(
+                "GLM-V image processor feature count does not match image grids: "
+                f"{features.shape[0]} != {sum(patch_counts)}"
+            )
+        if len(entries) == 1:
+            per_image_features = [features]
+        else:
+            # One storage per artifact: a slice keeps the whole batch alive, and
+            # the preprocess cache charges every entry for all of it.
+            per_image_features = [part.clone() for part in features.split(patch_counts)]
+
+        artifacts = []
+        for entry, grid, feature in zip(entries, image_grid_thw, per_image_features):
+            artifacts.append(
+                Glm4vImagePreprocessArtifact(
+                    content_digest=entry.content_digest,
+                    artifact_key=entry.artifact_key,
+                    # Hash the typed encoder inputs once on a miss; the digest
+                    # outlives cache_value dropping a device feature.
+                    feature_hash=resolve_multimodal_item_hash(
+                        feature=(feature, grid), namespace=entry.artifact_key
+                    ),
+                    grid_thw=tuple(int(value) for value in grid.tolist()),
+                    feature=feature,
+                )
+            )
+        return artifacts
+
+    def compose_image_artifacts(
+        self,
+        input_text: str,
+        artifacts: List[Glm4vImagePreprocessArtifact],
+    ) -> Optional[MultimodalProcessorOutput]:
+        """Compose prompt tokens and request-owned items from prepared images.
+
+        Returns None when the prompt cannot be aligned with the prepared
+        artifacts; the caller falls back to _process_mm_data_uncached.
+        """
+        image_grid_thw = torch.tensor(
+            [artifact.grid_thw for artifact in artifacts], dtype=torch.long
+        )
+        merge_length = self._processor.image_processor.merge_size**2
+        token_counts = [int(grid.prod()) // merge_length for grid in image_grid_thw]
+        prompt_ids = self._encode_prompt(input_text)
+        try:
+            # The image token is atomic, so expanding it after tokenizing gives
+            # the ids the HF processor gives when it expands the text first.
+            input_ids = self._expand_input_ids(
+                prompt_ids, token_counts, self.mm_tokens.image_token_id
+            )
+        except ValueError:
+            return None
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long)
+        offsets = self.get_mm_item_offsets(
+            input_ids=input_ids_tensor,
+            mm_tokens=self.mm_tokens,
+            modality=Modality.IMAGE,
+        )
+        if len(offsets) != len(artifacts):
+            return None
+
+        mm_items = []
+        for artifact, offset in zip(artifacts, offsets):
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=artifact.feature,
+                offsets=[offset],
+                model_specific_data={
+                    "image_grid_thw": torch.tensor(
+                        [artifact.grid_thw], dtype=torch.long
+                    )
+                },
+            )
+            item.set_identity(artifact.feature_hash.to_bytes(32, "big"))
+            mm_items.append(item)
+
+        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index_glm4v(
+            input_ids=input_ids_tensor.unsqueeze(0),
+            hf_config=self.hf_config,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=None,
+            attention_mask=None,
+        )
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=self._prepare_mm_items_for_transport(mm_items),
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            mrope_positions=mrope_positions.squeeze(1),
+            mrope_position_delta=mrope_position_delta,
+        )
+
+    def _encode_prompt(self, input_text: str) -> List[int]:
+        # Same guard as process_mm_data against a chat template's own BOS.
+        bos = self._tokenizer.bos_token
+        add_special_tokens = not (
+            self._tokenizer_auto_adds_specials and bos and input_text.startswith(bos)
+        )
+        return list(
+            self._tokenizer(input_text, add_special_tokens=add_special_tokens)[
+                "input_ids"
+            ]
+        )
+
+    def _uses_image_artifacts(self, image_data, input_text, request_obj) -> bool:
+        """Whether this request can be composed from per-image artifacts.
+
+        Video, audio, preprocessed inputs and a prompt whose markers do not
+        match its images keep the full path, which loads every modality and
+        tolerates a marker count the artifact path cannot align.
+        """
+        return bool(
+            self.mm_preprocess_cache.enabled
+            and image_data
+            and not request_obj.video_data
+            and not request_obj.audio_data
+            and not self.skip_tokenizer_init
+            and not self._tokenizer_sets_text_layout
+            and not any(self._is_preprocessed_input(item) for item in image_data)
+            # A pre-tokenized prompt is the full path's own decision: it keeps
+            # the given ids only while SGLANG_MM_AVOID_RETOKENIZE is on and the
+            # token-count helper agrees with the processor, and decodes and
+            # tokenizes again otherwise. Expanding the given ids is not that.
+            and isinstance(input_text, str)
+            and self._prompt_markers_match_images(input_text, image_data)
+        )
+
+    def _prompt_markers_match_images(self, input_text: str, image_data) -> bool:
+        modalities = [
+            self.mm_tokens.get_modality_of_token(part)
+            for part in re.split(self.mm_tokens.get_combined_regex(), input_text)
+        ]
+        return modalities.count(Modality.IMAGE) == len(image_data) and all(
+            modality in (None, Modality.IMAGE) for modality in modalities
+        )
+
     async def process_mm_data_async(
+        self,
+        image_data: List[Union[str, bytes]],
+        input_text,
+        request_obj,
+        *args,
+        **kwargs,
+    ):
+        if self._uses_image_artifacts(image_data, input_text, request_obj):
+            artifacts = await self.prepare_media_artifacts(
+                image_data,
+                content_hashes=getattr(request_obj, "mm_content_hashes", None),
+            )
+            composed = self.compose_image_artifacts(input_text, artifacts)
+            if composed is not None:
+                return composed
+        return await self._process_mm_data_uncached(
+            image_data, input_text, request_obj, *args, **kwargs
+        )
+
+    async def _process_mm_data_uncached(
         self,
         image_data: List[Union[str, bytes]],
         input_text,
