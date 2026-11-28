@@ -11,6 +11,8 @@ from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
+from requests import exceptions
+
 from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.serving import benchmark, get_request, set_global_args
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -164,6 +166,31 @@ class TestBenchServingCiCacheFlush(_BenchmarkRunTestCase):
                 self.server.flushes.clear()
                 self._run([row], backend="sglang-oai-chat")
                 self.assertEqual(len(self.server.flushes), flushes)
+
+
+class TestBenchServingServerInfo(_BenchmarkRunTestCase):
+    def test_server_info_request_failure_still_writes_results(self):
+        """A metadata request failure must not discard a completed benchmark."""
+        row = DatasetRow(prompt="p", prompt_len=1, output_len=1)
+        output_file = os.path.join(self.output_dir.name, "result.jsonl")
+        for count, error_type in enumerate(
+            (exceptions.ConnectionError, exceptions.Timeout), start=1
+        ):
+            with self.subTest(error=error_type.__name__):
+                with patch(
+                    "sglang.benchmark.serving.requests.get",
+                    side_effect=error_type("mock /server_info failure"),
+                ):
+                    result = self._run([row], backend="sglang-oai-chat")
+                self.assertEqual(result["completed"], 1)
+                with open(output_file) as file:
+                    saved_results = [json.loads(line) for line in file]
+                self.assertEqual(len(saved_results), count)
+                saved = saved_results[-1]
+                self.assertEqual(saved["completed"], 1)
+                self.assertEqual(saved["total_output_tokens"], 1)
+                self.assertIsNone(saved["server_info"])
+                self.assertIsNone(saved["accept_length"])
 
 
 if __name__ == "__main__":
