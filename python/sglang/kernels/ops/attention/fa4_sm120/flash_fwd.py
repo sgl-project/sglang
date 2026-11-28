@@ -4330,6 +4330,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem_copy_params.smem_thr_copy_Q,
             smem_copy_params.smem_thr_copy_K,
         )
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
         pipeline_k.consumer_release(consumer_state)
 
         if const_expr(self.has_bias):
@@ -4376,6 +4378,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem_copy_params.sV[None, None, consumer_state.index],
             smem_copy_params.smem_thr_copy_V,
         )
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
         pipeline_v.consumer_release(consumer_state)
         consumer_state.advance()
         return consumer_state
