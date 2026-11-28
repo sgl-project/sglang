@@ -20,6 +20,7 @@ class LinearAttnKernelBackend(Enum):
     NV_CUTEDSL = "nv_cutedsl"
     FLASHINFER = "flashinfer"
     FLASHKDA = "flashkda"
+    FLYDSL = "flydsl"
     NVIDIA_KDA = "nvidia_kda"
     PTX_KDA = "ptx_kda"
     HELION = "helion"
@@ -45,6 +46,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_flashkda(self):
         return self == LinearAttnKernelBackend.FLASHKDA
+
+    def is_flydsl(self):
+        return self == LinearAttnKernelBackend.FLYDSL
 
     def is_nvidia_kda(self):
         return self == LinearAttnKernelBackend.NVIDIA_KDA
@@ -131,6 +135,19 @@ def select_verify_intermediate_state_indices(
     )
 
 
+def max_verify_batch_size(pool_size: int) -> int:
+    from sglang.srt.layers.dp_attention import (
+        get_cuda_graph_max_batch_size,
+        get_eager_max_batch_size,
+    )
+
+    return max(
+        pool_size,
+        get_eager_max_batch_size(pool_size),
+        get_cuda_graph_max_batch_size(pool_size),
+    )
+
+
 def build_verify_intermediate_state_indices(pool_size: int, device):
     """Per-request row index into the speculative intermediate scratch
     (`intermediate_ssm` / `intermediate_conv_window`) for the MTP /
@@ -148,16 +165,7 @@ def build_verify_intermediate_state_indices(pool_size: int, device):
     """
     import torch
 
-    from sglang.srt.layers.dp_attention import (
-        get_cuda_graph_max_batch_size,
-        get_eager_max_batch_size,
-    )
-
-    padded_bs = max(
-        pool_size,
-        get_eager_max_batch_size(pool_size),
-        get_cuda_graph_max_batch_size(pool_size),
-    )
+    padded_bs = max_verify_batch_size(pool_size)
     indices = torch.arange(pool_size, dtype=torch.int32, device=device)
     if padded_bs > pool_size:
         indices = torch.cat(

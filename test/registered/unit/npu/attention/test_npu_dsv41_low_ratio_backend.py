@@ -52,7 +52,17 @@ for mod in (
     "sglang.srt.speculative.eagle_info",
     "sglang.srt.speculative.base_spec_worker",
 ):
-    sys.modules.setdefault(mod, MagicMock())
+    # Keep a really-importable module (NPU hosts) untouched: replacing a real
+    # package with a MagicMock poisons sys.modules for the whole pytest
+    # process -- e.g. mha.py's later ``from sgl_kernel_npu.operators.data_move
+    # import ...`` would fail with "'...operators' is not a package". Stub only
+    # what is genuinely missing (pure-CPU hosts).
+    if mod in sys.modules:
+        continue
+    try:
+        __import__(mod)
+    except Exception:
+        sys.modules[mod] = MagicMock()
 
 # Stub deepseek_v2._is_hip to avoid importing the heavy model.
 _ds2_stub = ModuleType("sglang.srt.models.deepseek_v2")
@@ -117,6 +127,14 @@ DS41 = _Ds41Stub()
 # Keep the real resolver for routing tests; other tests use CPU metadata stubs.
 _real_ds41_ops = dsv4_backend._ds41_ops
 dsv4_backend._ds41_ops = lambda: DS41
+
+
+def setUpModule():
+    # DS41 mocks the packed A5 ABI, regardless of the machine collecting the suite.
+    for module in (dsv4_backend, dsv4_memory_pool):
+        unittest.enterModuleContext(
+            patch.object(module, "is_npu_arch35", return_value=True)
+        )
 
 
 def _low_ratio_backend(*, ratios=(1, 2), window=128):

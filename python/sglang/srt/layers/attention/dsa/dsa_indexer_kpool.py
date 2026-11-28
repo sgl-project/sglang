@@ -1744,8 +1744,8 @@ class IndexerKPool(MultiPlatformOp):
         skip_logits_computation = False
         if forward_batch.forward_mode.is_extend_without_speculative():
             if forward_batch.seq_lens_cpu is not None:
-                max_kv_len = forward_batch.seq_lens_cpu.max().item()
-                skip_logits_computation = max_kv_len <= self.index_topk
+                batch_max_kv_len = forward_batch.seq_lens_cpu.max().item()
+                skip_logits_computation = batch_max_kv_len <= self.index_topk
 
         if skip_logits_computation:
             return self._forward_cuda_skip_logits(

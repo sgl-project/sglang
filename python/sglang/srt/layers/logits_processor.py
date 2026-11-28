@@ -632,16 +632,16 @@ class LogitsProcessor(nn.Module):
         info = forward_batch.sampling_info
         if info is None:
             return False
-        from sglang.srt.sampling.sampling_batch_info import adjusts_logits
         from sglang.srt.speculative.sharded_verify import (
             sampling_allows_vocab_shards,
             spec_allows_vocab_shards,
         )
 
-        has_grammar = bool(info.grammars) and any(g is not None for g in info.grammars)
+        route = forward_batch.verify_route
         return sampling_allows_vocab_shards(
             info,
-            adjusts_logits=adjusts_logits(info, has_grammar=has_grammar),
+            adjusts_logits=route.adjusts_logits,
+            need_truncated_sampling=route.need_truncated_sampling,
             return_logprob=forward_batch.return_logprob,
             # request seeds stay on stock seeded sampling
             has_local_keys=self._sharded_verify_temperature_keys
@@ -1444,7 +1444,14 @@ class LogitsProcessor(nn.Module):
             if use_mm_out_dtype and (
                 self.use_fp32_lm_head or self.use_fp32_lm_head_output
             ):
-                if out is None and _gfx1250_lmhead_applies(
+                from sglang.srt.layers.quantization.unquant import (
+                    sm12x_fp32_lm_head,
+                    sm12x_fp32_lm_head_applies,
+                )
+
+                if sm12x_fp32_lm_head_applies(hidden_states, lm_head.weight, out):
+                    logits = sm12x_fp32_lm_head(hidden_states, lm_head.weight, out)
+                elif out is None and _gfx1250_lmhead_applies(
                     hidden_states, lm_head.weight
                 ):
                     # gfx1250: hipBLASLt's FP32-output pick is slow at decode
