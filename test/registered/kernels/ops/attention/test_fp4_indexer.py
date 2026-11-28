@@ -33,6 +33,7 @@ from sglang.test.kernels.deepseek_v4.common import (
     quantize_fp4_indexer_ref,
     store_fp4_index_cache_ref,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -800,6 +801,47 @@ def test_expand_index_page_table_matches_cpu(bs, n, bpp):
         out = expand(table)
         assert out.dtype == torch.int32
         assert torch.equal(out.cpu(), expand(table.cpu()))
+
+
+class TestVerifySelectionRemap(CustomTestCase):
+    def test_rank_local_slots_and_padding(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.verify_shard import (
+            _remap_verify_positions,
+        )
+
+        raw = torch.tensor(
+            [[1, 4, -1], [2, 0, -1]], device=get_device(), dtype=torch.int32
+        )
+        requests = raw.new_tensor([1, 0])
+        output = raw.new_empty((3, 3))
+        request_to_token = torch.arange(24, device=raw.device, dtype=torch.int32).view(
+            2, 12
+        )
+        page_table = raw.new_tensor([[3, 5], [7, 9]])
+
+        for table, ratio, page_size, slots in (
+            (request_to_token, 2, 0, [[7, 10, -1], [2, 0, -1]]),
+            (request_to_token + 100, 2, 0, [[57, 60, -1], [52, 50, -1]]),
+            (page_table, 1, 4, [[13, 20, -1], [30, 28, -1]]),
+            (page_table + 10, 1, 4, [[53, 60, -1], [70, 68, -1]]),
+        ):
+            output.fill_(123)
+            _remap_verify_positions[(output.size(0),)](
+                raw,
+                requests,
+                table,
+                output,
+                raw.size(0),
+                raw.size(1),
+                table.stride(0),
+                output.stride(0),
+                ratio,
+                page_size,
+                4,
+                num_warps=4,
+            )
+            expected = raw.new_tensor([*slots, [-1, -1, -1]])
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Eager-only TP row sharding and query views for the V4.1 prefill indexer."""
+"""Row sharding and query views for the DeepSeek-V4.1 indexer."""
 
 import unittest
 from types import SimpleNamespace
@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+from sglang.srt.layers.attention.dsv4.v41_indexer import verify_shard
 from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import DeepGEMMPrefillData
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -123,6 +124,95 @@ class TestIndexerRowShardDispatch(CustomTestCase):
                 self.assertEqual(inputs.row_shard is not None, expected)
                 if expected:
                     self.assertEqual(inputs.row_shard.local_rows(rows), slice(0, 128))
+
+
+class TestVerifyIndexerRowShardDispatch(CustomTestCase):
+    def test_verify_sharding_is_automatic_for_supported_batches(self):
+        cases = (
+            ("TP4", {}, slice(5, 10)),
+            ("TP8", {"world": 8}, slice(5, 10)),
+            ("decode", {"mode": ForwardMode.DECODE}, None),
+            ("compact verify", {"verify_mode": "compact"}, None),
+            ("cap-accept verify", {"verify_mode": "cap-accept"}, None),
+            ("non-Hopper", {"is_sm90": False}, None),
+            ("DSV4", {"is_dsv41": False}, None),
+            ("draft worker", {"is_draft_runner": True}, None),
+            ("attention DP", {"dp": 2}, None),
+            ("mismatched group", {"mismatched_group": True}, None),
+            ("mismatched TP size", {"tp_size": 8}, None),
+            ("uneven batch", {"batch_size": 5}, None),
+            ("variable width", {"num_rows": 19}, None),
+        )
+        for name, kwargs, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(self.dispatch(**kwargs), [expected])
+
+    def dispatch(
+        self,
+        *,
+        world=4,
+        tp_size=None,
+        dp=1,
+        mismatched_group=False,
+        batch_size=None,
+        num_rows=None,
+        mode=ForwardMode.TARGET_VERIFY,
+        verify_mode="static",
+        is_sm90=True,
+        is_dsv41=True,
+        is_draft_runner=False,
+    ):
+        batch_size = world if batch_size is None else batch_size
+        num_rows = batch_size * 5 if num_rows is None else num_rows
+        ranks = list(range(world))
+        parallel = SimpleNamespace(
+            attn_cp_size=world,
+            attn_cp_rank=1,
+            attn_cp_group=SimpleNamespace(ranks=ranks),
+            tp_size=world if tp_size is None else tp_size,
+            tp_group=SimpleNamespace(ranks=ranks[::-1] if mismatched_group else ranks),
+            attn_dp_size=dp,
+        )
+        inputs = SimpleNamespace(
+            req_rows=torch.empty(num_rows),
+            out_page_indices=torch.empty((num_rows, 4)),
+        )
+        layer = SimpleNamespace(
+            compress_ratio=1,
+            indexer=SimpleNamespace(is_candidate_source=False, uses_candidates=False),
+        )
+        batch = SimpleNamespace(forward_mode=mode, batch_size=batch_size)
+        calls = []
+
+        def record_shard(*, score_rows, **kwargs):
+            calls.append(score_rows)
+            return None
+
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.is_dsv41 = is_dsv41
+        backend.is_draft_runner = is_draft_runner
+        backend.speculative_num_draft_tokens = 5
+        backend.token_to_kv_pool = backend.req_to_token = None
+        backend.forward_metadata = SimpleNamespace(candidate_metadata=None)
+        backend.full_topk_indexer = SimpleNamespace(
+            use_deep_select_decode=False,
+            topk_decode=lambda inputs: calls.append(None),
+        )
+        with (
+            envs.SGLANG_RAGGED_VERIFY_MODE.override(verify_mode),
+            patch.object(
+                backend, "_make_low_ratio_decode_indexer_inputs", return_value=inputs
+            ),
+            patch.object(verify_shard, "get_parallel", return_value=parallel),
+            patch.object(
+                verify_shard,
+                "get_platform",
+                return_value=SimpleNamespace(is_sm90=is_sm90),
+            ),
+            patch.object(verify_shard, "decode_scores", side_effect=record_shard),
+        ):
+            backend._low_ratio_index_topk(layer, None, None, None, None, batch)
+        return calls
 
 
 class TestPrefillQueryView(CustomTestCase):

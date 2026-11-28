@@ -4120,6 +4120,23 @@ class DeepseekV4AttnBackend(
             inputs = self._make_low_ratio_decode_indexer_inputs(
                 layer, x, q_lora, req, pos, mode
             )
+            if (
+                mode.is_target_verify()
+                and read_ragged_verify_mode() is RaggedVerifyMode.STATIC
+            ):
+                from sglang.srt.layers.attention.dsv4.v41_indexer.verify_shard import (
+                    try_sharded_verify,
+                )
+
+                if try_sharded_verify(
+                    self,
+                    forward_batch.batch_size,
+                    inputs,
+                    is_source,
+                    is_consumer,
+                    published,
+                ):
+                    return
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
                 self._publish_candidate_metadata(published)
