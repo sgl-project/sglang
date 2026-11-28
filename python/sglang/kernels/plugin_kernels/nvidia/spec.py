@@ -272,6 +272,12 @@ class VerifySamplingView(msgspec.Struct, frozen=True):
     max_top_k: Optional[int]
     device: torch.device
 
+    # A compatibility name read by the stock verifier, a property so the view's
+    # fields stay exact: the view carries no custom logit processors.
+    @property
+    def has_custom_logit_processor(self) -> bool:
+        return False
+
 
 class WatermarkStateView(Protocol):
     """The watermark operations used during speculative verification."""

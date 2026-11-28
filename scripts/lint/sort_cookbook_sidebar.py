@@ -2,7 +2,7 @@
 """Keep the vendor groups in the Cookbook sidebar sorted alphabetically.
 
 In docs/docs.json, the Cookbook tab has one section per model family
-(Autoregressive, Diffusion, VLA, ...). Each section lists its plain pages
+(Autoregressive, Diffusion, Action, ...). Each section lists its plain pages
 (e.g. the intro) first, followed by one nested group per vendor. This script
 sorts those vendor groups case-insensitively by name, leaving plain pages and
 the pages inside each vendor group untouched.

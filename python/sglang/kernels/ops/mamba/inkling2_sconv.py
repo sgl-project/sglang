@@ -39,6 +39,7 @@ def _sconv_kernel(
     Partial,
     Attention,
     Out,
+    X_ROWS,
     SX: tl.constexpr,
     SW0: tl.constexpr,
     SW1: tl.constexpr,
@@ -80,7 +81,15 @@ def _sconv_kernel(
         gathered = tl.zeros([BLOCK], dtype=tl.float32)
         for k in tl.static_range(TOP_K):
             dst = tl.load(Src2Dst + row * TOP_K + k).to(tl.int64)
-            gathered += tl.load(X + dst * SX + col, valid) * 1.0
+            dst_ok = (dst >= 0) & (dst < X_ROWS)
+            gathered += (
+                tl.load(
+                    X + tl.where(dst_ok, dst, 0) * SX + col,
+                    valid & dst_ok,
+                    other=0,
+                )
+                * 1.0
+            )
         current = gathered.to(X.dtype.element_ty).to(tl.float32)
         if ROUND_BF16:
             current = current.to(tl.bfloat16).to(tl.float32)
@@ -96,8 +105,16 @@ def _sconv_kernel(
         elif TOP_K:
             gathered = tl.zeros([BLOCK], dtype=tl.float32)
             for k in tl.static_range(TOP_K):
-                dst = tl.load(Src2Dst + src * TOP_K + k, from_x, other=0).to(tl.int64)
-                gathered += tl.load(X + dst * SX + col, valid & from_x, other=0) * 1.0
+                dst = tl.load(Src2Dst + src * TOP_K + k, from_x, other=-1).to(tl.int64)
+                dst_ok = from_x & (dst >= 0) & (dst < X_ROWS)
+                gathered += (
+                    tl.load(
+                        X + tl.where(dst_ok, dst, 0) * SX + col,
+                        valid & dst_ok,
+                        other=0,
+                    )
+                    * 1.0
+                )
             value = gathered.to(X.dtype.element_ty).to(tl.float32)
             if ROUND_BF16:
                 value = value.to(tl.bfloat16).to(tl.float32)
@@ -502,6 +519,7 @@ def short_convolution(
             None,
             None,
             None,
+            x.shape[0],
             x.stride(0),
             *weight.stride(),
             *cache.stride(),
@@ -591,6 +609,7 @@ def routed_sconv_epilogue(
             partial,
             attention,
             out,
+            down.shape[0],
             down.stride(0),
             *weight.stride(),
             *cache.stride(),
