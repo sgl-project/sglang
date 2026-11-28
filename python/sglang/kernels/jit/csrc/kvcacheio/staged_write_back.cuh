@@ -6,6 +6,10 @@
 #include <limits>
 #include <vector>
 
+#if !defined(USE_ROCM)
+#include <cuda.h>
+#endif
+
 namespace sglang {
 
 #if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12080
@@ -73,6 +77,36 @@ inline auto get_hip_memcpy_batch_async() -> HipMemcpyBatchAsyncFn {
 }
 #endif
 
+// Return a conservative number of consecutive bytes in the same host
+// registration. Unknown or unsupported pointers must retain per-page copies.
+inline size_t registered_host_span(const void* ptr) {
+#if !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12050
+  using Query = CUresult (*)(void*, CUpointer_attribute, CUdeviceptr);
+  static const auto query = []() -> Query {
+    void* fn = nullptr;
+    cudaDriverEntryPointQueryResult status{};
+    if (cudaGetDriverEntryPointByVersion("cuPointerGetAttribute", &fn, 11000, cudaEnableDefault, &status) !=
+            cudaSuccess ||
+        status != cudaDriverEntryPointSuccess) {
+      return nullptr;
+    }
+    return reinterpret_cast<Query>(fn);
+  }();
+  if (!query) return 0;
+  CUdeviceptr base = 0;
+  size_t size = 0;
+  const auto address = reinterpret_cast<CUdeviceptr>(ptr);
+  if (query(&base, CU_POINTER_ATTRIBUTE_RANGE_START_ADDR, address) != CUDA_SUCCESS ||
+      query(&size, CU_POINTER_ATTRIBUTE_RANGE_SIZE, address) != CUDA_SUCCESS || address < base ||
+      address - base >= size) {
+    return 0;
+  }
+  return size - (address - base);
+#else
+  return 0;
+#endif
+}
+
 inline void copy_page_first_pages_fallback(
     const std::vector<tvm::ffi::TensorView>& src_ptrs,
     std::vector<tvm::ffi::TensorView> dst_ptrs,
@@ -93,12 +127,23 @@ inline void copy_page_first_pages_fallback(
     const size_t src_page_bytes = static_cast<size_t>(page_size * src_stride0 * elem_size);
     const size_t dst_page_bytes = static_cast<size_t>(page_size * dst_stride0 * elem_size);
     RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
-    for (const auto page_offset : irange(num_pages)) {
+    for (int64_t page = 0; page < num_pages;) {
       const char* src_ptr = static_cast<const char*>(src_ptrs[tensor_id].data_ptr()) +
-                            static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
+                            static_cast<size_t>(page * page_size * src_stride0 * elem_size);
       char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
-                      static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
-      RuntimeDeviceCheck(cudaMemcpyAsync(dst_ptr, src_ptr, src_page_bytes, cudaMemcpyDeviceToHost, stream));
+                      static_cast<size_t>(dst_indices_ptr[page * page_size] * dst_stride0 * elem_size);
+      int64_t end = page + 1;
+      if (end < num_pages && dst_indices_ptr[end * page_size] == dst_indices_ptr[page * page_size] + page_size &&
+          dst_page_bytes != 0) {
+        const size_t max_pages = registered_host_span(dst_ptr) / dst_page_bytes;
+        while (end < num_pages && static_cast<size_t>(end - page) < max_pages &&
+               dst_indices_ptr[end * page_size] == dst_indices_ptr[(end - 1) * page_size] + page_size) {
+          ++end;
+        }
+      }
+      RuntimeDeviceCheck(cudaMemcpyAsync(
+          dst_ptr, src_ptr, src_page_bytes * static_cast<size_t>(end - page), cudaMemcpyDeviceToHost, stream));
+      page = end;
     }
   }
 }
@@ -204,6 +249,7 @@ inline bool try_copy_page_first_pages_batch(
     host::RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
     if (tensor_id == 0) {
       first_page_bytes = src_page_bytes;
+      if (first_page_bytes < kLargeCopyThresholdBytes) return false;
     }
     for (const auto page_offset : host::irange(num_pages)) {
       char* src_ptr = static_cast<char*>(src_ptrs[tensor_id].data_ptr()) +
