@@ -83,6 +83,8 @@ class PipelineStage(StageDedupMixin, ABC):
     _registered_stage_name: str | None = None
     _profile_stage_name: str | None = None
     _progress_range: tuple[float, float] = (0.0, 1.0)
+    # Profiling capability is independent of the role used for disaggregation.
+    supports_denoising_step_profiling: bool = False
     # MAIN_RANK_ONLY_AND_SEND_TO_OTHERS: move the received batch's device tensors,
     # unpickled on the sender's device index, to the receiving rank's device.
     relocate_broadcast_batch: bool = False
