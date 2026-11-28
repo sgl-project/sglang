@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=70, suite="base-a-test-cpu")
 
@@ -953,6 +954,73 @@ class TestStorageWorkerStop(unittest.TestCase):
         cc.pp_prefetch_command_thread = finished
         self.assertEqual(cc._storage_worker_threads(), [])
         self.assertEqual(cc.dead_storage_workers(), [])
+
+
+class TestHostResourceRelease(CustomTestCase):
+    def _cache_with_host_buffer(self, controller_type):
+        cc = _controller(controller_type)
+        pool = SimpleNamespace(buffer=[42])
+
+        def destroy():
+            pool.buffer = None
+
+        pool.destroy = destroy
+        cache = object.__new__(UnifiedRadixCache)
+        cache.linker = None
+        cache.cache_controller = cc
+        cache.host_pool_group = pool
+        return cache, cc, pool
+
+    def test_release_keeps_host_buffer_alive_until_backup_exits(self):
+        """Native and hybrid backups must finish reading host buffers;
+        shutdown must keep those buffers alive until the workers exit."""
+        for controller_type in (HiCacheController, HybridCacheController):
+            with self.subTest(controller=controller_type.__name__):
+                cache, cc, pool = self._cache_with_host_buffer(controller_type)
+                entered = threading.Event()
+                reads = Queue()
+
+                def backup():
+                    entered.set()
+                    cc.storage_stop_event.wait()
+                    try:
+                        reads.put(pool.buffer[0])
+                    except Exception as exc:
+                        reads.put(exc)
+
+                worker = cc._start_storage_worker("hicache-backup", backup)
+                cc.backup_thread = worker
+                try:
+                    self.assertTrue(entered.wait(timeout=5))
+                    cache.release_host_resources()
+                finally:
+                    cc.storage_stop_event.set()
+                    worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(reads.get_nowait(), 42)
+                self.assertIsNone(pool.buffer)
+
+    def test_release_retains_host_buffer_when_backup_does_not_stop(self):
+        """A timed-out shutdown must retain a live worker's host buffers;
+        a later shutdown can release them after that worker exits."""
+        cache, cc, pool = self._cache_with_host_buffer(HiCacheController)
+        release = threading.Event()
+        worker = cc._start_storage_worker("hicache-backup", release.wait)
+        cc.backup_thread = worker
+        try:
+            with (
+                patch.object(cache_controller, "STORAGE_STOP_JOIN_S", 0.01),
+                self.assertLogs(cache_controller.logger, level="ERROR"),
+                self.assertRaisesRegex(RuntimeError, "Failed to stop HiCache"),
+            ):
+                cache.release_host_resources()
+            self.assertEqual(pool.buffer, [42])
+            self.assertTrue(worker.is_alive())
+        finally:
+            release.set()
+            worker.join(timeout=5)
+        cache.release_host_resources()
+        self.assertIsNone(pool.buffer)
 
 
 if __name__ == "__main__":

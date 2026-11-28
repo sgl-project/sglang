@@ -56,6 +56,9 @@ class TestQwen35WithHiCache(CustomTestCase):
                 "extra_buffer",
                 "--mamba-track-interval",
                 "128",
+                # Avoid a separate storage file for every KV token.
+                "--page-size",
+                "128",
                 "--mamba-ssm-dtype",
                 "bfloat16",
                 "--speculative-algorithm",

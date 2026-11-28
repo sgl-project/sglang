@@ -699,6 +699,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        # Storage workers can still read host buffers after requests finish.
+        # If a worker cannot stop, retain the buffers instead of freeing them.
+        if self.cache_controller is not None:
+            self.cache_controller._stop_storage_threads()
         if self.linker is not None:
             self.linker.close()
         if self.host_pool_group is not None:
