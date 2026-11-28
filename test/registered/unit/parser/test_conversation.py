@@ -446,6 +446,34 @@ class TestConversationGetPrompt(CustomTestCase):
         self.assertIn("user\nHi\n", prompt)
         self.assertTrue(prompt.endswith("<|endoftext|>"))
 
+    def test_qwen2_vl_embed_none_or_list_stop_str_and_empty_system(self):
+        """Test QWEN2_VL_EMBED handles None/list stop_str and empty system_message."""
+        conv_none = Conversation(
+            name="test",
+            system_template="<|im_start|>system\n{system_message}",
+            system_message="",
+            roles=("<|im_start|>user", "<|im_start|>assistant"),
+            messages=[["<|im_start|>user", "Hi"], ["<|im_start|>assistant", None]],
+            sep_style=SeparatorStyle.QWEN2_VL_EMBED,
+            sep="<|im_end|>\n",
+            stop_str=None,
+        )
+        prompt_none = conv_none.get_prompt()
+        self.assertNotIn("<|im_start|>system", prompt_none)
+        self.assertTrue(prompt_none.endswith("<|im_start|>assistant\n"))
+
+        conv_list = Conversation(
+            name="test",
+            system_template="<|im_start|>system\n{system_message}",
+            system_message="Sys",
+            roles=("<|im_start|>user", "<|im_start|>assistant"),
+            messages=[["<|im_start|>user", "Hi"], ["<|im_start|>assistant", None]],
+            sep_style=SeparatorStyle.QWEN2_VL_EMBED,
+            sep="<|im_end|>\n",
+            stop_str=["<|endoftext|>", "<|im_end|>"],
+        )
+        self.assertTrue(conv_list.get_prompt().endswith("<|endoftext|>"))
+
     def test_chatglm(self):
         """Test prompt generation with CHATGLM style (round numbering)."""
         conv = Conversation(
@@ -507,6 +535,21 @@ class TestConversationGetPrompt(CustomTestCase):
         self.assertIn("<audio>1</audio>", prompt)
         self.assertIn("<audio>2</audio>", prompt)
         self.assertNotIn("{idx}", prompt)
+
+    def test_qwen2_audio_default_or_static_audio_token_does_not_hang(self):
+        """Test QWEN2_AUDIO does not loop infinitely when audio_token is empty or lacks {idx}."""
+        for token in ("", "<audio>"):
+            conv = Conversation(
+                name="test",
+                system_message="",
+                roles=("user", "assistant"),
+                messages=[["user", "Listen: <audio>"], ["assistant", None]],
+                sep_style=SeparatorStyle.QWEN2_AUDIO,
+                sep="\n",
+                audio_token=token,
+            )
+            prompt = conv.get_prompt()
+            self.assertIn("user\nListen: <audio>\n", prompt)
 
     def test_paddle_ocr(self):
         """Test prompt generation with PADDLE_OCR style."""
