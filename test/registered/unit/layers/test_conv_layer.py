@@ -3,11 +3,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import unittest
+from unittest import mock
 
 import torch
 import torch.nn as nn
 
+import sglang.srt.layers.conv as conv_module
 from sglang.srt.layers.conv import Conv2dLayer, Conv3dLayer
+from sglang.test.test_utils import CustomTestCase
 
 
 def _copy_weights(src, dst_nn):
@@ -16,6 +19,124 @@ def _copy_weights(src, dst_nn):
         dst_nn.weight.copy_(src.weight)
         if src.bias is not None:
             dst_nn.bias.copy_(src.bias)
+
+
+class TestConv3dRuntimePolicy(CustomTestCase):
+    def _fallback_required(
+        self,
+        *,
+        torch_version: tuple[int, ...],
+        cudnn_version: int | None,
+        is_cuda: bool = True,
+        is_hip: bool = False,
+    ) -> bool:
+        with (
+            mock.patch.object(conv_module, "is_cuda", return_value=is_cuda),
+            mock.patch.object(conv_module, "is_hip", return_value=is_hip),
+            mock.patch.object(conv_module, "torch_release", torch_version),
+            mock.patch.object(
+                conv_module.torch.backends.cudnn,
+                "version",
+                return_value=cudnn_version,
+            ),
+        ):
+            return conv_module._is_conv3d_linear_fallback_required()
+
+    def test_torch_2_9_0_requires_fallback(self):
+        self.assertTrue(
+            self._fallback_required(torch_version=(2, 9, 0), cudnn_version=91500)
+        )
+
+    def test_torch_2_8_keeps_conv3d(self):
+        self.assertFalse(
+            self._fallback_required(torch_version=(2, 8, 0), cudnn_version=91400)
+        )
+
+    def test_torch_2_9_1_with_old_cudnn_requires_fallback(self):
+        self.assertTrue(
+            self._fallback_required(torch_version=(2, 9, 1), cudnn_version=91400)
+        )
+
+    def test_torch_2_9_1_with_fixed_cudnn_keeps_conv3d(self):
+        self.assertFalse(
+            self._fallback_required(torch_version=(2, 9, 1), cudnn_version=91500)
+        )
+
+    def test_torch_2_10_keeps_conv3d(self):
+        self.assertFalse(
+            self._fallback_required(torch_version=(2, 10, 0), cudnn_version=91400)
+        )
+
+    def test_non_cuda_runtime_keeps_conv3d(self):
+        self.assertFalse(
+            self._fallback_required(
+                torch_version=(2, 9, 1), cudnn_version=91400, is_cuda=False
+            )
+        )
+
+    def test_hip_runtime_keeps_conv3d(self):
+        self.assertFalse(
+            self._fallback_required(
+                torch_version=(2, 9, 1),
+                cudnn_version=91400,
+                is_cuda=True,
+                is_hip=True,
+            )
+        )
+
+    def test_unknown_cudnn_uses_performance_safe_fallback(self):
+        self.assertTrue(
+            self._fallback_required(torch_version=(2, 9, 1), cudnn_version=None)
+        )
+
+    def _make_layer(self, *, stride=(2, 2, 2)) -> Conv3dLayer:
+        with (
+            mock.patch.object(
+                conv_module, "_is_conv3d_linear_fallback_required", return_value=True
+            ),
+            mock.patch.object(conv_module, "print_warning_once") as warning,
+        ):
+            layer = Conv3dLayer(
+                3, 8, kernel_size=(2, 2, 2), stride=stride, disable_linear=True
+            )
+        self._init_warning = warning
+        return layer
+
+    def _picks_linear(self, layer) -> dict[str, bool]:
+        """Run both dispatch targets and report which branch each one took."""
+        x = object()
+        picks = {}
+        for name in ("forward_native", "forward_cuda"):
+            with (
+                mock.patch.object(layer, "_forward_mulmat") as linear,
+                mock.patch.object(layer, "_forward_conv") as conv,
+                mock.patch.object(conv_module, "print_warning_once") as warning,
+            ):
+                getattr(layer, name)(x)
+            self.assertNotEqual(linear.called, conv.called)
+            warning.assert_not_called()
+            picks[name] = linear.called
+        return picks
+
+    def test_override_warns_once_at_construction(self):
+        self._make_layer()
+        self._init_warning.assert_called_once()
+
+    def test_native_and_cuda_paths_both_use_linear_fallback(self):
+        """torch.compile runs forward_native, so it must match forward_cuda."""
+        layer = self._make_layer()
+        self.assertEqual(
+            self._picks_linear(layer),
+            {"forward_native": True, "forward_cuda": True},
+        )
+
+    def test_non_equivalent_conv_cannot_use_linear_fallback(self):
+        layer = self._make_layer(stride=1)
+        self._init_warning.assert_not_called()
+        self.assertEqual(
+            self._picks_linear(layer),
+            {"forward_native": False, "forward_cuda": False},
+        )
 
 
 class TestConv2dLayer(unittest.TestCase):
