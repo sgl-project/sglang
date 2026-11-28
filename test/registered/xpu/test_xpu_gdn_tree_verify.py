@@ -1,11 +1,14 @@
-"""Numerical parity of the XPU GDN target-verify kernel with Triton on a
-branching draft tree (siblings and multi-level parents), including the
-per-node intermediate recurrent states the commit step reads back."""
+"""XPU GDN / KDA recurrent kernels: target-verify parity with Triton on
+branching draft trees, the intermediate-state buffer pitch, and the 4-D KDA
+gate stride."""
 
 import unittest
 
 import torch
 
+from sglang.srt.hardware_backend.xpu.kernels.fla.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.gdn_xpu import XpuGDNKernel
 from sglang.test.ci.ci_register import register_xpu_ci
@@ -26,7 +29,7 @@ TREES = {
     hasattr(torch, "xpu") and torch.xpu.is_available(), "requires an XPU device"
 )
 class TestXpuGdnTreeVerify(CustomTestCase):
-    def _run(self, kernel, parents, seed=0):
+    def _run(self, kernel, parents, seed=0, buffer_steps=None):
         torch.manual_seed(seed)
         dev = "xpu"
         num_req, steps = len(parents), len(parents[0])
@@ -40,7 +43,7 @@ class TestXpuGdnTreeVerify(CustomTestCase):
         A_log = torch.randn(HV, device=dev, dtype=torch.float32)
         dt_bias = torch.randn(HV, device=dev, dtype=torch.bfloat16)
         ssm_states = torch.randn(num_req + 1, HV, V, K, device=dev) * 0.1
-        buffer = torch.zeros(num_req + 1, steps, HV, V, K, device=dev)
+        buffer = torch.zeros(num_req + 1, buffer_steps or steps, HV, V, K, device=dev)
         indices = torch.arange(num_req, device=dev, dtype=torch.int32)
         out = kernel.target_verify(
             A_log,
@@ -74,6 +77,58 @@ class TestXpuGdnTreeVerify(CustomTestCase):
                 torch.testing.assert_close(buf, ref_buf, atol=2e-2, rtol=2e-2)
                 # Verify must not commit state; only the commit step does.
                 torch.testing.assert_close(ssm, ref_ssm, atol=0, rtol=0)
+
+    def test_triton_verify_uses_allocated_buffer_pitch(self):
+        """Adaptive spec verifies fewer drafts than the buffer was sized for; each
+        request's states must still land at its allocated per-request pitch."""
+        parent = TREES["branching"]
+        parents = [parent, parent]
+        steps = len(parent)
+        ref_out, ref_buf, _ = self._run(TritonGDNKernel(), parents)
+        out, buf, _ = self._run(TritonGDNKernel(), parents, buffer_steps=steps + 3)
+        torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
+        torch.testing.assert_close(buf[:, :steps], ref_buf, atol=0, rtol=0)
+        self.assertEqual(torch.count_nonzero(buf[:, steps:]).item(), 0)
+
+
+@unittest.skipUnless(
+    hasattr(torch, "xpu") and torch.xpu.is_available(), "requires an XPU device"
+)
+class TestXpuRecurrentWrapperKdaGate(CustomTestCase):
+    def _run(self, gate_layout):
+        torch.manual_seed(0)
+        dev = "xpu"
+        B, T, HV, K = 2, 4, 4, 128
+        q = torch.randn(B, T, HV, K, device=dev, dtype=torch.bfloat16)
+        k = torch.randn(B, T, HV, K, device=dev, dtype=torch.bfloat16)
+        v = torch.randn(B, T, HV, K, device=dev, dtype=torch.bfloat16)
+        a = torch.randn(B, T, HV, K, device=dev, dtype=torch.bfloat16)
+        b = torch.randn(B, T, HV, device=dev, dtype=torch.bfloat16)
+        state = torch.randn(B, HV, K, K, device=dev) * 0.1
+        out = fused_sigmoid_gating_delta_rule_update(
+            A_log=torch.randn(HV, device=dev, dtype=torch.float32),
+            a=a if gate_layout == "4d" else a.view(B, T, HV * K),
+            dt_bias=torch.randn(HV * K, device=dev, dtype=torch.float32),
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            initial_state_indices=torch.arange(B, device=dev, dtype=torch.int32),
+            use_qk_l2norm_in_kernel=True,
+            is_kda=True,
+        )
+        return out, state
+
+    def test_4d_gate_advances_by_token_stride(self):
+        """A [B, T, H, K] KDA gate must step by its token stride, not its head
+        stride; it reads the same values as the [B, T, H*K] layout."""
+        ref_out, ref_state = self._run("3d")
+        out, state = self._run("4d")
+        torch.testing.assert_close(out, ref_out, atol=0, rtol=0)
+        torch.testing.assert_close(state, ref_state, atol=0, rtol=0)
 
 
 if __name__ == "__main__":
