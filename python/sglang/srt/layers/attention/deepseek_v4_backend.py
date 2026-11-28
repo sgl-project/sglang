@@ -810,7 +810,14 @@ class DSV4AttnMetadata:
             if src_val is None and dst_val is None:
                 continue
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-            dst_val.copy_(src_val)
+            shape_mismatch = dst_val.shape != src_val.shape
+            assert not shape_mismatch or field_name in self._CP_GLOBAL_FIELDS, (
+                f"Only CP-global replay metadata may use a shorter live prefix, "
+                f"got {field_name=} {src_val.shape=} {dst_val.shape=}"
+            )
+            _copy_tensor_allowing_storage_alias(
+                dst_val, src_val, pad_value=0 if shape_mismatch else None
+            )
 
         # Safe to replace: captured kernels read only the per-replay objects, or
         # the field is produced in-graph before the attention graph break reads it.
@@ -1123,6 +1130,27 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
 
 
+def _copy_tensor_allowing_storage_alias(
+    dst: torch.Tensor, src: torch.Tensor, *, pad_value: Optional[int] = None
+) -> None:
+    """Copy replay metadata while preserving capture-stable destination addresses."""
+    if dst is src:
+        return
+    if dst.untyped_storage().data_ptr() == src.untyped_storage().data_ptr():
+        src = src.clone()
+    if dst.shape == src.shape:
+        dst.copy_(src)
+        return
+    assert (
+        pad_value is not None
+        and dst.ndim == src.ndim
+        and dst.shape[0] >= src.shape[0]
+        and dst.shape[1:] == src.shape[1:]
+    ), f"Cannot copy replay metadata from {src.shape=} to {dst.shape=}"
+    dst.fill_(pad_value)
+    dst[: src.shape[0]].copy_(src)
+
+
 @dataclass
 class DSV4Metadata:
     core_attn_metadata: DSV4AttnMetadata
@@ -1328,7 +1356,6 @@ class DeepseekV4AttnBackend(
         self.encoder_replay = False
         self.encoder_row_floor = None
         self.device = torch.device(model_runner.device)
-        self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert head_dim == 512, (
             "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
@@ -1381,7 +1408,7 @@ class DeepseekV4AttnBackend(
             index_heads=int(cfg.index_n_heads),
             index_topk=self.index_topk,
         )
-        self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
+        self.max_kv_len = self.req_to_token_pool.row_width
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
@@ -1410,7 +1437,7 @@ class DeepseekV4AttnBackend(
         if self.dsv4_prefill_backend == DSV4_CUTEDSL_H16_PREFILL_BACKEND:
             self._cutedsl_h16_c128_combined_topk = (
                 _validate_dsv4_cutedsl_h16_combined_topk(
-                    self.max_context_len,
+                    model_runner.model_config.context_len,
                     self.index_topk,
                 )
             )
@@ -1648,7 +1675,10 @@ class DeepseekV4AttnBackend(
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+                # The c1/c2 full top-k always calls this kernel;
+                # SGLANG_FP8_PAGED_MQA_LOGITS_TORCH (on for SM120) drops its schedule.
+                (self.enable_deepseek_v4_fp4_indexer or compress_ratio in (1, 2))
+                and get_platform().is_sm120
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
@@ -2401,7 +2431,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=self.max_kv_len,
             out_loc=out_cache_loc,
             need_compress=True,
             num_groups=bs,
@@ -2471,7 +2501,7 @@ class DeepseekV4AttnBackend(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices,
             seq_lens_casual=seq_lens,
-            max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+            max_seq_len=self.max_kv_len,
             out_loc=out_cache_loc,
             need_compress=True,
         )
@@ -2822,7 +2852,7 @@ class DeepseekV4AttnBackend(
 
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
-        chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+        chosen_max_seq_len = self.max_kv_len
         if seq_lens_cpu is not None:
             seq_lens_cpu = seq_lens_cpu[:bs]
             actual_max_seq_len = seq_lens_cpu.max().item()
@@ -3231,7 +3261,7 @@ class DeepseekV4AttnBackend(
         elif seq_lens_cpu is not None:
             max_seq_len = int(seq_lens_cpu.max().item())
         else:
-            max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+            max_seq_len = self.max_kv_len
         verify_bs = _get_target_verify_bs(forward_batch)
         online_c128_state_slot_offset = self.online_c128_mtp.prepare_forward(
             logical_forward_mode,
@@ -3371,7 +3401,7 @@ class DeepseekV4AttnBackend(
             seq_lens_cpu = forward_batch.seq_lens_cpu
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 return int(seq_lens_cpu.max().item())
-        max_seq_len = forward_batch.max_seq_len_override or self.MAX_SEQ_LEN_FOR_CAPTURE
+        max_seq_len = forward_batch.max_seq_len_override or self.max_kv_len
         if self.low_ratios == (1, 2):
             graph_context_limit = self._prefill_graph_seq_limit()
             if graph_context_limit is not None:
@@ -3507,7 +3537,7 @@ class DeepseekV4AttnBackend(
             is_draft_runner=self.is_draft_runner,
             skip_prefill=False,
             max_bs=max_bs,
-            max_context_len=self.max_context_len,
+            max_kv_len=self.max_kv_len,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             is_read=False,
@@ -3677,8 +3707,11 @@ class DeepseekV4AttnBackend(
             q_lens_cpu = tail.local_lens_cpu
             req_global, pos_global = tail.req_global, tail.pos_global
         else:
+            extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
+            # BCG gathers the capture bucket; compressed state belongs to live rows.
+            total = sum(extend_lens_cpu)
             q_lens_cpu = interleave_rows_per_request(
-                _as_int_list(forward_batch.extend_seq_lens_cpu),
+                extend_lens_cpu,
                 get_parallel().attn_cp_rank,
                 get_parallel().attn_cp_size,
             )

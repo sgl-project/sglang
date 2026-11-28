@@ -17,7 +17,7 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
 )
 
@@ -49,11 +49,10 @@ def _make_server_args(
         "--cuda-graph-backend-prefill=disabled",
         "--gc-warning-threshold-secs",
         "0.5",
-        "--admin-api-key",
-        ADMIN_API_KEY_FOR_TEST,
+        *ADMIN_LAUNCH_ARGS_FOR_TEST,
     ]
     if disable_cuda_graph:
-        extra.append("--disable-cuda-graph")
+        extra.extend(["--disable-decode-cuda-graph", "--disable-prefill-cuda-graph"])
     if canary_on:
         extra += ["--kv-canary", "raise"]
     extra += ["--port", str(DEFAULT_PORT_FOR_SRT_TEST_RUNNER)]

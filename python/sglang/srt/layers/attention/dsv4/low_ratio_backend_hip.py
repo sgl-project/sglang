@@ -12,7 +12,9 @@ from typing import (
     Dict,
     FrozenSet,
     List,
+    NamedTuple,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -192,14 +194,14 @@ def _indexer_inputs(layer, x, q_lora, pos):
 def build_low_ratio_decode_workspaces(
     metadata_by_ratio: Dict[int, PagedIndexerMetadata],
     *,
-    max_context_len: int,
+    max_kv_len: int,
     num_requests: Optional[int] = None,
     page8_ratios: FrozenSet[int] = frozenset(),
 ) -> Dict[int, Union[FP4DecodeWorkspace, FP4RowgroupDecodeWorkspace]]:
     """Capture-safe: everything the schedule kernel touches is pinned in the workspace.
     With the row-group kernel there is no schedule; a request's rows (``num_requests``
     requests of equal row counts, consecutive: decode 1, target-verify its draft rows)
-    score as one sequence, on a table as wide as ``max_context_len`` needs. A page8 pool
+    score as one sequence, on a table as wide as ``max_kv_len`` needs. A page8 pool
     is read by the row-group kernel only."""
     rowgroup = _fp4_rowgroup_enabled()
     workspaces = {}
@@ -220,7 +222,7 @@ def build_low_ratio_decode_workspaces(
             rows_per_request,
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
             table_columns=rowgroup_table_columns(
-                max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+                max_kv_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
             ),
         )
     return workspaces
@@ -231,12 +233,12 @@ def refresh_low_ratio_prefill_workspaces(
     previous: Optional[Dict[int, FP4PrefillWorkspace]],
     *,
     extend_lens: Optional[List[int]],
-    max_context_len: int,
+    max_kv_len: int,
     page8_ratios: FrozenSet[int] = frozenset(),
 ) -> Dict[int, Union[FP4PrefillWorkspace, FP4RowgroupPrefillWorkspace]]:
     """Must run outside CUDA-graph capture; see prepare_fp4_prefill_workspace. A page8 pool
     scores on the row-group kernel, which takes no schedule, on a table as wide as
-    ``max_context_len`` needs (without extend_lens, the indexer builds its workspace
+    ``max_kv_len`` needs (without extend_lens, the indexer builds its workspace
     itself)."""
     previous = previous or {}
     workspaces = {}
@@ -248,7 +250,7 @@ def refresh_low_ratio_prefill_workspaces(
                     extend_lens,
                     page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
                     table_columns=rowgroup_table_columns(
-                        max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+                        max_kv_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
                     ),
                 )
             continue
@@ -280,7 +282,7 @@ def _fill_identity_request(
     """Rows [t, topk] of the -1 filled buffers: column j < lc holds compressed
     position j (its slot / its raw index) when j < lens_row, else -1. An identity
     request publishes no candidates: every reachable block is one."""
-    j = torch.arange(lc, device=lens.device)
+    j = torch.arange(lc, device=lens.device, dtype=torch.int32)
     reach = j[None, :] < lens[:, None]
     page_rows[:, :lc] = torch.where(reach, slots_j[None, :], -1).to(torch.int32)
     if raw_rows is not None:
@@ -435,7 +437,9 @@ def low_ratio_index_topk_hip_decode(
         decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
         page8=page8,
         rowgroup_table_columns=rowgroup_table_columns(
-            backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            backend.max_kv_len,
+            ratio,
+            LOW_RATIO_PAGE_TABLE_BUCKET,
         ),
     )
     # level one is bounded on device by the compressed lengths: a captured step cannot read them back
@@ -476,16 +480,71 @@ def low_ratio_index_topk_hip_decode(
 
 
 def _extend_k_slots(req_to_token, *, ratio, lc_per_req, req_pool_indices, device):
-    """Per request, the c1/c2 pool slots of its visible compressed positions, and
-    each request's start offset in their concatenation."""
+    """Per request, the c1/c2 pool slots (int32) of its visible compressed positions,
+    and each request's start offset in their concatenation. All sizes are host-side,
+    so the gather does not sync."""
     starts = [0, *itertools.accumulate(lc_per_req)][:-1]
-    counts = torch.tensor(lc_per_req, dtype=torch.int64, device=device)
-    req_rows = torch.repeat_interleave(req_pool_indices.to(torch.int64), counts)
-    j = torch.arange(int(counts.sum()), device=device) - torch.repeat_interleave(
-        torch.tensor(starts, dtype=torch.int64, device=device), counts
+    total = sum(lc_per_req)
+    num_reqs = len(lc_per_req)
+    bounds = torch.tensor([*lc_per_req, *starts], dtype=torch.int64, device=device)
+    counts, start_offsets = bounds[:num_reqs], bounds[num_reqs:]
+    req_rows = torch.repeat_interleave(
+        req_pool_indices.to(torch.int64), counts, output_size=total
     )
-    slots = req_to_token[req_rows, j * ratio].to(torch.int64) // ratio
+    j = torch.arange(total, device=device) - torch.repeat_interleave(
+        start_offsets, counts, output_size=total
+    )
+    slots = (req_to_token[req_rows, j * ratio] // ratio).to(torch.int32)
     return slots, starts
+
+
+class LowRatioExtendSlots(NamedTuple):
+    """One ratio's extend slot gather, built once per forward for its index-source layers."""
+
+    slots: torch.Tensor
+    starts: List[int]
+    lc_per_req: List[int]
+    req_pool_indices: torch.Tensor
+
+    def matches(self, lc_per_req: List[int], req_pool_indices: torch.Tensor) -> bool:
+        return (
+            self.lc_per_req == lc_per_req and self.req_pool_indices is req_pool_indices
+        )
+
+
+def build_low_ratio_extend_k_slots(
+    req_to_token: torch.Tensor,
+    *,
+    ratios: Sequence[int],
+    seq_lens_cpu,
+    req_pool_indices: torch.Tensor,
+    index_topk: int,
+    identity_skip: bool,
+) -> Dict[int, LowRatioExtendSlots]:
+    """This forward's extend slot tables by ratio, for the ratios with an identity
+    request. Must run outside graph capture."""
+    tables: Dict[int, LowRatioExtendSlots] = {}
+    if not identity_skip:
+        return tables
+    seq_lens = _as_int_list(seq_lens_cpu)
+    for ratio in ratios:
+        lc_per_req = [s // ratio for s in seq_lens]
+        if not any(lc_per_req) or not any(lc <= index_topk for lc in lc_per_req):
+            continue
+        slots, starts = _extend_k_slots(
+            req_to_token,
+            ratio=ratio,
+            lc_per_req=lc_per_req,
+            req_pool_indices=req_pool_indices,
+            device=req_to_token.device,
+        )
+        tables[ratio] = LowRatioExtendSlots(
+            slots=slots,
+            starts=starts,
+            lc_per_req=lc_per_req,
+            req_pool_indices=req_pool_indices,
+        )
+    return tables
 
 
 def low_ratio_index_topk_hip_extend(
@@ -533,13 +592,19 @@ def low_ratio_index_topk_hip_extend(
     publish = [] if indexer.is_candidate_source else None
     if any(is_identity):
         # only the score-free fill resolves slots itself; scored rows resolve in the top-k transform
-        k_slots, starts = _extend_k_slots(
-            backend.req_to_token,
-            ratio=ratio,
-            lc_per_req=lc_per_req,
-            req_pool_indices=forward_batch.req_pool_indices.to(torch.int64),
-            device=pos.device,
-        )
+        hoisted = backend.low_ratio_extend_k_slots.get(ratio)
+        if hoisted is not None and hoisted.matches(
+            lc_per_req, forward_batch.req_pool_indices
+        ):
+            k_slots, starts = hoisted.slots, hoisted.starts
+        else:
+            k_slots, starts = _extend_k_slots(
+                backend.req_to_token,
+                ratio=ratio,
+                lc_per_req=lc_per_req,
+                req_pool_indices=forward_batch.req_pool_indices,
+                device=pos.device,
+            )
 
     def fill_identity_requests(req_lo, req_hi, tok_lo):
         """Identity requests req_lo..req_hi: rows written without scores, None published per request."""
@@ -586,7 +651,9 @@ def low_ratio_index_topk_hip_extend(
             extend_lens_cpu,
             page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
             table_columns=rowgroup_table_columns(
-                backend.max_context_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+                backend.max_kv_len,
+                ratio,
+                LOW_RATIO_PAGE_TABLE_BUCKET,
             ),
         )
 

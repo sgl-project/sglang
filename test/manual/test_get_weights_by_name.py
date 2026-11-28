@@ -8,8 +8,8 @@ from transformers import AutoModelForCausalLM
 import sglang as sgl
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
     ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -58,8 +58,7 @@ class TestGetWeightsByName(CustomTestCase):
                     str(tp),
                     "--dp-size",
                     str(dp),
-                    "--admin-api-key",
-                    ADMIN_API_KEY_FOR_TEST,
+                    *ADMIN_LAUNCH_ARGS_FOR_TEST,
                 ),
             )
 

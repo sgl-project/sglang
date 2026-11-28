@@ -20,9 +20,6 @@ from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    get_global_component_residency_manager,
-)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     resolve_diffusers_pipeline_offload,
 )
@@ -66,7 +63,7 @@ class DiffusersExecutionStage(PipelineStage):
         kwargs = self._build_pipeline_kwargs(batch)
 
         # Filter kwargs to only those supported by the pipeline, warn about ignored args
-        kwargs, _ = self._filter_pipeline_kwargs(kwargs)
+        kwargs = self._filter_pipeline_kwargs(kwargs)
 
         # Request tensor output for cleaner handling
         if "output_type" not in kwargs:
@@ -90,29 +87,19 @@ class DiffusersExecutionStage(PipelineStage):
 
         return batch
 
-    def _filter_pipeline_kwargs(
-        self, kwargs: dict[str, Any], *, strict: bool = False
-    ) -> tuple[dict[str, Any], list[str]]:
-        """Filter kwargs to those accepted by the pipeline's __call__.
-
-        Args:
-            kwargs: Arguments to filter
-            strict: If True, raise ValueError on unsupported args; otherwise warn
-
-        Returns:
-            Tuple of (filtered_kwargs, ignored_keys)
-        """
+    def _filter_pipeline_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Filter kwargs to those accepted by the pipeline's __call__, warning about the rest."""
         try:
             sig = inspect.signature(self.diffusers_pipe.__call__)
         except (ValueError, TypeError):
-            return kwargs, []
+            return kwargs
 
         params = sig.parameters
         accepts_var_kwargs = any(
             p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
         )
         if accepts_var_kwargs:
-            return kwargs, []
+            return kwargs
 
         valid = set(params.keys()) - {"self"}
 
@@ -130,11 +117,9 @@ class DiffusersExecutionStage(PipelineStage):
                 f"Pipeline '{pipe_name}' does not support: {', '.join(sorted(ignored))}. "
                 "These arguments will be ignored."
             )
-            if strict:
-                raise ValueError(msg)
             logger.warning(msg)
 
-        return filtered, ignored
+        return filtered
 
     def _extract_output(self, output: Any) -> torch.Tensor | None:
         """Extract tensor output from pipeline result."""
@@ -742,10 +727,7 @@ class DiffusersPipeline(ComposedPipelineBase):
         if not self.post_init_called:
             self.post_init()
 
-        self.component_residency_manager = get_global_component_residency_manager(
-            self, server_args
-        )
-        self.executor.component_residency_manager = self.component_residency_manager
+        self._install_component_residency_manager(server_args)
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
 

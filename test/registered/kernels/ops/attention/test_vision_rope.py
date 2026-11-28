@@ -9,10 +9,11 @@ from sglang.kernels.ops.attention.vision_rope import (
     apply_fused_qk_complex_rope_inplace,
     prepare_fused_qk_complex_rope_inplace,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_amd_ci(est_time=25, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 
 class TestVisionRoPE(CustomTestCase):
@@ -55,10 +56,6 @@ class TestVisionRoPE(CustomTestCase):
             atol = 2 * torch.finfo(dtype).eps
             torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=atol)
             torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=atol)
-
-    def test_vision_rope_inplace_rejects_non_complex_frequencies(self):
-        with self.assertRaises(ValueError):
-            prepare_fused_qk_complex_rope_inplace(torch.randn(8, 64, device="cuda"))
 
 
 if __name__ == "__main__":

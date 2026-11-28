@@ -10,35 +10,19 @@ reuse :func:`reduce_sharded_token_keys` without owning the collective.
 from __future__ import annotations
 
 import logging
-from importlib import import_module
 from typing import Optional
 
-import msgspec
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.plugin_kernels.nvidia.spec import VocabShardView
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
 
-_provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
-_provider_vocab_shard = getattr(_provider_spec, "VocabShardView", None)
-if _provider_vocab_shard is None:
-
-    class VocabShard(msgspec.Struct, frozen=True):
-        """Columns [0, valid) are global token ids ``start + column``."""
-
-        start: int
-        valid: int
-        vocab_size: int
-
-else:
-    # When the optional binding contract is installed, expose its one canonical
-    # shard-view type.  Runtime-only builds retain the structurally identical
-    # local type above and never import a binding-only symbol eagerly.
-    VocabShard = _provider_vocab_shard
+VocabShard = VocabShardView
 
 
 def spec_allows_vocab_shards(spec) -> bool:
@@ -51,7 +35,12 @@ def spec_allows_vocab_shards(spec) -> bool:
 
 
 def sampling_allows_vocab_shards(
-    info, *, return_logprob: bool, has_local_keys: bool
+    info,
+    *,
+    adjusts_logits: bool,
+    need_truncated_sampling: bool,
+    return_logprob: bool,
+    has_local_keys: bool,
 ) -> bool:
     """Whether a verify batch's sampling parameters can consume vocabulary shards.
 
@@ -66,20 +55,8 @@ def sampling_allows_vocab_shards(
         # invoking any optional local-key policy.
         not (has_local_keys and envs.SGLANG_SANITIZE_NAN_LOGITS.get())
         and not return_logprob
-        and info.acc_additive_penalties is None
-        and info.acc_scaling_penalties is None
-        and info.logit_bias is None
-        and (
-            info.is_all_greedy
-            or (
-                has_local_keys
-                and not (
-                    info.need_top_k_sampling
-                    or info.need_top_p_sampling
-                    or info.need_min_p_sampling
-                )
-            )
-        )
+        and not adjusts_logits
+        and (info.is_all_greedy or (has_local_keys and not need_truncated_sampling))
     )
 
 

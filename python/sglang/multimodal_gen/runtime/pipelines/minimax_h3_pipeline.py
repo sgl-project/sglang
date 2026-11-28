@@ -44,10 +44,18 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MiniMaxH3ReleaseMetadata,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+    MINIMAX_H3_DUAL_VARIANT,
     MINIMAX_H3_TASK_PARTITIONS,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    maybe_download_model,
+    verify_model_config_and_directory,
+)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
@@ -85,7 +93,21 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     f"{', '.join(missing_media_tools)}. Install the ffmpeg system "
                     "package before starting SGLang."
                 )
+        # fl2va+ref2va: (nickname, target, path) of each transformer's own
+        # release adapter; LoRAPipeline applies one adapter to every transformer
+        self.dual_variant_lora_adapters: list[tuple[str, str, str]] = []
         super().__init__(*args, **kwargs)
+        if self.dual_variant_lora_adapters:
+            self.convert_to_lora_layers()
+            for nickname, target, path in self.dual_variant_lora_adapters:
+                self.set_lora(
+                    nickname,
+                    path,
+                    target=target,
+                    strength=self.server_args.lora_scale,
+                    lora_alpha=self.server_args.lora_alpha,
+                    cache_merged=True,
+                )
 
     @staticmethod
     def model_subfolder_for_variant(variant: str) -> str:
@@ -96,6 +118,8 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             "fl2va": "FL2VA",
             "ref2va": "Ref2VA",
             "hybrid": "Ref2VA",
+            # FL2VA serves the shared components; Ref2VA adds transformer_2
+            MINIMAX_H3_DUAL_VARIANT: "FL2VA",
         }
         try:
             return subfolders[normalized]
@@ -104,6 +128,11 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 f"unsupported MiniMax H3 model variant {variant!r}; "
                 f"supported: {sorted(subfolders)!r}"
             ) from exc
+
+    @classmethod
+    def partition_for_variant(cls, variant: str) -> str:
+        """The release partition a --model-variant must load."""
+        return cls.model_subfolder_for_variant(variant).lower()
 
     def _load_config(self):
         model_variant = self.server_args.model_variant
@@ -138,7 +167,8 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             )
         if (
             model_variant is not None
-            and self.release_metadata.partition != semantic_subfolder.lower()
+            and self.release_metadata.partition
+            != self.partition_for_variant(model_variant)
         ):
             raise ValueError(
                 "MiniMax H3 loaded checkpoint partition does not match "
@@ -152,15 +182,90 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 partition="hybrid",
                 tasks=tuple(MINIMAX_H3_TASK_PARTITIONS),
             )
-        self._apply_release_lora_adapter()
+        if (
+            model_variant is not None
+            and model_variant.strip().lower() == MINIMAX_H3_DUAL_VARIANT
+        ):
+            self._add_ref2va_transformer(model_index)
+            return model_index
+        adapter = self.release_metadata.lora_adapter
+        if adapter is not None:
+            # LoRAPipeline reads server_args.lora_path once the modules are loaded
+            self.server_args.lora_path = self._release_lora_adapter_path(
+                adapter, self.model_path
+            )
         return model_index
 
-    def _apply_release_lora_adapter(self) -> None:
-        """Load a release's bundled LoRA adapter as the startup adapter."""
-        adapter = self.release_metadata.lora_adapter
-        if adapter is None:
-            return
-        adapter_path = os.path.join(self.model_path, adapter)
+    def _add_ref2va_transformer(self, model_index: dict) -> None:
+        """fl2va+ref2va: the Ref2VA transformer loads as ``transformer_2`` and
+        serves ref2va; the FL2VA one serves t2va / fl2va. Text encoder, VAEs,
+        tokenizer and processor are byte-identical between the partitions and
+        load once, from FL2VA."""
+        subfolder = self.model_subfolder_for_variant("ref2va")
+        ref2va_path = os.path.join(os.path.dirname(self.model_path), subfolder)
+        if not os.path.isfile(os.path.join(ref2va_path, "model_index.json")):
+            # a Hub snapshot holds the FL2VA partition only; the Hub cache keeps
+            # one copy of the files both partitions share
+            snapshot = maybe_download_model(
+                self.server_args.model_path,
+                allow_patterns=[f"{subfolder}/**"],
+                revision=self.server_args.revision,
+                model_subfolder=subfolder,
+            )
+            ref2va_path = os.path.join(snapshot, subfolder)
+        ref2va = MiniMaxH3ReleaseMetadata.from_model_index(
+            verify_model_config_and_directory(ref2va_path)
+        )
+        fl2va = self.release_metadata
+        # both transformers run behind the same stages and sampling contract
+        same_contract = replace(
+            ref2va,
+            partition=fl2va.partition,
+            tasks=fl2va.tasks,
+            task_aliases=fl2va.task_aliases,
+        )
+        if ref2va.partition != "ref2va" or same_contract != fl2va:
+            raise ValueError(
+                f"MiniMax H3 --model-variant {MINIMAX_H3_DUAL_VARIANT} needs a "
+                "Ref2VA partition with the FL2VA sampling contract; got "
+                f"{ref2va} vs {fl2va}"
+            )
+        self.release_metadata = replace(
+            fl2va,
+            partition=MINIMAX_H3_DUAL_VARIANT,
+            tasks=fl2va.tasks + ref2va.tasks,
+            task_aliases={**fl2va.task_aliases, **ref2va.task_aliases},
+        )
+        model_index["transformer_2"] = model_index["transformer"]
+        self.required_config_modules.append("transformer_2")
+        self.server_args.component_paths["transformer_2"] = os.path.join(
+            ref2va_path, "transformer"
+        )
+        for nickname, target, metadata, model_dir in (
+            ("fl2va", "transformer", fl2va, self.model_path),
+            ("ref2va", "transformer_2", ref2va, ref2va_path),
+        ):
+            if metadata.lora_adapter is not None:
+                adapter_path = self._release_lora_adapter_path(
+                    metadata.lora_adapter, model_dir
+                )
+                self.dual_variant_lora_adapters.append((nickname, target, adapter_path))
+        logger.info(
+            "MiniMax H3 %s: transformer from %s (%s), transformer_2 from %s (%s); "
+            "text_encoder, video_vae, audio_vae, tokenizer and processor once, "
+            "from %s; release adapters %s",
+            MINIMAX_H3_DUAL_VARIANT,
+            os.path.join(self.model_path, "transformer"),
+            "/".join(fl2va.tasks),
+            os.path.join(ref2va_path, "transformer"),
+            "/".join(ref2va.tasks),
+            self.model_path,
+            self.dual_variant_lora_adapters,
+        )
+
+    def _release_lora_adapter_path(self, adapter: str, model_dir: str) -> str:
+        """A release's bundled LoRA adapter, loaded as the startup adapter."""
+        adapter_path = os.path.join(model_dir, adapter)
         if not os.path.isfile(adapter_path):
             raise ValueError(
                 f"{self.pipeline_name} release adapter not found: {adapter_path}"
@@ -170,8 +275,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                 f"{self.pipeline_name} applies its own release adapter "
                 f"({adapter}); --lora-path cannot replace it"
             )
-        # LoRAPipeline reads server_args.lora_path once the modules are loaded
-        self.server_args.lora_path = adapter_path
+        return adapter_path
 
     def validate_disagg_role(self, role: RoleType) -> None:
         if role != RoleType.MONOLITHIC:
@@ -183,6 +287,17 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
     def initialize_pipeline(self, server_args: ServerArgs) -> None:
         self.pdd_heads = self._resolve_pdd_heads()
         transformer = self.get_module("transformer")
+        release_metadata = getattr(self, "release_metadata", None)
+        if (
+            release_metadata is not None
+            and release_metadata.video_output == "dwd"
+            and getattr(transformer, "dwd_pixel_refiner", None) is None
+        ):
+            raise ValueError(
+                f"{self.pipeline_name}: the release decodes its video with the DiT's "
+                "DWD pixel head, but transformer/config.json declares none "
+                "(dwd_head_config)"
+            )
         if (
             self.pdd_heads
             and transformer is not None
@@ -259,15 +374,25 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
                     else None
                 ),
                 pdd_heads=getattr(self, "pdd_heads", None),
+                raw_sigmas=(
+                    release_metadata.raw_sigmas
+                    if release_metadata is not None
+                    else None
+                ),
             )
         )
         self.add_stage(
             MiniMaxH3DenoisingStage(
                 transformer=self.get_module("transformer"),
+                transformer_2=self.get_module("transformer_2"),
                 pipeline=self,
                 stochastic_sampling=(
                     release_metadata is not None
                     and release_metadata.stochastic_sampling
+                ),
+                dwd_output=(
+                    release_metadata is not None
+                    and release_metadata.video_output == "dwd"
                 ),
             )
         )
@@ -338,6 +463,47 @@ class PikaH3FlexPipeline(MiniMaxH3Pipeline):
         }
 
 
+class PiH3Pipeline(MiniMaxH3Pipeline):
+    """pi-H3: 2- and 4-step pi-Flow adapters of the AdaLN-pruned MiniMax-H3.
+
+    The release's model overlay links the pruned DiT and the MiniMax-H3
+    FL2VA components into one directory per variant: ``2step`` and ``4step``
+    predict the frames with the DiT's pixel head (DWD, no VAE decode);
+    ``2step_vae`` and ``4step_vae`` decode the latents. The root serves
+    ``4step``. Each ``_minimax_h3`` block carries the sampling contract (the
+    unshifted Euler knots, video shift 12, audio shift 3) and the LoRA factors,
+    which load at startup; the adapters' replaced tensors are part of the
+    variant's DiT checkpoint.
+    """
+
+    pipeline_name = "PiH3Pipeline"
+    default_model_subfolder = None
+    VARIANT_SUBFOLDERS = {
+        "2step": "2step",
+        "4step": "4step",
+        "2step-vae": "2step_vae",
+        "4step-vae": "4step_vae",
+    }
+
+    @staticmethod
+    def model_subfolder_for_variant(variant: str) -> str:
+        if not isinstance(variant, str) or not variant.strip():
+            raise ValueError("pi-H3 model variant must be a non-empty string")
+        normalized = variant.strip().lower().replace("_", "-")
+        try:
+            return PiH3Pipeline.VARIANT_SUBFOLDERS[normalized]
+        except KeyError as exc:
+            raise ValueError(
+                f"unsupported pi-H3 model variant {variant!r}; "
+                f"supported: {sorted(PiH3Pipeline.VARIANT_SUBFOLDERS)!r}"
+            ) from exc
+
+    @classmethod
+    def partition_for_variant(cls, variant: str) -> str:
+        cls.model_subfolder_for_variant(variant)
+        return "fl2va"
+
+
 class MiniMaxH3ImagePipeline(MiniMaxH3Pipeline):
     """One image checkpoint for its declared t2i/edit tasks: H3 stages without audio."""
 
@@ -381,5 +547,6 @@ EntryClass = [
     MiniMaxH3Pipeline,
     FastH3Pipeline,
     PikaH3FlexPipeline,
+    PiH3Pipeline,
     MiniMaxH3ImagePipeline,
 ]

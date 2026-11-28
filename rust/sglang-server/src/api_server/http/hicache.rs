@@ -11,32 +11,20 @@ use axum::{
 };
 use sglang_api_types::api::v1 as api;
 
-use crate::api_server::handlers::{ADMIN_KEY_MISSING, HiCacheError, HiCacheManager};
-
-pub(super) fn admin_key_missing() -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({ "error": ADMIN_KEY_MISSING })),
-    )
-        .into_response()
-}
+use super::auth::DeclaredRoute;
+use crate::api_server::handlers::{HiCacheError, HiCacheManager};
 
 pub(super) fn routes(manager: Arc<HiCacheManager>) -> Router {
     Router::new()
-        .route(
+        .declared_route(
             "/hicache/storage-backend",
             get(status).put(attach).delete(detach),
         )
-        .route("/hicache/storage-backend/clear", post(clear))
+        .declared_route("/hicache/storage-backend/clear", post(clear))
         .with_state(manager)
 }
 
-/// The manager refuses attach and detach without an admin key; Python's HTTP
-/// server refuses this status read too, and `/clear` not at all.
 async fn status(State(manager): State<Arc<HiCacheManager>>) -> Response {
-    if !manager.admin_key_configured() {
-        return admin_key_missing();
-    }
     Json(manager.status().await).into_response()
 }
 
@@ -76,7 +64,7 @@ fn storage_response(result: Result<api::HiCacheStorageResponse, HiCacheError>) -
             };
             (status, Json(output)).into_response()
         }
-        Err(HiCacheError::AdminKeyMissing) => admin_key_missing(),
+        Err(HiCacheError::AdminKeyMissing) => super::auth::admin_key_missing(),
         Err(HiCacheError::Core(error)) => (error.http_status(), error.to_string()).into_response(),
     }
 }
@@ -92,7 +80,7 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    use crate::api_server::handlers::{CoreConfig, CoreHandle};
+    use crate::api_server::handlers::{ADMIN_KEY_MISSING, CoreConfig, CoreHandle};
     use crate::message::{
         config::{ApiKeys, ServerArgs},
         request::RequestKind,
@@ -112,10 +100,11 @@ mod tests {
     }
 
     /// Python refuses the storage-backend status, attach and detach without
-    /// an admin key.
+    /// an admin key: 403 from the key check, before any handler.
     #[tokio::test]
     async fn storage_backend_needs_a_configured_admin_key() {
         let (router, intake_rx) = app_with_args(ServerArgs::default());
+        let router = super::super::auth::apply(router, &ApiKeys::default());
         for method in ["GET", "PUT", "DELETE"] {
             let response = router
                 .clone()
@@ -129,7 +118,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
             let body: Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap())
                     .unwrap();

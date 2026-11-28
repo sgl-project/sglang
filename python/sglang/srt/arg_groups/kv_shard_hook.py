@@ -20,6 +20,7 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of
 from sglang.srt.utils.device import get_device_memory_capacity
@@ -60,6 +61,17 @@ def kv_shard_storage_backend_supported(name: Optional[str]) -> bool:
 
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
+    if is_qwen_qsa(model_config_of(server_args).hf_config):
+        # QwenSparseAttnBackend serves every full-attention layer whatever
+        # --attention-backend says; it reads the prefix through the shard
+        # scratch only on the CP-TP group sharing path.
+        if not cfg.enable_cp_tp_group_sharing:
+            raise ValueError(
+                "KV sharding for compressed-QSA models (Qwen4-Exp) requires "
+                "CP-TP group sharing: --enable-prefill-cp with --attn-cp-size "
+                "equal to --tp-size."
+            )
+        return
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
     if prefill_backend == "dsa":
         hf_config = model_config_of(server_args).hf_config
@@ -159,19 +171,6 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "UnifiedRadixCache with a rotation-aware UnifiedTreeCore and does "
             "not support "
             f"--radix-cache-backend={cfg.radix_cache_backend!r}."
-        )
-    # KV sharding defaults to Python even when the general tree default is Rust.
-    # Preserve an explicit backend choice for validation below.
-    if not envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set():
-        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.set("python")
-    tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
-    # A disabled radix cache never matches or inserts, so its tree core never
-    # sees a rotation base; chunked continuations keep the base on the request.
-    if not cfg.disable_radix_cache and tree_core_backend != "python":
-        raise ValueError(
-            "--enable-kv-cache-sharding requires the Python UnifiedTreeCore: "
-            f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={tree_core_backend!r} is "
-            "not supported for sharded KV."
         )
     if cfg.enable_unified_cache_external_linker:
         raise ValueError(
