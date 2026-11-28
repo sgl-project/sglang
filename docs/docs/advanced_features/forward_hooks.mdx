@@ -14,7 +14,7 @@ This is useful for:
 * Debugging model internals
 * Exporting hidden states to external tooling
 
-Hooks are attached once during `ModelRunner.initialize` and run on every forward pass.
+Hooks are attached once at startup, after CUDA graph capture. They run on every forward pass that runs in eager mode, but **not** when a captured CUDA graph is replayed. With default settings on CUDA, both decode and prefill use CUDA graphs, so a hook may never run. See [Hooks and CUDA graphs](#hooks-and-cuda-graphs).
 
 ***
 ### Configuration overview
@@ -149,11 +149,15 @@ The first two cause initialization to fail fast with a descriptive error; the la
 ***
 ### Hook lifecycle and behavior
 
-Hooks are registered in `ModelRunner.initialize()`:
+Hooks are registered once at startup, right after CUDA graph capture (`finalize_cuda_graph_capture` in `model_runner_components/cuda_graph_setup.py`):
 
 ```python Example
-if server_args.forward_hooks:
-    register_forward_hooks(self.model, server_args.forward_hooks)
+# Register forward hooks AFTER cuda-graph capture so their tensor ops are
+# not traced into any captured graph — capture stays hook-free and hooks
+# fire only on the eager forward path (capture replay never runs Python
+# hooks anyway).
+if get_observability().forward_hooks:
+    register_forward_hooks(model_runner.model, get_observability().forward_hooks)
 ```
 
 The actual registration logic is implemented by `register_forward_hooks`:
@@ -218,10 +222,41 @@ def register_forward_hooks(model: nn.Module, hook_specs: List[dict[str, Any]]) -
 Key points:
 
 * Hooks are **forward hooks only** (via `module.register_forward_hook`).
-* They are attached once at initialization.
+* They are attached once at startup, after CUDA graph capture.
+* They run only on the eager forward path. They do **not** run when a CUDA graph is replayed (see below).
 * Hook handles are currently not stored on `ModelRunner` (they cannot be removed later via this API).
 * Failure to match any modules is non-fatal; a warning is logged instead.
 * If a hook factory returns `None`, a warning is logged and that spec is skipped.
+
+***
+### Hooks and CUDA graphs
+
+A CUDA graph replay runs the captured GPU kernels directly and does not call into Python, so PyTorch forward hooks do not run on replayed steps. SGLang registers hooks after graph capture so that the captured graphs stay hook-free.
+
+With default settings on CUDA, both the decode phase and the prefill phase use CUDA graphs. A hook then runs only on batches that fall back to the eager path, which may be never. No warning is logged.
+
+To make hooks run on every forward pass, disable CUDA graphs for both phases:
+
+```bash Command
+python -m sglang.launch_server --model-path <model> \
+  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
+  --forward-hooks '[{"name": "...", "target_modules": ["..."], "hook_factory": "my_project.hooks:factory"}]'
+```
+
+With the offline engine:
+
+```python Example
+import sglang as sgl
+
+llm = sgl.Engine(
+    model_path="<model>",
+    forward_hooks=[...],
+    disable_decode_cuda_graph=True,
+    disable_prefill_cuda_graph=True,
+)
+```
+
+`--cuda-graph-backend-decode disabled --cuda-graph-backend-prefill disabled` does the same. Disabling CUDA graphs lowers throughput; how much depends on the GPU, the model and the batch size.
 
 ***
 ### Writing a hook factory
@@ -290,7 +325,7 @@ This will:
 
 * Hook factories are resolved via `resolve_callable`, which supports `module:factory` and `module.submodule.factory`.
 
-* Hooks are standard PyTorch forward hooks, attached once at startup and invoked on every forward pass.
+* Hooks are standard PyTorch forward hooks, attached once at startup (after CUDA graph capture) and invoked on every eager forward pass. They do not run on CUDA graph replay, so disable CUDA graphs for both phases if a hook must run on every step.
 
 * Misconfiguration is either:
 
