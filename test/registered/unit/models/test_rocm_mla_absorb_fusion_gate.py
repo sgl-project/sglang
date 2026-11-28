@@ -359,5 +359,80 @@ class TestGfx1250FusedRopeCall(_Gfx1250Case):
             torch.testing.assert_close(table[position], expected(position * inv_freq))
 
 
+class _MonoPreAttn(forward_mla_rocm.DeepseekMLARocmForwardMixin):
+    def __init__(self, *, use_dsa: bool, indexer, pre: dict):
+        self.q_lora_rank = 16
+        self.kv_lora_rank = 8
+        self.qk_nope_head_dim = 4
+        self.qk_head_dim = 8
+        self.num_local_heads = 2
+        self.dcp_size = 1
+        self.use_dsa = use_dsa
+        self.indexer = indexer
+        self.layer_id = 3
+        self._mono_pre = pre
+
+    def is_dcp_q_replicate_phase(self, forward_batch):
+        return False
+
+    def should_run_indexer(self, prev_topk_indices=None):
+        return True
+
+    def _split_q_nope_pe(self, q, latent_cache):
+        q_nope = q[..., : self.qk_nope_head_dim]
+        q_pe = q[..., self.qk_nope_head_dim :]
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        return q_nope, q_pe, k_pe
+
+    def _applies_rope_in_prepare(self, forward_batch):
+        return False
+
+
+class TestMonoPreIndexerGuard(CustomTestCase):
+    def _make_pre(self, *, include_q_lora: bool):
+        pre = {
+            "q": torch.zeros(2, 16, dtype=torch.bfloat16),
+            "latent": torch.zeros(2, 12, dtype=torch.bfloat16),
+            "k_nope": torch.zeros(2, 8, dtype=torch.bfloat16),
+            "q_nope_out": torch.zeros(2, 2, 8, dtype=torch.bfloat16),
+        }
+        if include_q_lora:
+            pre["q_lora"] = torch.zeros(2, 16, dtype=torch.bfloat16)
+        return pre
+
+    def test_mono_pre_skips_indexer_when_use_dsa_is_false(self):
+        """Non-DSA MLA models using _mono_pre have indexer=None and must not call it."""
+        pre = self._make_pre(include_q_lora=False)
+        attn = _MonoPreAttn(use_dsa=False, indexer=None, pre=pre)
+        result = attn.forward_absorb_rocm_prepare(
+            positions=torch.zeros(2, dtype=torch.int64),
+            hidden_states=torch.zeros(2, 16, dtype=torch.bfloat16),
+            forward_batch=_batch(ForwardMode.TARGET_VERIFY),
+            zero_allocator=None,
+        )
+        self.assertIs(result[2], pre["q_nope_out"])
+        self.assertIsNone(result[7])
+
+    def test_mono_pre_runs_indexer_when_use_dsa_is_true(self):
+        """DSA models using _mono_pre still invoke self.indexer and return topk_indices."""
+        sentinel = torch.tensor([[0, 1], [1, 0]])
+        calls = []
+
+        def fake_indexer(**kwargs):
+            calls.append(kwargs)
+            return sentinel
+
+        pre = self._make_pre(include_q_lora=True)
+        attn = _MonoPreAttn(use_dsa=True, indexer=fake_indexer, pre=pre)
+        result = attn.forward_absorb_rocm_prepare(
+            positions=torch.zeros(2, dtype=torch.int64),
+            hidden_states=torch.zeros(2, 16, dtype=torch.bfloat16),
+            forward_batch=_batch(ForwardMode.TARGET_VERIFY),
+            zero_allocator=None,
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertIs(result[7], sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
