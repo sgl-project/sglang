@@ -9,7 +9,8 @@
 //
 // Every datacenter recipe on this page is single-node: BF16 and FP8 run TP4 (so
 // four GPUs of an 8-GPU H200/B200/B300 host, or a whole 4-GPU GB300 node).
-// Both RadixArk and NVIDIA NVFP4 recipes use TP1. The AMD cells run TP8.
+// Both RadixArk and NVIDIA NVFP4 recipes use TP1. The AMD BF16 and FP8 cells run
+// TP8; AMD's Quark MXFP4 checkpoint (116 GiB) fits one MI355X, so its cells run TP1.
 // That fits because 6B active
 // params keeps compute small and the N-gram table is the only large weight block.
 // The one multi-node shape is NVFP4 on a pair of DGX Sparks (GB10): the 126 GiB
@@ -41,7 +42,9 @@ export const config = {
   ],
   // Checkpoint precisions. NVFP4 is SGLang's own Blackwell-only quantization of
   // the BF16 weights (RadixArk), so it has no H200 or AMD cell — SM90 and CDNA4
-  // have no NVFP4 path. AMD serves the upstream BF16 and FP8 repos.
+  // have no NVFP4 path. AMD serves the upstream BF16 and FP8 repos, and on MI355X
+  // also its own Quark MXFP4 export (MXFP4 MoE experts, FP8 attention, FP8 N-gram
+  // table), which is why MXFP4 has no NVIDIA or MI350X cell.
   // Two NVFP4 exports exist: RadixArk's (routed experts NVFP4, everything else
   // BF16 with an FP8 N-gram table) and NVIDIA's ModelOpt MIXED_PRECISION export
   // (NVFP4 experts, FP8 N-gram table, FP8 block-scaled MTP experts). The NVIDIA
@@ -51,10 +54,13 @@ export const config = {
     { id: "fp8",        label: "FP8"          },
     { id: "nvfp4",      label: "NVFP4 (RDXA)" },
     { id: "nvfp4-nvda", label: "NVFP4 (NVDA)" },
+    { id: "mxfp4",      label: "MXFP4"        },
   ],
   // BF16, FP8 and NVFP4 each ship two operating points, low latency adding the
   // in-checkpoint MTP head (NEXTN 3/1/4) on top of the high-throughput shape.
-  // The two AMD platforms ship one recipe each, which parks under `balanced`.
+  // The AMD BF16 and FP8 cells ship one recipe each, which parks under `balanced`;
+  // the MI355X MXFP4 cells ship a low-latency (concurrency 1-8, monokernel) and a
+  // balanced (concurrency 12-16) point, both with MTP.
   strategies: [
     { id: "low-latency",     label: "Low Latency"     },
     { id: "balanced",        label: "Balanced"        },
@@ -146,6 +152,8 @@ export const config = {
     "default|fp8":   "Qwen/Qwen3.8-Flash-Next-FP8",
     "default|nvfp4": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
     "default|nvfp4-nvda": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    // AMD's Quark export; the cells pass --quantization quark.
+    "default|mxfp4": "amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8",
   },
 
   placeholders: {
@@ -212,6 +220,10 @@ export const config = {
     gb300:  "lmsysorg/sglang:latest",
     mi350x: "lmsysorg/sglang-rocm:qwen38flashnext",
     mi355x: "lmsysorg/sglang-rocm:qwen38flashnext",
+    // The MXFP4 cells are the InferenceX-tested ROCm 10 nightly (SGLang e9c18259c7,
+    // AITER 285579b6, sgl-amd-mono b10f3b71), which carries the FlyDSL kernels and
+    // the monokernel the cells use.
+    "mi355x|mxfp4": "lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261031",
   },
 
   github: {
@@ -1482,6 +1494,98 @@ export const config = {
         "--mem-fraction-static 0.9",
         "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
         "--trust-remote-code",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    // ==== MXFP4 (AMD Quark export) on MI355X ====
+    // One MI355X (TP1): the 116 GiB checkpoint holds MXFP4 MoE experts (the MTP
+    // head's included), FP8 attention and an FP8 N-gram table. Both cells run
+    // NEXTN MTP with `--attention-backend aiter --page-size 64`, as measured in
+    // SemiAnalysis InferenceX (the "MI355X deployment measured with SemiAnalysis
+    // InferenceX" section of this page lists the higher-concurrency HiCache points).
+    // `SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1` keeps `--mem-fraction-static` as
+    // given instead of the aiter backend's 0.85 scaling for long-context models;
+    // `AITER_GDR_FLYDSL=1` runs the GDN recurrence on the FlyDSL kernels.
+    //
+    // Low latency: concurrency 1-8 on the FlyDSL monokernel (`--enable-amd-monokernel`),
+    // which runs MTP target verify and every draft step. It needs NEXTN 3/1/4 and this
+    // checkpoint, reads the N-gram table on the GPU (no PLE offload), writes the
+    // per-draft SSM states itself (no `--enable-linear-replayssm-spec`), and takes
+    // admission equal to the concurrency.
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "low-latency", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1", "AITER_GDR_FLYDSL=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
+        "--tp-size 1",
+        "--quantization quark",
+        "--attention-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--mamba-ssm-dtype bfloat16",
+        "--json-model-override-args '{\"text_config\": {\"ple_embedding_dtype\": \"float8_e4m3fn\"}}'",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--enable-amd-monokernel",
+        "--mem-fraction-static 0.9",
+        "--chunked-prefill-size 16384",
+        "--max-running-requests 8",
+        "--cuda-graph-max-bs-decode 8",
+        "--scheduler-recv-interval 10",
+        "--stream-interval 50",
+        "--tokenizer-worker-num 6",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--default-chat-template-kwargs '{\"enable_thinking\": false}'",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--watchdog-timeout 1200",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    // Balanced: concurrency 12-16 on the default path, MTP with ReplaySSM, the N-gram
+    // table offloaded to pinned host memory (`--ple-offload-embedding`, about 82 GB of
+    // weights stay on the GPU; offloading this checkpoint needs the
+    // `--json-model-override-args` value, which declares the table's FP8 storage), and
+    // admission at twice the concurrency so bursts still decode in a captured graph.
+    {
+      match: { hw: "mi355x", variant: "default", quant: "mxfp4", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: ["SGLANG_AITER_HONOR_EXPLICIT_MEM_FRACTION=1", "AITER_GDR_FLYDSL=1"],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--trust-remote-code",
+        "--tp-size 1",
+        "--quantization quark",
+        "--attention-backend aiter",
+        "--page-size 64",
+        "--kv-cache-dtype auto",
+        "--mamba-ssm-dtype bfloat16",
+        "--ple-offload-embedding",
+        "--json-model-override-args '{\"text_config\": {\"ple_embedding_dtype\": \"float8_e4m3fn\"}}'",
+        "--speculative-algorithm NEXTN",
+        "--speculative-num-steps 3",
+        "--speculative-eagle-topk 1",
+        "--speculative-num-draft-tokens 4",
+        "--enable-linear-replayssm-spec",
+        "--mem-fraction-static 0.9",
+        "--chunked-prefill-size 16384",
+        "--max-running-requests 32",
+        "--cuda-graph-max-bs-decode 32",
+        "--scheduler-recv-interval 10",
+        "--stream-interval 50",
+        "--tokenizer-worker-num 6",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--default-chat-template-kwargs '{\"enable_thinking\": false}'",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--watchdog-timeout 1200",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
