@@ -730,6 +730,13 @@ fn emit_tuple_codec(out: &mut String, m: &MessageModel, fields: &[FieldModel]) {
 fn emit_bare_list_codec(out: &mut String, m: &MessageModel, item: &FieldModel) {
     let name = &m.rust_name;
     let elem = match &item.kind {
+        // Token prompts can contain 100k+ JSON integers. Skip the scalar
+        // helper call for plain ints and retain its errors for other values.
+        FieldKind::RepeatedScalar {
+            ty: ty @ ScalarTy::I64,
+        } if name == "TokenIds" => {
+            format!("e if type(e) is int else {}", expect_call(ty, "e", None))
+        }
         FieldKind::RepeatedScalar { ty } => expect_call(ty, "e", None),
         FieldKind::RepeatedMessage { rust_path } => format!("decode_{rust_path}(e)"),
         other => panic!("{name}: bare_list item must be repeated, got {other:?}"),

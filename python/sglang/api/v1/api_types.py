@@ -4563,7 +4563,7 @@ KvHintsEnvelopeOrList = Union[KvHintsEnvelope, KvHintsEnvelopeList]
 
 
 def decode_TokenIds(value: Any) -> TokenIds:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+    return [e if type(e) is int else _expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_TokenIds(v: TokenIds) -> List[Any]:
