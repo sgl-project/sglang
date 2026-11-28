@@ -7,9 +7,12 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+_is_hip = is_hip()
 
 _FLASHINFER_TIE_BREAK_VALUES = {
     "small": 1,
@@ -106,6 +109,30 @@ class DSATopKBackend(Enum):
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
+
+        # Ahead of v2 and independent of it: ROCm turns v2 off for DSA by default,
+        # and real_page_table is always built on ROCm (only CUDA drops page_table_1).
+        if (
+            _use_triton_topk(logits, topk)
+            and self.is_sgl_kernel()
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and row_starts is None
+            and batch_idx_list is None
+            and lengths.shape[0]
+            == logits.shape[0]
+            == attn_metadata.real_page_table.shape[0]
+        ):
+            from sglang.kernels.ops.attention.dsa.triton_topk_transform import (
+                topk_transform_paged_triton,
+            )
+
+            return topk_transform_paged_triton(
+                logits,
+                lengths,
+                attn_metadata.real_page_table,
+                attn_metadata.page_size,
+                topk,
+            )
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
         # verify / draft-extend, whose expanded rows match the same shape) routes
@@ -310,6 +337,24 @@ def _topk_unfused(
     topk_indices[:, :valid_topk] = topk_local_indices
 
     return topk_indices
+
+
+def _use_triton_topk(logits: torch.Tensor, topk: int) -> bool:
+    """SGLANG_DSA_TOPK_TRITON (ROCm): the single-pass selector for decode-shaped
+    PAGED rows; see kernels/ops/attention/dsa/triton_topk_transform.py."""
+    if not _is_hip or not envs.SGLANG_DSA_TOPK_TRITON.get():
+        return False
+
+    from sglang.kernels.ops.attention.dsa.triton_topk_transform import MAX_ROWS
+
+    return (
+        0 < logits.shape[0] <= MAX_ROWS
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.shape[0] * logits.stride(0) * 4 < 2**31
+        and 0 < topk <= 2048
+        and topk & (topk - 1) == 0  # the selector's output tile is tl.arange(0, topk)
+    )
 
 
 def _topk_transform_v2_paged(
