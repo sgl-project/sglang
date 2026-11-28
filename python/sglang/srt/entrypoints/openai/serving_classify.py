@@ -6,10 +6,10 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
-import torch.nn.functional as F
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
+from sglang.srt.configs.embedding_model_spec import EmbeddingTask
 from sglang.srt.entrypoints.openai.protocol import (
     ClassifyRequest,
     ClassifyResponse,
@@ -39,6 +39,10 @@ class OpenAIServingClassify(OpenAIServingBase):
         self.is_multi_label = (
             getattr(self.tokenizer_manager.model_config.hf_config, "problem_type", None)
             == "multi_label_classification"
+        )
+        self.is_token_classifier = (
+            self.tokenizer_manager.model_config.embedding_model_spec.task
+            == EmbeddingTask.TOKEN_CLASSIFY
         )
         self.model_name = (
             self.tokenizer_manager.served_model_name
@@ -159,39 +163,21 @@ class OpenAIServingClassify(OpenAIServingBase):
         prompt_tokens = 0
 
         for i, item in enumerate(ret):
-            embedding = item.get("embedding", [])
             meta_info = item.get("meta_info", {})
+            num_tokens = meta_info.get("prompt_tokens", 0)
 
-            prompt_tokens += meta_info.get("prompt_tokens", 0)
+            prompt_tokens += num_tokens
 
-            if embedding:
-                try:
-                    embedding_tensor = torch.tensor(embedding, dtype=torch.float32)
-                    probs = (
-                        torch.sigmoid(embedding_tensor)
-                        if self.is_multi_label
-                        else F.softmax(embedding_tensor, dim=0)
-                    ).tolist()
-
-                    predicted_class = torch.argmax(embedding_tensor).item()
-
-                    label = self.id2label[predicted_class]
-
-                except Exception as e:
-                    logger.error(f"Error processing embedding for item {i}: {e}")
-                    probs = [1.0]
-                    label = "Default"
-            else:
-                probs = [1.0]
-                label = "Default"
-
-            classify_obj = {
-                "index": i,
-                "label": label,
-                "probs": probs,
-                "num_classes": len(probs),
-            }
-            classify_objects.append(classify_obj)
+            if "embedding" not in item:
+                raise RuntimeError("Missing classification scores in model output")
+            classify_objects.append(
+                {
+                    "index": i,
+                    **self._classify_scores(
+                        scores=item["embedding"], num_tokens=num_tokens
+                    ),
+                }
+            )
 
         response = {
             "id": request_id,
@@ -208,3 +194,49 @@ class OpenAIServingClassify(OpenAIServingBase):
         }
 
         return ClassifyResponse(**response)
+
+    def _classify_scores(self, *, scores: Any, num_tokens: int) -> Dict[str, Any]:
+        rows = self._score_rows(scores=scores, num_tokens=num_tokens)
+        probs = (
+            torch.sigmoid(rows) if self.is_multi_label else torch.softmax(rows, dim=-1)
+        ).tolist()
+        labels = [self._label(class_id) for class_id in rows.argmax(dim=-1).tolist()]
+        if not self.is_token_classifier:
+            probs, labels = probs[0], labels[0]
+        return {"label": labels, "probs": probs, "num_classes": rows.shape[-1]}
+
+    def _score_rows(self, *, scores: Any, num_tokens: int) -> torch.Tensor:
+        # one row for a sequence, or one per input token
+        try:
+            rows = torch.as_tensor(scores, dtype=torch.float32)
+        except (TypeError, ValueError, RuntimeError) as e:
+            # handle_request maps ValueError to 400, but this is a server fault.
+            raise RuntimeError(f"Malformed classification scores: {e}") from e
+        shape = list(rows.shape)
+        if not self.is_token_classifier:
+            if len(shape) != 1 or not rows.numel():
+                raise RuntimeError(
+                    f"Expected [num_classes] classification scores, got shape {shape}"
+                )
+            return rows.unsqueeze(0)
+        if len(shape) != 2 or shape[0] != num_tokens or not rows.numel():
+            raise RuntimeError(
+                f"Expected [{num_tokens}, num_classes] classification scores, "
+                f"got shape {shape}"
+            )
+        # token heads require one id2label entry per score column
+        if self.id2label.keys() != set(range(shape[1])):
+            raise RuntimeError(
+                f"Got {shape[1]} classification scores per token, but id2label "
+                f"does not map exactly class ids 0..{shape[1] - 1}"
+            )
+        return rows
+
+    def _label(self, class_id: int) -> str:
+        # sequence heads only require the winning class label
+        if class_id not in self.id2label:
+            raise RuntimeError(
+                f"Predicted class {class_id} of the classification scores "
+                "has no id2label entry"
+            )
+        return self.id2label[class_id]

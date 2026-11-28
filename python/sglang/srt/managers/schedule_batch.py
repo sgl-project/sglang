@@ -150,10 +150,10 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.logit_bias import LogitBiasEntries
-from sglang.srt.sampling.sampler_params import SamplerParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params_pool import SamplingRows
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -3186,7 +3186,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             vocab_size=self.model_config.vocab_size, device=self.device
         )
         # Workers launch some idle batches themselves, without the scheduler's builds.
-        self.sampling_info.set_sampler_params(SamplerParams.empty(self.device))
+        self.sampling_info.set_rows(SamplingRows.empty(self.device))
         self.sampling_info.set_step_state([])
 
     def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:

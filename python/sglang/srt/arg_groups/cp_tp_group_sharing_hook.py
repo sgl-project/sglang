@@ -84,7 +84,8 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
             )
 
     unsupported = {
-        "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split,
+        "enable-dsa-cache-layer-split": cfg.enable_dsa_cache_layer_split
+        and not (get_platform().is_npu and arch == "KimiK31ForConditionalGeneration"),
         "dcp-size > 1": cfg.dcp_size > 1,
         "enable-mixed-chunk": cfg.enable_mixed_chunk,
         "moe-dp-size > 1": cfg.moe_dp_size > 1,

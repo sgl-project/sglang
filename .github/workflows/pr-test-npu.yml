@@ -775,6 +775,7 @@ jobs:
       image: ${{ needs.set-image-config.outputs.CANN_image_a3 }}
       install_sglang_deps: true
       device_type_for_deps: 'a3'
+      partitions: '{"size":2,"arr":[0,1]}'
       only_tests: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_extra_c_acc_test_16_npu_a3 }}
       use_coverage_runner: ${{ inputs.coverage_mode == true }}
 

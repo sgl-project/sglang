@@ -1,3 +1,4 @@
+# Vendored from facebookexperimental/triton third_party/tlx/ops/kernels/router_gemm/gfx950.py at 87abb3f5a (MIT); see kernels/README.md.
 """FP32 MoE router logits ``x.float() @ weight.T`` for a BF16 ``x`` and an FP32 ``weight``, on gfx950.
 
 gfx950 has no TF32 matrix instruction, and FP32 MFMA runs at a sixteenth of the BF16 rate. Every product here is

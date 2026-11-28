@@ -2143,6 +2143,15 @@ class DetachHiCacheStorageReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class UpdateCacheLinkerReqInput(BaseReq, kw_only=True):
+    attach: bool
+
+
+class UpdateCacheLinkerReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
+
+
 class PauseGenerationReqInput(BaseReq, kw_only=True):
     """
     Note that the PauseGenerationRequests is only supported in SGLang Server.
