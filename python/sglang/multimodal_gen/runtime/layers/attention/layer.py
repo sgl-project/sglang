@@ -59,11 +59,13 @@ from sglang.multimodal_gen.runtime.layers.attention.turbo_layer import (
     async_a2a_communicate,
 )
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _can_use_packed_qkv_a2a_4d,
     _ipc_input_a2a_qkv,
     _merge_attention_partials,
     _ring_attention_varlen,
     _usp_input_all_to_all,
     _usp_input_all_to_all_qkv,
+    _usp_input_all_to_all_qkv_behind_prefix,
     _usp_input_all_to_all_varlen,
     _usp_output_all_to_all,
     _usp_output_all_to_all_varlen,
@@ -2328,7 +2330,23 @@ class USPAttention(nn.Module):
             return self.attn_impl.forward(q_group, k_group, v_group, ctx_attn_metadata)
 
         def sequential():
-            if (
+            packed_ok = _can_use_packed_qkv_a2a_4d(
+                q, k_shard, v_shard, get_ulysses_parallel_world_size()
+            )
+            if packed_ok and q.shape[0] == 1 and get_ring_parallel_world_size() == 1:
+                h_local = q.shape[2] // get_ulysses_parallel_world_size()
+                heads = slice(u_rank * h_local, (u_rank + 1) * h_local)
+                q_all, k_all, v_all = _usp_input_all_to_all_qkv_behind_prefix(
+                    q, k_shard, v_shard, k_rep[:, :, heads], v_rep[:, :, heads]
+                )
+                out = self.attn_impl.forward(q_all, k_all, v_all, ctx_attn_metadata)
+                return _usp_output_all_to_all(out, head_dim=2)
+            if packed_ok:
+                # One packed collective moves Q and the K/V suffix together.
+                q_gathered, k_gathered, v_gathered = _usp_input_all_to_all_qkv(
+                    q, k_shard, v_shard
+                )
+            elif (
                 q.device.type == "cuda"
                 and get_ulysses_parallel_world_size() > 1
                 and not torch.compiler.is_compiling()
