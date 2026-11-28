@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU checks of when the EAGLE draft worker binds the target's embedding and lm_head:
-under embedding replication before the scheduler sizes the KV pool (so the draft's own
-full table is freed first), otherwise in ``alloc_memory_pool`` as before."""
+"""CPU checks of when EAGLE draft workers bind the target's embedding and lm_head:
+both single-layer and multi-layer draft workers share them in ``__init__`` before
+the scheduler sizes the KV pool (so duplicate draft vocabulary tensors are freed
+first), and keep an idempotent fallback in ``alloc_memory_pool``."""
 
 import ast
 import inspect
@@ -12,13 +13,16 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.environ import envs
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from sglang.srt.speculative.multi_layer_eagle_worker_v2 import (
+    MultiLayerEagleDraftWorker,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-def _run(replicate: bool) -> list:
+def _run_eagle(replicate: bool, *, share_in_init: bool = True) -> list:
     """The order of the draft worker's calls from the end of ``__init__`` through
     ``alloc_memory_pool``."""
     calls = []
@@ -51,21 +55,63 @@ def _run(replicate: bool) -> list:
         ),
     ):
         worker.target_embed_and_head_shared = False
-        worker._maybe_share_embed_before_pool_sizing()
+        if share_in_init:
+            worker._share_target_embed_and_head()
+        calls.append("target_pool")
+        worker.alloc_memory_pool()
+    return calls
+
+
+def _run_multi_layer(*, share_in_init: bool = True) -> list:
+    """The order of ``MultiLayerEagleDraftWorker`` calls from ``__init__`` through
+    ``alloc_memory_pool``."""
+    calls = []
+    worker = MultiLayerEagleDraftWorker.__new__(MultiLayerEagleDraftWorker)
+    worker.draft_worker = MagicMock()
+    worker.draft_worker.alloc_memory_pool.side_effect = lambda **_: calls.append(
+        "draft_pool"
+    )
+    worker.draft_runner = worker.draft_worker.model_runner
+    worker.topk = 1
+    with (
+        patch.object(
+            MultiLayerEagleDraftWorker,
+            "init_lm_head",
+            lambda self: calls.append("lm_head"),
+        ),
+        patch.object(
+            MultiLayerEagleDraftWorker,
+            "_init_boundary_kv_fix_state",
+            lambda self: None,
+        ),
+        patch(
+            "sglang.srt.speculative.multi_layer_eagle_worker_v2.get_schedule",
+            return_value=SimpleNamespace(page_size=1),
+        ),
+    ):
+        worker.target_embed_and_head_shared = False
+        if share_in_init:
+            worker._share_target_embed_and_head()
         calls.append("target_pool")
         worker.alloc_memory_pool()
     return calls
 
 
 class TestEagleDraftEmbedShare(CustomTestCase):
-    def test_replicated_embedding_is_shared_before_the_pool_is_sized(self):
+    def test_default_embedding_is_shared_before_the_pool_is_sized(self):
         self.assertEqual(
-            _run(True), ["token_map", "lm_head", "target_pool", "draft_pool"]
+            _run_eagle(False), ["token_map", "lm_head", "target_pool", "draft_pool"]
         )
 
-    def test_otherwise_it_is_shared_when_the_draft_pool_is_allocated(self):
+    def test_replicated_embedding_is_shared_before_the_pool_is_sized(self):
         self.assertEqual(
-            _run(False), ["target_pool", "draft_pool", "token_map", "lm_head"]
+            _run_eagle(True), ["token_map", "lm_head", "target_pool", "draft_pool"]
+        )
+
+    def test_alloc_memory_pool_shares_if_init_did_not(self):
+        self.assertEqual(
+            _run_eagle(False, share_in_init=False),
+            ["target_pool", "draft_pool", "token_map", "lm_head"],
         )
 
     def test_init_shares_once_after_the_draft_runner_exists(self):
@@ -75,14 +121,40 @@ class TestEagleDraftEmbedShare(CustomTestCase):
         tree = ast.parse(textwrap.dedent(inspect.getsource(EagleDraftWorker.__init__)))
         body = [ast.unparse(stmt) for stmt in tree.body[0].body]
         share = [
-            i
-            for i, s in enumerate(body)
-            if s == "self._maybe_share_embed_before_pool_sizing()"
+            i for i, s in enumerate(body) if s == "self._share_target_embed_and_head()"
         ]
         runner = [i for i, s in enumerate(body) if s.startswith("self.draft_runner =")]
         self.assertEqual(len(share), 1, "__init__ must call the early share once")
         self.assertEqual(len(runner), 1, "__init__ must set self.draft_runner once")
         self.assertGreater(share[0], runner[0])
+
+
+class TestMultiLayerEagleDraftEmbedShare(CustomTestCase):
+    def test_embed_and_head_are_shared_before_the_pool_is_sized(self):
+        self.assertEqual(_run_multi_layer(), ["lm_head", "target_pool", "draft_pool"])
+
+    def test_alloc_memory_pool_shares_if_init_did_not(self):
+        self.assertEqual(
+            _run_multi_layer(share_in_init=False),
+            ["target_pool", "draft_pool", "lm_head"],
+        )
+
+    def test_init_shares_once_after_draft_runners_exist(self):
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(MultiLayerEagleDraftWorker.__init__))
+        )
+        body = [ast.unparse(stmt) for stmt in tree.body[0].body]
+        share = [
+            i for i, s in enumerate(body) if s == "self._share_target_embed_and_head()"
+        ]
+        runners = [
+            i for i, s in enumerate(body) if s.startswith("self.draft_runner_list")
+        ]
+        self.assertEqual(len(share), 1, "__init__ must call the early share once")
+        self.assertEqual(
+            len(runners), 1, "__init__ must set self.draft_runner_list once"
+        )
+        self.assertGreater(share[0], runners[0])
 
 
 if __name__ == "__main__":
