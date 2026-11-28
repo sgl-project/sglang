@@ -4,6 +4,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.diffusion.common.partial_sum import PartialSum
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_zimage_layer
 from sglang.multimodal_gen.runtime.distributed import (
@@ -11,7 +12,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_tp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
-    staged_partials,
+    row_parallel_deferred,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
@@ -82,25 +83,47 @@ class ZImageRMSNorm(nn.Module):
 
 
 def zimage_rmsnorm_tanh_mul_add(
-    x: torch.Tensor,
+    x: torch.Tensor | PartialSum,
     gate: torch.Tensor,
     residual: torch.Tensor,
     norm: ZImageRMSNorm,
     enable_fused: bool = True,
-) -> torch.Tensor:
+    scale: torch.Tensor | None = None,
+    scale_norm: ZImageRMSNorm | None = None,
+):
+    """``residual + tanh(gate) * norm(x)``; with ``scale``, also ``scale_norm``
+    of the result times it. ``x`` may be a row-parallel layer's ``PartialSum``,
+    which the kernel adds as it reads, applying ``scale`` in the same pass."""
+    peer = isinstance(x, PartialSum)
     if enable_fused:
         from sglang.kernels.ops.diffusion import rmsnorm_tanh_residual
 
+        weight = lambda m: m.weight.data.to(  # noqa: E731
+            device=residual.device, dtype=residual.dtype
+        ).contiguous()
+        fuse_scale = peer and scale is not None
         y = rmsnorm_tanh_residual(
             x,
             gate,
             residual,
-            norm.weight.data.to(device=x.device, dtype=x.dtype).contiguous(),
+            weight(norm),
             norm.variance_epsilon,
+            weight(scale_norm) if fuse_scale else None,
+            scale if fuse_scale else None,
         )
-        if y is not None:
+        if y is not None and (fuse_scale or scale is None):
             return y
-    return residual + torch.tanh(gate) * norm(x)
+        if y is not None:
+            return y, zimage_rmsnorm_scale(y, scale, scale_norm)
+    if peer:
+        # the kernel declined these operands: reduce the partials instead
+        return zimage_rmsnorm_tanh_mul_add(
+            x.reduce(), gate, residual, norm, enable_fused, scale, scale_norm
+        )
+    y = residual + torch.tanh(gate) * norm(x)
+    if scale is None:
+        return y
+    return y, zimage_rmsnorm_scale(y, scale, scale_norm, enable_fused)
 
 
 def zimage_rmsnorm_scale(
@@ -121,51 +144,6 @@ def zimage_rmsnorm_scale(
         if y is not None:
             return y
     return norm(x) * scale
-
-
-def zimage_peer_partial_rmsnorm_tanh_mul_add(
-    layer: nn.Module,
-    hidden: torch.Tensor,
-    gate: torch.Tensor,
-    residual: torch.Tensor,
-    norm: ZImageRMSNorm,
-    scale: torch.Tensor | None = None,
-    scale_norm: ZImageRMSNorm | None = None,
-):
-    """``residual + tanh(gate) * norm(layer(hidden))`` with the row-parallel
-    ``layer``'s all-reduce folded into the norm kernel, which reads both ranks'
-    partial sums; with ``scale``, also ``scale_norm`` of the result times it.
-
-    None, before anything is exchanged, when the call cannot take this path.
-    """
-    if type(layer) is not RowParallelLinear or residual.dtype != torch.bfloat16:
-        return None
-    partials = staged_partials(layer, hidden, residual)
-    if partials is None:
-        return None
-    from sglang.kernels.ops.diffusion import rmsnorm_tanh_residual_sum2
-
-    mine, theirs = partials
-    weight = lambda m: m.weight.data.to(  # noqa: E731
-        device=residual.device, dtype=residual.dtype
-    ).contiguous()
-    out = rmsnorm_tanh_residual_sum2(
-        mine,
-        theirs,
-        gate,
-        residual,
-        weight(norm),
-        norm.variance_epsilon,
-        None if scale is None else weight(scale_norm),
-        scale,
-    )
-    if out is not None:
-        return out
-    # the kernel declined these operands: reduce the staged partials instead
-    x = zimage_rmsnorm_tanh_mul_add(
-        (mine + theirs).view_as(residual), gate, residual, norm
-    )
-    return x if scale is None else (x, zimage_rmsnorm_scale(x, scale, scale_norm))
 
 
 def zimage_native_qk_rmsnorm(
@@ -638,53 +616,31 @@ class ZImageTransformerBlock(nn.Module):
                 rope_freqs_complex=rope_freqs_complex,
                 project_out=not peer_partials,
             )
-            to_out = self.attention.to_out[0]
-            fused = peer_partials and zimage_peer_partial_rmsnorm_tanh_mul_add(
-                to_out,
-                attn_hidden,
+            # two-rank TP: the norm kernels add both ranks' partial sums of
+            # to_out and w2 as they read them, instead of an all-reduce
+            attn_out = (
+                row_parallel_deferred(self.attention.to_out[0], attn_hidden, x)
+                if peer_partials
+                else attn_hidden
+            )
+            x, ffn_in = zimage_rmsnorm_tanh_mul_add(
+                attn_out,
                 gate_msa,
                 x,
                 self.attention_norm2,
+                peer_partials,
                 1.0 + scale_mlp,
                 self.ffn_norm1,
             )
-            if fused:
-                x, ffn_in = fused
-            else:
-                attn_out = to_out(attn_hidden)[0] if peer_partials else attn_hidden
-                x = self._norm_tanh_mul_add(
-                    attn_out,
-                    gate_msa,
-                    x,
-                    self.attention_norm2,
-                )
-                ffn_in = self._norm_scale(
-                    x,
-                    1.0 + scale_mlp,
-                    self.ffn_norm1,
-                )
 
             # FFN block
-            fused = None
             if peer_partials:
-                ffn_hidden = self.feed_forward.hidden(ffn_in)
-                fused = zimage_peer_partial_rmsnorm_tanh_mul_add(
-                    self.feed_forward.w2, ffn_hidden, gate_mlp, x, self.ffn_norm2
-                )
-                ffn_out = (
-                    None if fused is not None else self.feed_forward.w2(ffn_hidden)[0]
+                ffn_out = row_parallel_deferred(
+                    self.feed_forward.w2, self.feed_forward.hidden(ffn_in), x
                 )
             else:
                 ffn_out = self.feed_forward(ffn_in)
-            if fused is not None:
-                x = fused
-            else:
-                x = self._norm_tanh_mul_add(
-                    ffn_out,
-                    gate_mlp,
-                    x,
-                    self.ffn_norm2,
-                )
+            x = self._norm_tanh_mul_add(ffn_out, gate_mlp, x, self.ffn_norm2)
         else:
             # Attention block
             attn_input = self.attention_norm1(x)

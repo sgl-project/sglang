@@ -5,6 +5,11 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.numerics import mul_rn_f32, round_bf16_to_fp32
+from sglang.kernels.ops.diffusion.common.partial_sum import (
+    PartialSum,
+    load_partial_sum,
+    split_partials,
+)
 
 # Column tiles per row. One program per whole row padded to a power of two
 # masked off 37.5% of MiniMax-H3's 5376-wide rows; 2048-wide tiles run both
@@ -61,6 +66,7 @@ def _indexed_gate_bf16_kernel(
     x_ptr,
     gate_ptr,
     other_ptr,
+    peer_ptr,
     indices_ptr,
     hidden_size,
     stride_output_row,
@@ -69,7 +75,10 @@ def _indexed_gate_bf16_kernel(
     stride_other_row,
     stride_indices,
     BLOCK_N: tl.constexpr,
+    HAS_PEER: tl.constexpr,
 ):
+    # with HAS_PEER, other is the sum of two TP ranks' partials (other_ptr and
+    # peer_ptr), rounded as their all-reduce leaves it
     row = tl.program_id(0)
     columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = columns < hidden_size
@@ -81,8 +90,9 @@ def _indexed_gate_bf16_kernel(
     gate = tl.load(
         gate_ptr + index * stride_gate_row + columns, mask=mask, other=0.0
     ).to(tl.float32)
-    other = tl.load(
-        other_ptr + row * stride_other_row + columns, mask=mask, other=0.0
+    other_offsets = row * stride_other_row + columns
+    other = load_partial_sum(
+        other_ptr + other_offsets, peer_ptr + other_offsets, mask, HAS_PEER
     ).to(tl.float32)
 
     gated = round_bf16_to_fp32(gate * other)
@@ -90,100 +100,6 @@ def _indexed_gate_bf16_kernel(
         output_ptr + row * stride_output_row + columns,
         x + gated,
         mask=mask,
-    )
-
-
-@triton.jit
-def _indexed_gate_sum2_bf16_kernel(
-    x_ptr,
-    gate_ptr,
-    a_ptr,
-    b_ptr,
-    indices_ptr,
-    hidden_size,
-    stride_x_row,
-    stride_gate_row,
-    stride_indices,
-    BLOCK_N: tl.constexpr,
-):
-    # _indexed_gate_bf16_kernel in place on other = a + b rounded to BF16, the
-    # all-reduce's sum of the two partials
-    row = tl.program_id(0)
-    columns = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
-    mask = columns < hidden_size
-    index = tl.load(indices_ptr + row * stride_indices)
-
-    x = tl.load(x_ptr + row * stride_x_row + columns, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    gate = tl.load(
-        gate_ptr + index * stride_gate_row + columns, mask=mask, other=0.0
-    ).to(tl.float32)
-    a = tl.load(a_ptr + row * hidden_size + columns, mask=mask, other=0.0)
-    b = tl.load(b_ptr + row * hidden_size + columns, mask=mask, other=0.0)
-    other = round_bf16_to_fp32(a.to(tl.float32) + b.to(tl.float32))
-
-    gated = round_bf16_to_fp32(gate * other)
-    tl.store(
-        x_ptr + row * stride_x_row + columns,
-        x + gated,
-        mask=mask,
-    )
-
-
-def indexed_gate_bf16_sum2_(
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    indices: torch.Tensor,
-) -> torch.Tensor:
-    """``indexed_gate_bf16_(x, gate, a + b, indices)`` in one kernel.
-
-    ``a`` and ``b`` are a row-parallel layer's two partial sums as contiguous
-    ``[rows, hidden]`` BF16; either may be mapped from another device. The sum
-    is rounded to BF16 before the gate, as an all-reduce leaves it.
-    """
-    rows, hidden_size = x.shape
-    if rows == 0:
-        return x
-    block_n, tiles = _row_tiles(hidden_size)
-    _indexed_gate_sum2_bf16_kernel[(rows, tiles)](
-        x,
-        gate,
-        a,
-        b,
-        indices,
-        hidden_size,
-        x.stride(0),
-        gate.stride(0),
-        indices.stride(0),
-        BLOCK_N=block_n,
-        num_warps=4,
-    )
-    return x
-
-
-def can_use_indexed_gate_bf16_sum2(
-    x: torch.Tensor,
-    gate: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    indices: torch.Tensor,
-) -> bool:
-    return (
-        x.is_cuda
-        and x.dim() == 2
-        and x.dtype == gate.dtype == a.dtype == b.dtype == torch.bfloat16
-        and x.stride(-1) == 1
-        and a.shape == b.shape == x.shape
-        and a.is_contiguous()
-        and b.is_contiguous()
-        and gate.dim() == 2
-        and gate.shape[1] == x.shape[1]
-        and gate.stride(-1) == 1
-        and indices.dim() == 1
-        and indices.numel() == x.shape[0]
     )
 
 
@@ -218,9 +134,10 @@ def _indexed_gate_bf16(
     output: torch.Tensor,
     x: torch.Tensor,
     gate: torch.Tensor,
-    other: torch.Tensor,
+    other: torch.Tensor | PartialSum,
     indices: torch.Tensor,
 ) -> torch.Tensor:
+    other, peer = split_partials(other)
     rows, hidden_size = x.shape
     if rows == 0:
         return output
@@ -230,6 +147,7 @@ def _indexed_gate_bf16(
         x,
         gate,
         other,
+        other if peer is None else peer,
         indices,
         hidden_size,
         output.stride(0),
@@ -238,6 +156,7 @@ def _indexed_gate_bf16(
         other.stride(0),
         indices.stride(0),
         BLOCK_N=block_n,
+        HAS_PEER=peer is not None,
         num_warps=4,
     )
     return output
@@ -246,18 +165,22 @@ def _indexed_gate_bf16(
 def indexed_gate_bf16_(
     x: torch.Tensor,
     gate: torch.Tensor,
-    other: torch.Tensor,
+    other: torch.Tensor | PartialSum,
     indices: torch.Tensor,
 ) -> torch.Tensor:
+    """In place: ``x += bf16(gate[indices] * other)``. ``other`` may be a
+    two-rank row-parallel layer's ``PartialSum``, which the kernel adds as it
+    reads; both partials then need ``other``'s row stride."""
     return _indexed_gate_bf16(x, x, gate, other, indices)
 
 
 def indexed_gate_bf16(
     x: torch.Tensor,
     gate: torch.Tensor,
-    other: torch.Tensor,
+    other: torch.Tensor | PartialSum,
     indices: torch.Tensor,
 ) -> torch.Tensor:
+    """``indexed_gate_bf16_`` into a new tensor."""
     return _indexed_gate_bf16(torch.empty_like(x), x, gate, other, indices)
 
 
