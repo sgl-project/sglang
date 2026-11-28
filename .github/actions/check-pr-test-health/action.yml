@@ -1,5 +1,5 @@
 name: Check PR Test Health
-description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs. The jobs-failed check (but not the lint check) is bypassed when the PR carries the `bypass-fail-fast` label (or `highest-priority`, which implies it).
+description: Fail fast if any job in the current workflow run has already failed, or if the lint check (from lint.yml) has failed. Auto-skips for scheduled runs or exhausted GitHub API primary quota. The jobs-failed check (but not the lint check) is bypassed when the PR carries the `bypass-fail-fast` label (or `highest-priority`, which implies it).
 
 inputs:
   github-token:
@@ -45,7 +45,8 @@ runs:
           }
 
           // The installation quota is shared across jobs. A short wait at the
-          // published reset can recover a read without bypassing this check.
+          // published reset can recover a read. If it cannot, skip this advisory
+          // precheck so tests can run; required lint/test checks still gate merging.
           let waitedForQuota = false;
           async function readWithQuotaReset(read) {
             try {
@@ -55,16 +56,19 @@ runs:
               const reset = Number(headers?.['x-ratelimit-reset']);
               const waitMs = Math.max(0, reset * 1000 - Date.now()) + 1000;
               const maxWaitMinutes = Number(process.env.MAX_QUOTA_WAIT_MINUTES);
-              if (waitedForQuota || ![403, 429].includes(error.status) ||
-                  headers?.['x-ratelimit-remaining'] !== '0' ||
-                  !Number.isSafeInteger(reset) || reset <= 0 ||
-                  !Number.isSafeInteger(maxWaitMinutes) || waitMs > maxWaitMinutes * 60_000) {
+              if (![403, 429].includes(error.status) ||
+                  headers?.['x-ratelimit-remaining'] !== '0') {
                 throw error;
               }
-              waitedForQuota = true;
-              core.info(`[health-check] Installation quota exhausted. Retrying the read in ${Math.ceil(waitMs / 1000)}s.`);
-              await require('node:timers/promises').setTimeout(waitMs);
-              return read();
+              if (!waitedForQuota && Number.isSafeInteger(reset) && reset > 0 &&
+                  Number.isSafeInteger(maxWaitMinutes) && waitMs <= maxWaitMinutes * 60_000) {
+                waitedForQuota = true;
+                core.info(`[health-check] Installation quota exhausted. Retrying the read in ${Math.ceil(waitMs / 1000)}s.`);
+                await require('node:timers/promises').setTimeout(waitMs);
+                return readWithQuotaReset(read);
+              }
+              core.warning('[health-check] SKIP: GitHub API primary quota exhausted. Continuing tests; required lint/test checks still gate merging.');
+              return undefined;
             }
           }
 
@@ -73,12 +77,14 @@ runs:
           // checks.listForRef which queries by commit SHA across ALL workflows.
           const ref = context.payload.pull_request?.head?.sha || context.sha;
           core.info(`[health-check] Checking lint for ref=${ref}`);
-          const { data } = await readWithQuotaReset(() => github.rest.checks.listForRef({
+          const lintResponse = await readWithQuotaReset(() => github.rest.checks.listForRef({
             owner: context.repo.owner,
             repo: context.repo.repo,
             ref: ref,
             check_name: 'lint',
           }));
+          if (!lintResponse) return;
+          const { data } = lintResponse;
           const lintRun = data.check_runs.find(
             cr => cr.app?.slug === 'github-actions'
           );
@@ -113,6 +119,7 @@ runs:
             core.info('[health-check] Jobs listing hit a gateway error. Retrying with 30 jobs per page.');
             jobs = await listJobs(30);
           }
+          if (!jobs) return;
           core.info(`[health-check] Total jobs in run: ${jobs.length}`);
           const failedJobs = jobs.filter(j => j.status === 'completed' && j.conclusion === 'failure');
           core.info(`[health-check] Failed jobs (before filtering): ${failedJobs.map(j => `${j.name}(${j.conclusion})`).join(', ') || 'none'}`);
