@@ -1745,6 +1745,11 @@ class Envs:
     SGLANG_OPT_CUTEDSL_EP_DEFERRED_FINALIZE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Let TRT-LLM Gen MoE finalize NVFP4 decode rows into the FlashInfer A2A combine
+    # input buffer (bit-identical). Unset follows the NVIDIA runtime master.
+    SGLANG_OPT_MOE_A2A_OUTPUT_IN_WORKSPACE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
     # to per-token-group-128 fp8 ONCE and feed both the fused shared-expert
     # GEMM (cutlass w8a8 linear) and the routed experts' triton fused runner,
