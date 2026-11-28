@@ -115,11 +115,11 @@ def _e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
     """e8m0 bytes -> fp32 as 2**(e - 127), the arithmetic of torch's own cast.
 
     A5 implements no cast for this dtype either, so the float bits are assembled
-    from the exponent byte -- the same shift the GPU gather kernel applies.
+    from the exponent byte. On A5, int32 multiplication avoids an int64 left shift.
     """
     exps = raw.to(torch.int32)
     # E == 0 is 2**-127, a subnormal, not what zero exponent bits bitcast to.
-    return (exps << 23).view(torch.float32).masked_fill(exps == 0, 2.0**-127)
+    return (exps * (1 << 23)).view(torch.float32).masked_fill(exps == 0, 2.0**-127)
 
 
 def _is_prime(n: int) -> bool:
