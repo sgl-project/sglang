@@ -846,8 +846,17 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         config: ZImageDitConfig,
         hf_config: dict[str, Any],
         quant_config: Optional[QuantizationConfig] = None,
+        *,
+        shard_joint_sequence: bool = False,
     ) -> None:
+        """Initialize the Z-Image transformer.
+
+        When ``shard_joint_sequence`` is True, callers supply full latent grids
+        with uniform, evenly divisible unmasked sequences while ``forward`` owns
+        SP sharding and gathering across ``noise_refiner`` and ``layers``.
+        """
         super().__init__(config=config, hf_config=hf_config)
+        self.shard_joint_sequence = shard_joint_sequence
 
         arch_config = self.config
 
@@ -1604,13 +1613,23 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 device=device,
             )
         x_freqs_cis = freqs_cis[1]
-        x_rope_cos_sin_cache, x_rope_positions, x_rope_freqs_complex = (
-            self._get_rope_cache("x", x_freqs_cis)
-        )
+        x_rope = self._get_rope_cache("x", x_freqs_cis)
         x_attn_mask, x_attn_mask_meta = self._get_attn_mask_and_meta(
             "_cached_x_attn_mask_meta", x_attn_lens, x.shape[1], device
         )
 
+        joint_sp = self.shard_joint_sequence and get_sp_world_size() > 1
+        if joint_sp:
+            from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+                gather_seq,
+            )
+            from sglang.multimodal_gen.runtime.models.dits.zimage_joint_sp import (
+                shard_block_inputs,
+            )
+
+            x_length = x.shape[1]
+            x, x_rope = shard_block_inputs(x, x_rope, x_attn_mask, x_attn_mask_meta)
+        x_rope_cos_sin_cache, x_rope_positions, x_rope_freqs_complex = x_rope
         for layer_id, layer in enumerate(self.noise_refiner):
             x = layer(
                 x,
@@ -1622,6 +1641,9 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 attn_mask_meta=x_attn_mask_meta,
                 rope_freqs_complex=x_rope_freqs_complex,
             )
+
+        if joint_sp:
+            x = gather_seq(x, x_length)
 
         cap_feats, _ = self.cap_embedder(cap_feats)
         if cap_valid_mask is not None:
@@ -1662,12 +1684,21 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             cap_seq_len,
             device,
         )
+        unified_rope = self._get_rope_cache("unified", unified_freqs_cis)
+        if joint_sp:
+            unified_length = unified.shape[1]
+            unified, unified_rope = shard_block_inputs(
+                unified,
+                unified_rope,
+                unified_attn_mask,
+                unified_attn_mask_meta,
+            )
         (
             unified_rope_cos_sin_cache,
             unified_rope_positions,
             unified_rope_freqs_complex,
-        ) = self._get_rope_cache("unified", unified_freqs_cis)
-        num_replicated_suffix = cap_seq_len
+        ) = unified_rope
+        num_replicated_suffix = 0 if joint_sp else cap_seq_len
 
         for layer in self.layers:
             unified = layer(
@@ -1685,6 +1716,8 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
         )
+        if joint_sp:
+            unified = gather_seq(unified, unified_length)
         x = list(unified.unbind(dim=0))
         x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 
