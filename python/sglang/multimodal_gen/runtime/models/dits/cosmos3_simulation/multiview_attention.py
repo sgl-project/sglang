@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_layo
     _validate_temporal_window,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils.common import torch_release
 
 logger = init_logger(__name__)
 
@@ -861,13 +862,17 @@ def flex_attention(
             "Cosmos3 multiview FlexAttention requires contiguous [B, H, S, D] inputs."
         )
     kernel_options = {
-        "BACKEND": "TRITON",
         "BLOCK_M": TRITON_Q_BLOCK_SIZE,
         "BLOCK_N": TRITON_KV_BLOCK_SIZE,
         "num_stages": TRITON_NUM_STAGES,
         "num_warps": TRITON_NUM_WARPS,
         "USE_TMA": False,
     }
+    # torch < 2.10 does not know the BACKEND option, already defaults to the
+    # Triton kernel, and would render the value into the template as an
+    # undefined name (NameError: TRITON is not defined).
+    if torch_release >= (2, 10):
+        kernel_options["BACKEND"] = "TRITON"
     if q.device.type == "cuda":
         global _compiled_flex_attention
         if _compiled_flex_attention is None:
