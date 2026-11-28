@@ -1410,3 +1410,74 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CacheSaltAndUsageTest(unittest.TestCase):
+    """cache_salt on the request, and the cached count on the answer."""
+
+    def test_cache_salt_is_accepted(self):
+        # A gateway that isolates tenants sends cache_salt on every route. The
+        # request model forbade it, so those requests were refused with 400
+        # extra_forbidden even when the body was otherwise valid.
+        request = _request(
+            "The parcel was left at the front door.",
+            {"delivered": _question("yes_no")},
+            cache_salt="org-1234",
+        )
+
+        self.assertEqual(request.cache_salt, "org-1234")
+
+    def test_cache_salt_defaults_to_none(self):
+        request = _request("x", {"delivered": _question("yes_no")})
+
+        self.assertIsNone(request.cache_salt)
+
+    def test_an_unknown_field_is_still_refused(self):
+        # The route still forbids extras: only cache_salt was added.
+        with self.assertRaises(ValidationError):
+            _request(
+                "x",
+                {"delivered": _question("yes_no")},
+                not_a_real_field=1,
+            )
+
+
+class ScoreCachedTokensTest(unittest.TestCase):
+    """The scorer carries the prefix-cache hits out with the token count."""
+
+    @staticmethod
+    def _result(prompt_tokens, cached_tokens=None):
+        meta = {"id": "r", "prompt_tokens": prompt_tokens}
+        if cached_tokens is not None:
+            meta["cached_tokens"] = cached_tokens
+        return {
+            "meta_info": {
+                **meta,
+                "output_token_ids_logprobs": [[(0.0, 1, None), (0.0, 2, None)]],
+            }
+        }
+
+    def _score(self, results):
+        manager = TokenizerManagerScoreMixin()
+        manager.is_generation = True
+        return manager._process_single_item_scoring_results(
+            results=results,
+            label_token_ids=[[1, 2] for _ in results],
+            apply_softmax=False,
+        )
+
+    def test_cached_tokens_are_summed_over_the_questions(self):
+        # Every question is its own sequence over the same input, so the second
+        # and later ones hit the prefix cache. Reporting only prompt_tokens
+        # bills a cached token at the full rate.
+        result = self._score([self._result(40, 0), self._result(40, 32)])
+
+        self.assertEqual(result.prompt_tokens, 80)
+        self.assertEqual(result.cached_tokens, 32)
+
+    def test_a_scheduler_that_reports_no_cache_reads_zero(self):
+        # Without --enable-cache-report the field is absent, not zero-valued.
+        result = self._score([self._result(40), self._result(40)])
+
+        self.assertEqual(result.prompt_tokens, 80)
+        self.assertEqual(result.cached_tokens, 0)

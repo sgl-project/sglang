@@ -35,6 +35,10 @@ PooledHiddenStateOutput: TypeAlias = Union[
 class ScoreResult:
     scores: ScoreOutput
     prompt_tokens: int = 0
+    # Prefix-cache hits over the same prompts, summed like prompt_tokens. The
+    # scheduler only reports it with --enable-cache-report, so 0 means either
+    # no hit or no reporting; the caller decides whether to surface it.
+    cached_tokens: int = 0
     # Pre-head CPU tensors parallel to scores; kept as tensors so in-process
     # consumers avoid a .tolist() round-trip (the HTTP path converts before JSON).
     pooled_hidden_states: Optional[PooledHiddenStateOutput] = None
@@ -52,6 +56,7 @@ class TokenizerManagerScoreMixin:
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
         image_data: Optional[List[List[ImageData]]] = None,
+        cache_salt: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score probabilities of specified token IDs after each *full prompt*.
@@ -73,6 +78,7 @@ class TokenizerManagerScoreMixin:
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
                 image_data=image_data,
+                cache_salt=cache_salt,
             )
 
         # Tokenized prompts
@@ -87,6 +93,7 @@ class TokenizerManagerScoreMixin:
                 temperature=temperature,
                 return_token_logprobs=return_token_logprobs,
                 image_data=image_data,
+                cache_salt=cache_salt,
             )
 
         raise ValueError("Invalid prompts type for score_prompts.")
@@ -158,6 +165,7 @@ class TokenizerManagerScoreMixin:
         expected_count = num_items + 1
         request_id = meta_info.get("id", "<unknown>")
         prompt_tokens = meta_info.get("prompt_tokens", 0)
+        cached_tokens = meta_info.get("cached_tokens", 0)
 
         # Extract per-delimiter scores from whichever field has them
         input_logprobs = meta_info.get("input_token_ids_logprobs", [])
@@ -224,6 +232,7 @@ class TokenizerManagerScoreMixin:
         return ScoreResult(
             scores=scores,
             prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
             pooled_hidden_states=phs_list,
             token_logprobs=token_logprobs,
         )
@@ -283,6 +292,7 @@ class TokenizerManagerScoreMixin:
         meta_info = single_result.get("meta_info", {})
         request_id = meta_info.get("id", "<unknown>")
         prompt_tokens = meta_info.get("prompt_tokens", 0)
+        cached_tokens = meta_info.get("cached_tokens", 0)
         total_anchors = sum(per_item_anchor_counts)
 
         if self.is_generation:
@@ -317,7 +327,11 @@ class TokenizerManagerScoreMixin:
                     ]
                 )
                 offset += count
-            return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
+            return ScoreResult(
+                scores=scores,
+                prompt_tokens=prompt_tokens,
+                cached_tokens=cached_tokens,
+            )
 
         embedding = single_result.get("embedding")
         if embedding is None:
@@ -348,6 +362,7 @@ class TokenizerManagerScoreMixin:
         return ScoreResult(
             scores=scores,
             prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
             pooled_hidden_states=phs_grouped,
         )
 
@@ -373,6 +388,7 @@ class TokenizerManagerScoreMixin:
         phs_list = []
         has_phs = False
         prompt_tokens = 0
+        cached_tokens = 0
         token_logprobs = [] if return_token_logprobs else None
 
         is_generation = self.is_generation
@@ -380,6 +396,7 @@ class TokenizerManagerScoreMixin:
             for result, labels in zip(results, label_token_ids):
                 meta = result["meta_info"]
                 prompt_tokens += meta.get("prompt_tokens", 0)
+                cached_tokens += meta.get("cached_tokens", 0)
 
                 if per_item_matrix:
                     # Setwise: label-token logprobs were read AT each anchor
@@ -423,7 +440,9 @@ class TokenizerManagerScoreMixin:
                 if embedding is None:
                     raise ValueError("Embedding not found in the result.")
 
-                prompt_tokens += result.get("meta_info", {}).get("prompt_tokens", 0)
+                meta_info = result.get("meta_info", {})
+                prompt_tokens += meta_info.get("prompt_tokens", 0)
+                cached_tokens += meta_info.get("cached_tokens", 0)
 
                 if per_item_matrix:
                     rows = self._multi_position_score_rows(embedding, apply_softmax)
@@ -452,6 +471,7 @@ class TokenizerManagerScoreMixin:
         return ScoreResult(
             scores=scores,
             prompt_tokens=prompt_tokens,
+            cached_tokens=cached_tokens,
             pooled_hidden_states=phs_list if has_phs else None,
             token_logprobs=token_logprobs,
         )
@@ -884,6 +904,7 @@ class TokenizerManagerScoreMixin:
         return_token_logprobs: bool = False,
         image_data: Optional[List[List[ImageData]]] = None,
         rid: Optional[str] = None,
+        cache_salt: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -1186,6 +1207,7 @@ class TokenizerManagerScoreMixin:
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
                 rid=sub_rids,
+                cache_salt=cache_salt,
             )
         else:
             batch_request = EmbeddingReqInput(

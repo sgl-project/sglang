@@ -1795,6 +1795,12 @@ class DecisionRequest(BaseModel):
     prompt_format_version: Optional[int] = None
     return_prompt_token_ids: bool = False
     model: str = DEFAULT_MODEL_NAME
+    # Partitions the prefix cache, as on /v1/chat/completions and /v1/completions.
+    # A gateway that isolates tenants sends it on every route, and `extra="forbid"`
+    # above turned that into a 400 for this one.
+    cache_salt: Optional[str] = Field(
+        default=None, description="Cache salt for request caching"
+    )
 
     @field_validator("questions")
     @classmethod
