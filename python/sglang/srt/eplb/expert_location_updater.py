@@ -229,12 +229,18 @@ def _int64_view(t: torch.Tensor) -> Optional[torch.Tensor]:
     return t.view(torch.int64)
 
 
+_P2P_DTYPES = {
+    1: torch.uint8,
+    2: torch.float16,
+    4: torch.int32,
+    8: torch.int64,
+}
+
+
 def _p2p_tensor_view(tensor: torch.Tensor) -> torch.Tensor:
-    # ProcessGroupNCCL has no E8M0 dtype mapping. Move its bytes without
-    # changing the scale values or the storage used by the receive buffer.
-    if tensor.dtype == torch.float8_e8m0fnu:
-        return tensor.view(torch.uint8)
-    return tensor
+    # P2P moves bit patterns, not values. Use equally sized NCCL-supported
+    # dtypes; NCCL has no 16-bit integer type, so two-byte tensors use FP16.
+    return tensor.view(_P2P_DTYPES[tensor.element_size()])
 
 
 def update_expert_weights_single_layer(
