@@ -20,6 +20,12 @@ import socket
 import sys
 import time
 
+from sglang.srt.weight_cache.protocol import (
+    load_spec_mismatches,
+    recv_msg,
+    send_msg,
+)
+
 
 def find_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -99,8 +105,6 @@ def run_single_daemon(
         flush=True,
     )
 
-    from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
-
     if os.path.exists(socket_path):
         os.unlink(socket_path)
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -115,17 +119,14 @@ def run_single_daemon(
                 try:
                     req = recv_msg(conn)
                     if req.get("type") == "query_config":
-                        send_msg(
-                            conn, {"status": "ok", "config": daemon.config.to_dict()}
-                        )
+                        send_msg(conn, {"status": "ok", "config": daemon.config})
                     elif req.get("type") == "fetch_state":
-                        engine_config = CacheConfig.from_dict(req["config"])
-                        if daemon.config.matches(engine_config):
+                        if not load_spec_mismatches(daemon.config, req.get("config")):
                             send_msg(
                                 conn,
                                 {
                                     "status": "ok",
-                                    "config": daemon.config.to_dict(),
+                                    "config": daemon.config,
                                     "entries": daemon.state_entries,
                                 },
                             )
@@ -134,7 +135,7 @@ def run_single_daemon(
                                 conn,
                                 {
                                     "status": "mismatch",
-                                    "daemon_config": daemon.config.to_dict(),
+                                    "daemon_config": daemon.config,
                                 },
                             )
                     elif req.get("type") == "ping":
@@ -283,7 +284,6 @@ def main():
 
     # Query config from daemon (pp_rank=0, tp_rank=0)
     from sglang.srt.utils import MultiprocessingSerializer
-    from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 
     socket_path_0 = _temp_path(tp_size, 0, 0, ".sock")
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -294,7 +294,7 @@ def main():
     s.close()
     daemon_config = result.get("config", {})
     print(
-        f"\nDaemon (0,0) config: model={daemon_config.get('model_path')}, "
+        f"\nDaemon (0,0) config: model={daemon_config.get('checkpoint_id')}, "
         f"arch={daemon_config.get('model_arch')}, "
         f"tp_size={daemon_config.get('tp_size')}, "
         f"dtype={daemon_config.get('dtype')}"

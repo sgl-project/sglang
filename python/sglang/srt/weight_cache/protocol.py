@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Protocol definitions for the weight cache daemon.
 
-Defines CacheConfig for validation and socket message protocol helpers.
+The daemon and its engines compare LoadSpec dicts (msgspec.to_builtins) with
+load_spec_mismatches. Also: quantization checks, the environment stamp, rank and
+GPU ids, and the socket paths and messages.
 """
+
+from __future__ import annotations
 
 import hashlib
 import json
@@ -11,60 +15,26 @@ import os
 import pickle
 import signal
 import struct
-from typing import Any, Dict, Optional
-
-import msgspec
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.serialization import safe_pickle_loads
 
+if TYPE_CHECKING:
+    from sglang.srt.configs.model_config import ModelConfig
+
 logger = logging.getLogger(__name__)
 
 
-class CacheConfig(msgspec.Struct):
-    """Fingerprint of the cached weights. Used to validate compatibility
-    between a daemon's cached state and a requesting engine process.
-
-    Any mismatch triggers a fallback to disk loading.
-    """
-
-    model_path: str
-    model_arch: str
-    tp_size: int
-    tp_rank: int
-    pp_size: int
-    pp_rank: int
-    dp_size: int
-    ep_size: int
-    moe_dp_size: int
-    moe_dp_rank: int
-    moe_ep_rank: int
-    attn_dp_size: int
-    enable_dp_lm_head: bool
-    attn_cp_size: int
-    moe_dense_tp_size: Optional[int]
-    moe_a2a_backend: str
-    quant_method: str  # e.g. "fp8", "gptq_marlin", "" for unquantized
-    quant_config_hash: str  # SHA-256 hash of quantization config
-    dtype: str  # e.g. "torch.float16"
-    revision: str  # model revision the weights were loaded from ("" if unset)
-    # Environment stamp: a daemon and a client that ran different post-processing
-    # branches (different GPU compute capability or torch/kernel version) can
-    # produce incompatible weights that would map cleanly yet serve garbage.
-    # Comparing these turns that into a clean mismatch. See compute_env_stamp().
-    device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
-    torch_version: str  # torch.__version__ of the process that built the weights
-
-    def matches(self, other: "CacheConfig") -> bool:
-        """Check if two configs are compatible for weight sharing."""
-        return self == other
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {f: getattr(self, f) for f in self.__struct_fields__}
-
-    @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "CacheConfig":
-        return cls(**d)
+def load_spec_mismatches(
+    ours: Dict[str, Any], theirs: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Every field where two LoadSpec dicts differ, e.g. {"tp_rank": (0, 1)}."""
+    return {
+        name: (ours.get(name), theirs.get(name))
+        for name in sorted(ours.keys() | theirs.keys())
+        if name not in ours or name not in theirs or ours[name] != theirs[name]
+    }
 
 
 def hash_quant_config(quant_config: Any) -> str:
@@ -116,6 +86,13 @@ def get_quant_method_name(quant_config: Any) -> str:
     if hasattr(quant_config, "name"):
         return quant_config.name
     return type(quant_config).__name__
+
+
+def resolve_cache_quantization(model_config: ModelConfig) -> tuple[str, Any]:
+    """Resolve the method and config used by IPC checks and LoadSpec."""
+    config = getattr(model_config.hf_config, "quantization_config", None)
+    method = get_quant_method_name(model_config.quantization)
+    return method or get_quant_method_name(config), config
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +222,7 @@ def compute_env_stamp() -> Dict[str, str]:
     Returns the device compute capability and torch version of the current
     process. A daemon and a connecting client that differ on either may have run
     different post-processing / kernel-selection branches, producing weights that
-    map cleanly over IPC yet serve garbage; stamping these into CacheConfig turns
+    map cleanly over IPC yet serve garbage; stamping these into LoadSpec turns
     that into a clean mismatch. Imported lazily so protocol.py stays cheap to
     import and usable on CPU-only hosts (both fields degrade to "").
     """

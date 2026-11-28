@@ -17,6 +17,7 @@ import torch
 from sglang.srt.utils import MultiprocessingSerializer, is_npu
 
 from .protocol import send_msg
+from .schema import SnapshotManifest
 from .vmm_layout import pack_slot, plan_vmm_pack, validate_vmm_layout, view_from_entry
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,38 @@ def _prefix_offsets(sizes: Sequence[int]) -> List[int]:
         offsets.append(total)
         total += size
     return offsets
+
+
+class WeightTransport(ABC):
+    """Moves one rank's storages from an owner to a reader, and withdraws them.
+
+    It knows nothing about models or other ranks. A reader's transport is made by
+    the loader's lookup for one load, so it may hold that load's session, such as
+    the daemon connection that vmm_fd sends its file descriptors over.
+    """
+
+    @abstractmethod
+    def publish(self, *, storages: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        """Owner: make ``storages`` readable; returns the manifest's ``source``.
+
+        It may consume ``storages`` (vmm_fd repacks them), so nothing reads them after.
+        """
+
+    @abstractmethod
+    def fetch(
+        self, *, manifest: SnapshotManifest, device: torch.device
+    ) -> Dict[str, torch.Tensor]:
+        """Reader: every storage of ``manifest`` as uint8 bytes, all or nothing.
+
+        Returns once the bytes are visible on the current stream; raises otherwise,
+        leaving no mapped tensors exposed and the transport safe to close. Maps a
+        storage only if it is "shared_ro" and on this GPU (``device_uuid``), and
+        then read-only; copies the rest, and checks ``digest`` when it is set.
+        """
+
+    @abstractmethod
+    def close(self) -> None:
+        """Withdraw what publish or fetch set up. Idempotent."""
 
 
 class WeightCacheTransportBackend(ABC):
@@ -251,9 +284,8 @@ class VmmFdTransportBackend(WeightCacheTransportBackend):
     the tensors on top. CUDA frees a ``cuMemCreate`` allocation only after all
     of its mappings and handles are released, so the engine's mappings keep
     its weights valid even if the daemon exits. ``close`` unmaps them and
-    frees the address range; the IPC loader calls it only when a load fails,
-    since the tensors of a loaded model do not own the mappings (they stay
-    until the process exits).
+    frees the address range. The IPC loader only closes it before any tensors
+    may reference its mappings. After that the mappings stay until process exit.
     """
 
     name = VMM_FD_BACKEND
