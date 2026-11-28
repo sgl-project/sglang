@@ -43,14 +43,17 @@ def _sgemm_lora_a_kernel(
     SPLIT_K: tl.constexpr = 1,
     ENABLE_PDL: tl.constexpr = False,
     PADDED_RANK: tl.constexpr = False,
+    ZERO_PADDED_RANK: tl.constexpr = False,
 ):
     """
     Computes a segmented batched matrix multiplication for the LoRA A matrix.
 
     The kernel ensures that output[seg_start:seg_start + seg_len, :rank * stack_num]
     stores the product of the input `x` and the LoRA weights for the corresponding
-    sequence. This implies that when rank is 0, the kernel is essentially a no-op,
-    as output[seg_start:seg_start + seg_len, :0] is trivially correct (empty).
+    sequence. ZERO_PADDED_RANK also initializes its remaining rank columns to zero
+    for the single-rank-tile, non-split-K caller. When rank is 0, the kernel is
+    essentially a no-op, as output[seg_start:seg_start + seg_len, :0] is trivially
+    correct (empty).
 
     Args:
         x (torch.Tensor): The input activations tensor of shape `(s, K)`, where `s`
@@ -80,6 +83,9 @@ def _sgemm_lora_a_kernel(
     if seg_len == 0:
         return
 
+    # The ordinary shrink has one rank tile; retain its full output width for
+    # the optional zero-padding epilogue. Shared-sink tiling is unchanged.
+    padded_N = N
     # Adjust N (stack_num * max_rank) to this adapter's actual rank.
     if not PADDED_RANK:
         N = tl.minimum(N, rank * stack_num)
@@ -134,7 +140,14 @@ def _sgemm_lora_a_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
     # Store result to output matrix
-    output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
+    if ZERO_PADDED_RANK:
+        tl.static_assert(SPLIT_K == 1)
+        # Explicitly select zero, so even a nonfinite masked dot lane cannot
+        # contaminate the padded contraction in the following dense expand.
+        partial_sum = tl.where(n_offset[None, :] < N, partial_sum, 0.0)
+        output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < padded_N)
+    else:
+        output_mask = (s_offset[:, None] < seg_len) & (n_offset[None, :] < N)
     output_ptr = output + (
         s_physical[:, None] * output_stride_0 + n_offset[None, :] * output_stride_1
     )
@@ -227,6 +240,18 @@ def sgemm_lora_a_fwd(
     else:
         output = torch.empty((S, R), device=x.device, dtype=x.dtype)
 
+    if (
+        split_k == 1
+        and stack_num == 1
+        and R == 64
+        and S <= 256
+        and x.dtype == torch.bfloat16
+        and current_arch().is_sm(9)
+    ):
+        # For the small SM90 dense path, eight warps hide shrink load latency
+        # while keeping the zero-padding epilogue and shared-memory footprint.
+        launch_kwargs["num_warps"] = 8
+
     grid = (
         num_s_tiles * split_k,
         batch_info.bs,
@@ -258,6 +283,10 @@ def sgemm_lora_a_fwd(
         BLOCK_K,
         split_k,
         ENABLE_PDL=enable_pdl,
+        # The single-projection expand reads the full padded rank. Initialize
+        # its tail in this store rather than adding a separate memset kernel.
+        # Split-K already starts from zeros; stacked expands use compact ranks.
+        ZERO_PADDED_RANK=(split_k == 1 and stack_num == 1),
         **launch_kwargs,
         **pdl_kwargs,
     )
