@@ -467,12 +467,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             #
             # The mxfp4 weight loader (FusedMoE.weight_loader fast path) does
             # a NAIVE copy of HF's ``[2*intermediate_size, hidden_packed]``
-            # tensor into the buffer's ``[:dim1, :dim2]`` slice. Padding the
-            # buffer here would push the gate/up boundary, so HF's "up"
+            # tensor into the buffer's ``[:dim1, :dim2]`` slice. Padding each
+            # half to 128 here would push the gate/up boundary, so HF's "up"
             # rows would land in the buffer's "gate" half and vice versa.
-            # Marlin sidesteps this by not padding; we do the same and
-            # rebuild a properly-padded buffer in the architecture-specific
-            # CUTLASS post-load processor after the load completes.
+            # So the buffer is padded only to the mxfp4 block (below) and the
+            # architecture-specific CUTLASS post-load processor rebuilds the
+            # 128-aligned buffer after the load completes.
             self._padded_intermediate = round_up(intermediate_size_per_partition, 128)
             self._padded_hidden = round_up(hidden_size, 128)
             # `hidden_size` here may ALREADY be FusedMoE's rounded value (GPT-OSS
@@ -480,9 +480,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # processor can exclude the never-written tail from Humming's
             # per-expert scale range.
             self._unpadded_hidden = getattr(layer, "hidden_size_unpadded", hidden_size)
-            # create_weights below uses the *unpadded* sizes so the loader's
-            # naive-copy fast path is correct.
-            intermediate_size_per_partition_after_pad = intermediate_size_per_partition
+            # create_weights below aligns only to the mxfp4 block: gpt_oss.py
+            # shards by whole blocks, so a rank's slice can exceed
+            # intermediate_size / tp (736 vs 720 at tp=4). The extra rows have zero
+            # weights and bias and trail the interleaved pairs.
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, mxfp4_block
+            )
         elif self.use_aiter_moe:
             # Expert intermediate is padded to 128 or 256. On K3 (TP8) the 256
             # default costs +33% mem (3072/8=384 -> 512). K3 FlyDSL MoE works with
@@ -1159,9 +1163,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         K_real = min(getattr(self, "_unpadded_hidden", None) or K_un, K_un)
         # ceil: a partial trailing group is still real and must be kept.
         w13_scale_real = -(-K_real // sf_block_size)
+        # The loader (gpt_oss.py) records how many channels this rank got: the
+        # last ranks of a whole-block shard load fewer than N_un (672 of 736 at
+        # tp=4 on rank 3, 576 of 768 when the config is wider than the
+        # checkpoint). The rest of the buffer keeps the
+        # _UE8M0_ONE fill and must stay out of Humming's range as well.
+        N_real = min(N_un, getattr(layer, "loaded_intermediate_size", N_un))
 
         def _stack_up_gate_w13(
-            unpadded_w13, last_pad, last_un, preserve_expert_range=False, last_real=None
+            unpadded_w13,
+            last_pad,
+            last_un,
+            preserve_expert_range=False,
+            last_real=None,
+            rows_real=None,
         ):
             # unpadded_w13: [E, 2*N_un, last_un]
             # Returns: [E, 2*N_pad, last_pad] in [up_padded; gate_padded] order.
@@ -1187,10 +1202,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if (preserve_expert_range and last_real is not None)
                 else last_un
             )
+            copy_rows = N_un if rows_real is None else min(rows_real, N_un)
             # First half: up (with row + col padding zeros).
-            out[:, :N_un, :copy_un] = up_rows[:, :, :copy_un]
+            out[:, :copy_rows, :copy_un] = up_rows[:, :copy_rows, :copy_un]
             # Second half: gate.
-            out[:, N_pad : N_pad + N_un, :copy_un] = gate_rows[:, :, :copy_un]
+            out[:, N_pad : N_pad + copy_rows, :copy_un] = gate_rows[
+                :, :copy_rows, :copy_un
+            ]
             return out
 
         w13_padded = _stack_up_gate_w13(
@@ -1202,6 +1220,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             K_un // sf_block_size,
             preserve_expert_range=self._use_sm90_humming,
             last_real=w13_scale_real,
+            rows_real=N_real if self._use_sm90_humming else None,
         )
         # Bias: same de-interleave on dim=-1.
         if _interleaved:
@@ -1215,7 +1234,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         w13_bias_padded[:, N_pad : N_pad + N_un] = w13_bias_gate
 
         def _pad_w2_3d(
-            unpadded, last_pad, last_un, preserve_expert_range=False, k_real=None
+            unpadded,
+            last_pad,
+            last_un,
+            preserve_expert_range=False,
+            k_real=None,
+            last_real=None,
         ):
             out = torch.zeros(E, K_pad, last_pad, dtype=unpadded.dtype, device=device)
             if preserve_expert_range:
@@ -1226,7 +1250,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if (preserve_expert_range and k_real is not None)
                 else K_un
             )
-            out[:, :k_copy, :last_un] = unpadded[:, :k_copy, :]
+            last_copy = (
+                min(last_real, last_un)
+                if (preserve_expert_range and last_real is not None)
+                else last_un
+            )
+            out[:, :k_copy, :last_copy] = unpadded[:, :k_copy, :last_copy]
             return out
 
         # ---- w2 (no halving, just pad to [E, K_pad, N_pad/2]) ----------------
@@ -1239,6 +1268,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             N_un // sf_block_size,
             preserve_expert_range=self._use_sm90_humming,
             k_real=K_real,
+            last_real=-(-N_real // sf_block_size),
         )
         w2_bias_padded = torch.zeros(E, K_pad, dtype=bias_dtype, device=device)
         w2_bias_padded[:, :K_un] = layer.w2_weight_bias.data
