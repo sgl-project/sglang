@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once
 from sglang.srt.utils.common import ceil_div
-from sglang.srt.utils.device import get_device_core_count
 
 # quack 0.6.4's SM120 cooperative tile widths, widest first so ties keep it; 0.6.5
 # also accepts other multiples of 32, which were not measured here.
@@ -26,11 +26,6 @@ def _swiglu_epilogue_mod():
     return linear_act_mod(
         "swiglu", gated=True, has_c=False, has_rowvec=False, has_colvec=False
     )
-
-
-@cache_once
-def _num_sms(device_index: int) -> int:
-    return get_device_core_count(device_index)
 
 
 @cache_once
@@ -69,7 +64,7 @@ def quack_swiglu_gemm_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
 def quack_swiglu_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     m, n = x.shape[0], weight.shape[0]
     out = x.new_empty(m, n // 2)
-    tile_m, tile_n = _tile_shape(m, n, _num_sms(x.device.index))
+    tile_m, tile_n = _tile_shape(m, n, current_arch().num_sms)
     _swiglu_epilogue_mod().gemm(
         x,
         weight,

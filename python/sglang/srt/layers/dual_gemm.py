@@ -4,7 +4,9 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.kernels.arch import current_arch
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -27,7 +29,30 @@ class DualGemm:
         self.down_proj = down_proj
         self.tp_size = get_parallel().tp_size
         self.max_tokens = 0
-        self.mode = self._select_mode(gate_up_proj, hidden_size)
+        self.use_quack_swiglu_gemm = self._use_quack_swiglu_gemm(gate_up_proj)
+        if self.use_quack_swiglu_gemm:
+            from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
+
+            self.mode = DualGemmQuantMode.UNQUANT
+        else:
+            self.mode = self._select_mode(gate_up_proj, hidden_size)
+
+    @staticmethod
+    def _use_quack_swiglu_gemm(gate_up_proj: "MergedColumnParallelLinear") -> bool:
+        if not is_cuda():
+            return False
+
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        return (
+            isinstance(gate_up_proj.quant_method, UnquantizedLinearMethod)
+            and envs.SGLANG_USE_QUACK_SWIGLU_GEMM.get()
+            and current_arch().is_sm(12, 0)
+            # Batch invariance overrides aten::mm, which the fused GEMM never calls.
+            and not get_exec().deterministic.enable_deterministic_inference
+            # On-policy RL must match the trainer's unfused bf16 SwiGLU bit for bit.
+            and get_exec().deterministic.rl_on_policy_target is None
+        )
 
     def _select_mode(
         self,
@@ -101,14 +126,28 @@ class DualGemm:
 
     def can_run(self, x, gate_up_proj: "MergedColumnParallelLinear") -> bool:
         input_tensor = x[0] if isinstance(x, tuple) else x
-        return (
-            self.mode is not None
-            and 1 <= input_tensor.shape[0] <= self.max_tokens
-            and not hasattr(gate_up_proj, "base_layer")
-            and not (self.tp_size > 1 and get_forward().sp_active)
-        )
+        if (
+            self.mode is None
+            or hasattr(gate_up_proj, "base_layer")
+            or (self.tp_size > 1 and get_forward().sp_active)
+        ):
+            return False
+        if self.use_quack_swiglu_gemm:
+            from sglang.kernels.ops.gemm.quack_swiglu_gemm import (
+                quack_swiglu_gemm_supported,
+            )
+
+            return not torch.compiler.is_compiling() and quack_swiglu_gemm_supported(
+                input_tensor, gate_up_proj.weight
+            )
+        return 1 <= input_tensor.shape[0] <= self.max_tokens
 
     def __call__(self, x, gate_up_proj: "MergedColumnParallelLinear"):
+        if self.use_quack_swiglu_gemm:
+            from sglang.kernels.ops.gemm.quack_swiglu_gemm import quack_swiglu_gemm
+
+            return quack_swiglu_gemm(x, gate_up_proj.weight)
+
         if not self.mode.is_quantized:
             from sglang.kernels.ops.gemm import dual_gemm_swiglu
 

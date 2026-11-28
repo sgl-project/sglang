@@ -27,7 +27,7 @@ from sglang.srt.beam_search.trie_config import (
     get_beam_trie_config,
 )
 from sglang.srt.utils import is_cpu, is_npu
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -212,11 +212,7 @@ def build_trie_row_levels(
             row_levels.extend([level] * (entry.end - entry.start))
         assert len(row_levels) == len(batch.seq_lens)
         # Pinned and non-blocking, so the host never waits on the running forward.
-        return torch.tensor(
-            row_levels,
-            dtype=torch.int64,
-            pin_memory=is_pin_memory_available(batch.device),
-        ).to(batch.device, non_blocking=True)
+        return async_h2d(row_levels, dtype=torch.int64, device=batch.device)
     return None
 
 

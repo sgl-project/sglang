@@ -13,7 +13,7 @@
 # ==============================================================================
 """Split-KV shared-context attention for wide beam decoding.
 
-Opt-in with SGLANG_BEAM_SHARED_CONTEXT_KERNEL=split_kv. Every beam of a group
+Opt-in with SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV=1. Every beam of a group
 attends to the group's shared prompt and to its own decode tokens. The prompt
 part runs as tensor-core tiles of BLOCK_M beams of one query head, split along
 the prompt (split-KV) so that a few groups still fill the GPU; the last split
@@ -24,23 +24,20 @@ written through `row_indices`, like the default kernel.
 
 from __future__ import annotations
 
-from typing import Optional
+import threading
+from typing import Callable, Optional
 
 import msgspec
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.beam_shared_context import (
     attend_beam_token,
     attend_prompt_block,
     check_shared_context_inputs,
     empty_softmax_state,
-    launch_plan_key,
-    max_element_offset,
-    partial_buffers,
-    remember_plan,
-    wave_ctas,
 )
 
 # Fastest of ten tiles on RTX PRO 6000 at 256 beams, head_dim 128; untuned elsewhere.
@@ -330,6 +327,126 @@ def _merge_splits_kernel(
     )
 
 
+def resident_ctas_per_sm(kernel) -> int:
+    """CTAs of a compiled Triton kernel that one SM holds at once, as the driver counts.
+
+    On RTX PRO 6000 the split-KV kernel uses all 64K registers of an SM,
+    so this is 1 there; GPUs or compilers that need fewer registers per CTA fit more.
+    """
+    from cuda.bindings import driver
+
+    # Loads the module and sets kernel.function, which a first launch would also do.
+    kernel._init_handles()
+    error, count = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        kernel.function, kernel.metadata.num_warps * 32, kernel.metadata.shared
+    )
+    if error != driver.CUresult.CUDA_SUCCESS or count < 1:
+        raise RuntimeError(f"{kernel.name} fits no CTA on an SM: {error}, {count}")
+    return count
+
+
+def max_element_offset(tensor: torch.Tensor) -> int:
+    return sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+
+
+_WAVE_CTAS: dict[tuple, int] = {}
+
+
+def wave_ctas(
+    *,
+    key: tuple,  # what changes the compiled code: kernel, device, dtypes, constexprs
+    compile_kernel: Callable,  # compiles without launching (JITFunction.warmup)
+) -> int:
+    wave = _WAVE_CTAS.get(key)
+    if wave is None:
+        wave = current_arch().num_sms * resident_ctas_per_sm(compile_kernel())
+        _WAVE_CTAS[key] = wave
+    return wave
+
+
+def launch_plan_key(
+    q: torch.Tensor,
+    k_buffer: torch.Tensor,
+    v_buffer: torch.Tensor,
+    row_indices: torch.Tensor,
+    context_cu_seqlens: torch.Tensor,
+    decode_slots: torch.Tensor,
+    decode_lens: torch.Tensor,
+    output: torch.Tensor,
+) -> tuple:
+    return (
+        q.shape,
+        q.stride(),
+        q.dtype,
+        q.device.index,
+        k_buffer.shape,
+        k_buffer.stride(),
+        k_buffer.dtype,
+        v_buffer.shape,
+        v_buffer.stride(),
+        row_indices.shape,
+        row_indices.stride(),
+        context_cu_seqlens.shape,
+        decode_slots.shape,
+        decode_slots.stride(),
+        decode_lens.shape,
+        output.shape,
+        output.stride(),
+    )
+
+
+# Arbitrary. The decode capacity is part of the key, so each step of a long
+# generation adds a plan; a full cache starts over.
+_MAX_PLANS = 256
+
+
+class _KeptPartials(threading.local):
+    def __init__(self):
+        self.by_device: dict[int, tuple[int, torch.Tensor, torch.Tensor]] = {}
+
+
+_KEPT_PARTIALS = _KeptPartials()
+
+
+def partial_buffers(
+    device: torch.device,
+    output_numel: int,  # fp32 elements of the launch's partial outputs
+    lse_numel: int,  # fp32 elements of its partial log-sum-exps
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flat fp32 workspaces for a launch's partials, kept between eager launches.
+
+    A thread's launches on one stream run in order, so each launch reads its
+    partials before the next one writes them: a thread keeps one pair per device,
+    as large as the largest launch so far on the pair's stream, and replaces it
+    when its current stream changes. The contents are undefined.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        # A graph replays the pointers it captured, so it must own its buffers.
+        return (
+            torch.empty(output_numel, dtype=torch.float32, device=device),
+            torch.empty(lse_numel, dtype=torch.float32, device=device),
+        )
+    stream = triton.runtime.driver.active.get_current_stream(device.index)
+    kept = _KEPT_PARTIALS.by_device.get(device.index)
+    if kept is not None and kept[0] == stream:
+        if kept[1].numel() >= output_numel and kept[2].numel() >= lse_numel:
+            return kept[1], kept[2]
+        output_numel = max(output_numel, kept[1].numel())
+        lse_numel = max(lse_numel, kept[2].numel())
+    # Release the old pair first. Its queued launches stay safe: PyTorch gives a
+    # freed block only to the stream it was allocated on.
+    kept = None
+    _KEPT_PARTIALS.by_device.pop(device.index, None)
+    kept = _KEPT_PARTIALS.by_device[device.index] = (
+        stream,
+        torch.empty(output_numel, dtype=torch.float32, device=device),
+        torch.empty(lse_numel, dtype=torch.float32, device=device),
+    )
+    return kept[1], kept[2]
+
+
 def num_kv_splits(
     num_tiles: int,  # programs without splits: groups * q_heads * beam blocks
     wave: int,  # CTAs the GPU holds at once: SMs times CTAs per SM
@@ -433,7 +550,7 @@ def _make_plan(
         # Any split count above 1 compiles to the same kernel: probe it with the
         # partials' dtype, before they are allocated.
         wave = wave_ctas(
-            key=("split_kv", q.device.index, q.dtype, k_buffer.dtype)
+            key=(q.device.index, q.dtype, k_buffer.dtype)
             + tuple(sorted(constexprs.items())),
             compile_kernel=lambda: _shared_context_split_kv_kernel.warmup(
                 q,
@@ -455,11 +572,19 @@ def _make_plan(
                 grid=(1,),
                 **constexprs,
             ),
-            device_index=q.device.index,
         )
         num_splits = num_kv_splits(num_groups * q_heads * beam_blocks, wave)
-    if max(q.numel(), num_splits * rows * q_heads * head_dim) >= _MAX_OFFSET:
-        raise ValueError("Q and the split partials must have fewer than 2^31 elements")
+    if (
+        max(
+            max_element_offset(q),
+            max_element_offset(output),
+            num_splits * rows * q_heads * head_dim,
+        )
+        >= _MAX_OFFSET
+    ):
+        raise ValueError(
+            "Q, the output, and the split partials must have fewer than 2^31 elements"
+        )
     write_partials = num_splits > 1
     if not write_partials:
         # Unread with one split; Triton compiles strides of 1 in as constants.
@@ -525,23 +650,22 @@ def shared_context_attention_split_kv(
     ) + (num_splits,)
     plan = _PLANS.get(key)
     if plan is None:
-        plan = remember_plan(
-            _PLANS,
-            key,
-            _make_plan(
-                q,
-                k_buffer,
-                v_buffer,
-                row_indices,
-                context_slots,
-                context_cu_seqlens,
-                decode_slots,
-                decode_lens,
-                output,
-                softmax_scale,
-                num_splits,
-            ),
+        plan = _make_plan(
+            q,
+            k_buffer,
+            v_buffer,
+            row_indices,
+            context_slots,
+            context_cu_seqlens,
+            decode_slots,
+            decode_lens,
+            output,
+            softmax_scale,
+            num_splits,
         )
+        if len(_PLANS) >= _MAX_PLANS:
+            _PLANS.clear()
+        _PLANS[key] = plan
     if plan.partial_numel:
         partial_output, partial_lse = partial_buffers(
             q.device, plan.partial_numel, plan.lse_numel

@@ -65,7 +65,6 @@ _TRITON_KERNELS = [
     ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
     ("beam_shared_context", "shared_context_attention"),
     ("beam_shared_context_split_kv", "shared_context_attention_split_kv"),
-    ("beam_shared_context_stream_k", "shared_context_attention_stream_k"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

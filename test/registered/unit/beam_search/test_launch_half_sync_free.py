@@ -47,8 +47,6 @@ class _ReqToTokenPool:
 
 
 class _Storage:
-    """The KV storage calls member spawn makes: taking request rows."""
-
     def __init__(self, pool):
         self.take_rows = pool.alloc_rows
 

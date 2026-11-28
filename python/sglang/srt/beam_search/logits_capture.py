@@ -45,6 +45,18 @@ class BeamLogitsCapture(msgspec.Struct):
     leader_rows: Optional[List[int]] = None  # leaders' batch indices (extend)
     leader_normalizer: Optional[torch.Tensor] = None
     tail_normalizer: Optional[torch.Tensor] = None
+    # A beam-only batch: the worker skips the sampler and the scheduler relays
+    # no sampled token; the coordinator relays every row.
+    unsampled: bool = False
+
+
+def is_unsampled(logits_output: Optional[LogitsProcessorOutput]) -> bool:
+    """True for a beam-only batch, which the worker did not sample."""
+    return (
+        logits_output is not None
+        and logits_output.beam is not None
+        and logits_output.beam.unsampled
+    )
 
 
 def _copy_leader_rows(tensor: torch.Tensor, rows: List[int]) -> torch.Tensor:
@@ -108,6 +120,7 @@ def capture_pre_sample_logits(
                 tail_logits=logits[n:],
                 leader_normalizer=normalizer[:n] if normalizer is not None else None,
                 tail_normalizer=normalizer[n:] if normalizer is not None else None,
+                unsampled=True,
             )
         else:
             leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
@@ -138,6 +151,7 @@ def capture_pre_sample_logits(
                     leader_logits=logits_output.next_token_logits,
                     leader_rows=leader_rows,
                     leader_normalizer=normalizer,
+                    unsampled=True,
                 )
             else:
                 logits_output.beam = BeamLogitsCapture(

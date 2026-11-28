@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import enum
 import weakref
-from typing import Any, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import msgspec
 import torch
@@ -33,6 +33,9 @@ import torch
 from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 
 class BeamGroupState(enum.Enum):
@@ -120,14 +123,14 @@ class BeamGroup:
         self.slots_freed = 0
 
     @property
-    def leader(self) -> Any:
+    def leader(self) -> Optional[Req]:
         """The leader Req, held weakly: the Req owns its group through
         req.beam_group, and a strong back-reference would make every finished
         request cyclic garbage that only a full GC pass frees."""
         return None if self._leader is None else self._leader()
 
     @leader.setter
-    def leader(self, req: Any) -> None:
+    def leader(self, req: Optional[Req]) -> None:
         self._leader = None if req is None else weakref.ref(req)
 
     @property

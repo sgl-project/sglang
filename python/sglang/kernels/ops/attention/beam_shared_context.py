@@ -13,16 +13,11 @@
 # ==============================================================================
 """Native Triton shared-context attention for wide beam decoding.
 
-The online-softmax steps, the input checks, the SM count, the launch-plan cache
-and the partial buffers are shared with the opt-in split-KV and stream-K kernels
-(beam_shared_context_split_kv.py and beam_shared_context_stream_k.py).
+The online-softmax steps and the input checks are shared with the opt-in
+split-KV kernel (beam_shared_context_split_kv.py).
 """
 
 from __future__ import annotations
-
-import functools
-import threading
-from typing import Callable
 
 import torch
 import triton
@@ -261,144 +256,6 @@ def _shared_context_attention_kernel(
     )
 
 
-@functools.lru_cache(maxsize=None)
-def num_sms(device_index: int) -> int:
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
-
-
-def resident_ctas_per_sm(kernel) -> int:
-    """CTAs of a compiled Triton kernel that one SM holds at once, as the driver counts.
-
-    On RTX PRO 6000 the split-KV and stream-K kernels use all 64K registers of an SM,
-    so this is 1 there; GPUs or compilers that need fewer registers per CTA fit more.
-    """
-    from cuda.bindings import driver
-
-    # Loads the module and sets kernel.function, which a first launch would also do.
-    kernel._init_handles()
-    error, count = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
-        kernel.function, kernel.metadata.num_warps * 32, kernel.metadata.shared
-    )
-    if error != driver.CUresult.CUDA_SUCCESS or count < 1:
-        raise RuntimeError(f"{kernel.name} fits no CTA on an SM: {error}, {count}")
-    return count
-
-
-def max_element_offset(tensor: torch.Tensor) -> int:
-    """Largest element offset from the tensor's base that a kernel can address."""
-    return sum(
-        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
-    )
-
-
-_WAVE_CTAS: dict[tuple, int] = {}
-
-
-def wave_ctas(
-    *,
-    key: tuple,  # what changes the compiled code: kernel, device, dtypes, constexprs
-    compile_kernel: Callable,  # compiles without launching (JITFunction.warmup)
-    device_index: int,
-) -> int:
-    """CTAs the whole GPU holds at once for one kernel: SMs times CTAs per SM."""
-    wave = _WAVE_CTAS.get(key)
-    if wave is None:
-        wave = num_sms(device_index) * resident_ctas_per_sm(compile_kernel())
-        _WAVE_CTAS[key] = wave
-    return wave
-
-
-def launch_plan_key(
-    q: torch.Tensor,
-    k_buffer: torch.Tensor,
-    v_buffer: torch.Tensor,
-    row_indices: torch.Tensor,
-    context_cu_seqlens: torch.Tensor,
-    decode_slots: torch.Tensor,
-    decode_lens: torch.Tensor,
-    output: torch.Tensor,
-) -> tuple:
-    """All that the input checks and a launch plan read: equal keys share a plan."""
-    return (
-        q.shape,
-        q.stride(),
-        q.dtype,
-        q.device.index,
-        k_buffer.shape,
-        k_buffer.stride(),
-        k_buffer.dtype,
-        v_buffer.shape,
-        v_buffer.stride(),
-        row_indices.shape,
-        row_indices.stride(),
-        context_cu_seqlens.shape,
-        decode_slots.shape,
-        decode_slots.stride(),
-        decode_lens.shape,
-        output.shape,
-        output.stride(),
-    )
-
-
-# Arbitrary. The decode capacity is part of the key, so each step of a long
-# generation adds a plan; a full cache starts over.
-_MAX_PLANS = 256
-
-
-def remember_plan(plans: dict, key: tuple, plan):
-    if len(plans) >= _MAX_PLANS:
-        plans.clear()
-    plans[key] = plan
-    return plan
-
-
-class _KeptPartials(threading.local):
-    """Each thread's kept pair per device: (stream, partial outputs, log-sum-exps)."""
-
-    def __init__(self):
-        self.by_device: dict[int, tuple[int, torch.Tensor, torch.Tensor]] = {}
-
-
-_KEPT_PARTIALS = _KeptPartials()
-
-
-def partial_buffers(
-    device: torch.device,
-    output_numel: int,  # fp32 elements of the launch's partial outputs
-    lse_numel: int,  # fp32 elements of its partial log-sum-exps
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Flat fp32 workspaces for a launch's partials, kept between eager launches.
-
-    A thread's launches on one stream run in order, so each launch reads its
-    partials before the next one writes them: a thread keeps one pair per device,
-    as large as the largest launch so far on the pair's stream, and replaces it
-    when its current stream changes. The contents are undefined.
-    """
-    if torch.cuda.is_current_stream_capturing():
-        # A graph replays the pointers it captured, so it must own its buffers.
-        return (
-            torch.empty(output_numel, dtype=torch.float32, device=device),
-            torch.empty(lse_numel, dtype=torch.float32, device=device),
-        )
-    stream = triton.runtime.driver.active.get_current_stream(device.index)
-    kept = _KEPT_PARTIALS.by_device.get(device.index)
-    if kept is not None and kept[0] == stream:
-        if kept[1].numel() >= output_numel and kept[2].numel() >= lse_numel:
-            return kept[1], kept[2]
-        output_numel = max(output_numel, kept[1].numel())
-        lse_numel = max(lse_numel, kept[2].numel())
-    # Release the old pair first. Its queued launches stay safe: PyTorch gives a
-    # freed block only to the stream it was allocated on.
-    kept = None
-    _KEPT_PARTIALS.by_device.pop(device.index, None)
-    kept = _KEPT_PARTIALS.by_device[device.index] = (
-        stream,
-        torch.empty(output_numel, dtype=torch.float32, device=device),
-        torch.empty(lse_numel, dtype=torch.float32, device=device),
-    )
-    return kept[1], kept[2]
-
-
 def check_shared_context_inputs(
     q: torch.Tensor,  # [rows, q_heads, head_dim]
     k_buffer: torch.Tensor,  # [kv_slots, kv_heads, head_dim]
@@ -408,8 +265,7 @@ def check_shared_context_inputs(
     decode_slots: torch.Tensor,  # [groups, capacity * beam_width]
     decode_lens: torch.Tensor,  # [groups]
     output: torch.Tensor | None,  # like q, or None to allocate one
-) -> torch.Tensor:
-    """Check the inputs every kernel reads; returns the output to write."""
+) -> None:
     if q.ndim != 3:
         raise ValueError(f"Expected Q with 3 dimensions, got {q.shape}")
     if k_buffer.ndim != 3 or v_buffer.shape != k_buffer.shape:
@@ -430,11 +286,8 @@ def check_shared_context_inputs(
         raise ValueError("Decode lengths must contain one value per beam group")
     if context_cu_seqlens.shape != (num_groups + 1,):
         raise ValueError("Context offsets must contain one boundary per beam group")
-    if output is None:
-        return torch.empty_like(q)
-    if output.shape != q.shape:
+    if output is not None and output.shape != q.shape:
         raise ValueError("Output must match Q shape")
-    return output
 
 
 def shared_context_attention(
@@ -450,8 +303,7 @@ def shared_context_attention(
     output: torch.Tensor | None = None,  # like q; allocated when None
     softmax_scale: float,  # scales q.k before the softmax
 ) -> torch.Tensor:
-    """Apply shared prompt and per-beam suffix attention in one Triton kernel."""
-    output = check_shared_context_inputs(
+    check_shared_context_inputs(
         q,
         k_buffer,
         v_buffer,
@@ -461,6 +313,8 @@ def shared_context_attention(
         decode_lens,
         output,
     )
+    if output is None:
+        output = torch.empty_like(q)
     num_groups, beam_width = row_indices.shape
     _, q_heads, head_dim = q.shape
     kv_heads = k_buffer.shape[1]

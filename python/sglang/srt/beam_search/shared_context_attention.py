@@ -18,7 +18,7 @@ from __future__ import annotations
 import itertools
 import logging
 import weakref
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import torch
@@ -53,33 +53,16 @@ def enabled() -> bool:
     return envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get()
 
 
-_KERNELS = ("default", "split_kv", "stream_k")
-
-
-def selected_kernel() -> str:
-    kernel = envs.SGLANG_BEAM_SHARED_CONTEXT_KERNEL.get()
-    if kernel not in _KERNELS:
-        raise ValueError(
-            f"SGLANG_BEAM_SHARED_CONTEXT_KERNEL is {kernel!r}, not one of {_KERNELS}"
-        )
-    return kernel
-
-
-def _attention_kernel(kernel: str):
-    # One contract. "split_kv" and "stream_k" also spread the prompt over the SMs
-    # that a few groups leave idle, at the cost of a second launch for the merge.
-    if kernel == "split_kv":
+def resolve_attention_kernel() -> Callable:
+    """The kernel the attention backend runs for every bucket, picked at its startup."""
+    # One contract. Split-KV also spreads the prompt over the SMs that a few
+    # groups leave idle, at the cost of a second launch for the merge.
+    if envs.SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV.get():
         from sglang.kernels.ops.attention.beam_shared_context_split_kv import (
             shared_context_attention_split_kv,
         )
 
         return shared_context_attention_split_kv
-    if kernel == "stream_k":
-        from sglang.kernels.ops.attention.beam_shared_context_stream_k import (
-            shared_context_attention_stream_k,
-        )
-
-        return shared_context_attention_stream_k
     from sglang.kernels.ops.attention.beam_shared_context import (
         shared_context_attention,
     )
@@ -252,6 +235,7 @@ def forward(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
     kv_layers: KVLayerRouter,
+    attention_kernel: Callable,  # from resolve_attention_kernel()
 ) -> Optional[torch.Tensor]:
     if forward_batch.beam is None:
         return None
@@ -268,9 +252,8 @@ def forward(
     head_dim = layer.head_dim
     flat_q = q.contiguous().view(metadata.num_rows, q_heads, head_dim)
     output = torch.empty_like(flat_q)
-    attention = _attention_kernel(selected_kernel())
     for bucket in metadata.buckets:
-        attention(
+        attention_kernel(
             flat_q,
             k_buffer,
             v_buffer,

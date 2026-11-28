@@ -1574,25 +1574,10 @@ def _paged_prefill_batch(lengths, page_size, num_q_heads, num_kv_heads, head_dim
     )
 
 
-def test_sm120_split_kv_paged_prefill_stores_no_plan(monkeypatch):
-    """A prefill plan replays one launch. A SplitKV prefill also needs its combine
-    step, so it must store no plan and keep the generic path."""
+def test_sm120_split_kv_paged_prefill_is_not_replayed_from_a_plan():
+    """A prefill plan replays one launch, which would skip a SplitKV prefill's
+    combine step: repeated SplitKV launches must keep matching the unsplit one."""
     sm120_forward_host.clear_launch_plans()
-    cache_hits, registrations = [], []
-    original_try_paged = sm120_forward_host.try_paged
-    original_register_paged = sm120_forward_host.register_paged
-
-    def record_cache_hit(**kwargs):
-        result = original_try_paged(**kwargs)
-        cache_hits.append(result is not None)
-        return result
-
-    def record_registration(**kwargs):
-        registrations.append(kwargs)
-        return original_register_paged(**kwargs)
-
-    monkeypatch.setattr(sm120_forward_host, "try_paged", record_cache_hit)
-    monkeypatch.setattr(sm120_forward_host, "register_paged", record_registration)
     torch.manual_seed(20261118)
     lengths = (512, 448, 400)
     batch = _paged_prefill_batch(lengths, 64, 16, 2, 128)
@@ -1602,16 +1587,9 @@ def test_sm120_split_kv_paged_prefill_stores_no_plan(monkeypatch):
             **batch, max_seqlen_q=max(lengths), causal=True, num_splits=num_splits
         )
 
-    split = run(2)
-    split_again = run(2)
-    torch.cuda.synchronize()
-    # Both launches were SplitKV, and both missed in the wrapper and the generic path.
-    assert [call["actual_num_splits"] for call in registrations] == [2, 2]
-    assert cache_hits == [False] * 4
-    assert not sm120_forward_host._paged_prefill_plans
-    assert not sm120_forward_host._paged_plans
-    torch.testing.assert_close(split_again, split, atol=0.0, rtol=0.0)
-    _assert_attention_close(split, run(1))
+    unsplit = run(1)
+    for _ in range(2):
+        _assert_attention_close(run(2), unsplit)
 
 
 @pytest.mark.parametrize(

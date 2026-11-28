@@ -29,7 +29,6 @@ class _FakeRunner(SimpleNamespace):
 
 
 def _decode_batch():
-    """A decode batch of NUM_GROUPS beam leaders, before its member tail."""
     reqs = []
     for g in range(NUM_GROUPS):
         group = BeamGroup(

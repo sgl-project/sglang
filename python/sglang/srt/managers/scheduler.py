@@ -82,7 +82,7 @@ except ImportError:
 import traceback
 
 from sglang.srt.beam_search.coordinator import BeamCoordinator
-from sglang.srt.beam_search.logits_capture import is_beam_only_batch
+from sglang.srt.beam_search.logits_capture import is_unsampled
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
@@ -5825,8 +5825,7 @@ class Scheduler(
             payload = RelayPayload(bonus_tokens=batch_result.next_token_ids)
         else:
             return
-        # A beam-only batch was not sampled; the coordinator relays every row.
-        if not is_beam_only_batch(batch):
+        if not is_unsampled(batch_result.logits_output):
             if batch.beam_tail is not None:
                 # The worker sliced the tail off before sampling, so sampled tokens
                 # cover only the reqs-aligned rows; the coordinator relays the rest.

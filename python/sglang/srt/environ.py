@@ -756,9 +756,8 @@ class Envs:
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
-    # Shared-context attention kernel: "default", "split_kv" (prompt split across
-    # CTAs) or "stream_k" (persistent grid).
-    SGLANG_BEAM_SHARED_CONTEXT_KERNEL = EnvStr("default")
+    # Run shared-context attention with the split-KV kernel (prompt split across CTAs).
+    SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV = EnvBool(False)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
@@ -1742,7 +1741,7 @@ class Envs:
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
     # SM120 dense gated MLPs: fuse SiLU-and-mul into the gate_up GEMM (quack).
-    SGLANG_ENABLE_QUACK_SWIGLU_GEMM = EnvBool(False)
+    SGLANG_USE_QUACK_SWIGLU_GEMM = EnvBool(False)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 

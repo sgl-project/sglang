@@ -1029,8 +1029,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         self._varlen_plans: OrderedDict[tuple, _VarlenLaunchPlan] = OrderedDict()
         self._paged_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
         # One-launch plans keyed on the exact max_seqlen_k: prefill, and the decode
-        # shapes that _supports_cached_paged_decode leaves out.
-        self._paged_prefill_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
+        # shapes that _keys_on_kv_blocks leaves out.
+        self._paged_exact_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
         self._paged_plan_tiles: OrderedDict[tuple, tuple[int, int]] = OrderedDict()
         self._paged_workspaces: OrderedDict[
             tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
@@ -1316,7 +1316,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         return result
 
     @staticmethod
-    def _supports_cached_paged_decode(
+    def _keys_on_kv_blocks(
         *,
         head_dim: int,
         head_dim_v: int,
@@ -1333,7 +1333,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         ) and effective_q_rows <= 16
 
     @staticmethod
-    def _paged_prefill_key(base_key: tuple, max_seqlen_k: int) -> tuple:
+    def _paged_exact_key(base_key: tuple, max_seqlen_k: int) -> tuple:
         # get_fwd_tile_size reads the exact seqlen_k, total rows and batch; the
         # base key holds the rest, so prefill plans key on max_seqlen_k itself.
         return (*base_key, max_seqlen_k)
@@ -1363,13 +1363,13 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         self._paged_plans.move_to_end(selection_key)
         return plan
 
-    def _paged_prefill_plan(
+    def _paged_exact_plan(
         self, base_key: tuple, *, max_seqlen_k: int
     ) -> Optional[_PagedLaunchPlan]:
-        key = self._paged_prefill_key(base_key, max_seqlen_k)
-        plan = self._paged_prefill_plans.get(key)
+        key = self._paged_exact_key(base_key, max_seqlen_k)
+        plan = self._paged_exact_plans.get(key)
         if plan is not None:
-            self._paged_prefill_plans.move_to_end(key)
+            self._paged_exact_plans.move_to_end(key)
         return plan
 
     def try_paged(
@@ -1430,7 +1430,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         effective_q_rows = actual_max_seqlen_q * (
             qhead_per_kvhead if actual_pack_gqa else 1
         )
-        keys_on_kv_blocks = self._supports_cached_paged_decode(
+        keys_on_kv_blocks = self._keys_on_kv_blocks(
             head_dim=q.shape[-1],
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
@@ -1464,7 +1464,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
                 window_size_right=window_size_right,
             )
         else:
-            plan = self._paged_prefill_plan(base_key, max_seqlen_k=actual_max_seqlen_k)
+            plan = self._paged_exact_plan(base_key, max_seqlen_k=actual_max_seqlen_k)
         if plan is None:
             return None
         if out is None:
@@ -1546,7 +1546,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
     ) -> None:
         qhead_per_kvhead = q.shape[1] // k.shape[-2]
         effective_q_rows = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
-        keys_on_kv_blocks = self._supports_cached_paged_decode(
+        keys_on_kv_blocks = self._keys_on_kv_blocks(
             head_dim=q.shape[-1],
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
@@ -1571,8 +1571,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             requested_num_splits=requested_num_splits,
         )
         if not keys_on_kv_blocks:
-            self._register_paged_prefill_plan(
-                self._paged_prefill_key(base_key, max_seqlen_k),
+            self._register_paged_exact_plan(
+                self._paged_exact_key(base_key, max_seqlen_k),
                 _PagedLaunchPlan(
                     compiled_fn=compiled_fn,
                     compile_key=compile_key,
@@ -1651,11 +1651,11 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             ),
         )
 
-    def _register_paged_prefill_plan(self, key: tuple, plan: _PagedLaunchPlan) -> None:
-        self._paged_prefill_plans[key] = plan
-        self._paged_prefill_plans.move_to_end(key)
-        while len(self._paged_prefill_plans) > _LAUNCH_PLAN_CAPACITY:
-            self._paged_prefill_plans.popitem(last=False)
+    def _register_paged_exact_plan(self, key: tuple, plan: _PagedLaunchPlan) -> None:
+        self._paged_exact_plans[key] = plan
+        self._paged_exact_plans.move_to_end(key)
+        while len(self._paged_exact_plans) > _LAUNCH_PLAN_CAPACITY:
+            self._paged_exact_plans.popitem(last=False)
 
     def _cache_workspace_view(
         self,
@@ -1688,7 +1688,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
     def clear_launch_plans(self) -> None:
         self._varlen_plans.clear()
         self._paged_plans.clear()
-        self._paged_prefill_plans.clear()
+        self._paged_exact_plans.clear()
         self._paged_plan_tiles.clear()
         self._paged_workspaces.clear()
         self._paged_workspace_views.clear()

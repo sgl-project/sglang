@@ -49,7 +49,6 @@ def get_forward_arch(device) -> int | None:
 
 
 def try_cached_paged(*, arch: int, **kwargs):
-    """Try an architecture-owned paged decode or prefill launch plan."""
     host = get_forward_host(arch)
     return None if host is None else host.try_paged(arch=arch, **kwargs)
 
