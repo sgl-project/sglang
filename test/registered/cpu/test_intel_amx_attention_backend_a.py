@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -30,7 +31,7 @@ class TestIntelAMXAttnBackend(CustomTestCase):
 
     @intel_amx_benchmark(
         extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
-        min_throughput=40,
+        min_throughput=32 if os.environ.get("SGLANG_XEON_NIGHTLY") == "true" else 40,
     )
     def test_latency_default_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST

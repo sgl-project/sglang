@@ -84,12 +84,12 @@ class SamplingBatchInfo:
     # Set by the scheduler at each launch.
     step_penalties: Optional[StepPenalties] = None
 
-    # Set by the scheduler at each launch (set_plugin_state).
+    # Set by the scheduler at each launch (set_step_state).
     has_custom_logit_processor: bool = False
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
-    # Set by the scheduler at each launch (set_seeds_and_mask_rows).
+    # Set by the scheduler at each launch (set_step_state).
     # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor] = None
     # Rows of the requests that return sampling masks, and each support-mode row's
@@ -106,7 +106,7 @@ class SamplingBatchInfo:
     # Device
     device: str = "cuda"
 
-    # Set by the scheduler at each launch (set_plugin_state).
+    # Set by the scheduler at each launch (set_step_state).
     logit_bias: Optional[torch.Tensor] = None
     # The step's grammar objects, None when no request has one (see grammar_mask.py).
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
@@ -115,9 +115,10 @@ class SamplingBatchInfo:
         for name, value in zip(params._fields, params):
             setattr(self, name, value)
 
-    def set_plugin_state(self, reqs: List[Req]) -> None:
-        """Build logit_bias, the grammars, and the custom logit processors from the
-        step's requests."""
+    def set_step_state(self, reqs: List[Req]) -> None:
+        """Build the stages' step state from the step's requests: logit_bias, the
+        grammars, the custom logit processors, the per-row seeds, and the
+        sampling-mask rows."""
         self.logit_bias = build_logit_bias(
             reqs, vocab_size=self.vocab_size, device=self.device
         )
@@ -134,26 +135,24 @@ class SamplingBatchInfo:
             )
             for r in reqs
         )
-        if not self.has_custom_logit_processor:
+        if self.has_custom_logit_processor:
+            rows_by_processor: Dict[str, List[int]] = {}
+            for i, r in enumerate(reqs):
+                if r.custom_logit_processor is not None:
+                    rows_by_processor.setdefault(r.custom_logit_processor, []).append(i)
+            self.custom_params = [r.sampling_params.custom_params for r in reqs]
+            self.custom_logit_processor = {
+                hash(processor_str): ProcessorEntry(
+                    processor=CustomLogitProcessor.from_str(processor_str),
+                    rows=rows,
+                    indices=async_h2d(rows, dtype=torch.long, device=self.device),
+                )
+                for processor_str, rows in rows_by_processor.items()
+            }
+        else:
             self.custom_params = None
             self.custom_logit_processor = None
-            return
-        rows_by_processor: Dict[str, List[int]] = {}
-        for i, r in enumerate(reqs):
-            if r.custom_logit_processor is not None:
-                rows_by_processor.setdefault(r.custom_logit_processor, []).append(i)
-        self.custom_params = [r.sampling_params.custom_params for r in reqs]
-        self.custom_logit_processor = {
-            hash(processor_str): ProcessorEntry(
-                processor=CustomLogitProcessor.from_str(processor_str),
-                rows=rows,
-                indices=async_h2d(rows, dtype=torch.long, device=self.device),
-            )
-            for processor_str, rows in rows_by_processor.items()
-        }
 
-    def set_seeds_and_mask_rows(self, reqs: List[Req]) -> None:
-        """Build the per-row seeds and the sampling-mask rows from the step's requests."""
         enable_deterministic = get_exec().deterministic.enable_deterministic_inference
         seeded = enable_deterministic or _any_row_with_seed(reqs)
         seeds = []
@@ -200,19 +199,6 @@ class SamplingBatchInfo:
         else:
             new = dataclasses.replace(self)
         return new
-
-
-def adjusts_logits(info: SamplingBatchInfo, *, has_grammar: bool) -> bool:
-    """Whether sampling edits the logits before choosing tokens. has_grammar comes
-    from the batch: verify builds its grammar mask per step, outside the sampling info.
-    """
-    return (
-        has_grammar
-        or info.step_penalties is not None
-        or info.logit_bias is not None
-        or info.has_custom_logit_processor
-        or info.watermark is not None
-    )
 
 
 def need_truncated_sampling(info: SamplingBatchInfo) -> bool:
