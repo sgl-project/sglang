@@ -1,3 +1,4 @@
+# Vendored from facebookexperimental/triton third_party/tlx/ops/kernels/norm/gfx950.py at 87abb3f5a (MIT); see kernels/README.md.
 """Forward RMSNorm on gfx950: one row per program, FP32 statistics, ``x * rstd * weight`` in FP32.
 
 ``norm_fwd`` with ``norm='rms'`` and ``rmsnorm`` on top of it, as in ``sm100.py``. The sm100 kernels do not compile
@@ -23,7 +24,7 @@ import triton
 import triton.language as tl
 import triton.language.extra.tlx as tlx
 
-from ..._catalog import UnsupportedOp
+from sglang.kernels.jit.utils.tlx_runtime import UnsupportedOp
 
 MAX_FEATURES = 16384
 TLX_FEATURES = (4096, )
