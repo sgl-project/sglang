@@ -160,7 +160,11 @@ def create_wave_backend(runner):
 
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
-    from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
+    from sglang.srt.configs.model_config import (
+        get_dsa_index_kpool,
+        is_deepseek_dsa,
+        is_llada_image_text_encoder,
+    )
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
         AscendAttnBackend,
     )
@@ -172,6 +176,13 @@ def create_ascend_backend(runner):
         )
 
         return AscendDSAAttnBackend(runner)
+
+    if is_llada_image_text_encoder(config):
+        from sglang.srt.hardware_backend.npu.attention.ascend_llada2_cfg_backend import (
+            AscendLLaDA2CFGAttnBackend,
+        )
+
+        return AscendLLaDA2CFGAttnBackend(runner)
 
     return AscendAttnBackend(runner)
 

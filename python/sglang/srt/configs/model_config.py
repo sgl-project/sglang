@@ -227,6 +227,14 @@ def is_deepseek_dsa(config) -> bool:
     ) or is_kimi_k31(config)
 
 
+def is_llada_image_text_encoder(config) -> bool:
+    """Whether ``config`` is LLaDA-Image's conditioning text encoder."""
+    return (
+        _hf_arch(config) == "LLaDA2MoeModelLM"
+        and _hf_attr(config, "model_type") == "llada2_moe_veomni"
+    )
+
+
 def is_q8_raw_fp8_nope_layout(
     *,
     prefill_backend: Optional[str],
