@@ -92,9 +92,9 @@ elif _is_xpu:
         transfer_kv_per_layer_ph_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.operators.data_move import (
-        TransferDirection,
-        transfer_kv_dim_exchange,
+    from sgl_kernel_npu.operators.mem_cache import (
+        transfer_kv_all_layer_kv_split_lf_pf,
+        transfer_kv_per_layer_kv_split_pf_lf,
     )
 
 logger = logging.getLogger(__name__)
@@ -567,24 +567,25 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
-                # Ascend-specific: transfer KV data for all layers when layer_id == 0
-                if host_layer_id == 0:
-                    for (
-                        device_k,
-                        device_v,
-                        host_k,
-                        host_v,
-                    ) in self._npu_transfer_buffers():
-                        transfer_kv_dim_exchange(
-                            device_indices=device_indices,
-                            host_indices=host_indices,
-                            device_k=device_k,
-                            host_k=host_k,
-                            device_v=device_v,
-                            host_v=host_v,
-                            page_size=self.page_size,
-                            direction=TransferDirection.H2D,
-                        )
+                layer_start = 0
+                for device_k, device_v, host_k, host_v in self._npu_transfer_buffers():
+                    local_layer = host_layer_id - layer_start
+                    if not 0 <= local_layer < device_k.shape[0]:
+                        layer_start += device_k.shape[0]
+                        continue
+                    transfer_kv_per_layer_kv_split_pf_lf(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=device_k,
+                        host_k=host_k,
+                        device_v=device_v,
+                        host_v=host_v,
+                        page_size=self.page_size,
+                        device_layer_id=local_layer,
+                        host_layer_id=local_layer,
+                        impl="auto",
+                    )
+                    break
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
@@ -731,7 +732,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
                 for device_k, device_v, host_k, host_v in self._npu_transfer_buffers():
-                    transfer_kv_dim_exchange(
+                    transfer_kv_all_layer_kv_split_lf_pf(
                         device_indices=device_indices,
                         host_indices=host_indices,
                         device_k=device_k,
@@ -739,7 +740,7 @@ class MHATokenToKVPoolHost(HostKVCache):
                         device_v=device_v,
                         host_v=host_v,
                         page_size=self.page_size,
-                        direction=TransferDirection.D2H,
+                        impl="auto",
                     )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
