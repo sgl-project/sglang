@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import l2_transfer as transfer_module
@@ -34,6 +35,7 @@ from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -1658,6 +1660,38 @@ class TestL2TransferRecordStream(CustomTestCase):
         )
 
         self.assertEqual(device.recorded, [])
+
+
+class TestDirectBackendMetadataWarning(CustomTestCase):
+    """The direct backend warns about copy-engine queueing on CUDA and stays silent on ROCm."""
+
+    def _construct(self, *, hip, fill=False, io_backend="direct", engines=1):
+        transfer_module._warn_direct_without_metadata_kernels.cache_clear()
+        is_hip.cache_clear()
+        self.addCleanup(is_hip.cache_clear)
+        with (
+            mock.patch.object(transfer_module, "device_module", torch.cuda),
+            mock.patch.object(torch.cuda, "Stream"),
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.version, "hip", "7.2" if hip else None),
+            envs.SGLANG_ENABLE_MLP_SYNC_METADATA_FILL.override(fill),
+        ):
+            for _ in range(engines):
+                L2TransferEngine(io_backend)
+
+    def test_warns_once_on_cuda(self):
+        with self.assertLogs(transfer_module.logger, level="WARNING") as logs:
+            self._construct(hip=False, engines=2)
+        self.assertEqual(len(logs.records), 1)
+
+    def test_silent_on_rocm(self):
+        with self.assertNoLogs(transfer_module.logger, level="WARNING"):
+            self._construct(hip=True)
+
+    def test_silent_with_metadata_kernels_or_other_backend(self):
+        with self.assertNoLogs(transfer_module.logger, level="WARNING"):
+            self._construct(hip=False, fill=True)
+            self._construct(hip=False, io_backend="kernel")
 
 
 if __name__ == "__main__":

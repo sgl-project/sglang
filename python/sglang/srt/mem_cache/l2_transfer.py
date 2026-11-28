@@ -9,7 +9,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.pool_host.base import shared_host_layout_domains
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import get_device_module, is_hip
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -88,6 +88,7 @@ class L2TransferEngine:
         if (
             io_backend == "direct"
             and device_module is torch.cuda
+            and not is_hip()
             and not envs.SGLANG_ENABLE_MLP_SYNC_METADATA_FILL.get()
         ):
             _warn_direct_without_metadata_kernels()
