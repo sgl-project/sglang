@@ -31,6 +31,9 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     qwen3_5_gdn_prefill_projection_views,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+    _matmul_persistent_triton,
+)
 
 # Configs
 from sglang.srt.configs.model_config import (
@@ -95,6 +98,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import enable_gdn_fp8_prefill
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -330,6 +334,45 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
+
+
+def _allows_batch_invariant_gdn_prefill(module: nn.Module, num_tokens: int) -> bool:
+    max_tokens = getattr(module, "_gdn_prefill_max_tokens", None)
+    return max_tokens is None or num_tokens <= max_tokens
+
+
+def _forward_ba_proj(
+    ba_proj: nn.Module,
+    x: torch.Tensor,
+    forward_batch: Optional[ForwardBatch],
+) -> torch.Tensor:
+    max_tokens = getattr(ba_proj, "_gdn_prefill_max_tokens", None)
+    if (
+        _is_cuda
+        and max_tokens != 0
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and type(ba_proj) is MergedColumnParallelLinear
+        and isinstance(ba_proj.quant_method, UnquantizedLinearMethod)
+        and ba_proj.bias is None
+        and not ba_proj.gather_output
+        and not get_forward().sp_active
+        and isinstance(x, torch.Tensor)
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and ba_proj.weight.dtype == torch.bfloat16
+        and x.shape[0] > 0
+        and x.numel() > 0
+    ):
+        rows = x.reshape(-1, x.shape[-1])
+        if max_tokens is None or rows.shape[0] <= max_tokens:
+            # Keep GDN gate projections M-invariant across padded prefill graph buckets.
+            return _matmul_persistent_triton(
+                rows, ba_proj.weight.t(), torch.bfloat16
+            ).view(*x.shape[:-1], ba_proj.weight.shape[0])
+    out, _ = ba_proj(x)
+    return out
 
 
 if _is_npu:
@@ -844,7 +887,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         )
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_input_proj(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -926,7 +973,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_ba = _forward_ba_proj(
+                    self.in_proj_ba, hidden_states, forward_batch
+                )
             current_stream.wait_stream(self.alt_stream)
         elif self._fused_input_proj_cpu_enabled.value:
             projected_states_qkvz, projected_states_ba = (
@@ -939,7 +988,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            projected_states_ba = _forward_ba_proj(
+                self.in_proj_ba, hidden_states, forward_batch
+            )
         return projected_states_qkvz, projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
@@ -987,7 +1038,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         3. Output projection
         """
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, forward_batch
         )
 
         use_strided_prefill_z = False
@@ -1097,7 +1148,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             return self.out_proj(fp8)[0]
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if (
+            _is_cuda
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and _allows_batch_invariant_gdn_prefill(self, len(core_attn_out) // nv)
+        ):
+            # Padded GDN prefills require a fixed reduction layout on every
+            # qualifying CUDA architecture, not just the SM120 fixed-FP8 path.
+            core_attn_out, _, _ = _layer_norm_fwd(
+                core_attn_out,
+                self.norm.weight,
+                None,
+                self.norm.eps,
+                z=z,
+                group_size=self.norm.group_size,
+                norm_before_gate=self.norm.norm_before_gate,
+                is_rms_norm=True,
+                activation=self.norm.activation,
+                batch_invariant=True,
+            )
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
             *core_attn_out.shape[:-2],
@@ -1811,6 +1882,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 config.layers_block_type[idx]
             ].stage_facts(config, idx),
         )
+        enable_gdn_fp8_prefill(self.layers)
 
         self.flashinfer_mnnvl_cutedsl_fusion = None
         if _use_mnnvl_cutedsl_fusion(config, is_nextn):

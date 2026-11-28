@@ -1144,6 +1144,11 @@ class DefaultModelLoader(BaseModelLoader):
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
         finalize_gfx115_weight_padding(model)
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            configure_gdn_prefill_model,
+        )
+
+        configure_gdn_prefill_model(model)
 
     @staticmethod
     def restore_weights_before_loading(model, target_device):
@@ -1582,6 +1587,11 @@ class DummyModelLoader(BaseModelLoader):
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     quant_method.process_weights_after_loading(module)
+            from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+                configure_gdn_prefill_model,
+            )
+
+            configure_gdn_prefill_model(model)
 
         return model.eval()
 

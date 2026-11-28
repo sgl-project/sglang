@@ -41,6 +41,7 @@ import copy
 import dataclasses
 import inspect
 import logging
+import sys
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager, nullcontext
@@ -165,10 +166,12 @@ from sglang.srt.model_executor.runner_utils.shared_read_event import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
+    get_context,
     get_exec,
     get_flags,
     get_memory,
     get_parallel,
+    get_platform,
     get_schedule,
 )
 from sglang.srt.speculative.eagle_utils import get_draft_input_from_target_hidden_dim
@@ -194,6 +197,233 @@ _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
 # Prefix attention adds one loop body per chunk to the captured topology, so
 # capture a small geometric set and round each replay up to the nearest one.
 _CHUNKED_PREFIX_VARIANTS = (1, 2, 4, 8, 16)
+
+
+def _uses_gdn_linear_attention(attn_backend: Any) -> bool:
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+    from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+
+    return isinstance(attn_backend, GDNAttnBackend) or (
+        isinstance(attn_backend, HybridLinearAttnBackend)
+        and isinstance(attn_backend.linear_attn_backend, GDNAttnBackend)
+    )
+
+
+def _deterministic_inference_enabled() -> bool:
+    return (
+        get_context().is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+    )
+
+
+def _is_single_model_worker() -> bool:
+    parallel = get_parallel()
+    try:
+        return parallel.tp_size == 1 and parallel.pp_size == 1
+    except ValueError:
+        return False
+
+
+def _gdn_projection_padding_max_tokens(projection: torch.nn.Module) -> Optional[int]:
+    """None permits padding at any M; zero requires exact capture buckets."""
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        GDN_FP8_PREFILL_MAX_TOKENS,
+        ModelOptFp4LinearMethod,
+        ModelOptFp8LinearMethod,
+        is_sm120_gdn_prefill_supported,
+    )
+
+    method = projection.quant_method
+    if projection.bias is not None:
+        return 0
+    if type(method) is ModelOptFp8LinearMethod:
+        if (
+            method.use_marlin
+            or projection.input_scale is None
+            or projection.weight.dtype != torch.float8_e4m3fn
+        ):
+            return 0
+        if method.use_sm120_fp8:
+            if _deterministic_inference_enabled():
+                return None
+            return (
+                method.gdn_prefill_max_tokens if is_sm120_gdn_prefill_supported() else 0
+            )
+        return None if get_platform().is_sm100 and projection.use_flashinfer_bmm else 0
+    if type(method) is ModelOptFp4LinearMethod and (
+        method.quant_mode == "w4a4" and projection.weight.dtype == torch.uint8
+    ):
+        backend = get_fp4_gemm_runner_backend()
+        if get_platform().is_sm100 and backend.is_flashinfer():
+            return None
+        if (
+            is_sm120_gdn_prefill_supported()
+            and backend.is_flashinfer_cutlass()
+            and (
+                projection.input_size_per_partition,
+                projection.output_size_per_partition,
+            )
+            in ((5120, 34816), (17408, 5120))
+        ):
+            # Includes the SM120 M=9 KDA fast path, checked against CUTLASS.
+            return GDN_FP8_PREFILL_MAX_TOKENS
+    return 0
+
+
+def _layer_model_gdn_prefill_padding_max_tokens(
+    layer_model: torch.nn.Module,
+    *,
+    has_external_body: bool = False,
+) -> Optional[int]:
+    if not is_cuda():
+        return None
+    from sglang.srt.layers.linear import LinearBase, MergedColumnParallelLinear
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        is_sm120_gdn_prefill_supported,
+    )
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+    from sglang.srt.models.qwen3_5 import Qwen3_5GatedDeltaNet
+    from sglang.srt.models.qwen3_next import Qwen3GatedDeltaNet
+
+    deterministic_sm12x = get_platform().is_sm120 and _deterministic_inference_enabled()
+    if (
+        not (
+            get_platform().is_sm100
+            or is_sm120_gdn_prefill_supported()
+            or deterministic_sm12x
+        )
+        or get_flags().sp.enabled
+        or has_external_body
+        or external_prefill_body(layer_model) is not None
+    ):
+        return 0
+
+    skipped = set()
+    found_gdn = False
+    padding_limit = None
+    for module in layer_model.modules():
+        if isinstance(module, (Qwen3_5GatedDeltaNet, Qwen3GatedDeltaNet)):
+            found_gdn = True
+            # conv1d stores a convolution weight in a LinearBase wrapper.
+            skipped.add(module.conv1d)
+            ba = module.in_proj_ba
+            if (
+                type(ba) is MergedColumnParallelLinear
+                and isinstance(ba.quant_method, UnquantizedLinearMethod)
+                and ba.params_dtype == torch.bfloat16
+                and ba.weight.dtype == torch.bfloat16
+                and ba.bias is None
+                and not ba.gather_output
+            ):
+                # _forward_ba_proj uses the persistent, row-invariant matmul.
+                skipped.add(ba)
+        if isinstance(module, LinearBase) and module not in skipped:
+            limit = _gdn_projection_padding_max_tokens(module)
+            if limit == 0:
+                return 0
+            if limit is not None:
+                padding_limit = (
+                    limit if padding_limit is None else min(padding_limit, limit)
+                )
+    if padding_limit is not None and not _is_single_model_worker():
+        # Only the bounded optimization needs a local-M/single-worker contract;
+        # an already-selected deterministic path remains valid at arbitrary M.
+        return 0
+    # Includes MHA and FFN projections, but not the eager LM head or vision tower.
+    return padding_limit if found_gdn else 0
+
+
+def _gdn_prefill_padding_max_tokens(model_runner: ModelRunner) -> Optional[int]:
+    if not is_cuda() or not _uses_gdn_linear_attention(model_runner.attn_backend):
+        return None
+    layer_model = _resolve_transformer_layer_model(model_runner.model)
+    return _layer_model_gdn_prefill_padding_max_tokens(
+        layer_model,
+        has_external_body=external_prefill_body(model_runner.model) is not None,
+    )
+
+
+def _loaded_gdn_module_types() -> tuple[type[torch.nn.Module], ...]:
+    types = []
+    for mod_name, cls_name in (
+        ("sglang.srt.models.qwen3_5", "Qwen3_5GatedDeltaNet"),
+        ("sglang.srt.models.qwen3_next", "Qwen3GatedDeltaNet"),
+    ):
+        mod = sys.modules.get(mod_name)
+        cls = getattr(mod, cls_name, None) if mod is not None else None
+        if isinstance(cls, type):
+            types.append(cls)
+    return tuple(types)
+
+
+def _stamp_gdn_prefill_max_tokens(
+    layer_model: torch.nn.Module,
+    gdn_modules: Sequence[torch.nn.Module],
+    max_tokens: Optional[int],
+    *,
+    model_enabled: bool,
+) -> None:
+    from sglang.srt.layers.linear import LinearBase
+
+    for module in gdn_modules:
+        module._gdn_prefill_max_tokens = max_tokens
+        module.in_proj_ba._gdn_prefill_max_tokens = max_tokens
+    for module in layer_model.modules():
+        if isinstance(module, LinearBase):
+            module._gdn_model_prefill_enabled = model_enabled
+
+
+def configure_gdn_prefill_model(
+    model: torch.nn.Module,
+    *,
+    attn_backend: Any = None,
+) -> Optional[int]:
+    """Synchronize per-module prefill invariance with the loaded bucket policy."""
+    if not isinstance(model, torch.nn.Module):
+        return 0
+    gdn_types = _loaded_gdn_module_types()
+    if not gdn_types:
+        return 0
+    try:
+        layer_model = _resolve_transformer_layer_model(model)
+    except RuntimeError:
+        layer_model = model
+    gdn_modules = [m for m in layer_model.modules() if isinstance(m, gdn_types)]
+    if not gdn_modules:
+        return 0
+    has_external = (
+        external_prefill_body(model) is not None
+        or external_prefill_body(layer_model) is not None
+    )
+    if not is_cuda() or (
+        attn_backend is not None and not _uses_gdn_linear_attention(attn_backend)
+    ):
+        padding_max_tokens: Optional[int] = 0
+    else:
+        padding_max_tokens = _layer_model_gdn_prefill_padding_max_tokens(
+            layer_model, has_external_body=has_external
+        )
+    max_tokens = (
+        None
+        if (
+            is_cuda()
+            and not has_external
+            and not get_flags().sp.enabled
+            and _deterministic_inference_enabled()
+            and (attn_backend is None or _uses_gdn_linear_attention(attn_backend))
+        )
+        else padding_max_tokens
+    )
+    _stamp_gdn_prefill_max_tokens(
+        layer_model,
+        gdn_modules,
+        max_tokens,
+        model_enabled=padding_max_tokens != 0,
+    )
+    return max_tokens
 
 
 def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int]:
@@ -240,6 +470,13 @@ def set_external_prefill_body(model: torch.nn.Module, body: Any) -> None:
     """Mark the transformer body prefill graphs capture as a kernel plugin's
     (spec.SupportsPrefillBody), which reads the pools inside the graph."""
     model.__dict__["_external_prefill_body"] = body
+    try:
+        layer_model = _resolve_transformer_layer_model(model)
+    except RuntimeError:
+        layer_model = None
+    if layer_model is not None:
+        layer_model.__dict__["_external_prefill_body"] = body
+    configure_gdn_prefill_model(model)
 
 
 def external_prefill_body(model: torch.nn.Module) -> Optional[Any]:
@@ -349,6 +586,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _dcp_extend_active = False
     _kimi_k31_rocm_bcg = False
     _is_breakable_backend = False
+    _prefill_padding_max_tokens: Optional[int] = None
     dllm_attention = None
 
     @property
@@ -414,6 +652,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 False,
             )
         )
+        self._prefill_padding_max_tokens = _gdn_prefill_padding_max_tokens(model_runner)
+        if isinstance(getattr(model_runner, "model", None), torch.nn.Module):
+            configure_gdn_prefill_model(
+                model_runner.model, attn_backend=model_runner.attn_backend
+            )
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
@@ -1558,15 +1801,38 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return True
         if num_tokens > self.max_num_tokens:
             return False
-        # No exact-shape check: load_batch bucket-pads; only reject
-        # disproportionate padding waste.
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
+        if (
+            padded_num_tokens != num_tokens
+            and self._prefill_padding_max_tokens is not None
+            and padded_num_tokens > self._prefill_padding_max_tokens
+        ):
+            return False
         is_below_minimum_capture = 0 < num_tokens < self.capture_num_tokens[0]
         if (
             not is_below_minimum_capture
             and padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR
         ):
             return False
+        return True
+
+    def can_replay_dp_tokens(self, global_num_tokens: Sequence[int]) -> bool:
+        """Check gathered DP rank counts against their shared replay bucket."""
+        if not global_num_tokens:
+            return False
+        max_tokens = max(int(n) for n in global_num_tokens)
+        if max_tokens <= 0 or max_tokens > self.max_num_tokens:
+            return False
+        common_bucket = self._pad_to_bucket(max_tokens, self.capture_num_tokens)
+        for raw in global_num_tokens:
+            num_tokens = int(raw)
+            if num_tokens <= 0 or num_tokens == common_bucket:
+                continue
+            if (
+                self._prefill_padding_max_tokens is not None
+                and common_bucket > self._prefill_padding_max_tokens
+            ):
+                return False
         return True
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -1581,6 +1847,18 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # Every dp rank must hold tokens this forward (reads the synced
         # table post dp-padding; idle ranks vote permissively upstream).
         if self._has_inactive_dp_rank(forward_batch):
+            return False
+
+        raw_dp_tokens = (
+            getattr(forward_batch, "original_global_num_tokens_cpu", None)
+            or forward_batch.global_num_tokens_cpu
+        )
+        if (
+            raw_dp_tokens is not None
+            and len(raw_dp_tokens) > 1
+            and not prefill_graph_tolerates_sum_len()
+            and not self.can_replay_dp_tokens(raw_dp_tokens)
+        ):
             return False
 
         # A batch can be too small to activate CP. Its unsharded inputs must

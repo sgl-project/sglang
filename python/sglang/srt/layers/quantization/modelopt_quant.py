@@ -12,7 +12,11 @@ import regex as re
 import torch
 from torch.nn.parameter import Parameter
 
-from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.kernels.ops.gemm.fp8_kernel import triton_scaled_mm
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    scaled_fp8_quant,
+    static_quant_fp8,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -69,7 +73,11 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.runtime_context import get_exec, get_platform
+from sglang.srt.model_executor.forward_context import (
+    get_forward_context,
+    has_forward_context,
+)
+from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.device import get_device_capability, is_cuda
@@ -515,6 +523,47 @@ class ModelOptFp8Config(ModelOptQuantConfig):
         )
 
 
+# Fixed reductions qualified on SM120 for the Qwen3.8-27B projection shapes.
+# Select by (K, N), never M: changing the K tile changes the accumulation order.
+_GDN_FP8_PREFILL_CONFIGS = {
+    (5120, 16384): (64, 128, 64),
+    (6144, 5120): (64, 128, 128),
+    (5120, 14336): (64, 128, 64),
+}
+GDN_FP8_PREFILL_MAX_TOKENS = 256
+
+
+def _is_single_model_worker() -> bool:
+    parallel = get_parallel()
+    try:
+        return parallel.tp_size == 1 and parallel.pp_size == 1
+    except ValueError:
+        return False
+
+
+def is_sm120_gdn_prefill_supported() -> bool:
+    """True on SM120 (12.0) RTX Blackwell; excludes SM121 (12.1) GB10."""
+    platform = get_platform()
+    return (
+        platform.is_cuda and platform.is_sm120 and platform.device_capability == (12, 0)
+    )
+
+
+def enable_gdn_fp8_prefill(layers: torch.nn.Module) -> None:
+    """Opt in only the GDN language body's FP8 methods, before weights load."""
+    from sglang.srt.layers.linear import LinearBase
+
+    # Qualified shapes and row bounds are for a single SM120 (12.0) worker;
+    # DP/CP gathers can make M larger than the runner's local token count, and
+    # SM121/GB10 (12.1) keeps its faster native cuBLASLt kernels.
+    enabled = is_sm120_gdn_prefill_supported() and _is_single_model_worker()
+    for layer in layers.modules():
+        if isinstance(layer, LinearBase):
+            method = layer.quant_method
+            if type(method) is ModelOptFp8LinearMethod:
+                method._gdn_prefill_enabled = enabled and method.use_sm120_fp8
+
+
 class ModelOptFp8LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt static FP8 quantization.
 
@@ -528,6 +577,68 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     Args:
         quant_config (ModelOptFp8Config): The ModelOpt quantization configuration.
     """
+
+    _gdn_prefill_enabled = False
+    _gdn_prefill_config: Optional[Tuple[int, int, int]] = None
+
+    @property
+    def gdn_prefill_max_tokens(self) -> int:
+        return GDN_FP8_PREFILL_MAX_TOKENS if self._gdn_prefill_config is not None else 0
+
+    def _prepare_gdn_prefill(self, layer: torch.nn.Module) -> None:
+        self._gdn_prefill_config = None
+        if (
+            self._gdn_prefill_enabled
+            and self.use_sm120_fp8
+            and is_sm120_gdn_prefill_supported()
+            and _is_single_model_worker()
+            and not self.use_marlin
+            and layer.use_flashinfer_bmm
+            and layer.bias is None
+            and layer.orig_dtype == torch.bfloat16
+            and layer.weight.dtype == torch.float8_e4m3fn
+            and layer.input_scale is not None
+            and layer.input_scale.numel() == 1
+            and layer.weight_scale.numel() == 1
+        ):
+            self._gdn_prefill_config = _GDN_FP8_PREFILL_CONFIGS.get(
+                tuple(layer.weight.shape)
+            )
+
+    def _apply_gdn_prefill(self, layer, x, bias):
+        if (
+            bias is not None
+            or not getattr(layer, "_gdn_model_prefill_enabled", True)
+            or not has_forward_context()
+        ):
+            return None
+        mode = get_forward_context().forward_mode
+        if (
+            mode is None
+            or not mode.is_context_parallel_extend()
+            or x.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+            or not 0 < x.numel() // x.shape[-1] <= GDN_FP8_PREFILL_MAX_TOKENS
+        ):
+            return None
+        x = x.view(-1, x.shape[-1])
+        if x.dtype == torch.float8_e4m3fn:
+            qinput, scale = x, layer.input_scale
+        else:
+            qinput, scale = static_quant_fp8(x, layer.input_scale, repeat_scale=False)
+        bm, bn, bk = self._gdn_prefill_config
+        return triton_scaled_mm(
+            qinput,
+            layer.weight,
+            scale,
+            layer.weight_scale,
+            torch.bfloat16,
+            block_size_m=bm,
+            block_size_n=bn,
+            block_size_k=bk,
+            use_heuristic=False,
+            num_warps=4,
+            num_stages=3,
+        )
 
     def __init__(self, quant_config: ModelOptFp8Config):
         super().__init__()
@@ -626,6 +737,7 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             prepare_fp8_layer_for_marlin(layer)
             # Marlin uses FP8 weights with unquantized activations.
             del layer.input_scale
+        self._prepare_gdn_prefill(layer)
 
     def apply(
         self,
@@ -655,6 +767,10 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                 input_scale=layer.input_scale,
                 bias=bias,
             )
+        if self._gdn_prefill_config is not None:
+            output = self._apply_gdn_prefill(layer, x, bias)
+            if output is not None:
+                return output.view(*x.shape[:-1], layer.weight.shape[1])
         if self.use_sm120_fp8:
             from sglang.kernels.ops.gemm import try_sm120_fp8_linear
 

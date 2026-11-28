@@ -37,6 +37,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
+from sglang.srt.model_executor.forward_batch_info import prefill_graph_tolerates_sum_len
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
@@ -761,6 +762,16 @@ def prepare_mlp_sync_batch_raw(
             group=group,
             use_all_reduce=use_world_group,
         )
+        if (
+            mlp_sync_info.can_run_prefill_cuda_graph
+            and mlp_sync_info.is_extend_in_batch
+            and isinstance(prefill_graph_runner, PrefillCudaGraphRunner)
+            and not prefill_graph_tolerates_sum_len()
+            and not prefill_graph_runner.can_replay_dp_tokens(
+                mlp_sync_info.global_num_tokens
+            )
+        ):
+            mlp_sync_info.can_run_prefill_cuda_graph = False
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
     if shutdown_vote is not None and metadata_ready:

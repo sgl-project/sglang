@@ -1251,6 +1251,11 @@ class ModelRunner:
         backends = build_attention_backends(model_runner=self)
         self.attn_backend = backends.attn_backend
         self.runner_ids.bind_and_verify_backends([self.attn_backend])
+        from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            configure_gdn_prefill_model,
+        )
+
+        configure_gdn_prefill_model(self.model, attn_backend=self.attn_backend)
 
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()

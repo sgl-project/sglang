@@ -14,6 +14,9 @@ from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat,
 )
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+    _matmul_persistent_triton,
+)
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -46,6 +49,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import enable_gdn_fp8_prefill
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import validate_quant_param_compatibility
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -68,7 +73,11 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_parallel,
+    get_stream,
+)
 from sglang.srt.utils import (
     LazyValue,
     cpu_has_amx_support,
@@ -166,6 +175,45 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
+
+
+def _allows_batch_invariant_gdn_prefill(module: nn.Module, num_tokens: int) -> bool:
+    max_tokens = getattr(module, "_gdn_prefill_max_tokens", None)
+    return max_tokens is None or num_tokens <= max_tokens
+
+
+def _forward_ba_proj(
+    ba_proj: nn.Module,
+    x: torch.Tensor,
+    forward_batch: Optional[ForwardBatch],
+) -> torch.Tensor:
+    max_tokens = getattr(ba_proj, "_gdn_prefill_max_tokens", None)
+    if (
+        _is_cuda
+        and max_tokens != 0
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and type(ba_proj) is MergedColumnParallelLinear
+        and isinstance(ba_proj.quant_method, UnquantizedLinearMethod)
+        and ba_proj.bias is None
+        and not ba_proj.gather_output
+        and not get_forward().sp_active
+        and isinstance(x, torch.Tensor)
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and ba_proj.weight.dtype == torch.bfloat16
+        and x.shape[0] > 0
+        and x.numel() > 0
+    ):
+        rows = x.reshape(-1, x.shape[-1])
+        if max_tokens is None or rows.shape[0] <= max_tokens:
+            # Keep GDN gate projections M-invariant across padded prefill graph buckets.
+            return _matmul_persistent_triton(
+                rows, ba_proj.weight.t(), torch.bfloat16
+            ).view(*x.shape[:-1], ba_proj.weight.shape[0])
+    out, _ = ba_proj(x)
+    return out
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -506,7 +554,11 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_input_proj(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         if (
             _is_cpu
             or _is_npu
@@ -539,11 +591,15 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hs_ba)
+                projected_states_ba = _forward_ba_proj(
+                    self.in_proj_ba, hs_ba, forward_batch
+                )
             current_stream.wait_stream(self.alt_stream)
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
-            projected_states_ba, _ = self.in_proj_ba(hs_ba)
+            projected_states_ba = _forward_ba_proj(
+                self.in_proj_ba, hs_ba, forward_batch
+            )
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -552,7 +608,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         forward_batch: ForwardBatch,
     ):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, forward_batch
         )
 
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
@@ -601,7 +657,19 @@ class Qwen3GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if (
+            _is_cuda
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and isinstance(self.norm, FusedRMSNormGated)
+            and _allows_batch_invariant_gdn_prefill(
+                self, core_attn_out.shape[0] // z_shape_og[-2]
+            )
+        ):
+            # SM103 otherwise selects different row tiles for small batches.
+            core_attn_out = self.norm(core_attn_out, z, batch_invariant=True)
+        else:
+            # The TC-piecewise RMSNorm path already fixes its reduction layout.
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
@@ -1098,6 +1166,7 @@ class Qwen3NextModel(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        enable_gdn_fp8_prefill(self.layers)
 
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
@@ -1123,7 +1192,6 @@ class Qwen3NextModel(nn.Module):
         # mamba_cache_params: MambaCacheParams,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         # pass a sequence index tensor, that is required for
         # proper continuous batching computation including
         # chunked prefill
