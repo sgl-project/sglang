@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
@@ -15,6 +16,10 @@ from sglang.srt.batch_overlap.operations import (
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.layer_boundary import (
     Layout,
     tbo_split_moves,
@@ -753,6 +758,12 @@ class TboForwardBatchPreparer:
             )
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
+        # Offsets into the child's token buffers, which start at start_token_index.
+        if output_dict.get("extend_start_loc") is not None:
+            output_dict["extend_start_loc"] = (
+                output_dict["extend_start_loc"] - start_token_index
+            )
+
         spec_info = getattr(batch, "spec_info")
         output_spec_info = split_spec_info(
             spec_info=spec_info,
@@ -959,8 +970,14 @@ def model_forward_stages(
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
     zero_allocator: Optional[BumpAllocator] = None,
+    captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+    capture_layer_ids: Sequence[int] = (),
 ):
-    """Run stage operations with an independent residual stream per microbatch."""
+    """Run stage operations with an independent residual stream per microbatch.
+
+    Layers whose layer_id is in capture_layer_ids append their attention input to
+    captured_last_layer_outputs, in layer order, as the ordinary forward does.
+    """
     strategy = OperationsStrategy.init_new_tbo(
         layers, forward_batch.global_forward_mode
     )
@@ -970,8 +987,17 @@ def model_forward_stages(
         forward_batch=forward_batch,
         zero_allocator=zero_allocator,
     )
+    capture_layers = [
+        layer
+        for layer in layers
+        if captured_last_layer_outputs is not None
+        and layer.layer_id in capture_layer_ids
+    ]
     if not enable_tbo:
-        return execute_operations(inputs, strategy.operations)["hidden_states"]
+        operations = _bind_aux_capture(
+            strategy.operations, capture_layers, captured_last_layer_outputs
+        )
+        return execute_operations(inputs, operations)["hidden_states"]
 
     stream = residual_batch.stream_of(forward_batch)
     pending = stream.pending
@@ -999,11 +1025,26 @@ def model_forward_stages(
         if _is_hip
         else deep_gemm_wrapper.configure_deep_gemm_num_sms(strategy.deep_gemm_num_sms)
     )
+    # The two children interleave layer ops, so each collects into its own list.
+    child_captures = [AuxHiddenStateList(), AuxHiddenStateList()]
     with context:
         outputs = execute_overlapped_operations(
             inputs_arr=parts,
-            operations_arr=[strategy.operations] * 2,
+            operations_arr=[
+                _bind_aux_capture(strategy.operations, capture_layers, capture)
+                for capture in child_captures
+            ],
             delta_stages=[0, strategy.tbo_delta_stages],
+        )
+    for capture_a, capture_b in zip(*child_captures, strict=True):
+        captured_last_layer_outputs.capture(
+            _model_forward_tbo_merge_key(
+                dict(aux=capture_a, forward_batch=outputs[0]["forward_batch"]),
+                dict(aux=capture_b, forward_batch=outputs[1]["forward_batch"]),
+                "aux",
+                original_len,
+            ),
+            owned=True,
         )
     for output in outputs:
         output["residual"] = residual_batch.stream_of(output["forward_batch"])
@@ -1013,6 +1054,19 @@ def model_forward_stages(
     for output in outputs:
         output["forward_batch"].residual_stream = None
     return hidden_states
+
+
+def _bind_aux_capture(operations, capture_layers, capture):
+    prepares = {
+        layer.op_comm_prepare_attn: functools.update_wrapper(
+            functools.partial(
+                layer.op_comm_prepare_attn, captured_last_layer_outputs=capture
+            ),
+            layer.op_comm_prepare_attn,
+        )
+        for layer in capture_layers
+    }
+    return [prepares.get(op, op) for op in operations]
 
 
 def _model_forward_tbo_split_inputs(

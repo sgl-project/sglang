@@ -148,6 +148,43 @@ class TestTboFilterBatchMarker(CustomTestCase):
         child = _filter(parent, lo=0, hi=4)
         self.assertIsNone(child.input_candidate_selectors)
 
+    def test_filter_batch_rebases_extend_start_loc_to_child_tokens(self):
+        """Each child's token buffers start at its own row 0, so its per-request
+        extend offsets must too; parent-relative offsets made the second child
+        read other requests' tokens or run past its buffer."""
+        extend_lens = [3, 2, 4]
+        parent = _make_target_verify_batch(3)
+        parent.forward_mode = ForwardMode.EXTEND
+        parent.input_ids = torch.arange(9)
+        parent.positions = torch.arange(9)
+        parent.out_cache_loc = torch.arange(9)
+        parent.extend_num_tokens = 9
+        parent.extend_seq_lens = torch.tensor(extend_lens, dtype=torch.int32)
+        parent.extend_seq_lens_cpu = extend_lens
+        parent.extend_start_loc = torch.tensor([0, 3, 5], dtype=torch.int32)
+
+        with (
+            get_context().override_server_args(
+                attention_backend="triton", moe_dense_tp_size=None
+            ),
+            get_parallel().override(attn_tp_size=1),
+        ):
+            children = [
+                TboForwardBatchPreparer.filter_batch(
+                    parent,
+                    start_token_index=lo_tok,
+                    end_token_index=hi_tok,
+                    start_seq_index=lo_seq,
+                    end_seq_index=hi_seq,
+                    out_num_token_non_padded=torch.tensor(hi_tok - lo_tok),
+                )
+                for lo_tok, hi_tok, lo_seq, hi_seq in ((0, 3, 0, 1), (3, 9, 1, 3))
+            ]
+
+        self.assertEqual(children[0].extend_start_loc.tolist(), [0])
+        self.assertEqual(children[1].extend_start_loc.tolist(), [0, 2])
+        self.assertEqual(parent.extend_start_loc.tolist(), [0, 3, 5])
+
     def test_filter_batch_drops_aux_hidden_states_buffer(self):
         """Decode graph capture sets the shared aux output on the parent before
         the TBO split; children must not inherit it."""
