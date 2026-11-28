@@ -333,14 +333,27 @@ class TestPoolFactory(unittest.TestCase):
             [row.dtype for row in pool.kv_buffer],
             [torch.bfloat16, torch.int8, torch.int8],
         )
-        rows = torch.zeros((1, 1, 512), dtype=torch.bfloat16)
-        slots = torch.tensor([128], dtype=torch.int32)
-        kernel_attention = sys.modules["sgl_kernel_npu.operators.attention"]
-        with patch.object(kernel_attention, "int8_csa_write", create=True) as writer:
-            dsv4_memory_pool._write_dsv41_a3_rows(pool.kv_buffer[1], slots, rows)
-        writer.assert_called_once_with(
-            pool.kv_buffer[1], rows, slots, reserve_page_zero=True
-        )
+
+    def test_a3_int8_cache_writes_vllm_record_and_preserves_page_zero(self):
+        cache = torch.full((3, 4, 1, 608), 19, dtype=torch.int8)
+        before = cache.clone().flatten(0, 1)
+        rows = torch.zeros((5, 1, 512), dtype=torch.bfloat16)
+        rows[..., 0], rows[..., 1], rows[..., 2] = 100, 13, -13
+        rows[..., 448:] = torch.arange(64, dtype=torch.bfloat16)
+        slots = torch.tensor([-1, 0, 3, 6, 12], dtype=torch.int32)
+
+        dsv4_memory_pool._write_dsv41_a3_rows(cache, slots, rows)
+
+        flat = cache.flatten(0, 1)
+        packed = flat[6, 0]
+        bf16 = packed.view(torch.bfloat16)
+        # Retaining the BF16 scale before division makes +/-13 quantize to +/-16.
+        self.assertEqual(packed[128:131].tolist(), [127, 16, -16])
+        torch.testing.assert_close(bf16[:64], rows[3, 0, 448:])
+        self.assertEqual(bf16[288], torch.tensor(100 / 127, dtype=torch.bfloat16))
+        self.assertTrue(torch.all(packed[590:] == 0))
+        torch.testing.assert_close(flat[:6], before[:6])
+        torch.testing.assert_close(flat[7:], before[7:])
 
     def test_compressed_pools_are_fp4(self):
         # A ratio-1 compressed page keeps the global page; a ratio-2 page holds
@@ -1297,7 +1310,7 @@ class TestLowRatioAttentionBody(unittest.TestCase):
             self._run(ratio=2, seq_lens=[7], topk_indices=False)
 
     def test_a3_int8_reuses_lengths_but_dispatches_native_csa(self):
-        kernel_attention = sys.modules["sgl_kernel_npu.operators.attention"]
+        kernel_attention = dsv4_backend.npu_attention_ops
         backend = _low_ratio_backend()
         backend._dsv41_int8_kv = True
         full_length = torch.tensor([7], dtype=torch.int32)
@@ -1325,15 +1338,13 @@ class TestLowRatioAttentionBody(unittest.TestCase):
             patch.object(dsv4_backend, "_dsv41_a3_ops") as bf16,
             patch.object(
                 kernel_attention,
-                "int8_csa_metadata",
+                "mixed_quant_sparse_flash_mla_metadata",
                 return_value=metadata,
-                create=True,
             ) as meta,
             patch.object(
                 kernel_attention,
-                "int8_csa_attention",
+                "mixed_quant_sparse_flash_mla",
                 return_value=(q, None),
-                create=True,
             ) as attn,
         ):
             bf16.return_value.metadata.return_value = torch.zeros(
@@ -1347,7 +1358,14 @@ class TestLowRatioAttentionBody(unittest.TestCase):
         bf16.return_value.attention.assert_not_called()
         bf16.return_value.metadata.assert_called_once()
         self.assertEqual(meta.call_count, 2)
+        meta_kwargs = meta.call_args.kwargs
+        self.assertEqual(meta_kwargs["impl"], "cann_ops_transformer_a3_int8")
+        self.assertEqual(meta_kwargs["quant_mode"], 1)
+        self.assertEqual(meta_kwargs["num_heads_q"], 64)
+        self.assertEqual(meta_kwargs["cmp_residual_kv"].tolist(), [1])
         kw = attn.call_args.kwargs
+        self.assertEqual(kw["impl"], "cann_ops_transformer_a3_int8")
+        self.assertEqual(kw["quant_mode"], 1)
         self.assertIs(kw["ori_kv"], ori)
         self.assertIs(kw["cmp_kv"], cmp)
         self.assertEqual(kw["cmp_residual_kv"].tolist(), [1])

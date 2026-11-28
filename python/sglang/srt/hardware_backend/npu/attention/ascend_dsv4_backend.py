@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 # Ascend 950 kv-quant KV layout: nope is quantized in groups of 64 and the RoPE half is
 # stored unquantized, so the kernels need both dimensions spelled out.
 _NPU_ARCH35_KV_ROPE_HEAD_DIM = 64
+_DSV41_A3_INT8_IMPL = "cann_ops_transformer_a3_int8"
 
 
 def _sparse_attn_ops():
@@ -152,6 +153,86 @@ def _dsv41_a3_ops():
         indexer=lightning_indexer_v2,
         sparse_indexer=sparse_lightning_indexer,
     )
+
+
+@functools.cache
+def _check_dsv41_a3_int8_support(device):
+    """Probe the 608-byte writer and CANN metadata/reader before serving."""
+    import acl
+
+    from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
+        _write_dsv41_a3_rows,
+    )
+
+    soc = acl.get_soc_name()
+    if not soc.startswith("Ascend910_93"):
+        raise ValueError(f"DeepSeek-V4.1 INT8 KV requires Atlas A3, got {soc}.")
+
+    try:
+        win = torch.zeros((2, 16, 1, 608), dtype=torch.int8, device=device)
+        cmp = torch.zeros_like(win)
+        q = torch.zeros((1, 1, 512), dtype=torch.bfloat16, device=device)
+        kv = torch.zeros_like(q)
+        kv[..., 0], kv[..., -1] = -3, 2
+        slot = torch.tensor([16], dtype=torch.int32, device=device)
+        _write_dsv41_a3_rows(win, slot, kv)
+        _write_dsv41_a3_rows(cmp, slot, kv)
+
+        lens = torch.ones(1, dtype=torch.int32, device=device)
+        common = {
+            "impl": _DSV41_A3_INT8_IMPL,
+            "quant_mode": 1,
+            "rope_head_dim": 64,
+            "cu_seqlens_q": torch.tensor([0, 1], dtype=torch.int32, device=device),
+            "seqused_ori_kv": lens,
+            "seqused_cmp_kv": lens,
+            "cmp_ratio": 1,
+            "ori_mask_mode": 4,
+            "cmp_mask_mode": 3,
+            "ori_win_left": 127,
+            "ori_win_right": 0,
+            "layout_q": "TND",
+            "layout_kv": "PA_BBND",
+        }
+        metadata = npu_attention_ops.mixed_quant_sparse_flash_mla_metadata(
+            num_heads_q=1,
+            num_heads_kv=1,
+            head_dim=512,
+            batch_size=1,
+            cmp_topk=16,
+            has_ori_kv=True,
+            has_cmp_kv=True,
+            **common,
+        )
+        indices = torch.full((1, 1, 16), -1, dtype=torch.int32, device=device)
+        indices[..., 0] = 0
+        page_table = lens.view(1, 1)
+        out, _ = npu_attention_ops.mixed_quant_sparse_flash_mla(
+            q,
+            ori_kv=win,
+            cmp_kv=cmp,
+            cmp_sparse_indices=indices,
+            ori_block_table=page_table,
+            cmp_block_table=page_table,
+            metadata=metadata,
+            sinks=torch.zeros(1, dtype=torch.float32, device=device),
+            softmax_scale=512**-0.5,
+            **common,
+        )
+        # Equal logits for the two KV rows and the sink give a weight of 2/3.
+        if (
+            out.dtype != torch.bfloat16
+            or win[1, 0, 0, 128].item() != -127
+            or not math.isclose(out[0, 0, 0].item(), -2, abs_tol=0.02)
+            or not math.isclose(out[0, 0, -1].item(), 4 / 3, abs_tol=0.02)
+        ):
+            raise RuntimeError("The A3 INT8 CSA probe returned an invalid result.")
+    except (ImportError, AttributeError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(
+            f"DeepSeek-V4.1 INT8 KV probe failed on {soc}. Install sgl-kernel-npu "
+            "with A3 INT8 mixed-quant attention support and matching "
+            "cann_ops_transformer bindings and CANN OPP."
+        ) from exc
 
 
 @functools.cache
@@ -2125,19 +2206,27 @@ class LowRatioCompressAscendBackendMixin:
     def _dsv41_a3_kernel_metadata(
         self, forward_batch, ratio, *, batch_size, metadata=None
     ):
-        if ratio and self._dsv41_int8_kv:
-            from sgl_kernel_npu.operators.attention import int8_csa_metadata as op
-        else:
-            op = _dsv41_a3_ops().metadata
-        return op(
-            self._dsv4_q_head_num,
-            1,
-            self._dsv4_head_dim,
+        kwargs = self._dsv41_a3_attention_kwargs(
+            forward_batch, ratio, metadata=metadata
+        )
+        kwargs.update(
             batch_size=batch_size,
             has_ori_kv=True,
             has_cmp_kv=ratio > 0,
             cmp_topk=self._dsv4_index_topk if ratio else 0,
-            **self._dsv41_a3_attention_kwargs(forward_batch, ratio, metadata=metadata),
+        )
+        if ratio and self._dsv41_int8_kv:
+            return npu_attention_ops.mixed_quant_sparse_flash_mla_metadata(
+                num_heads_q=self._dsv4_q_head_num,
+                num_heads_kv=1,
+                head_dim=self._dsv4_head_dim,
+                impl=_DSV41_A3_INT8_IMPL,
+                quant_mode=1,
+                rope_head_dim=64,
+                **kwargs,
+            )
+        return _dsv41_a3_ops().metadata(
+            self._dsv4_q_head_num, 1, self._dsv4_head_dim, **kwargs
         )
 
     def _dsv41_a3_query_tokens(self, forward_batch) -> int | None:
@@ -2165,8 +2254,8 @@ class LowRatioCompressAscendBackendMixin:
         return forward_batch.seq_lens.to(torch.int32)
 
     def _dsv41_a3_attention_kwargs(self, forward_batch, ratio, *, metadata=None):
-        # Unlike MQSMLA, the BF16 A3 kernel derives causal windows and the
-        # compressed prefix from lengths, masks and the unfinished C2 pair.
+        # The A3 readers derive windows and the compressed prefix from lengths,
+        # masks and the unfinished C2 pair.
         seq_lens = self._dsv41_a3_kv_lengths(forward_batch, metadata=metadata)
         fm = self.forward_metadata if metadata is None else metadata
         return dict(
@@ -2224,10 +2313,8 @@ class LowRatioCompressAscendBackendMixin:
             if compress_ratio:
                 topk = getattr(fm, f"c{compress_ratio}_topk_indices")
                 if self._dsv41_int8_kv:
-                    from sgl_kernel_npu.operators.attention import (
-                        int8_csa_attention as attention,
-                    )
-
+                    attention = npu_attention_ops.mixed_quant_sparse_flash_mla
+                    kwargs.update(impl=_DSV41_A3_INT8_IMPL, quant_mode=1)
                     topk = topk[: attention_q.shape[0]].to(torch.int32).contiguous()
                 kwargs.update(
                     cmp_kv=pool.get_compress_buffer(layer.layer_id, False),
@@ -2909,15 +2996,7 @@ class DeepseekV4AscendAttnBackend(
         )
         self._dsv41_int8_kv = getattr(self.token_to_kv_pool, "dsv41_int8_kv", False)
         if self._dsv41_int8_kv:
-            try:
-                from sgl_kernel_npu.operators.attention import check_int8_csa_support
-            except ImportError as exc:
-                raise RuntimeError(
-                    "DeepSeek-V4.1 INT8 KV requires sgl-kernel-npu built with "
-                    "the ops_transformer_int8_csa profile."
-                ) from exc
-
-            check_int8_csa_support(self.device)
+            _check_dsv41_a3_int8_support(self.device)
         if self._dsv4_has_low_ratio:
             if is_npu_arch35():
                 # MQSMLA fixes N1 = 64 and does not shard query heads over TP.

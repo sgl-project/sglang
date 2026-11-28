@@ -111,14 +111,31 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
 
 def _write_dsv41_a3_rows(buf, loc, cache):
     """Fixed-shape A3 scatter; page zero is reserved for padding, never live KV."""
-    if buf.dtype == torch.int8:
-        from sgl_kernel_npu.operators.attention import int8_csa_write
-
-        int8_csa_write(buf, cache, loc, reserve_page_zero=True)
-        return
-
     rows = buf.view(-1, 1, buf.shape[-1])
     slots = loc.reshape(-1).long()
+    if buf.dtype == torch.int8:
+        latent = cache.reshape(-1, 512)
+        if latent.shape[0] != slots.numel() or latent.dtype != torch.bfloat16:
+            raise ValueError("INT8 CSA requires one BF16 latent row per cache slot")
+        if not slots.numel():
+            return
+
+        # Match vLLM-Ascend's A3 CSA packer: quantize with the saved BF16 scale.
+        groups = latent[:, :448].float().reshape(-1, 7, 64)
+        scales = (groups.abs().amax(dim=-1).clamp_min(1e-8) / 127).to(torch.bfloat16)
+        quantized = (groups / scales.float().unsqueeze(-1)).round().clamp(-127, 127)
+        values = rows.new_zeros((slots.numel(), 1, 608))
+        values[..., 128:576] = quantized.reshape(-1, 1, 448).to(torch.int8)
+        bf16_fields = values.view(torch.bfloat16)
+        bf16_fields[..., :64] = latent[:, None, 448:]
+        bf16_fields[..., 288:295] = scales[:, None, :]
+
+        # Redirect padding to the reserved row with its existing contents.
+        valid = (slots >= buf.shape[1]) & (slots < rows.shape[0])
+        values = torch.where(valid[:, None, None], values, rows[:1])
+        rows.index_copy_(0, slots.masked_fill(~valid, 0), values)
+        return
+
     values = cache.reshape(-1, 1, buf.shape[-1]).to(rows.dtype)
     if values.shape[0] != slots.shape[0]:
         raise ValueError("DeepSeek-V4.1 cache write requires one slot per token")
@@ -131,7 +148,7 @@ def _write_dsv41_a3_rows(buf, loc, cache):
 class DSV41NPUSingleKVPool(NPUDeepSeekV4SingleKVPool):
     """NPU DeepSeek-V4.1 KV pool.
 
-    A3 stores unquantized BF16 rows. A5 rows are fully quantized by
+    A3 uses BF16 or signed 608-byte INT8 CSA rows. A5 rows are fully quantized by
     ``kv_compress_epilog_v2`` (no bf16 RoPE tail), so
     the row width and store dtype come from :class:`NPUDSV4KVLayout`.
     ``V41_SWA_FP8`` is the model-wide window/main pool (FP8 E4M3 group 32, 544 B)
