@@ -299,6 +299,18 @@ for _mod, _fn, _backend, _device in [
         )
     )
 del _mod, _fn, _backend, _device
+# ROCm gfx950 grouped-head split-KV verify attention for GQA DSPARK drafts.
+register_kernel(
+    KernelSpec(
+        op="attention.verify_gqa_draft_fwd_hip",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.attention.dspark_draft_attn_hip:"
+            "verify_gqa_draft_fwd_hip"
+        ),
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 # Called through ops.attention.kda_fused_decode_gfx950, which checks for gfx950.
 register_kernel(
     KernelSpec(
