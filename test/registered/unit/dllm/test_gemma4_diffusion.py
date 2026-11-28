@@ -202,6 +202,7 @@ def _fa_batch(extend_lens, prefix_lens, mm_items_per_req):
         extend_seq_lens_cpu=list(extend_lens),
         extend_prefix_lens_cpu=list(prefix_lens),
         mm_inputs=[SimpleNamespace(mm_items=items) for items in mm_items_per_req],
+        contains_image_inputs=lambda: True,
     )
 
 
