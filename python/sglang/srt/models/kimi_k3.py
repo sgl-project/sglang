@@ -85,7 +85,11 @@ from sglang.srt.layers.linear import (
     resolve_linear_parallel_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import route_quant_handoff
+from sglang.srt.layers.moe import (
+    k3_deepgemm_routed,
+    k3_die_local_moe,
+    route_quant_handoff,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import (
@@ -1780,11 +1784,17 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             shared_output = buf[latent_numel:].view(num_tokens, hidden_size)
         fused_norm = False
         if self.alt_stream is not None and k3_ar_fusion.enabled():
+            # the MegaMoE kernel is persistent, one CTA per SM: no AR may overlap it
+            fused_pull = not scatters and k3_deepgemm_routed.handles(
+                self.experts, num_tokens
+            )
             defer_finalize = (
                 not scatters
                 and self._defer_moe_finalize
                 and self.fuse_ar_norm
                 and k3_ar_fusion.finalize_push_fits(num_tokens)
+                # the MegaMoE kernel finalizes in-kernel
+                and not fused_pull
             )
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -1796,21 +1806,30 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 router_logits, routed_input = self._sharded_front_gather(
                     front_block, hidden_states
                 )
-                self.alt_stream.wait_stream(current_stream)
+                if fused_pull:
+                    # the kernel starts on an idle GPU, behind the shared GEMM
+                    current_stream.wait_stream(self.alt_stream)
+                else:
+                    self.alt_stream.wait_stream(current_stream)
+                    with torch.cuda.stream(self.alt_stream):
+                        if scatters:
+                            shared_output = k3_sp_collective.sp_reduce_scatter(
+                                shared_output, k3_sp_collective.SP_RS_OVERLAP_BLOCKS
+                            )
+                        else:
+                            k3_ar_fusion.all_reduce_low_sm(shared_output)
+            elif fused_pull:
+                # the pull behind the kernel needs both halves of the buffer written
                 with torch.cuda.stream(self.alt_stream):
-                    if scatters:
-                        shared_output = k3_sp_collective.sp_reduce_scatter(
-                            shared_output, k3_sp_collective.SP_RS_OVERLAP_BLOCKS
-                        )
-                    else:
-                        k3_ar_fusion.all_reduce_low_sm(shared_output)
+                    self._forward_shared(gate_up, shared_output)
+                current_stream.wait_stream(self.alt_stream)
             if defer_finalize:
                 deferred = self._forward_routed_deferred(
                     hidden_states, router_logits, routed_input
                 )
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
-            if not sharded:
+            if not sharded and not fused_pull:
                 with torch.cuda.stream(self.alt_stream):
                     self._forward_shared(gate_up, shared_output)
                     # low-SM pull so the side-stream AR leaves the SMs to the
@@ -1839,6 +1858,17 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                     deferred.expert_weights,
                     *self._get_fused_norm_params(),
                 )
+            elif fused_pull:
+                # one collective over the flat [latent | shared] pair
+                if self.fuse_ar_norm:
+                    fused_norm = True
+                    k3_ar_fusion.all_reduce_norm(
+                        buf.view(-1, k3_ar_fusion.NORM_DIM),
+                        *self._get_fused_norm_params(),
+                        num_tokens=num_tokens,
+                    )
+                else:
+                    k3_ar_fusion.all_reduce(buf)
             elif self.fuse_ar_norm:
                 fused_norm = True
                 k3_ar_fusion.all_reduce_norm(
@@ -3608,6 +3638,7 @@ class KimiK3LinearModel(nn.Module):
         if _is_gfx95:
             link_hip_paths(self)
 
+    @k3_die_local_moe.target_forward
     def forward(
         self,
         input_ids: torch.Tensor | None,

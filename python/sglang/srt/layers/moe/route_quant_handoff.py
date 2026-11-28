@@ -104,6 +104,26 @@ def try_route_quant_fused(
     from sglang.kernels.ops.moe import kimi_k3_fused_routing, moe_route_quant_fused
 
     layer = _handoff.request_layer
+    from sglang.srt.layers.moe import k3_deepgemm_routed
+
+    if (
+        layer is not None
+        and _handoff.fused_routing_ok
+        and k3_deepgemm_routed.handles(layer, x.shape[0])
+    ):
+        routed = k3_deepgemm_routed.route_quant_into_buffer(
+            gating_output,
+            correction_bias,
+            x,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            apply_routed_scaling_factor_on_output,
+            _handoff.num_token_non_padded,
+        )
+        if routed is not None:
+            _handoff.padded_rows_masked = True
+            return _publish(x, *routed)
     if (
         layer is not None
         and _handoff.fused_routing_ok

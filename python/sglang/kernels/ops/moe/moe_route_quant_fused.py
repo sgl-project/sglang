@@ -111,8 +111,20 @@ def route_quant_fused(
     out_w = torch.empty((M, topk), dtype=torch.float32, device=device)
     out_i = torch.empty((M, topk), dtype=torch.int32, device=device)
     out_packed = torch.empty((M, topk), dtype=torch.int32, device=device)
-    out_q = torch.empty((M, _HIDDEN), dtype=torch.float8_e4m3fn, device=device)
-    out_s = torch.empty((M, _NUM_GROUPS // 4), dtype=torch.int32, device=device)
+    from sglang.srt.layers.moe import k3_deepgemm_routed
+
+    dest = k3_deepgemm_routed.activation_dest(M)
+    if (
+        dest is not None
+        and dest[0].dtype == torch.float8_e4m3fn
+        and tuple(dest[0].shape) == (M, _HIDDEN)
+        and dest[1].dtype == torch.int32
+        and tuple(dest[1].shape) == (M, _NUM_GROUPS // 4)
+    ):
+        out_q, out_s = dest
+    else:
+        out_q = torch.empty((M, _HIDDEN), dtype=torch.float8_e4m3fn, device=device)
+        out_s = torch.empty((M, _NUM_GROUPS // 4), dtype=torch.int32, device=device)
     _jit_module().run(
         scores,
         bias,

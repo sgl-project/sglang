@@ -2725,6 +2725,9 @@ class Envs:
     # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
     # gemm_ag_up_fits). Online weight updates are rejected while on.
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
+    # Die-local routed experts on DeepGEMM's one-rank MegaMoE for DFlash target
+    # verify on two-die GPUs (srt/layers/moe/k3_die_local_moe.py).
+    SGLANG_K3_ROUTED_MOE_DEEPGEMM = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
