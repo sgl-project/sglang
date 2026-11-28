@@ -149,6 +149,15 @@ class MooncakeTransport(Transport):
     def status(self, handle: MooncakeHandle) -> Result:
         return handle.result
 
+    @property
+    def supports_session_refresh(self) -> bool:
+        """Whether the underlying engine supports native session refresh."""
+        return self._engine.supports_session_refresh
+
+    def refresh_session(self, session_id: str) -> int:
+        """Refresh one cached peer without unregistering local memory."""
+        return self._engine.refresh_session(session_id)
+
     def send_probe(self, session_id: str) -> int:
         """Lifts the engine's blacklist of a failed session when it answers."""
         return self._engine.send_probe(session_id)

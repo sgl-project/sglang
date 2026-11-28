@@ -67,6 +67,15 @@ class KVTransferEngine(ABC):
             session_id, [buffer], [peer_buffer_address], [length], intent
         )
 
+    @property
+    def supports_session_refresh(self) -> bool:
+        """Whether `refresh_session` is supported by this engine."""
+        return False
+
+    def refresh_session(self, peer_session_id: str) -> int:
+        """Refresh one cached peer without unregistering local memory."""
+        raise NotImplementedError
+
     @abstractmethod
     def send_probe(self, peer_session_id: str) -> int:
         """Return 0 if the peer is reachable."""
