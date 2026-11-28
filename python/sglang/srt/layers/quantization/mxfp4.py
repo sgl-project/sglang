@@ -60,6 +60,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_xpu,
+    print_warning_once,
     round_up,
     use_intel_amx_backend,
 )
@@ -147,17 +148,40 @@ _flashinfer_mxfp4_permute_indices_device_cache: dict[
 ] = {}
 
 
-def _aiter_situ_uses_gu_interleaved_weights() -> bool:
-    """Match AITER's SiTU activation-mode precedence when choosing weight layout."""
-    a8w4 = get_bool_env_var("AITER_SITUV2_A8W4", "false")
-    a4w4 = get_bool_env_var("AITER_SITUV2_A4W4", "false")
-    return a8w4 or not a4w4
+def _aiter_env_flag(name: str) -> bool:
+    """Read an AITER on/off env var the way AITER does: only "1" is on.
+
+    get_bool_env_var also accepts "true", which AITER reads as off. Parsing these
+    differently makes SGLang pick a weight layout for a route AITER does not run.
+    """
+    value = os.environ.get(name, "0")
+    if value not in ("0", "1"):
+        print_warning_once(
+            f"{name}={value!r} is treated as off: AITER only enables it for '1'."
+        )
+    return value == "1"
 
 
 def _aiter_situ_uses_a8w4() -> bool:
     """Match AITER's SiTU activation-mode precedence: A8W4 wins over A4W4, and
     gfx1250 overrides it with fp4 activations."""
-    return is_gfx95_supported() and get_bool_env_var("AITER_SITUV2_A8W4", "false")
+    return is_gfx95_supported() and _aiter_env_flag("AITER_SITUV2_A8W4")
+
+
+def _aiter_situ_uses_a4w4() -> bool:
+    """Whether AITER's SiTUv2 route takes fp4 activations (A4W4); A8W4 wins."""
+    return not _aiter_env_flag("AITER_SITUV2_A8W4") and _aiter_env_flag(
+        "AITER_SITUV2_A4W4"
+    )
+
+
+def _aiter_situ_uses_gu_interleaved_weights() -> bool:
+    """Whether AITER's SiTUv2 route reads w13 gate/up-interleaved.
+
+    Only A8W4 does, and it runs on gfx95 only. A16W4 (the default, and the only
+    route on gfx942) reads the separated layout, as does A4W4.
+    """
+    return _aiter_situ_uses_a8w4()
 
 
 def _get_flashinfer_mxfp4_device_permute_indices(
@@ -968,10 +992,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         .view(-1, n)
                     )
 
-            # AITER selects the activation dtype at runtime. A8W4 takes precedence
-            # and, together with A16W4, uses the preshuffled GU-interleaved layout.
-            # A4W4 uses the generic separated layout instead; feeding it the
-            # A16/A8 layout makes real-checkpoint MoE outputs nearly orthogonal.
+            # AITER selects the activation dtype at runtime. Only A8W4 (gfx95)
+            # reads the preshuffled GU-interleaved layout. A16W4 and A4W4 read the
+            # separated layout; feeding either one the GU-interleaved layout makes
+            # real-checkpoint MoE outputs nearly orthogonal.
             k3_situ = getattr(layer.moe_runner_config, "activation", None) == "situ"
             use_aiter_gu_interleave = (
                 k3_situ and _aiter_situ_uses_gu_interleaved_weights()
@@ -1014,13 +1038,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     gate_up=False,
                 )
 
-            # shuffle_weight_a16w4(gate_up=True) above preshuffles w13 into aiter's
-            # preshuffle + gate/up-interleaved layout. Tag the Parameter so apply()
-            # can carry the metadata across .view(float4_e2m1fn_x2) and aiter's
-            # fused_moe selects the preshuffle_on kernel family.
+            # Both branches above preshuffle the weights (gate/up-interleaved or
+            # separated). Tag the Parameter so apply() can carry the metadata
+            # across .view(float4_e2m1fn_x2) and aiter's fused_moe selects the
+            # preshuffle_on kernel family.
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
-            # K3 SiTU w13 is GU-interleaved; only gfx950's INTERLEAVE reads this layout
+            # A8W4 (gfx950) reads w13 GU-interleaved; tag it so apply() passes INTERLEAVE.
             if is_gfx95_supported() and k3_situ and use_aiter_gu_interleave:
                 layer.situ_gate_up_interleaved = True
 
