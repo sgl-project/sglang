@@ -31,7 +31,7 @@ the caller's test jobs skip. `pr-test-finish` then fails, so a PR cannot merge
 without running Base CI.
 
 The workflows in `run_ci_approval.APPROVAL_WORKFLOWS` (`pr-test.yml`, `pr-test-extra.yml`,
-`pr-test-sgl-router.yml`, `pr-test-mlu.yml`) call the gate with `approval-mode: commit`:
+`pr-test-sgl-router.yml`, `pr-test-mlu.yml`, `pr-test-xpu.yml`) call the gate with `approval-mode: commit`:
 unless the PR's author can approve, besides the `run-ci` label they need a
 `ci/run-ci-approved` status on the PR's head commit, so every push needs a new
 approval. Only the slash command handler records it, when an approver runs

@@ -87,4 +87,14 @@ def copy_head_groups(src: torch.Tensor, dst: torch.Tensor) -> None:
         )
 
 
-__all__ = ["copy_head_groups"]
+def prebuild_copy_head_groups(widths, dtype: torch.dtype, device) -> None:
+    """Compile ``copy_head_groups`` for row ``widths`` before they are first
+    copied: its block width is a compile-time constant, so a width first met
+    by a request would compile there. The specialization matches the real
+    calls (batch 1, strides and width multiples of 16)."""
+    for width in sorted(set(widths)):
+        src = torch.zeros(1, 1, 1, width, dtype=dtype, device=device)
+        copy_head_groups(src, torch.empty_like(src))
+
+
+__all__ = ["copy_head_groups", "prebuild_copy_head_groups"]

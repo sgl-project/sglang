@@ -402,6 +402,7 @@ from sglang.srt.rust_server.server import (
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -2131,6 +2132,7 @@ class Scheduler(
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
+            "max_req_len": self.max_req_len,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
@@ -2997,6 +2999,9 @@ class Scheduler(
             get_total_prefill_busy_us=lambda: self._get_total_prefill_busy_us(),
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
+            get_storage_metrics_collector=lambda: (
+                self.tree_cache.storage_metrics_collector
+            ),
         )
 
     def _get_total_prefill_busy_us(self) -> int:
@@ -3160,12 +3165,7 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # max_req_len is the largest number of tokens that can be forwarded for
-        # one request. The last generated token is sampled but never forwarded,
-        # so a request may generate max_req_len - input_len + 1 tokens.
-        context_max_new_tokens = self.max_req_len - input_len + 1
-
-        # Keep this bound consistent with PrefillAdder's admission budget.
+        context_max_new_tokens = self.max_req_len - input_len
         max_new_tokens = max(
             0,
             min(
@@ -3758,17 +3758,6 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
-                )
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
-
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
@@ -3778,6 +3767,7 @@ class Scheduler(
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
             self._embedding_preserve_last_token_id,
+            is_multimodal=recv_req.mm_inputs is not None,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -4288,24 +4278,16 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
-                )
-                self._add_request_to_queue(req)
-                return
-
         # Validate prompts length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
             self._embedding_preserve_last_token_id,
+            is_multimodal=recv_req.mm_inputs is not None,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
@@ -5565,8 +5547,7 @@ class Scheduler(
             batch.sampling_info.watermark = build_watermark_rows(
                 batch.reqs, batch.device
             )
-            batch.sampling_info.set_plugin_state(batch.reqs)
-            batch.sampling_info.set_seeds_and_mask_rows(batch.reqs)
+            batch.sampling_info.set_step_state(batch.reqs)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -5691,6 +5672,15 @@ class Scheduler(
                             eagle_prepare_for_verify,
                         )
 
+                        # PP speculative decoding refuses the watermark, so
+                        # only the route is needed, not a bound verify step.
+                        sampling_info = batch.sampling_info
+                        verify_route = VerifyRoute.derive(
+                            sampling_info,
+                            has_grammar=batch.has_grammar,
+                            has_watermark=sampling_info is not None
+                            and sampling_info.watermark is not None,
+                        )
                         # Isolation is load-bearing: eagle_prepare_for_verify
                         # mutates SB fields (forward_mode -> TARGET_VERIFY,
                         # input_ids, out_cache_loc); without the restore the
@@ -5703,6 +5693,7 @@ class Scheduler(
                                     self.req_to_token_pool,
                                     batch,
                                     self.tp_worker,
+                                    route=verify_route,
                                 )
                             )
                             batch_result = self.tp_worker.forward_batch_generation(
@@ -6427,6 +6418,9 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+                if idle:
+                    # Waited, not polled, so every rank agrees on idle.
+                    tc.wait_fenced_writes()
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
