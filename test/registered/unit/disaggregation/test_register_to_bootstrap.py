@@ -35,6 +35,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         mock_put.return_value = success_resp
 
         mgr = self._make_manager()
+        mgr.kv_args.linker_pools = ["kv", "mamba"]
         mgr.register_to_bootstrap()
 
         call_kwargs = mock_put.call_args
@@ -65,6 +66,7 @@ class TestRegisterToBootstrap(CustomTestCase):
         for field in required_fields:
             self.assertIn(field, payload)
         self.assertEqual(payload["prefill_http_port"], 30000)
+        self.assertEqual(payload["linker_pools"], ["kv", "mamba"])
         # An empty layout never goes on the wire as a new field.
         self.assertIsNone(payload["spec_kv_layout"])
 
