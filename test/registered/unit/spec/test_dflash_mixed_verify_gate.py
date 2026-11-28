@@ -9,7 +9,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.speculative import dflash_worker_v2
+from sglang.srt.speculative import dflash_utils
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -20,7 +20,8 @@ class TestDFlashMixedVerifyGate(unittest.TestCase):
     def test_context_parallel_takes_the_plain_mixed_step(self):
         """A context-parallel forward runs the stock attention, which has no tree
         mask, so a mixed batch under CP must not carry verify rows; the running
-        requests take the plain mixed step instead."""
+        requests take the plain mixed step, and the scheduler budgets one row
+        each for them instead of a verify block."""
         worker = object.__new__(DFlashWorkerV2)
         worker._target_logits_processor = object()
         worker._is_domino = False
@@ -43,16 +44,22 @@ class TestDFlashMixedVerifyGate(unittest.TestCase):
         parallel = SimpleNamespace(
             attn_dp_enabled=False, pp_group=SimpleNamespace(world_size=1)
         )
+        spec = SimpleNamespace(speculative_num_draft_tokens=8)
         with (
             envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.override(True),
-            patch.object(dflash_worker_v2, "get_parallel", return_value=parallel),
+            patch.object(dflash_utils, "get_parallel", return_value=parallel),
+            patch.object(dflash_utils, "get_spec", return_value=spec),
         ):
-            for strategy, runs in ((False, True), (object(), False)):
+            for strategy, runs, rows in ((False, True, 8), (object(), False, 1)):
                 with (
                     self.subTest(cp=strategy is not False),
                     patch.object(cp_base, "_STRATEGY", strategy),
                 ):
                     self.assertEqual(worker._runs_mixed_verify(batch), runs)
+                    self.assertEqual(
+                        dflash_utils.mixed_decode_tokens_per_request(is_dflash=True),
+                        rows,
+                    )
 
 
 if __name__ == "__main__":

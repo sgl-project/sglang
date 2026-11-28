@@ -15,6 +15,7 @@ from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.base import is_cp_enabled
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import top_p_normalize_probs_torch
 from sglang.srt.layers.sampling_renorm import (
@@ -24,7 +25,7 @@ from sglang.srt.layers.sampling_renorm import (
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
-from sglang.srt.runtime_context import get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.sampling.penalties import uses_penalty
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_npu
@@ -58,6 +59,28 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = (
     tree_speculative_sampling_target_only is not None and not is_npu()
 )
+
+
+def mixed_verify_configured() -> bool:
+    """Whether the server's configuration lets a mixed DFLASH batch verify its
+    running requests inside the extend forward. `DFlashWorkerV2._runs_mixed_verify`
+    adds the per-batch conditions; the scheduler budgets the verify rows on this."""
+    return (
+        envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
+        and not get_parallel().attn_dp_enabled
+        and get_parallel().pp_group.world_size == 1
+        # a context-parallel forward splits the rows across ranks and runs the
+        # stock attention, which has no tree mask for the verify rows
+        and not is_cp_enabled()
+    )
+
+
+def mixed_decode_tokens_per_request(*, is_dflash: bool) -> int:
+    """Rows a running request takes in a mixed prefill batch: a verify block under
+    DFLASH mixed verify, otherwise its one decode token."""
+    if is_dflash and mixed_verify_configured():
+        return int(get_spec().speculative_num_draft_tokens or 1)
+    return 1
 
 
 def is_dflash_sampling_verify_available() -> bool:

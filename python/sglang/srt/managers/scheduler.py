@@ -413,7 +413,10 @@ from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_utils import validate_dflash_request
+from sglang.srt.speculative.dflash_utils import (
+    mixed_decode_tokens_per_request,
+    validate_dflash_request,
+)
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
 )
@@ -4791,15 +4794,9 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
         logprob_cap = InputLogprobChunkCap.for_batch(chunked_prefill_size)
         max_prefill_tokens = self.max_prefill_tokens
-        # a mixed DFlash batch carries each running request's verify block
         num_mixed_decode_tokens = (
             running_bs
-            * (
-                int(get_spec().speculative_num_draft_tokens or 1)
-                if envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
-                and self.spec_algorithm.is_dflash()
-                else 1
-            )
+            * mixed_decode_tokens_per_request(is_dflash=self.spec_algorithm.is_dflash())
             if self.is_mixed_chunk
             else 0
         )
