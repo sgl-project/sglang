@@ -1,6 +1,7 @@
 """Unit tests for InputValidationStage.preprocess_condition_image resolution logic."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -61,6 +62,51 @@ class _DummyTI2IConfig:
 
     def prepare_calculated_size(self, image):
         return image.size
+
+
+class TestGenerateSeeds(unittest.TestCase):
+    def setUp(self):
+        self.stage = InputValidationStage()
+        self.server_args = SimpleNamespace()
+
+    def _make_request(self, seed, outputs=2):
+        return Req(
+            sampling_params=SamplingParams(
+                prompt="test",
+                seed=seed,
+                num_outputs_per_prompt=outputs,
+                generator_device="cpu",
+            )
+        )
+
+    def test_single_request_seeds_are_unchanged(self):
+        for seed, expected in ((7, [7, 8]), ([7, 101], [7, 101])):
+            with self.subTest(seed=seed):
+                batch = self._make_request(seed)
+                self.stage._generate_seeds(batch, self.server_args)
+                self.assertEqual(batch.seeds, expected)
+                self.assertEqual(
+                    [generator.initial_seed() for generator in batch.generator],
+                    expected,
+                )
+
+    def test_dynamic_batch_rejects_wrong_prompt_count(self):
+        for dynamic_seeds in (7, [], [7], [7, 17, 27]):
+            with self.subTest(dynamic_seeds=dynamic_seeds):
+                batch = self._make_request(7)
+                batch.prompt = ["first", "second"]
+                batch.extra["dynamic_batch_seeds"] = dynamic_seeds
+                with self.assertRaisesRegex(ValueError, "one seed per prompt"):
+                    self.stage._generate_seeds(batch, self.server_args)
+
+    def test_dynamic_batch_rejects_wrong_output_seed_count(self):
+        for seed_list in ([], [7], [7, 101, 203]):
+            with self.subTest(seed_list=seed_list):
+                batch = self._make_request(7)
+                batch.prompt = ["first", "second"]
+                batch.extra["dynamic_batch_seeds"] = [seed_list, 17]
+                with self.assertRaisesRegex(ValueError, "seed list length"):
+                    self.stage._generate_seeds(batch, self.server_args)
 
 
 class TestCalculateDimensionsFromArea(unittest.TestCase):
