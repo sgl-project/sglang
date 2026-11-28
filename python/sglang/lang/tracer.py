@@ -225,6 +225,16 @@ class TracerProgramState(ProgramState):
 
         self.cur_role = None
 
+    @property
+    def stream_executor(self):
+        return self
+
+    def submit(self, expr: SglExpr):
+        self._execute(expr)
+
+    def _execute_var_scope_begin(self, expr: SglVarScopeBegin):
+        pass
+
     def _execute_var_scope_end(self, expr: SglVarScopeEnd):
         new_node = SglVariable(expr.name, source=self.last_node)
         self.variables[expr.name] = new_node
