@@ -39,6 +39,7 @@ import torch
 
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import RejectionNoise
 from sglang.srt.distributed.parallel_state import graph_capture
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     AcceptOuts,
@@ -96,6 +97,8 @@ def sampling_accept_commit_lens(
         draft_block=draft_block,
         # params.temperatures is the batch's, clamped at 1e-5 (resolve_draft_params).
         sampling_info=GraphSamplingInfo(temperatures=params.temperatures[:bs]),
+        # Only steps without logit adjustments or truncated sampling reach here.
+        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
         draft_input=None,
         gamma=stride - 1,
         verify_num_draft_tokens=stride,

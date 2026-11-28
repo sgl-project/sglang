@@ -3226,7 +3226,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         # Workers launch some idle batches themselves, without the scheduler's builds.
         self.sampling_info.set_sampler_params(SamplerParams.empty(self.device))
-        self.sampling_info.set_seeds_and_mask_rows([])
+        self.sampling_info.set_step_state([])
 
     def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:
         return alloc_tracking_slots(
