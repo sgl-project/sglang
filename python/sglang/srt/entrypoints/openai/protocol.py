@@ -411,6 +411,7 @@ class CompletionRequest(PDRoutingFields):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: Union[bool, Literal["last"]] = False
+    steering_vector: Optional[Union[str, Dict[str, Any]]] = None
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
@@ -1039,6 +1040,7 @@ class ChatCompletionRequest(PDRoutingFields):
     _message_tools_indices: List[int] = PrivateAttr(default_factory=list)
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
+    steering_vector: Optional[Union[str, Dict[str, Any]]] = None
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False

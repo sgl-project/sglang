@@ -70,6 +70,7 @@ from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams, validate_n
+from sglang.srt.steering.spec import SteeringVectorSpec, decode_steering_vector_spec
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import (
     dec_hook,
@@ -434,6 +435,17 @@ class GenerateReqInput:
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
 
+    # Optional per-request activation steering vector spec (string name, dict, or
+    # SteeringVectorSpec; or a batch-aligned list of them).
+    steering_vector: Optional[
+        Union[
+            List[Optional[Union[str, Dict[str, Any], SteeringVectorSpec]]],
+            str,
+            Dict[str, Any],
+            SteeringVectorSpec,
+        ]
+    ] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -675,6 +687,13 @@ class GenerateReqInput:
         self.kv_hints = (
             decode_kv_hints_envelope(self.kv_hints) if self.kv_hints else None
         )
+        if isinstance(self.steering_vector, list):
+            raise ValueError("steering_vector should be a single spec for one request.")
+        self.steering_vector = (
+            decode_steering_vector_spec(self.steering_vector)
+            if self.steering_vector is not None
+            else None
+        )
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -706,6 +725,7 @@ class GenerateReqInput:
         self._normalize_extra_key(num)
         self._normalize_cache_salt(num)
         self._normalize_kv_hints(num)
+        self._normalize_steering_vector(num)
         self._normalize_bootstrap_params(num)
 
     def _expand_inputs(self, num):
@@ -1039,6 +1059,29 @@ class GenerateReqInput:
         else:
             raise ValueError("kv_hints should be a list or a dict.")
 
+    def _normalize_steering_vector(self, num):
+        """Normalize steering_vector for batch processing."""
+        if self.steering_vector is None:
+            return
+        if isinstance(self.steering_vector, (str, dict, SteeringVectorSpec)):
+            self.steering_vector = [
+                decode_steering_vector_spec(self.steering_vector)
+            ] * num
+        elif isinstance(self.steering_vector, list):
+            if len(self.steering_vector) != self.batch_size:
+                raise ValueError(
+                    "The length of steering_vector should be equal to the batch size."
+                )
+            self.steering_vector = [
+                decode_steering_vector_spec(value) if value is not None else None
+                for value in self.steering_vector
+            ]
+            self.steering_vector = self.steering_vector * self.parallel_sample_num
+        else:
+            raise ValueError(
+                "steering_vector should be a string, dict, SteeringVectorSpec, or list."
+            )
+
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
         # Normalize bootstrap_host
@@ -1182,6 +1225,9 @@ class GenerateReqInput:
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
             cache_salt=(self.cache_salt[i] if self.cache_salt is not None else None),
             kv_hints=(self.kv_hints[i] if self.kv_hints is not None else None),
+            steering_vector=(
+                self.steering_vector[i] if self.steering_vector is not None else None
+            ),
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -1328,6 +1374,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     token_ids_logprob_rows: Optional[List[List[int]]] = None
     # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
     filler_seed: Optional[int] = None
+    # See GenerateReqInput.steering_vector. Keep as an append-only defaulted tail
+    # field to preserve positional Rust wire schema lockstep.
+    steering_vector: Optional[SteeringVectorSpec] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

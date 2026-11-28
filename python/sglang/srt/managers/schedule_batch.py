@@ -94,6 +94,7 @@ from sglang.srt.dllm.mixin.req import ReqDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
+from sglang.srt.steering.spec import SteeringVectorSpec
 from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     FINISH_LENGTH,
@@ -480,6 +481,7 @@ class Req(ReqDllmMixin):
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         kv_hints: Optional[KvHintsEnvelope] = None,
+        steering_vector: Optional[SteeringVectorSpec] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -592,11 +594,16 @@ class Req(ReqDllmMixin):
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
+        if steering_vector is not None:
+            steering_cache_key = steering_vector.radix_cache_key()
+            if steering_cache_key is not None:
+                extra_key = (extra_key or "") + steering_cache_key
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
         self._user_cache_salt = self.cache_salt
         self.lora_id = lora_id
+        self.steering_vector: Optional[SteeringVectorSpec] = steering_vector
         self.routing_key = routing_key
 
         # Lazy extra buffer + spec: False when the finishing verify wrote the

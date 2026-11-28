@@ -1338,6 +1338,8 @@ class CPUGraphRunner:
         return bool(forward_batch.encoder_lens.max() == 0)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        if forward_batch.steering_vectors is not None:
+            return False
         if forward_batch.forward_mode.is_extend():
             return self._can_run_prefill_graph(forward_batch)
 

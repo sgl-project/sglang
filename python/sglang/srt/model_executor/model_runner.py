@@ -128,6 +128,7 @@ from sglang.srt.layers.offloader import (
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.steering.manager import SteeringVectorManager
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -428,6 +429,9 @@ class ModelRunner:
         # Set by maybe_init_lora_manager; stays None when LoRA is off and on
         # draft runners, which serve adapters' target model unadapted.
         self.lora_manager: Optional[LoRAManager] = None
+        # Lazily initialized when steering vectors are registered; stays None
+        # when steering is unused for zero forward-path overhead.
+        self.steering_manager: Optional[SteeringVectorManager] = None
         self.device = get_device().device
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
@@ -1662,6 +1666,42 @@ class ModelRunner:
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
         return self.lora_manager.unload_lora_adapter(lora_ref)
 
+    def init_steering_manager(self) -> SteeringVectorManager:
+        """Initialize and return the SteeringVectorManager for this model."""
+        if self.steering_manager is None:
+            self.steering_manager = SteeringVectorManager(
+                hidden_size=self.model_config.hidden_size,
+                num_hidden_layers=self.model_config.num_hidden_layers,
+                device=self.device,
+                dtype=getattr(self, "dtype", None),
+            )
+        return self.steering_manager
+
+    def register_steering_vector(
+        self,
+        name: str,
+        vectors,
+        *,
+        default_scale: float = 1.0,
+        overwrite: bool = False,
+        metadata: Optional[dict] = None,
+    ):
+        """Register an activation steering vector on this ModelRunner."""
+        manager = self.init_steering_manager()
+        return manager.register(
+            name,
+            vectors,
+            default_scale=default_scale,
+            overwrite=overwrite,
+            metadata=metadata,
+        )
+
+    def unregister_steering_vector(self, name: str) -> None:
+        """Remove a previously registered steering vector."""
+        if self.steering_manager is None:
+            raise KeyError(f"Steering vector {name!r} is not registered.")
+        self.steering_manager.unregister(name)
+
     @property
     def logical_max_total_num_tokens(self):
         """Request-token capacity in logical tokens, not per-rank DCP rows."""
@@ -2184,9 +2224,22 @@ class ModelRunner:
                 ForwardContext(attn_backend=self.attn_backend),
                 forward_batch=forward_batch,
             )
+        if forward_batch.has_steering():
+            if self.steering_manager is None:
+                raise RuntimeError(
+                    "Steering vector requested in forward_batch, but no "
+                    "steering_manager is initialized on ModelRunner."
+                )
+            steering_ctx = self.steering_manager.forward_context(
+                self.model, forward_batch
+            )
+        else:
+            steering_ctx = contextlib.nullcontext()
+
         with (
             get_model().override(shared_experts=self.model.shared_experts_config),
             ctx_mgr,
+            steering_ctx,
         ):
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
