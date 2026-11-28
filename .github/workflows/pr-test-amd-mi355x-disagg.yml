@@ -1,0 +1,307 @@
+name: PR Test (AMD MI355X Disagg)
+
+# Runs a short 2-node 1P1D disaggregation check for PRs that touch the
+# disaggregation code or the MI355X Slurm harness, on the same pit2 `amd-sglang`
+# nodes and `linux-sglang-mi35x-di` runners as nightly-amd-mi355x-disagg.yml.
+#
+# The nightly owns those nodes from 04:00 UTC for 11-15 hours. PR legs only use
+# them outside that window: the wait jobs below block on GitHub-hosted runners
+# (not the DI runners) until the nightly is done and not due within the next
+# 75 minutes, so a PR leg never delays the nightly.
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "python/sglang/srt/disaggregation/**"
+      - "scripts/ci/slurm/launch_mi355x.sh"
+      - "scripts/ci/slurm/nightly-configs.yaml"
+      - "scripts/ci/slurm/generate_matrix.py"
+      - "scripts/ci/slurm/process_result.py"
+      - "scripts/ci/slurm/runner_disk_preflight.py"
+      - "scripts/ci/slurm/wait_for_mi355x_nightly.py"
+      - "scripts/ci/slurm/recipes/mi355x-*/**"
+      - ".github/workflows/pr-test-amd-mi355x-disagg.yml"
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Optional. ROCm SGLang Docker image. Leave empty for the latest MI35x ROCm 10 image.'
+        required: false
+        default: ''
+      configs:
+        description: 'Optional. Comma-separated config names (see nightly-configs.yaml). Leave empty for the PR default set.'
+        required: false
+        default: ''
+      skip_nightly_wait:
+        description: 'Start without waiting for the nightly to finish (it may delay the nightly).'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: pr-test-amd-mi355x-disagg-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SGLANG_IS_IN_CI: true
+  # One MORI and one Mooncake KV-transfer case, both 2-node 1P1D on the
+  # smallest DeepSeek-V4 checkpoint already in the node-local HF cache.
+  PR_DEFAULT_CONFIGS: dsv4flash-fp8-1k1k-1p1d,dsv4flash-fp4-1k1k-1p1d-mooncake
+
+jobs:
+  call-gate:
+    uses: ./.github/workflows/pr-gate.yml
+    secrets: inherit
+
+  setup:
+    needs: call-gate
+    if: github.repository == 'sgl-project/sglang' && needs.call-gate.outputs.opted-in == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve latest MI35x ROCm 10 nightly image
+        id: image
+        # Same resolution as nightly-amd-mi355x-disagg.yml.
+        run: |
+          set -o pipefail
+          FALLBACK_IMAGE="lmsysorg/sglang-rocm:v0.5.20-rocm10-mi35x-20260922"
+          RESOLVED=$(curl -fsSL "https://hub.docker.com/v2/repositories/lmsysorg/sglang-rocm/tags?page_size=100&ordering=last_updated" \
+            | python3 -c "import json,re,sys;p=re.compile(r'^v[0-9][0-9A-Za-z.]*-rocm10-mi35x-([0-9]{8})\$');c=sorted((m.group(1),t['name']) for t in json.load(sys.stdin).get('results',[]) for m in [p.match(t.get('name',''))] if m);print(c[-1][1] if c else '')" || true)
+          if [ -n "$RESOLVED" ]; then
+            echo "image=lmsysorg/sglang-rocm:$RESOLVED" >> $GITHUB_OUTPUT
+          else
+            echo "Could not resolve a latest image; using fallback: $FALLBACK_IMAGE"
+            echo "image=$FALLBACK_IMAGE" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate matrix
+        id: generate
+        env:
+          CONFIGS_FILTER: ${{ inputs.configs }}
+        run: |
+          pip install pyyaml -q
+          MATRIX=$(python3 scripts/ci/slurm/generate_matrix.py \
+            scripts/ci/slurm/nightly-configs.yaml --runner mi355x \
+            --filter "${CONFIGS_FILTER:-$PR_DEFAULT_CONFIGS}")
+          MATRIX="$MATRIX" python3 - <<'PY'
+          import json
+          import os
+
+          matrix = json.loads(os.environ["MATRIX"])
+          wide = [e["name"] for e in matrix if "-1p1d" not in e["name"]]
+          if wide:
+              # PR legs are 2-node, one-hour jobs; 4-node EP16 cases stay nightly-only.
+              raise SystemExit("Only 2-node 1P1D configs can run here: " + ", ".join(wide))
+          value = {"include": [{"config": e} for e in matrix]}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"matrix={json.dumps(value, separators=(',', ':'))}", file=output)
+          PY
+
+  # A hosted job may run for at most 6 hours and the nightly takes up to ~15,
+  # so the wait is split into three chained jobs. Each one is skipped once an
+  # earlier one found the nodes free.
+  wait-for-nightly-1:
+    needs: setup
+    if: needs.setup.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      clear: ${{ steps.wait.outputs.clear }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ inputs.skip_nightly_wait }}" = "true" ]; then
+            echo "clear=true" >> "$GITHUB_OUTPUT"
+          else
+            python3 scripts/ci/slurm/wait_for_mi355x_nightly.py --budget-minutes 340
+          fi
+
+  wait-for-nightly-2:
+    needs: wait-for-nightly-1
+    if: needs.wait-for-nightly-1.outputs.clear == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      clear: ${{ steps.wait.outputs.clear }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/slurm/wait_for_mi355x_nightly.py --budget-minutes 340
+
+  wait-for-nightly-3:
+    needs: wait-for-nightly-2
+    if: needs.wait-for-nightly-2.outputs.clear == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    outputs:
+      clear: ${{ steps.wait.outputs.clear }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/slurm/wait_for_mi355x_nightly.py --budget-minutes 340
+
+  mi355x-disagg-2n:
+    needs:
+      - setup
+      - wait-for-nightly-1
+      - wait-for-nightly-2
+      - wait-for-nightly-3
+    if: |
+      always() && !cancelled() && needs.setup.result == 'success'
+      && needs.setup.outputs.matrix != '{"include":[]}'
+      && (needs.wait-for-nightly-1.outputs.clear == 'true'
+          || needs.wait-for-nightly-2.outputs.clear == 'true'
+          || needs.wait-for-nightly-3.outputs.clear == 'true')
+    runs-on: linux-sglang-mi35x-di
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    env:
+      # Same cluster config as nightly-amd-mi355x-disagg.yml.
+      CLUSTER: spur
+      SLURM_PARTITION: amd-sglang
+      SLURM_ACCOUNT: amd-sglang
+      SLURM_QOS: amd-sglang-qos
+      HF_CACHE: /var/tmp/sglang-ci/model_coverage
+      FRAMEWORK: sglang
+      HW: mi355x
+      MODEL: ${{ matrix.config.model }}
+      MODEL_PREFIX: ${{ matrix.config.model_prefix }}
+      PRECISION: ${{ matrix.config.precision }}
+      ISL: ${{ matrix.config.isl }}
+      OSL: ${{ matrix.config.osl }}
+      CONFIG_FILE: ${{ matrix.config.config_file }}
+      # The launcher's scratch dir is $HOME/.mi355x_ci/<MATRIX_CONFIG_NAME> on
+      # the shared login node. Prefix the run id so two PRs running the same
+      # case on the two runners never share (and wipe) one directory.
+      MATRIX_CONFIG_NAME: pr${{ github.run_id }}-${{ matrix.config.name }}
+      RESULT_FILENAME: mi355x-pr-${{ matrix.config.name }}
+      # Keeps the leg inside the 75-minute guard before the nightly starts.
+      TIME_LIMIT: '01:00:00'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Clean up prior Slurm jobs from this runner
+        continue-on-error: true
+        run: |
+          # Same as the nightly: only this runner's leftovers, by the
+          # mi355x-ci-<RUNNER_NAME>- job-name prefix.
+          if [ -z "${RUNNER_NAME:-}" ]; then echo "RUNNER_NAME unset; skipping"; exit 0; fi
+          STALE_JOBS=$(squeue --noheader --format="%i %200j" | grep -F "mi355x-ci-${RUNNER_NAME}-" | awk '{print $1}' || true)
+          if [ -n "$STALE_JOBS" ]; then
+            echo "Cancelling stale jobs for ${RUNNER_NAME}: $STALE_JOBS"
+            for job in $STALE_JOBS; do
+              NODES=$(scontrol show job "$job" 2>/dev/null | tr ' ' '\n' | sed -n 's/^NodeList=//p' | tr ',' '\n' | grep -vx '(null)' || true)
+              for node in $NODES; do
+                ssh -o BatchMode=yes -o ConnectTimeout=10 -n "$node" \
+                  'docker rm -f mi355x_prefill mi355x_decode mi355x_bench' \
+                  >/dev/null 2>&1 || true
+              done
+            done
+            scancel $STALE_JOBS
+          fi
+
+      - name: Reclaim old runner diagnostics and check disk headroom
+        timeout-minutes: 2
+        run: python3 scripts/ci/slurm/runner_disk_preflight.py
+
+      - name: Launch MI355X disagg test
+        timeout-minutes: 75
+        env:
+          IMAGE: ${{ inputs.image != '' && inputs.image || needs.setup.outputs.image }}
+        run: bash scripts/ci/slurm/launch_mi355x.sh
+
+      - name: Pack logs
+        if: always()
+        run: |
+          LOG_DIR="$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
+          LOG_BUNDLE="${GITHUB_WORKSPACE}/${RESULT_FILENAME}_logs.tar.gz"
+          if [ ! -d "$LOG_DIR" ]; then
+            echo "WARN: log directory not found: $LOG_DIR"
+            exit 0
+          fi
+          mapfile -d '' LOG_FILES < <(
+            find "$LOG_DIR" -maxdepth 1 -type f \
+              \( -name '*.log' -o -name 'server_exit_*' -o -name 'bench_exit' \) \
+              -printf '%P\0' | sort -z
+          )
+          if [ "${#LOG_FILES[@]}" -eq 0 ]; then
+            echo "WARN: no log files found in $LOG_DIR"
+            exit 0
+          fi
+          tar czf "$LOG_BUNDLE" -C "$LOG_DIR" -- "${LOG_FILES[@]}"
+
+      - name: Upload logs
+        id: upload-logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi355x-pr-${{ matrix.config.name }}-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/*.json
+            ${{ github.workspace }}/*_logs.tar.gz
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Remove uploaded log bundle
+        if: always() && steps.upload-logs.outcome == 'success'
+        run: rm -f -- "${GITHUB_WORKSPACE}/${RESULT_FILENAME}_logs.tar.gz"
+
+      - name: Clean up Slurm jobs on failure/cancel
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          if [ -z "${RUNNER_NAME:-}" ]; then echo "RUNNER_NAME unset; skipping"; exit 0; fi
+          JOB_TAG="mi355x-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-${MATRIX_CONFIG_NAME}"
+          ACTIVE_JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$JOB_TAG" | awk '{print $1}' || true)
+          if [ -n "$ACTIVE_JOBS" ]; then
+            echo "Cancelling jobs for ${JOB_TAG}: $ACTIVE_JOBS"
+            scancel $ACTIVE_JOBS
+          fi
+
+      - name: Clean up MI355X scratch
+        if: always()
+        continue-on-error: true
+        run: rm -rf "$HOME/.mi355x_ci/${MATRIX_CONFIG_NAME}"
+
+  pr-test-amd-mi355x-disagg-finish:
+    needs:
+      - call-gate
+      - setup
+      - wait-for-nightly-3
+      - mi355x-disagg-2n
+    if: always() && needs.call-gate.outputs.opted-in == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          if [ "${{ needs.wait-for-nightly-3.outputs.clear }}" = "false" ]; then
+            echo "::error::The MI355X disagg nodes stayed busy with the nightly for the whole wait. Re-run this workflow later."
+            exit 1
+          fi
+          if [ "${{ needs.mi355x-disagg-2n.result }}" != "success" ]; then
+            echo "::error::MI355X disagg test result: ${{ needs.mi355x-disagg-2n.result }}"
+            exit 1
+          fi
