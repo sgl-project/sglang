@@ -1063,6 +1063,7 @@ class MambaComponent(TreeComponent):
                 if self.cache.enable_mamba_extra_buffer:
                     new_slot = self._try_alloc_mamba_slot(req)
                     if new_slot is None:
+                        insert_params.mamba_checkpoint_dropped = True
                         return 0
                     storage, sub_pool = self._state()
                     src_active = storage.donate_tracking_slot(sub_pool, req, new_slot)
@@ -1075,6 +1076,7 @@ class MambaComponent(TreeComponent):
             elif self.cache.enable_mamba_extra_buffer:
                 new_slot = self._try_alloc_mamba_slot(req)
                 if new_slot is None:
+                    insert_params.mamba_checkpoint_dropped = True
                     return 0
                 storage, sub_pool = self._state()
                 mamba_value_donated = storage.donate_tracking_slot(
@@ -1083,6 +1085,7 @@ class MambaComponent(TreeComponent):
             else:
                 mamba_value_donated = self._try_alloc_mamba_slot(req)
                 if mamba_value_donated is None:
+                    insert_params.mamba_checkpoint_dropped = True
                     return 0
                 storage, sub_pool = self._state()
                 storage.copy_state(

@@ -704,6 +704,27 @@ class TestWindowDemandUnderCheckpointRetention(CustomTestCase):
         self.assertEqual(live // page, 128)
         self.assertGreaterEqual(demand // page, live // page)
 
+    def test_a_publication_without_a_state_slot_keeps_the_last_lock(self):
+        """REGRESSION: a publication no free state slot can take moves no tree
+        lock, so what the last published checkpoint locks, up to two retained
+        windows less a page, stays beside the request's window while the next
+        chunk is written."""
+        page, window, chunk, grid = 128, 511, 384, 128
+        retained = 512
+        # The request's window, the last lock, and the next chunk.
+        live = retained + (2 * retained - page) + chunk
+        demand = request_demand(
+            8192,
+            1,
+            windows={"swa": window},
+            page_size=page,
+            prefill_retire_lag=0,
+            eviction_interval=1,
+            checkpoint_interval=grid,
+            chunk_size=chunk,
+        ).window_tokens["swa"]
+        self.assertGreaterEqual(demand, live)
+
 
 class TestChunkGrid(CustomTestCase):
     def test_the_smallest_chunk_is_on_the_grid(self):
