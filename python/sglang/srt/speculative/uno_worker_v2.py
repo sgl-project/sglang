@@ -18,7 +18,7 @@ from sglang.srt.model_executor.forward_context import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_schedule, get_spec
-from sglang.srt.sampling.sampling_batch_info import adjusts_logits
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
@@ -252,7 +252,11 @@ class UnoWorkerV2(BaseSpecWorker):
         if sampling_info.need_min_p_sampling:
             raise NotImplementedError("UNO does not support min-p sampling.")
 
-        if adjusts_logits(sampling_info, has_grammar=batch.has_grammar):
+        if VerifyRoute.derive(
+            sampling_info,
+            has_grammar=batch.has_grammar,
+            has_watermark=sampling_info.watermark is not None,
+        ).adjusts_logits:
             raise NotImplementedError(
                 "UNO does not support logit adjustments (grammar, penalties, "
                 "logit bias, custom logit processors, or watermarks)."

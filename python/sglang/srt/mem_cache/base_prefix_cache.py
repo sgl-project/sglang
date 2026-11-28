@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
+    StorageMetricsCollector,
     radix_cache_metric_labels,
     resolve_collector_class,
 )
@@ -487,6 +488,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     cache_controller: Optional[HiCacheController] = None
     buffer_pipeline: Optional[BufferModePipeline] = None
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
+    # Set by caches with an L3 storage backend and storage metrics enabled.
+    storage_metrics_collector: Optional[StorageMetricsCollector] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
 
