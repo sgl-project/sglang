@@ -71,21 +71,8 @@ _entry: _Fa4Entry | None = None
 
 
 def _build_mask_mod(cutlass, cute, fa_utils):
-    """Multiview mask_mod over the packed run truth table.
-
-    ``aux_tensors`` are, in order:
-
-    * ``q_word_base`` ``(seqlen_q,)`` int32: ``q_run * words_per_row``.
-    * ``k_group_ids`` ``(seqlen_k,)`` int32: the key token's run id.
-    * ``allowed_words`` ``(q_runs * words_per_row,)`` int32: the truth table
-      over run pairs, bit-packed 32 keys per word.
-
-    FA4 wraps the indices modulo ``seqlen_q``/``seqlen_k`` before calling a
-    mask_mod that has aux tensors, so reads on out-of-range padded lanes stay
-    in bounds; those lanes are force-masked afterwards. That holds only while
-    the aux tensors are exactly ``seqlen_q``/``seqlen_k`` long, which
-    ``multiview_fa4_attention`` checks.
-    """
+    # FA4 wraps indices modulo seqlen_q and seqlen_k before calling a mask_mod
+    # with aux tensors, so q_word_base and k_group_ids must match padded lengths.
 
     @cute.jit
     def multiview_mask_mod(
@@ -117,12 +104,6 @@ def _build_mask_mod(cutlass, cute, fa_utils):
 
 
 def _load_fa4() -> _Fa4Entry:
-    """Import FA4 and build the mask_mod once per process.
-
-    Raises rather than falling back: ``backend='fa4'`` is an explicit request,
-    and silently running a different kernel would invalidate any comparison
-    against the Triton path.
-    """
     global _entry
     if _entry is not None:
         return _entry

@@ -753,7 +753,6 @@ class TestCosmosDreamsSdeSeeding(unittest.TestCase):
 
 
 def _text_kv(layers: int = 2, text_tokens: int = 3) -> list:
-    """Per-layer text K/V labelled -1, so it never collides with a frame label."""
     return [
         (
             torch.full((1, text_tokens, 1, 1), -1.0),

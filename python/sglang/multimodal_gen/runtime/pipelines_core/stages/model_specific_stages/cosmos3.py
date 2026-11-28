@@ -2658,7 +2658,6 @@ class Cosmos3DecodingStage(PipelineStage):
         return decoded.mul(0.5).add_(0.5).clamp_(0, 1).float()
 
     def _streams_frames(self, batch: Req) -> bool:
-        """Whether the plain video frames may go straight to the MP4, on every rank."""
         return not (
             not self.vae.supports_decode_on_frames
             or (self._guardrails and batch.use_guardrails is not False)
@@ -2670,7 +2669,6 @@ class Cosmos3DecodingStage(PipelineStage):
     def _encode_while_decoding(
         self, batch: Req, server_args: ServerArgs
     ) -> EncodeWhileDecoding | None:
-        """An encoder fed by the decode, if the plain video frames go straight to the MP4."""
         if not self._streams_frames(batch):
             return None
         save_file_path = streamed_video_output_path(

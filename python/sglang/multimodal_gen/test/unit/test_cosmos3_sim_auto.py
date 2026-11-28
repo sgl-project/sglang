@@ -701,11 +701,6 @@ def _dense_oracle(q, k, v, mask):
 
 
 def _expand_fa4_mask(mask):
-    """Token mask exactly as the CuTe kernel resolves it: skipped, full and partial tiles.
-
-    Partial tiles read byte ``q_table_base[q] + k`` of a key-expanded table, or
-    bit ``k_run % 32`` of word ``q_table_base[q] + k_run // 32`` of a packed one.
-    """
     sparsity = mask.sparsity
     q_block, kv_block = sparsity.q_block_size, sparsity.kv_block_size
     base = sparsity.q_word_base.long()
@@ -926,7 +921,6 @@ def _replay_layer(hidden, heads, kv_heads, head_dim):
 
 
 def _positional_shift(q, k, norm_q, norm_k, head_dim, cos_sin_cache, positions):
-    """Position-sensitive stand-in for ``_apply_qwen3_qk_norm_rope``."""
     shift = cos_sin_cache[positions].view(1, -1, 1, head_dim)
     return q + shift, k + shift
 

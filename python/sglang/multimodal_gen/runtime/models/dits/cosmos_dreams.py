@@ -228,8 +228,6 @@ def _pack_kernel_applies(
     kv_slot: CosmosDreamsKVSlot,
     cos_sin_cache: torch.Tensor,
 ) -> bool:
-    """Same arithmetic as the in-place kernel ``_apply_qwen3_qk_norm_rope`` picks,
-    so the packing kernel only saves the two copies into the slot."""
     return (
         envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
         and q.device.type == "cuda"
@@ -257,8 +255,6 @@ def _write_chunk_kv(
     rope_positions: torch.Tensor,
     null_token_slices: list[slice],
 ) -> torch.Tensor:
-    """``kv_slot`` gets what history must store: post-norm, post-RoPE K and V
-    with null-action slots zeroed."""
     batch_size, seq_len = qkv.shape[:2]
     num_q_heads = attention.local_num_attention_heads
     num_kv_heads = attention.local_num_key_value_heads
@@ -696,7 +692,6 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         action_domain_ids: torch.Tensor | None,
         null_action_frame_indexes: Sequence[int],
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """``timestep`` None embeds the chunk as clean history, with no time embedding."""
         self._validate_chunk_inputs(hidden_states, kv_slots=kv_slots)
         self._validate_action_inputs(
             action_latents, action_domain_ids, null_action_frame_indexes

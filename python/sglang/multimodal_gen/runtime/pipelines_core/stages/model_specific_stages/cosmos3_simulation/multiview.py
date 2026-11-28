@@ -845,11 +845,6 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         keep_first: bool,
         require_complete: bool = False,
     ) -> PendingCameraMajorPixels:
-        """One field of the rig as camera-major ``uint8 [1, 3, V*F, H, W]``, loading on ``pool``.
-
-        ``F`` is ``num_frames``, every clip truncated or padded with its last
-        frame, or 1 with ``keep_first``.
-        """
         frames_per_view = 1 if keep_first else num_frames
         rig = torch.empty(
             (1, 3, len(views) * frames_per_view, height, width), dtype=torch.uint8
@@ -910,11 +905,6 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         vision_keep_first: bool,
         completion: bool,
     ) -> tuple[PendingCameraMajorPixels, PendingCameraMajorPixels | None]:
-        """Start loading the rig's control and RGB clips; returns before they finish.
-
-        The latent stage encodes the cameras in the order they are queued here,
-        controls first, and one gate paces both rigs' loads to that consumer.
-        """
         pool = ThreadPoolExecutor(
             max_workers=COSMOS3_MULTIVIEW_MEDIA_THREADS,
             thread_name_prefix="cosmos3-multiview-load",
@@ -1312,11 +1302,7 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
         dtype: torch.dtype,
         latent_frames: int | None = None,
     ) -> torch.Tensor:
-        """Encode camera-major ``uint8 [1, 3, V*P, H, W]`` one camera at a time into ``[1, C, V*Fl, h, w]``.
-
-        The Wan VAE is causal in time, so the camera-major stream must never be
-        encoded as one long clip.
-        """
+        # Wan VAE is causal in time, so each camera clip must be encoded separately.
         pending = isinstance(pixels, PendingCameraMajorPixels)
         if len(pixels.shape) != 5 or num_views < 1 or pixels.shape[2] % num_views:
             raise ValueError(
@@ -1366,8 +1352,6 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Encode the RGB conditions. Only the latents at ``condition_indexes`` are
-        meaningful, and the rest may be filler."""
         needed = 1 + max(index % latent_frames_per_view for index in condition_indexes)
         latent_frames = None
         if needed < latent_frames_per_view and self.vae.use_feature_cache:

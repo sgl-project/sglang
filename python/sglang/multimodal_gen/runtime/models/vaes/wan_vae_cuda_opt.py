@@ -334,8 +334,6 @@ def _install_exact_encoder_norm_silu(
     rms_norm_cls: type,
     label: str,
 ) -> None:
-    """The wrappers get a gate nothing enables, so no quality level trades the
-    encode's exactness for the fully fused kernel."""
     n_norm = _install_norm_silu(
         encoder,
         VaeFastPathGate(),

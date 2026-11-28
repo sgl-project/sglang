@@ -358,15 +358,6 @@ def _replay_layer_attention(
     rows: torch.Tensor | None = None,
     stream_kv: KVPair | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One softmax over ``[current | ring | captions]``; returns the output and the chunk's K/V.
-
-    With ``shard`` the hidden states, RoPE positions and output are the rank's
-    token shard, while the K/V streams and the returned K/V hold every token
-    for the rank's head group.
-
-    With ``rows`` the hidden states hold those tokens alone, ``mask`` still
-    covers the whole chunk, and ``stream_kv`` is updated in place and returned.
-    """
     batch_size, seq_len = hidden.shape[:2]
     q, k, v = _project_qkv(
         attention, hidden, cos_sin_cache=cos_sin_cache, rope_positions=rope_positions
@@ -774,7 +765,6 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
         replay: ChunkReuse | None,
         kv_only: bool,
     ) -> tuple[torch.Tensor | None, list[KVPair]]:
-        """Final hidden states (``None`` with ``kv_only``) and the chunk's per-layer K/V."""
         shard = None if self.ulysses is None else self.ulysses.shard(hidden.shape[1])
         sp_check = None
         if shard is not None:

@@ -1801,7 +1801,6 @@ class CosmosDreamsRolloutStage(PipelineStage):
         null_indexes: tuple[int, ...],
         domain_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Fixed-step SDE updates over the chunk's schedule; history K/V is read but never committed."""
         return run_fixed_step_sde(
             self.transformer,
             self.schedules,
