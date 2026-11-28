@@ -248,18 +248,30 @@ def test_output_dtype_follows_values():
 
 
 @pytest.mark.parametrize(
-    "return_lse,sparse", [(False, False), (True, False), (False, True)]
+    "return_lse,sparse,lse_from_keyword",
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, False, True),
+        (False, True, False),
+    ],
 )
-def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, sparse):
+def test_attention_replay_uses_live_batch_and_static_output_buffers(
+    return_lse, sparse, lse_from_keyword
+):
 
     layer = RadixAttention(2, 3, 1.0, 2, 0)
     q = torch.zeros(4, 2, 3)
-    captured_batch = make_batch(return_lse=return_lse)
-    live_batch = make_batch(tokens=1, return_lse=return_lse)
+    # AMD DCP requests LSE on the attention call, without changing the batch flag.
+    batch_lse = return_lse and not lse_from_keyword
+    captured_batch = make_batch(return_lse=batch_lse)
+    live_batch = make_batch(tokens=1, return_lse=batch_lse)
     seen = []
 
     def attention(query, key, value, actual_layer, batch, save_kv_cache, **kwargs):
         seen.append(batch)
+        if lse_from_keyword:
+            assert kwargs["return_lse"] is True
         out = torch.full_like(query, float(len(seen)))
         lse = torch.full((query.shape[0], 2), float(len(seen)))
         if sparse:
@@ -283,6 +295,8 @@ def test_attention_replay_uses_live_batch_and_static_output_buffers(return_lse, 
     ):
         with bcg.use_breakable_capture_recorder(capture):
             kwargs = {"idx_q": q, "idx_k": q} if sparse else {}
+            if lse_from_keyword:
+                kwargs["return_lse"] = True
             result = layer(q, q, q, captured_batch, **kwargs)
     index_output = None
     if sparse:
