@@ -36,6 +36,7 @@ from typing import (
     Any,
     ClassVar,
     Dict,
+    Iterable,
     List,
     Optional,
     Set,
@@ -2244,6 +2245,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if self.seq_lens_cpu is not None:
                 self.seq_lens_cpu = self.seq_lens_cpu[:bs]
 
+        if logits_output is None or not hasattr(logits_output, "next_token_logits"):
+            return
+
         if self.spec_info is not None:
             if self.forward_mode.is_decode():  # draft
                 num_tokens = self.hidden_states_backup.shape[0]
@@ -2315,7 +2319,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.out_cache_loc = self.output_cache_loc_backup
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
-            logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+            if logits_output.next_token_logits is not None:
+                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
@@ -2326,9 +2331,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if self._original_num_tokens is not None
                 else self.seq_lens_sum
             )
-            logits_output.next_token_logits = logits_output.next_token_logits[
-                :num_tokens
-            ]
+            if logits_output.next_token_logits is not None:
+                logits_output.next_token_logits = logits_output.next_token_logits[
+                    :num_tokens
+                ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             if logits_output.mm_input_embeds is not None:
@@ -2506,3 +2512,32 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+_CUSTOM_PREFILL_READOUT_BATCH_FIELDS = (
+    "multi_item_delimiter_indices",
+    "token_indices_to_pool",
+    "decision_layouts",
+)
+_CUSTOM_PREFILL_READOUT_REQ_FIELDS = (
+    "multi_item_delimiter_indices",
+    "token_indices_to_pool",
+    "decision_layout",
+)
+
+
+def has_custom_prefill_readout(forward_batch: Any) -> bool:
+    """Return True if a forward batch uses MIS, pooling, or setwise readout."""
+    return any(
+        getattr(forward_batch, field, None) is not None
+        for field in _CUSTOM_PREFILL_READOUT_BATCH_FIELDS
+    )
+
+
+def has_custom_prefill_readout_reqs(reqs: Iterable[Any]) -> bool:
+    """Return True if any request in ``reqs`` uses a custom prefill readout."""
+    return any(
+        getattr(req, field, None) is not None
+        for req in reqs
+        for field in _CUSTOM_PREFILL_READOUT_REQ_FIELDS
+    )

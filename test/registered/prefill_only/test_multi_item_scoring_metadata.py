@@ -26,6 +26,8 @@ def _build(
     seq_lens=None,
     prefix_lens=None,
     mode=ForwardMode.EXTEND,
+    mrope_positions=None,
+    mm_inputs=None,
 ):
     """Construct a minimal forward_batch stub for the builder."""
     fb = SimpleNamespace(
@@ -38,6 +40,10 @@ def _build(
         fb.extend_seq_lens_cpu = seq_lens
     if prefix_lens is not None:
         fb.extend_prefix_lens_cpu = prefix_lens
+    if mrope_positions is not None:
+        fb.mrope_positions = mrope_positions
+    if mm_inputs is not None:
+        fb.mm_inputs = mm_inputs
     return fb
 
 
@@ -149,11 +155,101 @@ class TestMISMetadataBuild(CustomTestCase):
         fb = _build(None, 14)
         self.assertFalse(_run(fb).is_enabled())
 
+    def test_empty_prefix_clamps_delimiter_positions_to_zero(self):
+        # On BOS-less models with an empty query (first_delim == 0), delimiter
+        # positions must clamp at 0 rather than -1 so RoPE does not read OOB.
+        fb = _build([torch.tensor([0, 3, 6])], 7, seq_lens=[7])
+        p = _run(fb)
+
+        self.assertEqual(p.prefix_len_ptr.tolist(), [0])
+        self.assertEqual(p.token_pos_in_items_ptr.tolist(), [0, 1, 2, 0, 1, 2, 0])
+        self.assertEqual(p.max_item_len_ptr.tolist(), [2])
+        self.assertEqual(fb.positions.tolist(), [0, 0, 1, 0, 0, 1, 0])
+        self.assertTrue((fb.positions >= 0).all())
+
     def test_empty_delimiters_skipped(self):
         # A sequence with no delimiters is skipped; with only such sequences the
         # builder returns empty params.
         fb = _build([torch.tensor([], dtype=torch.int64)], 14)
         self.assertFalse(_run(fb).is_enabled())
+
+    def test_mrope_positions_keep_second_item_invariant_when_first_item_lengthens(
+        self,
+    ):
+        short_mrope = torch.arange(9, dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+        long_mrope = torch.arange(13, dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+        short_fb = _build(
+            [torch.tensor([3, 5, 7], dtype=torch.int64)],
+            9,
+            mrope_positions=short_mrope,
+        )
+        short_fb.positions = torch.arange(9, dtype=torch.int64)
+        long_fb = _build(
+            [torch.tensor([3, 9, 11], dtype=torch.int64)],
+            13,
+            mrope_positions=long_mrope,
+        )
+        long_fb.positions = torch.arange(13, dtype=torch.int64)
+
+        self.assertTrue(_run(short_fb).is_enabled())
+        self.assertTrue(_run(long_fb).is_enabled())
+        torch.testing.assert_close(
+            short_fb.mrope_positions,
+            short_fb.positions.unsqueeze(0).expand(3, -1),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            long_fb.mrope_positions,
+            long_fb.positions.unsqueeze(0).expand(3, -1),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            long_fb.mrope_positions[:, -2:],
+            short_fb.mrope_positions[:, -2:],
+            rtol=0,
+            atol=0,
+        )
+
+    def test_mrope_positions_stride0_expand_is_materialized_before_write(self):
+        fb = _build(
+            [torch.tensor([4, 7, 10], dtype=torch.int64)],
+            13,
+            mrope_positions=torch.arange(13, dtype=torch.int64)
+            .unsqueeze(0)
+            .expand(3, -1),
+        )
+        fb.positions = torch.arange(13, dtype=torch.int64)
+        self.assertTrue(_run(fb).is_enabled())
+        self.assertNotEqual(fb.mrope_positions.stride(0), 0)
+        torch.testing.assert_close(
+            fb.mrope_positions,
+            fb.positions.unsqueeze(0).expand(3, -1),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_dp_padded_extend_seq_lens_with_trailing_zero_is_ignored(self):
+        fb = _build(
+            [torch.tensor([3, 5, 7], dtype=torch.int64)],
+            9,
+            seq_lens=[9, 0],
+            mrope_positions=torch.arange(9, dtype=torch.int64)
+            .unsqueeze(0)
+            .repeat(3, 1),
+        )
+        p = _run(fb)
+        self.assertTrue(p.is_enabled())
+        self.assertEqual(p.prefix_len_ptr.tolist(), [3])
+        torch.testing.assert_close(
+            fb.mrope_positions[:, 3:],
+            torch.tensor([2, 3, 2, 3, 2, 3], dtype=torch.int64)
+            .unsqueeze(0)
+            .expand(3, -1),
+            rtol=0,
+            atol=0,
+        )
 
 
 if __name__ == "__main__":

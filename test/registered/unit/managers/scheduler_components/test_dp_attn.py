@@ -1,6 +1,7 @@
 import datetime
 import socket
 import time
+import traceback
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -11,15 +12,31 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.layers.logits_processor import (  # noqa: E402
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
 from sglang.srt.model_executor.cuda_graph_config import Backend  # noqa: E402
-from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch  # noqa: E402
+from sglang.srt.model_executor.forward_mode import (  # noqa: E402
+    CaptureHiddenMode,
+    ForwardMode,
+)
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (  # noqa: E402
+    PrefillCudaGraphRunner,
+)
 from sglang.srt.observability.metrics_collector import DPBalanceStats  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
@@ -994,6 +1011,217 @@ class TestSyncRowExchangeGloo(CustomTestCase):
                     self.assertEqual(stop, round_idx == _EXCHANGE_ROUNDS - 1)
                     # Every rank's drain state, one row per DP rank.
                     self.assertEqual(drain, [(r + round_idx) % 8 for r in range(sub)])
+
+
+class TestTwoRankDPScorePrefillGraph(CustomTestCase):
+    def test_two_rank_dp_mis_vote_and_post_forward_trim(self):
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        ctx = mp.get_context("forkserver")
+        ctx.set_forkserver_preload([__name__])
+        out_q = ctx.Queue()
+        procs = [
+            ctx.Process(target=_dp_score_worker, args=(r, 2, port, out_q))
+            for r in range(2)
+        ]
+        results = {}
+        try:
+            for proc in procs:
+                proc.start()
+            for _ in range(2):
+                rank, outcome = out_q.get(timeout=120)
+                results[rank] = outcome
+            for proc in procs:
+                proc.join(timeout=60)
+                self.assertEqual(proc.exitcode, 0)
+        finally:
+            for proc in procs:
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=10)
+
+        for rank, expected_tokens, expected_items in ((0, 10, 3), (1, 14, 4)):
+            outcome = results[rank]
+            self.assertNotIn("error", outcome, outcome.get("error"))
+            self.assertTrue(outcome["local_vote"])
+            self.assertTrue(outcome["agreed_prefill_graph"])
+            self.assertEqual(outcome["global_num_tokens"], [10, 14])
+            self.assertEqual(outcome["positions_len"], expected_tokens)
+            self.assertIsNone(outcome["next_token_logits"])
+            self.assertEqual(outcome["hidden_rows"], expected_tokens)
+            self.assertEqual(outcome["score_shape"], (expected_items, 2))
+            self.assertTrue(outcome["scores_finite"])
+
+
+def _dp_score_worker(rank, world, port, out_q):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world,
+        timeout=datetime.timedelta(seconds=60),
+    )
+    try:
+        group = dist.new_group([0, 1])
+        num_tokens = 10 if rank == 0 else 14
+        delims = (
+            torch.tensor([4, 7, 9], dtype=torch.int64)
+            if rank == 0
+            else torch.tensor([5, 8, 11, 13], dtype=torch.int64)
+        )
+
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = False
+        runner.enable_lora = False
+        runner._capture_chunked_prefix = False
+        runner._captured_attn_metadata_max_bs = None
+        runner._qwen_bcg_hc_sidechannel = False
+        runner._qwen_bcg_mtp_draft = False
+        runner.prefill_backend_name = Backend.BREAKABLE
+        runner.has_mha_companion_layers = False
+        runner.prefer_eager_mixed_prefill = False
+        runner._backend_vote_prefill_cuda_graph = None
+        runner._backend_can_run_prefill_cuda_graph = None
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+        runner.capture_num_tokens = [16]
+        runner.max_context_size = None
+        runner.max_seq_len = None
+        runner.max_num_tokens = 16
+
+        schedule_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=lambda: 1,
+            extend_num_tokens=num_tokens,
+            input_embeds=None,
+            replace_embeds=None,
+            prefix_lens=[0],
+            return_logprob=False,
+            multimodal_inputs=None,
+            reqs=[
+                SimpleNamespace(
+                    multi_item_delimiter_indices=delims.tolist(),
+                    token_indices_to_pool=None,
+                    decision_layout=None,
+                )
+            ],
+        )
+        local_vote = dp_attn._local_prefill_cuda_graph_vote(
+            local_batch=schedule_batch,
+            num_tokens=num_tokens,
+            prefill_graph_runner=runner,
+            coordinated_prefill=True,
+            breakable_prefill=True,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            model_config=None,
+        )
+
+        info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=2,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=num_tokens,
+            num_tokens_for_logprob=num_tokens,
+            can_run_decode_cuda_graph=False,
+            can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=local_vote,
+            is_extend_in_batch=True,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.EXTEND.value,
+            attention_pairs=num_tokens * num_tokens,
+        )
+        parallel = SimpleNamespace(
+            tp_group=SimpleNamespace(active_ranks_cpu=torch.ones(2, dtype=torch.int64))
+        )
+        with patch.object(dp_attn, "get_parallel", return_value=parallel):
+            info.all_gather(device="cpu", group=group)
+
+        padded_tokens = max(info.global_num_tokens)
+        fb = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(num_tokens, dtype=torch.int64),
+            req_pool_indices=torch.zeros(1, dtype=torch.int64),
+            seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+            out_cache_loc=torch.arange(num_tokens, dtype=torch.int64),
+            seq_lens_sum=num_tokens,
+            positions=torch.arange(num_tokens, dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([num_tokens], dtype=torch.int32),
+            extend_seq_lens=torch.tensor([num_tokens], dtype=torch.int32),
+            extend_prefix_lens=torch.zeros(1, dtype=torch.int32),
+            extend_start_loc=torch.zeros(1, dtype=torch.int32),
+            extend_seq_lens_cpu=[num_tokens],
+            extend_prefix_lens_cpu=[0],
+            extend_logprob_start_lens_cpu=[0],
+            multi_item_delimiter_indices=[delims],
+            is_prefill_only=True,
+            return_logprob=True,
+            top_logprobs_nums=[0],
+            token_ids_logprobs=[[1, 2]],
+            global_forward_mode=ForwardMode.EXTEND,
+            global_num_tokens_cpu=info.global_num_tokens,
+        )
+        mock_runner = SimpleNamespace(
+            attn_backend=SimpleNamespace(get_cuda_graph_seq_len_fill_value=lambda: 1)
+        )
+        fb._original_batch_size = fb.batch_size
+        fb._pad_inputs_to_size(mock_runner, num_tokens=padded_tokens, bs=1)
+
+        padded_hidden = torch.linspace(
+            -0.5, 0.5, steps=padded_tokens * 4, dtype=torch.float32
+        ).reshape(padded_tokens, 4)
+        vocab_weight = torch.linspace(
+            -0.3, 0.3, steps=8 * 4, dtype=torch.float32
+        ).reshape(8, 4)
+        with published_topology():
+            logits_metadata = LogitsMetadata.from_forward_batch(fb)
+            processor = LogitsProcessor(SimpleNamespace(vocab_size=8))
+            with patch.object(
+                processor,
+                "_get_logits",
+                side_effect=lambda states, *args, **kwargs: states @ vocab_weight.T,
+            ):
+                out = processor.compute_logprobs_for_multi_item_scoring(
+                    input_ids=fb.input_ids,
+                    hidden_states=padded_hidden,
+                    lm_head=None,
+                    logits_metadata=logits_metadata,
+                    multi_item_delimiter_indices=fb.multi_item_delimiter_indices,
+                )
+        out = LogitsProcessorOutput(
+            next_token_logits=out.next_token_logits,
+            input_token_logprobs=out.input_token_logprobs,
+            input_top_logprobs_val=out.input_top_logprobs_val,
+            input_top_logprobs_idx=out.input_top_logprobs_idx,
+            input_token_ids_logprobs_val=out.input_token_ids_logprobs_val,
+            input_token_ids_logprobs_idx=out.input_token_ids_logprobs_idx,
+            hidden_states=padded_hidden,
+            mm_input_embeds=out.mm_input_embeds,
+        )
+        fb.post_forward_mlp_sync_batch(out)
+
+        vals = out.input_token_ids_logprobs_val[0]
+        out_q.put(
+            (
+                rank,
+                {
+                    "local_vote": local_vote,
+                    "agreed_prefill_graph": info.can_run_prefill_cuda_graph,
+                    "global_num_tokens": info.global_num_tokens,
+                    "positions_len": int(fb.positions.shape[0]),
+                    "next_token_logits": out.next_token_logits,
+                    "hidden_rows": int(out.hidden_states.shape[0]),
+                    "score_shape": tuple(vals.shape),
+                    "scores_finite": bool(torch.isfinite(vals).all()),
+                },
+            )
+        )
+    except BaseException:
+        out_q.put((rank, {"error": traceback.format_exc()}))
+    finally:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

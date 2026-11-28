@@ -14,10 +14,16 @@ bugs in tensor shape handling (e.g., 2D tensors [num_delimiters, num_label_token
 """
 
 import asyncio
+import json
 import os
+import re
+import tempfile
 import unittest
+from pathlib import Path
 
+import requests
 import torch
+from safetensors.torch import save_file
 from transformers import AutoConfig, AutoTokenizer
 
 from sglang.srt.entrypoints.engine import Engine
@@ -25,7 +31,11 @@ from sglang.srt.server_args import _declared_default
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
+    find_available_port,
+    popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=137, stage="extra-a", runner_config="1-gpu-small")
@@ -149,6 +159,12 @@ class TestMultiItemScoringOptimization(CustomTestCase):
         for score_list in scores:
             self.assertEqual(len(score_list), len(label_token_ids))
             self.assertAlmostEqual(sum(score_list), 1.0, places=5)
+
+    def test_prefill_cuda_graph_breakable_enabled(self):
+        """MIS keeps breakable prefill CUDA graph active while disabling decode."""
+        info = self.engine.get_server_info()
+        self.assertEqual(info["cuda_graph_config"]["prefill"]["backend"], "breakable")
+        self.assertEqual(info["cuda_graph_config"]["decode"]["backend"], "disabled")
 
 
 class TestMultiItemScoringClassification(CustomTestCase):
@@ -423,6 +439,34 @@ class TestMultiItemScoringClassification(CustomTestCase):
                     msg=f"item {i} label {j}: MIS={m} vs non-MIS={n}",
                 )
 
+    def test_classification_prefill_cuda_graph_breakable_enabled(self):
+        """Classification MIS keeps breakable prefill CUDA graph active."""
+        info = self.engine.get_server_info()
+        self.assertEqual(info["cuda_graph_config"]["prefill"]["backend"], "breakable")
+        self.assertEqual(info["cuda_graph_config"]["decode"]["backend"], "disabled")
+
+    def test_classification_mis_empty_query(self):
+        """Classification MIS with empty query handles clamped delimiter-1 safely."""
+        for return_phs in (False, True):
+            with self.subTest(return_pooled_hidden_states=return_phs):
+                result = self.engine.score(
+                    query="",
+                    items=["alpha", "beta", "gamma"],
+                    apply_softmax=True,
+                    return_pooled_hidden_states=return_phs,
+                )
+                self.assertEqual(len(result.scores), 3)
+                for row in result.scores:
+                    self.assertEqual(len(row), self.NUM_LABELS)
+                    self.assertAlmostEqual(sum(row), 1.0, places=5)
+                if return_phs:
+                    self.assertIsNotNone(result.pooled_hidden_states)
+                    self.assertEqual(len(result.pooled_hidden_states), 3)
+                    for phs in result.pooled_hidden_states:
+                        self.assertTrue(torch.isfinite(phs).all())
+                else:
+                    self.assertIsNone(result.pooled_hidden_states)
+
 
 class TestMultiItemScoringParity(CustomTestCase):
     """Test that MIS produces the same results as single-item scoring."""
@@ -525,6 +569,485 @@ class TestMultiItemScoringParity(CustomTestCase):
 
     def test_parity_many_items(self):
         self._compare_scores("many_items")
+
+
+class TestMultiItemScoringPrefillCudaGraphParity(CustomTestCase):
+    """Compare MIS under breakable prefill CUDA graph against eager MIS."""
+
+    @classmethod
+    def _causallm_calls(cls):
+        tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_NAME)
+        yes_no = [
+            tokenizer.encode(lbl, add_special_tokens=False)[0]
+            for lbl in (" good", " bad")
+        ]
+        return {
+            "bucket_small": dict(
+                query="Rate relevance:",
+                items=[f" candidate item {i}" for i in range(4)],
+                label_token_ids=yes_no,
+                apply_softmax=True,
+            ),
+            "bucket_medium": dict(
+                query="Score each document for relevance to search:",
+                items=[f" document summary number {i}" for i in range(12)],
+                label_token_ids=yes_no,
+                apply_softmax=True,
+            ),
+            "empty_query": dict(
+                query="",
+                items=[" alpha option", " beta option", " gamma option"],
+                label_token_ids=yes_no,
+                apply_softmax=True,
+            ),
+            "raw_logprobs": dict(
+                query="Is this helpful?",
+                items=[" very helpful overview", " irrelevant text"],
+                label_token_ids=yes_no,
+                apply_softmax=False,
+                return_token_logprobs=True,
+            ),
+        }
+
+    def _assert_scores_close(
+        self,
+        *,
+        actual_scores,
+        expected_scores,
+        label: str,
+        check_top1: bool = True,
+    ) -> None:
+        self.assertEqual(len(actual_scores), len(expected_scores), label)
+        for i, (act_row, exp_row) in enumerate(zip(actual_scores, expected_scores)):
+            self.assertEqual(len(act_row), len(exp_row), f"{label}[{i}]")
+            for j, (act_val, exp_val) in enumerate(zip(act_row, exp_row)):
+                self.assertAlmostEqual(
+                    act_val,
+                    exp_val,
+                    delta=1e-2,
+                    msg=f"{label}[{i}][{j}]: actual={act_val} vs expected={exp_val}",
+                )
+            if check_top1 and len(act_row) > 1:
+                act_top = max(range(len(act_row)), key=act_row.__getitem__)
+                exp_top = max(range(len(exp_row)), key=exp_row.__getitem__)
+                self.assertEqual(act_top, exp_top, f"{label}[{i}] top-1 mismatch")
+
+    def _assert_token_logprobs_close(
+        self, *, actual_tlp, expected_tlp, label: str
+    ) -> None:
+        self.assertIsNotNone(actual_tlp, f"{label}: missing actual token_logprobs")
+        self.assertIsNotNone(expected_tlp, f"{label}: missing expected token_logprobs")
+        self.assertEqual(len(actual_tlp), len(expected_tlp), label)
+        for i, (act_row, exp_row) in enumerate(zip(actual_tlp, expected_tlp)):
+            self.assertEqual(len(act_row), len(exp_row), f"{label} logprob[{i}]")
+            for j, (act_lp, exp_lp) in enumerate(zip(act_row, exp_row)):
+                self.assertAlmostEqual(
+                    act_lp,
+                    exp_lp,
+                    delta=5e-2,
+                    msg=f"{label} logprob[{i}][{j}]: actual={act_lp} vs expected={exp_lp}",
+                )
+            act_top = max(range(len(act_row)), key=act_row.__getitem__)
+            exp_top = max(range(len(exp_row)), key=exp_row.__getitem__)
+            self.assertEqual(act_top, exp_top, f"{label} logprob[{i}] top-1 mismatch")
+
+    def _assert_causallm_case_close(
+        self,
+        *,
+        name: str,
+        actual_scores,
+        actual_tlp,
+        expected_scores,
+        expected_tlp,
+        label: str,
+    ) -> None:
+        self._assert_scores_close(
+            actual_scores=actual_scores,
+            expected_scores=expected_scores,
+            label=label,
+            check_top1=(name != "raw_logprobs"),
+        )
+        if name == "raw_logprobs":
+            self._assert_token_logprobs_close(
+                actual_tlp=actual_tlp, expected_tlp=expected_tlp, label=label
+            )
+        else:
+            self.assertIsNone(actual_tlp)
+            self.assertIsNone(expected_tlp)
+
+    def test_causallm_breakable_pcg_matches_eager_mis_and_replays_graphs(self):
+        calls_map = self._causallm_calls()
+        names = list(calls_map)
+        calls = list(calls_map.values())
+
+        common = dict(
+            model_path=TEST_MODEL_NAME,
+            enable_mis=True,
+            attention_backend="flashinfer",
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            mem_fraction_static=0.20,
+            log_level="error",
+        )
+        eager_outs = dict(
+            zip(
+                names,
+                _collect_engine_outputs(
+                    engine_kwargs=dict(common, disable_cuda_graph=True),
+                    calls=calls,
+                ),
+            )
+        )
+        graph_outs = dict(
+            zip(
+                names,
+                _collect_engine_outputs(engine_kwargs=common, calls=calls),
+            )
+        )
+
+        for name in names:
+            g_scores, _, g_tlp = graph_outs[name]
+            e_scores, _, e_tlp = eager_outs[name]
+            self._assert_causallm_case_close(
+                name=name,
+                actual_scores=g_scores,
+                actual_tlp=g_tlp,
+                expected_scores=e_scores,
+                expected_tlp=e_tlp,
+                label=name,
+            )
+
+        port = find_available_port(31000)
+        base_url = f"http://127.0.0.1:{port}"
+        proc = popen_launch_server(
+            TEST_MODEL_NAME,
+            base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-mis",
+                "--attention-backend",
+                "flashinfer",
+                "--disable-radix-cache",
+                "--chunked-prefill-size",
+                "-1",
+                "--mem-fraction-static",
+                "0.20",
+                "--enable-metrics",
+            ],
+        )
+        try:
+            info = requests.get(base_url + "/server_info", timeout=30).json()
+            self.assertEqual(
+                info["cuda_graph_config"]["prefill"]["backend"], "breakable"
+            )
+            self.assertEqual(info["cuda_graph_config"]["decode"]["backend"], "disabled")
+            before = _prefill_graph_count(base_url)
+            for name in names:
+                resp = requests.post(
+                    base_url + "/v1/score",
+                    json={"model": TEST_MODEL_NAME, **calls_map[name]},
+                    timeout=30,
+                )
+                self.assertEqual(resp.status_code, 200, resp.text)
+                body = resp.json()
+                e_scores, _, e_tlp = eager_outs[name]
+                self._assert_causallm_case_close(
+                    name=name,
+                    actual_scores=body["scores"],
+                    actual_tlp=body.get("token_logprobs"),
+                    expected_scores=e_scores,
+                    expected_tlp=e_tlp,
+                    label=f"http {name}",
+                )
+            after = _prefill_graph_count(base_url)
+            self.assertGreaterEqual(after - before, 4.0)
+        finally:
+            terminate_and_kill_process_tree(proc)
+            torch.cuda.empty_cache()
+
+    def test_seqcls_breakable_pcg_matches_eager_mis(self):
+        calls = [
+            dict(
+                query="Rate this option:",
+                items=[" Option A", " Option B", " Option C", " Option D"],
+                apply_softmax=True,
+                return_pooled_hidden_states=False,
+            ),
+            dict(
+                query="",
+                items=[" alpha item", " beta item"],
+                apply_softmax=True,
+                return_pooled_hidden_states=True,
+            ),
+        ]
+        common = dict(
+            model_path=TEST_CLASSIFICATION_BASE_MODEL,
+            enable_mis=True,
+            attention_backend="flashinfer",
+            disable_radix_cache=True,
+            chunked_prefill_size=-1,
+            mem_fraction_static=0.20,
+            log_level="error",
+        )
+        eager_outs = _collect_engine_outputs(
+            engine_kwargs=dict(common, disable_cuda_graph=True), calls=calls
+        )
+        graph_outs = _collect_engine_outputs(engine_kwargs=common, calls=calls)
+
+        for idx, ((g_scores, g_phs, g_tlp), (e_scores, e_phs, e_tlp)) in enumerate(
+            zip(graph_outs, eager_outs)
+        ):
+            self.assertIsNone(g_tlp)
+            self.assertIsNone(e_tlp)
+            self._assert_scores_close(
+                actual_scores=g_scores,
+                expected_scores=e_scores,
+                label=f"seqcls call={idx}",
+                check_top1=False,
+            )
+            if idx == 0:
+                self.assertIsNone(g_phs)
+                self.assertIsNone(e_phs)
+            else:
+                self.assertIsNotNone(g_phs)
+                self.assertIsNotNone(e_phs)
+                for gp, ep in zip(g_phs, e_phs):
+                    torch.testing.assert_close(gp, ep, rtol=5e-2, atol=5e-2)
+
+    def test_mrope_qwen3_5_item_position_invariance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_dir = _make_tiny_qwen3_5_mrope_dir(Path(tmpdir))
+            tokenizer = AutoTokenizer.from_pretrained(model_dir)
+            labels = [
+                tokenizer.encode(lbl, add_special_tokens=False)[0]
+                for lbl in (" good", " bad")
+            ]
+            target_item = " candidate item with distinct tokens for scoring"
+            long_first_item = " ".join(["distractor"] * 24)
+            solo_call = dict(
+                query="Rate relevance:",
+                items=[target_item],
+                label_token_ids=labels,
+                apply_softmax=False,
+                return_token_logprobs=True,
+            )
+            multi_call = dict(
+                query="Rate relevance:",
+                items=[long_first_item, target_item],
+                label_token_ids=labels,
+                apply_softmax=False,
+                return_token_logprobs=True,
+            )
+            common = dict(
+                model_path=model_dir,
+                enable_mis=True,
+                attention_backend="flashinfer",
+                linear_attn_backend="triton",
+                disable_radix_cache=True,
+                chunked_prefill_size=-1,
+                mem_fraction_static=0.15,
+                dtype="bfloat16",
+                log_level="error",
+            )
+            for disable_cuda_graph in (True, False):
+                with self.subTest(disable_cuda_graph=disable_cuda_graph):
+                    engine = Engine(
+                        **common,
+                        disable_cuda_graph=disable_cuda_graph,
+                    )
+                    try:
+                        info = engine.get_server_info()
+                        expected_backend = (
+                            "disabled" if disable_cuda_graph else "breakable"
+                        )
+                        self.assertEqual(
+                            info["cuda_graph_config"]["prefill"]["backend"],
+                            expected_backend,
+                        )
+                        solo_out = engine.score(**solo_call)
+                        multi_out = engine.score(**multi_call)
+                    finally:
+                        engine.shutdown()
+                        torch.cuda.empty_cache()
+
+                    self._assert_token_logprobs_close(
+                        actual_tlp=[multi_out.token_logprobs[1]],
+                        expected_tlp=[solo_out.token_logprobs[0]],
+                        label=f"qwen3_5 mrope disable_cuda_graph={disable_cuda_graph}",
+                    )
+
+
+def _prefill_graph_count(base_url: str) -> float:
+    metrics = requests.get(base_url + "/metrics", timeout=30).text
+    matches = re.findall(
+        r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
+        r"\s+([0-9.eE+-]+)$",
+        metrics,
+        re.MULTILINE,
+    )
+    return sum(map(float, matches), 0.0)
+
+
+def _collect_engine_outputs(*, engine_kwargs, calls):
+    engine = Engine(**engine_kwargs)
+    try:
+        outs = [engine.score(**call) for call in calls]
+        return [
+            (
+                o.scores,
+                [t.clone() for t in o.pooled_hidden_states]
+                if o.pooled_hidden_states is not None
+                else None,
+                o.token_logprobs,
+            )
+            for o in outs
+        ]
+    finally:
+        engine.shutdown()
+        torch.cuda.empty_cache()
+
+
+def _make_tiny_qwen3_5_mrope_dir(root: Path) -> str:
+    """Write a minimal hybrid Qwen3_5ForCausalLM checkpoint with M-RoPE."""
+    tokenizer = AutoTokenizer.from_pretrained(TEST_MODEL_NAME)
+    tokenizer.save_pretrained(root)
+
+    hidden_size = 128
+    intermediate_size = 256
+    num_hidden_layers = 2
+    num_attention_heads = 4
+    num_key_value_heads = 2
+    head_dim = 64
+    linear_conv_kernel_dim = 4
+    linear_key_head_dim = 64
+    linear_value_head_dim = 64
+    linear_num_key_heads = 2
+    linear_num_value_heads = 4
+    key_dim = linear_key_head_dim * linear_num_key_heads
+    value_dim = linear_value_head_dim * linear_num_value_heads
+    conv_dim = key_dim * 2 + value_dim
+    vocab_size = len(tokenizer)
+
+    config = {
+        "architectures": ["Qwen3_5ForCausalLM"],
+        "model_type": "qwen3_5_text",
+        "vocab_size": vocab_size,
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "num_hidden_layers": num_hidden_layers,
+        "num_attention_heads": num_attention_heads,
+        "num_key_value_heads": num_key_value_heads,
+        "head_dim": head_dim,
+        "hidden_act": "silu",
+        "max_position_embeddings": 1024,
+        "rms_norm_eps": 1e-6,
+        "tie_word_embeddings": True,
+        "attn_output_gate": True,
+        "full_attention_interval": 2,
+        "linear_conv_kernel_dim": linear_conv_kernel_dim,
+        "linear_key_head_dim": linear_key_head_dim,
+        "linear_value_head_dim": linear_value_head_dim,
+        "linear_num_key_heads": linear_num_key_heads,
+        "linear_num_value_heads": linear_num_value_heads,
+        "partial_rotary_factor": 1.0,
+        "rope_parameters": {
+            "rope_type": "default",
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 1.0,
+            "mrope_section": [11, 11, 10],
+            "mrope_interleaved": True,
+        },
+        "torch_dtype": "bfloat16",
+    }
+    (root / "config.json").write_text(json.dumps(config, indent=2))
+
+    gen = torch.Generator().manual_seed(42)
+
+    def rand(shape):
+        return (torch.randn(shape, generator=gen, dtype=torch.float32) * 0.02).to(
+            torch.bfloat16
+        )
+
+    tensors = {
+        "model.embed_tokens.weight": rand((vocab_size, hidden_size)),
+        "model.norm.weight": torch.ones(hidden_size, dtype=torch.bfloat16),
+    }
+    for layer_idx in range(num_hidden_layers):
+        prefix = f"model.layers.{layer_idx}"
+        tensors.update(
+            {
+                f"{prefix}.input_layernorm.weight": torch.ones(
+                    hidden_size, dtype=torch.bfloat16
+                ),
+                f"{prefix}.post_attention_layernorm.weight": torch.ones(
+                    hidden_size, dtype=torch.bfloat16
+                ),
+                f"{prefix}.mlp.gate_proj.weight": rand(
+                    (intermediate_size, hidden_size)
+                ),
+                f"{prefix}.mlp.up_proj.weight": rand((intermediate_size, hidden_size)),
+                f"{prefix}.mlp.down_proj.weight": rand(
+                    (hidden_size, intermediate_size)
+                ),
+            }
+        )
+        if layer_idx == 0:
+            tensors.update(
+                {
+                    f"{prefix}.linear_attn.conv1d.weight": rand(
+                        (conv_dim, 1, linear_conv_kernel_dim)
+                    ),
+                    f"{prefix}.linear_attn.in_proj_qkv.weight": rand(
+                        (conv_dim, hidden_size)
+                    ),
+                    f"{prefix}.linear_attn.in_proj_z.weight": rand(
+                        (value_dim, hidden_size)
+                    ),
+                    f"{prefix}.linear_attn.in_proj_b.weight": rand(
+                        (linear_num_value_heads, hidden_size)
+                    ),
+                    f"{prefix}.linear_attn.in_proj_a.weight": rand(
+                        (linear_num_value_heads, hidden_size)
+                    ),
+                    f"{prefix}.linear_attn.dt_bias": torch.ones(
+                        linear_num_value_heads, dtype=torch.bfloat16
+                    ),
+                    f"{prefix}.linear_attn.A_log": torch.zeros(
+                        linear_num_value_heads, dtype=torch.float32
+                    ),
+                    f"{prefix}.linear_attn.norm.weight": torch.ones(
+                        linear_value_head_dim, dtype=torch.bfloat16
+                    ),
+                    f"{prefix}.linear_attn.out_proj.weight": rand(
+                        (hidden_size, value_dim)
+                    ),
+                }
+            )
+        else:
+            tensors.update(
+                {
+                    f"{prefix}.self_attn.q_proj.weight": rand(
+                        (num_attention_heads * head_dim * 2, hidden_size)
+                    ),
+                    f"{prefix}.self_attn.k_proj.weight": rand(
+                        (num_key_value_heads * head_dim, hidden_size)
+                    ),
+                    f"{prefix}.self_attn.v_proj.weight": rand(
+                        (num_key_value_heads * head_dim, hidden_size)
+                    ),
+                    f"{prefix}.self_attn.o_proj.weight": rand(
+                        (hidden_size, num_attention_heads * head_dim)
+                    ),
+                    f"{prefix}.self_attn.q_norm.weight": torch.ones(
+                        head_dim, dtype=torch.bfloat16
+                    ),
+                    f"{prefix}.self_attn.k_norm.weight": torch.ones(
+                        head_dim, dtype=torch.bfloat16
+                    ),
+                }
+            )
+    save_file(tensors, str(root / "model.safetensors"))
+    return str(root)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     cuda_graph_fully_disabled,
 )
 from sglang.srt.model_executor.encoder_swa_replay import folded_replay_rows
+from sglang.srt.model_executor.forward_batch_info import has_custom_prefill_readout_reqs
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import PrefillCudaGraphRunner
 from sglang.srt.observability.metrics_collector import (
@@ -506,6 +507,12 @@ def _local_prefill_cuda_graph_vote(
         is_target_verify=mode.is_target_verify(),
         capture_hidden_mode=None,
         return_logprob=return_logprob,
+        has_custom_prefill_readout=(
+            mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            and not return_logprob
+            and not prefill_graph_runner._uses_eager_prefill_tail()
+            and has_custom_prefill_readout_reqs(getattr(local_batch, "reqs", ()))
+        ),
         contains_mm_inputs=any(
             mm_input is not None and mm_input.contains_mm_input()
             for mm_input in local_batch.multimodal_inputs or ()
