@@ -18,6 +18,7 @@ from sglang.multimodal_gen.configs.models.dits.magi2 import (
 )
 from sglang.multimodal_gen.configs.models.fsdp import is_block
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
@@ -45,7 +46,10 @@ from sglang.multimodal_gen.runtime.models.dits.magi2_layers import (
     sharded_cu_seqlens,
     swiglu7_interleaved,
 )
-from sglang.multimodal_gen.runtime.models.dits.magi2_moe import Magi2MultiHeadMoE
+from sglang.multimodal_gen.runtime.models.dits.magi2_moe import (
+    Magi2MultiHeadMoE,
+    resolve_pipeline_groups,
+)
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 MAGI2_PREVIEW_FORWARD_KWARGS = frozenset(
@@ -554,6 +558,9 @@ class Magi2SinkAttention(nn.Module):
         )
         self._impl = None
         self._impl_dtype: torch.dtype | None = None
+        self._group_impls: (
+            tuple[tuple[torch.dtype, int], list[FlashAttentionImpl]] | None
+        ) = None
 
     def _local_sinks(self) -> torch.Tensor | None:
         """``_usp_input_all_to_all_packed_qkv`` gives rank *r* heads ``[r * h_local, (r + 1) * h_local)``."""
@@ -579,6 +586,23 @@ class Magi2SinkAttention(nn.Module):
         # wrong width.
         if self._impl is not None and self._impl_dtype == dtype:
             return
+        world_size = get_ulysses_parallel_world_size()
+        self._impl = self._build_impl(
+            dtype,
+            heads=self.num_heads // world_size,
+            kv_heads=max(1, self.num_kv_heads // world_size),
+            sinks=self._local_sinks(),
+        )
+        self._impl_dtype = dtype
+
+    def _build_impl(
+        self,
+        dtype: torch.dtype,
+        *,
+        heads: int,
+        kv_heads: int,
+        sinks: torch.Tensor | None,
+    ) -> FlashAttentionImpl:
         backend = get_attn_backend(
             self.head_dim,
             dtype,
@@ -594,21 +618,50 @@ class Magi2SinkAttention(nn.Module):
                 f"window, but the platform resolved {backend.get_enum().name}; "
                 "run on a GPU with FA support"
             )
-        world_size = get_ulysses_parallel_world_size()
-        local_heads = self.num_heads // world_size
-        local_kv_heads = max(1, self.num_kv_heads // world_size)
-        sinks = self._local_sinks()
-        self._impl = impl_cls(
-            num_heads=local_heads,
+        return impl_cls(
+            num_heads=heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=self.softmax_scale,
-            num_kv_heads=local_kv_heads,
+            num_kv_heads=kv_heads,
             # The parameter stays fp32, but FA3 wants sinks in the q dtype.
             sinks=None if sinks is None else sinks.to(dtype).contiguous(),
             window_size=self.window_size,
         )
-        self._impl_dtype = dtype
+
+    def _pipeline_groups(self) -> int:
+        world_size = get_ulysses_parallel_world_size()
+        if world_size <= 1:
+            return 1
+        # Measured on magi-2-preview with 6 local heads: 3 groups 17.82 s, 6 groups 18.17 s.
+        return resolve_pipeline_groups(
+            local_heads=self.num_heads // world_size,
+            preferred=4,
+            group=get_sp_group().ulysses_group,
+        )
+
+    def _ensure_group_impls(
+        self, dtype: torch.dtype, groups: int
+    ) -> list[FlashAttentionImpl]:
+        # Sinks are per head, so each group carries its own slice and the kernel
+        # sees exactly the heads it attends.
+        if self._group_impls is not None and self._group_impls[0] == (dtype, groups):
+            return self._group_impls[1]
+        world_size = get_ulysses_parallel_world_size()
+        heads = self.num_heads // (world_size * groups)
+        kv_heads = max(1, self.num_kv_heads // (world_size * groups))
+        sinks = self._local_sinks()
+        impls = [
+            self._build_impl(
+                dtype,
+                heads=heads,
+                kv_heads=kv_heads,
+                sinks=None if sinks is None else sinks[g * heads : (g + 1) * heads],
+            )
+            for g in range(groups)
+        ]
+        self._group_impls = ((dtype, groups), impls)
+        return impls
 
     def forward(
         self,
@@ -622,7 +675,24 @@ class Magi2SinkAttention(nn.Module):
         from sglang.multimodal_gen.runtime.layers.usp import (
             _usp_input_all_to_all_packed_qkv,
             _usp_output_all_to_all,
+            ulysses_head_group_pipelined_attention,
         )
+
+        groups = self._pipeline_groups()
+        if groups > 1:
+            pending = iter(self._ensure_group_impls(q.dtype, groups))
+
+            def attend(group_q, group_k, group_v):
+                # One call per group, in ascending order.
+                return next(pending).forward_varlen(
+                    group_q,
+                    group_k,
+                    group_v,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+
+            return ulysses_head_group_pipelined_attention(q, k, v, attend, groups)
 
         ulysses = get_ulysses_parallel_world_size() > 1
         if ulysses:

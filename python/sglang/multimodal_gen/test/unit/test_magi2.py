@@ -782,6 +782,36 @@ def _unbiased_scores(router, tokens):
     return torch.einsum("thd,hed->the", tokens.float(), gate.float()).sigmoid()
 
 
+class TestMagi2PipelineGroups(unittest.TestCase):
+    def test_explicit_counts_reduce_to_a_divisor(self):
+        from sglang.multimodal_gen import envs
+        from sglang.multimodal_gen.runtime.models.dits.magi2_moe import (
+            resolve_pipeline_groups,
+        )
+
+        original = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
+        try:
+            for requested, local_heads, want in (
+                (0, 6, 1),
+                (1, 6, 1),
+                (2, 6, 2),
+                (5, 6, 3),
+                (6, 6, 6),
+                (4, 3, 3),
+                (2, 1, 1),
+            ):
+                envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = requested
+                self.assertEqual(
+                    resolve_pipeline_groups(
+                        local_heads=local_heads, preferred=4, group=None
+                    ),
+                    want,
+                    f"requested={requested} local_heads={local_heads}",
+                )
+        finally:
+            envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS = original
+
+
 class TestMagi2MoERouterSelection(unittest.TestCase):
     def test_each_head_selects_only_from_its_own_expert_bank(self):
         heads, experts, top_k = 4, 8, 2
