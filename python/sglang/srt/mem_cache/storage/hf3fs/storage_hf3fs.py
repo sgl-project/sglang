@@ -399,7 +399,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
         for target_location in values:
             assert target_location.is_contiguous()
-        file_results = values
+        file_results = [values[j] for j in batch_indices]
 
         start_time = time.perf_counter()
 
