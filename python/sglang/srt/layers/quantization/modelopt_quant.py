@@ -2828,8 +2828,20 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 assert torch.all(w13_input_scale == w13_input_scale[0])
                 w13_input_scale = w13_input_scale[0]
         else:
-            w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
-            w2_input_scale = layer.w2_input_scale
+            # create_weights registers both input scales at the global expert
+            # count, while g1_alphas / g2_alphas are read per local expert.
+            w13_input_scale = _input_scale_to_local_experts(
+                layer.w13_input_scale.max(dim=-1).values,
+                layer.num_local_experts,
+                layer.num_experts,
+                layer.moe_ep_rank,
+            )
+            w2_input_scale = _input_scale_to_local_experts(
+                layer.w2_input_scale,
+                layer.num_local_experts,
+                layer.num_experts,
+                layer.moe_ep_rank,
+            )
 
         use_w4a16 = (
             self._is_cutedsl_v2_standard or moe_runner_backend.is_flashinfer_megamoe()
