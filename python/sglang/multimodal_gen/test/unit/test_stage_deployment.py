@@ -2,6 +2,7 @@
 """Contracts, placement, and real coordinator fan-out/join without model weights."""
 
 import asyncio
+import base64
 import json
 import pickle
 import sys
@@ -50,6 +51,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.postprocess import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
+from sglang.multimodal_gen.runtime.utils.image_io import inline_local_image_paths
 
 
 def specs():
@@ -339,6 +341,23 @@ def test_deployed_postprocess_can_precede_another_stage():
     current = run(stages[1], current)
     assert current is req
     torch.testing.assert_close(current.output, torch.full((3, 2, 2), 2.0))
+
+
+def test_inline_local_image_paths_passes_through_non_files(tmp_path):
+    local = tmp_path / "ref.png"
+    local.write_bytes(b"png")
+    others = [
+        "https://example.com/x.png",
+        "http://[bad/x.png",
+        "data:image/png;base64," + "A" * 8192,
+        "x" * 5000,
+        None,
+    ]
+    inlined = inline_local_image_paths([str(local), *others])
+    assert inlined[0] == "data:application/octet-stream;base64," + base64.b64encode(
+        b"png"
+    ).decode("ascii")
+    assert inlined[1:] == others
 
 
 def test_postprocess_stage_matches_monolithic_decode_output():
