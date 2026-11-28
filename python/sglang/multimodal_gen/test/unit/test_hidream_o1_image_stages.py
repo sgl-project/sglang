@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.hidream_o1_image import (
     HiDreamO1ImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.sample.hidream_o1_image import (
+    _VARIANT_DEFAULTS,
     HiDreamO1ImageSamplingParams,
 )
 from sglang.multimodal_gen.registry import _get_config_info, get_model_info
@@ -26,12 +27,8 @@ from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGBranch, CFGP
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_unipc_multistep import (
     FlowUniPCMultistepScheduler,
 )
-from sglang.multimodal_gen.runtime.pipelines.hidream_o1_image import (
-    HIDREAM_O1_FLOW_SHIFT,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream_o1_image import (
     HIDREAM_O1_MROPE_FIX_POINT,
-    HIDREAM_O1_NOISE_SCALE,
     HIDREAM_O1_T_EPS,
     _resolve_single_prompt,
     build_hidream_o1_attention_mask,
@@ -42,6 +39,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.h
 
 PATCH_SIZE = 32
 CPU = torch.device("cpu")
+
+# Flow shift the reference implementation trains and samples with; a named
+# constant because the tests pin the UniPC contract against it.
+HIDREAM_O1_FLOW_SHIFT = 3.0
+
+noise_scale = _VARIANT_DEFAULTS["full"]["noise_scale_start"]
 
 
 class TestHiDreamO1PositionIds(unittest.TestCase):
@@ -135,8 +138,10 @@ class TestHiDreamO1Noise(unittest.TestCase):
     def test_seed_offset_is_one(self) -> None:
         """The reference draws noise from ``seed + 1`` on a CPU generator.
 
-        Dropping the offset would still produce a valid image, just a different
-        one than every published sample, so nothing else would flag it.
+        The scale itself comes from the per-variant recipe table now, so the
+        test passes the Dev variant's noise_scale_start explicitly. Dropping
+        the offset would still produce a valid image, just a different one
+        than every published sample, so nothing else would flag it.
         """
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hidream_o1_image import (
             HiDreamO1ImageBeforeDenoisingStage,
@@ -153,13 +158,12 @@ class TestHiDreamO1Noise(unittest.TestCase):
             channels=3,
             dtype=torch.float32,
             device=CPU,
+            noise_scale=noise_scale,
         )
 
         def reference(seed: int) -> torch.Tensor:
             generator = torch.Generator("cpu").manual_seed(seed)
-            noise = HIDREAM_O1_NOISE_SCALE * torch.randn(
-                (1, 3, 64, 64), generator=generator
-            )
+            noise = noise_scale * torch.randn((1, 3, 64, 64), generator=generator)
             return patchify_pixels(noise, PATCH_SIZE)
 
         self.assertTrue(torch.equal(latents, reference(42)))
@@ -304,9 +308,8 @@ class TestHiDreamO1Config(unittest.TestCase):
             with self.subTest(option=option), self.assertRaisesRegex(ValueError, flag):
                 config.validate_server_args(SimpleNamespace(sp_degree=1))
 
-    def test_dynamic_batching_is_disabled(self) -> None:
-        """A merged multi-prompt batch fails every request in it."""
-        self.assertFalse(HiDreamO1ImagePipelineConfig().supports_dynamic_batching())
+    def test_dynamic_batching_is_enabled(self) -> None:
+        self.assertTrue(HiDreamO1ImagePipelineConfig().supports_dynamic_batching())
 
     def test_multi_prompt_is_refused(self) -> None:
         self.assertEqual(_resolve_single_prompt("a cat", field_name="prompt"), "a cat")
