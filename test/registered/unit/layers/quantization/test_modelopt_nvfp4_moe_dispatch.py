@@ -34,7 +34,12 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 # isort: on
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-from sglang.srt.layers.moe.topk import StandardTopKOutput
+from sglang.srt.layers.moe.topk import (
+    BypassedTopKOutput,
+    PackedTopKOutput,
+    StandardTopKOutput,
+    TopKConfig,
+)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
 from sglang.test.test_utils import CustomTestCase
 
@@ -388,6 +393,81 @@ class TestNvFp4MoeDispatch(CustomTestCase):
 
         self.assertIn("g1_scale_c", str(ctx.exception))
         self.assertEqual(method.runner.calls, [])
+
+    def test_regular_trtllm_runner_routes_every_materialized_topk(self):
+        """The regular TRT-LLM FP4 runner takes the routed kernel for a top-k that a
+        model already computed, packed (Inkling's gate packs it for quantized
+        experts) as well as standard; only the bypassed logits reach the router
+        kernel. A packed top-k used to fail its bypassed-format assert."""
+        from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm as kernels
+
+        calls = []
+
+        def kernel(name):
+            def run(**kwargs):
+                calls.append((name, kwargs))
+                return (kwargs["output"],)
+
+            return run
+
+        fused = ModuleType("flashinfer.fused_moe")
+        fused.trtllm_fp4_block_scale_moe = kernel("logits")
+        fused.trtllm_fp4_block_scale_routed_moe = kernel("routed")
+        byte, one = torch.zeros(1, dtype=torch.uint8), torch.ones(1)
+        quant_info = FlashInferTrtllmFp4MoeQuantInfo(
+            *[byte] * 4, *[one] * 4, NUM_EXPERTS, 0, NUM_EXPERTS, INTERMEDIATE, None
+        )
+        rows, top_k = 3, 2
+        # FP4 activations and their scales, as an NVFP4 dispatcher delivers them.
+        hidden = torch.zeros(rows, HIDDEN // 2, dtype=torch.uint8)
+        scale = torch.zeros(rows, HIDDEN // 16, dtype=torch.uint8)
+        experts = torch.tensor([[1, 5], [7, 2], [3, 6]], dtype=torch.int32)
+        weights = torch.full((rows, top_k), 0.5)
+        # FlashInfer's packed layout: expert id in the high 16 bits, bf16 weight bits
+        # in the low 16 (0x3F00 is 0.5).
+        packed = (experts << 16) | 0x3F00
+        no_logits = torch.empty(rows, 0)
+        cases = (
+            ("packed", PackedTopKOutput(packed, no_logits), "routed"),
+            ("standard", StandardTopKOutput(weights, experts, no_logits), "routed"),
+            (
+                "bypassed",
+                BypassedTopKOutput(
+                    hidden, torch.zeros(rows, NUM_EXPERTS), TopKConfig(top_k=top_k)
+                ),
+                "logits",
+            ),
+        )
+        with (
+            mock.patch.dict(sys.modules, {"flashinfer.fused_moe": fused}),
+            mock.patch.object(kernels, "get_activation_type", return_value=0),
+            mock.patch.object(kernels, "trtllm_moe_enable_pdl", return_value=False),
+            mock.patch.object(
+                kernels,
+                "_get_fp4_moe_output_buffer",
+                side_effect=lambda num_tokens, hidden_size, dtype, **_: torch.empty(
+                    num_tokens, hidden_size, dtype=dtype
+                ),
+            ),
+        ):
+            for form, topk_output, want_kernel in cases:
+                with self.subTest(topk=form):
+                    calls.clear()
+                    kernels.fused_experts_none_to_flashinfer_trtllm_fp4(
+                        StandardDispatchOutput(hidden, scale, topk_output),
+                        quant_info,
+                        MoeRunnerConfig(),
+                    )
+                    ((name, kwargs),) = calls
+                    self.assertEqual(name, want_kernel)
+                    self.assertEqual(kwargs["top_k"], top_k)
+                    if form == "packed":
+                        # The packed ids go to the kernel as they are, weights inside.
+                        self.assertIs(kwargs["topk_ids"], packed)
+                    elif form == "standard":
+                        ids, routed_weights = kwargs["topk_ids"]
+                        self.assertTrue(torch.equal(ids, experts))
+                        self.assertTrue(torch.equal(routed_weights, weights))
 
 
 if __name__ == "__main__":
