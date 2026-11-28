@@ -243,6 +243,30 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
 
         # TensorRT-LLM specific processing
         if self.use_flashinfer_trtllm:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                _align_fp4_moe_weights,
+                trtllm_nvfp4_hidden_alignment,
+            )
+
+            # Zero-pad the hidden size to the kernel alignment; the runner pads
+            # the activations to match and slices the output.
+            hidden_size = layer.w2_weight.size(-2)
+            w13, w13_scale, w2, w2_scale, _, padded_hidden_size = (
+                _align_fp4_moe_weights(
+                    layer.w13_weight,
+                    layer.w13_weight_scale,
+                    layer.w2_weight,
+                    layer.w2_weight_scale,
+                    is_gated=True,
+                    intermediate_alignment=1,
+                    hidden_alignment=trtllm_nvfp4_hidden_alignment(
+                        use_per_token_activation=False, is_gated=True
+                    ),
+                )
+            )
+            layer.trtllm_padded_hidden_size = (
+                padded_hidden_size if padded_hidden_size != hidden_size else None
+            )
             # Prepare static weights for TRT-LLM kernel
             (
                 gemm1_weights_fp4_shuffled,
@@ -250,13 +274,13 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 gemm2_weights_fp4_shuffled,
                 gemm2_scales_fp4_shuffled,
             ) = prepare_static_weights_for_trtllm_fp4_moe(
-                layer.w13_weight,
-                layer.w2_weight,
-                layer.w13_weight_scale,
-                layer.w2_weight_scale,
-                layer.w2_weight.size(-2),  # hidden_size
-                layer.w13_weight.size(-2) // 2,  # intermediate_size
-                layer.w13_weight.size(0),  # num_experts
+                w13,
+                w2,
+                w13_scale,
+                w2_scale,
+                padded_hidden_size,
+                w13.size(-2) // 2,  # intermediate_size
+                w13.size(0),  # num_experts
             )
             logger.debug("Finished shuffling weights for TRT-LLM MOE")
 
@@ -344,6 +368,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 routing_method_type=layer.routing_method_type,
                 use_per_token_activation=False,
                 gemm1_clamp_limit=None,
+                padded_hidden_size=layer.trtllm_padded_hidden_size,
             )
             return self.runner.run(dispatch_output, quant_info)
         else:

@@ -342,6 +342,7 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
                 gemm1_alpha=layer.gemm1_alpha,
                 gemm1_beta=layer.gemm1_beta,
                 gemm1_clamp_limit=layer.gemm1_clamp_limit,
+                padded_hidden_size=layer.trtllm_padded_hidden_size,
             )
             if self.use_mega_moe_prefill:
                 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
