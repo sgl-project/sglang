@@ -361,6 +361,8 @@ class ServerArgs:
         "Cosmos3EdgeForConditionalGeneration",
         "Gemma4ForConditionalGeneration",
         "HYV4FlashForConditionalGeneration",
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     )
 
     # The attention-backend allow-list is enforced via
