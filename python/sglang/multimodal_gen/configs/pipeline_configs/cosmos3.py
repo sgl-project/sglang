@@ -207,6 +207,9 @@ class Cosmos3Config(PipelineConfig):
             else COSMOS3_DEFAULT_KEEP_RESIDENT_MIN_AVAILABLE_GB
         )
         return ModelDeploymentConfig(
+            # component offload moves the whole 28 GiB Nano DiT onto the GPU, which
+            # runs the default video out of memory with 32 GiB free
+            dit_layerwise_offload_modes=("memory",) if is_nano else (),
             keep_resident_min_available_gb=threshold_gb,
             keep_resident_components=("dit", "vae"),
         )
