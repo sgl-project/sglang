@@ -47,7 +47,7 @@ pip install -e "tools/sglang-simulator[aisimulate]"
 ```
 
 The extra pins `aisimulate==0.13.0`. The official wheels require Python
-3.11–3.13 and cover Linux x86_64/aarch64 and macOS arm64. This release exposes
+3.11â€“3.13 and cover Linux x86_64/aarch64 and macOS arm64. This release exposes
 the modern `aisimulate.sdk` namespace.
 
 AISimulate 0.13.0 requires NumPy>=2.1,<3, replacing the NumPy 1.26.4 pin
@@ -327,3 +327,34 @@ Runtime changes should also be validated in a matching official SGLang image
 with both `OFFLINE` and `BLOCKING` modes. Predictor changes should report
 step-level error, and scheduler or cache changes should compare request latency,
 throughput, and prefix-cache reuse against measured traces.
+
+### Optional SimOpus model-forward provider
+
+Select `predictor.name: "simopus"` to estimate ordinary DeepSeek-R1 forwards
+through the public SimOpus SDK. Install a compatible SDK separately and use the
+[explicit R1 example](examples/sim_configs/simopus_deepseek_r1_mi355x_eager.json)
+with the complete matching systems data, model revision and SDK revision.
+
+The adapter snapshots CPU batch metadata before the runner mutates it, converts
+SDK milliseconds to simulator seconds, and preserves query failures and result
+provenance. Unselected providers do not import SimOpus. This route does not
+require a coordinator or automatic KV budgeting and does not implement native
+speculative stages.
+
+Contract checks run without model execution. The HTTP checks in
+`test/test_simopus_e2e.py` require Linux, SGLang, the real SDK,
+`SIMOPUS_E2E_SYSTEMS_ROOT` and `SIMOPUS_E2E_MODEL_PATH`; missing inputs are reported
+as skipped rather than presented as integration evidence.
+
+The adapter opens performance data through `simopus.sdk.PerfDB`, passing its
+`systems_root` configuration as the SDK's `perfdb_dir` argument. The configuration
+key and value stay unchanged. The SDK owns storage interpretation and queries;
+the adapter does not open SQLite tables or inspect SDK implementation modules.
+An older SDK can use the former public opening entry. `stack_digest` is an
+optional SDK-provided label and is null when absent; it is not a data checksum.
+
+Execution profiles use the fields in the R1 example. Remove the obsolete
+`profile_id` and `runtime_compatibility_manifest_sha256` keys from older context
+and decode profiles. Keep the actual execution settings and independent context
+and decode profiles. Use an SDK-compatible PerfDB; migrate an existing personal
+database with that SDK's documented migration command before starting readers.
