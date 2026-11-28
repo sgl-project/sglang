@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+import torch
+
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
@@ -597,13 +599,47 @@ def _check_dsv4_indexer_page_size(key: DSV4PagedBufferInfo, page_size: int) -> N
         )
 
 
+def _dsv4_full_page_index_row(
+    buffer: torch.Tensor,
+    *,
+    full_pages: int,
+    index_pages_per_full_page: int,
+    slots_per_full_page: int,
+) -> torch.Tensor:
+    """One full-page row per buffer, preserving an NPU PA_ND view.
+
+    GPU index buffers are 2-D rows; NPU buffers are 4-D PA_ND pages whose
+    native K slots must be folded into one full logical page.
+    """
+    page = buffer[: full_pages * index_pages_per_full_page]
+    if page.ndim == 4:
+        return page.reshape(full_pages, slots_per_full_page, *page.shape[2:])
+    return page.view(torch.uint8).reshape(full_pages, -1)
+
+
+def _dsv4_full_page_bytes(buffers: list[torch.Tensor]) -> int:
+    """Bytes in one full logical page, for either 2-D or 4-D device rows."""
+    return buffers[0][0].numel() * buffers[0].element_size()
+
+
+def _check_dsv4_draft_swa_row_bytes(
+    draft_buffers: list[torch.Tensor], target_page_bytes: int
+) -> None:
+    """Packed draft rows share the target pool's host item_bytes."""
+    for buffer in draft_buffers:
+        draft_page_bytes = buffer[0].numel() * buffer.element_size()
+        if draft_page_bytes != target_page_bytes:
+            raise ValueError(
+                "packed DSV4 draft SWA rows do not match the target's "
+                f"{target_page_bytes} B pages: {tuple(buffer.shape)}"
+            )
+
+
 def _dsv4_low_ratio_regions(
     kvcache: Any, infos: dict[PoolName, DevicePoolInfo], page_size: int
 ) -> list[tuple[PoolName, Any, list, dict[int, int]]]:
     """(name, device_pool, buffers, layer_mapping) per shared source KV and
     indexer buffer group, in FULL-page units."""
-    import torch
-
     regions = []
     for ratio, names in (
         (
@@ -649,9 +685,12 @@ def _dsv4_low_ratio_regions(
             for buffer in index.buffer_info.buffers:
                 full_pages = buffer.shape[0] // index_pages_per_full_page
                 rows.append(
-                    buffer[: full_pages * index_pages_per_full_page]
-                    .view(torch.uint8)
-                    .reshape(full_pages, -1)
+                    _dsv4_full_page_index_row(
+                        buffer,
+                        full_pages=full_pages,
+                        index_pages_per_full_page=index_pages_per_full_page,
+                        slots_per_full_page=slots_per_page,
+                    )
                 )
             regions.append((name, kvcache.index_pools[ratio], rows, layer_mapping))
     return regions
@@ -675,7 +714,7 @@ def _dsv4_low_ratio_entries(
                 host_pool=DeepSeekV4PagedHostPool(
                     pool_name=str(name),
                     device_buffers=buffers,
-                    item_bytes=buffers[0].shape[1] * buffers[0].element_size(),
+                    item_bytes=_dsv4_full_page_bytes(buffers),
                     num_host_pages=num_host_pages,
                     slot_page_size=page_size,
                     layout=get_memory().hicache_mem_layout,
@@ -785,6 +824,26 @@ def _build_dsv4_rope_entry(
     )
 
 
+def _sidecar_draft_swa_layer_bytes(
+    params: CacheInitParams, *, swa_num_host_pages: int
+) -> list[int]:
+    """Host bytes of each sidecar DSpark SWA layer, matching build_swa_draft_pools."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    layer_bytes = []
+    for pool in params.sidecar_draft_device_pools:
+        if not isinstance(pool, DeepSeekV4TokenToKVPool):
+            continue
+        draft_swa = _dsv4_pool_infos(pool).get(PoolName.SWA)
+        if draft_swa is None or not draft_swa.layer_ids:
+            continue
+        layer_bytes.extend(
+            [swa_num_host_pages * draft_swa.buffer_info.page_bytes]
+            * len(draft_swa.buffer_info.buffers)
+        )
+    return layer_bytes
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -820,14 +879,22 @@ def build_deepseek_v4_hicache_stack(
             DeepSeekV4TokenToKVPool,
         )
 
+        # Sidecar drafts get their own DRAFT_SWA host pool; only packed drafts
+        # share the target's SWA rows.
+        sidecar_draft_ids = {id(pool) for pool in params.sidecar_draft_device_pools}
         # NextN has one layer per pool, while DSpark keeps all stages in one pool.
         for pool in params.mtp_draft_device_pools:
+            if id(pool) in sidecar_draft_ids:
+                continue
             if isinstance(pool, DeepSeekV4TokenToKVPool) and not pool.swa_layer_ids():
                 # A draft with no SWA layer has no SWA buffer to pack.
                 continue
             draft_swa = _dsv4_pool_infos(pool).get(PoolName.SWA)
             if draft_swa is None:
                 raise ValueError("Packed DSV4 draft requires paged SWA storage")
+            _check_dsv4_draft_swa_row_bytes(
+                draft_swa.buffer_info.buffers, swa_info.page_bytes
+            )
             mtp_swa_device_buffers.extend(draft_swa.buffer_info.buffers)
         # Map the SWA layers alone; the MLA layers own no SWA buffer.
         swa_layer_mapping = with_packed_draft_layer_mapping(
@@ -863,6 +930,9 @@ def build_deepseek_v4_hicache_stack(
         swa_num_host_pages=swa_num_host_pages,
         c128_num_host_pages=c128_num_host_pages,
         num_draft_swa_layers=len(mtp_swa_device_buffers),
+        sidecar_draft_swa_layer_bytes=_sidecar_draft_swa_layer_bytes(
+            params, swa_num_host_pages=swa_num_host_pages
+        ),
     )
 
     logical_host_pool = LogicalHostPool(

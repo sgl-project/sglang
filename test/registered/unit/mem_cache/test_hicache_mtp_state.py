@@ -124,6 +124,60 @@ def test_shared_target_state_is_not_packed_twice(monkeypatch, has_state):
     assert target.mtp_draft_mamba_pools == ()
 
 
+def _dsv4_pool_stub(swa_row_bytes):
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+    pool.swa_kv_pool = SimpleNamespace(
+        paged_buffer_info=lambda: SimpleNamespace(page_bytes=swa_row_bytes)
+    )
+    pool.layer_router = SimpleNamespace(part_view=lambda part: None)
+    return pool
+
+
+@pytest.mark.parametrize(
+    "draft_row_bytes, expected_mode",
+    [
+        (544 * 128, spec.HiCacheDraftMode.PACKED),
+        # A V4 DSpark draft under a V4.1 target keeps 608 B rows.
+        (608 * 128, spec.HiCacheDraftMode.SIDECAR),
+    ],
+)
+def test_dspark_draft_swa_rows_decide_the_hicache_layout(
+    monkeypatch, draft_row_bytes, expected_mode
+):
+    target_pool = _dsv4_pool_stub(544 * 128)
+    draft_pool = _dsv4_pool_stub(draft_row_bytes)
+    monkeypatch.setattr(spec, "_can_pack_hicache_mtp", lambda *_: True)
+    monkeypatch.setattr(
+        spec,
+        "get_memory",
+        lambda: SimpleNamespace(
+            enable_hierarchical_cache=True,
+            enable_unified_cache_external_linker=False,
+        ),
+    )
+    target = SimpleNamespace(spec_algorithm=None, token_to_kv_pool=target_pool)
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(num_nextn_predict_layers=0),
+        token_to_kv_pool=draft_pool,
+        runner_ids=SimpleNamespace(is_fused_draft=False),
+    )
+    worker = SimpleNamespace(
+        target_worker=SimpleNamespace(model_runner=target),
+        _draft_model_runners=lambda: (runner,),
+    )
+
+    plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+    assert plan.mode == expected_mode
+    if expected_mode == spec.HiCacheDraftMode.PACKED:
+        assert target.mtp_draft_device_pools == (draft_pool,)
+    else:
+        assert plan.device_pools == (draft_pool,)
+        assert target.mtp_draft_device_pools == ()
+
+
 @pytest.mark.parametrize("missing_target", [False, True])
 def test_separate_state_requires_compatible_slot_ownership(monkeypatch, missing_target):
     target_pool = None if missing_target else object()

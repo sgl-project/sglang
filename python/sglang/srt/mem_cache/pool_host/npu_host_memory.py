@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -368,6 +368,7 @@ def reserve_dsv4_paged_host_memory(
     swa_num_host_pages: int,
     c128_num_host_pages: int,
     num_draft_swa_layers: int,
+    sidecar_draft_swa_layer_bytes: Sequence[int] = (),
 ) -> None:
     """Reserve DSV4 paged buffers before constructing the host pools."""
     if not is_npu():
@@ -398,6 +399,47 @@ def reserve_dsv4_paged_host_memory(
             )
 
     add_paged(PoolName.SWA, swa_num_host_pages, num_draft_swa_layers)
+    # Sidecar DSpark SWA rows can differ from the target's, so reserve them
+    # with the draft's own page bytes instead of the target SWA block.
+    add_blocks(list(sidecar_draft_swa_layer_bytes))
+
+    # V4.1 indexer pages are K-slot native pages; one host full page covers I.
+    for kv_name, index_names in (
+        (
+            PoolName.DEEPSEEK_V4_C1,
+            (
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+            ),
+        ),
+        (
+            PoolName.DEEPSEEK_V4_C2,
+            (
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            ),
+        ),
+    ):
+        kv = infos.get(kv_name)
+        if kv is None or not kv.layer_ids:
+            continue
+        add_paged(kv_name, num_host_pages)
+        slots_per_full_page = kv.buffer_info.page_slots
+        for name in index_names:
+            index = infos.get(name)
+            if index is None:
+                continue
+            native_slots = index.buffer_info.page_slots
+            if slots_per_full_page % native_slots:
+                raise ValueError(
+                    f"{name}: {slots_per_full_page} slots per full page is not "
+                    f"tiled by native pages of {native_slots} slots"
+                )
+            add_paged(
+                name,
+                num_host_pages * (slots_per_full_page // native_slots),
+            )
+
     c4 = infos.get(PoolName.DEEPSEEK_V4_C4)
     if c4 is not None and c4.layer_ids:
         for name in (

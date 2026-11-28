@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -29,6 +30,8 @@ if TYPE_CHECKING:
         SamplingPrewarmResult,
     )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+logger = logging.getLogger(__name__)
 
 
 class HiCacheDraftMode(str, Enum):
@@ -60,6 +63,32 @@ def _can_pack_hicache_mtp(
         and uses_compressed_kv_attention(draft_runners[0].model_config.hf_config)
     )
     return is_nextn_mtp or is_dspark_compressed_kv
+
+
+def _packed_swa_rows_match_target(target_pool, draft_pools) -> bool:
+    """Whether every packed draft SWA row fits the target SWA host pages.
+
+    A DSpark draft keeps its own architecture: a V4 draft under a V4.1 target
+    has 608 B rows against the target's 544 B pages, so it needs a DRAFT_SWA
+    sidecar instead of the target's packed SWA rows.
+    """
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if not isinstance(target_pool, DeepSeekV4TokenToKVPool):
+        return True
+    target_swa = target_pool.swa_kv_pool
+    if target_swa is None:
+        return True
+    target_row_bytes = target_swa.paged_buffer_info().page_bytes
+    for draft in draft_pools:
+        if not isinstance(draft, DeepSeekV4TokenToKVPool):
+            continue
+        draft_swa = draft.swa_kv_pool
+        if draft_swa is None:
+            continue
+        if draft_swa.paged_buffer_info().page_bytes != target_row_bytes:
+            return False
+    return True
 
 
 def _check_hicache_draft_dcp_layout(
@@ -326,7 +355,16 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.FUSED, device_pools=draft_pools
             )
-        if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
+        pack_eligible = _can_pack_hicache_mtp(spec_algorithm, draft_runners)
+        if pack_eligible and not _packed_swa_rows_match_target(
+            target_model_runner.token_to_kv_pool, draft_pools
+        ):
+            logger.info(
+                "HiCache draft SWA rows differ from the target's; using a "
+                "DRAFT_SWA sidecar instead of the target SWA host pool."
+            )
+            pack_eligible = False
+        if pack_eligible:
             _check_hicache_draft_dcp_layout(HiCacheDraftMode.PACKED, draft_pools)
             target_model_runner.mtp_draft_device_pools = draft_pools
             target_mamba_pool = (

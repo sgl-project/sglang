@@ -13,11 +13,16 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     DSV4NPUTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache import memory_pool_host
-from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4PagedBufferInfo,
+    DSV4StateBufferInfo,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     KVAndScore,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
@@ -522,6 +527,92 @@ class TestDSV4HostViews(CustomTestCase):
                     )
                 backend.ensure_capacity.assert_called_once_with(sum(blocks), 0)
 
+    def test_low_ratio_pools_reserve_indexer_native_pages(self):
+        def paged(num_layers, page_bytes, page_slots):
+            return SimpleNamespace(
+                layer_ids=tuple(range(num_layers)),
+                buffer_info=SimpleNamespace(
+                    buffers=(object(),) * num_layers,
+                    page_bytes=page_bytes,
+                    page_slots=page_slots,
+                ),
+            )
+
+        infos = {
+            PoolName.DEEPSEEK_V4_C1: paged(2, 128 * 320, 128),
+            PoolName.DEEPSEEK_V4_C1_INDEXER: paged(2, 64 * 64, 64),
+            PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE: paged(2, 64 * 4, 64),
+            PoolName.DEEPSEEK_V4_C2: paged(2, 64 * 320, 64),
+            PoolName.DEEPSEEK_V4_C2_INDEXER: paged(2, 64 * 64, 64),
+            PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE: paged(2, 64 * 4, 64),
+        }
+        expected = (
+            4 * (128 * 320) * 2
+            + 8 * (64 * 64) * 2
+            + 8 * (64 * 4) * 2
+            + 4 * (64 * 320) * 2
+            + 4 * (64 * 64) * 2
+            + 4 * (64 * 4) * 2
+        )
+        backend = MagicMock()
+        with (
+            patch.object(npu_host_memory, "is_npu", return_value=True),
+            patch.object(
+                npu_host_memory,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+            ),
+            patch.object(
+                npu_host_memory, "get_host_memory_backend", return_value=backend
+            ),
+            patch.object(
+                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+            ),
+        ):
+            npu_host_memory.reserve_dsv4_paged_host_memory(
+                infos=infos,
+                num_host_pages=4,
+                swa_num_host_pages=4,
+                c128_num_host_pages=0,
+                num_draft_swa_layers=0,
+            )
+        backend.ensure_capacity.assert_called_once_with(expected, 0)
+
+    def test_sidecar_draft_swa_bytes_are_reserved(self):
+        swa = SimpleNamespace(
+            layer_ids=(0, 1),
+            buffer_info=SimpleNamespace(
+                buffers=(object(), object()),
+                page_bytes=128 * 544,
+                page_slots=128,
+            ),
+        )
+        backend = MagicMock()
+        with (
+            patch.object(npu_host_memory, "is_npu", return_value=True),
+            patch.object(
+                npu_host_memory,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+            ),
+            patch.object(
+                npu_host_memory, "get_host_memory_backend", return_value=backend
+            ),
+            patch.object(
+                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+            ),
+        ):
+            npu_host_memory.reserve_dsv4_paged_host_memory(
+                infos={PoolName.SWA: swa},
+                num_host_pages=4,
+                swa_num_host_pages=4,
+                c128_num_host_pages=0,
+                num_draft_swa_layers=0,
+                sidecar_draft_swa_layer_bytes=[4 * 128 * 608] * 3,
+            )
+        expected = 2 * (4 * 128 * 544) + 3 * (4 * 128 * 608)
+        backend.ensure_capacity.assert_called_once_with(expected, 0)
+
     def test_non_npu_skips_host_memory_reservation(self):
         with (
             patch.object(npu_host_memory, "is_npu", return_value=False),
@@ -537,6 +628,149 @@ class TestDSV4HostViews(CustomTestCase):
             )
         get_memory.assert_not_called()
         get_backend.assert_not_called()
+
+
+class TestDSV4LowRatioHostPages(CustomTestCase):
+    def test_npu_pa_nd_rows_use_full_page_bytes(self):
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+
+        def info(name, buffer, *, page_slots):
+            return DevicePoolInfo(
+                pool_name=name,
+                indices_from_pool=PoolName.KV,
+                layer_ids=(0,),
+                buffer_info=DSV4PagedBufferInfo.from_buffers(
+                    [buffer], page_slots=page_slots, layout="pa_nd"
+                ),
+            )
+
+        infos = {
+            PoolName.DEEPSEEK_V4_C1: info(
+                PoolName.DEEPSEEK_V4_C1,
+                torch.zeros((2, 128, 1, 320), dtype=torch.uint8),
+                page_slots=128,
+            ),
+            PoolName.DEEPSEEK_V4_C1_INDEXER: info(
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                torch.zeros((4, 64, 1, 64), dtype=torch.uint8),
+                page_slots=64,
+            ),
+            PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE: info(
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+                torch.zeros((4, 64, 1, 4), dtype=torch.uint8),
+                page_slots=64,
+            ),
+            PoolName.DEEPSEEK_V4_C2: info(
+                PoolName.DEEPSEEK_V4_C2,
+                torch.zeros((2, 64, 1, 320), dtype=torch.uint8),
+                page_slots=64,
+            ),
+            PoolName.DEEPSEEK_V4_C2_INDEXER: info(
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                torch.zeros((2, 64, 1, 64), dtype=torch.uint8),
+                page_slots=64,
+            ),
+            PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE: info(
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+                torch.zeros((2, 64, 1, 4), dtype=torch.uint8),
+                page_slots=64,
+            ),
+        }
+        kvcache = SimpleNamespace(
+            kv_pools={1: object(), 2: object()},
+            index_pools={1: object(), 2: object()},
+            start_layer=0,
+        )
+
+        class _FakeHostPool:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        with (
+            patch.object(
+                assembler,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+            ),
+            patch.object(assembler, "_get_allocator_type", return_value="default"),
+            patch.object(assembler, "DeepSeekV4PagedHostPool", _FakeHostPool),
+            patch.object(
+                assembler,
+                "build_pool_entry",
+                side_effect=lambda **kwargs: kwargs,
+            ),
+        ):
+            entries = assembler._dsv4_low_ratio_entries(kvcache, infos, 128, 2, 1)
+
+        by_name = {entry["name"]: entry for entry in entries}
+        self.assertEqual(
+            by_name[PoolName.DEEPSEEK_V4_C1]["host_pool"].item_bytes, 128 * 320
+        )
+        self.assertEqual(
+            by_name[PoolName.DEEPSEEK_V4_C1_INDEXER]["host_pool"].item_bytes, 128 * 64
+        )
+        self.assertEqual(
+            by_name[PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE]["host_pool"].item_bytes,
+            128 * 4,
+        )
+        self.assertEqual(
+            by_name[PoolName.DEEPSEEK_V4_C2]["host_pool"].item_bytes, 64 * 320
+        )
+        self.assertEqual(
+            by_name[PoolName.DEEPSEEK_V4_C2_INDEXER]["host_pool"].item_bytes, 64 * 64
+        )
+        self.assertEqual(
+            by_name[PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE]["host_pool"].item_bytes,
+            64 * 4,
+        )
+        self.assertEqual(
+            by_name[PoolName.DEEPSEEK_V4_C1_INDEXER]["host_pool"]
+            .device_buffers[0]
+            .shape,
+            (2, 128, 1, 64),
+        )
+        self.assertEqual(
+            by_name[PoolName.DEEPSEEK_V4_C2_INDEXER]["host_pool"]
+            .device_buffers[0]
+            .shape,
+            (2, 64, 1, 64),
+        )
+
+    def test_ratio2_compressor_state_is_cleared_at_page_boundary(self):
+        pool = CompressStatePool(
+            size=4,
+            ring_size=4,
+            overlap=False,
+            head_dim=4,
+            dtype=torch.float32,
+            device="cpu",
+            enable_memory_saver=False,
+            ratio=2,
+            request_scoped=True,
+            state_cache_page_size=4,
+        )
+        pool.kv_score_buffer.kv_score.fill_(1.0)
+        fake_owner = SimpleNamespace(compress_state_pools=[pool])
+
+        DeepSeekV4TokenToKVPool.clear_request_scoped_state(fake_owner, 1)
+
+        start = 1 * pool.ring_size
+        ring = pool.kv_score_buffer[start : start + pool.ring_size]
+        self.assertEqual(torch.count_nonzero(ring.kv).item(), 0)
+        self.assertTrue(torch.isneginf(ring.score).all())
+        # 768 is an even, page-aligned boundary: no pending half-pair.
+        self.assertEqual(len(pool.transfer_indices(1, 768)), 0)
+        self.assertEqual(pool.transfer_indices(1, 769).tolist(), [1])
+
+    def test_draft_swa_row_bytes_must_match_target(self):
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+
+        good = torch.zeros((2, 128, 1, 544), dtype=torch.uint8)
+        assembler._check_dsv4_draft_swa_row_bytes([good], 128 * 544)
+
+        bad = torch.zeros((2, 128, 1, 545), dtype=torch.uint8)
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            assembler._check_dsv4_draft_swa_row_bytes([bad], 128 * 544)
 
 
 class TestC128L2Ownership(CustomTestCase):

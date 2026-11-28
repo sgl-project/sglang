@@ -623,6 +623,7 @@ class TestV41KVPoolLayouts(CustomTestCase):
                 )
             ),
             mtp_draft_device_pools=(draft,),
+            sidecar_draft_device_pools=(),
             tp_cache_group=None,
             attn_cp_cache_group=None,
             attn_tp_cache_group=None,
@@ -664,6 +665,112 @@ class TestV41KVPoolLayouts(CustomTestCase):
         ):
             self.assertIs(actual, expected)
         self.assertEqual(len(swa.host_pool.device_buffers), 5)
+
+    def test_sidecar_draft_is_not_packed_into_target_swa(self):
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+        pool = self.make_pool([0] * 5, [], KVLayout.V41, start_layer=1, end_layer=4)
+        draft = self.make_pool([0, 0], [], KVLayout.V41)
+        params = SimpleNamespace(
+            page_size=PAGE_SIZE,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                swa_attn_allocator=SimpleNamespace(
+                    alloc=lambda n: None, free=lambda indices: None
+                )
+            ),
+            mtp_draft_device_pools=(draft,),
+            sidecar_draft_device_pools=(draft,),
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        memory = SimpleNamespace(
+            hicache_mem_layout="layer_first",
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="cache",
+        )
+        with (
+            patch.object(assembler, "get_memory", return_value=memory),
+            patch.object(
+                assembler, "_deepseek_v4_num_host_pages", return_value=(3, 2, 0)
+            ),
+            patch.object(assembler, "_get_allocator_type", return_value="default"),
+            patch.object(
+                assembler,
+                "DeepSeekV4PagedHostPool",
+                partial(DeepSeekV4PagedHostPool, pin_memory=False),
+            ),
+            patch.object(assembler, "HybridCacheController"),
+        ):
+            group, _ = assembler.build_deepseek_v4_hicache_stack(
+                params=params,
+                kvcache=pool,
+                load_cache_event=None,
+                storage_backend=None,
+            )
+        swa = group.entry_map[PoolName.SWA]
+        self.assertEqual(len(swa.host_pool.device_buffers), 3)
+        for actual, expected in zip(
+            swa.host_pool.device_buffers, pool.swa_kv_pool.kv_buffer, strict=True
+        ):
+            self.assertIs(actual, expected)
+
+    def test_sidecar_draft_swa_is_in_initial_reservation(self):
+        from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
+        from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+        pool = self.make_pool([0] * 5, [], KVLayout.V41, start_layer=1, end_layer=4)
+        draft = self.make_pool([0, 0], [], KVLayout.V4)
+        params = SimpleNamespace(
+            page_size=PAGE_SIZE,
+            token_to_kv_pool_allocator=SimpleNamespace(
+                swa_attn_allocator=SimpleNamespace(
+                    alloc=lambda n: None, free=lambda indices: None
+                )
+            ),
+            mtp_draft_device_pools=(),
+            sidecar_draft_device_pools=(draft,),
+            tp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+            pp_cache_group=None,
+        )
+        memory = SimpleNamespace(
+            hicache_mem_layout="layer_first",
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="cache",
+        )
+        draft_page_bytes = draft.swa_kv_pool.paged_buffer_info().page_bytes
+        draft_layers = len(draft.swa_kv_pool.kv_buffer)
+        with (
+            patch.object(assembler, "get_memory", return_value=memory),
+            patch.object(
+                assembler, "_deepseek_v4_num_host_pages", return_value=(3, 2, 0)
+            ),
+            patch.object(assembler, "_get_allocator_type", return_value="default"),
+            patch.object(
+                assembler,
+                "DeepSeekV4PagedHostPool",
+                partial(DeepSeekV4PagedHostPool, pin_memory=False),
+            ),
+            patch.object(assembler, "HybridCacheController"),
+            patch.object(assembler, "reserve_dsv4_paged_host_memory") as reserve,
+        ):
+            assembler.build_deepseek_v4_hicache_stack(
+                params=params,
+                kvcache=pool,
+                load_cache_event=None,
+                storage_backend=None,
+            )
+        self.assertEqual(
+            reserve.call_args.kwargs["sidecar_draft_swa_layer_bytes"],
+            [2 * draft_page_bytes] * draft_layers,
+        )
 
     def test_draft_swa_sidecar_moves_whole_v41_pages(self):
         """A separate V4.1 draft SWA sidecar must not take the token-granular copy,
