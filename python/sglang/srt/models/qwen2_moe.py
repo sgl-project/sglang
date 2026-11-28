@@ -74,6 +74,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
     TopKOutputChecker,
+    TopKOutputFormat,
     capture_routed_experts_if_allowed,
     is_expert_remapping_enabled,
 )
@@ -338,6 +339,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             layer_id=layer_id,
+            output_format=(
+                TopKOutputFormat.STANDARD
+                if get_moe_a2a_backend().is_megamoe()
+                else None
+            ),
         )
 
         # Disable inplace MoE when fused gate will need hidden_states after experts
