@@ -15,8 +15,10 @@ from ..common.utils import (
     _bitonic_merge,
     _sort_ids_ascending,
     check_sparse_kv_fp8,
+    grid_batch_size,
     robust_allocator,
     sparse_out_dtype,
+    topk_tie_by_id,
     unit_scale,
 )
 
@@ -43,7 +45,7 @@ _ON_HIP = torch.version.hip is not None
 def _decode_score_block_n(args):
     # gfx950 pick: 512 for tiny batches (few CTAs), else 128. A 512-token bf16
     # K tile needs 128 KB of LDS, more than gfx942's 64 KB, so other archs keep 128.
-    small_batch = args["batch_size"] <= 4 and is_gfx95_supported()
+    small_batch = grid_batch_size(args["batch_size"]) <= 4 and is_gfx95_supported()
     return max(512 if small_batch else 128, args["block_size"])
 
 
@@ -776,6 +778,7 @@ def _topk_index_partial_kernel(
     # META
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    TIE_BY_ID: tl.constexpr = False,
 ):
     tl.static_assert(BLOCK_SIZE_K > topk)
     pid_b = tl.program_id(0)
@@ -820,11 +823,11 @@ def _topk_index_partial_kernel(
         n_dims: tl.constexpr = tl.standard._log2(BLOCK_SIZE_K)
         for j in tl.static_range(1, n_dims):
             topk_score, topk_idx = _bitonic_merge(
-                topk_score, topk_idx.to(tl.int32), j, 2, n_dims
+                topk_score, topk_idx.to(tl.int32), j, 2, n_dims, TIE_BY_ID
             )
         if i != 0:
             topk_score, topk_idx = _bitonic_merge(
-                topk_score, topk_idx.to(tl.int32), n_dims, False, n_dims
+                topk_score, topk_idx.to(tl.int32), n_dims, False, n_dims, TIE_BY_ID
             )
             topk_score_new = last_topk_score * left_half_mask + topk_score * (
                 1 - left_half_mask
@@ -833,11 +836,16 @@ def _topk_index_partial_kernel(
                 1 - left_half_mask
             )
             topk_score, topk_idx = _bitonic_merge(
-                topk_score_new, topk_idx_new.to(tl.int32), n_dims, True, n_dims
+                topk_score_new,
+                topk_idx_new.to(tl.int32),
+                n_dims,
+                True,
+                n_dims,
+                TIE_BY_ID,
             )
         else:
             topk_score, topk_idx = _bitonic_merge(
-                topk_score, topk_idx.to(tl.int32), n_dims, True, n_dims
+                topk_score, topk_idx.to(tl.int32), n_dims, True, n_dims, TIE_BY_ID
             )
 
     # Extract first BLOCK_SIZE_T entries (top-K of this chunk after descending sort).
@@ -905,6 +913,7 @@ def _topk_index_merge_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    TIE_BY_ID: tl.constexpr = False,
 ):
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -942,8 +951,10 @@ def _topk_index_merge_kernel(
     # Full bitonic descending sort of BLOCK_SIZE_K items.
     n_dims: tl.constexpr = tl.standard._log2(BLOCK_SIZE_K)
     for j in tl.static_range(1, n_dims):
-        score, idx = _bitonic_merge(score, idx.to(tl.int32), j, 2, n_dims)
-    score, idx = _bitonic_merge(score, idx.to(tl.int32), n_dims, True, n_dims)
+        score, idx = _bitonic_merge(score, idx.to(tl.int32), j, 2, n_dims, TIE_BY_ID)
+    score, idx = _bitonic_merge(
+        score, idx.to(tl.int32), n_dims, True, n_dims, TIE_BY_ID
+    )
 
     # Extract first BLOCK_SIZE_T positions — these are the global top-K.
     extract_mask = tl.arange(0, BLOCK_SIZE_K // BLOCK_SIZE_T) == 0
@@ -1028,6 +1039,9 @@ def select_decode_topk(
             ),
         )
         NUM_TOPK_CHUNKS = 1 << (topk_target.bit_length() - 1)
+        # The chunking depends on the batch (size and longest sequence), so in
+        # deterministic inference score ties are broken by block id.
+        tie_by_id = topk_tie_by_id()
         BLOCK_SIZE_T = triton.next_power_of_2(topk)
         max_seqblock = score.shape[2]
         chunk_blocks = (max_seqblock + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
@@ -1067,6 +1081,7 @@ def select_decode_topk(
             topk_idx_partial.stride(1),
             topk_idx_partial.stride(2),
             topk_idx_partial.stride(3),
+            TIE_BY_ID=tie_by_id,
         )
         grid = (batch_size, num_q_heads)
         _topk_index_merge_kernel[grid](
@@ -1088,6 +1103,7 @@ def select_decode_topk(
             topk_idx.stride(1),
             topk_idx.stride(2),
             NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
+            TIE_BY_ID=tie_by_id,
         )
     return topk_idx
 
@@ -1155,7 +1171,10 @@ def flash_decode_with_topk_idx(
     MAX_NUM_KV_CHUNKS = 256
     target = max(
         1,
-        min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch_size * num_kv_heads)),
+        min(
+            MAX_NUM_KV_CHUNKS,
+            TARGET_GRID // max(1, grid_batch_size(batch_size) * num_kv_heads),
+        ),
     )
     NUM_KV_CHUNKS = 1 << (target.bit_length() - 1)
     score_kv_len = min(max_seqlen, max_kv_len)
