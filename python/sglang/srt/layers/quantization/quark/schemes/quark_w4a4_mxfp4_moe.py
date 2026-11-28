@@ -105,10 +105,12 @@ def _rank_chunk_padding_loader(weight_loader, *, tp_size: int):
 # gfx950. Using the wrong layout silently corrupts the dequant scales.
 _is_gfx1250 = is_gfx1250_supported()
 
+dynamic_mxfp4_quant = None
 if _is_hip:
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant
-else:
-    dynamic_mxfp4_quant = None
+    try:
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant
+    except ImportError:
+        pass  # aiter is optional on ROCm; only online MXFP4 MoE quantization needs it.
 
 OCP_MX_BLOCK_SIZE = 32
 

@@ -161,18 +161,28 @@ def _dequant_mxfp4_to_bf16(
     return w.to(torch.bfloat16)
 
 
+# aiter is optional on ROCm: this module is imported with every model through
+# quantization/__init__.py, but only Quark MXFP4 linear layers need these kernels.
+_aiter_mxfp4_import_error: Optional[ImportError] = None
 if _is_hip:
-    from aiter import gemm_a4w4 as _gemm_a4w4_orig
-    from aiter import per_1x32_f4_quant_hip as _per_1x32_f4_quant_hip_orig
-    from aiter.ops.shuffle import shuffle_weight
-    from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-        fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
-    )
-    from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as _gemm_afp4wfp4_orig
-    from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
-        gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
-    )
-    from aiter.ops.triton.quant import dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig
+    try:
+        from aiter import gemm_a4w4 as _gemm_a4w4_orig
+        from aiter import per_1x32_f4_quant_hip as _per_1x32_f4_quant_hip_orig
+        from aiter.ops.shuffle import shuffle_weight
+        from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+            fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
+        )
+        from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as _gemm_afp4wfp4_orig
+        from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
+            gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
+        )
+        from aiter.ops.triton.quant import (
+            dynamic_mxfp4_quant as _dynamic_mxfp4_quant_orig,
+        )
+    except ImportError as e:
+        _aiter_mxfp4_import_error = e
+
+if _is_hip and _aiter_mxfp4_import_error is None:
 
     def _aiter_gemm_afp4wfp4(
         x: torch.Tensor,
@@ -394,6 +404,12 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.dequantization_config = dequantization_config
+
+        if _aiter_mxfp4_import_error is not None:
+            raise ImportError(
+                "Quark MXFP4 linear layers on ROCm need aiter, which failed to import: "
+                f"{_aiter_mxfp4_import_error}"
+            ) from _aiter_mxfp4_import_error
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not is_gfx95_supported():
