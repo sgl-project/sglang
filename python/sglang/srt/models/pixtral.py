@@ -16,6 +16,7 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
+import itertools
 from array import array
 from dataclasses import dataclass, fields
 from typing import Iterable, List, Optional, Set, Tuple, Union
@@ -32,7 +33,11 @@ from transformers.models.pixtral.modeling_pixtral import (
 )
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
@@ -524,7 +529,7 @@ class PixtralHFTransformerBlock(nn.Module):
             quant_config=quant_config,
             dropout=0.0,
             use_context_forward=False,
-            flatten_batch=False,
+            flatten_batch=True,
             qkv_bias=False,
             proj_bias=False,
             prefix=f"{prefix}.attention",
@@ -539,8 +544,9 @@ class PixtralHFTransformerBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        cu_seqlens: torch.Tensor,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         # Ensure hidden_states has the batch dimension [batch, seq_len, hidden_dim]
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -553,9 +559,9 @@ class PixtralHFTransformerBlock(nn.Module):
         # Pass through attention layer
         attention_output = self.attention(
             attn_normalized,
-            attention_mask=attention_mask,
-            cu_seqlens=None,
+            cu_seqlens=cu_seqlens,
             position_embeddings=position_embeddings,
+            forward_metadata=forward_metadata,
         )
 
         # Apply first residual connection
@@ -758,17 +764,19 @@ class PixtralHFTransformer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
+        cu_seqlens: torch.Tensor,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
         return_all_hidden_states: bool = False,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """Forward pass through transformer layers.
 
         Args:
             x: Input tensor
-            attention_mask: Optional attention mask
+            cu_seqlens: Offsets of each image in the packed patch sequence
             position_embeddings: Optional position embeddings for rotary attention
             return_all_hidden_states: Whether to return all hidden states
+            forward_metadata: Attention metadata shared by all layers
 
         Returns:
             Either the final hidden state, or a list of all hidden states if
@@ -779,7 +787,9 @@ class PixtralHFTransformer(nn.Module):
         all_hidden_states = [hidden_states] if return_all_hidden_states else None
 
         for i, layer in enumerate(self.layers):
-            hidden_states = layer(hidden_states, attention_mask, position_embeddings)
+            hidden_states = layer(
+                hidden_states, cu_seqlens, position_embeddings, forward_metadata
+            )
             if return_all_hidden_states:
                 all_hidden_states.append(hidden_states)
 
@@ -886,15 +896,27 @@ class PixtralHFVisionModel(nn.Module):
         position_embedding = self.patch_positional_embedding(
             embeds_featurized, position_ids
         )
-        attention_mask = _get_pixtral_attention_mask(
-            [p.shape[-2] * p.shape[-1] for p in embeds_2d], embeds_featurized
+        # Each image attends only to its own patches. Pass that as varlen
+        # offsets: FA3 and Triton ignore a dense attention_mask. The varlen
+        # backends read the device copy in forward_metadata; SDPA reads the
+        # host offsets, so no layer has to copy them back.
+        patch_counts = [p.shape[-2] * p.shape[-1] for p in embeds_2d]
+        cu_seqlens = torch.tensor(
+            [0, *itertools.accumulate(patch_counts)], dtype=torch.int32
+        )
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens,
+            self.device,
+            max_seqlen=max(patch_counts),
+            actual_seq_lengths_cpu=cu_seqlens[1:].tolist(),
         )
 
         transformer_outputs = self.transformer(
             embeds_featurized,  # add batch dimension
-            attention_mask,
+            cu_seqlens,
             position_embedding,
             return_all_hidden_states=output_hidden_states,
+            forward_metadata=forward_metadata,
         )
 
         # Store all hidden states if requested
