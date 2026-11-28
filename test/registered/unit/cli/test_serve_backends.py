@@ -492,9 +492,6 @@ def _launch_argv(argv):
 # may have both parseable and branch-only recipes; parsing does not prove it runs.
 BRANCH_ONLY_CLI_MODES = {
     "stepfun-ai/Step-5-Preview": None,  # every recipe
-    # The Hy4-flash low-latency recipes need the DFly arguments from #51159.
-    "tencent/Hy4-flash": {"low-latency"},
-    "tencent/Hy4-flash-FP8": {"low-latency"},
 }
 
 
@@ -514,6 +511,11 @@ def _main_cli_recipes():
 
 
 class TestExportedCookbookCommands(CustomTestCase):
+    def test_hy4_flash_is_not_offered_without_model_support(self):
+        exported = _exported()
+        self.assertNotIn("tencent/Hy4-flash", exported)
+        self.assertNotIn("tencent/Hy4-flash-FP8", exported)
+
     def test_every_hardware_is_detected(self):
         """A Cookbook hardware id the Guide cannot detect ships commands it never
         picks; add its device name to _HARDWARE or skip it in export_commands.mjs."""

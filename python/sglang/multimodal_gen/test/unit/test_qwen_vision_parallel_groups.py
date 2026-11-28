@@ -80,6 +80,11 @@ class TestQwenGenerationParallelGroups(unittest.TestCase):
                     )
                     with (
                         parallel_scope(tp_group=tp, attn_tp_group=attn),
+                        # CPU-only math/reload checks use the PyTorch GEMM path.
+                        patch(
+                            "sglang.srt.layers.quantization.unquant._skip_aiter_unquant",
+                            True,
+                        ),
                         patch(
                             "sglang.srt.layers.linear.is_allocation_symmetric",
                             return_value=False,
