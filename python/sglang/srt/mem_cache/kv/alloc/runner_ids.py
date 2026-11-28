@@ -494,6 +494,7 @@ class RunnerIds:
         positions_out: Optional[torch.Tensor] = None,
         anchor_src: Optional[torch.Tensor] = None,
         anchor_out: Optional[torch.Tensor] = None,
+        mask_token_id: Optional[int] = None,
     ) -> IterationIds:
         """Gather one fixed-width speculative window, translating at its producer.
 
@@ -534,6 +535,7 @@ class RunnerIds:
             positions_out=positions_out,
             anchor_src=anchor_src,
             anchor_out=anchor_out,
+            mask_token_id=mask_token_id,
         )
         return self.plan(
             req_pool_indices=req_pool_indices,
