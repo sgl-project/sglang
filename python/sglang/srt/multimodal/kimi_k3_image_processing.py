@@ -16,7 +16,9 @@ class KimiK3DeferredPreprocessing:
 
     ``backend`` is the producer's decision and cannot be recovered from the
     item; the feature's own layout stays observable on ``item.feature``, so it
-    is not mirrored here.
+    is not mirrored here. ``encoded_image_decode`` is set when ``item.feature``
+    holds the encoded image file bytes, and names the decode mode that turns
+    them into the same pixels the producer validated.
     """
 
     backend: Literal["gpu", "cpu"]
@@ -24,6 +26,7 @@ class KimiK3DeferredPreprocessing:
     image_std: list[float]
     transparent_bg_config: Optional[dict]
     resize_config: dict
+    encoded_image_decode: Optional[Union[bool, str]] = None
 
 
 def prepare_kimi_k3_encoder_inputs(
@@ -223,6 +226,19 @@ def to_hwc_uint8(image: Union[torch.Tensor, Image.Image]) -> torch.Tensor:
     if image.shape[-1] == 1:
         image = image.repeat(1, 1, 3)
     return image.cpu().contiguous()
+
+
+def decode_deferred_feature(
+    feature: Union[torch.Tensor, Image.Image],
+    config: KimiK3DeferredPreprocessing,
+) -> Union[torch.Tensor, Image.Image]:
+    """Return a deferred image's pixels, decoding encoded file bytes when shipped."""
+    if config.encoded_image_decode is None:
+        return feature
+    from sglang.srt.multimodal.media_io import load_image
+
+    image, _ = load_image(feature.cpu().numpy().tobytes(), config.encoded_image_decode)
+    return image
 
 
 def to_chw_uint8(

@@ -201,6 +201,17 @@ class MediaArtifactCacheMixin:
         """
         return artifact.has_feature or allow_featureless
 
+    def complete_featureless_artifact(
+        self, artifact: MediaArtifact, snapshot: MediaSnapshot
+    ) -> Optional[MediaArtifact]:
+        """Rebuild a metadata-only cache hit from this request's media snapshot.
+
+        Models whose encoder can consume the snapshot directly override this to
+        skip decode and preprocessing on a hit. ``None`` sends the input to the
+        miss path.
+        """
+        return None
+
     @staticmethod
     def validate_artifact(artifact: MediaArtifact, entry: MediaArtifactInput) -> None:
         """Enforce identity invariants shared by every model adapter."""
@@ -236,12 +247,14 @@ class MediaArtifactCacheMixin:
         modality: Modality,
         *,
         allow_featureless: bool,
+        snapshot: Optional[MediaSnapshot] = None,
     ) -> Optional[MediaArtifact]:
         """Return a compatible cached artifact without recording a cold miss.
 
         Identity mismatches are corrupt entries and are evicted. A featureless
-        entry that this request cannot use is left for the miss path, which
-        removes it temporarily and verifies the recomputed feature hash.
+        entry that this request cannot use is completed from ``snapshot`` when
+        the model supports it, otherwise left for the miss path, which removes
+        it temporarily and verifies the recomputed feature hash.
         """
         artifact = self.mm_preprocess_cache.get_if_present(
             key,
@@ -258,7 +271,9 @@ class MediaArtifactCacheMixin:
                 MediaArtifactInput(content_digest, key, modality, None),
             )
             if not self.artifact_usable(artifact, allow_featureless=allow_featureless):
-                return None
+                if snapshot is None:
+                    return None
+                return self.complete_featureless_artifact(artifact, snapshot)
         return artifact
 
     async def prepare_media_artifacts(
@@ -352,6 +367,7 @@ class MediaArtifactCacheMixin:
                 snapshot.content_digest,
                 modality,
                 allow_featureless=featureless_hit_mask[index],
+                snapshot=snapshot,
             )
 
         # 3. deduplicate misses before decode

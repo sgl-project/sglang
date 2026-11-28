@@ -147,6 +147,7 @@ from sglang.srt.models.utils import WeightsMapper, bind_or_assign
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
+    decode_deferred_feature,
     fill_transparent_bg,
     normalization_tensors,
     to_chw_uint8,
@@ -4644,7 +4645,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                             device,
                         )
                         pixel_values, produced_grids = _gpu_preprocess_images(
-                            [item.feature for item in group_items],
+                            [
+                                decode_deferred_feature(item.feature, config)
+                                for item, config in zip(group_items, group_configs)
+                            ],
                             [config.resize_config for config in group_configs],
                             image_scale,
                             image_bias,

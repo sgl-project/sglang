@@ -106,8 +106,17 @@ class KimiK3ImagePreprocessArtifact:
         return self.feature is not None
 
     def cache_value(self) -> KimiK3ImagePreprocessArtifact:
-        """Return the CPU-cacheable copy; never retain a CUDA tensor."""
-        if self.feature is None or self.feature.device.type == "cpu":
+        """Return the CPU-cacheable copy; never retain a CUDA tensor.
+
+        Deferred GPU artifacts keep only metadata: a hit is completed from the
+        request's encoded bytes, so retaining decoded pixels would only shrink
+        how many images the budget holds.
+        """
+        if self.feature is None:
+            return self
+        if self.deferred is not None and self.deferred.backend == "gpu":
+            return replace(self, feature=None)
+        if self.feature.device.type == "cpu":
             return self
         return replace(self, feature=None)
 
@@ -121,6 +130,7 @@ class KimiK3ImagePreprocessArtifact:
                 self.deferred.image_std,
                 self.deferred.transparent_bg_config,
                 self.deferred.resize_config,
+                self.deferred.encoded_image_decode,
             )
         return (
             self.content_digest,

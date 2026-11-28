@@ -866,7 +866,7 @@ def test_kimi_k3_cached_deferred_artifact_has_model_contract():
     assert config.resize_config["new_width"] == 2
 
 
-def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
+def _k3_cache_path_processor():
     hf_processor = _HFProcessor()
     hf_processor.tokenizer = _AnySizeTokenizer()
     hf_config = SimpleNamespace(
@@ -886,40 +886,51 @@ def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
         mm_preprocess_cache_size_mb=1,
     )
     publish(server_args, role="tokenizer")
+    return KimiK3ImageProcessor(
+        hf_config=hf_config,
+        server_args=server_args,
+        _processor=hf_processor,
+        transport_mode=None,
+    )
+
+
+def _k3_png_image_data(color):
+    encoded_image = io.BytesIO()
+    Image.new("RGB", (28, 28), color=color).save(encoded_image, format="PNG")
+    return ImageData(
+        url="data:image/png;base64,"
+        + base64.b64encode(encoded_image.getvalue()).decode()
+    )
+
+
+def _k3_identity_tower_model():
+    class _Tower(nn.Module):
+        device = torch.device("cpu")
+        patch_size = 14
+
+        def __init__(self):
+            super().__init__()
+            self.patch_embed = SimpleNamespace(
+                proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
+            )
+
+        def forward(self, pixel_values, _grid_thws):
+            return pixel_values
+
+    model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.use_data_parallel = False
+    model.vision_tower = _Tower()
+    model.mm_projector = _Projector()
+    return model
+
+
+def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
     try:
-        processor = KimiK3ImageProcessor(
-            hf_config=hf_config,
-            server_args=server_args,
-            _processor=hf_processor,
-            transport_mode=None,
-        )
-        image = Image.new("RGB", (28, 28), color=(1, 2, 3))
-        encoded_image = io.BytesIO()
-        image.save(encoded_image, format="PNG")
-        image_data = ImageData(
-            url="data:image/png;base64,"
-            + base64.b64encode(encoded_image.getvalue()).decode()
-        )
+        processor = _k3_cache_path_processor()
+        image_data = _k3_png_image_data((1, 2, 3))
         request = SimpleNamespace(video_data=None, mm_content_hashes=None)
-
-        class _Tower(nn.Module):
-            device = torch.device("cpu")
-            patch_size = 14
-
-            def __init__(self):
-                super().__init__()
-                self.patch_embed = SimpleNamespace(
-                    proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.float32))
-                )
-
-            def forward(self, pixel_values, _grid_thws):
-                return pixel_values
-
-        model = KimiK3ForConditionalGeneration.__new__(KimiK3ForConditionalGeneration)
-        nn.Module.__init__(model)
-        model.use_data_parallel = False
-        model.vision_tower = _Tower()
-        model.mm_projector = _Projector()
+        model = _k3_identity_tower_model()
 
         try:
             with (
@@ -965,6 +976,56 @@ def test_kimi_k3_normal_cache_path_connects_real_producer_to_model_consumer():
             == "gpu"
         )
         torch.testing.assert_close(cold_features, hot_features)
+    finally:
+        reset_context()
+
+
+def test_kimi_k3_cache_hit_ships_encoded_bytes_decoded_to_same_pixels():
+    try:
+        processor = _k3_cache_path_processor()
+        image_data = _k3_png_image_data((7, 80, 200))
+        request = SimpleNamespace(video_data=None, mm_content_hashes=None)
+        model = _k3_identity_tower_model()
+        seen_images = []
+
+        def capture(images, *_args, to_chw, **_kwargs):
+            seen_images.append([to_chw(image) for image in images])
+            return (
+                torch.ones((4, 3), dtype=torch.float32),
+                torch.tensor([[1, 2, 2]], dtype=torch.int64),
+            )
+
+        try:
+            with patch(
+                "sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=True
+            ):
+                cold = asyncio.run(
+                    processor.process_mm_data_async([image_data], [1, 42, 2], request)
+                )
+                hot = asyncio.run(
+                    processor.process_mm_data_async([image_data], [3, 42, 4], request)
+                )
+            (cached,) = processor.mm_preprocess_cache._entries.values()
+            with (
+                get_parallel().override(tp_size=1),
+                patch(
+                    "sglang.srt.multimodal.processors.kimi_k25._gpu_preprocess_images",
+                    side_effect=capture,
+                ),
+            ):
+                model.get_image_feature(pickle.loads(pickle.dumps(cold.mm_items)))
+                model.get_image_feature(pickle.loads(pickle.dumps(hot.mm_items)))
+        finally:
+            processor.shutdown()
+
+        assert cached.value.feature is None
+        hot_item = hot.mm_items[0]
+        hot_config = hot_item.model_specific_data[DEFERRED_PREPROCESSING_KEY]
+        assert hot_config.encoded_image_decode == processor.gpu_image_decode
+        assert hot_item.feature.dim() == 1
+        assert cold.mm_items[0].hash == hot_item.hash
+        assert torch.equal(seen_images[0][0], seen_images[1][0])
+        assert seen_images[0][0].shape == (3, 28, 28)
     finally:
         reset_context()
 
