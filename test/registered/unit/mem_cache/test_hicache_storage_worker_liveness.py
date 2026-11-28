@@ -794,7 +794,8 @@ class TestStorageWorkerStop(unittest.TestCase):
             return {str(t.name): [True] * len(t.keys) for t in transfers}
 
         cc.storage_backend = SimpleNamespace(
-            batch_set_v2=Mock(side_effect=batch_set_v2)
+            batch_set_v2=Mock(side_effect=batch_set_v2),
+            requires_rank_local_backup=False,
         )
         operation = SimpleNamespace(
             id=7,

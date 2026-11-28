@@ -411,6 +411,25 @@ class HiCacheStorage(ABC):
         """
         return False
 
+    # A backend that keys objects by its own rank (not by the shared object)
+    # must back up on every rank, even where is_storage_writer elects one
+    # writer for rank-replicated KV such as MLA.
+    requires_rank_local_backup = False
+    # Where HiCache does elect one writer, the backend keys MHA draft and
+    # draft-SWA pools by rank, so every rank backs them up (see
+    # HybridCacheController.should_backup).
+    rank_keyed_mha_drafts = False
+
+    def get_kv_hint_source(self) -> Optional[dict]:
+        """Describe this rank's backend-owned router source, without starting IO.
+
+        Describes configured addresses, not socket readiness or residency.
+        Return None without one; only the owner rank of a shared source
+        reports it. Keys: "dp_rank" (int), "capabilities" (list of str, e.g.
+        "router_hint") and "source_control_endpoint" ("tcp://host:port").
+        """
+        return None
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
@@ -696,6 +715,17 @@ class HiCacheStorageFailureInjector(HiCacheStorage):
 
     def consumes_kv_hints(self) -> bool:
         return self._backend.consumes_kv_hints()
+
+    @property
+    def requires_rank_local_backup(self) -> bool:
+        return self._backend.requires_rank_local_backup
+
+    @property
+    def rank_keyed_mha_drafts(self) -> bool:
+        return self._backend.rank_keyed_mha_drafts
+
+    def get_kv_hint_source(self) -> Optional[dict]:
+        return self._backend.get_kv_hint_source()
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self._backend.register_mem_pool_host(mem_pool_host)

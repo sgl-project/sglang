@@ -17,6 +17,7 @@ import importlib
 import threading
 import time
 import unittest
+from contextlib import nullcontext
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -44,6 +45,7 @@ from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -186,6 +188,169 @@ class TestJoinerWorkerPortAdmission(CustomTestCase):
         self._launch_joiner(parallel, handshake, launch)
 
         self.assertEqual(launch.call_args.args[-1], [1002])
+
+
+class TestLocalKvHintSources(CustomTestCase):
+    @staticmethod
+    def _source(rank, block_size=64):
+        return {
+            "dp_rank": rank,
+            "endpoint": f"tcp://127.0.0.1:{5557 + rank}",
+            "topic": "kv",
+            "block_size": block_size,
+        }
+
+    def test_scheduler_reports_backend_hint_sources_only_when_present(self):
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+
+        hint = {
+            "dp_rank": 0,
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": "tcp://worker-a:29017",
+        }
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.max_total_num_tokens = 64
+        scheduler.max_req_len = 38
+        scheduler.max_req_input_len = 32
+        scheduler.startup_time = {}
+        scheduler.page_size = 64
+        scheduler.enable_hierarchical_cache = True
+        scheduler.enable_unified_cache_external_linker = False
+        for reported in (None, hint):
+            with self.subTest(hint=reported is not None):
+                cache = SimpleNamespace(
+                    cache_controller=SimpleNamespace(
+                        storage_backend=SimpleNamespace(
+                            get_kv_hint_source=lambda r=reported: r
+                        )
+                    ),
+                )
+                cache.storage_kv_hint_sources = lambda c=cache: (
+                    BasePrefixCache.storage_kv_hint_sources(c)
+                )
+                scheduler.tree_cache = cache
+                with patch.object(Scheduler, "_hicache_l3_layout", return_value={}):
+                    info = scheduler.get_init_info()
+                if reported is None:
+                    self.assertNotIn("kv_hint_sources", info)
+                else:
+                    self.assertEqual(info["kv_hint_sources"], [hint])
+
+    def test_controller_collects_all_scheduler_sources(self):
+        from sglang.srt.managers import data_parallel_controller as module
+
+        controller = DataParallelController.__new__(DataParallelController)
+        controller.env_lock = threading.Lock()
+        controller._scheduler_init_info_lock = threading.Lock()
+        controller._scheduler_init_infos = []
+        controller.scheduler_procs = []
+        controller.local_kv_hint_sources = []
+        controller.run_scheduler_process_func = MagicMock()
+        controller.attn_replica_size = 1
+        controller.prelaunched_schedulers = None
+        # TP8/DP4 over two nodes: this follower's four schedulers own ranks 2,3.
+        readers = [
+            MagicMock(
+                recv=MagicMock(
+                    return_value={
+                        "max_total_num_tokens": 64,
+                        "max_req_len": 38,
+                        "max_req_input_len": 32,
+                        "kv_hint_sources": [
+                            {
+                                "dp_rank": source["dp_rank"],
+                                "capabilities": ["router_hint"],
+                                "source_control_endpoint": source["endpoint"],
+                            }
+                            for source in sources
+                        ],
+                    }
+                )
+            )
+            for sources in ([self._source(2)], [], [self._source(3)], [])
+        ]
+        with (
+            get_context().override_server_args(
+                tp_size=8,
+                attn_dp_size=4,
+                nnodes=2,
+                node_rank=1,
+                pp_size=1,
+                attn_cp_size=1,
+            ),
+            patch.object(module.mp, "Process"),
+            patch.object(
+                module.mp,
+                "Pipe",
+                side_effect=[(reader, MagicMock()) for reader in readers],
+            ),
+            patch.object(module.PortArgs, "init_new", return_value=MagicMock()),
+            patch.object(module.TorchMemorySaverAdapter, "create"),
+            patch.object(module.numa_utils, "configure_subprocess"),
+            patch.object(
+                module, "maybe_reindex_device_id", return_value=nullcontext(0)
+            ),
+        ):
+            controller.launch_tensor_parallel_group(
+                MagicMock(), MagicMock(), 0, None, [7000, 7001, 7002, 7003]
+            )
+        self.assertEqual(
+            [source["dp_rank"] for source in controller.local_kv_hint_sources], [2, 3]
+        )
+
+    def _run_controller_process(self, *, hint_sources):
+        from sglang.srt.managers import data_parallel_controller as module
+
+        controller = SimpleNamespace(
+            scheduler_procs=[],
+            get_init_info=lambda: {
+                "max_total_num_tokens": 64,
+                "max_req_input_len": 32,
+                "startup_time": {},
+            },
+            local_kv_hint_sources=hint_sources,
+            event_loop=MagicMock(),
+        )
+        pipe = MagicMock()
+        with (
+            patch.object(module, "DataParallelController", return_value=controller),
+            patch.object(module.setproctitle, "setproctitle"),
+            patch.object(module.faulthandler, "enable"),
+            patch.object(module, "kill_itself_when_parent_died"),
+            patch.object(module.psutil, "Process"),
+            patch.object(module, "load_plugins"),
+            patch.object(module, "publish"),
+            patch.object(module, "configure_logger"),
+            patch.object(
+                module,
+                "get_observability",
+                return_value=SimpleNamespace(enable_trace=False),
+            ),
+            patch.object(
+                module, "get_parallel", return_value=SimpleNamespace(node_rank=0)
+            ),
+            patch.object(
+                module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+        ):
+            module.run_data_parallel_controller_process(MagicMock(), MagicMock(), pipe)
+        return pipe.send.call_args.args[0]
+
+    def test_controller_forwards_hint_sources(self):
+        """An in-process engine discovers a backend's router sources."""
+        info = self._run_controller_process(
+            hint_sources=[{"dp_rank": 1}, {"dp_rank": 0}]
+        )
+        self.assertEqual(info["kv_hint_sources"], [{"dp_rank": 0}, {"dp_rank": 1}])
+
+    def test_controller_reply_is_unchanged_without_backend_sources(self):
+        info = self._run_controller_process(hint_sources=[])
+        self.assertNotIn("kv_hint_sources", info)
 
 
 class TestRayAttentionDpPortArgs(CustomTestCase):

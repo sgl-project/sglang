@@ -660,6 +660,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         controller._scheduler_init_info_lock = threading.Lock()
         controller._scheduler_init_infos = []
         controller.scheduler_procs = []
+        controller.local_kv_hint_sources = []
         controller.attn_replica_size = 1
         controller.prelaunched_schedulers = None
         return controller

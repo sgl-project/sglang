@@ -2152,6 +2152,12 @@ class Scheduler(
             # The main process waits for this process's crash dump.
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
+
+        # Reported only by a storage backend that owns a router source.
+        if self.enable_hierarchical_cache and (
+            hint_sources := self.tree_cache.storage_kv_hint_sources()
+        ):
+            result_dict["kv_hint_sources"] = hint_sources
         return result_dict
 
     def release_host_resources(self) -> None:

@@ -942,6 +942,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Whether request ``kv_hints`` reach an attached storage backend."""
         return False
 
+    def storage_kv_hint_sources(self) -> list[dict]:
+        """The attached storage backend's router source on this rank, if any.
+
+        See HiCacheStorage.get_kv_hint_source.
+        """
+        cc = self.cache_controller
+        backend = cc.storage_backend if cc is not None else None
+        source = backend.get_kv_hint_source() if backend is not None else None
+        return [source] if source is not None else []
+
     def forwards_kv_hint_actions(self, kv_hints: Optional[KvHintsEnvelope]) -> bool:
         """Whether this request's ``kv_hints`` would reach the storage backend."""
         return (

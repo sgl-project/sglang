@@ -369,6 +369,9 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
 
 
 class HiCacheController:
+    # Default for controllers built without __init__ (unit tests read backup_skip).
+    storage_backend = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -808,6 +811,7 @@ class HiCacheController:
                 in [
                     "hf3fs",
                     "mooncake",
+                    "kvcr",
                     "npu_memcache",
                     "eic",
                     "nixl",
@@ -901,6 +905,10 @@ class HiCacheController:
 
     @property
     def backup_skip(self) -> bool:
+        # A rank-local store keeps every rank's copy, even of replicated KV.
+        backend = self.storage_backend
+        if backend is not None and backend.requires_rank_local_backup is True:
+            return False
         return not self.storage_config.is_storage_writer
 
     def _generate_storage_config(
