@@ -41,6 +41,7 @@ from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     attention_backends_of,
     ep_offset_joiner_of,
+    flashinfer_fa2_serves_head_dims,
     get_default_attn_backend,
     is_attention_backend_not_set,
     mamba_extra_buffer_of,
@@ -397,6 +398,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Lfm3ForCausalLM",
         "Lfm3VlForConditionalGeneration",
         "Lfm3AudioForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
@@ -435,6 +437,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Lfm3ForCausalLM",
         "Lfm3VlForConditionalGeneration",
         "Lfm3AudioForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
@@ -1132,6 +1135,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         "Xing4_0ForCausalLM",
     }
@@ -1252,6 +1256,26 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
         return False
 
 
+def _deterministic_flashinfer_serves_head_dims(view: Any) -> bool:
+    """Whether flashinfer's FA2 prefill handles the model's head dims (see
+    `flashinfer_fa2_serves_head_dims`). Unknown configs keep flashinfer."""
+    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.connector import ConnectorType
+    from sglang.srt.utils.common import parse_connector_type
+
+    if parse_connector_type(view.model_path) == ConnectorType.INSTANCE:
+        return True
+    try:
+        model_config = model_config_of(view)
+    except Exception:
+        return True
+    # MLA head_dim/swa_head_dim are placeholders (e.g. 72 for Kimi-Linear),
+    # not the dims the MLA prefill kernel runs with.
+    if model_config.attention_arch == AttentionArch.MLA:
+        return True
+    return flashinfer_fa2_serves_head_dims(model_config)
+
+
 @register_post_process
 def _deterministic_allreduce_fusion_disable(view: Any) -> dict:
     if (
@@ -1364,6 +1388,9 @@ def _deterministic_attention_backend(view: Any) -> dict:
             if _deterministic_is_deepseek_model(view):
                 # fallback to triton for DeepSeek models because flashinfer
                 # doesn't support deterministic inference for DeepSeek models yet
+                backend = "triton"
+            elif not _deterministic_flashinfer_serves_head_dims(view):
+                # flashinfer prefills with FA2, which rejects these head dims.
                 backend = "triton"
             else:
                 # fallback to flashinfer on Blackwell for non-DeepSeek models

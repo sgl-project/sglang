@@ -99,6 +99,23 @@ def test_native_encoder_registry_and_checkpoint(small_text_encoder):
         model.load_weights([("language_model.invalid.weight", torch.zeros(1))])
 
 
+def test_conditional_generation_checkpoint_loads_only_the_text_model(
+    small_text_encoder,
+):
+    """A Qwen3_5ForConditionalGeneration checkpoint nests the text model under model."""
+    config = Qwen3_5EncoderConfig()
+    config.update_model_arch(small_text_encoder.config.to_dict())
+    config.post_diffusers_config_update()
+    with set_default_torch_dtype(small_text_encoder.dtype):
+        model = Qwen3_5Model(config).eval()
+    weights = [
+        (f"model.{name}", tensor)
+        for name, tensor in small_text_encoder.state_dict().items()
+    ]
+    weights += [("mtp.fc.weight", torch.zeros(1)), ("lm_head.weight", torch.zeros(1))]
+    assert model.load_weights(weights) == set(dict(model.named_parameters()))
+
+
 @pytest.mark.parametrize("backend", [None, "torch_sdpa", "fa"])
 def test_text_attention_default_and_explicit_selection(small_text_encoder, backend):
     from sglang.multimodal_gen.runtime.platforms import (

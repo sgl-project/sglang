@@ -55,6 +55,7 @@ def test_scheduler_ingress_binds_configured_port_only(monkeypatch):
         raise _Stop
 
     monkeypatch.setattr(scheduler_module, "set_global_server_args", lambda **_: None)
+    monkeypatch.setattr(scheduler_module, "configure_media_url_policy", lambda _: None)
     monkeypatch.setattr(scheduler_module, "get_zmq_socket", _record)
     server_args = SimpleNamespace(
         num_gpus=1,
