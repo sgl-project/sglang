@@ -658,9 +658,11 @@ class TestDpPadRows(CustomTestCase):
     @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
     def test_kimi_k3_takes_no_dp_counts(self):
         # K3's router would mask after route_radix and give up the fused route +
-        # quant handoff (above), so the K3 models opt out of the counts.
+        # quant handoff (above), so the K3 models opt out of the counts. The
+        # runner resolves the flag when it loads the model; decode reads it there.
         from sglang.srt.model_executor.forward_batch_info import (
             _model_skips_dp_pad_rows,
+            resolve_moe_skips_dp_pad_rows,
         )
         from sglang.srt.models.kimi_k3 import (
             KimiK3ForConditionalGeneration,
@@ -674,11 +676,10 @@ class TestDpPadRows(CustomTestCase):
             KimiK31ForConditionalGeneration,
         ):
             with self.subTest(model=cls.__name__):
-                runner = SimpleNamespace(model=cls.__new__(cls))
-                self.assertFalse(_model_skips_dp_pad_rows(runner))
-        self.assertTrue(
-            _model_skips_dp_pad_rows(SimpleNamespace(model=torch.nn.Identity()))
-        )
+                self.assertFalse(resolve_moe_skips_dp_pad_rows(cls.__new__(cls)))
+        self.assertTrue(resolve_moe_skips_dp_pad_rows(torch.nn.Identity()))
+        runner = SimpleNamespace(moe_skips_dp_pad_rows=False)
+        self.assertFalse(_model_skips_dp_pad_rows(runner))
         self.assertTrue(_model_skips_dp_pad_rows(SimpleNamespace()))
 
     @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")

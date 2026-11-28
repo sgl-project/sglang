@@ -2419,11 +2419,16 @@ def _dp_tp_moe_skips_pad_rows() -> bool:
     )
 
 
-def _model_skips_dp_pad_rows(model_runner: ModelRunner) -> bool:
+def resolve_moe_skips_dp_pad_rows(model: torch.nn.Module) -> bool:
     """False for a model whose router keeps the padding rows routed
-    (``moe_skips_dp_pad_rows = False``): decode builds no counts for it."""
-    model = getattr(model_runner, "model", None)
+    (``moe_skips_dp_pad_rows = False``): decode builds no counts for it.
+    ModelRunner resolves this once per loaded model."""
     return getattr(model, "moe_skips_dp_pad_rows", True)
+
+
+def _model_skips_dp_pad_rows(model_runner: ModelRunner) -> bool:
+    # Runners that never loaded a model (test stand-ins) keep the default.
+    return getattr(model_runner, "moe_skips_dp_pad_rows", True)
 
 
 @lru_cache(maxsize=1)

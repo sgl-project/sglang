@@ -3772,7 +3772,7 @@ class KimiK3LinearForCausalLM(nn.Module):
 
     # route_radix (896 experts, top-16) has no DP padding-row mask: masking after
     # it would cost two fill launches per MoE layer and the fused route + quant
-    # launch, so decode builds no DP counts for K3 (_model_skips_dp_pad_rows).
+    # launch, so decode builds no DP counts for K3 (resolve_moe_skips_dp_pad_rows).
     moe_skips_dp_pad_rows = False
 
     @staticmethod

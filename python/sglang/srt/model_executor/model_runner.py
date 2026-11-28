@@ -148,6 +148,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
+    resolve_moe_skips_dp_pad_rows,
 )
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -1496,6 +1497,7 @@ class ModelRunner:
         self.loader = loaded.loader
         self.model = loaded.model
         current_platform.post_load_model(self.model)
+        self.moe_skips_dp_pad_rows = resolve_moe_skips_dp_pad_rows(self.model)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
@@ -2764,6 +2766,7 @@ class ModelRunner:
         load_config: LoadConfig,
     ) -> None:
         self.model = new_model
+        self.moe_skips_dp_pad_rows = resolve_moe_skips_dp_pad_rows(new_model)
         # The record says what model this PROCESS serves; a draft's weight
         # update is not that (its own state is on the runner).
         if not self.is_draft_worker:
