@@ -1,5 +1,5 @@
 name: Upload CUDA Coredumps
-description: Upload CUDA coredump files as artifacts and clean up the directory.
+description: Upload CUDA coredump files as artifacts and clean up. cuda-coredump-tracker.yml signals the tracker issue from the artifacts.
 
 inputs:
   artifact-suffix:
@@ -14,14 +14,41 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Check for coredumps
+      id: check
+      shell: bash
+      run: |
+        # Mirror get_dump_dir() in python/sglang/srt/debug_utils/cuda_coredump.py:
+        # explicit override > per-job RUNNER_TEMP > /tmp default, then a
+        # per-(run, attempt) subdir so dumps are never mis-attributed across CI
+        # jobs that share a self-hosted runner's filesystem.
+        if [ -n "$SGLANG_CUDA_COREDUMP_DIR" ]; then
+          base="$SGLANG_CUDA_COREDUMP_DIR"
+        elif [ -n "$RUNNER_TEMP" ]; then
+          base="$RUNNER_TEMP/sglang_cuda_coredumps"
+        else
+          base="/tmp/sglang_cuda_coredumps"
+        fi
+        if [ -n "$GITHUB_RUN_ID" ]; then
+          dir="$base/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT:-1}"
+        else
+          dir="$base"
+        fi
+        echo "dump_dir=$dir" >> "$GITHUB_OUTPUT"
+        if [ -d "$dir" ] && [ -n "$(ls -A "$dir" 2>/dev/null)" ]; then
+          echo "has_dumps=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_dumps=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Upload CUDA coredumps
+      if: steps.check.outputs.has_dumps == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: cuda-coredumps-${{ github.job }}${{ inputs.artifact-suffix && format('-{0}', inputs.artifact-suffix) }}
-        path: ${{ env.SGLANG_CUDA_COREDUMP_DIR || '/tmp/sglang_cuda_coredumps' }}/
+        path: ${{ steps.check.outputs.dump_dir }}/
         retention-days: ${{ inputs.retention-days }}
-        if-no-files-found: ignore
 
     - name: Cleanup CUDA coredumps
       shell: bash
-      run: rm -rf "${{ env.SGLANG_CUDA_COREDUMP_DIR || '/tmp/sglang_cuda_coredumps' }}"
+      run: rm -rf "${{ steps.check.outputs.dump_dir }}"

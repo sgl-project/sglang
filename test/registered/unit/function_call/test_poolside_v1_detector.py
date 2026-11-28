@@ -8,7 +8,7 @@ from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(1.0, "stage-a-test-cpu")
+register_cpu_ci(1.0, "base-a-test-cpu")
 
 
 class TestPoolsideV1Detector(CustomTestCase):
@@ -154,9 +154,7 @@ class TestPoolsideV1Detector(CustomTestCase):
         in-flight call, matching the old closing-tag-anchored regex behavior.
         Without the truncated-call filter in detect_and_parse, streaming-as-
         primitive surfaced a tool call with parameters="{}" on this input."""
-        text = (
-            "<tool_call>get_weather\n<arg_key>location</arg_key>\n" "<arg_value>San Fr"
-        )
+        text = "<tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>San Fr"
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(
             len(result.calls), 0, "truncated mid-arg_value must yield 0 calls"

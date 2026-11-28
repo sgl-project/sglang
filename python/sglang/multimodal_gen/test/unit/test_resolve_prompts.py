@@ -51,9 +51,10 @@ class TestResolvePrompts(unittest.TestCase):
             os.unlink(path)
 
     def test_prompt_path_takes_priority_over_server_args(self):
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".txt", delete=False
-        ) as f1, tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f2:
+        with (
+            tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f1,
+            tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f2,
+        ):
             f1.write("from prompt_path\n")
             f2.write("from server_args\n")
             path1, path2 = f1.name, f2.name

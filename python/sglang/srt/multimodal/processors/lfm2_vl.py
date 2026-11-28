@@ -14,8 +14,9 @@
 
 from typing import List, Union
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.lfm2_vl import Lfm2VlForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -58,23 +59,26 @@ class Lfm2VlImageProcessor(SGLangBaseProcessor):
         request_obj,
         **kwargs,
     ):
+        if audio_data or getattr(request_obj, "video_data", None):
+            raise ValueError("LFM2-VL only supports image media inputs")
+
         if not image_data:
             input_ids = self._tokenizer(
                 input_text, return_tensors="pt", add_special_tokens=False
             ).input_ids
-            return {
-                "input_ids": input_ids.squeeze(0).tolist(),
-                "mm_items": [],
-                "im_token_id": self.IMAGE_TOKEN_ID,
-            }
+            return MultimodalProcessorOutput(
+                input_ids=input_ids.squeeze(0).tolist(),
+                mm_items=[],
+                im_token_id=self.IMAGE_TOKEN_ID,
+            )
 
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, ret = self.process_and_combine_mm_data(
+        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

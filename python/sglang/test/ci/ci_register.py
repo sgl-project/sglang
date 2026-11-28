@@ -1,22 +1,40 @@
 import ast
+import glob
+import json
+import os
 import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
     "HWBackend",
     "CIRegistry",
+    "registered_test_files",
     "collect_tests",
+    "filter_tests",
     "auto_partition",
+    "load_live_est",
     "register_cpu_ci",
     "register_cuda_ci",
     "register_amd_ci",
+    "register_musa_ci",
     "register_npu_ci",
+    "register_xpu_ci",
+    "register_mlx_ci",
+    "register_mps_ci",
+    "register_ppu_ci",
+    "register_mlu_ci",
+    "declare_models",
     "ut_parse_one_file",
 ]
 
+# `suite` stays in positional slot 2 for backward compat with existing
+# `register_cpu_ci(5, "base-a-test-cpu")` style positional calls. New fields
+# (`stage`, `runner_config`) are kwarg-only.
 _PARAM_ORDER = ("est_time", "suite", "nightly", "disabled")
+_KWARG_ONLY = ("stage", "runner_config")
+_ALL_PARAMS = _PARAM_ORDER + _KWARG_ONLY
 _UNSET = object()
 
 
@@ -25,31 +43,55 @@ class HWBackend(Enum):
     CUDA = auto()
     AMD = auto()
     NPU = auto()
+    XPU = auto()
+    MUSA = auto()
+    MLX = auto()
+    MPS = auto()
+    PPU = auto()
+    MLU = auto()
 
 
 @dataclass
 class CIRegistry:
     backend: HWBackend
     filename: str
-    # Estimated time to run the test in seconds.
     est_time: float
-    # The suite this test is registered in.
-    suite: str
-    # Whether the test is a nightly test.
+    stage: Optional[str] = None
+    runner_config: Optional[str] = None
+    # Legacy single-string suite; kept for nightly/stress/weekly + AMD/CPU/NPU
+    # suites whose names don't follow `{stage}-test-{runner_config}` shape.
+    suite: Optional[str] = None
     nightly: bool = False
-    # Reason for disabling the test. None = enabled, string = disabled with reason.
     disabled: Optional[str] = None
+
+    @property
+    def effective_suite(self) -> Optional[str]:
+        if self.stage is not None and self.runner_config is not None:
+            return f"{self.stage}-test-{self.runner_config}"
+        return self.suite
 
 
 def register_cpu_ci(
-    est_time: float, suite: str, nightly: bool = False, disabled: Optional[str] = None
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
 ):
     """Marker for CPU CI registration (parsed via AST; runtime no-op)."""
     return None
 
 
 def register_cuda_ci(
-    est_time: float, suite: str, nightly: bool = False, disabled: Optional[str] = None
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
 ):
     """Marker for CUDA CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -57,9 +99,12 @@ def register_cuda_ci(
 
 def register_amd_ci(
     est_time: float,
-    suite: str,
+    suite: Optional[str] = None,
     nightly: bool = False,
     disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
 ):
     """Marker for AMD CI registration (parsed via AST; runtime no-op)."""
     return None
@@ -67,11 +112,99 @@ def register_amd_ci(
 
 def register_npu_ci(
     est_time: float,
-    suite: str,
+    suite: Optional[str] = None,
     nightly: bool = False,
     disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
 ):
     """Marker for NPU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def register_xpu_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for XPU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def register_musa_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for MUSA CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def register_mlx_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for MLX CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def register_ppu_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for PPU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def register_mps_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for Apple MPS CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def register_mlu_ci(
+    est_time: float,
+    suite: Optional[str] = None,
+    nightly: bool = False,
+    disabled: Optional[str] = None,
+    *,
+    stage: Optional[str] = None,
+    runner_config: Optional[str] = None,
+):
+    """Marker for MLU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def declare_models(*, skip_models: Sequence[str] = ()) -> None:
+    """Repo ids this test file names but does not load on CUDA, so CI does not
+    prefetch them. Read statically by scripts/ci/hf_repo_scan.py from a
+    top-level call (literals or module-level names); no-op at runtime."""
     return None
 
 
@@ -79,7 +212,13 @@ REGISTER_MAPPING = {
     "register_cpu_ci": HWBackend.CPU,
     "register_cuda_ci": HWBackend.CUDA,
     "register_amd_ci": HWBackend.AMD,
+    "register_musa_ci": HWBackend.MUSA,
     "register_npu_ci": HWBackend.NPU,
+    "register_xpu_ci": HWBackend.XPU,
+    "register_mlx_ci": HWBackend.MLX,
+    "register_mps_ci": HWBackend.MPS,
+    "register_ppu_ci": HWBackend.PPU,
+    "register_mlu_ci": HWBackend.MLU,
 }
 
 
@@ -94,10 +233,8 @@ class RegistryVisitor(ast.NodeVisitor):
             return node.value
         return _UNSET
 
-    def _parse_call_args(
-        self, func_call: ast.Call
-    ) -> tuple[float, str, bool, Optional[str]]:
-        args = {name: _UNSET for name in _PARAM_ORDER}
+    def _parse_call_args(self, func_call: ast.Call) -> dict:
+        args = {name: _UNSET for name in _ALL_PARAMS}
         seen = set()
 
         if any(isinstance(arg, ast.Starred) for arg in func_call.args):
@@ -129,23 +266,49 @@ class RegistryVisitor(ast.NodeVisitor):
             seen.add(kw.arg)
             args[kw.arg] = self._constant_value(kw.value)
 
-        if args["est_time"] is _UNSET or args["suite"] is _UNSET:
+        if args["est_time"] is _UNSET:
             raise ValueError(
-                f"{self.filename}: est_time and suite are required constants in {func_call.func.id}()"
+                f"{self.filename}: est_time is a required constant in {func_call.func.id}()"
             )
 
-        est_time, suite = args["est_time"], args["suite"]
-        nightly_value = args["nightly"]
+        # The only valid (stage, runner_config, suite) shapes are:
+        #   (set,   set,   unset)  -> new-style pair
+        #   (unset, unset, set)    -> legacy single-string
+        # Any other combination is rejected with the actual triple in the error.
+        stage_set = args["stage"] is not _UNSET
+        runner_set = args["runner_config"] is not _UNSET
+        suite_set = args["suite"] is not _UNSET
+        valid_shape = (stage_set and runner_set and not suite_set) or (
+            not stage_set and not runner_set and suite_set
+        )
+        if not valid_shape:
+            raise ValueError(
+                f"{self.filename}: {func_call.func.id}() must specify exactly one of "
+                f"(stage, runner_config) pair or suite; got stage={stage_set}, "
+                f"runner_config={runner_set}, suite={suite_set}"
+            )
 
+        est_time = args["est_time"]
         if not isinstance(est_time, (int, float)):
             raise ValueError(
                 f"{self.filename}: est_time must be a number in {func_call.func.id}()"
             )
-        if not isinstance(suite, str):
+
+        suite = args["suite"] if suite_set else None
+        if suite is not None and not isinstance(suite, str):
             raise ValueError(
                 f"{self.filename}: suite must be a string in {func_call.func.id}()"
             )
 
+        stage = args["stage"] if stage_set else None
+        runner_config = args["runner_config"] if runner_set else None
+        for name, value in (("stage", stage), ("runner_config", runner_config)):
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"{self.filename}: {name} must be a string in {func_call.func.id}()"
+                )
+
+        nightly_value = args["nightly"]
         if nightly_value is _UNSET:
             nightly = False
         elif isinstance(nightly_value, bool):
@@ -161,7 +324,14 @@ class RegistryVisitor(ast.NodeVisitor):
                 f"{self.filename}: disabled must be a string in {func_call.func.id}()"
             )
 
-        return float(est_time), suite, nightly, disabled
+        return {
+            "est_time": float(est_time),
+            "stage": stage,
+            "runner_config": runner_config,
+            "suite": suite,
+            "nightly": nightly,
+            "disabled": disabled,
+        }
 
     def _collect_ci_registry(self, func_call: ast.Call):
         if not isinstance(func_call.func, ast.Name):
@@ -171,14 +341,11 @@ class RegistryVisitor(ast.NodeVisitor):
         if backend is None:
             return None
 
-        est_time, suite, nightly, disabled = self._parse_call_args(func_call)
+        parsed = self._parse_call_args(func_call)
         return CIRegistry(
             backend=backend,
             filename=self.filename,
-            est_time=est_time,
-            suite=suite,
-            nightly=nightly,
-            disabled=disabled,
+            **parsed,
         )
 
     @staticmethod
@@ -230,17 +397,30 @@ def ut_parse_one_file(filename: str) -> Tuple[List[CIRegistry], bool]:
     return visitor.registries, visitor.has_main_entry
 
 
-def auto_partition(files: List[CIRegistry], rank: int, size: int) -> List[CIRegistry]:
+def auto_partition(
+    files: List[CIRegistry],
+    rank: int,
+    size: int,
+    live_est: Optional[dict] = None,
+) -> List[CIRegistry]:
     """Partition files into `size` sublists with approximately equal sums of
     estimated times using a greedy algorithm (LPT heuristic), and return the
     partition for the specified rank.
+
+    `live_est`: optional `filename -> est seconds` overrides; missing
+    files fall back to in-source `est_time`.
     """
     if not files or size <= 0:
         return []
 
+    def est_of(f: CIRegistry) -> float:
+        if live_est is not None and f.filename in live_est:
+            return live_est[f.filename]
+        return f.est_time
+
     # Sort by estimated_time descending; filename as tie-breaker for
     # deterministic partitioning regardless of glob ordering.
-    sorted_files = sorted(files, key=lambda f: (-f.est_time, f.filename))
+    sorted_files = sorted(files, key=lambda f: (-est_of(f), f.filename))
 
     partitions: List[List[CIRegistry]] = [[] for _ in range(size)]
     partition_sums = [0.0] * size
@@ -249,11 +429,39 @@ def auto_partition(files: List[CIRegistry], rank: int, size: int) -> List[CIRegi
     for file in sorted_files:
         min_sum_idx = min(range(size), key=partition_sums.__getitem__)
         partitions[min_sum_idx].append(file)
-        partition_sums[min_sum_idx] += file.est_time
+        partition_sums[min_sum_idx] += est_of(file)
 
     if rank < size:
         return partitions[rank]
     return []
+
+
+def load_live_est(
+    partition_model_file: Optional[str], suites: List[str], repo_root: str
+) -> Optional[Dict[str, float]]:
+    """`CIRegistry.filename -> est seconds` from `model.json est[suite]`,
+    merged across all requested `suites`; None if no suite yielded any entry
+    (caller then falls back to in-source `est_time`)."""
+    if not partition_model_file or not os.path.exists(partition_model_file):
+        return None
+    try:
+        with open(partition_model_file) as f:
+            partition_model = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(partition_model, dict):
+        return None
+    est_by_suite = partition_model.get("est", {})
+    if not isinstance(est_by_suite, dict):
+        return None
+    merged: Dict[str, float] = {}
+    for suite in suites:
+        suite_est = est_by_suite.get(suite)
+        if not isinstance(suite_est, dict):
+            continue
+        for relpath, elapsed in suite_est.items():
+            merged[os.path.join(repo_root, relpath)] = float(elapsed)
+    return merged or None
 
 
 def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistry]:
@@ -285,3 +493,38 @@ def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistr
         ci_tests.extend(registries)
 
     return ci_tests
+
+
+def registered_test_files(repo_root: str) -> List[str]:
+    return [
+        f
+        for f in glob.glob(
+            os.path.join(repo_root, "test", "registered", "**", "*.py"),
+            recursive=True,
+        )
+        # conftest.py / __init__.py are pytest+package structure, never
+        # registered tests, and must not be executed as one.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
+    ]
+
+
+def filter_tests(
+    ci_tests: List[CIRegistry],
+    hw: HWBackend,
+    suites: List[str],
+    nightly: bool = False,
+) -> Tuple[List[CIRegistry], List[CIRegistry]]:
+    """`(enabled, disabled)` tests of backend `hw` in any of `suites`.
+
+    `suites` may hold more than one suite (comma-separated --suite): the
+    matched tests are unioned so a single runner can partition several
+    suites as one balanced pool (e.g. base-b + base-c on a Xeon SPR box)."""
+    suite_set = set(suites)
+    ci_tests = [
+        t
+        for t in ci_tests
+        if t.backend == hw and t.effective_suite in suite_set and t.nightly == nightly
+    ]
+    enabled_tests = [t for t in ci_tests if t.disabled is None]
+    skipped_tests = [t for t in ci_tests if t.disabled is not None]
+    return enabled_tests, skipped_tests

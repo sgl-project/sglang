@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
+import msgspec
 import torch
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import ORJSONResponse
+from fastapi import APIRouter, HTTPException, Response
 
-from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    generate_request_id,
+)
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    build_sampling_params,
+    resolve_sampling_params_cls,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutRequest,
     RolloutResponse,
@@ -33,21 +40,33 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/rollout", tags=["rollout"])
 
 
-def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) -> Any:
+def _extract_single_sample_tensor(
+    obj: Any, sample_idx: int, batch_size: int, *, current_key: str | None = None
+) -> Any:
     if isinstance(obj, torch.Tensor):
         if obj.dim() >= 1 and obj.shape[0] == batch_size:
             return obj[sample_idx].contiguous()
         return obj
     if isinstance(obj, dict):
         return {
-            k: _extract_single_sample_tensor(v, sample_idx, batch_size)
+            k: _extract_single_sample_tensor(v, sample_idx, batch_size, current_key=k)
             for k, v in obj.items()
         }
     if isinstance(obj, list):
-        return [_extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj]
+        if current_key == "img_shapes" and len(obj) == batch_size:
+            return [obj[sample_idx]]
+        return [
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
+            for v in obj
+        ]
     if isinstance(obj, tuple):
         return tuple(
-            _extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj
+            _extract_single_sample_tensor(
+                v, sample_idx, batch_size, current_key=current_key
+            )
+            for v in obj
         )
     return obj
 
@@ -118,6 +137,7 @@ def _slice_rollout_trajectory_for_sample(
         dit_trajectory = RolloutDitTrajectory(
             latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
             timesteps=dit.timesteps,
+            sigmas=dit.sigmas,
         )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
@@ -131,6 +151,7 @@ def _serialize_rollout_trajectory(
     rtd: RolloutTrajectoryData | None,
     *,
     serialized_dit_timesteps: dict | None = None,
+    serialized_dit_sigmas: dict | None = None,
 ) -> tuple[dict | None, dict | None, dict | None, dict | None]:
     """Return order: rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory."""
     if rtd is None:
@@ -170,6 +191,7 @@ def _serialize_rollout_trajectory(
                 _maybe_serialize(dit.latents) if dit.latents is not None else None
             ),
             "timesteps": serialized_dit_timesteps,
+            "sigmas": serialized_dit_sigmas,
         }
     return (
         serialized_log_probs,
@@ -194,19 +216,25 @@ def _build_response(
     peak_memory_mb = result.peak_memory_mb if result.peak_memory_mb > 0 else None
     rollout_trajectory_data = result.rollout_trajectory_data
     if rollout:
-        assert (
-            rollout_trajectory_data is not None
-        ), "rollout_trajectory_data must be present when rollout=True"
+        assert rollout_trajectory_data is not None, (
+            "rollout_trajectory_data must be present when rollout=True"
+        )
 
     serialized_dit_timesteps = None
+    serialized_dit_sigmas = None
     if rollout and rollout_trajectory_data and rollout_trajectory_data.dit_trajectory:
         serialized_dit_timesteps = _maybe_serialize(
             rollout_trajectory_data.dit_trajectory.timesteps
         )
+        serialized_dit_sigmas = _maybe_serialize(
+            rollout_trajectory_data.dit_trajectory.sigmas
+        )
 
     responses: list[RolloutResponse] = []
     for sample_idx in range(batch_size):
-        out_i = result.output[sample_idx].contiguous()
+        out_i = result.output[sample_idx]
+        if isinstance(out_i, torch.Tensor):
+            out_i = out_i.contiguous()
         serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
             responses.append(
@@ -231,6 +259,7 @@ def _build_response(
         ) = _serialize_rollout_trajectory(
             per_sample_trajectory,
             serialized_dit_timesteps=serialized_dit_timesteps,
+            serialized_dit_sigmas=serialized_dit_sigmas,
         )
         responses.append(
             RolloutResponse(
@@ -247,6 +276,81 @@ def _build_response(
             )
         )
     return responses
+
+
+# Fields a remote /rollout/generate client must never override through
+# `extra_sampling_params`. These control where the server reads/writes files,
+# whether generated output is persisted, or identify/route the request
+# itself. Without this filter, an unauthenticated client could inject e.g.
+# `perf_dump_path` and make GPUWorker create directories and overwrite
+# arbitrary files (PerformanceLogger.dump_benchmark_report does os.makedirs
+# + an atomic os.replace at the supplied path), or flip `save_output` back
+# on after this endpoint forced it off. The rejected-vs-ignored choice is
+# deliberate: invalid request params fail loudly with HTTP 400 everywhere
+# else in this codebase (see _reject_remote_model_paths), so silently
+# dropping a field would hide client mistakes instead of surfacing them.
+_EXTRA_SAMPLING_PARAMS_BLOCKED_FIELDS = frozenset(
+    {
+        # file input paths (image_path already has a typed request field)
+        "image_path",
+        "video_path",
+        "prompt_path",
+        # file output paths
+        "output_path",
+        "output_file_name",
+        "perf_dump_path",
+        # model file paths (remote URLs are rejected later, but a client
+        # must not pick server-side files either)
+        "frame_interpolation_model_path",
+        "upscaling_model_path",
+        # output persistence control (this endpoint forces save_output=False)
+        "save_output",
+        # request/server identity and routing (server-derived, not client-set)
+        "request_id",
+        "data_type",
+        "task_type",
+        # internal switch guarding the protected-fields merge mechanism
+        "no_override_protected_fields",
+        # untyped nested dict passed straight to the diffusers scheduler;
+        # not a documented rollout knob and not examinable as a flat field
+        "diffusers_kwargs",
+    }
+)
+
+
+def _allowed_extra_sampling_params() -> frozenset[str]:
+    """Sampling knobs a rollout client may override via extra_sampling_params.
+
+    The active model's SamplingParams subclass when the server is running
+    (so model-specific knobs such as LTX's video_*_scale stay usable),
+    falling back to the base class when server args are not set (unit tests,
+    or before the server starts). Blocked fields can never be overridden,
+    whichever class is active; any other `*_path`/`*_paths` field is blocked
+    too, so a subclass-declared path field is covered as well.
+    """
+    cls: type[SamplingParams] = SamplingParams
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        # No global server args (unit tests, or before the server starts):
+        # fall back to the base class.
+        server_args = None
+    if server_args is not None:
+        try:
+            cls = resolve_sampling_params_cls(server_args)
+        except (ValueError, AttributeError, TypeError):
+            logger.debug(
+                "Could not resolve the active SamplingParams subclass; "
+                "falling back to the base-class allowlist.",
+                exc_info=True,
+            )
+    return frozenset(
+        field.name
+        for field in dataclasses.fields(cls)
+        if field.init
+        and field.name not in _EXTRA_SAMPLING_PARAMS_BLOCKED_FIELDS
+        and not field.name.endswith(("_path", "_paths"))
+    )
 
 
 def _build_sampling_kwargs(request: RolloutRequest) -> dict:
@@ -279,12 +383,42 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         return_trajectory_decoded=False,
     )
     if request.extra_sampling_params:
+        # The allowlist is about keys, not values: even a null value for a
+        # blocked field is rejected, because a null would otherwise be
+        # stripped by the None filter below and the downstream default
+        # (e.g. save_output=True in build_sampling_params) would silently
+        # re-enable the behaviour this endpoint forces off.
+        rejected = sorted(
+            key
+            for key in request.extra_sampling_params
+            if key not in _allowed_extra_sampling_params()
+        )
+        if rejected:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "extra_sampling_params may only contain SamplingParams "
+                    f"sampling knobs; rejected field(s): {', '.join(rejected)}. "
+                    "Path and output-control fields (e.g. perf_dump_path, "
+                    "output_path, save_output, image_path, video_path) "
+                    "cannot be set by a client."
+                ),
+            )
         sampling_kwargs.update(request.extra_sampling_params)
         sampling_kwargs["rollout"] = request.rollout
     return {k: v for k, v in sampling_kwargs.items() if v is not None}
 
 
-@router.post("/generate", response_model=list[RolloutResponse])
+@router.post(
+    "/generate",
+    response_class=Response,
+    responses={
+        200: {
+            "model": list[RolloutResponse],
+            "content": {"application/msgpack": {}},
+        }
+    },
+)
 async def rollout_generate(request: RolloutRequest):
     request_id = generate_request_id()
     server_args = get_global_server_args()
@@ -309,7 +443,12 @@ async def rollout_generate(request: RolloutRequest):
         ) from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
+    seed = request.seed if request.seed is not None else sampling_params.seed
     rollout_responses = _build_response(
-        request_id, request.prompt, request.seed, request.rollout, output_batch
+        request_id, request.prompt, seed, request.rollout, output_batch
     )
-    return ORJSONResponse(content=[r.model_dump() for r in rollout_responses])
+    payload = [r.model_dump() for r in rollout_responses]
+    return Response(
+        content=msgspec.msgpack.encode(payload),
+        media_type="application/msgpack",
+    )

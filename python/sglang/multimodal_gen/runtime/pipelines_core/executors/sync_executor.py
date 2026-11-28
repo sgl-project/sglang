@@ -7,9 +7,9 @@ Synchronous pipeline executor implementation.
 
 from typing import Any, Callable, List
 
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
-    SGLDiffusionProfiler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
@@ -29,17 +29,24 @@ class SyncExecutor(PipelineExecutor):
         run_stage: Callable[[PipelineStage, Any], Any],
     ) -> Any:
         """Execute all pipeline stages sequentially and step the profiler."""
-        self.begin_component_residency_request(stages, payload, server_args)
-        try:
+
+        run_stage = self.stage_runner(server_args, run_stage)
+        use_nvtx = self._should_use_stage_nvtx(payload, server_args)
+        requests = payload if isinstance(payload, list) else [payload]
+        with self._component_residency_request(stages, payload, server_args):
             for stage_index, stage in enumerate(stages):
-                self.before_stage(stage, stage_index, payload, server_args)
-                payload = run_stage(stage, payload)
-                self.after_stage(stage_index)
-                profiler = SGLDiffusionProfiler.get_instance()
-                if profiler:
-                    profiler.step_stage()
-        finally:
-            self.finish_component_residency_request()
+                raise_if_cancelled(requests)
+                payload = self._run_stage_with_executor_hooks(
+                    stage,
+                    stage_index,
+                    payload,
+                    server_args,
+                    run_stage,
+                    use_nvtx,
+                )
+                self._check_peer_waits(stage)
+                self._step_stage_profiler()
+            raise_if_cancelled(requests)
         return payload
 
     def run_profile_all_stages(

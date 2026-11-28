@@ -20,7 +20,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -31,6 +31,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -38,8 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaMLP as LoopCoderMLP
-from sglang.srt.utils import add_prefix, make_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ class LoopGateProjection(nn.Module):
         super().__init__()
         self.total_num_heads = total_num_heads
         self.head_dim = head_dim
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
 
@@ -90,9 +91,9 @@ class LoopGateProjection(nn.Module):
         """
         num_heads, num_tokens, head_dim = query.shape
 
-        assert (
-            num_heads == self.num_heads
-        ), f"Expected {self.num_heads} heads, got {num_heads}"
+        assert num_heads == self.num_heads, (
+            f"Expected {self.num_heads} heads, got {num_heads}"
+        )
 
         query_flat = query.reshape(-1, head_dim)
 
@@ -131,7 +132,7 @@ class LoopCoderAttention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

@@ -45,9 +45,8 @@ class TestB300FlashBalanced(DSV4FlashAime25TestBase):
         "--trust-remote-code",
         "--tp",
         "4",
-        "--dp",
+        "--attn-dp-size",
         "4",
-        "--enable-dp-attention",
         "--moe-a2a-backend",
         "deepep",
         "--speculative-algorithm",
@@ -70,9 +69,8 @@ class TestB300FlashMaxThroughput(DSV4FlashAime25TestBase):
         "--trust-remote-code",
         "--tp",
         "4",
-        "--dp",
+        "--attn-dp-size",
         "4",
-        "--enable-dp-attention",
         "--moe-a2a-backend",
         "deepep",
         "--deepep-config",
@@ -89,9 +87,9 @@ class TestB300FlashCP(DSV4FlashAime25TestBase):
         "4",
         "--moe-a2a-backend",
         "deepep",
-        "--enable-nsa-prefill-context-parallel",
-        "--nsa-prefill-cp-mode",
-        "round-robin-split",
+        "--enable-prefill-cp",
+        "--cp-strategy",
+        "interleave",
         "--chunked-prefill-size",
         "16384",
         "--mem-fraction-static",
@@ -102,7 +100,6 @@ class TestB300FlashCP(DSV4FlashAime25TestBase):
         DEEPEP_LARGE_SMS_CONFIG,
     ]
     EXTRA_ENV = {
-        "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "1",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     }
 

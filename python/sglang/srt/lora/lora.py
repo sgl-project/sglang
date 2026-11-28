@@ -26,11 +26,11 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
-from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 # Matches both per-expert keys ("...experts.0.<module>...") and shared-outer
 # keys ("...experts.<module>..."), while excluding "shared_experts." (where the
@@ -48,6 +48,7 @@ class LoRALayer(nn.Module):
 
         # lora weights in cpu. The weights are loaded from checkpoint.
         self.weights: Dict[str, torch.Tensor] = {}
+        self.pinned_weights: Dict[str, torch.Tensor] = {}
 
 
 class LoRAAdapter(nn.Module):
@@ -87,7 +88,9 @@ class LoRAAdapter(nn.Module):
         )
 
         self.embedding_layers: Dict[str, torch.Tensor] = {}
+        self.pinned_embedding_layers: Dict[str, torch.Tensor] = {}
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
+        self.pinned_added_tokens_embeddings: Dict[str, torch.Tensor] = {}
 
     @staticmethod
     def _build_moe_gated_map(base_model: torch.nn.Module) -> Dict[int, bool]:
@@ -138,33 +141,42 @@ class LoRAAdapter(nn.Module):
         return self._moe_is_gated_by_layer.get(layer_id) is False
 
     def initialize_weights(self):
+        from sglang.srt.lora.utils import get_normalized_target_modules
+
         model_path = self.config.path
         loader = DefaultModelLoader(self.load_config)
         revision = getattr(self.config.hf_config, "revision", None)
 
         # Get normalized target modules for filtering
+        normalized_target_modules = get_normalized_target_modules(
+            self.config.target_modules
+        )
         for name, loaded_weight in loader._get_weights_iterator(
             DefaultModelLoader.Source(
                 model_path, revision=revision, fall_back_to_pt=True
             )
         ):
-            self._process_weight(name, loaded_weight)
+            self._process_weight(name, loaded_weight, normalized_target_modules)
 
         self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
-        for name, tensor in tensors.items():
-            self._process_weight(name, tensor)
-
-        self._normalize_weights()
-
-    def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules
 
         normalized_target_modules = get_normalized_target_modules(
             self.config.target_modules
         )
+        for name, tensor in tensors.items():
+            self._process_weight(name, tensor, normalized_target_modules)
 
+        self._normalize_weights()
+
+    def _process_weight(
+        self,
+        name: str,
+        loaded_weight: torch.Tensor,
+        normalized_target_modules: set[str],
+    ):
         # Remap PEFT "unembed_tokens" key to "lm_head" so the weight is
         # recognized and loaded into the correct buffer.
         if "unembed_tokens" in name:
@@ -200,6 +212,8 @@ class LoRAAdapter(nn.Module):
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
+            self.normalize_inkling_qkvr_proj(weight_names, layer.weights)
+            self._normalize_shared_expert_moe(layer.weights)
             self._rename_expert_w_to_proj(layer.weights)
             # Stack gate_proj + x_proj → in_proj for Mamba layers (before gate_up normalization)
             self._normalize_in_proj(layer.weights)
@@ -209,6 +223,52 @@ class LoRAAdapter(nn.Module):
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
+
+    def normalize_inkling_qkvr_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
+        """Normalize Inkling split attention LoRA keys into the runtime qkvr layer.
+
+        Inkling checkpoints expose separate attention projections
+        (wq_du/wk_dv/wv_dv/wr_du), while the serving model uses a single
+        MergedColumnParallelLinear named qkvr with those slices in that order.
+        """
+        for weight_name in weight_names:
+            if "wq_du" not in weight_name:
+                continue
+
+            q_name = weight_name
+            k_name = weight_name.replace("wq_du", "wk_dv")
+            v_name = weight_name.replace("wq_du", "wv_dv")
+            r_name = weight_name.replace("wq_du", "wr_du")
+            qkvr_name = weight_name.replace("wq_du", "qkvr")
+
+            if any(name not in weights for name in (k_name, v_name, r_name)):
+                continue
+
+            cat_dim = weights[q_name].dim() - 2
+            weights[qkvr_name] = torch.cat(
+                (
+                    weights[q_name],
+                    weights[k_name],
+                    weights[v_name],
+                    weights[r_name],
+                ),
+                cat_dim,
+            )
+            weights.pop(q_name)
+            weights.pop(k_name)
+            weights.pop(v_name)
+            weights.pop(r_name)
+
+        for weight_name in list(weights.keys()):
+            if "qkvr" not in weight_name or "lora_A" not in weight_name:
+                continue
+            if weights[weight_name].shape[-2] != self.config.r:
+                continue
+            repeat_dims = [1] * weights[weight_name].dim()
+            repeat_dims[-2] = 4
+            weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -262,6 +322,61 @@ class LoRAAdapter(nn.Module):
                 if "lora_A" in weight_name:
                     weights[qkv_name] = weights[qkv_name].repeat(3, 1)
                 # else: no-op as LoRA B weight is already stacked.
+
+    def _normalize_shared_expert_moe(self, weights: Dict[str, torch.Tensor]):
+        """Reshape flat Inkling shared-sink factors to shared-outer 3D form."""
+        # Gate on the architecture so other models with 2D shared experts keep
+        # the stock path.
+        cfg = self.base_hf_config
+        if hasattr(cfg, "get_text_config"):
+            cfg = cfg.get_text_config()
+        archs = list(getattr(self.base_hf_config, "architectures", None) or [])
+        archs += list(getattr(cfg, "architectures", None) or [])
+        is_inkling = (
+            any("Inkling" in arch for arch in archs)
+            or "inkling" in str(getattr(cfg, "model_type", "")).lower()
+        )
+        if not is_inkling:
+            return
+        num_shared = getattr(cfg, "n_shared_experts", 0) or 0
+        if num_shared <= 0:
+            return
+        for name in list(weights.keys()):
+            if "shared_experts." not in name:
+                continue
+            if re.search(r"shared_experts\.\d+\.", name):
+                # Preserve named per-expert factors so adapter validation can
+                # reject outer factors that are not actually shared.
+                continue
+            is_down = any(k in name for k in (".w2.", ".down_proj."))
+            is_gate_up = any(
+                k in name
+                for k in (
+                    ".w1.",
+                    ".w3.",
+                    ".gate_proj.",
+                    ".up_proj.",
+                    ".gate_up_proj.",
+                )
+            )
+            if not (is_down or is_gate_up):
+                continue
+            w = weights[name]
+            if w.dim() != 2:
+                continue
+            if "lora_A" in name:
+                if is_down:
+                    r, flat = w.shape
+                    weights[name] = w.reshape(r, num_shared, flat // num_shared)
+                    weights[name] = weights[name].transpose(0, 1).contiguous()
+                else:
+                    weights[name] = w.unsqueeze(0)
+            else:
+                if is_down:
+                    weights[name] = w.unsqueeze(0)
+                else:
+                    flat, r = w.shape
+                    weights[name] = w.reshape(num_shared, flat // num_shared, r)
 
     def _rename_expert_w_to_proj(self, weights: Dict[str, torch.Tensor]):
         """Rename w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj so that
@@ -356,7 +471,12 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
+        from sglang.srt.lora.utils import PRESERVED_LORA_TARGET_NAMES
+
         for weight_name in weight_names:
+            if any(f".{name}." in weight_name for name in PRESERVED_LORA_TARGET_NAMES):
+                # The attention output gate has no up_proj to stack with.
+                continue
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
@@ -420,14 +540,3 @@ class LoRAAdapter(nn.Module):
             weights.pop(q_a_name)
             if kv_a_name in weights:
                 weights.pop(kv_a_name)
-
-    def pin_weights_in_cpu(self):
-        for layer in self.layers:
-            for name, weight in layer.weights.items():
-                layer.weights[name] = weight.pin_memory()
-
-        for name, weight in self.embedding_layers.items():
-            self.embedding_layers[name] = weight.pin_memory()
-
-        for name, weight in self.added_tokens_embeddings.items():
-            self.added_tokens_embeddings[name] = weight.pin_memory()

@@ -17,7 +17,6 @@ import os
 import unittest
 from typing import List
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
     BACKENDS,
@@ -29,16 +28,8 @@ from sglang.test.lora_utils import (
 )
 from sglang.test.test_utils import CustomTestCase, is_in_ci
 
-register_cuda_ci(est_time=224, suite="stage-b-test-1-gpu-small")
-register_amd_ci(
-    est_time=200,
-    suite="stage-b-test-1-gpu-small-amd",
-    disabled="see https://github.com/sgl-project/sglang/issues/13107",
-)
-
 
 class TestLoRABackend(CustomTestCase):
-
     def _run_backend_on_model_cases(self, model_cases: List[LoRAModelCase]):
         for model_case in model_cases:
             # If skip_long_prompt is True, filter out prompts longer than 1000 characters

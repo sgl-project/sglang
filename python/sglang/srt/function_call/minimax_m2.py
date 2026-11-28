@@ -10,6 +10,7 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
+from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +31,7 @@ class MinimaxM2Detector(BaseFormatDetector):
         super().__init__()
         self.tool_call_start_token: str = "<minimax:tool_call>"
         self.tool_call_end_token: str = "</minimax:tool_call>"
-        self.tool_call_prefix: str = '<invoke name="'
         self.tool_call_function_end_token: str = "</invoke>"
-        self.tool_call_regex = re.compile(
-            r"<minimax:tool_call>(.*?)</minimax:tool_call>|<minimax:tool_call>(.*?)$",
-            re.DOTALL,
-        )
         self.tool_call_function_regex = re.compile(
             r"<invoke name=\"(.*?)</invoke>|<invoke name=\"(.*)$", re.DOTALL
         )
@@ -47,9 +43,6 @@ class MinimaxM2Detector(BaseFormatDetector):
         # Streaming state variables
         self._current_function_name: str = ""
         self._current_parameters: Dict[str, Any] = {}
-        self._streamed_parameters: Dict[str, str] = (
-            {}
-        )  # Track what parameter content we've streamed
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 
@@ -59,10 +52,6 @@ class MinimaxM2Detector(BaseFormatDetector):
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         normal, calls = self._extract(text, tools)
         return StreamingParseResult(normal_text=normal, calls=calls)
-
-    def _convert_param_value(self, value: str, param_type: str) -> Any:
-        """Convert parameter value to the correct type (legacy single-type version)."""
-        return self._convert_param_value_with_types(value, [param_type])
 
     def _extract_types_from_schema(self, schema: Any) -> list[str]:
         """
@@ -256,7 +245,6 @@ class MinimaxM2Detector(BaseFormatDetector):
                 self._function_name_sent = False
                 self._current_function_name = ""
                 self._current_parameters = {}
-                self._streamed_parameters = {}
 
                 # Remove the start token
                 self._buf = self._buf[len(self.tool_call_start_token) :]
@@ -264,8 +252,11 @@ class MinimaxM2Detector(BaseFormatDetector):
 
             # We're in a tool call, try to parse function name if not sent yet
             if not self._function_name_sent:
-                # Look for function name pattern: <invoke name=name>
-                function_match = re.search(r"<invoke name=\"([^>]+)\">", self._buf)
+                # Look for function name pattern: <invoke name=name>, only before
+                # the section end; the text after it is content.
+                section_end = self._buf.find(self.tool_call_end_token)
+                section = self._buf if section_end == -1 else self._buf[:section_end]
+                function_match = re.search(r"<invoke name=\"([^>]+)\">", section)
                 if function_match:
                     function_name = function_match.group(1).strip()
 
@@ -303,43 +294,53 @@ class MinimaxM2Detector(BaseFormatDetector):
                         self._buf = self._buf[function_match.end() :]
                         continue
                     else:
-                        # Invalid function name, reset state
-                        logger.warning(f"Invalid function name: {function_name}")
-                        self._reset_streaming_state()
-                        normal += self._buf
-                        self._buf = ""
+                        # Drop the whole invoke, as detect_and_parse does.
+                        invoke_end = section.find(
+                            self.tool_call_function_end_token, function_match.end()
+                        )
+                        if invoke_end != -1:
+                            logger.warning(f"Invalid function name: {function_name}")
+                            self._buf = self._buf[
+                                invoke_end + len(self.tool_call_function_end_token) :
+                            ]
+                            self._reset_streaming_state(True)
+                            continue
                         break
                 else:
+                    # No further invoke: leave tool-call mode at the section end.
+                    if section_end != -1:
+                        self._buf = self._buf[
+                            section_end + len(self.tool_call_end_token) :
+                        ]
+                        self._reset_streaming_state(False)
+                        continue
                     # Function name not complete yet, wait for more text
                     break
 
             # Parse parameters incrementally
             if self._function_name_sent:
-                # Process parameters and get any calls to emit
-                parameter_calls = self._parse_and_stream_parameters(self._buf, tools)
+                # Parse only this invoke; the next one may already be buffered.
+                end_pos = self._buf.find(self.tool_call_function_end_token)
+                invoke_text = self._buf if end_pos == -1 else self._buf[:end_pos]
+                parameter_calls = self._parse_and_stream_parameters(invoke_text, tools)
                 calls.extend(parameter_calls)
 
                 # Check if tool call is complete
-                if self.tool_call_function_end_token in self._buf:
-                    end_pos = self._buf.find(self.tool_call_function_end_token)
-
-                    # Add closing brace to complete the JSON object
+                if end_pos != -1:
+                    # The streamed object is left open; a call with no parameters
+                    # has streamed nothing yet.
                     current_streamed = self.streamed_args_for_tool[self.current_tool_id]
-                    if current_streamed:
-                        # Count opening and closing braces to check if JSON is complete
-                        open_braces = current_streamed.count("{")
-                        close_braces = current_streamed.count("}")
-                        if open_braces > close_braces:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id,
-                                    name=None,
-                                    parameters="}",
-                                )
-                            )
-                            self.streamed_args_for_tool[self.current_tool_id] = (
-                                current_streamed + "}"
-                            )
+                    closing = "}" if current_streamed else "{}"
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=closing,
+                        )
+                    )
+                    self.streamed_args_for_tool[self.current_tool_id] = (
+                        current_streamed + closing
+                    )
 
                     # Complete the tool call
                     self._buf = self._buf[
@@ -452,7 +453,6 @@ class MinimaxM2Detector(BaseFormatDetector):
         self._function_name_sent = False
         self._current_function_name = ""
         self._current_parameters = {}
-        self._streamed_parameters = {}
         self.current_tool_name_sent = False
 
     def _extract(self, text: str, tools: List[Tool]) -> Tuple[str, List[ToolCallItem]]:
@@ -508,8 +508,8 @@ class MinimaxM2Detector(BaseFormatDetector):
         for tool in tools:
             if tool.function.name == fname and tool.function.parameters is not None:
                 parameters = tool.function.parameters
-                if isinstance(parameters, dict) and "properties" in parameters:
-                    param_config = parameters["properties"]
+                if isinstance(parameters, dict):
+                    param_config = get_schema_properties(parameters)
                     break
 
         param_type = self._get_param_types_from_config(pname, param_config)

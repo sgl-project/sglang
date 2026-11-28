@@ -477,6 +477,7 @@ class Qwen3VLMoeVisionConfig(PretrainedConfig):
         num_position_embeddings=2304,
         deepstack_visual_indexes=[8, 16, 24],
         initializer_range=0.02,
+        disable_merger_proj=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -494,6 +495,7 @@ class Qwen3VLMoeVisionConfig(PretrainedConfig):
         self.num_position_embeddings = num_position_embeddings
         self.initializer_range = initializer_range
         self.deepstack_visual_indexes = deepstack_visual_indexes
+        self.disable_merger_proj = disable_merger_proj
 
 
 class Qwen3VLMoeConfig(PretrainedConfig):

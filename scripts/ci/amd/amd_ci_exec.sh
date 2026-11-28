@@ -1,28 +1,45 @@
 #!/bin/bash
 set -euo pipefail
+# Container the CI steps run in. Spur jobs that share a node give each job its
+# own; everywhere else it stays ci_sglang.
+CI_CONTAINER_NAME="${CI_CONTAINER_NAME:-ci_sglang}"
 
 # Detect GPU family from hostname (e.g., linux-mi35x-gpu-1-xxxxx-runner-zzzzz)
 HOSTNAME_VALUE=$(hostname)
 GPU_FAMILY=""
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+# Non-ARC runners have no such hostname and set AMD_CI_GPU_ARCH instead.
+if [[ -n "${AMD_CI_GPU_ARCH:-}" ]]; then
+  GPU_FAMILY="${AMD_CI_GPU_ARCH}"
+  echo "Using GPU family from AMD_CI_GPU_ARCH: ${GPU_FAMILY}"
+elif [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_FAMILY="${BASH_REMATCH[1]}"
   echo "Detected GPU family from hostname: ${GPU_FAMILY}"
 else
   echo "Warning: could not parse GPU family from '${HOSTNAME_VALUE}'"
 fi
 
-WORKDIR="/sglang-checkout/test/srt"
+WORKDIR="/sglang-checkout/test"
 declare -A ENV_MAP=(
   [SGLANG_IS_IN_CI_AMD]=1
   [SGLANG_IS_IN_CI]=1
+  # Disabled on AMD: the async-assert probes (#27461) fire torch._assert_async in
+  # the MXFP4 EAGLE-MTP decode path and abort the queue with an HSA hardware
+  # exception.
+  [SGLANG_ENABLE_ASYNC_ASSERT]=0
   [SGLANG_USE_AITER]=1
 )
 
 # Conditionally add GPU_ARCHS only for mi35x
 if [[ "${GPU_FAMILY}" == "mi35x" ]]; then
   ENV_MAP[GPU_ARCHS]="gfx950"
+fi
+
+# The download-sgl-router action puts the binary in the workspace, which the
+# container mounts at /sglang-checkout.
+if [[ -n "${SGLANG_TEST_PD_ROUTER_BINARY:-}" && -n "${GITHUB_WORKSPACE:-}" ]]; then
+  ENV_MAP[SGLANG_TEST_PD_ROUTER_BINARY]="/sglang-checkout${SGLANG_TEST_PD_ROUTER_BINARY#"${GITHUB_WORKSPACE}"}"
 fi
 
 # Parse -w/--workdir and -e ENV=VAL
@@ -61,7 +78,7 @@ done
 if docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
-  ci_sglang "$@"; then
+  "$CI_CONTAINER_NAME" "$@"; then
   exit 0
 else
   FIRST_EXIT_CODE=$?
@@ -86,4 +103,4 @@ docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
   -e HF_HUB_OFFLINE=1 \
-  ci_sglang "$@"
+  "$CI_CONTAINER_NAME" "$@"

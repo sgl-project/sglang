@@ -8,32 +8,34 @@ os.environ.setdefault("SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", "50")
 os.environ.setdefault("SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", "4")
 
 import logging
-import shlex
 import time
 import unittest
 from urllib.parse import urlparse
 
 import requests
 
+from sglang.srt.observability.mooncake_trace import MooncakeRequestStage
 from sglang.srt.observability.req_time_stats import RequestStage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.otel_collector import LightweightOtlpCollector
-from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    get_rdma_devices_args,
+    popen_launch_sgl_router,
+)
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_pd_server,
-    popen_with_error_check,
 )
 from sglang.utils import wait_for_http_ready
 
 logger = logging.getLogger(__name__)
 
 # CI registration - PD disaggregation requires 2 GPUs
-register_cuda_ci(est_time=65, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=69, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestTraceDisaggregation(CustomTestCase):
@@ -78,6 +80,8 @@ class TestTraceDisaggregation(CustomTestCase):
             "--enable-trace",
             "--otlp-traces-endpoint",
             "localhost:4317",
+            "--trace-modules",
+            "request,mooncake",
         ]
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = popen_launch_pd_server(
@@ -123,24 +127,12 @@ class TestTraceDisaggregation(CustomTestCase):
         )
 
         # Start load balancer
-        lb_command = [
-            "python3",
-            "-m",
-            "sglang_router.launch_router",
-            "--pd-disaggregation",
-            "--mini-lb",
-            "--prefill",
-            cls.prefill_url,
-            "--decode",
-            cls.decode_url,
-            "--host",
-            cls.base_host,
-            "--port",
-            cls.lb_port,
-        ]
-        print("Starting load balancer:", shlex.join(lb_command))
-        cls.process_lb = popen_with_error_check(lb_command)
-        wait_for_http_ready(url=cls.lb_url + "/health", process=cls.process_lb)
+        cls.process_lb = popen_launch_sgl_router(
+            cls.model,
+            [cls.prefill_url, cls.decode_url],
+            host=cls.base_host,
+            port=cls.lb_port,
+        )
 
         # Wait for warmup spans and clear
         time.sleep(1)
@@ -186,9 +178,7 @@ class TestTraceDisaggregation(CustomTestCase):
     def test_disaggregation_transfer_spans(self):
         """Test that disaggregation produces PREFILL_TRANSFER_KV_CACHE and DECODE_TRANSFERRED spans."""
         # Set trace level
-        response = requests.get(f"{self.prefill_url}/set_trace_level?level=1")
-        self.assertEqual(response.status_code, 200)
-        response = requests.get(f"{self.decode_url}/set_trace_level?level=1")
+        response = requests.get(f"{self.prefill_url}/set_trace_level?level=2")
         self.assertEqual(response.status_code, 200)
         self.collector.clear()
 
@@ -221,13 +211,14 @@ class TestTraceDisaggregation(CustomTestCase):
 
         # Check for transfer-related spans
         self.assertTrue(
-            self.collector.has_any_span(
+            self.collector.has_all_spans(
                 [
                     RequestStage.PREFILL_TRANSFER_KV_CACHE.stage_name,
                     RequestStage.DECODE_TRANSFERRED.stage_name,
+                    MooncakeRequestStage.MOONCAKE_WORKER_SEND.stage_name,
                 ]
             ),
-            f"Expected disaggregation transfer spans, got {sorted(span_names)}",
+            f"Expected all disaggregation transfer spans, got {sorted(span_names)}",
         )
 
 

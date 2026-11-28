@@ -11,15 +11,26 @@ import numpy as np
 import requests
 from tqdm.asyncio import tqdm
 
-from sglang.bench_serving import RequestFuncOutput
 from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.serving import RequestFuncOutput
 from sglang.benchmark.utils import get_tokenizer
 from sglang.test.kits.cache_hit_kit import (
     async_request_openai_chat_completions,
     async_request_sglang_generate,
+    calculate_tpot_statistics,
     gen_payload,
     gen_payload_openai,
 )
+
+
+def parse_json_object(value):
+    try:
+        obj = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(f"invalid JSON: {exc.msg}") from exc
+    if not isinstance(obj, dict):
+        raise argparse.ArgumentTypeError("expected a JSON object")
+    return obj
 
 
 def parse_args():
@@ -86,6 +97,21 @@ def parse_args():
         type=str,
         default="meta-llama/Llama-3.1-8B-Instruct",
         help="model path compatible with Hugging Face Transformers",
+    )
+    parser.add_argument(
+        "--model",
+        help="Model ID for OpenAI chat requests (defaults to --model-path)",
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=parse_json_object,
+        help="JSON object of chat template parameters for OpenAI chat requests",
+    )
+    parser.add_argument(
+        "--extra-request-body",
+        type=parse_json_object,
+        help="JSON object of extra request fields for --api-format openai. "
+        "--chat-template-kwargs takes precedence if both set chat_template_kwargs.",
     )
     parser.add_argument(
         "--dataset-path",
@@ -165,7 +191,26 @@ def parse_args():
         help="API format to use: 'sglang' for native /generate endpoint, "
         "'openai' for OpenAI-compatible /v1/chat/completions endpoint.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.extra_request_body is not None:
+        if args.api_format != "openai":
+            parser.error("--extra-request-body requires --api-format openai")
+        managed_fields = {
+            "model",
+            "messages",
+            "max_tokens",
+            "max_completion_tokens",
+            "n",
+            "stream",
+            "stream_options",
+        }
+        conflicts = managed_fields.intersection(args.extra_request_body)
+        if conflicts:
+            parser.error(
+                "--extra-request-body cannot override benchmark-managed fields: "
+                + ", ".join(sorted(conflicts))
+            )
+    return args
 
 
 def log_to_jsonl_file(data, file_path="performance_metrics.jsonl", tag=""):
@@ -211,7 +256,9 @@ class ReadyQueue:
 class WorkloadGenerator:
     def __init__(self, args):
         self.api_format = args.api_format
-        self.model_path = args.model_path
+        self.model = args.model or args.model_path
+        self.chat_template_kwargs = args.chat_template_kwargs
+        self.extra_request_body = args.extra_request_body
 
         # Construct the base URL and select request/payload functions
         if self.api_format == "openai":
@@ -319,7 +366,9 @@ class WorkloadGenerator:
                     gen_payload_openai(
                         initial_messages[i],
                         first_round_output_lens[i],
-                        self.model_path,
+                        self.model,
+                        chat_template_kwargs=self.chat_template_kwargs,
+                        extra_request_body=self.extra_request_body,
                     ),
                 )
                 for i in range(args.num_clients)
@@ -362,6 +411,7 @@ class WorkloadGenerator:
         self.pbar = tqdm(total=self.total_requests)
         self.performance_metrics = {
             "ttft": [],
+            "tpot": [],
             "itl": [],
             "latency": [],
             "prompt_len": [],
@@ -458,6 +508,8 @@ class WorkloadGenerator:
                 current_round = self.client_records[client_id]["round"]
                 self.client_records[client_id]["round"] += 1
                 self.performance_metrics["ttft"].append(response.ttft)
+                if response.tpot is not None:
+                    self.performance_metrics["tpot"].append(response.tpot)
                 self.performance_metrics["itl"].extend(response.itl)
                 self.performance_metrics["latency"].append(response.latency)
                 self.performance_metrics["prompt_len"].append(response.prompt_len)
@@ -495,7 +547,9 @@ class WorkloadGenerator:
                             gen_payload_openai(
                                 self.client_records[client_id]["history"],
                                 sub_q.output_len,
-                                self.model_path,
+                                self.model,
+                                chat_template_kwargs=self.chat_template_kwargs,
+                                extra_request_body=self.extra_request_body,
                             ),
                         )
                     else:
@@ -582,6 +636,8 @@ class WorkloadGenerator:
         def max_or_zero(sorted_vals):
             return sorted_vals[-1] if sorted_vals else 0.0
 
+        tpot_statistics = calculate_tpot_statistics(self.performance_metrics["tpot"])
+
         performance_data = {
             "summary": {
                 "total_requests": len(self.performance_metrics["ttft"]),
@@ -608,6 +664,7 @@ class WorkloadGenerator:
                 "p99_ttft": percentile(sorted_ttft, 0.99),
                 "median_ttft": percentile(sorted_ttft, 0.5),
                 "max_ttft": max_or_zero(sorted_ttft),
+                **tpot_statistics,
                 "average_itl": (
                     sum(self.performance_metrics["itl"])
                     / len(self.performance_metrics["itl"])
@@ -686,6 +743,11 @@ class WorkloadGenerator:
         print(f"  P99 TTFT: {performance_data['summary']['p99_ttft']:.2f}")
         print(f"  Median TTFT: {performance_data['summary']['median_ttft']:.2f}")
         print(f"  Max TTFT: {performance_data['summary']['max_ttft']:.2f}")
+        print(f"  Average TPOT: {performance_data['summary']['average_tpot']:.4f}")
+        print(f"  P90 TPOT: {performance_data['summary']['p90_tpot']:.4f}")
+        print(f"  P99 TPOT: {performance_data['summary']['p99_tpot']:.4f}")
+        print(f"  Median TPOT: {performance_data['summary']['median_tpot']:.4f}")
+        print(f"  Max TPOT: {performance_data['summary']['max_tpot']:.4f}")
         print(f"  Average ITL: {performance_data['summary']['average_itl']:.4f}")
         print(f"  P90 ITL: {performance_data['summary']['p90_itl']:.4f}")
         print(f"  P99 ITL: {performance_data['summary']['p99_itl']:.4f}")

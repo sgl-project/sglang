@@ -4,12 +4,13 @@ import types
 import unittest
 
 import torch
+from fastapi import HTTPException
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_deserialize,
     _maybe_serialize,
-    base64_to_tensor,
-    tensor_to_base64,
+    bytes_to_tensor,
+    tensor_to_bytes,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
@@ -20,12 +21,11 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 )
 
 
-class TestTensorToBase64Roundtrip(unittest.TestCase):
-
+class TestTensorToBytesRoundtrip(unittest.TestCase):
     def _roundtrip(self, t: torch.Tensor):
-        encoded = tensor_to_base64(t)
-        self.assertIsInstance(encoded, str)
-        decoded = base64_to_tensor(encoded)
+        encoded = tensor_to_bytes(t)
+        self.assertIsInstance(encoded, bytes)
+        decoded = bytes_to_tensor(encoded)
         self.assertTrue(
             torch.equal(t, decoded), f"Mismatch for shape={t.shape} dtype={t.dtype}"
         )
@@ -55,21 +55,21 @@ class TestTensorToBase64Roundtrip(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA not available")
         t = torch.randn(4, device="cuda")
-        encoded = tensor_to_base64(t)
-        decoded = base64_to_tensor(encoded)
+        encoded = tensor_to_bytes(t)
+        decoded = bytes_to_tensor(encoded)
         self.assertTrue(torch.equal(t.cpu(), decoded))
 
     def test_non_contiguous(self):
         t = torch.randn(4, 6)[:, ::2]
         self.assertFalse(t.is_contiguous())
         self._roundtrip(t.contiguous())
-        decoded = base64_to_tensor(tensor_to_base64(t))
+        decoded = bytes_to_tensor(tensor_to_bytes(t))
         self.assertTrue(torch.equal(t.contiguous(), decoded))
 
     def test_grad_tensor_detaches(self):
         t = torch.randn(3, requires_grad=True)
-        encoded = tensor_to_base64(t)
-        decoded = base64_to_tensor(encoded)
+        encoded = tensor_to_bytes(t)
+        decoded = bytes_to_tensor(encoded)
         self.assertFalse(decoded.requires_grad)
         self.assertTrue(torch.equal(t.detach(), decoded))
 
@@ -82,7 +82,7 @@ class TestMaybeSerialize(unittest.TestCase):
         self.assertTrue(result["__tensor__"])
         self.assertEqual(result["shape"], [2, 3])
         self.assertEqual(result["dtype"], "torch.float32")
-        decoded = base64_to_tensor(result["data"])
+        decoded = bytes_to_tensor(result["data"])
         self.assertTrue(torch.equal(t, decoded))
 
     def test_dict_with_tensors(self):
@@ -207,11 +207,13 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             dit_trajectory=RolloutDitTrajectory(
                 latents=torch.randn(1, 5, 4, 2, 2, 2),
                 timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25]),
+                sigmas=torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
             ),
         )
         _, _, env, dit_traj = _serialize_rollout_trajectory(
             rtd,
             serialized_dit_timesteps=_maybe_serialize(rtd.dit_trajectory.timesteps),
+            serialized_dit_sigmas=_maybe_serialize(rtd.dit_trajectory.sigmas),
         )
         self.assertIsNotNone(env)
         self.assertIn("pos_cond_kwargs", env)
@@ -219,8 +221,10 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         self.assertIsNotNone(dit_traj)
         self.assertIn("latents", dit_traj)
         self.assertIn("timesteps", dit_traj)
+        self.assertIn("sigmas", dit_traj)
         self.assertTrue(dit_traj["latents"]["__tensor__"])
         self.assertTrue(dit_traj["timesteps"]["__tensor__"])
+        self.assertTrue(dit_traj["sigmas"]["__tensor__"])
 
 
 class TestBuildResponse(unittest.TestCase):
@@ -243,7 +247,7 @@ class TestBuildResponse(unittest.TestCase):
         self.assertEqual(resp.seed, 42)
         self.assertIsNotNone(resp.generated_output)
         self.assertIsNotNone(resp.rollout_log_probs)
-        lp = base64_to_tensor(resp.rollout_log_probs["data"])
+        lp = bytes_to_tensor(resp.rollout_log_probs["data"])
         self.assertEqual(lp.shape, ())
         self.assertAlmostEqual(resp.inference_time_s, 2.5)
 
@@ -308,12 +312,12 @@ class TestBuildResponse(unittest.TestCase):
         batch.metrics = self._make_metrics(1.0)
         resps = _build_response("rb", "p", 0, True, batch)
         self.assertEqual(len(resps), B)
-        lp0 = base64_to_tensor(resps[0].rollout_log_probs["data"])
-        lp1 = base64_to_tensor(resps[1].rollout_log_probs["data"])
+        lp0 = bytes_to_tensor(resps[0].rollout_log_probs["data"])
+        lp1 = bytes_to_tensor(resps[1].rollout_log_probs["data"])
         self.assertEqual(lp0.shape, (T,))
         self.assertEqual(lp1.shape, (T,))
-        g0 = base64_to_tensor(resps[0].generated_output["data"])
-        g1 = base64_to_tensor(resps[1].generated_output["data"])
+        g0 = bytes_to_tensor(resps[0].generated_output["data"])
+        g1 = bytes_to_tensor(resps[1].generated_output["data"])
         self.assertEqual(g0.shape, (1, 8, 8))
         self.assertEqual(g1.shape, (1, 8, 8))
         self.assertFalse(torch.equal(g0, g1))
@@ -327,6 +331,7 @@ class TestBuildResponse(unittest.TestCase):
                 dit_trajectory=RolloutDitTrajectory(
                     latents=torch.randn(B, T + 1, D),
                     timesteps=torch.linspace(1.0, 0.0, T),
+                    sigmas=torch.linspace(1.0, 0.0, T + 1),
                 ),
             ),
         )
@@ -335,10 +340,14 @@ class TestBuildResponse(unittest.TestCase):
         self.assertEqual(len(resps), B)
         self.assertIsNotNone(resps[0].dit_trajectory)
         self.assertIsNotNone(resps[1].dit_trajectory)
-        ts0 = base64_to_tensor(resps[0].dit_trajectory["timesteps"]["data"])
-        ts1 = base64_to_tensor(resps[1].dit_trajectory["timesteps"]["data"])
+        ts0 = bytes_to_tensor(resps[0].dit_trajectory["timesteps"]["data"])
+        ts1 = bytes_to_tensor(resps[1].dit_trajectory["timesteps"]["data"])
         self.assertEqual(ts0.shape, (T,))
         self.assertTrue(torch.equal(ts0, ts1))
+        sg0 = bytes_to_tensor(resps[0].dit_trajectory["sigmas"]["data"])
+        sg1 = bytes_to_tensor(resps[1].dit_trajectory["sigmas"]["data"])
+        self.assertEqual(sg0.shape, (T + 1,))
+        self.assertTrue(torch.equal(sg0, sg1))
         self.assertEqual(
             _maybe_deserialize(resps[1].dit_trajectory["latents"]).shape, (T + 1, D)
         )
@@ -354,6 +363,71 @@ class TestBuildResponse(unittest.TestCase):
         self.assertIsNone(resps[0].rollout_log_probs)
         self.assertIsNone(resps[1].rollout_log_probs)
         self.assertIsNotNone(resps[0].generated_output)
+
+
+class TestRolloutGenerateEndpoint(unittest.TestCase):
+    def _generate(self, **request_fields):
+        import asyncio
+        from unittest.mock import patch
+
+        import msgspec
+
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training import (
+            rollout_api,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+            RolloutRequest,
+        )
+
+        async def forward(pipeline_request):
+            return OutputBatch(output=torch.zeros(1, 3, 1, 8, 8))
+
+        def build_sampling_params(request_id, **kwargs):
+            return SamplingParams(request_id=request_id, **kwargs)
+
+        with (
+            patch.object(rollout_api, "get_global_server_args", return_value=None),
+            patch.object(rollout_api, "build_sampling_params", build_sampling_params),
+            patch.object(rollout_api, "prepare_request", lambda **kwargs: None),
+            patch.object(
+                rollout_api,
+                "async_scheduler_client",
+                types.SimpleNamespace(forward=forward),
+            ),
+        ):
+            response = asyncio.run(
+                rollout_api.rollout_generate(
+                    RolloutRequest(
+                        prompt="x",
+                        num_inference_steps=4,
+                        rollout=False,
+                        **request_fields,
+                    )
+                )
+            )
+
+        payload = msgspec.msgpack.decode(response.body)
+        self.assertEqual(len(payload), 1)
+        return payload[0]
+
+    def test_request_without_seed_reports_the_seed_that_was_used(self):
+        """`seed` is optional on the request; a seedless rollout must return the
+        generated sample with the default seed it ran with, not fail after generation."""
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+
+        self.assertEqual(self._generate()["seed"], SamplingParams.seed)
+
+    def test_request_seed_is_reported_next_to_a_per_sample_seed_list(self):
+        """`extra_sampling_params` may carry a list of seeds, which the response's
+        integer `seed` field cannot hold; the request's own seed is reported."""
+        sample = self._generate(seed=7, extra_sampling_params={"seed": [3, 4]})
+
+        self.assertEqual(sample["seed"], 7)
 
 
 class TestBuildSamplingKwargs(unittest.TestCase):
@@ -406,6 +480,93 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         req = Req(sampling_params=sp)
         self.assertEqual(req.rollout_sde_step_indices, [0, 2])
         self.assertEqual(req.rollout_return_step_indices, [1, 3])
+
+    def test_extra_sampling_params_allows_sampling_knobs(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        kwargs = _build_sampling_kwargs(
+            self._make_request(
+                extra_sampling_params={
+                    "guidance_scale_2": 2.5,
+                    "enable_teacache": True,
+                }
+            )
+        )
+        self.assertEqual(kwargs["guidance_scale_2"], 2.5)
+        self.assertTrue(kwargs["enable_teacache"])
+
+    def test_extra_sampling_params_rejects_path_and_output_control_fields(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        # Regression test for sglang#51555: an unauthenticated client could
+        # inject these through extra_sampling_params and make GPUWorker
+        # create directories / overwrite arbitrary files (perf_dump_path)
+        # or re-enable on-disk output (save_output + output_path).
+        for field, value in [
+            ("perf_dump_path", "/tmp/evil/report.json"),
+            ("output_path", "/tmp/evil"),
+            ("output_file_name", "evil.mp4"),
+            ("save_output", True),
+            ("image_path", "/etc/passwd"),
+            ("video_path", "/etc/passwd"),
+            ("prompt_path", "/etc/passwd"),
+            ("frame_interpolation_model_path", "/tmp/evil/model.pkl"),
+            ("upscaling_model_path", "/tmp/evil/model.pth"),
+            ("request_id", "spoofed"),
+            ("data_type", "IMAGE"),
+            ("task_type", "ACTION"),
+            ("no_override_protected_fields", True),
+            # not a SamplingParams field at all (incl. the nested
+            # diffusers_kwargs escape hatch): unknown keys are rejected too.
+            ("diffusers_kwargs", {"key": "value"}),
+            ("not_a_real_field", 1),
+        ]:
+            with self.subTest(field=field):
+                with self.assertRaises(HTTPException) as ctx:
+                    _build_sampling_kwargs(
+                        self._make_request(extra_sampling_params={field: value})
+                    )
+                self.assertEqual(ctx.exception.status_code, 400)
+                self.assertIn(field, ctx.exception.detail)
+
+    def test_extra_sampling_params_none_values_are_ignored(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        # None means "unset" for an allowed knob: it is dropped by the
+        # None filter below. A blocked field set to None is still rejected:
+        # stripping it would let the downstream default (e.g. save_output
+        # defaults to True in build_sampling_params) silently re-enable
+        # the behaviour this endpoint forces off.
+        kwargs = _build_sampling_kwargs(
+            self._make_request(extra_sampling_params={"guidance_scale_2": None})
+        )
+        self.assertNotIn("guidance_scale_2", kwargs)
+        with self.assertRaises(HTTPException) as ctx:
+            _build_sampling_kwargs(
+                self._make_request(extra_sampling_params={"save_output": None})
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_extra_sampling_params_model_specific_field_needs_server_args(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        # video_cfg_scale only exists on the LTX SamplingParams subclass. With
+        # no global server args set, the allowlist falls back to the base
+        # class, so it is rejected here; with a running LTX server it is
+        # allowed (the subclass is resolved from the global server args).
+        with self.assertRaises(HTTPException) as ctx:
+            _build_sampling_kwargs(
+                self._make_request(extra_sampling_params={"video_cfg_scale": 3.0})
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 if __name__ == "__main__":

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
-from collections import deque
-from typing import Deque, Generic, List, Optional, TypeVar
+import logging
+from typing import Callable, Generic, List, Optional, TypeVar
 
-import zmq
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -22,46 +22,68 @@ class FanOutCommunicator(Generic[T]):
     Only one request is in-flight at any time in either mode.
     """
 
-    def __init__(self, sender: zmq.Socket, fan_out: int, mode="queueing"):
-        self._sender = sender
+    _STRAGGLER_WINDOW_S = 0.05
+    _STRAGGLER_POLL_S = 0.005
+
+    def __init__(
+        self,
+        send: Callable[[T], None],
+        fan_out: int,
+        mode: str = "queueing",
+    ):
+        self._send = send
         self._fan_out = fan_out
         self._mode = mode
         self._result_event: Optional[asyncio.Event] = None
         self._result_values: Optional[List[T]] = None
-        self._ready_queue: Deque[asyncio.Event] = deque()
+        # DP rank of each reply, None when the sender did not stamp one.
+        self._result_senders: Optional[List[Optional[int]]] = None
+        self._result_fan_out: Optional[int] = None
+        # Replies from DP ranks at or above this are from retired ranks.
+        self._live_senders: Optional[int] = None
+        self._queueing_lock = asyncio.Lock()
 
         assert mode in ["queueing", "watching"]
 
     async def queueing_call(self, obj: T):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
-            assert self._result_event is None
-            assert self._result_values is None
+        # asyncio.Lock is FIFO-fair: a new caller cannot acquire while earlier
+        # callers are still waiting, so requests are strictly serialized in
+        # arrival order. It also releases on exception/cancellation, so a
+        # failed caller never blocks the callers queued behind it.
+        async with self._queueing_lock:
+            if obj is not None:
+                self._send(obj)
 
-        if obj is not None:
-            self._sender.send_pyobj(obj)
-
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
-
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
+            self._result_event = asyncio.Event()
+            self._result_values = []
+            self._result_senders = []
+            self._result_fan_out = self._fan_out
+            requested = self._fan_out
+            try:
+                await self._result_event.wait()
+                # Snapshot: a straggler absorbed below must not reach the caller.
+                result_values = list(self._result_values)
+                # Absorb replies a set_fan_out shrink left owed, so the next call never
+                # sees them; one slower than the window still reaches handle_recv.
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + self._STRAGGLER_WINDOW_S
+                while len(self._result_values) < requested and loop.time() < deadline:
+                    await asyncio.sleep(self._STRAGGLER_POLL_S)
+                return result_values
+            finally:
+                self._result_event = self._result_values = None
+                self._result_senders = self._result_fan_out = None
 
     async def watching_call(self, obj):
         if self._result_event is None:
             assert self._result_values is None
             self._result_values = []
+            self._result_senders = []
             self._result_event = asyncio.Event()
+            self._result_fan_out = self._fan_out
 
             if obj is not None:
-                self._sender.send_pyobj(obj)
+                self._send(obj)
 
         # Capture local refs before await -- after event fires, the first
         # awakened coroutine clears shared state; later awaiters use local refs.
@@ -72,6 +94,7 @@ class FanOutCommunicator(Generic[T]):
         result_values = copy.deepcopy(values)
         if self._result_event is event:
             self._result_event = self._result_values = None
+            self._result_senders = self._result_fan_out = None
         return result_values
 
     async def __call__(self, obj):
@@ -80,9 +103,46 @@ class FanOutCommunicator(Generic[T]):
         else:
             return await self.watching_call(obj)
 
-    def handle_recv(self, recv_obj: T):
+    def set_fan_out(self, fan_out: int, live_senders: Optional[int] = None):
+        # Shrink mid-call: lower in-flight expected replies (retirees already exited).
+        self._fan_out = fan_out
+        self._live_senders = live_senders
+        if self._result_fan_out is not None and fan_out < self._result_fan_out:
+            self._result_fan_out = fan_out
+            if live_senders is not None:
+                # In place: a watching caller holds a reference to the list.
+                kept = [
+                    (value, sender)
+                    for value, sender in zip(self._result_values, self._result_senders)
+                    if sender is None or sender < live_senders
+                ]
+                self._result_values[:] = [value for value, _ in kept]
+                self._result_senders[:] = [sender for _, sender in kept]
+            if len(self._result_values) >= fan_out:
+                self._result_event.set()
+
+    def handle_recv(self, recv_obj: T, sender: Optional[int] = None):
+        if (
+            self._result_values is None
+            or self._result_event is None
+            or self._result_fan_out is None
+        ):
+            logger.debug(
+                "Dropping communicator response without active waiter: %s",
+                type(recv_obj).__name__,
+            )
+            return
+        if (
+            sender is not None
+            and self._live_senders is not None
+            and sender >= self._live_senders
+        ):
+            logger.debug("Dropping a reply from retired DP rank %d", sender)
+            return
         self._result_values.append(recv_obj)
-        if len(self._result_values) == self._fan_out:
+        self._result_senders.append(sender)
+        # >=, not ==: set_fan_out can lower the target below what already arrived.
+        if len(self._result_values) >= self._result_fan_out:
             self._result_event.set()
 
     @staticmethod

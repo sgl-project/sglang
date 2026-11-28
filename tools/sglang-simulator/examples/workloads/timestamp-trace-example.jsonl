@@ -1,0 +1,3 @@
+{"prompt":[100,101,102,103],"prompt_len":4,"output_len":4,"timestamp":0}
+{"prompt":[100,101,102,104],"prompt_len":4,"output_len":4,"timestamp":75}
+{"prompt":[200,201,202,203],"prompt_len":4,"output_len":4,"timestamp":250}

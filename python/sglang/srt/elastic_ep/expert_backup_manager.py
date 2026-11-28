@@ -9,13 +9,24 @@ import zmq
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import BackupDramReq
+from sglang.srt.managers.io_struct import (
+    BackupDramReq,
+    ExpertWeightPointer,
+    sock_recv,
+    sock_send,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_exec,
+    get_model,
+    get_parallel,
+    publish,
+)
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
-    set_global_server_args_for_scheduler,
 )
 from sglang.srt.utils.network import get_local_ip_auto
 
@@ -33,14 +44,14 @@ def extract_expert_id(param_name):
 
 class ExpertBackupManager:
     def __init__(self, server_args: ServerArgs, port_args: PortArgs):
-        self.load_format = server_args.load_format
+        self.load_format = get_model().load_format
         self.model_config = ModelConfig.from_server_args(server_args)
         self.continuous_buffer = None
         self.weight_pointer_map = {}
         self.transfer_engine = None
         self.session_id = None
-        self.engine_num = server_args.nnodes
-        self.engine_rank = server_args.node_rank
+        self.engine_num = get_parallel().nnodes
+        self.engine_rank = get_parallel().node_rank
         self.expert_num = self.model_config.hf_config.n_routed_experts
         self.idmn = (self.expert_num // self.engine_num) * self.engine_rank
         self.idmx = (self.expert_num // self.engine_num) * (self.engine_rank + 1)
@@ -48,11 +59,11 @@ class ExpertBackupManager:
         # Synchronization socket to avoid PUB/SUB slow joiner issues.
         self.recv_from_expert_backup_client = context.socket(zmq.PULL)
         self.recv_from_expert_backup_client.bind(
-            f"tcp://{get_local_ip_auto()}:{PORT_BASE + server_args.node_rank * 2}"
+            f"tcp://{get_local_ip_auto()}:{PORT_BASE + get_parallel().node_rank * 2}"
         )
         self.send_to_expert_backup_client = context.socket(zmq.PUB)
         self.send_to_expert_backup_client.bind(
-            f"tcp://{get_local_ip_auto()}:{PORT_BASE + server_args.node_rank * 2 + 1}"
+            f"tcp://{get_local_ip_auto()}:{PORT_BASE + get_parallel().node_rank * 2 + 1}"
         )
         self.backup_weights_from_disk()
         self.start_transfer_server()
@@ -61,8 +72,8 @@ class ExpertBackupManager:
         # losing the initial PUB message due to slow joiners.
         num_ready_clients = 0
 
-        while num_ready_clients < server_args.tp_size:
-            self.recv_from_expert_backup_client.recv_pyobj()
+        while num_ready_clients < get_parallel().tp_size:
+            sock_recv(self.recv_from_expert_backup_client)
             num_ready_clients += 1
 
         back_req = BackupDramReq(
@@ -72,7 +83,7 @@ class ExpertBackupManager:
             buffer_size=self.continuous_buffer.numel()
             * self.continuous_buffer.element_size(),
         )
-        self.send_to_expert_backup_client.send_pyobj(back_req)
+        sock_send(self.send_to_expert_backup_client, back_req)
 
         # Keep the manager subprocess alive until signals
         signal.pause()
@@ -128,15 +139,10 @@ class ExpertBackupManager:
                 end_byte = current_byte_offset + byte_size
                 weight_ptr = buffer_base_ptr + current_byte_offset
                 self.continuous_buffer[start_byte:end_byte].copy_(weight_bytes)
-                self.weight_pointer_map[name] = {
-                    "name": name,
-                    "weight_ptr": weight_ptr,
-                    "shape": weight_info["shape"],
-                    "numel": weight_info["numel"],
-                    "dtype": weight_info["dtype"],
-                    "element_size": weight_info["element_size"],
-                    "byte_size": byte_size,
-                }
+                self.weight_pointer_map[name] = ExpertWeightPointer(
+                    weight_ptr=weight_ptr,
+                    byte_size=byte_size,
+                )
 
                 current_byte_offset = end_byte
 
@@ -159,7 +165,7 @@ def run_expert_backup_manager_process(
     server_args: ServerArgs,
     port_args: PortArgs,
 ):
-    set_global_server_args_for_scheduler(server_args)
+    publish(server_args, role="expert_backup")
     from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
         init_mooncake_transfer_engine,
     )
@@ -168,7 +174,7 @@ def run_expert_backup_manager_process(
         hostname=get_local_ip_auto(),
         gpu_id=0,
         ib_device=(
-            server_args.disaggregation_ib_device or server_args.mooncake_ib_device
+            get_disagg().disaggregation_ib_device or get_exec().moe.mooncake_ib_device
         ),
     )
     manager = ExpertBackupManager(server_args, port_args)

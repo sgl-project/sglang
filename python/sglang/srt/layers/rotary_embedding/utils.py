@@ -13,6 +13,35 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
+
+def rotary_embedding_cpu(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if query.ndim == 3:
+        query = query.clone()
+        key = key.clone()
+    torch.ops.sgl_kernel.rotary_embedding_cpu(
+        positions, query, key, head_size, cos_sin_cache, is_neox
+    )
+    return query, key
+
+
+def apply_rotary_pos_emb_cpu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(query, key, cos, sin, unsqueeze_dim)
+    return query, key
+
+
 if _is_npu:
     import torch_npu
 
@@ -70,8 +99,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
-def apply_rotary_pos_emb_native(
+def apply_rotary_pos_emb_native_eager(
     q: torch.Tensor,
     k: torch.Tensor,
     cos: torch.Tensor,
@@ -92,6 +120,17 @@ def apply_rotary_pos_emb_native(
     k_embed = k_embed.to(orig_k_dtype)
 
     return q_embed, k_embed
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def apply_rotary_pos_emb_native(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim=1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return apply_rotary_pos_emb_native_eager(q, k, cos, sin, unsqueeze_dim)
 
 
 def apply_rotary_pos_emb_npu(
@@ -131,6 +170,6 @@ def apply_rotary_pos_emb_npu(
 if _is_npu:
     apply_rotary_pos_emb = apply_rotary_pos_emb_npu
 elif _is_cpu and _is_cpu_amx_available:
-    apply_rotary_pos_emb = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu
+    apply_rotary_pos_emb = apply_rotary_pos_emb_cpu
 else:
     apply_rotary_pos_emb = apply_rotary_pos_emb_native

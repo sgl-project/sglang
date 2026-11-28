@@ -1,11 +1,19 @@
 import functools
 import logging
+import sys
 from enum import IntEnum
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolving_view,
+    use_mla_backend,
+)
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
 from sglang.srt.utils import get_npu_memory_capacity, is_npu
 
 if TYPE_CHECKING:
@@ -14,17 +22,73 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 indexer_weight_stream = None
+gva_is_inited = False
+
+
+def _is_npu_arch(arch: int) -> bool:
+    if not is_npu():
+        return False
+
+    import acl
+
+    return acl.rt.get_device_info(0, 601) == (arch, 0)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch22() -> bool:
+    """Whether the runtime is on NPU architecture 22 (Atlas A2/A3)."""
+    return _is_npu_arch(2201)
+
+
+@functools.lru_cache(maxsize=1)
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
+    return _is_npu_arch(3510)
+
+
+# SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
+# SoCs report higher values and share the same capability gates.
+ASCEND_950_SOC_VERSION = 260
+
+
+def is_ascend_950() -> bool:
+    """Whether the runtime SoC is Ascend 950 (Atlas A5) or a later aclnn-only SoC.
+
+    The SoC query initializes NPU state, so this must not be called before
+    device selection (see the deferred setup in ``init_npu_backend``).
+    """
+    if not _is_npu:
+        return False
+    from torch_npu.npu._backends import get_soc_version
+
+    return get_soc_version() >= ASCEND_950_SOC_VERSION
+
+
+def use_npu_arch35_mxfp8_wo_a(
+    quant_config, wo_a_keeps_quant_config: Optional[bool] = None
+) -> bool:
+    """Whether wo_a runs the native NPU arch35 MXFP8 GEMM.
+
+    Only for serialized DeepSeek block-FP8 checkpoints — those are the ones
+    ``Fp8LinearMethod.process_weights_after_loading`` can reinterpret into the
+    NPU arch35 MXFP8 scale layout.
+    """
+    if (
+        wo_a_keeps_quant_config is False
+        or not _is_npu
+        or not is_npu_arch35()
+        or quant_config is None
+        or not getattr(quant_config, "is_checkpoint_fp8_serialized", False)
+    ):
+        return False
+    weight_block_size = getattr(quant_config, "weight_block_size", None)
+    return tuple(weight_block_size or ()) == (128, 128)
 
 
 class NPUACLFormat(IntEnum):
     ACL_FORMAT_UNDEFINED = -1
     ACL_FORMAT_ND = 2
     ACL_FORMAT_FRACTAL_NZ = 29
-
-
-class FusedMoEMode(IntEnum):
-    FUSED_DEEP_MOE = 1
-    DISPATCH_FFN_COMBINE = 2
 
 
 def _call_once(fn: Callable):
@@ -46,46 +110,180 @@ def set_default_server_args(args: "ServerArgs"):
     Set default server arguments for NPU backend.
     """
 
+    cfg = resolving_view(args)
+
     # NPU only works with "ascend" attention backend for now
-    args.attention_backend = "ascend"
-    args.prefill_attention_backend = "ascend"
-    args.decode_attention_backend = "ascend"
-    if args.page_size is None:
-        args.page_size = 128
+    declare_resolution(
+        args,
+        "set_default_server_args",
+        attention_backend="ascend",
+    )
+    declare_resolution(
+        args,
+        "set_default_server_args",
+        prefill_attention_backend="ascend",
+    )
+    declare_resolution(
+        args,
+        "set_default_server_args",
+        decode_attention_backend="ascend",
+    )
+    if cfg.page_size is None:
+        declare_resolution(
+            args,
+            "set_default_server_args",
+            page_size=128,
+        )
 
     # NPU memory settings
     npu_mem = get_npu_memory_capacity()
     if npu_mem <= 32 * 1024:
         # Ascend 910B4,910B4_1
-        # (chunked_prefill_size 4k, cuda_graph_max_bs 16 if tp < 4 else 64)
-        if args.chunked_prefill_size is None:
-            args.chunked_prefill_size = 4 * 1024
-        if args.cuda_graph_max_bs is None:
-            if args.tp_size < 4:
-                args.cuda_graph_max_bs = 16
+        # (chunked_prefill_size 4k, max_bs 16 if tp < 4 else 64)
+        if cfg.chunked_prefill_size is None:
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                chunked_prefill_size=4 * 1024,
+            )
+        if cfg.cuda_graph_config.decode.max_bs is None:
+            if cfg.tp_size < 4:
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=16,
+                    ),
+                )
             else:
-                args.cuda_graph_max_bs = 64
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=64,
+                    ),
+                )
     elif npu_mem <= 64 * 1024:
         # Ascend 910B1,910B2,910B2C,910B3,910_9391,910_9392,910_9381,910_9382,910_9372,910_9362
-        # (chunked_prefill_size 8k, cuda_graph_max_bs 64 if tp < 4 else 256)
-        if args.chunked_prefill_size is None:
-            args.chunked_prefill_size = 8 * 1024
-        if args.cuda_graph_max_bs is None:
-            if args.tp_size < 4:
-                args.cuda_graph_max_bs = 64
+        # (chunked_prefill_size 8k, max_bs 64 if tp < 4 else 256)
+        if cfg.chunked_prefill_size is None:
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                chunked_prefill_size=8 * 1024,
+            )
+        if cfg.cuda_graph_config.decode.max_bs is None:
+            if cfg.tp_size < 4:
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=64,
+                    ),
+                )
             else:
-                args.cuda_graph_max_bs = 256
+                declare_resolution(
+                    args,
+                    "set_default_server_args",
+                    cuda_graph_config=with_phase(
+                        cfg.cuda_graph_config,
+                        Phase.DECODE,
+                        max_bs=256,
+                    ),
+                )
 
     # NPU does not support CustomAllReduce
-    args.disable_custom_all_reduce = True
+    declare_resolution(
+        args,
+        "set_default_server_args",
+        disable_custom_all_reduce=True,
+    )
 
-    # handles hierarchical cache configs
-    if args.enable_hierarchical_cache:
-        args.hicache_io_backend = "kernel_ascend"
-        if args.use_mla_backend():
-            args.hicache_mem_layout = "page_first_kv_split"
+    # Backup-only decode retraction also builds a HiCache host pool. The
+    # inferred backend is resolved later, once the device KV pool exists.
+    if (
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+        or (
+            cfg.disaggregation_mode == "decode"
+            and cfg.disaggregation_decode_retraction_backup in (None, "host_pool")
+        )
+    ):
+        declare_resolution(
+            args,
+            "set_default_server_args",
+            hicache_io_backend="kernel_ascend",
+        )
+        from sglang.srt.configs.model_config import is_deepseek_v4
+
+        # DSV4 and MLA require their own host layouts; other models use direct pages.
+        if is_deepseek_v4(model_config_of(args).hf_config):
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                hicache_mem_layout=(
+                    "layer_first"
+                    if cfg.hicache_mem_layout == "layer_first"
+                    else "page_first"
+                ),
+            )
+        elif use_mla_backend(args):
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                hicache_mem_layout=(
+                    "layer_first_kv_split"
+                    if cfg.hicache_mem_layout in ("layer_first", "layer_first_kv_split")
+                    else "page_first_kv_split"
+                ),
+            )
         else:
-            args.hicache_mem_layout = "page_first_direct"
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                hicache_mem_layout="page_first_direct",
+            )
+
+
+def _patch_npu_seed_trace_rules():
+    """Keep aliased CUDA/NPU seed functions consistent with Dynamo's RNG rules."""
+    try:
+        from torch._dynamo import trace_rules
+        from torch._dynamo.variables import (
+            SkipFunctionVariable,
+            TorchInGraphFunctionVariable,
+        )
+        from torch_npu.dynamo.trace_rule import (
+            torch_non_c_binding_in_graph_functions_npu as npu_rules,
+        )
+    except ImportError:
+        # Older torch_npu releases do not register aliases through this rule map.
+        return
+
+    changed = False
+    for name in ("manual_seed", "manual_seed_all"):
+        npu_name = f"torch.npu.random.{name}"
+        if npu_rules.get(npu_name) is TorchInGraphFunctionVariable and any(
+            trace_rules.manual_torch_name_rule_map.get(f"{prefix}.{name}")
+            is SkipFunctionVariable
+            and getattr(module, name) is getattr(torch.npu.random, name)
+            for prefix, module in (
+                ("torch.cuda", torch.cuda),
+                ("torch.cuda.random", torch.cuda.random),
+            )
+        ):
+            # CUDA's top-level and random entries may alias different functions.
+            # Patch the source dict to also cover lazy NPU rule registration.
+            npu_rules[npu_name] = SkipFunctionVariable
+            changed = True
+    if changed:
+        trace_rules.clear_lru_cache()
 
 
 @_call_once
@@ -96,32 +294,66 @@ def init_npu_backend():
 
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
-    import sgl_kernel_npu  # noqa: F401
+    try:
+        import sgl_kernel_npu  # noqa: F401
+    except ImportError as e:
+        logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
+
     import torch_npu
-    from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
-    # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
-    torch.cuda.is_available = lambda: False
+    def register_dsv41_vendor_ops():
+        if is_npu_arch35():
+            try:
+                import cann_ops_transformer  # noqa: F401
+            except ImportError as e:
+                logger.warning("DeepSeek-V4.1 A5 operator extension unavailable: %s", e)
 
-    torch_npu.npu.config.allow_internal_format = True
+    # The A3 bundle registers overlapping Torch schemas (e.g. sparse_flash_mla).
+    # Don't register them again through the standalone CANN wheel.
+    torch_npu.npu._lazy_call(register_dsv41_vendor_ops)
+
+    # These imports lead to unpredictable behavior in diffusion models
+    # and a significant reduction in performance.
+    if "sglang.multimodal_gen" not in sys.modules:
+        from torch_npu.contrib import transfer_to_npu  # noqa: F401
+
+        _patch_npu_seed_trace_rules()
+
+        # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
+        torch.cuda.is_available = lambda: False
+        torch.cuda.get_device_capability = lambda device=None: (0, 0)
+
+        def configure_internal_format():
+            if not is_ascend_950():
+                torch_npu.npu.config.allow_internal_format = True
+
+        # The SoC query initializes NPU state; defer it until device selection.
+        torch_npu.npu._lazy_call(configure_internal_format)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
 
-    Ascend FRACTAL_NZ requires:
-      BF16 / FP16 : both dims divisible by 16
-      INT8         : k % 16 == 0  and  n % 32 == 0
+    A fractal tile is 16 rows by 32 bytes (the C0_32 in the op's error strings),
+    so the row rule is always k % 16 and the column rule is 32 // itemsize:
+
+      BF16 / FP16  : k % 16 == 0  and  n % 16 == 0
+      INT8 / FP8   : k % 16 == 0  and  n % 32 == 0
       INT4         : k % 16 == 0  and  n % 64 == 0
-      FP4          : both dims divisible by 64
+
+    Unlisted dtypes fall through to True: this is a cheap pre-filter for known
+    bad combinations, not an authority — the op itself is.
     """
     if tensor.dim() < 2:
         return False
     k, n = tensor.shape[-2], tensor.shape[-1]
     if tensor.dtype in (torch.bfloat16, torch.float16):
         return k % 16 == 0 and n % 16 == 0
-    if tensor.dtype == torch.int8:
+    if tensor.dtype in (torch.int8, torch.float8_e4m3fn):
+        # e4m3 is single-byte like int8, so it shares the column rule. Reached
+        # only by the MXFP8 MoE weights; the packed-FP4 callers pass
+        # customize_dtype and return before this check.
         return k % 16 == 0 and n % 32 == 0
     if tensor.dtype in (torch.uint8, torch.int32):
         # INT4 is typically packed into uint8/int32; be conservative
@@ -132,6 +364,9 @@ def _is_nz_aligned(tensor: torch.Tensor) -> bool:
 def npu_format_cast(
     tensor: torch.Tensor,
     acl_format: NPUACLFormat = NPUACLFormat.ACL_FORMAT_FRACTAL_NZ,
+    *,
+    customize_dtype=None,
+    input_dtype=None,
 ) -> torch.Tensor:
     """
     Cast a tensor to a specific NPU ACL format.
@@ -139,6 +374,12 @@ def npu_format_cast(
     Args:
         tensor (torch.Tensor): The input tensor.
         acl_format (NPUACLFormat): The target NPU ACL format.
+        customize_dtype / input_dtype: packed-FP4 unpack kwargs (e.g.
+            ``customize_dtype=torch.float8_e4m3fn``,
+            ``input_dtype=torch.float4_e2m1fn_x2``). When either is set the unpack
+            kwargs are forwarded to the op and the ``_is_nz_aligned`` ND fallback
+            is skipped: the FP4 matmul strictly requires FRACTAL_NZ, so a silent
+            ND fallback would corrupt results.
 
     Returns:
         torch.Tensor: The tensor cast to the specified NPU ACL format.
@@ -158,6 +399,21 @@ def npu_format_cast(
         )
         return tensor
 
+    # Skip format cast for meta tensors (used in offloader)
+    if tensor.device.type == "meta":
+        return tensor
+
+    # Packed-FP4 → FRACTAL_NZ: forward the unpack kwargs to the op, and skip the
+    # _is_nz_aligned ND fallback — the FP4 matmul strictly requires NZ, so a
+    # silent ND fallback would corrupt results.
+    if customize_dtype is not None or input_dtype is not None:
+        return torch.ops.npu.npu_format_cast(
+            tensor,
+            int(acl_format),
+            customize_dtype=customize_dtype,
+            input_dtype=input_dtype,
+        )
+
     if acl_format == NPUACLFormat.ACL_FORMAT_FRACTAL_NZ and not _is_nz_aligned(tensor):
         k, n = tensor.shape[-2], tensor.shape[-1]
         logger.warning_once(
@@ -170,10 +426,6 @@ def npu_format_cast(
         )
         return tensor
 
-    # Skip format cast for meta tensors (used in offloader)
-    if tensor.device.type == "meta":
-        return tensor
-
     return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
 
 
@@ -182,6 +434,96 @@ def get_indexer_weight_stream():
     if indexer_weight_stream is None:
         indexer_weight_stream = torch.npu.Stream()
     return indexer_weight_stream
+
+
+def init_zbal(world_size, gpu_id, world_rank, do_check=True):
+    """
+    init zbal, if is mix alloc mode, only register for sma & comm
+    """
+    zbal_mem_size = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get()
+    if not zbal_mem_size > 0:
+        return 1
+
+    global gva_is_inited
+    from zbal import is_mix_alloc, switch_to_allocator, zbal_init
+
+    if is_mix_alloc():
+        switch_to_allocator()
+        # use lazy init for mix alloc
+        return 1
+    else:
+        if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
+            ret = zbal_init(
+                world_size,
+                gpu_id,
+                world_rank,
+                zbal_mem_size * (1024**2),
+                ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get(),
+            )
+        else:
+            ret = zbal_init(world_size, gpu_id, world_rank, zbal_mem_size * (1024**2))
+
+        gva_is_inited = True
+
+        if do_check and not ret:
+            logger.error("[ZBAL] zbal init failed!")
+            sys.exit(-1)
+
+        return ret
+
+
+def lazy_init_zbal_gva_mem(
+    device, gpu_id, world_rank, world_size, cpu_group=None, do_check=True
+):
+    """
+    lazy init zbal gva mem, keep weights and kv remains alloc by dma vmm to avoid memory fragment
+    """
+    from zbal import is_mix_alloc, zbal_init
+
+    if not is_mix_alloc():
+        logger.info(
+            "lazy init is supported only in mix alloc mode, this action will be passed"
+        )
+        return 1
+
+    global gva_is_inited
+    from sglang.srt.utils.device import get_available_gpu_memory
+
+    # TODO need to use allgather if you want use total_memory stats from mem_get_info as unbalance os
+    total_memory = 61.2  # 2.5GB for other (workspace & os) outside torch
+    free_gpu_memory = get_available_gpu_memory(
+        device,
+        gpu_id,
+        distributed=world_size > 1,
+        cpu_group=cpu_group,
+        empty_cache=True,
+    )
+
+    used_memory = total_memory - free_gpu_memory
+
+    used_memory_in_mb = int(used_memory * 1024)
+    gva_in_mb = envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() - used_memory_in_mb
+    gva_in_mb = gva_in_mb - gva_in_mb % 128  # align to 128MB
+    print(f"[ZBAL] rank {world_rank} allocated {gva_in_mb} MB gva space.")
+
+    assert not gva_is_inited, "zbal gva should be inited only once"
+    # zbal_set_logger_level(0)
+    if envs.SGLANG_ZBAL_BOOTSTRAP_URL.get():
+        res = zbal_init(
+            world_size,
+            gpu_id,
+            world_rank,
+            gva_in_mb * (1024**2),
+            ip_port=envs.SGLANG_ZBAL_BOOTSTRAP_URL.get(),
+        )
+    else:
+        res = zbal_init(world_size, gpu_id, world_rank, gva_in_mb * (1024**2))
+
+    gva_is_inited = True
+    if do_check and not res:
+        logger.error("[ZBAL] zbal lazy init failed!")
+        sys.exit(-1)
+    return res
 
 
 share_stream = None

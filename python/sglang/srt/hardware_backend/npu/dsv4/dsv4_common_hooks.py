@@ -1,0 +1,433 @@
+"""Helpers used by mem_cache/common.py to wire DSV4-NPU KV tables.
+
+mem_cache/common.py runs platform-agnostic alloc flow. When the model is
+DSV4 on NPU, ``alloc_paged_token_slots_{extend,decode}`` already stashed the
+:class:`DSV4OutCacheLoc` the allocator returned onto
+``batch.out_cache_loc_dsv4``. After each ``alloc_extend`` / ``alloc_decode``
+these hooks then:
+
+  1. Read the bundle from ``batch.out_cache_loc_dsv4``.
+  2. Write newly allocated C128 page ids into the per-request sidecar.
+
+Compressor state is fixed ring storage and does not participate in this
+allocation/write path. PD reuses the public SWA/C128-state payloads and builds
+NPU-specific payloads for the independently addressed C128 KV pool. C4 state
+travels with SWA using the same page indices.
+
+Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
+no-op for them.
+
+The disagg per-req prealloc path does not build a ``ScheduleBatch`` and so
+bypasses the batch hook; it writes the same sidecar via
+``write_dsv4_prealloc_tables`` (driven by ``dsv4_unwrap_prealloc``).
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+
+
+def maybe_write_dsv4_extend(
+    batch: ScheduleBatch,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+) -> None:
+    """Post-alloc_extend hook for DSV4. No-op when allocator/pool is not DSV4.
+
+    Spreads the flat ``out_c128_loc`` tensor across requests and writes newly
+    allocated page ids into ``req_to_c128_sidecar``. C4 locations are derived
+    from the full-token table.
+
+    """
+    # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
+    # None on CUDA / non-V4 paths → no-op.
+    bundle = batch.out_cache_loc_dsv4
+    if bundle is None:
+        return
+
+    req_to_token_pool = batch.req_to_token_pool
+    if not hasattr(req_to_token_pool, "write_c128"):
+        return  # non-DSV4 pool; skip defensively (shouldn't happen)
+
+    _write_dsv4_tables(
+        req_to_token_pool,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle,
+    )
+
+
+def dsv4_state_payloads(
+    req_to_token_pool,
+    req_pool_idx: int,
+    seq_len: int,
+    page_size: int,
+    *,
+    prefix_len: int = 0,
+):
+    """Build NPU-specific DSV4 PD payloads.
+
+    Returns payloads for components that are addressed differently from the
+    cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
+
+    * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
+    """
+
+    import numpy as np
+
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    seq_len = max(0, int(seq_len))
+    prefix_len = max(0, min(int(prefix_len), seq_len))
+
+    def c128_kv_pages():
+        c128_page_size = req_to_token_pool.c128_page_size
+        lo = prefix_len // (128 * c128_page_size)
+        hi = (seq_len // 128 + c128_page_size - 1) // c128_page_size
+        if hi <= lo:
+            return np.empty((0,), dtype=np.int32)
+        pages = (
+            req_to_token_pool.req_to_c128_sidecar[req_pool_idx, lo:hi]
+            .cpu()
+            .numpy()
+            .astype(np.int32)
+        )
+        return pages[pages > 0]
+
+    return {StateType.DSV4_C128: c128_kv_pages}
+
+
+def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):
+    """Extra ``alloc_extend(_swa_tail)`` kwargs for the DSV4 allocator; ``{}`` for
+    non-DSV4 so callers can splat it unconditionally."""
+    if not hasattr(allocator, "c128_attn_allocator"):
+        return {}
+    return dict(
+        req_pool_indices=torch.tensor(
+            [req.kv.req_pool_idx], dtype=torch.int64, device=device
+        ),
+        req_to_token_pool=req_to_token_pool,
+    )
+
+
+def dsv4_unwrap_prealloc(kv_loc, req_to_token_pool, req, prefix_len, fill_len):
+    """Unwrap a DSV4OutCacheLoc bundle to its full-pool loc and write the
+    per-req tables; a plain tensor (non-DSV4) passes through unchanged."""
+    if kv_loc is None or not hasattr(kv_loc, "out_full_loc"):
+        return kv_loc
+    write_dsv4_prealloc_tables(req_to_token_pool, req, prefix_len, fill_len, kv_loc)
+    return kv_loc.out_full_loc
+
+
+def write_dsv4_prealloc_tables(
+    req_to_token_pool,
+    req: Req,
+    prefix_len: int,
+    fill_len: int,
+    bundle,
+) -> None:
+    """Write the DSV4 per-req tables for one request on the disagg-decode
+    prealloc path (no ScheduleBatch); no-op without bundle / DSV4 tables."""
+    if bundle is None or not hasattr(req_to_token_pool, "write_c128"):
+        return
+    rp = torch.tensor([req.kv.req_pool_idx])
+    pl = torch.tensor([prefix_len])
+    sl = torch.tensor([fill_len])
+
+    _write_dsv4_tables(
+        req_to_token_pool,
+        rp,
+        pl,
+        sl,
+        bundle,
+    )
+
+
+def _write_dsv4_tables(
+    req_to_token_pool,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    bundle,
+) -> None:
+    """Write newly allocated C128 page ids into the request sidecar."""
+    _write_per_req_slice(
+        req_to_token_pool.write_c128,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_c128_loc,
+        ratio=128,
+    )
+
+
+def maybe_write_dsv4_decode(
+    batch: ScheduleBatch,
+    req_pool_indices_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    token_per_req: int,
+) -> None:
+    """Post-alloc_decode hook for DSV4. Spreads new C128 KV slot ids into
+    the per-req sidecar on DSV4NPUReqToTokenPool.
+
+    ``req_pool_indices_cpu`` must be the batch's host mirror — reading the
+    device tensor here D2H-syncs with the in-flight forward. ``seq_lens_cpu``
+    is the POST-decode seq len (already incremented by ``token_per_req``);
+    the new compressed tokens go at positions
+    ``[(old_seq) // ratio, (new_seq) // ratio)``.
+    """
+    # Bundle stashed on batch.out_cache_loc_dsv4 by mem_cache/common.py;
+    # None on CUDA / non-V4 paths → no-op.
+    bundle = batch.out_cache_loc_dsv4
+    if bundle is None:
+        return
+
+    req_to_token_pool = batch.req_to_token_pool
+    if not hasattr(req_to_token_pool, "write_c128"):
+        return
+
+    prefix_lens_cpu = (seq_lens_cpu - token_per_req).clamp(min=0)
+
+    _write_per_req_slice(
+        req_to_token_pool.write_c128,
+        req_pool_indices_cpu,
+        prefix_lens_cpu,
+        seq_lens_cpu,
+        bundle.out_c128_loc,
+        ratio=128,
+    )
+
+
+def _compact_c4_loc(out_full_loc: torch.Tensor, upper: int) -> torch.Tensor:
+    """C4 slots of the group-closing full slots, compacted in order and
+    zero-padded to ``upper``.
+
+    Equivalent to
+    ``out_full_loc[(out_full_loc >= 0) & ((out_full_loc % 4) == 3)] // 4``
+    followed by the verify consumers' zero padding, but without boolean
+    indexing: ``x[mask]`` lowers to aclnnNonzeroV2, a host-synchronizing op
+    that stalls the draft->verify transition until the draft kernels drain.
+    All ops below are asynchronous device kernels.
+    """
+    if upper <= 0:
+        return out_full_loc.new_zeros((0,))
+    valid = (out_full_loc >= 0) & ((out_full_loc % 4) == 3)
+    # Compact destination per row; invalid rows dump into a trash slot at
+    # ``upper`` (their values are arbitrary — duplicate scatter into the
+    # trash slot is fine) which the slice below drops.
+    dest = valid.cumsum(0).sub_(1).masked_fill_(~valid, upper)
+    buf = out_full_loc.new_zeros((upper + 1,))
+    buf.scatter_(0, dest, out_full_loc // 4)
+    return buf[:upper]
+
+
+def maybe_build_dsv4_verify_bundle(
+    batch: ScheduleBatch,
+    draft_token_num: int,
+    *,
+    live_seq_lens_cpu: torch.Tensor | None = None,
+):
+    """Build the DSV4 cache-location view for one target-verify pass.
+
+    Spec-v2 reserves cache ahead of time, so target verify must select only the
+    current draft interval from the per-request DSV4 tables instead of reusing
+    the larger allocation bundle produced during decode preparation.
+    """
+    pool = batch.req_to_token_pool
+    if not hasattr(pool, "req_to_c128_sidecar"):
+        return None
+    reserve_bundle = batch.out_cache_loc_dsv4
+    if reserve_bundle is None:
+        return None
+
+    req_indices = batch.req_pool_indices_cpu.tolist()
+
+    if live_seq_lens_cpu is None:
+        live_seq_lens_cpu = batch.seq_lens_cpu
+    if live_seq_lens_cpu is None:
+        # Mirrorless (SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0): the host
+        # seq_lens mirror does not exist, and a seq_lens.cpu() fallback here
+        # would be a pageable D2H that drains the whole async task queue (the
+        # per-step StreamSynchronize bubble). Build the whole bundle on
+        # device; every op stays asynchronous.
+        ragged_layout = getattr(
+            getattr(batch, "spec_info", None), "ragged_verify_layout", None
+        )
+        out_full_loc = batch.out_cache_loc
+        t = out_full_loc.numel()
+        bs = len(req_indices)
+        return type(reserve_bundle)(
+            out_full_loc=out_full_loc,
+            out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                out_full_loc
+            ),
+            out_c4_loc=_compact_c4_loc(out_full_loc, min(t, t // 4 + bs)),
+            out_c128_loc=_flatten_interval_device(
+                table=pool.req_to_c128_sidecar,
+                page_size=pool.c128_page_size,
+                req_pool_indices=batch.req_pool_indices[:bs],
+                live_seq_lens=batch.seq_lens[:bs],
+                verify_lens=(
+                    None if ragged_layout is None else ragged_layout.verify_lens[:bs]
+                ),
+                n_draft=int(draft_token_num),
+                upper=min(t, t // 128 + bs),
+            ),
+        )
+    live_seq_lens = live_seq_lens_cpu[: len(req_indices)].tolist()
+
+    ragged_layout = getattr(
+        getattr(batch, "spec_info", None), "ragged_verify_layout", None
+    )
+    if ragged_layout is None:
+        verify_lens = [int(draft_token_num)] * len(req_indices)
+    elif ragged_layout.verify_lens_cpu is not None:
+        verify_lens = [int(v) for v in ragged_layout.verify_lens_cpu]
+    else:
+        # This helper only runs while preparing eager NPU verify metadata. A
+        # device layout is allowed here; compact graph replay has its own
+        # static metadata buffers and must not take this host path.
+        verify_lens = [int(v) for v in ragged_layout.verify_lens.cpu().tolist()]
+
+    def flatten_interval(table: torch.Tensor, ratio: int) -> torch.Tensor:
+        page_size = pool.c128_page_size
+        chunks = []
+        for req_idx, live_seq_len, verify_len in zip(
+            req_indices, live_seq_lens, verify_lens
+        ):
+            start = int(live_seq_len) // ratio
+            end = (int(live_seq_len) + int(verify_len)) // ratio
+            if end > start:
+                positions = torch.arange(start, end, device=table.device)
+                pages = table[int(req_idx), positions // page_size]
+                chunks.append(pages * page_size + positions % page_size)
+        return torch.cat(chunks) if chunks else table.new_empty((0,))
+
+    out_full_loc = batch.out_cache_loc
+    # Fixed upper bound — the padding size the verify consumers already use
+    # (ascend_dsv4_backend: ``max(1, min(t, t // ratio + bs))``), so the padded
+    # result is byte-identical to what they built from the compact tensor.
+    t = out_full_loc.numel()
+    c4_upper = min(t, t // 4 + len(req_indices))
+    out_c4_loc = _compact_c4_loc(out_full_loc, c4_upper)
+    return type(reserve_bundle)(
+        out_full_loc=out_full_loc,
+        out_swa_loc=batch.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+            out_full_loc
+        ),
+        out_c4_loc=out_c4_loc,
+        out_c128_loc=flatten_interval(pool.req_to_c128_sidecar, 128),
+    )
+
+
+def _flatten_interval_device(
+    *,
+    table: torch.Tensor,
+    page_size: int,
+    req_pool_indices: torch.Tensor,
+    live_seq_lens: torch.Tensor,
+    verify_lens: torch.Tensor | None,
+    n_draft: int,
+    upper: int,
+) -> torch.Tensor:
+    """Device twin of the host ``flatten_interval`` loop (ratio=128): the c128
+    slots of the compressed positions ``[live // 128, (live + verify) // 128)``,
+    compacted req-major into a fixed ``upper``-wide buffer whose tail carries
+    the slot-map skip sentinel. Every op is an asynchronous device kernel and
+    the shape is host-known, so consumers' ``numel()`` never syncs. DP-padding
+    rows (live == 0) yield an empty interval, like the host ``end > start``
+    guard.
+    """
+    from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+        _loc_pad_value,
+    )
+
+    device = live_seq_lens.device
+    bs = live_seq_lens.shape[0]
+    if verify_lens is None:
+        verify_lens = torch.full((bs,), n_draft, dtype=torch.int64, device=device)
+    live = live_seq_lens.reshape(-1)[:bs].to(torch.int64)
+    verify = verify_lens.reshape(-1)[:bs].to(torch.int64)
+    starts, ends = live // 128, (live + verify) // 128
+
+    # Per-req interval is at most n_draft // 128 + 1 compressed positions,
+    # which sizes the shared position grid without a host ``max()`` read.
+    positions = (
+        starts[:, None] + torch.arange(n_draft // 128 + 1, device=device)[None, :]
+    )
+    valid = positions < ends[:, None]
+
+    # Single flat gather; invalid lanes clamp their page index into the row
+    # and contribute garbage that the compact below drops.
+    n_cols = table.shape[1]
+    page_idx = (positions // page_size).clamp_(max=n_cols - 1)
+    flat_idx = (
+        req_pool_indices[:bs].to(torch.int64)[:, None] * n_cols + page_idx
+    ).reshape(-1)
+    locs = table.reshape(-1)[flat_idx] * page_size + positions.reshape(-1) % page_size
+
+    # Stable compact without NonZero, mirroring _compact_c4_loc: each valid
+    # lane lands on its ordinal among valid lanes; invalid lanes share the
+    # trash slot at ``upper`` (duplicate writes are fine) which the slice
+    # below drops.
+    flat_valid = valid.reshape(-1)
+    dest = flat_valid.cumsum(0).sub_(1).masked_fill_(~flat_valid, upper)
+    buf = torch.full((upper + 1,), _loc_pad_value(), dtype=locs.dtype, device=device)
+    buf.scatter_(0, dest, locs)
+    return buf[:upper]
+
+
+def _write_per_req(
+    write_fn,
+    req_pool_indices_cpu: torch.Tensor,
+    flat_loc: torch.Tensor,
+    bounds_fn,
+) -> None:
+    """Distribute a flat ``[total_alloc]`` slot tensor across reqs.
+
+    ``bounds_fn(i) -> (lo, hi)`` gives req i's write window; the matching
+    ``hi - lo`` slots are sliced off ``flat_loc`` in order and written via
+    ``write_fn((req_idx, slice(lo, hi)), values)``. flat_loc may be None /
+    empty when the alloc path bypassed DSV4NPUTokenToKVPoolAllocator (e.g.
+    page_size=1 or HiSparse wrapper); skip then.
+    """
+    if flat_loc is None or flat_loc.numel() == 0:
+        return
+    pt = 0
+    for i in range(req_pool_indices_cpu.shape[0]):
+        lo, hi = bounds_fn(i)
+        alloc_len = max(0, hi - lo)
+        if alloc_len == 0:
+            continue
+        req_idx = int(req_pool_indices_cpu[i].item())
+        chunk = flat_loc[pt : pt + alloc_len].to(torch.int32)
+        write_fn((req_idx, slice(lo, hi)), chunk)
+        pt += alloc_len
+
+
+def _write_per_req_slice(
+    write_fn,
+    req_pool_indices_cpu: torch.Tensor,
+    prefix_lens_cpu: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    flat_loc: torch.Tensor,
+    ratio: int,
+) -> None:
+    """Compressed-position write: req i's slots go at
+    ``[prefix_lens[i] // ratio, seq_lens[i] // ratio)``."""
+    _write_per_req(
+        write_fn,
+        req_pool_indices_cpu,
+        flat_loc,
+        lambda i: (
+            int(prefix_lens_cpu[i].item()) // ratio,
+            int(seq_lens_cpu[i].item()) // ratio,
+        ),
+    )

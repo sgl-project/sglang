@@ -6,6 +6,7 @@ import copy
 import multiprocessing
 import queue
 import threading
+import traceback
 import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import tqdm
 
-from sglang.global_config import global_config
+from sglang.lang.global_config import global_config
 from sglang.lang.ir import (
     SglCommitLazy,
     SglConcateAndAppend,
@@ -32,11 +33,7 @@ from sglang.lang.ir import (
     SglVarScopeEnd,
     SglVideo,
 )
-from sglang.utils import (
-    encode_image_base64,
-    encode_video_base64,
-    get_exception_traceback,
-)
+from sglang.utils import encode_image_base64, encode_video_base64
 
 
 def run_internal(state, program, func_args, func_kwargs, sync):
@@ -431,7 +428,7 @@ class StreamExecutor:
             try:
                 self._execute(expr)
             except Exception as e:
-                warnings.warn(f"Error in stream_executor: {get_exception_traceback()}")
+                warnings.warn(f"Error in stream_executor: {traceback.format_exc()}")
                 error = e
                 break
             self.queue.task_done()
@@ -624,9 +621,9 @@ class StreamExecutor:
             self.meta_info[name] = meta_info
             self.variable_event[name].set()
         else:
-            assert (
-                self.num_api_spec_tokens is None
-            ), "stream is not supported with api speculative execution"
+            assert self.num_api_spec_tokens is None, (
+                "stream is not supported with api speculative execution"
+            )
             generator = self.backend.generate_stream(
                 self, sampling_params=sampling_params
             )

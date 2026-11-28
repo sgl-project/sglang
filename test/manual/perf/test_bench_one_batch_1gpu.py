@@ -5,26 +5,21 @@ import unittest
 
 import numpy as np
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     is_in_ci,
-    kill_process_tree,
     run_bench_one_batch,
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=95, suite="stage-b-test-1-gpu-large")
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-large-amd")
-
 
 class TestBenchOneBatch1GPU(CustomTestCase):
-
     def test_bs1_small(self):
         _, output_throughput, _ = run_bench_one_batch(
-            DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["--cuda-graph-max-bs", "2"]
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST, ["--cuda-graph-max-bs-decode", "2"]
         )
         self.assertGreater(output_throughput, 50)
 
@@ -35,7 +30,7 @@ class TestBenchOneBatch1GPU(CustomTestCase):
         command = [
             "python3",
             "-m",
-            "sglang.bench_offline_throughput",
+            "sglang.benchmark.offline_throughput",
             "--num-prompts",
             "1",
             "--dataset-name",
@@ -46,7 +41,7 @@ class TestBenchOneBatch1GPU(CustomTestCase):
             "1024",
             "--model-path",
             DEFAULT_MODEL_NAME_FOR_TEST,
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "2",
         ]
 

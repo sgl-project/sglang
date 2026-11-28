@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import torch
 
 from sglang.multimodal_gen.configs.models.vaes.base import VAEArchConfig, VAEConfig
+from sglang.srt.utils import is_gfx1250_supported
 
 
 @dataclass
@@ -83,12 +84,16 @@ class WanVAEConfig(VAEConfig):
     use_parallel_tiling: bool = False
 
     use_parallel_encode: bool = True
-    use_parallel_decode: bool = True
 
     def __post_init__(self):
         self.blend_num_frames = (
             self.tile_sample_min_num_frames - self.tile_sample_stride_num_frames
         ) * 2
+
+    def auto_parallel_decode_prefers_spatial_shard(self) -> bool:
+        # gfx1250: the single-rank NHWC fast path (wan_vae_cuda_opt) cannot run
+        # sharded and beats spatial-shard decode on 2 ranks (8.6 s vs 27.9 s).
+        return not is_gfx1250_supported()
 
     def get_vae_scale_factor(self):
         # Wan VAE does not expose block_out_channels like SD-style VAEs.

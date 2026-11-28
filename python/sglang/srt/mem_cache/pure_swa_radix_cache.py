@@ -1,0 +1,67 @@
+"""Radix cache for all-SWA models (every layer is sliding-window attention)."""
+
+from __future__ import annotations
+
+import logging
+
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, EvictResult
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.radix_cache import RadixCache
+
+logger = logging.getLogger(__name__)
+
+
+class PureSWARadixCache(RadixCache):
+    """Radix cache for all-SWA models (no full attention layers).
+
+    Extends RadixCache with SWA semantics. Only caches the prefill portion
+    [0, evict_floor) on request completion. Window-range KV is freed.
+    No tombstone mechanism needed. With ``params.disable`` it serves
+    ``--disable-radix-cache`` and caches nothing.
+    """
+
+    def __init__(self, params: CacheInitParams):
+        super().__init__(params)
+        self.sliding_window_size = params.sliding_window_size
+
+    def supports_swa(self) -> bool:
+        assert self.sliding_window_size is not None, (
+            "sliding_window_size must be set for PureSWARadixCache"
+        )
+        return True
+
+    def _keeps(self, sub_pool: str) -> bool:
+        # Every layer is a window layer: the tree's one pool is the window's.
+        return sub_pool in self.token_to_kv_pool_allocator.window_pool_names()
+
+    def window_evictable_size(self, sub_pool: str) -> int:
+        return self.evictable_size_ if self._keeps(sub_pool) else 0
+
+    def window_protected_size(self, sub_pool: str) -> int:
+        return self.protected_size_ if self._keeps(sub_pool) else 0
+
+    def full_evictable_size(self):
+        return 0
+
+    def full_protected_size(self):
+        return 0
+
+    def sanity_check(self):
+        """No-op: an all-SWA model has no full tier, so there is no full/SWA
+        split to cross-check."""
+        pass
+
+    def evict(self, params: EvictParams) -> EvictResult:
+        """An all-SWA model keeps one pool: window tokens and tokens are
+        evicted from it alike."""
+        num_tokens = max(params.num_tokens, *params.window_num_tokens.values(), 0)
+        return super().evict(EvictParams(num_tokens=num_tokens))
+
+    def available_and_evictable_str(self) -> str:
+        allocator = self.token_to_kv_pool_allocator
+        swa_available = allocator.swa_available_size()
+        swa_evictable = self.evictable_size_
+        return (
+            f"SWA available tokens: {swa_available + swa_evictable} "
+            f"({swa_available=} + {swa_evictable=})\n"
+        )

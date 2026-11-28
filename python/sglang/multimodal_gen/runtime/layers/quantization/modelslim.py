@@ -139,7 +139,20 @@ class ModelSlimConfig(QuantizationConfig):
             )
 
             return ModelSlimMXFP8Scheme()
-        raise NotImplementedError("No modelslim compatible scheme was found.")
+        elif quant_type in ("W4A4_MXFP4", "W4A4_MXFP4_DUALSCALE"):
+            from sglang.multimodal_gen.runtime.layers.quantization.modelslim_mxfp4_scheme import (
+                ModelSlimMXFP4Scheme,
+            )
+
+            return ModelSlimMXFP4Scheme(
+                quant_config=self.quant_description,
+                prefix=prefix,
+                quant_type=quant_type,
+            )
+        raise NotImplementedError(
+            f"No modelslim compatible scheme was found for layer '{layer_name}'. "
+            f"quant_description['{layer_name}.weight'] = '{quant_type}'"
+        )
 
     def get_scheme(
         self, layer: torch.nn.Module, layer_name: Optional[str] = None
@@ -187,12 +200,8 @@ class ModelSlimConfig(QuantizationConfig):
         assert is_skipped is not None
         return is_skipped
 
-    def get_scaled_act_names(self) -> List[str]:
-        return []
-
 
 class ModelSlimLinearMethod(LinearMethodBase):
-
     def __init__(self, quantization_config: ModelSlimConfig):
         self.quantization_config = quantization_config
 

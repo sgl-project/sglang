@@ -1,0 +1,16 @@
+{
+  "useful_configs": {
+    "1": "helion.Config(block_sizes=[32, 64], indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer', 'tensor_descriptor', 'pointer', 'pointer', 'tensor_descriptor', 'pointer'], l2_groupings=[1], load_eviction_policies=['', 'last', 'first', '', '', '', 'last', '', '', '', 'first', 'first', '', '', 'first', 'first', '', '', ''], loop_orders=[[0, 2, 1]], num_stages=4, num_warps=1, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[0], range_unroll_factors=[0], range_warp_specializes=[None])",
+    "2": "helion.Config(block_sizes=[32, 64], indexing=['pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer'], l2_groupings=[1], load_eviction_policies=['', 'last', 'first', '', '', '', 'last', '', '', '', 'first', 'first', '', '', 'first', 'first', '', '', ''], loop_orders=[[0, 2, 1]], num_stages=4, num_warps=1, pid_type='flat', range_flattens=[None], range_multi_buffers=[None], range_num_stages=[0], range_unroll_factors=[0], range_warp_specializes=[None])"
+  },
+  "hash_configs": {
+    "(4096, (2, 2), (4,))": 1,
+    "(8192, (2, 2), (4,))": 1,
+    "(4096, (4, 4), (4,))": 2,
+    "(8192, (4, 4), (4,))": 2,
+    "(4096, (2, 2), (3,))": 2,
+    "(8192, (2, 2), (3,))": 2,
+    "(4096, (4, 4), (3,))": 2,
+    "(8192, (4, 4), (3,))": 2
+  }
+}

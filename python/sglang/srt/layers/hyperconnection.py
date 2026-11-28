@@ -1,0 +1,547 @@
+from functools import lru_cache
+from typing import Optional
+
+import msgspec
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.environ import envs
+from sglang.srt.layers.hc_mix_flydsl import (
+    flydsl_hc_fused_available,
+    flydsl_hc_mix_supported,
+    flydsl_hc_mix_weights_supported,
+    weight_cache_key,
+)
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
+
+_use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
+_is_npu = is_npu()
+
+
+@lru_cache(None)
+def _hc_gate_stream(device: int) -> torch.cuda.Stream:
+    return torch.cuda.Stream(device=device)
+
+
+class HyperConnectionConfig(msgspec.Struct, frozen=True):
+    hc_count: int = 4
+    hidden_size: int = 64
+    params_dtype: torch.dtype = torch.bfloat16
+    mtp_hc: bool = False
+    hc_lowrank: int = 16
+    rms_norm_eps: float = 1e-6
+    hc_per_branch_norm: bool = False
+
+
+class GroupedGemmaRMSNorm(nn.Module):
+    def __init__(
+        self, hidden_size: int, eps: float = 1e-6, group_size: Optional[int] = None
+    ):
+        super().__init__()
+        if group_size is not None and hidden_size % group_size != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by group_size ({group_size})"
+            )
+        self.weight = nn.Parameter(torch.zeros(hidden_size))
+        self.variance_epsilon = eps
+        self.group_size = group_size
+        self.weight.weight_loader = self._weight_loader
+        # The JIT kernel requires group_size to be a multiple of 512; this is
+        # init-static, so resolve it once here (device/dtype stay per-call).
+        effective_group_size = group_size if group_size is not None else hidden_size
+        self._jit_group_size = (
+            effective_group_size if effective_group_size % 512 == 0 else None
+        )
+
+    def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        assert param.size() == loaded_weight.size()
+        param.data.copy_(loaded_weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_npu:
+            from sgl_kernel_npu.operators.norm import grouped_gemma_rmsnorm
+
+            return grouped_gemma_rmsnorm(
+                x, self.weight, self.group_size, self.variance_epsilon
+            )
+        if (
+            self._jit_group_size is not None
+            and x.is_cuda
+            and x.dtype in (torch.bfloat16, torch.float16)
+        ):
+            from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
+                grouped_gemma_rmsnorm,
+            )
+
+            return grouped_gemma_rmsnorm(
+                x, self.weight, self._jit_group_size, self.variance_epsilon
+            )
+        input_dtype = x.dtype
+        x_float = x.float()
+        if self.group_size is None:
+            variance = x_float.pow(2).mean(dim=-1, keepdim=True)
+            x_norm = x_float * torch.rsqrt(variance + self.variance_epsilon)
+        else:
+            x_grouped = x_float.reshape(
+                *x_float.shape[:-1],
+                x_float.shape[-1] // self.group_size,
+                self.group_size,
+            )
+            variance = x_grouped.pow(2).mean(dim=-1, keepdim=True)
+            x_norm = (
+                x_grouped * torch.rsqrt(variance + self.variance_epsilon)
+            ).flatten(-2)
+        return (x_norm * (1.0 + self.weight.float())).to(input_dtype)
+
+
+class GatedResidual(nn.Module):
+    def __init__(
+        self,
+        config: HyperConnectionConfig,
+        use_mix: bool = True,
+        use_combine: bool = True,
+        role: Optional[str] = None,
+    ):
+        super().__init__()
+
+        self.config = config
+        self.hc_count = config.hc_count
+        if config.mtp_hc and role is not None and "mtp" in role:
+            self.hc_count = self.hc_count + 1
+        self.hidden_size = config.hidden_size
+        self.params_dtype = config.params_dtype
+
+        norm_dim = (
+            self.config.hidden_size * self.hc_count
+            if self.config.hc_per_branch_norm
+            else self.config.hidden_size
+        )
+        norm_group_size = (
+            self.config.hidden_size if self.config.hc_per_branch_norm else None
+        )
+        self.hc_norm = GroupedGemmaRMSNorm(
+            norm_dim, eps=self.config.rms_norm_eps, group_size=norm_group_size
+        )
+
+        if use_mix:
+            self.input_mix_weight_down = nn.Linear(
+                self.hidden_size * self.hc_count,
+                self.config.hc_lowrank,
+                bias=False,
+                dtype=config.params_dtype,
+            )
+            self.input_mix_weight_up = nn.Linear(
+                self.config.hc_lowrank,
+                self.hc_count * self.hidden_size,
+                bias=False,
+                dtype=config.params_dtype,
+            )
+            lowrank = self.config.hc_lowrank
+            self._jit_mix_ok = (
+                not _is_npu
+                and torch.cuda.is_available()
+                # The CuTe split-K pair is tcgen05 (sm_100 family) only.
+                and torch.cuda.get_device_capability()[0] == 10
+                and (self.hc_count * self.hidden_size) % 2048 == 0
+                and self.hidden_size % 8 == 0
+                and lowrank > 0
+                and lowrank % 8 == 0
+            )
+            self._mix_up_weight_padded = None
+            # Resolved on the first mix(), once the weights are final.
+            self._mix_flydsl_ok = None
+            self._mix_flydsl_weights = None
+            self._mix_flydsl_weight_key = None
+        # Decode-sized gfx950 sites: the norm and the inject GEMV fold into the mix,
+        # which hands its combine the inject logits as gate partials.
+        self._fused_hc_ok = (
+            use_mix
+            and envs.SGLANG_ROCM_OPT_QWEN4_FUSED_HC.get()
+            and self.hc_count == 4
+            and self.config.hc_per_branch_norm
+            and _use_aiter
+            and is_gfx95_supported()
+            and flydsl_hc_fused_available()
+        )
+        if self._fused_hc_ok:
+            from sglang.kernels.ops.gemm.hc_fused_flydsl import (
+                hc_fused_shapes_supported,
+            )
+
+            self._fused_hc_ok = hc_fused_shapes_supported(
+                self.hc_count * self.hidden_size, self.config.hc_lowrank
+            )
+        self._fused_hc_weights = None
+        self._fused_hc_weight_key = None
+
+        self._gate_stream = None
+        if use_combine:
+            self.block_inject_weight = nn.Linear(
+                self.hidden_size * self.hc_count,
+                self.hc_count,
+                bias=False,
+                dtype=config.params_dtype,
+            )
+            # hc_combine rejects other shapes; device and dtype are checked per call.
+            self._jit_combine_ok = (
+                self.hidden_size % 8 == 0
+                and (self.hc_count * self.hidden_size) % 2048 == 0
+            )
+            vecs = self.hc_count * self.hidden_size // 8
+            self._split_combine_ok = (
+                self._jit_combine_ok
+                and vecs % (8 * 160) == 0
+                and (self.hidden_size // 8) % (vecs // 8) == 0
+            )
+            if (
+                self.hc_count == 4
+                and self.hidden_size == 2560
+                and config.hc_per_branch_norm
+                and config.params_dtype == torch.bfloat16
+                and torch.cuda.is_available()
+                and torch.cuda.get_device_capability()[0] == 10
+            ):
+                # Create before graph capture; all layers on a device share it.
+                self._gate_stream = _hc_gate_stream(torch.cuda.current_device())
+        else:
+            self.block_inject_weight = None
+
+        def _mix_compute(
+            hyper_input_normed: torch.Tensor,
+            input_mix_weight_down: torch.Tensor,
+            input_mix_weight_up: torch.Tensor,
+            hc: int,
+            hs: int,
+        ) -> torch.Tensor:
+            input_mix_weight = F.silu(
+                F.linear(hyper_input_normed, input_mix_weight_down) / hc
+            )
+            input_mix_weight = F.linear(input_mix_weight, input_mix_weight_up)
+            input_mix_weight = torch.sigmoid(input_mix_weight)
+            input_mix_weight = input_mix_weight.unflatten(-1, (hc, hs))
+            output = (
+                input_mix_weight * hyper_input_normed.unflatten(-1, (hc, hs))
+            ).mean(dim=-2)
+            return output
+
+        def _combine_compute(
+            block_output: torch.Tensor,
+            residual: torch.Tensor,
+            normed_residual: torch.Tensor,
+            block_inject_weight: torch.Tensor,
+            hc: int,
+            hs: int,
+        ) -> torch.Tensor:
+            R = residual.unflatten(-1, (hc, hs))
+            block_inject_weight_out = 2 * torch.sigmoid(
+                F.linear(normed_residual, block_inject_weight) / hc
+            )
+            injection = block_output.unsqueeze(-2) * block_inject_weight_out.unsqueeze(
+                -1
+            )
+            return (R + injection).flatten(-2)
+
+        # With PyTorch 2.10.0+cpu and torch_npu 2.10.0, multi-rank cached
+        # restarts can fail in Inductor's timeout-extension helper with
+        # "No backend type associated with device type npu".
+        # Disable torch.compile on NPU; NPU graph capture remains unchanged.
+        # TODO: Re-enable after both fresh-cache and cached-restart tests pass
+        # on NPU with compatible dependencies.
+        self._mix_compute = torch.compile(_mix_compute, disable=_is_npu)
+        self._combine_compute = torch.compile(_combine_compute, disable=_is_npu)
+
+    def _flydsl_mix_ok(self) -> bool:
+        if self._mix_flydsl_ok is None:
+            self._mix_flydsl_ok = flydsl_hc_mix_weights_supported(
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+            )
+        return self._mix_flydsl_ok
+
+    def _fused_weights(self):
+        from sglang.kernels.ops.gemm.hc_fused_flydsl import HcFusedWeights
+
+        down = self.input_mix_weight_down.weight
+        up = self.input_mix_weight_up.weight
+        norm = self.hc_norm.weight
+        inject = self.block_inject_weight
+        inject = None if inject is None else inject.weight
+        # The norm and inject weights are folded into the packed copy as well.
+        key = (
+            weight_cache_key(down, up),
+            weight_cache_key(norm, norm if inject is None else inject),
+        )
+        if self._fused_hc_weight_key != key:
+            self._fused_hc_weights = HcFusedWeights(
+                down=down,
+                up=up,
+                inject=inject,
+                norm_weight=norm,
+                eps=self.hc_norm.variance_epsilon,
+            )
+            self._fused_hc_weight_key = key
+        return self._fused_hc_weights
+
+    def prewarm_fused_hc(self) -> None:
+        """Compile the fused HC kernels for every row count bucket before serving."""
+        if not self._fused_hc_ok:
+            return
+        from sglang.kernels.ops.gemm.hc_fused_flydsl import prewarm_hc_fused
+
+        with torch.no_grad():
+            prewarm_hc_fused(
+                weights=self._fused_weights(),
+                k=self.hc_count * self.hidden_size,
+                device=self.input_mix_weight_down.weight.device,
+            )
+
+    def _fused_mix(self, hyper_input: torch.Tensor, sumsq: Optional[torch.Tensor]):
+        from sglang.kernels.ops.gemm.hc_fused_flydsl import hc_fused_mix
+
+        mixed_input, inject_logits = hc_fused_mix(
+            h=hyper_input, weights=self._fused_weights(), sumsq=sumsq
+        )
+        # The fused combine never reads the normed slot.
+        return mixed_input, (hyper_input, hyper_input, inject_logits)
+
+    def mix(
+        self,
+        hyper_input: torch.Tensor,
+        prepared_norm: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+        """``prepared_norm`` is whatever ``combine_and_normalize`` returned for
+        ``hyper_input``: on the fused path, the [M, HC * NP] FP32 partial sums of
+        squares from ``hc_apply_inject``; otherwise, ``hc_norm(hyper_input)``.
+        None makes ``mix`` compute whichever one its path needs.
+        """
+        assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
+        if hyper_input.shape[0] == 0:
+            mixed_input = hyper_input.new_empty(
+                (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
+            )
+            return mixed_input, (hyper_input, hyper_input, None)
+        if (
+            self._fused_hc_ok
+            and not torch.compiler.is_compiling()
+            and flydsl_hc_mix_supported(hyper_input, True)
+        ):
+            return self._fused_mix(hyper_input, sumsq=prepared_norm)
+
+        if prepared_norm is not None:
+            assert self.config.hc_per_branch_norm
+            assert prepared_norm.shape == hyper_input.shape
+            hyper_input_normed = prepared_norm
+        elif self.config.hc_per_branch_norm:
+            hyper_input_normed = self.hc_norm(hyper_input)
+        else:
+            hyper_input_normed = self.hc_norm(
+                hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
+            ).flatten(-2)
+        if _is_npu:
+            from sgl_kernel_npu.operators.hyper_conn import hc_mix
+
+            mixed_input = hc_mix(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+        elif (
+            self._jit_mix_ok
+            and hyper_input_normed.is_cuda
+            and hyper_input_normed.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input_normed.shape[0] <= 24
+        ):
+            from sglang.kernels.ops.gemm.hc_mix_splitk import (
+                hc_mix,
+                permute_pad_up_weight,
+            )
+
+            if self._mix_up_weight_padded is None:
+                self._mix_up_weight_padded = permute_pad_up_weight(
+                    self.input_mix_weight_up.weight, self.hc_count
+                )
+            mixed_input = hc_mix(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight.data,
+                self._mix_up_weight_padded,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+        elif flydsl_hc_mix_supported(hyper_input_normed, self._flydsl_mix_ok()):
+            from aiter.ops.flydsl.hc_mix import hc_mix, pack_hc_weights
+
+            down = self.input_mix_weight_down.weight
+            up = self.input_mix_weight_up.weight
+            key = weight_cache_key(down, up)
+            if self._mix_flydsl_weight_key != key:
+                self._mix_flydsl_weights = pack_hc_weights(down, up, self.hc_count)
+                self._mix_flydsl_weight_key = key
+            mixed_input = hc_mix(hyper_input_normed, *self._mix_flydsl_weights).to(
+                self.params_dtype
+            )
+        elif fused_hc_mix_supported(
+            hyper_input_normed,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+        ):
+            mixed_input = fused_hc_mix(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+        else:
+            mixed_input = self._mix_compute(
+                hyper_input_normed,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+        partials = None
+        stream = self._gate_stream
+        if (
+            stream is not None
+            and hyper_input.shape[0] == 1
+            and hyper_input.dtype == torch.bfloat16
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import hc_combine_gate
+
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                partials = hc_combine_gate(
+                    hyper_input_normed, self.block_inject_weight.weight
+                )
+            hyper_input_normed.record_stream(stream)
+        return mixed_input, (hyper_input, hyper_input_normed, partials)
+
+    def combine_and_normalize(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        next_norm: Optional[GroupedGemmaRMSNorm],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return the combined residual and the next ``mix``'s ``prepared_norm``.
+
+        That is the [M, HC * NP] FP32 partial sums of squares on the fused path,
+        ``next_norm`` of the BF16-rounded residual on the decode combine-norm path,
+        and None otherwise or when ``next_norm`` is None.
+        Pass ``next_norm`` only when no PLE or other update touches the residual first.
+        """
+        hyper_input, _, partials = residuals
+        # Fused mix: partials are [M, HC] inject logits; SM100: [M, 8, 4] gate partials.
+        # This check tells them apart only because ROCm never sets _gate_stream.
+        if self._fused_hc_ok and partials is not None:
+            from sglang.kernels.ops.gemm.hc_fused_flydsl import hc_apply_inject
+
+            out, sumsq = hc_apply_inject(
+                h=hyper_input, y=block_output.contiguous(), g=partials
+            )
+            return out, (sumsq if next_norm is not None else None)
+        if (
+            partials is not None
+            and next_norm is not None
+            and next_norm.group_size == self.hidden_size
+            and next_norm.weight.dtype == torch.bfloat16
+            and block_output.dtype == torch.bfloat16
+        ):
+            from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                hc_combine_apply_norm,
+            )
+
+            current = torch.cuda.current_stream()
+            current.wait_stream(self._gate_stream)
+            partials.record_stream(current)
+            return hc_combine_apply_norm(
+                block_output,
+                hyper_input,
+                partials,
+                next_norm.weight,
+                next_norm.variance_epsilon,
+            )
+        return self.combine(block_output, residuals), None
+
+    def combine(
+        self,
+        block_output: torch.Tensor,
+        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+    ) -> torch.Tensor:
+        hyper_input, hyper_input_normed, partials = residuals
+        if self._fused_hc_ok and partials is not None:
+            from sglang.kernels.ops.gemm.hc_fused_flydsl import hc_apply_inject
+
+            return hc_apply_inject(
+                h=hyper_input, y=block_output.contiguous(), g=partials
+            )[0]
+        if partials is not None:
+            from sglang.kernels.ops.elementwise.hc_combine_decode import (
+                hc_combine_apply,
+            )
+
+            current = torch.cuda.current_stream()
+            current.wait_stream(self._gate_stream)
+            partials.record_stream(current)
+            return hc_combine_apply(block_output, hyper_input, partials)
+        assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
+        assert block_output.shape[-1] == self.hidden_size
+        if block_output.shape[0] == 0:
+            return hyper_input.to(self.params_dtype)
+
+        if _is_npu:
+            from sgl_kernel_npu.operators.hyper_conn import hc_combine
+
+            return hc_combine(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                self.block_inject_weight.weight,
+                self.hc_count,
+                self.hidden_size,
+            ).to(self.params_dtype)
+
+        if (
+            self._jit_combine_ok
+            and block_output.is_cuda
+            and block_output.dtype in (torch.bfloat16, torch.float16)
+            and hyper_input.dtype == block_output.dtype
+            and hyper_input_normed.dtype == block_output.dtype
+            and self.block_inject_weight.weight.dtype == block_output.dtype
+        ):
+            if self._split_combine_ok and block_output.shape[0] <= 32:
+                from sglang.kernels.ops.elementwise.hc_combine import hc_combine_split
+
+                return hc_combine_split(
+                    block_output,
+                    hyper_input,
+                    hyper_input_normed,
+                    self.block_inject_weight.weight.data,
+                    self.hc_count,
+                    self.hidden_size,
+                )
+            from sglang.kernels.ops.elementwise.hc_combine import hc_combine
+
+            return hc_combine(
+                block_output,
+                hyper_input,
+                hyper_input_normed,
+                self.block_inject_weight.weight,
+                self.hc_count,
+                self.hidden_size,
+            )
+
+        updated_residuals = self._combine_compute(
+            block_output,
+            hyper_input,
+            hyper_input_normed,
+            self.block_inject_weight.weight,
+            self.hc_count,
+            self.hidden_size,
+        ).to(self.params_dtype)
+        return updated_residuals

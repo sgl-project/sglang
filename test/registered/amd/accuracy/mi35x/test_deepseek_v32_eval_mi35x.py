@@ -3,16 +3,11 @@
 Tests DeepSeek-V3.2 with basic configuration using few-shot completion
 benchmark on MI35x.
 
-Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32 suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v32 suite
 """
 
 import ast
 import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -35,8 +30,9 @@ from sglang.utils import download_and_cache_file, read_jsonl
 # Register for AMD CI - MI35x DeepSeek-V3.2 accuracy test (~90 min for basic only)
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-deepseek-v32",
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v32",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999
@@ -78,9 +74,9 @@ MI35X_DEEPSEEK_V32_MODELS = [
         variant="basic",
         other_args=[
             "--trust-remote-code",
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
             "--mem-fraction-static",
             "0.85",
@@ -188,9 +184,9 @@ class TestDeepSeekV32EvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

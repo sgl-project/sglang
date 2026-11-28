@@ -4,51 +4,88 @@ Server management and performance validation for diffusion tests.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import io
+import math
 import os
+import re
 import shlex
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 import pytest
 from openai import Client
+from PIL import Image
 
 from sglang.multimodal_gen.benchmarks.compare_perf import calculate_upper_bound
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.common import kill_process_tree
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     globally_suppress_loggers,
     init_logger,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.runtime.utils.process import kill_process_tree
+from sglang.multimodal_gen.test.server.common.slack import upload_file_to_slack
+from sglang.multimodal_gen.test.server.realtime_consistency import (
+    build_realtime_init_payload,
+    collect_realtime_output,
+    encode_realtime_frames_to_mp4,
+    prepare_realtime_first_frame,
+    realtime_ws_url,
+    record_realtime_key_frames,
+    record_realtime_perf_stats,
+)
 from sglang.multimodal_gen.test.server.testcase_configs import (
     DiffusionSamplingParams,
     PerformanceSummary,
     ScenarioConfig,
     ToleranceConfig,
 )
-from sglang.multimodal_gen.test.slack_utils import upload_file_to_slack
 from sglang.multimodal_gen.test.test_utils import (
     get_expected_image_format,
     get_video_frame_count,
     is_image_url,
     prepare_perf_log,
+    validate_audio_output,
     validate_image,
     validate_image_file,
     validate_openai_video,
     validate_video_file,
 )
+from sglang.test.test_utils import ADMIN_LAUNCH_ARGS_FOR_TEST
+
+if TYPE_CHECKING:
+    from sglang.multimodal_gen.test.server.common.gpu_headroom import GpuHeadroomSampler
 
 logger = init_logger(__name__)
 
 globally_suppress_loggers()
+
+FIRST_DENOISE_STEP_TOLERANCE = 4.0
+FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 80.0
+DECODING_STAGE_MIN_ABS_TOLERANCE_MS = 450.0
+VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 160.0
+
+
+def is_missing_diffusers_pipeline_error(message: str) -> bool:
+    """Return whether a server startup error is caused by a missing diffusers pipeline."""
+    normalized_message = message.lower()
+    return (
+        "not found in diffusers" in normalized_message
+        or "module 'diffusers' has no attribute" in normalized_message
+        or 'module "diffusers" has no attribute' in normalized_message
+    )
+
 
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
@@ -159,6 +196,23 @@ class ServerContext:
     log_dir: Path
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
+    load_time_ms: float | None = None
+    load_finished_ns: int | None = None
+    server_ready_ns: int | None = None
+    headroom_sampler: GpuHeadroomSampler | None = None
+
+    def minimum_free_vram(self) -> dict[str, list[float]]:
+        assert self.headroom_sampler is not None, "GPU headroom sampler missing"
+        assert self.load_finished_ns is not None and self.server_ready_ns is not None
+        return self.headroom_sampler.minima(self.load_finished_ns, self.server_ready_ns)
+
+    def log_tail(self, lines: int = 200) -> str:
+        """Return recent server output for failure diagnostics."""
+        try:
+            content = self.stdout_file.read_text(encoding="utf-8", errors="ignore")
+            return "\n".join(content.splitlines()[-lines:])
+        except Exception:
+            return ""
 
     def cleanup(self) -> None:
         """Clean up server resources."""
@@ -367,9 +421,14 @@ class ServerManager:
             "--port",
             str(self.port),
             "--log-level=debug",
+            # The admin routes (weights, LoRA, profiling) refuse a server without one.
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
         if self.extra_args.strip():
-            command.extend(self.extra_args.strip().split())
+            command.extend(shlex.split(self.extra_args))
+        access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
+        if not any(arg.startswith(access_log_exclude_flag) for arg in command):
+            command.extend(["--uvicorn-access-log-exclude-prefixes", "/health"])
 
         env = os.environ.copy()
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
@@ -383,6 +442,9 @@ class ServerManager:
         # regardless of log-level configuration.
         print(f"[server-test] Running command: {cmd_str}", flush=True)
 
+        load_started_ns = time.monotonic_ns()
+        load_finished_ns = None
+        load_ready = threading.Event()
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -398,9 +460,17 @@ class ServerManager:
 
             def _log_pipe(pipe: Any, file: Any) -> None:
                 """Read from pipe and write to file and stdout."""
+                nonlocal load_finished_ns
                 try:
                     with pipe:
                         for line in iter(pipe.readline, ""):
+                            match = re.search(
+                                r"\[server-load\] workers_ready_monotonic_ns=(\d+)",
+                                line,
+                            )
+                            if match and load_finished_ns is None:
+                                load_finished_ns = int(match.group(1))
+                                load_ready.set()
                             sys.stdout.write(line)
                             sys.stdout.flush()
                             file.write(line)
@@ -423,9 +493,7 @@ class ServerManager:
             flush=True,
         )
 
-        self._wait_for_ready(process, stdout_path)
-
-        return ServerContext(
+        context = ServerContext(
             port=self.port,
             process=process,
             model=self.model,
@@ -435,11 +503,24 @@ class ServerManager:
             _stdout_fh=stdout_fh,
             _log_thread=log_thread,
         )
+        try:
+            self._wait_for_ready(process, stdout_path)
+            context.server_ready_ns = time.monotonic_ns()
+            # health includes warmup; the worker marker's clock excludes it
+            load_ready.wait(timeout=5)
+            if load_finished_ns is not None:
+                context.load_finished_ns = load_finished_ns
+                context.load_time_ms = (load_finished_ns - load_started_ns) / 1e6
+        except BaseException:
+            context.cleanup()
+            raise
+
+        return context
 
     def _wait_for_ready(self, process: subprocess.Popen, stdout_path: Path) -> None:
-        """Wait for server to become ready."""
+        """Wait until model warmup finishes and inference traffic is accepted."""
         start = time.time()
-        ready_message = "Application startup complete."
+        health_url = f"http://127.0.0.1:{self.port}/health"
         log_period = 30
         prev_log_period_count = 0
 
@@ -450,14 +531,13 @@ class ServerManager:
                     f"Server exited early (code {process.returncode}).\n{tail}"
                 )
 
-            if stdout_path.exists():
-                try:
-                    content = stdout_path.read_text(encoding="utf-8", errors="ignore")
-                    if ready_message in content:
+            try:
+                with urlopen(health_url, timeout=1) as response:
+                    if response.status == 200:
                         logger.info("[server-test] Server ready")
                         return
-                except Exception as e:
-                    logger.debug("Could not read log yet: %s", e)
+            except (HTTPError, URLError, TimeoutError, OSError):
+                pass
 
             elapsed = int(time.time() - start)
             if (elapsed // log_period) > prev_log_period_count:
@@ -502,7 +582,8 @@ class PerformanceValidator:
         actual: float,
         expected: float,
         tolerance: float,
-        min_abs_tolerance_ms: float = 20.0,
+        min_abs_tolerance: float = 20.0,
+        unit: str = "ms",
     ):
         """Assert that actual is less than or equal to expected within a tolerance.
 
@@ -518,27 +599,166 @@ class PerformanceValidator:
             # Use 100% higher tolerance for AMD (2x the expected value)
             amd_tolerance = 1.0  # 100%
             upper_bound = calculate_upper_bound(
-                expected, amd_tolerance, min_abs_tolerance_ms
+                expected, amd_tolerance, min_abs_tolerance
             )
             if actual > upper_bound:
                 logger.warning(
                     f"[AMD PERF WARNING] Validation would fail for '{name}'.\n"
-                    f"  Actual:   {actual:.4f}ms\n"
-                    f"  Expected: {expected:.4f}ms\n"
-                    f"  AMD Limit: {upper_bound:.4f}ms "
-                    f"(rel_tol: {amd_tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)\n"
+                    f"  Actual:   {actual:.4f}{unit}\n"
+                    f"  Expected: {expected:.4f}{unit}\n"
+                    f"  AMD Limit: {upper_bound:.4f}{unit} "
+                    f"(rel_tol: {amd_tolerance:.1%}, "
+                    f"abs_pad: {min_abs_tolerance}{unit})\n"
                     f"  Original tolerance was: {tolerance:.1%}"
                 )
         else:
-            upper_bound = calculate_upper_bound(
-                expected, tolerance, min_abs_tolerance_ms
-            )
+            upper_bound = calculate_upper_bound(expected, tolerance, min_abs_tolerance)
             assert actual <= upper_bound, (
                 f"Validation failed for '{name}'.\n"
-                f"  Actual:   {actual:.4f}ms\n"
-                f"  Expected: {expected:.4f}ms\n"
-                f"  Limit:    {upper_bound:.4f}ms "
-                f"(rel_tol: {tolerance:.1%}, abs_pad: {min_abs_tolerance_ms}ms)"
+                f"  Actual:   {actual:.4f}{unit}\n"
+                f"  Expected: {expected:.4f}{unit}\n"
+                f"  Limit:    {upper_bound:.4f}{unit} "
+                f"(rel_tol: {tolerance:.1%}, "
+                f"abs_pad: {min_abs_tolerance}{unit})"
+            )
+
+    def validate_peak_vram(
+        self,
+        summary: PerformanceSummary,
+        expected_load_peak_vram_mb: float,
+        expected_runtime_peak_vram_mb: float,
+        expected_warmup_peak_vram_mb: float | None = None,
+        expected_load_peak_allocated_mb: float | None = None,
+        expected_runtime_peak_allocated_mb: float | None = None,
+    ) -> None:
+        assert summary.load_peak_vram_mb > 0, "Load peak VRAM metric missing"
+        assert summary.runtime_peak_vram_mb > 0, "Runtime peak VRAM metric missing"
+        floors = self.scenario.min_free_vram_mb
+        if floors is None:
+            self._assert_peak_vram(
+                "Load Peak VRAM",
+                reserved=summary.load_peak_vram_mb,
+                allocated=summary.load_peak_allocated_mb,
+                expected_reserved=expected_load_peak_vram_mb,
+                expected_allocated=expected_load_peak_allocated_mb,
+                tolerance=self.tolerances.load_peak_vram,
+            )
+        else:
+            # auto placement may keep more weights resident to reduce request time
+            assert {"load", "serving"} <= floors.keys(), (
+                "Missing load or serving GPU headroom floor"
+            )
+            minima = summary.min_free_vram_mb
+            for phase, floor in floors.items():
+                assert math.isfinite(floor) and floor > 0, (
+                    f"Invalid {phase} GPU headroom floor"
+                )
+                assert phase in minima, f"Missing {phase} GPU headroom measurement"
+                assert minima[phase] >= floor, (
+                    f"{phase} minimum free VRAM: {minima[phase]:.0f} MiB, need {floor:.0f} MiB"
+                )
+        self._assert_peak_vram(
+            "Runtime Peak VRAM",
+            reserved=summary.runtime_peak_vram_mb,
+            allocated=summary.runtime_peak_allocated_mb,
+            expected_reserved=expected_runtime_peak_vram_mb,
+            expected_allocated=expected_runtime_peak_allocated_mb,
+            tolerance=self.tolerances.runtime_peak_vram,
+        )
+        # the full-shape warmup probe keeps its own budget, separate from serving
+        if expected_warmup_peak_vram_mb is not None and summary.warmup_peak_vram_mb > 0:
+            self._assert_le(
+                "Warmup Peak VRAM",
+                summary.warmup_peak_vram_mb,
+                expected_warmup_peak_vram_mb,
+                self.tolerances.runtime_peak_vram,
+                min_abs_tolerance=128.0,
+                unit=" MiB",
+            )
+
+    def _assert_peak_vram(
+        self,
+        name: str,
+        *,
+        reserved: float,
+        allocated: float,
+        expected_reserved: float,
+        expected_allocated: float | None,
+        tolerance: float,
+    ) -> None:
+        """Enforce the allocated peak when the baseline has one, else reserved.
+
+        Reserved peaks include the caching allocator's pool, which follows the
+        allocation history of everything run before the request (warmup shapes,
+        load-time leftovers) and moves a few percent for identical work. The
+        allocated peak is what the model and its activations actually use.
+        """
+        if expected_allocated is not None and allocated > 0:
+            self._assert_le(
+                f"{name} (allocated)",
+                allocated,
+                expected_allocated,
+                tolerance,
+                min_abs_tolerance=128.0,
+                unit=" MiB",
+            )
+            logger.info(
+                "%s reserved %.0f MiB (baseline %.0f MiB, reported only)",
+                name,
+                reserved,
+                expected_reserved,
+            )
+            return
+        self._assert_le(
+            name,
+            reserved,
+            expected_reserved,
+            tolerance,
+            min_abs_tolerance=128.0,
+            unit=" MiB",
+        )
+
+    def validate_peak_host_anon(
+        self,
+        summary: PerformanceSummary,
+        expected_load_mb: float | None,
+        expected_runtime_mb: float | None,
+    ) -> None:
+        """Anonymous-host budget: peaks must stay at or under the baseline.
+
+        Skipped wholesale when the baseline carries no host figures (older
+        scenarios) or the record has none (non-Linux, or a server predating
+        the sampler) -- the VRAM checks do not imply anything about the host,
+        as the LoRA-merge blow-up showed: VRAM green, host budget gone.
+        """
+        if expected_load_mb is None and expected_runtime_mb is None:
+            return
+        if summary.runtime_peak_host_anon_mb <= 0:
+            logger.warning(
+                "Host-anon baseline present but the record has no host peaks; "
+                "skipping the host budget check"
+            )
+            return
+        tolerance = self.scenario.host_anon_tolerance
+        if tolerance is None:
+            tolerance = self.tolerances.host_anon
+        if expected_load_mb is not None:
+            self._assert_le(
+                "Load Peak Host Anon",
+                summary.load_peak_host_anon_mb,
+                expected_load_mb,
+                tolerance,
+                min_abs_tolerance=256.0,
+                unit=" MiB",
+            )
+        if expected_runtime_mb is not None:
+            self._assert_le(
+                "Runtime Peak Host Anon",
+                summary.runtime_peak_host_anon_mb,
+                expected_runtime_mb,
+                tolerance,
+                min_abs_tolerance=256.0,
+                unit=" MiB",
             )
 
     def validate(
@@ -549,7 +769,7 @@ class PerformanceValidator:
         if self.is_baseline_generation_mode:
             return summary
 
-        self._validate_e2e(summary)
+        self.validate_e2e(summary)
         self._validate_denoise_agg(summary)
         self._validate_denoise_steps(summary)
         self._validate_stages(summary)
@@ -562,14 +782,57 @@ class PerformanceValidator:
     ) -> PerformanceSummary:
         return PerformanceSummary.from_req_perf_record(perf_record, self.step_fractions)
 
-    def _validate_e2e(self, summary: PerformanceSummary) -> None:
+    def _timing_tol(self, profile_tolerance: float) -> float:
+        """Tolerance for a wall-clock check, honoring a per-case override.
+
+        A case whose runtime is dominated by shared-runner host I/O cannot be
+        guarded at the profile tolerance; ``timing_tolerance`` in its baseline
+        entry widens only the wall-clock checks, never the memory ones.
+        """
+        override = self.scenario.timing_tolerance
+        if override is None:
+            return profile_tolerance
+        return max(profile_tolerance, override)
+
+    def validate_e2e(self, summary: PerformanceSummary) -> None:
         """Validate end-to-end performance."""
-        assert summary.e2e_ms > 0, "E2E duration missing"
+        assert math.isfinite(summary.e2e_ms) and summary.e2e_ms > 0, (
+            "E2E duration missing or invalid"
+        )
+        expected = self.scenario.expected_e2e_ms
+        assert math.isfinite(expected) and expected > 0, (
+            "E2E baseline missing or invalid"
+        )
         self._assert_le(
             "E2E Latency",
             summary.e2e_ms,
             self.scenario.expected_e2e_ms,
-            self.tolerances.e2e,
+            self._timing_tol(self.tolerances.e2e),
+        )
+
+    def validate_load(self, summary: PerformanceSummary) -> None:
+        load_ms = summary.load_time_ms
+        expected_load_ms = self.scenario.expected_load_ms
+        assert load_ms is not None and math.isfinite(load_ms) and load_ms > 0, (
+            "Load duration missing or invalid"
+        )
+        assert (
+            expected_load_ms is not None
+            and math.isfinite(expected_load_ms)
+            and expected_load_ms > 0
+        ), "Load baseline missing or invalid"
+        # Startup time swings with the runner's page-cache state far more than
+        # request latency does, so a profile may give it its own tolerance.
+        load_tolerance = (
+            self.tolerances.load
+            if self.tolerances.load is not None
+            else self.tolerances.e2e
+        )
+        self._assert_le(
+            "Load Latency (excluding warmup)",
+            load_ms,
+            expected_load_ms,
+            self._timing_tol(load_tolerance),
         )
 
     def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
@@ -580,13 +843,13 @@ class PerformanceValidator:
             "Average Denoise Step",
             summary.avg_denoise_ms,
             self.scenario.expected_avg_denoise_ms,
-            self.tolerances.denoise_agg,
+            self._timing_tol(self.tolerances.denoise_agg),
         )
         self._assert_le(
             "Median Denoise Step",
             summary.median_denoise_ms,
             self.scenario.expected_median_denoise_ms,
-            self.tolerances.denoise_agg,
+            self._timing_tol(self.tolerances.denoise_agg),
         )
 
     def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
@@ -595,14 +858,23 @@ class PerformanceValidator:
             expected = self.scenario.denoise_step_ms.get(idx)
             if expected is None:
                 continue
-            # FIXME: hardcode, looser for first step
-            tolerance = 0.4 if idx == 0 else self.tolerances.denoise_step
+            if idx == 0:
+                # server warmup is generic, so the first real step can still
+                # pay request-shape/path lazy init that is not a steady-state signal
+                self._assert_le(
+                    f"Denoise Step {idx}",
+                    actual,
+                    expected,
+                    self._timing_tol(FIRST_DENOISE_STEP_TOLERANCE),
+                    min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                )
+                continue
 
             self._assert_le(
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                tolerance,
+                self._timing_tol(self.tolerances.denoise_step),
             )
 
     def _validate_stages(self, summary: PerformanceSummary) -> None:
@@ -614,29 +886,65 @@ class PerformanceValidator:
                 continue
             actual = summary.stage_metrics.get(stage)
             assert actual is not None, f"Stage {stage} timing missing"
-            tolerance = (
+            tolerance = self._timing_tol(
                 self.tolerances.denoise_stage
-                if stage == "DenoisingStage"
+                if stage in summary.denoising_stages
                 else self.tolerances.non_denoise_stage
             )
             if stage.endswith("DecodingStage"):
                 tolerance = max(tolerance, 0.9)
-                min_abs_tolerance_ms = 250.0
+                min_abs_tolerance = DECODING_STAGE_MIN_ABS_TOLERANCE_MS
             else:
-                min_abs_tolerance_ms = 120.0
+                min_abs_tolerance = 120.0
             self._assert_le(
                 f"Stage '{stage}'",
                 actual,
                 expected,
                 tolerance,
-                min_abs_tolerance_ms=min_abs_tolerance_ms,
+                min_abs_tolerance=min_abs_tolerance,
             )
+
+
+class ActionPerformanceValidator(PerformanceValidator):
+    """Action policies run no denoising loop, so only the denoise checks are skipped."""
+
+    def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
+        return None
+
+    def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
+        return None
 
 
 class VideoPerformanceValidator(PerformanceValidator):
     """Extended validator for video diffusion with frame-level metrics."""
 
     is_video_gen = True
+
+    def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
+        """Validate individual denoising steps."""
+        for idx, actual in summary.sampled_steps.items():
+            expected = self.scenario.denoise_step_ms.get(idx)
+            if expected is None:
+                continue
+            if idx == 0:
+                self._assert_le(
+                    f"Denoise Step {idx}",
+                    actual,
+                    expected,
+                    self._timing_tol(FIRST_DENOISE_STEP_TOLERANCE),
+                    min_abs_tolerance=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                )
+                continue
+
+            # video per-step samples can catch one-off scheduling/offload jitter;
+            # avg and median denoise checks remain the steady-state guard
+            self._assert_le(
+                f"Denoise Step {idx}",
+                actual,
+                expected,
+                self._timing_tol(self.tolerances.denoise_step),
+                min_abs_tolerance=VIDEO_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+            )
 
     def validate(
         self,
@@ -664,7 +972,7 @@ class VideoPerformanceValidator(PerformanceValidator):
                 "Average Frame Time",
                 summary.avg_frame_time_ms,
                 expected_frame_time,
-                self.tolerances.denoise_stage,
+                self._timing_tol(self.tolerances.denoise_stage),
             )
 
 
@@ -674,24 +982,62 @@ class MeshValidator(PerformanceValidator):
     pass
 
 
+# Pinned to a ci-data commit (not main): invalidates the per-URL download cache
+# whenever the reference is regenerated, and keeps the mesh GT reproducible.
+# New GT now publishes to sgl-project/ci-data-diffusion, so when you push a new
+# hunyuan3d.glb, switch the repo in the URL below to it and bump the SHA together
+# (this frozen SHA stays readable on sgl-project/ci-data).
 HUNYUAN3D_REFERENCE_URL = (
-    "https://raw.githubusercontent.com/sgl-project/sgl-test-files/"
-    "main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
+    "https://raw.githubusercontent.com/sgl-project/ci-data/"
+    "395f6e49c37d22a57d79fbcd3653d43984099ae2"
+    "/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.glb"
 )
 
 
 def _download_reference_mesh(url: str) -> Path:
-    """Download a reference mesh from URL, caching in temp dir."""
+    """Download a reference mesh from URL, caching in temp dir.
+
+    Validates that the cached/downloaded file actually *loads* as a non-empty
+    mesh — not just that a magic/length header looks right. raw.githubusercontent
+    can briefly serve a truncated or corrupt response for a just-pushed large
+    file, and a prior run may have cached those bytes on a persistent runner; a
+    size/magic check can't catch a blob whose byte count matches the declared
+    length but whose body is corrupt (exactly what poisoned this CI cache and
+    surfaced as a cryptic trimesh "incorrect header on GLB file" deep inside
+    validation). Loading via trimesh rejects any such cache (forcing a
+    re-download) and turns a bad fresh download into a clear error. The ``v2``
+    cache prefix also invalidates blobs written by the earlier, weaker checks.
+    """
     import hashlib
 
-    cache_name = f"ref_mesh_{hashlib.md5(url.encode()).hexdigest()}.glb"
+    cache_name = f"ref_mesh_v2_{hashlib.md5(url.encode()).hexdigest()}.glb"
     cache_path = Path(tempfile.gettempdir()) / cache_name
-    if cache_path.exists():
+
+    def _loads_as_mesh(path: Path) -> bool:
+        try:
+            import trimesh
+
+            mesh = trimesh.load(str(path), force="mesh")
+            return (
+                getattr(mesh, "vertices", None) is not None and len(mesh.vertices) > 0
+            )
+        except Exception:
+            return False
+
+    if cache_path.exists() and _loads_as_mesh(cache_path):
         logger.info(f"Using cached reference mesh: {cache_path}")
         return cache_path
 
     logger.info(f"Downloading reference mesh from: {url}")
     cache_path.write_bytes(_urlopen_with_retry(url, timeout=60))
+    if not _loads_as_mesh(cache_path):
+        size = cache_path.stat().st_size if cache_path.exists() else 0
+        cache_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Reference mesh from {url} did not load as a valid mesh "
+            f"({size} bytes). The CDN may not have propagated a recently-pushed "
+            f"file yet; retry shortly."
+        )
     logger.info(f"Reference mesh cached at: {cache_path}")
     return cache_path
 
@@ -760,6 +1106,7 @@ VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
     "mesh": MeshValidator,
+    "action": ActionPerformanceValidator,
 }
 
 
@@ -841,10 +1188,28 @@ def get_generate_fn(
         else:
             timeout = 1200.0
         deadline = time.time() + timeout
+        last_progress = 0
+        was_running = False
         while True:
             page = client.videos.list()  # type: ignore[attr-defined]
             item = next((v for v in page.data if v.id == video_id), None)
             status = getattr(item, "status", None) if item is not None else None
+            if item is not None:
+                progress = item.progress
+                assert isinstance(progress, int) and last_progress <= progress <= 100, (
+                    f"{case_id}: invalid video progress {last_progress} -> {progress}"
+                )
+                assert not (was_running and status == "queued"), (
+                    f"{case_id}: running video job returned to queued"
+                )
+                assert status != "completed" or progress == 100, (
+                    f"{case_id}: completed video job has progress={progress}"
+                )
+                assert status not in {"queued", "in_progress"} or progress < 100, (
+                    f"{case_id}: unfinished video job has progress={progress}"
+                )
+                last_progress = progress
+                was_running = was_running or status == "in_progress"
 
             if status == "completed":
                 job_completed = True
@@ -911,6 +1276,15 @@ def get_generate_fn(
         validate_video_file(
             tmp_path, expected_filename, expected_width, expected_height
         )
+        if sampling_params.expect_audio_output:
+            audio_info = validate_audio_output(tmp_path)
+            logger.info(
+                "%s: validated audio output (%s Hz, %s channels, %.3fs)",
+                case_id,
+                audio_info.sample_rate,
+                audio_info.channels,
+                audio_info.duration_seconds,
+            )
 
         if expected_frame_count is not None:
             actual_count = get_video_frame_count(tmp_path)
@@ -938,7 +1312,7 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no text prompt configured")
 
         # Request parameters that affect output format
-        req_output_format = None  # Not specified in current request
+        req_output_format = sampling_params.output_format
         req_background = None  # Not specified in current request
 
         # Build extra_body for optional features
@@ -950,6 +1324,7 @@ def get_generate_fn(
             n=n,
             size=output_size,
             response_format="b64_json",
+            output_format=req_output_format,
             extra_body=extra_body if extra_body else None,
         )
         result = response.parse()
@@ -999,34 +1374,28 @@ def get_generate_fn(
             pytest.skip(f"{case_id}: no edit config")
 
         image_paths = sampling_params.image_path
-
         if not isinstance(image_paths, list):
             image_paths = [image_paths]
 
-        new_image_paths = []
-        for image_path in image_paths:
-            if is_image_url(image_path):
-                new_image_paths.append(download_image_from_url(str(image_path)))
+        extra_body = {
+            "num_frames": sampling_params.num_frames,
+            **sampling_params.extras,
+        }
+        with ExitStack() as stack:
+            images = []
+            if sampling_params.direct_url_test:
+                for url in image_paths:
+                    assert is_image_url(url), (
+                        f"{case_id}: expected an image URL, got {url}"
+                    )
+                extra_body["url"] = image_paths
             else:
-                local_path = Path(image_path)
-                new_image_paths.append(local_path)
-                if not local_path.exists():
-                    pytest.skip(f"{case_id}: file missing: {image_path}")
-
-        image_paths = new_image_paths
-
-        # Request parameters that affect output format
-        req_output_format = (
-            sampling_params.output_format
-        )  # Not specified in current request
-        req_background = None  # Not specified in current request
-
-        # Build extra_body for optional features
-        extra_body = {"num_frames": sampling_params.num_frames}
-        extra_body.update(sampling_params.extras)
-
-        images = [open(image_path, "rb") for image_path in image_paths]
-        try:
+                for path in image_paths:
+                    if is_image_url(path):
+                        path = download_image_from_url(str(path))
+                    if not Path(path).exists():
+                        pytest.skip(f"{case_id}: file missing: {path}")
+                    images.append(stack.enter_context(open(path, "rb")))
             response = client.images.with_raw_response.edit(
                 model=model_path,
                 image=images,
@@ -1034,21 +1403,29 @@ def get_generate_fn(
                 n=n,
                 size=output_size,
                 response_format="b64_json",
-                output_format=req_output_format,
+                output_format=sampling_params.output_format,
                 extra_body=extra_body,
             )
-        finally:
-            for img in images:
-                img.close()
 
         result = response.parse()
+        if sampling_params.expect_rgba_layers:
+            expected = n * sampling_params.num_frames
+            assert len(result.data) == expected, (
+                f"{case_id}: expected {expected} layers, got {len(result.data)}"
+            )
+            for index, item in enumerate(result.data):
+                with Image.open(io.BytesIO(base64.b64decode(item.b64_json))) as layer:
+                    assert (layer.format, layer.mode) == ("PNG", "RGBA"), (
+                        f"{case_id}: layer {index} is {layer.format}/{layer.mode}"
+                    )
+                    layer.load()
         validate_image(result.data[0].b64_json)
 
         img_data = base64.b64decode(result.data[0].b64_json)
         rid = result.id
 
         # Infer expected format from request parameters
-        expected_ext = get_expected_image_format(req_output_format, req_background)
+        expected_ext = get_expected_image_format(sampling_params.output_format, None)
         expected_filename = f"{rid}.{expected_ext}"
         tmp_path = expected_filename
         with open(tmp_path, "wb") as f:
@@ -1061,8 +1438,7 @@ def get_generate_fn(
             expected_filename,
             expected_width,
             expected_height,
-            output_format=req_output_format,
-            background=req_background,
+            output_format=sampling_params.output_format,
         )
 
         upload_file_to_slack(
@@ -1071,75 +1447,6 @@ def get_generate_fn(
             prompt=sampling_params.prompt,
             file_path=tmp_path,
             origin_file_path=sampling_params.image_path,
-        )
-        os.remove(tmp_path)
-
-        return (rid, img_data)
-
-    def generate_image_edit_url(case_id, client) -> tuple[str, bytes]:
-        """TI2I: Text + Image ? Image edit using direct URL transfer (no pre-download)."""
-        if not sampling_params.prompt or not sampling_params.image_path:
-            pytest.skip(f"{case_id}: no edit config")
-        # Handle both single URL and list of URLs
-        image_urls = sampling_params.image_path
-        if not isinstance(image_urls, list):
-            image_urls = [image_urls]
-
-        # Validate all URLs
-        for url in image_urls:
-            if not is_image_url(url):
-                pytest.skip(
-                    f"{case_id}: image_path must be a URL for URL direct test: {url}"
-                )
-
-        # Request parameters that affect output format
-        req_output_format = (
-            sampling_params.output_format
-        )  # Not specified in current request
-        req_background = None  # Not specified in current request
-
-        response = client.images.with_raw_response.edit(
-            model=model_path,
-            prompt=sampling_params.prompt,
-            image=[],  # Only for OpenAI verification
-            n=n,
-            size=sampling_params.output_size,
-            response_format="b64_json",
-            output_format=req_output_format,
-            extra_body={"url": image_urls, "num_frames": sampling_params.num_frames},
-        )
-
-        result = response.parse()
-        rid = result.id
-
-        validate_image(result.data[0].b64_json)
-
-        # Save and upload result for verification
-        img_data = base64.b64decode(result.data[0].b64_json)
-        # Infer expected format from request parameters
-        expected_ext = get_expected_image_format(req_output_format, req_background)
-        expected_filename = f"{rid}.{expected_ext}"
-        tmp_path = expected_filename
-        with open(tmp_path, "wb") as f:
-            f.write(img_data)
-
-        # Validate output file
-        expected_width, expected_height = parse_dimensions(sampling_params.output_size)
-        validate_image_file(
-            tmp_path,
-            expected_filename,
-            expected_width,
-            expected_height,
-            output_format=req_output_format,
-            background=req_background,
-        )
-
-        upload_file_to_slack(
-            case_id=case_id,
-            model=model_path,
-            prompt=sampling_params.prompt,
-            file_path=tmp_path,
-            origin_file_path=str(sampling_params.image_path),
         )
         os.remove(tmp_path)
 
@@ -1219,9 +1526,9 @@ def get_generate_fn(
             size=sampling_params.output_size,
             seconds=video_seconds,
             extra_body={
-                "reference_url": sampling_params.image_path,
                 "fps": sampling_params.fps,
                 "num_frames": sampling_params.num_frames,
+                **extra_body,
             },
         )
 
@@ -1255,6 +1562,57 @@ def get_generate_fn(
                     **extra_body,
                 },
             )
+
+    def generate_realtime_video(case_id, client) -> tuple[str, bytes]:
+        """Realtime video generation folded back into mp4 for consistency checks."""
+        if not sampling_params.prompt:
+            pytest.skip(f"{case_id}: no realtime prompt configured")
+        if sampling_params.realtime_num_chunks is None:
+            pytest.skip(f"{case_id}: realtime_num_chunks is not configured")
+        if sampling_params.realtime_num_chunks <= 0:
+            pytest.fail(f"{case_id}: realtime_num_chunks must be positive")
+
+        first_frame = prepare_realtime_first_frame(sampling_params.image_path)
+        init_payload = build_realtime_init_payload(
+            model_path=model_path,
+            sampling_params=sampling_params,
+            output_size=output_size,
+            first_frame=first_frame,
+        )
+        realtime_output = asyncio.run(
+            collect_realtime_output(
+                ws_url=realtime_ws_url(client),
+                init_payload=init_payload,
+                events=list(sampling_params.realtime_events),
+                num_chunks=sampling_params.realtime_num_chunks,
+                require_chunk_stats=True,
+            )
+        )
+        record_realtime_perf_stats(
+            case_id, realtime_output.chunk_stats, realtime_output.e2e_ms
+        )
+        record_realtime_key_frames(case_id, realtime_output.frames)
+        fps = int(sampling_params.fps or 24)
+        video_bytes = encode_realtime_frames_to_mp4(realtime_output.frames, fps=fps)
+        validate_openai_video(video_bytes)
+
+        rid = f"{case_id}-realtime"
+        expected_filename = f"{rid}.mp4"
+        tmp_path = expected_filename
+        Path(tmp_path).write_bytes(video_bytes)
+        expected_width, expected_height = parse_dimensions(output_size)
+        validate_video_file(
+            tmp_path, expected_filename, expected_width, expected_height
+        )
+        upload_file_to_slack(
+            case_id=case_id,
+            model=model_path,
+            prompt=sampling_params.prompt,
+            file_path=tmp_path,
+            origin_file_path=sampling_params.image_path,
+        )
+        os.remove(tmp_path)
+        return (rid, video_bytes)
 
     def generate_mesh(case_id, client) -> tuple[str, bytes]:
         """I2M: Image to Mesh generation using async /v1/meshes API."""
@@ -1338,8 +1696,15 @@ def get_generate_fn(
                 if content_resp.status_code != 200:
                     pytest.fail(f"{case_id}: mesh download failed: {content_resp.text}")
 
-                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}.glb"
-                temp_path.write_bytes(content_resp.content)
+                content = content_resp.content
+                # Shape-only Hunyuan3D meshes are returned as OBJ, painted meshes
+                # as GLB. Pick the extension from the content magic so trimesh.load
+                # (which dispatches on the file extension) parses it correctly,
+                # instead of raising "incorrect header on GLB file" when an OBJ
+                # body is saved under a .glb name.
+                ext = ".glb" if content[:4] == b"glTF" else ".obj"
+                temp_path = Path(tempfile.gettempdir()) / f"mesh_test_{mesh_id}{ext}"
+                temp_path.write_bytes(content)
                 MESH_OUTPUT_PATHS[case_id] = str(temp_path)
 
                 logger.info(f"[Mesh Gen] Mesh downloaded to {temp_path}")
@@ -1350,10 +1715,126 @@ def get_generate_fn(
 
         pytest.fail(f"{case_id}: mesh generation timed out after {max_wait}s")
 
+    def generate_action(case_id, client) -> tuple[str, bytes]:
+        """VLA action generation using /v1/actions/generations."""
+        import numpy as np
+        import requests as http_requests
+
+        extra = dict(sampling_params.extras)
+        action_horizon = int(extra.get("action_horizon", 50))
+        action_dim = int(extra.get("action_dim", 32))
+        state_dim = int(extra.get("state_dim", action_dim))
+        image_size = int(extra.get("image_size", 64))
+        # Policies with a fixed camera resolution (e.g. DROID 360x640) set both.
+        image_height = int(extra.get("image_height", image_size))
+        image_width = int(extra.get("image_width", image_size))
+        camera_order = tuple(
+            extra.get(
+                "camera_order",
+                ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+            )
+        )
+        observation_rows = int(extra.get("observation_rows", 0))
+
+        def tensor_payload(array):
+            return {
+                "dtype": str(array.dtype),
+                "shape": list(array.shape),
+                "values": array.tolist(),
+            }
+
+        def image_payload(camera_index: int):
+            y = np.arange(image_height, dtype=np.uint16)[:, None]
+            x = np.arange(image_width, dtype=np.uint16)[None, :]
+            image = np.stack(
+                (
+                    (x + camera_index * 17) % 256 + np.zeros_like(y),
+                    (y + camera_index * 29) % 256 + np.zeros_like(x),
+                    (x + y + camera_index * 41) % 256,
+                ),
+                axis=-1,
+            )
+            image = image.astype(np.uint8)
+            if observation_rows:
+                # Frame stack [T, H, W, 3], oldest first (Praxis).
+                image = np.tile(image, (observation_rows, 1, 1, 1))
+            return tensor_payload(image)
+
+        def state_payload():
+            if "state_row" in extra:
+                # One valid pose row per frame, so the quaternion stays normalized.
+                row = np.asarray(extra["state_row"], dtype=np.float32)
+                return tensor_payload(np.tile(row, (max(observation_rows, 1), 1)))
+            return tensor_payload(np.linspace(-0.5, 0.5, state_dim, dtype=np.float32))
+
+        rng = np.random.default_rng(int(extra.get("seed", 0)))
+        request_id = f"{case_id}-{int(time.time() * 1000)}"
+        payload = {
+            "request_id": request_id,
+            "model": model_path,
+            "input": {
+                "task": sampling_params.prompt or "pick up the blue block",
+                "observation": {
+                    "images": {
+                        camera: image_payload(index)
+                        for index, camera in enumerate(camera_order)
+                    },
+                    "camera_order": list(camera_order),
+                    "state": state_payload(),
+                    "noise": tensor_payload(
+                        rng.standard_normal((action_horizon, action_dim)).astype(
+                            np.float32
+                        )
+                    ),
+                },
+            },
+            "parameters": {
+                "action_horizon": action_horizon,
+                "action_dim": action_dim,
+                "num_inference_steps": int(extra.get("num_inference_steps", 2)),
+            },
+            "runtime": {
+                "return_timing": True,
+                "prefix_cache": bool(extra.get("enable_prefix_cache", False)),
+                "cuda_graph": bool(extra.get("enable_cuda_graph", True)),
+                "output_format": "list",
+            },
+        }
+
+        base_url = str(client.base_url).rstrip("/")
+        endpoint = (
+            f"{base_url}/actions/generations"
+            if base_url.endswith("/v1")
+            else f"{base_url}/v1/actions/generations"
+        )
+        response = http_requests.post(endpoint, json=payload, timeout=600)
+        if response.status_code != 200:
+            pytest.fail(f"{case_id}: action generation failed: {response.text}")
+
+        body = response.json()
+        action = body["data"][0]["action"]
+        if action["shape"] != [action_horizon, action_dim]:
+            pytest.fail(
+                f"{case_id}: action shape mismatch: {action['shape']} "
+                f"!= {[action_horizon, action_dim]}"
+            )
+        values = action["values"]
+        if not all(
+            isinstance(value, (int, float)) and np.isfinite(value)
+            for row in values
+            for value in row
+        ):
+            pytest.fail(f"{case_id}: action response contains non-finite values")
+        return body["id"], response.content
+
     if modality == "3d":
         fn = generate_mesh
+    elif modality == "action":
+        fn = generate_action
     elif modality == "video":
-        if sampling_params.image_path and sampling_params.prompt:
+        if sampling_params.realtime_num_chunks is not None:
+            fn = generate_realtime_video
+        elif sampling_params.image_path and sampling_params.prompt:
             if getattr(sampling_params, "direct_url_test", False):
                 fn = generate_text_url_image_to_video
             else:
@@ -1363,10 +1844,7 @@ def get_generate_fn(
         else:
             fn = generate_video
     elif sampling_params.prompt and sampling_params.image_path:
-        if getattr(sampling_params, "direct_url_test", False):
-            fn = generate_image_edit_url
-        else:
-            fn = generate_image_edit
+        fn = generate_image_edit
     else:
         fn = generate_image
 

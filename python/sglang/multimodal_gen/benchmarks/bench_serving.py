@@ -7,6 +7,9 @@ Usage:
 
     # T2V or T2I or any other multimodal generation model
     sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
+    # With profiling:
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+         --backend sglang-image --dataset vbench --task image-to-image --num-prompts 5 --profile
 
     # benchmark it and make sure the port is the same as the server's port
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
@@ -20,7 +23,7 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -39,6 +42,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -111,6 +115,21 @@ def _infer_slo_base_time_ms_from_warmups(
     return float(np.median(candidates_ms)) if candidates_ms else None
 
 
+def _parse_extra_body(raw: Optional[str]) -> Dict[str, Any]:
+    """Parses --extra-body, which is merged over every generated payload."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--extra-body is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"--extra-body must be a JSON object, got {type(parsed).__name__}."
+        )
+    return parsed
+
+
 def _populate_slo_ms_from_warmups(
     requests_list: List[RequestFuncInput], warmup_pairs: List[tuple], args
 ) -> List[RequestFuncInput]:
@@ -122,7 +141,7 @@ def _populate_slo_ms_from_warmups(
     if base_time_ms is None:
         return requests_list
 
-    slo_scale = float(getattr(args, "slo_scale", 3.0))
+    slo_scale = float(args.slo_scale)
     if slo_scale <= 0:
         raise ValueError(f"slo_scale must be positive, got {slo_scale}.")
 
@@ -161,8 +180,15 @@ async def async_request_image_sglang(
         if input.width and input.height:
             data.add_field("size", f"{input.width}x{input.height}")
 
-        # Merge extra parameters
-        for key, value in input.extra_body.items():
+        # Add inference parameters
+        if input.num_inference_steps is not None:
+            data.add_field("num_inference_steps", str(input.num_inference_steps))
+
+        # Add profiling and other extra parameters
+        extra_params = input.extra_body.copy()
+        if extra_params.pop("profile", None):
+            data.add_field("profile", "true")
+        for key, value in extra_params.items():
             data.add_field(key, str(value))
 
         # Add image file(s)
@@ -185,7 +211,6 @@ async def async_request_image_sglang(
             async with session.post(input.api_url, data=data) as response:
                 if response.status == 200:
                     resp_json = await response.json()
-                    output.response_body = resp_json
                     output.success = True
                     output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
@@ -217,7 +242,6 @@ async def async_request_image_sglang(
             async with session.post(input.api_url, json=payload) as response:
                 if response.status == 200:
                     resp_json = await response.json()
-                    output.response_body = resp_json
                     output.success = True
                     output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
@@ -269,6 +293,8 @@ async def async_request_video_sglang(
         # Explicitly add fps/num_frames if they are not in extra_body (bench_serving logic overrides)
         if input.num_frames:
             data.add_field("num_frames", str(input.num_frames))
+        if input.num_inference_steps is not None:
+            data.add_field("num_inference_steps", str(input.num_inference_steps))
         if input.fps:
             data.add_field("fps", str(input.fps))
 
@@ -368,7 +394,6 @@ async def async_request_video_sglang(
                     status = status_data.get("status")
                     if status == "completed":
                         output.success = True
-                        output.response_body = status_data
                         output.output_count = _get_response_output_count(status_data)
                         if "peak_memory_mb" in status_data:
                             output.peak_memory_mb = status_data["peak_memory_mb"]
@@ -461,7 +486,7 @@ def calculate_metrics(
             {
                 "slo_attainment_rate": slo_attain_all,
                 "slo_met_success": slo_met_success,
-                "slo_scale": getattr(args, "slo_scale", 3.0),
+                "slo_scale": args.slo_scale,
             }
         )
 
@@ -489,12 +514,61 @@ def wait_for_service(base_url: str, timeout: int = 1200) -> None:
         time.sleep(1)
 
 
+@dataclass
+class ProfileReqOutput:
+    """Output for profile request."""
+
+    success: bool = False
+    message: str = ""
+    error: str = ""
+
+
+async def async_request_profile(
+    api_url: str,
+    admin_api_key: Optional[str] = None,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> ProfileReqOutput:
+    """Send a profile start/stop request to the server."""
+    output = ProfileReqOutput()
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        async with session.post(
+            api_url, headers=admin_auth_headers(admin_api_key)
+        ) as response:
+            response_text = await response.text()
+            if response.status == 200:
+                output.success = True
+                output.message = response_text.strip()
+            else:
+                output.success = False
+                output.error = f"HTTP {response.status}: {response_text}"
+    except Exception as e:
+        output.success = False
+        output.error = str(e)
+    finally:
+        if close_session:
+            await session.close()
+
+    return output
+
+
 async def benchmark(args):
     from huggingface_hub import model_info
 
     # Construct base_url if not provided
     if args.base_url is None:
         args.base_url = NetworkAddress(args.host, args.port).to_url()
+
+    # Parsed before the service wait and the dataset download so a malformed
+    # value fails immediately instead of after minutes of setup.
+    extra_body = _parse_extra_body(args.extra_body)
+    if args.guidance_scale is not None:
+        extra_body.setdefault("guidance_scale", args.guidance_scale)
 
     # Wait for service
     wait_for_service(args.base_url)
@@ -567,9 +641,16 @@ async def benchmark(args):
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
-    logger.info(f"Loading requests...")
+    logger.info("Loading requests...")
     requests_list = dataset.get_requests()
     logger.info(f"Prepared {len(requests_list)} requests from {args.dataset} dataset.")
+
+    if extra_body:
+        logger.info(f"Merging --extra-body into every request: {extra_body}")
+        requests_list = [
+            replace(req, extra_body={**req.extra_body, **extra_body})
+            for req in requests_list
+        ]
 
     # Limit concurrency
     if args.max_concurrency is not None:
@@ -588,10 +669,10 @@ async def benchmark(args):
         # Run warmup requests
         warmup_pairs: List[tuple] = []
         if args.warmup_requests and requests_list:
-            # The server always overrides warmup requests to use
-            # num_inference_steps=1 (see Req.set_as_warmup), so we match
-            # that here to keep the benchmark's SLO estimation consistent.
-            warmup_steps = 1
+            # Defaults to 1 to match the server's own boot warmup (see
+            # Req.set_as_warmup) and keep SLO estimation consistent. Raise it
+            # for models that reject a 1-step schedule, such as MiniMax-H3.
+            warmup_steps = args.warmup_inference_steps
             logger.info(
                 f"Running {args.warmup_requests} warmup request(s) with "
                 f"num_inference_steps={warmup_steps}..."
@@ -605,7 +686,7 @@ async def benchmark(args):
                 warm_out = await limited_request_func(warm_req, session, None)
                 warmup_pairs.append((warm_req, warm_out))
                 logger.info(
-                    f"Warmup {i+1}/{args.warmup_requests}: "
+                    f"Warmup {i + 1}/{args.warmup_requests}: "
                     f"latency={warm_out.latency:.2f}s, success={warm_out.success}"
                 )
 
@@ -614,6 +695,17 @@ async def benchmark(args):
             requests_list = _populate_slo_ms_from_warmups(
                 requests_list=requests_list, warmup_pairs=warmup_pairs, args=args
             )
+
+        # Start profiler if --profile is enabled (after warmup)
+        if args.profile:
+            profile_output = await async_request_profile(
+                api_url=f"{args.base_url}/start_profile",
+                admin_api_key=args.admin_api_key,
+            )
+            if profile_output.success:
+                logger.info(f"Profiler started: {profile_output.message}")
+            else:
+                logger.warning(f"Failed to start profiler: {profile_output.error}")
 
         # Run benchmark
         pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
@@ -632,6 +724,18 @@ async def benchmark(args):
         total_duration = time.perf_counter() - start_time
 
         pbar.close()
+
+    # Stop profiler if it was started
+    if args.profile:
+        logger.info("Stopping profiler and saving traces...")
+        profile_output = await async_request_profile(
+            api_url=f"{args.base_url}/stop_profile",
+            admin_api_key=args.admin_api_key,
+        )
+        if profile_output.success:
+            logger.info(f"Profiler stopped: {profile_output.message}")
+        else:
+            logger.warning(f"Failed to stop profiler: {profile_output.error}")
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
@@ -701,12 +805,6 @@ async def benchmark(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark serving for diffusion models."
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        default=None,
-        help="DEPRECATED: --task is deprecated and will be ignored. The task will be inferred from --model.",
     )
     parser.add_argument(
         "--base-url",
@@ -799,10 +897,29 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale",
+    )
+    parser.add_argument(
         "--output-file", type=str, default=None, help="Output JSON file for metrics."
     )
     parser.add_argument(
         "--disable-tqdm", action="store_true", help="Disable progress bar."
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable full pipeline profiling. "
+        "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR.",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires "
+        "(default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--log-level",
@@ -827,6 +944,22 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before measurement.",
+    )
+    parser.add_argument(
+        "--warmup-inference-steps",
+        type=int,
+        default=1,
+        help="Denoise steps for warmup requests. Raise it for models that "
+        "reject a 1-step schedule.",
+    )
+    parser.add_argument(
+        "--extra-body",
+        type=str,
+        default=None,
+        help="JSON object merged over each JSON request body, for contract "
+        'fields the generic payload omits (e.g. \'{"task": "t2va"}\' for '
+        "MiniMax-H3). Multipart image requests forward it as an extra_body "
+        "form field instead, which the server may not unpack.",
     )
     parser.add_argument(
         "--num-inference-steps",

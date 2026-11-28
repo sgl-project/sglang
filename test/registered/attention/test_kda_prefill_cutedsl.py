@@ -1,0 +1,353 @@
+"""Correctness test for the SM100 CuTe DSL KDA prefill pipeline.
+
+Validates ``chunk_kda_cutedsl`` (the ``kda_blackwell`` package: fused Triton
+prologue -> kkt_inv_uw -> h -> o) against the token-by-token
+``fused_recurrent_kda`` Triton reference. Mirrors ``test_gdn_prefill_cutedsl.py``.
+
+KDA differs from GDN by a PER-CHANNEL decay gate (g is [T, H, K], not scalar
+[T, H]); otherwise the chunk pipeline, head dims, and recurrent-state layout
+[N, H, V, K] are identical.
+"""
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# CuteDSL prefill kernel only exists on Blackwell. Single-GPU kernel-unit suite,
+# same slot as the GDN prefill test.
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+
+if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
+    pytest.skip(
+        "KDA CuteDSL prefill requires CUDA SM10x (Blackwell).",
+        allow_module_level=True,
+    )
+
+from sglang.kernels.ops.attention.fla.index import (  # noqa: E402
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+)
+from sglang.kernels.ops.attention.fla.kda import fused_recurrent_kda  # noqa: E402
+from sglang.kernels.ops.attention.linear.kda_blackwell import (  # noqa: E402
+    chunk_kda_cutedsl,
+    prepare_metadata,
+)
+
+
+def _l2norm(x: torch.Tensor) -> torch.Tensor:
+    return F.normalize(x.float(), p=2, dim=-1)
+
+
+@pytest.mark.parametrize("num_seqs", [1, 5, 257])
+def test_kda_chunk_cutedsl_correctness(num_seqs: int):
+    torch.manual_seed(num_seqs)
+    seq_lens = torch.randint(1, 130, (num_seqs,), dtype=torch.int32)
+    cu_seqlens = torch.zeros(num_seqs + 1, device="cuda", dtype=torch.int32)
+    cu_seqlens[1:] = seq_lens.to("cuda").cumsum(0)
+    total_tokens = int(cu_seqlens[-1].item())
+
+    # KDA shares the head count across q/k/v (G=1). CuteDSL prefill hard-requires
+    # head_k_dim == head_v_dim == 128.
+    num_heads = 8
+    head_dim = 128
+    scale = head_dim**-0.5
+
+    q = _l2norm(torch.randn(1, total_tokens, num_heads, head_dim, device="cuda"))
+    k = _l2norm(torch.randn(1, total_tokens, num_heads, head_dim, device="cuda"))
+    v = torch.randn(1, total_tokens, num_heads, head_dim, device="cuda")
+
+    # Per-channel KDA gate. Mild gates keep the kernel's externalized per-channel
+    # pre-scaling (qg2 = scale*q*exp(g_cu - g_last), unbounded >= 1) inside fp32
+    # range -- this matches real Kimi-Linear retention gates. Large per-chunk gate
+    # spans are a known limitation (B2 TODO: clamp / sub-chunk normalize).
+    A_log = torch.randn(num_heads, device="cuda") * 0.5 - 1.5
+    dt_bias = torch.randn(num_heads, head_dim, device="cuda") * 0.1
+    g_raw = torch.randn(1, total_tokens, num_heads, head_dim, device="cuda")
+    g_act = -A_log.exp().view(1, 1, num_heads, 1) * F.softplus(
+        g_raw + dt_bias.view(1, 1, num_heads, head_dim)
+    )
+    beta = torch.sigmoid(torch.randn(1, total_tokens, num_heads, device="cuda")).float()
+
+    # Recurrent-state layout [N, H, V, K] (V-major) -- identical for the recurrent
+    # reference and the cutedsl ht output (no transpose needed).
+    initial_state = (
+        torch.randn(num_seqs, num_heads, head_dim, head_dim, device="cuda") * 0.05
+    ).float()
+
+    # --- metadata helper must match the FLA chunkers the Triton path uses ---
+    chunk_indices, chunk_offsets, _, total_chunks = prepare_metadata(cu_seqlens)
+    torch.cuda.synchronize()
+    expected_indices = prepare_chunk_indices(cu_seqlens, 64)
+    expected_offsets = prepare_chunk_offsets(cu_seqlens, 64)
+    torch.testing.assert_close(chunk_offsets, expected_offsets.to(torch.int32))
+    torch.testing.assert_close(chunk_indices[:total_chunks], expected_indices)
+
+    # --- reference: token-by-token recurrent kernel (ground truth) ---
+    ref_o, ref_state = fused_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g_act,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state.clone(),
+        inplace_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        cu_seqlens=cu_seqlens.long(),
+    )
+
+    # --- cutedsl chunk prefill (q/k already L2-normed; pass g_act directly) ---
+    o, ht = chunk_kda_cutedsl(
+        q[0].bfloat16(),
+        k[0].bfloat16(),
+        v[0].bfloat16(),
+        g_act[0].float(),
+        beta[0].float(),
+        initial_state.clone(),
+        cu_seqlens,
+        scale,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(o).all(), "cutedsl output has non-finite values"
+    assert torch.isfinite(ht).all(), "cutedsl final state has non-finite values"
+
+    o_error = (o.float() - ref_o[0].float()).abs()
+    state_error = (ht.float() - ref_state.float()).abs()
+    # bf16 MMA + Newton-Schulz inverse noise; matches the B200 e2e validation
+    # (o ~5e-4, ht ~4e-3) with margin.
+    assert o_error.max().item() < 1e-2
+    assert o_error.mean().item() < 1e-3
+    assert state_error.max().item() < 5e-2
+    assert state_error.mean().item() < 5e-3
+
+
+def test_kda_chunk_cutedsl_internal_gate_activation():
+    """The A_log/dt_bias gate activation inside chunk_kda_cutedsl must match
+    feeding a pre-activated gate."""
+    torch.manual_seed(0)
+    T = 256
+    num_heads = 8
+    head_dim = 128
+    scale = head_dim**-0.5
+
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device="cuda")
+    q = _l2norm(torch.randn(1, T, num_heads, head_dim, device="cuda")).bfloat16()
+    k = _l2norm(torch.randn(1, T, num_heads, head_dim, device="cuda")).bfloat16()
+    v = torch.randn(1, T, num_heads, head_dim, device="cuda").bfloat16()
+    A_log = torch.randn(num_heads, device="cuda") * 0.5 - 1.5
+    dt_bias = torch.randn(num_heads, head_dim, device="cuda") * 0.1
+    g_raw = torch.randn(1, T, num_heads, head_dim, device="cuda")
+    beta = torch.sigmoid(torch.randn(1, T, num_heads, device="cuda")).float()
+    h0 = torch.zeros(1, num_heads, head_dim, head_dim, device="cuda")
+
+    g_pre = -A_log.exp().view(1, num_heads, 1) * F.softplus(
+        g_raw[0] + dt_bias.view(1, num_heads, head_dim)
+    )
+    o_pre, ht_pre = chunk_kda_cutedsl(
+        q[0], k[0], v[0], g_pre.float(), beta[0], h0.clone(), cu_seqlens, scale
+    )
+    o_int, ht_int = chunk_kda_cutedsl(
+        q[0],
+        k[0],
+        v[0],
+        g_raw[0].float(),
+        beta[0],
+        h0.clone(),
+        cu_seqlens,
+        scale,
+        A_log=A_log,
+        dt_bias=dt_bias,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(o_int.float(), o_pre.float(), atol=2e-3, rtol=1e-2)
+    torch.testing.assert_close(ht_int.float(), ht_pre.float(), atol=2e-3, rtol=1e-2)
+
+
+def test_kda_chunk_cutedsl_realistic_gate():
+    """Real Kimi-Linear retention gates are far stronger than the mild gates in
+    the tests above (exp(A_log) ~ 0.2 there vs up to ~200 in the model). Strong
+    gates make the per-chunk cumulative decay span large; a chunk-global g_last
+    reference would overflow the externalized exp(g_cu - g_last) pre-scaling.
+    The intra-chunk matrices use a sub-chunk-normalized path instead, so this
+    must stay finite and match the recurrent reference."""
+    torch.manual_seed(0)
+    num_heads = 8
+    head_dim = 128
+    scale = head_dim**-0.5
+    T = 128
+    cu_seqlens = torch.tensor([0, T], dtype=torch.int32, device="cuda")
+
+    q = _l2norm(torch.randn(1, T, num_heads, head_dim, device="cuda"))
+    k = _l2norm(torch.randn(1, T, num_heads, head_dim, device="cuda"))
+    v = torch.randn(1, T, num_heads, head_dim, device="cuda")
+    # exp(A_log) ~ exp(1.5) ~ 4.5 mean (real model reaches ~200), vs ~0.22 above.
+    A_log = torch.randn(num_heads, device="cuda") * 0.5 + 1.5
+    dt_bias = torch.randn(num_heads, head_dim, device="cuda") * 0.1
+    g_raw = torch.randn(1, T, num_heads, head_dim, device="cuda")
+    g_act = -A_log.exp().view(1, 1, num_heads, 1) * F.softplus(
+        g_raw + dt_bias.view(1, 1, num_heads, head_dim)
+    )
+    beta = torch.sigmoid(torch.randn(1, T, num_heads, device="cuda")).float()
+    h0 = torch.zeros(1, num_heads, head_dim, head_dim, device="cuda").float()
+
+    ref_o, _ = fused_recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g_act,
+        beta=beta,
+        scale=scale,
+        initial_state=h0.clone(),
+        inplace_final_state=False,
+        use_qk_l2norm_in_kernel=False,
+        cu_seqlens=cu_seqlens.long(),
+    )
+    o, ht = chunk_kda_cutedsl(
+        q[0].bfloat16(),
+        k[0].bfloat16(),
+        v[0].bfloat16(),
+        g_act[0].float(),
+        beta[0].float(),
+        h0.clone(),
+        cu_seqlens,
+        scale,
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(o).all() and torch.isfinite(ht).all()
+    assert (o.float() - ref_o[0].float()).abs().max().item() < 1e-2
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("replay_entry", [False, True])
+def test_kda_chunk_cutedsl_pool_mode_matches_dense(
+    state_dtype: torch.dtype, replay_entry: bool
+):
+    """Pool mode (h0_indices) must reproduce the dense gather/scatter path
+    bit-for-bit: same o, same final-state rows written in place at the indexed
+    pool slots, and every other pool row untouched."""
+    torch.manual_seed(3)
+    num_seqs = 5
+    seq_lens = torch.randint(1, 130, (num_seqs,), dtype=torch.int32)
+    cu_seqlens = torch.zeros(num_seqs + 1, device="cuda", dtype=torch.int32)
+    cu_seqlens[1:] = seq_lens.to("cuda").cumsum(0)
+    total_tokens = int(cu_seqlens[-1].item())
+
+    num_heads = 8
+    head_dim = 128
+    scale = head_dim**-0.5
+
+    q = _l2norm(torch.randn(1, total_tokens, num_heads, head_dim, device="cuda"))
+    k = _l2norm(torch.randn(1, total_tokens, num_heads, head_dim, device="cuda"))
+    v = torch.randn(1, total_tokens, num_heads, head_dim, device="cuda")
+    A_log = torch.randn(num_heads, device="cuda") * 0.5 - 1.5
+    dt_bias = torch.randn(num_heads, head_dim, device="cuda") * 0.1
+    g_raw = torch.randn(1, total_tokens, num_heads, head_dim, device="cuda")
+    g_act = -A_log.exp().view(1, 1, num_heads, 1) * F.softplus(
+        g_raw + dt_bias.view(1, 1, num_heads, head_dim)
+    )
+    beta = torch.sigmoid(torch.randn(1, total_tokens, num_heads, device="cuda")).float()
+
+    h0_dense = (
+        torch.randn(num_seqs, num_heads, head_dim, head_dim, device="cuda") * 0.05
+    ).to(state_dtype)
+
+    # Same states scattered into a larger pool at shuffled slots.
+    num_slots = 64
+    pool = (
+        torch.randn(num_slots, num_heads, head_dim, head_dim, device="cuda") * 0.05
+    ).to(state_dtype)
+    other_parts = {}
+    if replay_entry:
+        from sglang.srt.mem_cache.kv.decl import (
+            StateGeometry,
+            StateReplay,
+            with_state_replay,
+        )
+        from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+
+        geometry = with_state_replay(
+            StateGeometry(
+                conv_state_shapes=((3, 3072),),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(num_heads, head_dim, head_dim),
+                temporal_dtype=state_dtype,
+            ),
+            StateReplay(
+                decode=True,
+                speculative=False,
+                is_kda=True,
+                cache_len=16,
+                key_heads=num_heads,
+            ),
+            layer_ids=(0, 1),
+            speculative_num_draft_tokens=None,
+        )
+        spec = MambaSubPoolSpec(
+            name="mamba",
+            layer_num=2,
+            grow_direction="down",
+            conv_state_shapes=geometry.conv_state_shapes,
+            conv_dtype=geometry.conv_dtype,
+            temporal_state_shape=geometry.temporal_state_shape,
+            temporal_dtype=geometry.temporal_dtype,
+            extra_parts=geometry.extra_parts,
+            replay=geometry.replay,
+        )
+        raw = torch.zeros(
+            num_slots * spec.entry_bytes(), dtype=torch.uint8, device="cuda"
+        )
+        parts = spec.entry_layout().views(raw, num_slots)
+        parts["temporal"][1].copy_(pool)
+        pool = parts["temporal"][1]
+        other_parts = {
+            name: value for name, value in parts.items() if name != "temporal"
+        }
+        other_parts["other_layer"] = parts["temporal"][0]
+        assert pool.stride(0) * pool.element_size() == spec.entry_bytes()
+        assert pool.stride(0) % 16 == 0
+    slots = torch.randperm(num_slots, device="cuda")[:num_seqs].to(torch.int32)
+    pool[slots.long()] = h0_dense
+    pool_before = pool.clone()
+
+    q_b, k_b, v_b = q[0].bfloat16(), k[0].bfloat16(), v[0].bfloat16()
+    o_dense, ht_dense = chunk_kda_cutedsl(
+        q_b,
+        k_b,
+        v_b,
+        g_act[0].float(),
+        beta[0].float(),
+        h0_dense.clone(),
+        cu_seqlens,
+        scale,
+    )
+    o_pool, ht_pool = chunk_kda_cutedsl(
+        q_b,
+        k_b,
+        v_b,
+        g_act[0].float(),
+        beta[0].float(),
+        pool,
+        cu_seqlens,
+        scale,
+        h0_indices=slots,
+    )
+    torch.cuda.synchronize()
+
+    # Same kernels and math; only the state addressing differs -> bit-identical.
+    assert ht_pool is pool
+    assert torch.equal(o_pool, o_dense)
+    assert torch.equal(pool[slots.long()], ht_dense)
+    untouched = torch.ones(num_slots, dtype=torch.bool, device="cuda")
+    untouched[slots.long()] = False
+    assert torch.equal(pool[untouched], pool_before[untouched])
+    for value in other_parts.values():
+        assert torch.count_nonzero(value) == 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -3,17 +3,14 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.eagle_fixture import EagleServerBase
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
-
-register_cuda_ci(est_time=88, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small")
 
 _is_hip = is_hip()
 
@@ -38,18 +35,25 @@ class TestEagle3Basic(EagleServerBase):
         else ["--dtype=float16", "--chunked-prefill-size", 1024]
     )
 
+    @classmethod
+    def setUpClass(cls):
+        # The EAGLE3 draft derives a shorter context than the target.
+        with envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.override(True):
+            super().setUpClass()
+
     def test_mmlu(self):
         """Override to add EAGLE-specific assertions"""
         args = SimpleNamespace(
             base_url=self.base_url,
             model=self.target_model,
             eval_name="mmlu",
-            num_examples=64,
+            num_examples=256,
             num_threads=32,
         )
 
-        metrics = run_eval(args)
-        self.assertGreaterEqual(metrics["score"], 0.72)
+        metrics = run_sgl_eval(args)
+        # Same spec config and floor as TestHiCacheEagle; 0.72 predates sgl-eval.
+        self.assertGreaterEqual(metrics["score"], 0.64)
 
         server_info = requests.get(self.base_url + "/server_info").json()
         avg_spec_accept_length = server_info["internal_states"][0][
@@ -63,5 +67,4 @@ class TestEagle3Basic(EagleServerBase):
 
 
 if __name__ == "__main__":
-
     unittest.main()

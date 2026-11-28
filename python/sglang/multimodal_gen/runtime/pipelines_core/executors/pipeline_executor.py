@@ -6,15 +6,44 @@ Base class for all pipeline executors.
 """
 
 import contextlib
+import time
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, Callable, List
 
-from sglang.multimodal_gen.runtime.distributed import get_world_rank
+import torch
+
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    ConditioningCache,
+    conditioning_cache_group,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
+    get_world_rank,
+)
+from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+    IPC_A2A_MULTI,
+)
+from sglang.multimodal_gen.runtime.managers.progress_reporter import (
+    get_progress_reporter,
+)
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_out_of_memory_error,
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
-from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
+from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
+from sglang.multimodal_gen.runtime.utils.profiler import (
+    SGLDiffusionProfiler,
+    maybe_record_function,
+)
 
 if TYPE_CHECKING:
     # Only for type checkers; avoids runtime circular import
@@ -23,16 +52,31 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-class Timer(StageProfiler):
-    """
-    A wrapper around StageProfiler to maintain backward compatibility.
-    It forces simple logging behavior (log start/end) regardless of env vars.
-    """
+def _forward_error_ends_the_replica(error: Exception) -> bool:
+    """Errors the worker turns into an exit instead of a request error.
 
-    def __init__(self, name="Stage"):
-        super().__init__(
-            stage_name=name, logger=logger, metrics=None, log_stage_start_end=True
-        )
+    An error output would let this rank take the next request while the other
+    ranks are still inside the failed forward's collectives, or keep serving
+    from a device that can no longer be trusted.
+    """
+    if is_out_of_memory_error(error):
+        return get_replica_group().world_size > 1
+    # Only RuntimeError messages are matched: a request error may quote the
+    # caller's text (e.g. a Cosmos3 domain name) that contains a marker.
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        message = str(error)
+        if "out of memory" not in message.lower() and (
+            isinstance(error, torch.AcceleratorError)
+            or (
+                isinstance(error, RuntimeError)
+                and is_unrecoverable_device_error(message)
+            )
+        ):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
 
 
 class PipelineExecutor(ABC):
@@ -46,11 +90,16 @@ class PipelineExecutor(ABC):
     def __init__(self, server_args):
         self.server_args = server_args
         self.component_residency_manager = None
+        self.conditioning_cache = ConditioningCache(
+            int(server_args.conditioning_cache_max_size_mb * 1024**2)
+            if not server_args.disable_conditioning_cache
+            else 0
+        )
 
     def begin_component_residency_request(
         self,
         stages: List["PipelineStage"],
-        batch: Req,
+        batch: Any,
         server_args: ServerArgs,
     ) -> None:
         self.component_residency_manager.begin_request(stages, batch, server_args)
@@ -59,7 +108,7 @@ class PipelineExecutor(ABC):
         self,
         stage: "PipelineStage",
         stage_index: int,
-        batch: Req,
+        batch: Any,
         server_args: ServerArgs,
     ) -> None:
         stage.set_component_residency_manager(self.component_residency_manager)
@@ -67,11 +116,118 @@ class PipelineExecutor(ABC):
             stage, stage_index, batch, server_args
         )
 
-    def after_stage(self, stage_index: int) -> None:
-        self.component_residency_manager.after_stage(stage_index)
-
     def finish_component_residency_request(self) -> None:
         self.component_residency_manager.finish_request()
+
+    @contextlib.contextmanager
+    def _component_residency_request(
+        self,
+        stages: List["PipelineStage"],
+        payload: Any,
+        server_args: ServerArgs,
+    ):
+        requests = payload if isinstance(payload, list) else [payload]
+        if get_progress_reporter() is not None and any(
+            req.report_progress and not req.is_warmup for req in requests
+        ):
+            # partition denoising progress across all passes, including refinement
+            denoisers = [s for s in stages if s.role_affinity == RoleType.DENOISER]
+            for index, stage in enumerate(denoisers):
+                stage._progress_range = (
+                    index / len(denoisers),
+                    (index + 1) / len(denoisers),
+                )
+        self.begin_component_residency_request(stages, payload, server_args)
+        try:
+            with self.conditioning_cache.scope(
+                cross_request=not server_args.use_fsdp_inference,
+                refresh=self._is_warmup_payload(payload),
+            ):
+                yield
+        finally:
+            self.finish_component_residency_request()
+
+    @staticmethod
+    def _is_warmup_payload(payload: Any) -> bool:
+        if isinstance(payload, list):
+            return bool(payload) and all(
+                getattr(item, "is_warmup", False) for item in payload
+            )
+        return getattr(payload, "is_warmup", False)
+
+    def _should_use_stage_nvtx(self, payload: Any, server_args: ServerArgs) -> bool:
+        return server_args.enable_layerwise_nvtx_marker and not self._is_warmup_payload(
+            payload
+        )
+
+    def _run_stage_with_executor_hooks(
+        self,
+        stage: "PipelineStage",
+        stage_index: int,
+        payload: Any,
+        server_args: ServerArgs,
+        run_stage: Callable[["PipelineStage", Any], Any],
+        use_nvtx: bool,
+    ) -> Any:
+        stage_name = stage._component_stage_name()
+        self.before_stage(stage, stage_index, payload, server_args)
+        with maybe_record_function(f"STAGE {stage_name}"):
+            with maybe_nvtx_range(f"stage_{stage_name}", use_nvtx):
+                with conditioning_cache_group(
+                    enabled=(isinstance(payload, list) and len(payload) > 1)
+                    or (isinstance(payload, Req) and payload.batch_size > 1)
+                ):
+                    payload = self.run_stage_with_context(
+                        stage, payload, server_args, run_stage
+                    )
+        return payload
+
+    @staticmethod
+    def _check_peer_waits(stage: "PipelineStage") -> None:
+        """Fail the request if a Ulysses peer wait expired in a denoising stage,
+        before anything decodes or saves its incomplete output. A group
+        collective: call it where every rank arrives, whichever ranks ran the
+        stage."""
+        if stage.role_affinity == RoleType.DENOISER:
+            IPC_A2A_MULTI.check_timeout()
+
+    @staticmethod
+    def _step_stage_profiler() -> None:
+        profiler = SGLDiffusionProfiler.get_instance()
+        if profiler:
+            profiler.step_stage()
+
+    @staticmethod
+    def retain_stage_output(current, result):
+        if not isinstance(result, OutputBatch):
+            return result
+        if result.error:
+            raise RuntimeError(result.error)
+        current.extra["_deployment_result"] = result
+        current.output = result.output
+        current.audio = result.audio
+        current.audio_sample_rate = result.audio_sample_rate
+        if result.fps is not None:
+            current.fps = result.fps
+        return current
+
+    def stage_runner(self, server_args, run_stage):
+        """keep the request context across stage outputs; monolithic runs are untouched"""
+        if getattr(server_args, "stage_deployment", None) is None:
+            return run_stage
+
+        def run(stage, current):
+            result = run_stage(stage, current)
+            if isinstance(result, list):
+                if any(isinstance(item, OutputBatch) for item in result):
+                    return [
+                        self.retain_stage_output(req, item)
+                        for req, item in zip(current, result, strict=True)
+                    ]
+                return result
+            return self.retain_stage_output(current, result)
+
+        return run
 
     def execute_with_profiling(
         self,
@@ -79,9 +235,9 @@ class PipelineExecutor(ABC):
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-
-        with self.profile_execution(batch, dump_rank=0):
-            batch = self.execute(stages, batch, server_args)
+        with self.profile_execution(batch, dump_rank=None):
+            with current_platform.inference_mode():
+                batch = self.execute(stages, batch, server_args)
 
         return batch
 
@@ -93,8 +249,61 @@ class PipelineExecutor(ABC):
     ):
         """Execute a grouped request under the same profiler as a single request."""
         with self.profile_execution(batches[0], dump_rank=0):
-            batches = self.execute_group(stages, batches, server_args)
+            with current_platform.inference_mode():
+                batches = self.execute_group(stages, batches, server_args)
         return batches
+
+    def execute_group_sequentially_with_profiling(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Run the AR stage as a group, then yield each completed DiT request."""
+        with self.profile_execution(batches[0], dump_rank=0):
+            with current_platform.inference_mode():
+                yield from self.execute_group_sequentially(
+                    stages,
+                    batches,
+                    server_args,
+                )
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _stage_execution_context(stage: "PipelineStage", server_args: ServerArgs):
+        if PipelineExecutor._stage_needs_version_counters(stage, server_args):
+            # fsdp and cpu-offload hooks need tensor version counters
+            with torch.inference_mode(False), torch.no_grad():
+                yield
+            return
+        yield
+
+    @staticmethod
+    def _stage_needs_version_counters(
+        stage: "PipelineStage", server_args: ServerArgs
+    ) -> bool:
+        if server_args.use_fsdp_inference:
+            return True
+
+        stage_name = stage._active_component_stage_name()
+        for use in stage.component_uses(server_args, stage_name):
+            if server_args.should_cpu_offload_component(use.component_name):
+                return True
+        return False
+
+    def run_stage_with_context(
+        self,
+        stage: "PipelineStage",
+        payload,
+        server_args: ServerArgs,
+        run_stage,
+    ):
+        with self._stage_execution_context(stage, server_args):
+            self.component_residency_manager.begin_stage()
+            try:
+                return run_stage(stage, payload)
+            finally:
+                self.component_residency_manager.end_stage()
 
     @abstractmethod
     def execute(
@@ -128,9 +337,59 @@ class PipelineExecutor(ABC):
         work can be removed. The base executor simply calls
         ``stage.run_grouped_requests`` for each stage in order.
         """
+        requests = list(batches)
         for stage in stages:
+            raise_if_cancelled(requests)
             batches = stage.run_grouped_requests(batches, server_args)
+        raise_if_cancelled(requests)
         return batches
+
+    def execute_group_sequentially(
+        self,
+        stages: List["PipelineStage"],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        """Yield outputs after batched AR and sequential DiT/VAE inference."""
+        batches = self.execute_group(stages[:1], batches, server_args)
+
+        remaining_stages = stages[1:]
+        sequential_start_time = time.monotonic()
+        for parent_batch in batches:
+            for batch in stages[0].iter_sequential_requests(parent_batch, server_args):
+                if batch.metrics is not None:
+                    batch.metrics.record_stage(
+                        "PipelineExecutor.sequential_wait",
+                        time.monotonic() - sequential_start_time,
+                    )
+                try:
+                    # each rank yields the same outputs, so the check stays a
+                    # collective; after a cancel, each later output stops here
+                    raise_if_cancelled([batch])
+                    output = self.execute(remaining_stages, batch, server_args)
+                except RequestCancelledError as e:
+                    logger.info("Stopped request %s: %s", batch.request_id, e)
+                    output = OutputBatch(
+                        error=str(e), cancelled=True, metrics=batch.metrics
+                    )
+                except Exception as e:
+                    if _forward_error_ends_the_replica(e):
+                        raise
+                    logger.error(
+                        "Sequential DiT/VAE inference failed for request %s: %s",
+                        batch.request_id,
+                        e,
+                        exc_info=True,
+                    )
+                    output = OutputBatch(
+                        error=f"Error executing grouped request {batch.request_id}: {e}",
+                        metrics=batch.metrics,
+                    )
+                yield output
+                del output
+                del batch
+                if current_platform.is_npu():
+                    torch.get_device_module().empty_cache()
 
     @contextlib.contextmanager
     def profile_execution(self, batch: Req, dump_rank: int = 0):
@@ -155,5 +414,8 @@ class PipelineExecutor(ABC):
         )
         try:
             yield
-        finally:
+        except BaseException:
+            profiler.stop_on_error(dump_rank=dump_rank)
+            raise
+        else:
             profiler.stop(dump_rank=dump_rank)

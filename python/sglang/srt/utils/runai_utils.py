@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/model_loader/runai_utils.py
 
 import hashlib
@@ -17,7 +19,7 @@ SUPPORTED_SCHEMES = ["s3://", "gs://", "az://"]
 #     - Downloads config/tokenizer metadata ONCE before launching subprocesses
 #     - This happens in the main process, avoiding multi-process coordination
 #
-#   2. ModelConfig/HF Utils (model_config.py, hf_transformers_utils.py):
+#   2. ModelConfig/HF Utils (model_config.py, hf_transformers/):
 #     - Use ObjectStorageModel.get_path() to retrieve the cached local path
 #     - NO re-download - just path resolution
 #

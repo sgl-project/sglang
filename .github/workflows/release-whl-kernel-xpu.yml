@@ -1,0 +1,205 @@
+name: Release SGLang XPU Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Version number, must be in the form of vX.Y.Z (e.g. v0.1.0)"
+        type: string
+        required: true
+      pr_number:
+        description: "PR number to check out in the build job (e.g. 12345); the release job always uses the dispatched ref"
+        type: string
+        required: false
+
+concurrency:
+  group: release-sglang-xpu-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-xpu:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: x64-docker-build-node
+    strategy:
+      matrix:
+        python-version: ["3.10"]
+    steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # can leave root-owned artifacts that actions/checkout cannot remove.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
+          # Self-hosted build host that may build PR code: keep the job token out of .git/config.
+          persist-credentials: false
+
+      - name: Set XPU kernel release metadata
+        id: xpu_meta
+        run: |
+          set -euo pipefail
+          TAG_NAME="${{ inputs.tag_name }}"
+          VERSION="${TAG_NAME#v}"
+          BRANCH="release/${TAG_NAME}"
+          echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Building sgl-kernel-xpu ${TAG_NAME} from ${BRANCH}"
+
+      - name: Refuse prebuilt wheels in the checkout
+        run: |
+          set -euo pipefail
+          # A PR could ship a wheel that the old export path would have uploaded and published.
+          found=$(find . -path ./sgl-kernel-xpu -prune -o -name '*.whl' -print)
+          if [ -n "${found}" ]; then
+            echo "::error::Checkout contains prebuilt wheels; refusing to build a release:"
+            echo "${found}"
+            exit 1
+          fi
+
+      - name: Checkout SGLang XPU kernel
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/sgl-kernel-xpu
+          ref: ${{ steps.xpu_meta.outputs.branch }}
+          path: sgl-kernel-xpu
+          # Self-hosted build host that may build PR code: keep the job token out of .git/config.
+          persist-credentials: false
+
+      - name: Build native XPU Docker image
+        run: |
+          set -euo pipefail
+          IMAGE="sglang-xpu-kernel-release:${{ steps.xpu_meta.outputs.version }}"
+          docker build sgl-kernel-xpu \
+            -f sgl-kernel-xpu/Dockerfile.xpu_kernel \
+            --build-arg PYTHON_VERSION=${{ matrix.python-version }} \
+            --build-arg SG_LANG_REPO=https://github.com/sgl-project/sglang.git \
+            --build-arg SG_LANG_BRANCH=main \
+            --build-arg SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git \
+            --build-arg SG_LANG_KERNEL_BRANCH=${{ steps.xpu_meta.outputs.branch }} \
+            --pull --no-cache --progress=plain \
+            -t "${IMAGE}"
+          echo "XPU_IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Build and export XPU kernel wheels
+        run: |
+          set -euo pipefail
+          docker rm -f sgl_kernel_xpu_release_build || true
+          docker run -dt \
+            --device /dev/dri/ \
+            --name sgl_kernel_xpu_release_build \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=64 \
+            -e MAX_JOBS=64 \
+            "${XPU_IMAGE}" \
+            /bin/bash -lc 'sleep infinity'
+          docker exec \
+            -w /root/sglang/sgl-kernel-xpu \
+            sgl_kernel_xpu_release_build \
+            /bin/bash -lc '
+              set -exo pipefail
+              # release/v0.6.0 and older branches still build the conda image.
+              if [ -f /opt/venv/bin/activate ]; then
+                . /opt/venv/bin/activate
+              else
+                . /miniforge3/bin/activate
+                conda activate py${{ matrix.python-version }}
+              fi
+              python -c "import sys; assert sys.version.startswith(\"${{ matrix.python-version }}.\"), sys.version"
+              source /opt/intel/oneapi/setvars.sh --force
+              command -v patchelf || (apt-get update && apt-get install -y patchelf)
+              python scripts/build_rel_wheel.py
+              ls -lh dist
+            '
+          # Export outside the (possibly PR) checkout so only container-built wheels are uploaded.
+          WHEEL_DIR="${RUNNER_TEMP}/xpu-kernel-wheels"
+          rm -rf "${WHEEL_DIR}" && mkdir -p "${WHEEL_DIR}"
+          docker cp sgl_kernel_xpu_release_build:/root/sglang/sgl-kernel-xpu/dist/. "${WHEEL_DIR}/"
+          echo "WHEEL_DIR=${WHEEL_DIR}" >> "$GITHUB_ENV"
+
+      - name: Verify exported XPU kernel wheels
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.xpu_meta.outputs.version }}"
+          ls -la "${WHEEL_DIR}"
+          shopt -s nullglob
+          wheels=("${WHEEL_DIR}"/sglang_kernel_xpu-"${VERSION}"-*.whl)
+          others=$(find "${WHEEL_DIR}" -mindepth 1 -name '*.whl' ! -name "sglang_kernel_xpu-${VERSION}-*.whl")
+          if [ "${#wheels[@]}" -eq 0 ] || [ -n "${others}" ]; then
+            echo "::error::Expected only sglang_kernel_xpu-${VERSION}-*.whl in ${WHEEL_DIR}; unexpected: ${others:-<none built>}"
+            exit 1
+          fi
+
+      - name: Cleanup XPU kernel build container
+        if: always()
+        run: docker rm -f sgl_kernel_xpu_release_build || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-python${{ matrix.python-version }}-xpu
+          path: ${{ env.WHEEL_DIR }}/sglang_kernel_xpu-*.whl
+          if-no-files-found: error
+
+  release-xpu:
+    if: github.repository == 'sgl-project/sglang'
+    needs: build-xpu
+    runs-on: ubuntu-latest
+    steps:
+      # This job holds GH_PAT_FOR_WHL_RELEASE (write to sgl-project/whl), so it runs the
+      # index script from the dispatched ref only, never from pr_number's PR head.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: python/sglang/kernels/aot/dist/
+          merge-multiple: true
+          pattern: wheel-*-xpu
+
+      - name: Verify downloaded XPU kernel wheels
+        run: |
+          set -euo pipefail
+          VERSION="${TAG_NAME#v}"
+          DIST=python/sglang/kernels/aot/dist
+          ls -la "${DIST}"
+          shopt -s nullglob
+          wheels=("${DIST}"/sglang_kernel_xpu-"${VERSION}"-*.whl)
+          others=$(find "${DIST}" -mindepth 1 ! -name "sglang_kernel_xpu-${VERSION}-*.whl")
+          if [ "${#wheels[@]}" -eq 0 ] || [ -n "${others}" ]; then
+            echo "::error::Refusing to publish: expected only sglang_kernel_xpu-${VERSION}-*.whl; unexpected: ${others:-<none>}"
+            exit 1
+          fi
+        env:
+          TAG_NAME: ${{ inputs.tag_name }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sglang-kernel-xpu-${{ inputs.tag_name }}
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          files: |
+            python/sglang/kernels/aot/dist/sglang_kernel_xpu-*.whl
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_kernel_whl_index.py --xpu
+
+      - name: Push wheel index
+        run: |
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+          git add -A
+          git commit -m "update whl index"
+          git push

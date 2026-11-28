@@ -24,8 +24,8 @@ from sglang.test.test_utils import CustomTestCase
 # ==============================================================================
 
 
-register_cuda_ci(est_time=166, suite="stage-b-test-1-gpu-small")
-register_amd_ci(est_time=132, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
+register_cuda_ci(est_time=160, stage="extra-a", runner_config="1-gpu-small")
+register_amd_ci(est_time=330, suite="extra-a-test-1-gpu-small-amd")
 
 MODELS = [
     ("LxzGordon/URM-LLaMa-3.1-8B", 1, 4e-2),
@@ -52,7 +52,6 @@ CONVS = [
 
 
 class TestRewardModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
@@ -87,9 +86,9 @@ class TestRewardModels(CustomTestCase):
         print(f"{hf_scores=}")
         print(f"{srt_scores=}")
 
-        assert torch.all(
-            abs(hf_scores - srt_scores) < tolerance
-        ), "reward scores are not all close"
+        assert torch.all(abs(hf_scores - srt_scores) < tolerance), (
+            "reward scores are not all close"
+        )
 
     def test_reward_scores(self):
         for model, tp_size, tolerance in MODELS:

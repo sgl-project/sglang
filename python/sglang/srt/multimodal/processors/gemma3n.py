@@ -14,12 +14,14 @@
 
 from typing import Dict, List, Optional, Union
 
-from sglang.srt.managers.multimodal_processor import (
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
+from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
+from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
-from sglang.srt.models.gemma3n_mm import Gemma3nForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 
 
 class Gemma3nSGLangProcessor(SGLangBaseProcessor):
@@ -33,8 +35,6 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         self.IM_START_TOKEN_ID = hf_config.boi_token_id
         self.IM_END_TOKEN_ID = hf_config.eoi_token_id
 
-        self.AUDIO_START_TOKEN_ID = hf_config.boa_token_id
-        self.AUDIO_END_TOKEN_ID = hf_config.eoa_token_id
         self.mm_tokens = MultimodalSpecialTokens(
             image_token="<image_soft_token>",
             image_token_id=hf_config.image_token_id,
@@ -52,14 +52,14 @@ class Gemma3nSGLangProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         """Process multimodal data including images and audio."""
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             audio_data=audio_data,
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

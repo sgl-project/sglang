@@ -35,6 +35,13 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    EncoderTensorParallelMixin,
+    get_attention_head_partition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,14 +115,10 @@ class Gemma2Attention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_tp_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads, self.num_kv_heads = get_attention_head_partition(
+            num_heads, num_kv_heads, tp_size
+        )
 
         arch = config.arch_config
         self.head_dim = arch.head_dim
@@ -280,10 +283,14 @@ class Gemma2DecoderLayer(nn.Module):
         return hidden_states
 
 
-class Gemma2Model(nn.Module):
+class Gemma2Model(
+    EncoderTensorParallelMixin, nn.Module, LayerwiseOffloadableModuleMixin
+):
     """Gemma2 text encoder model for SANA pipeline."""
 
     _fsdp_shard_conditions = []
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["layers"]
 
     def __init__(self, config: Gemma2Config, **kwargs):
         super().__init__()

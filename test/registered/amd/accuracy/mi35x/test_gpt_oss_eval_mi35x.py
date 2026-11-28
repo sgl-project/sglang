@@ -5,16 +5,11 @@ few-shot completion benchmark on MI35x.
 
 Note: MI35x uses openai/* paths, not lmsys/* paths like MI300X.
 
-Registry: nightly-amd-8-gpu-mi35x suite
+Registry: nightly-test-8-gpu-amd-mi35x suite
 """
 
 import ast
 import os
-
-# Set HF cache for MI35x
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -35,7 +30,7 @@ from sglang.test.test_utils import (
 from sglang.utils import download_and_cache_file, read_jsonl
 
 # Register for AMD CI - MI35x GPT-OSS accuracy tests (~30 min)
-register_amd_ci(est_time=1800, suite="nightly-amd-8-gpu-mi35x", nightly=True)
+register_amd_ci(est_time=1800, suite="nightly-test-8-gpu-amd-mi35x", nightly=True)
 
 INVALID = -9999999
 
@@ -75,7 +70,14 @@ MI35X_GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "1"},
+        # AITER MXFP4 fused-MoE for gpt-oss uses the SEPARATED gate/up tile
+        # layout (matches `gptoss_fp4_tuned_fmoe.csv` flydsl entries and the
+        # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4 callers default
+        # to INTERLEAVE, so opt out explicitly here.
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
+        },
     ),
     ModelConfig(
         model_path="openai/gpt-oss-120b",
@@ -93,7 +95,10 @@ MI35X_GPT_OSS_MODELS = [
             "triton",
             "--trust-remote-code",
         ],
-        env_vars={"SGLANG_USE_AITER": "1"},
+        env_vars={
+            "SGLANG_USE_AITER": "1",
+            "SGLANG_USE_AITER_MOE_GU_ITLV": "1",
+        },
     ),
 ]
 
@@ -191,9 +196,9 @@ class TestGptOssEvalMI35x(unittest.TestCase):
 
         for config in self.models:
             with self.subTest(model=config.model_path):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {config.model_path}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

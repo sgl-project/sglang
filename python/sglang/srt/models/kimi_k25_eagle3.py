@@ -1,10 +1,18 @@
-"""EAGLE3 draft model with MLA attention for Kimi-K2.5.
+"""EAGLE3 / EAGLE3.1 draft model with MLA attention for Kimi-K2.x.
 
 The ``kimi-k2.5-eagle3-mla`` checkpoint pairs an EAGLE3 layout
 (concatenated [embed_norm, hidden_norm] pre-attention input, fc projection
 over the concatenated multi-layer aux hidden states, single decoder layer,
 dense MLP) with DeepSeek-V2 multi-latent attention. Sharing the MLA layout
-with the Kimi-K2.5 target keeps the draft KV cache small.
+with the Kimi-K2.x target keeps the draft KV cache small.
+
+The eagle3.1 variant (e.g. ``kimi-k2.6-eagle3.1-mla``) adds two optional
+config flags on top of the same layout:
+
+* ``fc_norm``: per-chunk RMSNorm applied to each auxiliary hidden state
+  before the fc projection.
+* ``norm_output``: emit post-norm (rather than pre-norm) hidden states as
+  the auxiliary output consumed by the next draft step.
 """
 
 import copy
@@ -16,20 +24,24 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.communicator import AttentionInputs, get_attn_tp_context
+from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
+from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
-from sglang.srt.utils import BumpAllocator, add_prefix
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +125,7 @@ class Eagle3MLADecoderLayer(nn.Module):
         )
         # Recompute fused-proj-dependent flags so they reflect the new input dim.
         attn.has_fused_proj = True
-        attn.use_min_latency_fused_a_gemm = False
+        attn._use_min_latency_fused_a_gemm = False
         quant_method = getattr(attn.fused_qkv_a_proj_with_mqa, "quant_method", None)
         attn.is_packed_weight = (
             quant_method is not None
@@ -151,7 +163,7 @@ class Eagle3MLADecoderLayer(nn.Module):
         attn_input = torch.cat([embeds, hidden_states], dim=-1)
 
         # MLA's forward_absorb_prepare reads the qkv-down projection result
-        # from attn_tp_context. We bypass LayerCommunicator here (the eagle3
+        # from attn_tp_context. We bypass layer boundary preparation here (the eagle3
         # draft layer is one isolated layer with custom pre-attention norms),
         # so publish the attention input ourselves.
         get_attn_tp_context().set_attn_inputs(
@@ -191,17 +203,43 @@ class Eagle3MLAModel(nn.Module):
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
+            **get_embedding_tp_kwargs(),
         )
 
         target_hidden_size = (
             getattr(config, "target_hidden_size", None) or config.hidden_size
         )
-        num_fc_input = _get_eagle_aux_layer_count(config)
-        self.fc = nn.Linear(
-            target_hidden_size * num_fc_input,
+        self.num_aux_hidden_states = _get_eagle_aux_layer_count(config)
+        self.fc = ColumnParallelLinear(
+            target_hidden_size * self.num_aux_hidden_states,
             config.hidden_size,
             bias=getattr(config, "bias", False),
+            gather_output=False,
+            quant_config=quant_config,
+            prefix=add_prefix("fc", prefix),
         )
+        # Guarded multimem all-gather for the fc output; buffer covers prefill.
+        self._fc_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
+            max_tokens=triton_symm_mem_ag.recommended_max_tokens(
+                include_prefill=True, floor=512
+            ),
+            skip_entry_sync=False,
+        )
+
+        # Per-aux RMSNorm before fc; enabled via `fc_norm` or legacy
+        # `use_aux_norm` flag. Matches the eagle3.1 layout.
+        use_fc_norm = getattr(config, "fc_norm", None) or getattr(
+            config, "use_aux_norm", False
+        )
+        if use_fc_norm:
+            self.fc_norm = nn.ModuleList(
+                [
+                    RMSNorm(target_hidden_size, eps=config.rms_norm_eps)
+                    for _ in range(self.num_aux_hidden_states)
+                ]
+            )
+        else:
+            self.fc_norm = None
 
         if config.num_hidden_layers != 1:
             raise ValueError("EAGLE3 currently only supports 1 layer")
@@ -213,6 +251,9 @@ class Eagle3MLAModel(nn.Module):
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Draft decode captures pre-norm hidden by default; eagle3.1 opts for
+        # post-norm via `norm_output: true`.
+        self.norm_output = getattr(config, "norm_output", False)
 
     def forward(
         self,
@@ -230,12 +271,13 @@ class Eagle3MLAModel(nn.Module):
             if (
                 forward_batch.forward_mode.is_extend()
                 and forward_batch.contains_mm_inputs()
-                and not forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 assert embeds is not None
-                embeds = torch.cat(
-                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
-                )
+                last_indices = (
+                    forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+                ).long()
+                embeds[last_indices] = self.embed_tokens(input_ids[last_indices])
             if embeds is None:
                 embeds = self.embed_tokens(input_ids)
         else:
@@ -243,7 +285,14 @@ class Eagle3MLAModel(nn.Module):
 
         hidden_states = forward_batch.spec_info.hidden_states
         if hidden_states.shape[-1] != embeds.shape[-1]:
-            hidden_states = self.fc(hidden_states)
+            if self.fc_norm is not None:
+                chunks = hidden_states.chunk(self.num_aux_hidden_states, dim=-1)
+                hidden_states = torch.cat(
+                    [norm(chunk) for norm, chunk in zip(self.fc_norm, chunks)],
+                    dim=-1,
+                )
+            hidden_states, _ = self.fc(hidden_states)
+            hidden_states = self._fc_gatherer(hidden_states)
 
         if hidden_states.shape[0] == 0:
             return hidden_states, [hidden_states]
@@ -260,7 +309,8 @@ class Eagle3MLAModel(nn.Module):
         hidden_states_to_logits, hidden_states_to_aux = self.norm(
             hidden_states, residual
         )
-        return hidden_states_to_logits, [hidden_states_to_aux]
+        aux = hidden_states_to_logits if self.norm_output else hidden_states_to_aux
+        return hidden_states_to_logits, [aux]
 
 
 class Eagle3DeepseekV2ForCausalLM(nn.Module):
@@ -271,6 +321,15 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     matches the target's MLA cache.
     """
 
+    draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
+
+    @staticmethod
+    def own_quant_config(hf_config, quant_config):
+        """Like deepseek_nextn: modelopt_fp4 is target-only; the draft is bf16."""
+        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+            return None
+        return quant_config
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -279,16 +338,15 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        # Match deepseek_nextn behavior: modelopt_fp4 is target-only and the
-        # bf16 draft must not inherit the FP4 quant method.
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
+        loader_quant_config = quant_config
+        quant_config = self.own_quant_config(config, quant_config)
+        if loader_quant_config is not None and quant_config is None:
             logger.warning(
                 "Overriding Eagle3DeepseekV2ForCausalLM quant config for "
                 "modelopt_fp4 target; draft weights are bf16."
             )
-            quant_config = None
         self.quant_config = quant_config
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         self.model = Eagle3MLAModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)

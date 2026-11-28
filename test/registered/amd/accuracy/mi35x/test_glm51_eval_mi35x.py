@@ -1,17 +1,13 @@
 """MI35x GLM-5.1 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests GLM-5.1-FP8 with NSA attention backend using few-shot
+Tests GLM-5.1-FP8 with DSA attention backend using few-shot
 completion benchmark on MI35x.
 
-Registry: nightly-amd-8-gpu-mi35x-glm51 suite
+Registry: nightly-test-8-gpu-amd-mi35x-glm51 suite
 """
 
 import ast
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -33,8 +29,9 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-glm51",
+    suite="nightly-test-8-gpu-amd-mi35x-glm51",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999
@@ -62,16 +59,16 @@ MI35X_GLM51_MODELS = [
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=5400,
-        variant="nsa",
+        variant="dsa",
         other_args=[
             "--trust-remote-code",
             "--reasoning-parser",
             "glm45",
             "--tool-call-parser",
             "glm47",
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
             "--chunked-prefill-size",
             "131072",
@@ -165,7 +162,7 @@ class TestGLM51EvalMI35x(unittest.TestCase):
     def setUpClass(cls):
         cls.models = MI35X_GLM51_MODELS
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_glm51_accuracy(self):
         all_results = []
@@ -176,9 +173,9 @@ class TestGLM51EvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

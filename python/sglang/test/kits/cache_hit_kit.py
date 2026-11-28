@@ -3,13 +3,48 @@ import json
 import time
 
 import aiohttp
+import numpy as np
 import requests
 
-from sglang.bench_serving import RequestFuncOutput
 from sglang.benchmark.datasets.random import sample_random_requests
+from sglang.benchmark.serving import RequestFuncOutput
 from sglang.benchmark.utils import get_tokenizer, remove_prefix
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=20 * 60 * 60)
+
+
+def get_openai_chat_output_delta(delta):
+    """Return text emitted by an OpenAI-compatible chat streaming delta."""
+    if not delta:
+        return ""
+    reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+    return reasoning + (delta.get("content") or "")
+
+
+def calculate_tpot(latency, ttft, completion_tokens):
+    """Calculate request-level time per output token when inputs are valid."""
+    if ttft <= 0 or completion_tokens <= 1 or latency < ttft:
+        return None
+    return (latency - ttft) / (completion_tokens - 1)
+
+
+def calculate_tpot_statistics(tpots):
+    """Aggregate TPOT samples using the same NumPy definitions as bench_serving."""
+    if not tpots:
+        return {
+            "average_tpot": 0.0,
+            "p90_tpot": 0.0,
+            "p99_tpot": 0.0,
+            "median_tpot": 0.0,
+            "max_tpot": 0.0,
+        }
+    return {
+        "average_tpot": float(np.mean(tpots)),
+        "p90_tpot": float(np.percentile(tpots, 90)),
+        "p99_tpot": float(np.percentile(tpots, 99)),
+        "median_tpot": float(np.median(tpots)),
+        "max_tpot": float(np.max(tpots)),
+    }
 
 
 async def async_request_sglang_generate(
@@ -75,7 +110,10 @@ async def async_request_sglang_generate(
                     output.latency = latency
                     output.prompt_len = prompt_tokens
                     output.cached_tokens = cached_tokens
-                    output.generated_len = len(output.itl) + 1
+                    output.generated_len = len(all_output_ids)
+                    output.tpot = calculate_tpot(
+                        output.latency, output.ttft, output.generated_len
+                    )
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -130,9 +168,10 @@ async def async_request_openai_chat_completions(
                             # Streaming token chunks
                             if data.get("choices"):
                                 raw_delta = data["choices"][0].get("delta")
-                                text = raw_delta.get("content", "") if raw_delta else ""
-                                if text:
-                                    generated_text += text
+                                output_delta = get_openai_chat_output_delta(raw_delta)
+                                if output_delta:
+                                    content = raw_delta.get("content") or ""
+                                    generated_text += content
                                     timestamp = time.perf_counter()
 
                                     if ttft == 0.0:
@@ -162,6 +201,9 @@ async def async_request_openai_chat_completions(
                     output.generated_len = (
                         completion_tokens if completion_tokens else len(output.itl) + 1
                     )
+                    output.tpot = calculate_tpot(
+                        output.latency, output.ttft, output.generated_len
+                    )
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -175,8 +217,10 @@ async def async_request_openai_chat_completions(
     return output
 
 
-def gen_payload_openai(messages, output_len, model):
-    return {
+def gen_payload_openai(
+    messages, output_len, model, *, chat_template_kwargs=None, extra_request_body=None
+):
+    payload = {
         "model": model,
         "messages": messages,
         "max_tokens": output_len,
@@ -184,6 +228,11 @@ def gen_payload_openai(messages, output_len, model):
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if extra_request_body is not None:
+        payload.update(extra_request_body)
+    if chat_template_kwargs is not None:
+        payload["chat_template_kwargs"] = chat_template_kwargs
+    return payload
 
 
 def gen_payload(input_ids, output_len, lora_path=""):
@@ -344,6 +393,15 @@ def run_multiturn_cache_hit_test(
             print(msg)
 
             assert resp.cached_tokens >= expected_cached
+            # Upper bound: cached tokens are a subset of the prompt, so they can
+            # never exceed prompt_len. In PD disaggregation with decode radix
+            # cache, the shared prefix was previously counted on both the prefill
+            # and the decode node, making cached_tokens exceed prompt_len.
+            assert resp.cached_tokens <= resp.prompt_len, (
+                f"Round {round_num}, client {i}: cached_tokens="
+                f"{resp.cached_tokens} exceeds prompt_len={resp.prompt_len} "
+                f"(double-counted prefix across prefill/decode)"
+            )
 
             # Record this round's prompt_len for next round's expected calc
             prev_prompt_lens[i] = resp.prompt_len

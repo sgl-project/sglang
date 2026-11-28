@@ -18,7 +18,6 @@
 """Inference-only GLM-OCR model compatible with HuggingFace weights."""
 
 import logging
-from functools import lru_cache
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -26,19 +25,22 @@ import torch.nn as nn
 from einops import rearrange
 from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrConfig,
-    GlmOcrTextConfig,
     GlmOcrVisionConfig,
 )
 
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention import vision_utils
-from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.attention.vision import (
+    VisionAttention,
+    VisionAttentionMetadata,
+    prepare_vision_attention_metadata,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
@@ -49,14 +51,11 @@ from sglang.srt.models.glm4v import (
     Glm4vVisionMLP,
     Glm4vVisionModel,
     Glm4vVisionPatchEmbed,
+    glm4v_vision_reduces_over_attn_tp,
 )
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.runtime_context import get_mm, get_parallel
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class GlmOcrRMSNorm(Glm4vRMSNorm):
@@ -96,6 +95,9 @@ class GlmOcrVisionBlock(nn.Module):
             prefix=add_prefix("attn", prefix),
             num_dummy_heads=num_dummy_heads,
             use_data_parallel=use_data_parallel,
+            use_dp_attention_reduce=glm4v_vision_reduces_over_attn_tp(
+                use_data_parallel
+            ),
         )
         self.mlp = GlmOcrVisionMLP(
             dim,
@@ -112,6 +114,7 @@ class GlmOcrVisionBlock(nn.Module):
         cu_seqlens: torch.Tensor,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
+        forward_metadata: Optional[VisionAttentionMetadata] = None,
     ) -> torch.Tensor:
         S, B, H = x.shape
         # norm1: flatten to 2D -> [S*B, H], then reshape back
@@ -125,6 +128,7 @@ class GlmOcrVisionBlock(nn.Module):
             cu_seqlens=cu_seqlens,
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
+            forward_metadata=forward_metadata,
         )
         attn = rearrange(attn, "b s h -> s b h")
 
@@ -152,7 +156,6 @@ class GlmOcrVisionModel(Glm4vVisionModel):
     def __init__(
         self,
         vision_config: GlmOcrVisionConfig,
-        text_config: GlmOcrTextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
@@ -198,14 +201,22 @@ class GlmOcrVisionModel(Glm4vVisionModel):
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
+                    num_dummy_heads=vision_config.num_dummy_heads,
                     use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(depth)
             ]
         )
+        projection_intermediate_size = getattr(
+            vision_config, "projection_intermediate_size", None
+        )
         self.merger = GlmOcrVisionPatchMerger(
             d_model=vision_config.out_hidden_size,
-            context_dim=text_config.intermediate_size,
+            context_dim=(
+                projection_intermediate_size
+                if projection_intermediate_size is not None
+                else vision_config.intermediate_size
+            ),
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),
@@ -236,6 +247,9 @@ class GlmOcrVisionModel(Glm4vVisionModel):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
+        forward_metadata = prepare_vision_attention_metadata(
+            cu_seqlens, device=x.device
+        )
 
         rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
         rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
@@ -249,6 +263,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
                 cu_seqlens=cu_seqlens,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
+                forward_metadata=forward_metadata,
             )
 
         # adapter
@@ -270,12 +285,11 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
     ) -> None:
         super().__init__(config, quant_config, prefix)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         self.visual = GlmOcrVisionModel(
             vision_config=config.vision_config,
-            text_config=config.text_config,
             quant_config=quant_config,
             prefix=add_prefix("visual", prefix),
             use_data_parallel=self.use_data_parallel,
@@ -414,18 +428,14 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
 
-                    if name not in params_dict:
-                        continue
+                if name not in params_dict:
+                    continue
 
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                param = params_dict[name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if "visual" in name:

@@ -1,0 +1,201 @@
+---
+title: "Profiling"
+description: "Profile SGLang diffusion workloads with PyTorch Profiler and Nsight Systems."
+tag: "diag"
+---
+This guide covers profiling techniques for multimodal generation pipelines in SGLang.
+
+## PyTorch Profiler
+
+PyTorch Profiler provides detailed kernel execution time, call stack, and GPU utilization metrics.
+
+### Denoising Stage Profiling
+
+Profile the denoising stage with sampled timesteps (default: 5 steps after 1 warmup step):
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+  --seed 0 \
+  --profile
+```
+
+**Parameters:**
+- `--profile`: Enable profiling for the denoising stage
+- `--num-profiled-timesteps N`: Number of timesteps to profile after warmup (default: 5)
+  - Smaller values reduce trace file size
+  - Example: `--num-profiled-timesteps 10` profiles 10 steps after 1 warmup step
+
+### Full Pipeline Profiling
+
+Profile all pipeline stages (text encoding, denoising, VAE decoding, etc.):
+
+```bash
+sglang generate \
+  --model-path Qwen/Qwen-Image \
+  --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+  --seed 0 \
+  --profile \
+  --profile-all-stages
+```
+
+**Parameters:**
+- `--profile-all-stages`: Used with `--profile`, profile all pipeline stages instead of just denoising
+
+### Image API requests
+
+For an already running image server, enable profiling on an individual request.
+The JSON generations endpoint accepts the same controls with underscores:
+
+```bash
+curl -sS http://127.0.0.1:30000/v1/images/generations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "prompt": "A mountain lake at sunrise",
+    "seed": 0,
+    "profile": true,
+    "num_profiled_timesteps": 5,
+    "profile_all_stages": false
+  }'
+```
+
+For `/v1/images/edits`, pass these controls as multipart form fields alongside
+the image and prompt: `-F profile=true -F num_profiled_timesteps=5`.
+Add `-F profile_all_stages=true` to profile the full pipeline instead.
+
+Traces are written on the server, not returned as image-response attachments.
+Use `perf_dump_path` for a lightweight timing report instead of a profiler trace.
+Run latency benchmarks separately with profiling disabled, since collecting a
+trace adds overhead.
+
+### Output Location
+
+Trace output uses the first available setting:
+
+1. An explicit `log_dir` passed to the Python profiler wrapper.
+2. `SGLANG_DIFFUSION_TORCH_PROFILER_DIR`.
+3. `SGLANG_TORCH_PROFILER_DIR`.
+4. `./logs/`.
+
+Relative paths are resolved in the generation worker's working directory. For API requests, configure the directory on the server.
+
+On CUDA and other backends using Chrome trace export, the console shows the output path, for example:
+
+```bash
+[mm-dd hh:mm:ss] Saved profiler traces to: /sgl-workspace/sglang/logs/<request_id>-rank-0.trace.json.gz
+```
+
+### Ascend NPU traces
+
+On Linux with an Ascend NPU deployment and its matching `torch_npu`/CANN installation, use the same `--profile`, `--num-profiled-timesteps`, and `--profile-all-stages` controls. No separate parsing command is required.
+
+NPU traces use the native Ascend directory layout rather than the `*.trace.json.gz` filename above:
+
+```text
+<output_dir>/<hostname>_<pid>_<timestamp>_ascend_pt/
+  ASCEND_PROFILER_OUTPUT/trace_view.json
+  sglang_analysis.log
+  sglang_analysis.json
+```
+
+Diffusion workers are daemon processes, where the native NPU analyzer cannot create its multiprocessing pool. SGLang saves the raw capture, then starts an independent parser immediately after profiling stops **without waiting**. Remaining generation and request completion do not wait for analysis. Each participating rank submits its own capture; the `NPU profile analysis submitted; status:` log identifies its status file, which may not exist until the new interpreter starts. Non-daemon callers keep native automatic parsing.
+
+On a normal stop, daemon workers coordinate capture-stop errors across the participating ranks before submitting analysis. A capture-stop error is reported to all participating ranks; it is distinct from a background parser failure. If the request fails or is cancelled, profiling cleanup stays local, does not submit another parser, and preserves the original request error. Repeated cleanup does not stop or submit the same capture again.
+
+The parser runs without a fixed timeout and can finish after the generation worker exits. It writes progress and results atomically to `sglang_analysis.json`:
+
+- `running`: analysis has started; a trace may not be ready yet.
+- `succeeded`: analysis finished and produced a nonempty `trace_view.json`. `trace_path` identifies the artifact.
+- `failed`: analysis failed, or no nonempty trace was produced. Read `error` and `sglang_analysis.log`. Parser launch failures are also reported separately.
+
+Analysis failures do not change a successful generation result. Raw data and logs remain for diagnosis or [optional re-parsing](/docs/hardware-platforms/ascend-npus/optimization/profiling#6-re-parsing-raw-data-optional). Wait for `succeeded` before opening the trace; completion of the generation command alone does not mean analysis is complete. If the parser is forcibly killed or its host shuts down, it may not write a final status. SGLang does not monitor or automatically retry these tasks.
+
+<Note>
+Background analysis still consumes CPU, memory, and I/O resources. Profiled latency is not an unprofiled benchmark. A nonempty trace proves an artifact was produced, not that all expected events are present; inspect native warnings and the trace itself. Stopping the generation worker does not cancel an already submitted parser; destroying its container or host can still terminate it.
+</Note>
+
+### View Traces
+
+Load and visualize trace files at:
+- https://ui.perfetto.dev/ (recommended)
+- chrome://tracing (Chrome only)
+
+For large trace files, reduce `--num-profiled-timesteps` or avoid using `--profile-all-stages`.
+
+
+### `--perf-dump-path` (Stage/Step Timing Dump)
+
+Besides profiler traces, you can also dump a lightweight JSON report that contains:
+- stage-level timing breakdown for the full pipeline
+- step-level timing breakdown for the denoising stage (per diffusion step)
+
+This is useful to quickly identify which stage dominates end-to-end latency, and whether denoising steps have uniform runtimes (and if not, which step has an abnormal spike).
+
+The dumped JSON contains a `denoise_steps_ms` field formatted as an array of objects, each with a `step` key (the step index) and a `duration_ms` key.
+
+Example:
+
+```bash
+sglang generate \
+  --model-path <MODEL_PATH_OR_ID> \
+  --prompt "<PROMPT>" \
+  --perf-dump-path perf.json
+```
+
+## Nsight Systems
+
+Nsight Systems provides low-level CUDA profiling with kernel details, register usage, and memory access patterns.
+
+### Installation
+
+See the [SGLang profiling guide](../developer_guide/benchmark_and_profiling#profile-with-nsight) for installation instructions.
+
+### Basic Profiling
+
+Profile the entire pipeline execution:
+
+```bash
+nsys profile \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  --force-overwrite=true \
+  -o QwenImage \
+  sglang generate \
+    --model-path Qwen/Qwen-Image \
+    --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+    --seed 0
+```
+
+### Targeted Stage Profiling
+
+Use `--delay` and `--duration` to capture specific stages and reduce file size:
+
+```bash
+nsys profile \
+  --trace-fork-before-exec=true \
+  --cuda-graph-trace=node \
+  --force-overwrite=true \
+  --delay 10 \
+  --duration 30 \
+  -o QwenImage_denoising \
+  sglang generate \
+    --model-path Qwen/Qwen-Image \
+    --prompt "A Logo With Bold Large Text: SGL Diffusion" \
+    --seed 0
+```
+
+**Parameters:**
+- `--delay N`: Wait N seconds before starting capture (skip initialization overhead)
+- `--duration N`: Capture for N seconds (focus on specific stages)
+- `--force-overwrite`: Overwrite existing output files
+
+## Notes
+
+- **Reduce trace size**: Use `--num-profiled-timesteps` with smaller values or `--delay`/`--duration` with Nsight Systems
+- **Stage-specific analysis**: Use `--profile` alone for denoising stage, add `--profile-all-stages` for full pipeline
+- **Multiple runs**: Profile with different prompts and resolutions to identify bottlenecks across workloads
+
+## FAQ
+
+- If you are profiling `sglang generate` with Nsight Systems and find that the generated profiler file did not capture any CUDA kernels, you can resolve this issue by increasing the model's inference steps to extend the execution time.

@@ -5,10 +5,10 @@ import torch
 from tqdm import tqdm
 
 from sglang.srt.distributed import (
-    get_world_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.managers.cache_controller import (
     HiCacheController,
     PrefetchOperation,
@@ -16,7 +16,8 @@ from sglang.srt.managers.cache_controller import (
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.test.test_utils import publish_build_topology
 
 init_distributed_environment(
     world_size=1,
@@ -26,10 +27,8 @@ init_distributed_environment(
     backend="gloo",
 )
 
-initialize_model_parallel(
-    tensor_model_parallel_size=1,
-    pipeline_model_parallel_size=1,
-)
+publish_build_topology()
+initialize_model_parallel()
 
 group = get_world_group().cpu_group
 
@@ -109,12 +108,11 @@ elif hicache_mem_layout == "layer_first":
     for operation in operations:
         cache_controller.generic_page_backup(operation, batch_size=128)
 tok = time.monotonic()
-print(f"{tok-tik:.6f} s")
+print(f"{tok - tik:.6f} s")
 
 operations = [
     PrefetchOperation(
         f"{i}",
-        torch.tensor(list(range(i, i + op_size))),
         list(range(i, i + op_size)),
         f"{i}",
     )
@@ -122,6 +120,7 @@ operations = [
 ]
 
 for operation in operations:
+    operation.host_indices = torch.tensor(operation.token_ids)
     operation.hash_value = [
         f"{j}"
         for j in range(
@@ -137,4 +136,4 @@ elif hicache_mem_layout == "layer_first":
     for operation in operations:
         cache_controller.generic_page_transfer(operation, batch_size=128)
 tok = time.monotonic()
-print(f"{tok-tik:.6f} s")
+print(f"{tok - tik:.6f} s")

@@ -69,7 +69,7 @@ class TestVLMViTCudaGraph(CustomTestCase):
         os.makedirs(output_path, exist_ok=True)
 
         # -------- compose --model_args --------
-        model_args = f'model_version="{model_version}",' f"tp={tp}"
+        model_args = f'model_version="{model_version}",tp={tp}'
 
         # -------- build command list --------
         cmd = [
@@ -120,8 +120,6 @@ class TestVLMViTCudaGraph(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
-            # if test vlm with cuda_ipc feature, open this env_var
-            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
             process_env["SGLANG_VIT_ENABLE_CUDA_GRAPH"] = "1"
 
             # Prepare stdout/stderr redirection if needed
@@ -138,16 +136,18 @@ class TestVLMViTCudaGraph(CustomTestCase):
                 timeout=self.time_out,
                 api_key=self.api_key,
                 other_args=[
+                    "--mm-feature-transport",
+                    "cuda_ipc",
                     "--mm-attention-backend",
                     "fa3",
-                    "--enforce-piecewise-cuda-graph",
-                    "--piecewise-cuda-graph-max-tokens",
+                    "--cuda-graph-backend-prefill=tc_piecewise",
+                    "--cuda-graph-max-bs-prefill",
                     "8192",
                     "--chunked-prefill-size",
                     "8192",
                     "--disable-radix-cache",
                     "--disable-overlap-schedule",
-                    "--piecewise-cuda-graph-compiler",
+                    "--cuda-graph-tc-compiler",
                     "eager",
                 ],
                 env=process_env,

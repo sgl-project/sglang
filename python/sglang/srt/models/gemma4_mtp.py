@@ -28,11 +28,12 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessorOutput,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM, Gemma4TextModel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         self.assistant_config = config
         self.config = text_config
         self.quant_config = quant_config
+        self.pp_group = get_parallel().pp_group
 
         self.vocab_size = text_config.vocab_size
         self.hidden_size = text_config.hidden_size
@@ -89,7 +91,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             2 * self.backbone_hidden_size,
             self.hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("pre_projection", prefix),
         )
         self.model = Gemma4TextModel(
@@ -101,7 +103,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             self.hidden_size,
             self.backbone_hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("post_projection", prefix),
         )
 
@@ -210,10 +212,16 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def get_attention_sliding_window_size(self) -> int:
+    @staticmethod
+    def sliding_layer_window_size(config) -> int:
         # Gemma 4 config treats the bound as inclusive; SGLang attention metadata
         # uses an exclusive window size, matching the target Gemma 4 models.
-        return self.config.sliding_window - 1
+        # Before load the config may still wrap the text config the built
+        # model keeps.
+        return _get_text_config(config).sliding_window - 1
+
+    def get_attention_sliding_window_size(self) -> int:
+        return self.sliding_layer_window_size(self.config)
 
     @torch.no_grad()
     def forward(
@@ -395,4 +403,8 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         )
 
 
-EntryClass = Gemma4AssistantForCausalLM
+class Gemma4UnifiedAssistantForCausalLM(Gemma4AssistantForCausalLM):
+    """Gemma 4 unified MTP assistant; text path identical to the gemma4 assistant."""
+
+
+EntryClass = [Gemma4AssistantForCausalLM, Gemma4UnifiedAssistantForCausalLM]

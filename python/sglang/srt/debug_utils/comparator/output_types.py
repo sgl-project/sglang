@@ -7,9 +7,6 @@ from pydantic import ConfigDict, Discriminator, Field, TypeAdapter, model_valida
 from rich.console import Group, RenderableType
 from rich.markup import escape
 
-from sglang.srt.debug_utils.comparator.output_formatter import (  # noqa: F401 — re-export
-    _format_aligner_plan as _format_aligner_plan,
-)
 from sglang.srt.debug_utils.comparator.output_formatter import (
     _format_config_body,
     _format_config_rich_body,
@@ -277,7 +274,7 @@ class SummaryRecord(_OutputRecord):
     errored: int = 0
 
     @model_validator(mode="after")
-    def _validate_totals(self) -> "SummaryRecord":
+    def _validate_totals(self) -> SummaryRecord:
         expected: int = self.passed + self.failed + self.skipped + self.errored
         if self.total != expected:
             raise ValueError(

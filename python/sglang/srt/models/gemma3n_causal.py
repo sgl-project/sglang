@@ -3,9 +3,8 @@ from typing import Iterable, Optional, Set, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoModel, Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
+from transformers import Gemma3nTextConfig, PretrainedConfig, PreTrainedModel
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -19,6 +18,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
@@ -26,7 +27,7 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.runtime_context import get_parallel
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -295,21 +296,6 @@ class Gemma3nAltUp(nn.Module):
         """Scales the provided 3D tensor."""
         return corrected * self.correct_output_scale.to(corrected.dtype)
 
-    def forward(
-        self, hidden_states: torch.Tensor, activated: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predicts, correct, and optionally scales the output of a layer using trainable maps.
-
-        hidden_states: [num_altup_inputs, num_tokens, hidden_size]
-        """
-
-        predictions = self.predict(hidden_states)
-        corrected = self.correct(predictions=predictions, activated=activated)
-        output = corrected[self.config.altup_active_idx]
-        if self.config.altup_correct_scale:
-            output = self.scale_corrected_output(output)
-        return corrected, output
-
 
 class Gemma3nAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -325,7 +311,7 @@ class Gemma3nAttention(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.config = config
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size = get_parallel().tp_size
 
         self.total_num_heads = config.num_attention_heads
         assert self.total_num_heads % tp_size == 0
@@ -389,16 +375,21 @@ class Gemma3nAttention(nn.Module):
                 self.head_dim,
                 rotary_dim=self.head_dim,
                 max_position=config.max_position_embeddings,
-                base=config.rope_local_base_freq,
+                base=config.rope_parameters.get("sliding_attention", {}).get(
+                    "rope_theta", 10000.0
+                ),
                 rope_scaling={"rope_type": "default"},
             )
         else:
+            full_attn_rope = config.rope_parameters.get("full_attention", {})
             self.rotary_emb = get_rope(
                 self.head_dim,
                 rotary_dim=self.head_dim,
                 max_position=config.max_position_embeddings,
-                base=config.rope_parameters["rope_theta"],
-                rope_scaling=config.rope_parameters,
+                base=full_attn_rope.get("rope_theta", 1000000.0),
+                rope_scaling=(
+                    full_attn_rope if full_attn_rope else {"rope_type": "default"}
+                ),
             )
 
         self.sliding_window = config.sliding_window if self.is_sliding else None
@@ -893,10 +884,6 @@ class Gemma3nForCausalLM(PreTrainedModel):
         ".gate_up_proj",
         ".down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
 
     def __init__(
         self,
@@ -1008,4 +995,3 @@ class Gemma3nForCausalLM(PreTrainedModel):
 
 
 EntryClass = Gemma3nForCausalLM
-AutoModel.register(Gemma3nTextConfig, Gemma3nForCausalLM, exist_ok=True)

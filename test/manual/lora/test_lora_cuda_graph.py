@@ -44,7 +44,6 @@ TEST_CUDA_GRAPH_PADDING_PROMPTS = [
 
 
 class TestLoRACudaGraph(CustomTestCase):
-
     def _run_without_cuda_graph_on_model_cases(self, model_cases: List[LoRAModelCase]):
         # Since we have already enabled CUDA graph by default in other lora tests,
         # we only need to run lora tests without CUDA graph here.

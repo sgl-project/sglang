@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/model_executor/parameter.py"""
 
 import logging
@@ -52,9 +54,9 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
     bf16/fp16 share the same rank, and all fp8 variants share the same rank.
     """
 
-    assert (
-        target.shape == loaded_weight.shape
-    ), f"{target.shape=}, {loaded_weight.shape=}"
+    assert target.shape == loaded_weight.shape, (
+        f"{target.shape=}, {loaded_weight.shape=}"
+    )
 
     if target.dtype == loaded_weight.dtype:
         target.copy_(loaded_weight)
@@ -71,8 +73,8 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
         raise ValueError(
             f"Downcasting not allowed: {target.dtype=}, {loaded_weight.dtype=}"
         )
-    if loaded_rank == torch.float8_e8m0fnu:
-        assert target_rank in {torch.float8_e8m0fnu, torch.float32}
+    if loaded_weight.dtype == torch.float8_e8m0fnu and target.dtype != torch.float32:
+        raise ValueError(f"E8M0 scales load only into E8M0 or float32: {target.dtype=}")
 
     target.copy_(loaded_weight)
 
@@ -266,9 +268,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.output_dim, shard_id * shard_size, shard_size
                 )
 
-        assert (
-            param_data.shape == loaded_weight.shape
-        ), f"{param_data.shape=}, {loaded_weight.shape=}"
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=}, {loaded_weight.shape=}"
+        )
         param_data.copy_(loaded_weight)
 
 
@@ -588,8 +590,8 @@ def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size)
 def _adjust_shard_indexes_for_packing(
     shard_size, shard_offset, packed_factor, marlin_tile_size
 ):
-    shard_size = shard_size // packed_factor
-    shard_offset = shard_offset // packed_factor
+    shard_size = round(shard_size // packed_factor)
+    shard_offset = round(shard_offset // packed_factor)
     if marlin_tile_size is not None:
         return _adjust_shard_indexes_for_marlin(
             shard_size=shard_size,

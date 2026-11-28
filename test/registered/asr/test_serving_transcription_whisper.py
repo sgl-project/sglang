@@ -8,12 +8,35 @@ Usage:
     python3 test_serving_transcription_whisper.py -v
 """
 
+import io
 import unittest
 
+import numpy as np
+import soundfile as sf
+
+from sglang.srt.multimodal.media_io import load_audio
 from sglang.test.asr_utils import ASRTestBase, AudioTestCase
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import download_audio_bytes
 
-register_cuda_ci(est_time=60, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=119, stage="extra-a", runner_config="1-gpu-small")
+
+
+def long_audio_wav_bytes(case: AudioTestCase, prefix_silence_s: float = 30.0) -> bytes:
+    """A 40 s WAV: silence, then the 10 s speech clip.
+
+    The speech sits entirely past Whisper's 30 s encoder window, so without
+    long-audio chunking the feature extractor silently truncates it away
+    and the transcript contains none of the spoken content.
+    """
+    sr = 16000
+    speech = load_audio(download_audio_bytes(case.url), sr=sr, mono=True).astype(
+        np.float32
+    )
+    wav = np.concatenate([np.zeros(int(prefix_silence_s * sr), np.float32), speech])
+    buf = io.BytesIO()
+    sf.write(buf, wav, sr, format="WAV")
+    return buf.getvalue()
 
 
 class TestServingTranscriptionWhisper(ASRTestBase):
@@ -97,6 +120,45 @@ class TestServingTranscriptionWhisper(ASRTestBase):
             reference,
             "Streamed auto-detect text should match the non-streaming result.",
         )
+
+    def test_long_audio_transcribes_past_30s(self):
+        """Speech past the 30 s window must appear in the transcript."""
+        case = self.audio_cases[0]
+        result = self._transcribe_json(case, audio_bytes=long_audio_wav_bytes(case))
+        self._assert_keywords(result["text"], case)
+        # Usage reports the full audio duration, not one chunk's.
+        self.assertGreaterEqual(result["usage"]["seconds"], 40)
+
+    def test_long_audio_verbose_json_segment_offsets(self):
+        """Segment timestamps are offset by each chunk's start time."""
+        case = self.audio_cases[0]
+        result = self._transcribe_json(
+            case,
+            response_format="verbose_json",
+            timestamp_granularities=["segment"],
+            audio_bytes=long_audio_wav_bytes(case),
+        )
+        self._assert_keywords(result.get("text", ""), case)
+        segments = result.get("segments") or []
+        self.assertGreater(len(segments), 0, "Expected at least one segment")
+        # The speech starts at t=30 s; its segments must be reported in
+        # original-audio time, which is unreachable within a single 30 s
+        # window.
+        self.assertGreater(
+            max(seg["end"] for seg in segments),
+            30.0,
+            f"Expected segment timing past the 30 s window, got {segments!r}",
+        )
+
+    def test_long_audio_streaming(self):
+        """Streaming long audio emits the post-30 s content as deltas."""
+        case = self.audio_cases[0]
+        events, _ = self._transcribe_stream(
+            case, language="en", audio_bytes=long_audio_wav_bytes(case)
+        )
+        deltas = self._iter_deltas(events)
+        self.assertTrue(len(deltas) > 0, "Expected at least one streamed delta")
+        self._assert_keywords("".join(deltas), case)
 
 
 if __name__ == "__main__":

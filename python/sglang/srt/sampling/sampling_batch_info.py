@@ -2,445 +2,175 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+import operator
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
 
-import sglang.srt.sampling.penaltylib as penaltylib
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
-from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
-from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
+from sglang.srt.runtime_context import get_exec
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    CustomLogitProcessor,
+)
+from sglang.srt.sampling.logit_bias import build_logit_bias
+from sglang.srt.sampling.penalties import StepPenalties
+from sglang.srt.sampling.watermarking.interface import WatermarkRows
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.sampling.sampling_params_pool import SamplingRows
 
 
 logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
+class ProcessorEntry:
+    """A custom logit processor and the batch rows it applies to."""
+
+    processor: CustomLogitProcessor
+    rows: List[int]
+    indices: torch.Tensor
+
+
+@dataclasses.dataclass
 class SamplingBatchInfo:
-    # Basic batched sampling params
-    temperatures: torch.Tensor
-    top_ps: torch.Tensor
-    top_ks: torch.Tensor
-    min_ps: torch.Tensor
-
-    # Whether all requests use greedy sampling
-    is_all_greedy: bool
-
-    # Whether any requests use top_p sampling
-    need_top_p_sampling: bool
-
-    # Whether any requests use top_k sampling
-    need_top_k_sampling: bool
-
-    # Whether any request needs min_p sampling
-    need_min_p_sampling: bool
-
-    # Masking tensors for grammar-guided structured outputs
     vocab_size: int
-    grammars: Optional[List] = None
-    vocab_mask: Optional[torch.Tensor] = None
-    apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
-    # Penalizer
-    penalizer_orchestrator: Optional[penaltylib.BatchedPenalizerOrchestrator] = None
-    acc_additive_penalties: Optional[torch.Tensor] = None  # Used in the overlap mode
-    acc_scaling_penalties: Optional[torch.Tensor] = (
-        None  # Used in the overlap mode for repetition penalty
-    )
+    # The sampler params, set by the scheduler at each launch (set_rows).
+    temperatures: Optional[torch.Tensor] = None
+    top_ps: Optional[torch.Tensor] = None
+    top_ks: Optional[torch.Tensor] = None
+    min_ps: Optional[torch.Tensor] = None
+    is_all_greedy: bool = False
+    is_any_greedy: bool = False
+    need_top_p_sampling: bool = False
+    need_top_k_sampling: bool = False
+    need_min_p_sampling: bool = False
+    npu_top_k_top_p_eligible: bool = False
+    max_top_k: Optional[int] = None
 
-    # Whether any request has custom logit processor
+    # Hashed request ids for the KV canary's token oracle; set in ForwardBatch.
+    rids_int: Optional[torch.Tensor] = None
+    bootstrap_room_ids_int: Optional[torch.Tensor] = None
+
+    # Set by the scheduler at each launch (set_rows).
+    step_penalties: Optional[StepPenalties] = None
+
+    # Set by the scheduler at each launch (set_step_state).
     has_custom_logit_processor: bool = False
-    # Custom parameters
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
-    # Custom logit processor
-    custom_logit_processor: Optional[
-        Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]
-    ] = None
+    custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
-    # Used for deterministic sampling
+    # Set by the scheduler at each launch (set_rows).
+    # Per-row seeds, or None to sample unseeded; deterministic mode seeds every row.
     sampling_seed: Optional[torch.Tensor] = None
+
+    # Set by the scheduler at each launch (set_step_state).
+    # Rows of the requests that return sampling masks, and each support-mode row's
+    # index among them; None when no row has one. They limit capture to those rows.
+    sampling_mask_batch_indices: Optional[torch.Tensor] = None
+    sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
+    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+    sampling_mask_top_ks: Optional[List[int]] = None
+
+    # Per-row watermark policy, None unless some row is a watermark candidate;
+    # set by the scheduler at each launch (set_rows).
+    watermark: Optional[WatermarkRows] = None
 
     # Device
     device: str = "cuda"
 
-    # Handle logit bias
+    # Set by the scheduler at each launch (set_step_state).
     logit_bias: Optional[torch.Tensor] = None
+    # The step's grammar objects, None when no request has one (see grammar_mask.py).
+    grammars: Optional[List[Optional[BaseGrammarObject]]] = None
 
-    @classmethod
-    def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
-        global_server_args = get_global_server_args()
-        enable_deterministic = global_server_args.enable_deterministic_inference
+    def set_rows(self, rows: SamplingRows) -> None:
+        """Set the step's state from its rows of `SamplingParamsPool`."""
+        for name, value in zip(rows._fields, rows):
+            setattr(self, name, value)
 
-        reqs = batch.reqs
-        device = batch.device
-        temperatures = torch.tensor(
-            [r.sampling_params.temperature for r in reqs],
-            dtype=torch.float,
-            device=device,
-        ).view(-1, 1)
-        top_ps = torch.tensor(
-            [r.sampling_params.top_p for r in reqs], dtype=torch.float, device=device
+    def set_step_state(self, reqs: List[Req]) -> None:
+        """Build the stages' step state from the step's requests: logit_bias, the
+        grammars, the custom logit processors, and the sampling-mask rows."""
+        self.logit_bias = build_logit_bias(
+            reqs, vocab_size=self.vocab_size, device=self.device
         )
-        top_ks = torch.tensor(
-            [r.sampling_params.top_k for r in reqs], dtype=torch.int32, device=device
-        )
-        min_ps = torch.tensor(
-            [r.sampling_params.min_p for r in reqs], dtype=torch.float, device=device
-        )
-        sampling_seed = (
-            torch.tensor(
-                [
-                    (
-                        r.sampling_params.sampling_seed
-                        if r.sampling_params.sampling_seed is not None
-                        else 42
-                    )
-                    for r in reqs
-                ],
-                dtype=torch.int64,
-                device=device,
+        grammars = [r.grammar for r in reqs]
+        self.grammars = grammars if any(grammars) else None
+
+        # Group the step's requests by custom logit processor.
+        enable_custom_processor = get_exec().features.enable_custom_logit_processor
+        self.has_custom_logit_processor = any(
+            r.custom_logit_processor
+            and (
+                enable_custom_processor
+                or r.custom_logit_processor == UOCR_PAGE_GUARD_PROCESSOR
             )
-            if enable_deterministic
+            for r in reqs
+        )
+        if self.has_custom_logit_processor:
+            rows_by_processor: Dict[str, List[int]] = {}
+            for i, r in enumerate(reqs):
+                if r.custom_logit_processor is not None:
+                    rows_by_processor.setdefault(r.custom_logit_processor, []).append(i)
+            self.custom_params = [r.sampling_params.custom_params for r in reqs]
+            self.custom_logit_processor = {
+                hash(processor_str): ProcessorEntry(
+                    processor=CustomLogitProcessor.from_str(processor_str),
+                    rows=rows,
+                    indices=async_h2d(rows, dtype=torch.long, device=self.device),
+                )
+                for processor_str, rows in rows_by_processor.items()
+            }
+        else:
+            self.custom_params = None
+            self.custom_logit_processor = None
+
+        mask_rows = [i for i, r in enumerate(reqs) if r.return_sampling_mask]
+        capture_rows = [
+            j
+            for j, i in enumerate(mask_rows)
+            if reqs[i].sampling_logprobs_mode == "support"
+        ]
+        if mask_rows:
+            # One copy for both int64 lists.
+            device_rows = async_h2d(
+                mask_rows + capture_rows, dtype=torch.int64, device=self.device
+            )
+            self.sampling_mask_batch_indices = device_rows[: len(mask_rows)]
+            self.sampling_support_logprobs_capture_indices = (
+                device_rows[len(mask_rows) :] if capture_rows else None
+            )
+        else:
+            self.sampling_mask_batch_indices = None
+            self.sampling_support_logprobs_capture_indices = None
+        self.sampling_mask_top_ks = (
+            [r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs]
+            if mask_rows
             else None
         )
 
-        logit_bias = None
-        if any(r.sampling_params.logit_bias is not None for r in reqs):
-            logit_bias = torch.zeros(len(reqs), vocab_size, device=device)
-            for i, r in enumerate(reqs):
-                if r.sampling_params.logit_bias is not None:
-                    for key, value in r.sampling_params.logit_bias.items():
-                        logit_bias[i, int(key)] = value
-
-        # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            global_server_args.enable_custom_logit_processor
-            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
-        )  # then check the requests.
-
-        if has_custom_logit_processor:
-            # Merge the same type of custom logit processors together
-            processor_dict = {}
-            for i, r in enumerate(reqs):
-                if r.custom_logit_processor is None:
-                    continue
-                processor_str = r.custom_logit_processor
-                if processor_str not in processor_dict:
-                    processor_dict[processor_str] = []
-                processor_dict[processor_str].append(i)
-
-            merged_custom_logit_processor = {
-                hash(processor_str): (
-                    # The deserialized custom logit processor object
-                    CustomLogitProcessor.from_str(processor_str),
-                    # The mask tensor for the requests that use this custom logit processor
-                    torch.zeros(len(reqs), dtype=torch.bool)
-                    .scatter_(0, torch.tensor(true_indices), True)
-                    .to(device, non_blocking=True),
-                )
-                for processor_str, true_indices in processor_dict.items()
-            }
-            custom_params = [r.sampling_params.custom_params for r in reqs]
-        else:
-            merged_custom_logit_processor = None
-            custom_params = None
-
-        # Each penalizers will do nothing if they evaluate themselves as not required by looking at
-        # the sampling_params of the requests (See {_is_required()} of each penalizers). So this
-        # should not add hefty computation overhead other than simple checks.
-        #
-        # While we can choose not to even create the class instances if they are not required, this
-        # could add additional complexity to the {ScheduleBatch} class, especially we need to
-        # handle {filter_batch()} and {merge_batch()} cases as well.
-        penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
-            vocab_size=vocab_size,
-            batch=batch,
-            penalizers={
-                penaltylib.BatchedFrequencyPenalizer,
-                penaltylib.BatchedMinNewTokensPenalizer,
-                penaltylib.BatchedPresencePenalizer,
-                penaltylib.BatchedRepetitionPenalizer,
-            },
-        )
-
-        ret = cls(
-            temperatures=temperatures,
-            top_ps=top_ps,
-            top_ks=top_ks,
-            min_ps=min_ps,
-            sampling_seed=sampling_seed,
-            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
-            need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            vocab_size=vocab_size,
-            penalizer_orchestrator=penalizer_orchestrator,
-            has_custom_logit_processor=has_custom_logit_processor,
-            custom_params=custom_params,
-            custom_logit_processor=merged_custom_logit_processor,
-            device=device,
-            logit_bias=logit_bias,
-        )
-        ret.adjusted_from_schedule_batch(batch, vocab_size)
-        return ret
-
-    # placeholder for override
-    def adjusted_from_schedule_batch(self, batch: ScheduleBatch, vocab_size: int):
-        pass
-
-    # placeholder for override
-    def adjusted_merge_batch(self, other: "SamplingBatchInfo"):
-        pass
-
-    # placeholder for override
-    def adjusted_filter_batch(
-        self, keep_indices: List[int], keep_indices_device: torch.Tensor
-    ):
-        pass
-
-    def __len__(self):
-        return len(self.temperatures)
-
-    def update_regex_vocab_mask(self):
-        if not self.grammars:
-            self.vocab_mask = None
-            self.apply_mask_func = None
-            return
-
-        # Find a grammar from the list
-        first_grammar = next(grammar for grammar in self.grammars if grammar)
-
-        # TODO(lianmin): Maybe we can reuse the existing mask?
-        self.vocab_mask = first_grammar.allocate_vocab_mask(
-            vocab_size=self.vocab_size,
-            batch_size=len(self.temperatures),
-            device=self.device,
-        )
-        self.apply_mask_func = (
-            first_grammar.apply_vocab_mask
-        )  # force to use static method
-
-        # Apply the mask
-        for i, grammar in enumerate(self.grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(self.vocab_mask, i)
-
-        # Move the mask to the device if needed
-        self.vocab_mask = first_grammar.move_vocab_mask(self.vocab_mask, self.device)
-
-    def update_penalties(self):
-        if self.penalizer_orchestrator.is_required:
-            self.acc_additive_penalties = torch.zeros(
-                (len(self.temperatures), self.vocab_size),
-                dtype=torch.float32,
-                device=self.temperatures.device,
-            )
-            self.penalizer_orchestrator.accumulate_additive_penalties(
-                self.acc_additive_penalties
-            )
-            self.acc_scaling_penalties = (
-                self.penalizer_orchestrator.accumulate_scaling_penalties()
-            )
-        else:
-            self.acc_additive_penalties = None
-            self.acc_scaling_penalties = None
-
-    def apply_logits_bias(self, logits: torch.Tensor):
-        if self.acc_additive_penalties is not None:
-            # Used in the overlap mode
-            logits.add_(self.acc_additive_penalties)
-
-        if self.acc_scaling_penalties is not None:
-            # Used in the overlap mode
-            apply_scaling_penalties(logits, self.acc_scaling_penalties)
-
-        if self.penalizer_orchestrator and self.penalizer_orchestrator.is_required:
-            # Used in the non-overlap mode
-            self.penalizer_orchestrator.apply(logits)
-
-        if self.vocab_mask is not None:
-            self.apply_mask_func(logits=logits, vocab_mask=self.vocab_mask)
-
-        if self.logit_bias is not None:
-            logits.add_(self.logit_bias)
-
-    def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
-        self.penalizer_orchestrator.filter(keep_indices_device)
-
-        if self.has_custom_logit_processor:
-            self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
-
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            value = getattr(self, item, None)
-            if value is not None:
-                setattr(self, item, value[keep_indices_device])
-
-        if self.logit_bias is not None:
-            self.logit_bias = self.logit_bias[keep_indices_device]
-
-        self.adjusted_filter_batch(keep_indices, keep_indices_device)
-
-    def _filter_batch_custom_logit_processor(
-        self, keep_indices: List[int], keep_indices_device: torch.Tensor
-    ):
-        """Filter the custom logit processor and custom params"""
-        self.custom_logit_processor = {
-            k: (p, mask[keep_indices_device])
-            for k, (p, mask) in self.custom_logit_processor.items()
-            if torch.any(
-                mask[keep_indices_device]
-            )  # ignore the custom logit processor whose mask is all False
-        }
-        self.custom_params = [self.custom_params[i] for i in keep_indices]
-
-        # If the custom logit processor is an empty dict, set the flag to False,
-        # and set the custom logit processor and custom params to None.
-        if len(self.custom_logit_processor) == 0:
-            self.custom_logit_processor = None
-            self.custom_params = None
-            self.has_custom_logit_processor = False
-
-    @staticmethod
-    def merge_custom_logit_processor(
-        lhs: Optional[Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]],
-        rhs: Optional[Dict[int, Tuple[CustomLogitProcessor, torch.Tensor]]],
-        bs1: int,
-        bs2: int,
-        device: str,
-    ):
-        if lhs is None and rhs is None:
-            return None
-        lhs, rhs = lhs or {}, rhs or {}
-
-        keys = set(lhs.keys()).union(set(rhs.keys()))
-        merged_dict = {}
-
-        for k in keys:
-            # Get the logit processor object
-            processor = lhs[k][0] if k in lhs else rhs[k][0]
-            # Get and merge the mask tensors from the two dicts
-            left_mask = (
-                lhs[k][1]
-                if k in lhs
-                else torch.zeros(bs1, dtype=torch.bool, device=device)
-            )
-            right_mask = (
-                rhs[k][1]
-                if k in rhs
-                else torch.zeros(bs2, dtype=torch.bool, device=device)
-            )
-            merged_dict[k] = (processor, torch.cat([left_mask, right_mask]))
-
-            assert merged_dict[k][1].shape[0] == bs1 + bs2, (
-                f"The batch size of merged mask ({merged_dict[k][1].shape[0]}) does not match "
-                f"the sum of the batch sizes of the two masks ({bs1 + bs2})"
-                f"\n{left_mask=}\n{right_mask=}\n{bs1=}\n{bs2=}"
-                f"\n{lhs=}\n{rhs=}"
-            )
-
-        return merged_dict
-
-    def merge_batch(self, other: "SamplingBatchInfo"):
-        self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
-
-        # Merge the custom logit processors and custom params lists
-        if self.has_custom_logit_processor or other.has_custom_logit_processor:
-            # Merge the custom logit processors
-            self.custom_logit_processor = (
-                SamplingBatchInfo.merge_custom_logit_processor(
-                    self.custom_logit_processor,
-                    other.custom_logit_processor,
-                    len(self),
-                    len(other),
-                    self.device,
-                )
-            )
-            # Merge the custom params lists
-            self.custom_params = self.custom_params or [None] * len(self)
-            other.custom_params = other.custom_params or [None] * len(other)
-            self.custom_params.extend(other.custom_params)
-
-            # Set the flag to True if any of the two has custom logit processor
-            self.has_custom_logit_processor = True
-
-        # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
-        # See note below on len(self) and len(other).
-        self.logit_bias = merge_bias_tensor(
-            self.logit_bias, other.logit_bias, len(self), len(other), self.device, 0.0
-        )
-
-        # Note: because the __len()__ operator is defined on the temperatures tensor,
-        # please make sure any merge operation with len(self) or len(other) is done before
-        # the merge operation of the temperatures tensor below.
-        for item in [
-            "temperatures",
-            "top_ps",
-            "top_ks",
-            "min_ps",
-            "sampling_seed",
-        ]:
-            self_val = getattr(self, item, None)
-            other_val = getattr(other, item, None)
-            if self_val is not None and other_val is not None:
-                setattr(self, item, torch.cat([self_val, other_val]))
-
-        self.is_all_greedy &= other.is_all_greedy
-        self.need_top_p_sampling |= other.need_top_p_sampling
-        self.need_top_k_sampling |= other.need_top_k_sampling
-        self.need_min_p_sampling |= other.need_min_p_sampling
-
-        self.adjusted_merge_batch(other)
-
     def copy_for_forward(self):
-        # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
-        self.update_penalties()
-        return dataclasses.replace(self, penalizer_orchestrator=None)
-
-
-def merge_bias_tensor(
-    lhs: Optional[torch.Tensor],
-    rhs: Optional[torch.Tensor],
-    bs1: int,
-    bs2: int,
-    device: str,
-    default: float,
-):
-    """Merge two bias tensors for batch merging.
-
-    Args:
-        lhs: Left-hand side tensor
-        rhs: Right-hand side tensor
-        bs1: Batch size of left-hand side tensor
-        bs2: Batch size of right-hand side tensor
-        device: Device to place the merged tensor on
-        default: Default value for missing tensor elements
-
-    Returns:
-        Merged tensor or None if both inputs are None
-    """
-    if lhs is None and rhs is None:
-        return None
-
-    if lhs is not None and rhs is not None:
-        return torch.cat([lhs, rhs])
-    else:
-        if lhs is not None:
-            shape, dtype = lhs.shape[1:], lhs.dtype
+        if type(self) is SamplingBatchInfo:
+            # The same fields as dataclasses.replace (no __post_init__, no init=False
+            # field), without a keyword __init__ call per forward.
+            new = object.__new__(SamplingBatchInfo)
+            new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
         else:
-            shape, dtype = rhs.shape[1:], rhs.dtype
+            new = dataclasses.replace(self)
+        return new
 
-        if lhs is None:
-            lhs = torch.empty((bs1, *shape), device=device, dtype=dtype).fill_(default)
-        if rhs is None:
-            rhs = torch.empty((bs2, *shape), device=device, dtype=dtype).fill_(default)
-        return torch.cat([lhs, rhs])
+
+def need_truncated_sampling(info: SamplingBatchInfo) -> bool:
+    """Whether some row truncates its distribution with top-k, top-p, or min-p."""
+    return (
+        info.need_top_k_sampling or info.need_top_p_sampling or info.need_min_p_sampling
+    )
+
+
+_FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
+_FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)

@@ -1,42 +1,34 @@
-# mapping on device memory, host memory and memory allocator
+from __future__ import annotations
 
 import logging
-import weakref
 from typing import Optional
 
-import psutil
 import torch
 
+from sglang.kernels.ops.kvcache.cache_move import copy_all_layer_kv_cache_func
+from sglang.kernels.ops.kvcache.hisparse import (
+    load_cache_to_device_buffer_mla,
+)
+from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
+    translate_padded_hisparse_locations,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.allocator import (
-    BaseTokenToKVPoolAllocator,
-    PagedTokenToKVPoolAllocator,
+from sglang.srt.mem_cache.base_hisparse_memory_pool import (
+    HiSparseDevicePoolMappingMixin,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-    DeepSeekV4TokenToKVPool,
-    HiSparseC4DevicePool,
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    MHATokenToKVPool,
+    unwrap_write_loc,
 )
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
-from sglang.srt.utils import is_cuda, is_hip
-from sglang.srt.utils.common import get_num_new_pages
+
+# mapping on device memory, host memory and memory allocator
+
 
 logger = logging.getLogger(__name__)
 
-# sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-if _is_cuda or _is_hip:
-    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
-else:
 
-    def transfer_kv_all_layer_mla(*args, **kwargs):
-        raise RuntimeError(
-            "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
-            "It is not available on this backend."
-        )
-
-
-class HiSparseNSATokenToKVPool(NSATokenToKVPool):
+class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool):
     def __init__(
         self,
         size: int,
@@ -51,7 +43,15 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
         kv_cache_dim: int,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
+        skip_topk_layers: Optional[list[bool]] = None,
         host_to_device_ratio: int = 2,
+        kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
+        use_fp4_indexer: bool = False,
     ):
         super().__init__(
             size=size,
@@ -67,24 +67,31 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
             start_layer=start_layer,
             end_layer=end_layer,
             index_buf_size=size * host_to_device_ratio,
+            index_kpool=index_kpool,
+            index_kpool_compress=index_kpool_compress,
+            tail_extra_slots=tail_extra_slots,
+            max_running_requests=max_running_requests,
+            skip_topk_layers=skip_topk_layers,
+            kv_scale_ue8m0=kv_scale_ue8m0,
+            fp8_cast_on_write=fp8_cast_on_write,
+            use_fp4_indexer=use_fp4_indexer,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
+        self.data_strides = torch.full_like(self.data_ptrs, self.bytes_per_token)
 
-    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
-        self.full_to_hisparse_device_index_mapping = (
-            full_to_hisparse_device_index_mapping
-        )
+    def translate_loc_to_hisparse_device(
+        self, compressed_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Map logical locations to physical slots with the same shape.
 
-    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
-            torch.int32
-        )
-
-    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices]
-
-    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
-        return self._translate_loc_to_hisparse_device(full_indices)
+        CUDA and ROCm use a fused kernel for 1D GPU slot lists, preserving
+        negative padding. Page tables and CPU inputs keep the direct gather.
+        """
+        if compressed_indices.is_cuda and compressed_indices.ndim == 1:
+            return translate_padded_hisparse_locations(
+                self.full_to_hisparse_device_index_mapping, compressed_indices
+            )
+        return super().translate_loc_to_hisparse_device(compressed_indices)
 
     def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
         return full_indices
@@ -92,687 +99,302 @@ class HiSparseNSATokenToKVPool(NSATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        loc, _, _ = unwrap_write_loc(loc_info)
         loc = self.translate_loc_to_hisparse_device(loc)
         super().set_kv_buffer(layer, loc, cache_k, cache_v)
 
     def set_mla_kv_buffer(
         self,
         layer: RadixAttention,
-        loc: torch.Tensor,
+        loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
+        loc, _, _ = unwrap_write_loc(loc_info)
         loc = self.translate_loc_to_hisparse_device(loc)
-        super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+        super().set_mla_kv_buffer(
+            layer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            layer_id_override=layer_id_override,
+        )
 
     def get_mla_kv_buffer(
         self,
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         loc = self.translate_loc_to_hisparse_device(loc)
-        return super().get_mla_kv_buffer(layer, loc, dst_dtype)
-
-    def transfer_values_on_device(self, dst_indices, src_indices):
-        transfer_kv_all_layer_mla(
-            src_layers=self.data_ptrs,
-            dst_layers=self.data_ptrs,
-            src_indices=src_indices,
-            dst_indices=dst_indices,
-            item_size=self.bytes_per_token,
-            num_layers=self.layer_num,
+        return super().get_mla_kv_buffer(
+            layer, loc, dst_dtype, layer_id_override=layer_id_override
         )
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def transfer_values_on_device(
+        self, dst_indices: torch.Tensor, src_indices: torch.Tensor
+    ) -> None:
+        """Copy target MLA KV between physical slots, without remapping IDs."""
+        if src_indices.numel() == 0:
+            return
+        config = {
+            "bytes_per_tile": 128,
+            "byte_tiles": (self.bytes_per_token + 127) // 128,
+            "num_warps": 4,
+        }
+        for start in range(0, src_indices.numel(), 256):
+            src = src_indices[start : start + 256].contiguous()
+            dst = dst_indices[start : start + 256].contiguous()
+            copy_all_layer_kv_cache_func(
+                self.data_ptrs,
+                self.data_strides,
+                dst,
+                src,
+                src.numel(),
+                1 << (src.numel() - 1).bit_length(),
+                config,
+            )
+
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
 
 
-class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+class HiSparseMHAMainPool(HiSparseDevicePoolMappingMixin, MHATokenToKVPool):
+    """MHA KV pool with HiSparse logical-to-device mapping.
+
+    Used by MiniMax M3 HiSparse. The index pools (index_kv_pool, index_k_pool)
+    stay fully resident on the device and do not use this mapping.
+    """
+
     def __init__(
         self,
         size: int,
         page_size: int,
         dtype: torch.dtype,
-        device: torch.device,
-        kvcache: HiSparseNSATokenToKVPool,
-        need_sort: bool,
-        host_to_device_ratio: int = 2,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
     ):
-        self._kvcache = kvcache
-        self._size_full = size * host_to_device_ratio
-        self._size_hisparse = size
-        self.compress_ratio = 1
-        self.dtype = dtype
-        self.device = device
-        self.page_size = page_size
-        self.need_sort = need_sort
-
-        self.logical_attn_allocator = PagedTokenToKVPoolAllocator(
-            self._size_full,
-            self.page_size,
-            self.dtype,
-            self.device,
-            kvcache,
-            need_sort,
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
         )
-        self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
-            self._size_hisparse,
-            self.page_size,
-            self.dtype,
-            self.device,
-            kvcache,
-            need_sort,
-        )
-        self.full_to_hisparse_device_index_mapping = torch.cat(
-            [
-                torch.zeros(
-                    self._size_full + self.page_size,
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                torch.tensor([-1], dtype=torch.int64, device=self.device),
-            ]
-        )
+        self.full_to_hisparse_device_index_mapping: Optional[torch.Tensor] = None
+        self.bytes_per_token_k = head_num * head_dim * self.store_dtype.itemsize
 
-        self.free_pages = None
-        self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
-        self.clear()
-        self._kvcache.register_mapping(
-            weakref.proxy(self.full_to_hisparse_device_index_mapping)
-        )
+    def _translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        assert self.full_to_hisparse_device_index_mapping is not None
+        return super()._translate_loc_to_hisparse_device(indices)
 
-    @property
-    def size_full(self) -> int:
-        return self._size_full
+    def translate_loc_from_full_to_compressed(
+        self, full_indices: torch.Tensor
+    ) -> torch.Tensor:
+        return full_indices
 
-    @property
-    def size(self) -> int:
-        return self._size_full
-
-    def available_size(self) -> int:
-        return min(
-            self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size(),
-        )
-
-    def get_kvcache(self):
-        return self._kvcache
-
-    def alloc(self, need_size: int):
-        raise NotImplementedError(
-            "HiSparse allocator does not support direct token allocation; "
-            "use alloc_extend or alloc_decode instead."
-        )
-
-    def alloc_logical_only(
+    def set_kv_buffer(
         self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
+        layer: RadixAttention,
+        loc,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        *args,
+        **kwargs,
     ):
-        """Allocate only logical indices without hisparse device indices.
+        raw_loc, _, _ = unwrap_write_loc(loc)
+        translated = self.translate_loc_to_hisparse_device(raw_loc)
+        super().set_kv_buffer(layer, translated, cache_k, cache_v, *args, **kwargs)
 
-        Used in the direct-to-host transfer path where KV data is written
-        directly to host memory by the prefill node, skipping GPU staging.
-        """
-        return self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        raise NotImplementedError("HiSparseMHAMainPool does not support get_cpu_copy")
 
-    def alloc_device_buffer(self, allocated_indices, need_size: int):
-        assert need_size % self.page_size == 0
-        # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
-        hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
-        # Filter valid (non-zero) hisparse indices.
-        # In the direct-to-host path, mapping is all zeros since no hisparse
-        # device indices were pre-allocated.
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
-        if len(hisparse_indices) >= need_size:
-            buffer_indices = hisparse_indices[:need_size]
-            self.free_hisparse_indices(hisparse_indices[need_size:])
-        else:
-            # page alignment, claiming the residual space for an incomplete page
-            page_residual_length = len(hisparse_indices) % self.page_size
-            if page_residual_length != 0:
-                hisparse_indices = torch.cat(
-                    [
-                        hisparse_indices,
-                        torch.arange(
-                            hisparse_indices[-1] + 1,
-                            hisparse_indices[-1]
-                            + self.page_size
-                            - page_residual_length
-                            + 1,
-                            device=self.device,
-                        ),
-                    ]
-                )
-            extra_indices = self.hisparse_attn_allocator.alloc(
-                need_size - len(hisparse_indices)
-            )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
-            buffer_indices = torch.cat([hisparse_indices, extra_indices])
-        return buffer_indices
-
-    def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        # disable free group mechanism for device buffer free
-        self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
-
-    def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        return last_locs
-
-    def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
-        return self._kvcache._translate_loc_to_hisparse_device(last_locs)
-
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-        extend_num_tokens: int,
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        assert self.page_size > 1
-
-        num_new_pages = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
-        )
-        if (
-            num_new_pages
-            > self.logical_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-        if (
-            num_new_pages
-            > self.hisparse_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-
-        logical_indices = self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
-        assert logical_indices is not None, "Logical allocation failed in alloc_extend"
-
-        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
-        hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            hisparse_last_loc,
-            len(logical_indices),
-            num_new_pages=num_new_pages,
-        )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
-        self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
-        return logical_indices
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,  # last_loc for full layers
-    ):
-        return self.logical_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
-
-    def free_hisparse(self, free_indices: torch.Tensor):
-        hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
-        self.free_hisparse_indices(hisparse_indices)
-        self.full_to_hisparse_device_index_mapping[free_indices] = 0
-
-    def clear(self):
-        self.logical_attn_allocator.clear()
-        self.hisparse_attn_allocator.clear()
-        # Note: the last item is -1, we don't clear it, see the comment in __init__
-        self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
-        self.is_not_in_free_group = True
-        self.free_group = []
-
-    def free_group_begin(self):
-        return
-
-    def free_group_end(self):
-        return
-
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
-            return
-        if self.is_not_in_free_group:
-            self.logical_attn_allocator.free(free_index)
-            self.free_hisparse(free_index)
-        else:
-            self.free_group.append(free_index)
-        assert (
-            self.logical_attn_allocator.available_size()
-            <= self.logical_attn_allocator.size
-        )
-        assert (
-            self.hisparse_attn_allocator.available_size()
-            <= self.hisparse_attn_allocator.size
-        )
+        raise NotImplementedError("HiSparseMHAMainPool does not support load_cpu_copy")
 
 
-class DeepSeekV4SingleKVPoolHost:
-
+class HiSparseHiCacheBuffer:
+    @torch.inference_mode(False)
     def __init__(
         self,
-        device_pool: HiSparseC4DevicePool,
-        host_size: int,
-        page_size: int,
-        pin_memory: bool = True,
-        device: str = "cpu",
+        *,
+        req_to_token_pool,
+        token_to_kv_pool,
+        top_k: int,
+        buffer_tokens: int,
+        block_size: int,
+        device: str,
     ):
-
-        assert host_size > 0, "Host size must be specified and greater than 0"
-        assert page_size == 1, "Host page size must be 1 for DeepSeekV4SingleKVPoolHost"
-
-        self.device_pool = device_pool
-        self.size = host_size
-        self.page_size = page_size
-        self.num_pages = (self.size + self.page_size - 1) // self.page_size
-        self.pin_memory = pin_memory
+        self.pool = token_to_kv_pool
+        self.req_to_token = req_to_token_pool.req_to_token
+        self.page_size = self.pool.page_size
+        self.top_k = top_k
+        self.buffer_tokens = buffer_tokens
+        self.block_size = block_size
         self.device = device
-
-        self.dtype = device_pool.store_dtype
-        self.layer_num = device_pool.layer_num
-        self.kv_cache_total_dim = device_pool.kv_cache_total_dim
-
-        self.kv_buffer = self.init_kv_buffer()
-        self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        self.data_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.data_refs],
-            dtype=torch.uint64,
-            device=self.device_pool.device,
-        )
-        self.clear()
-
-    def clear(self):
-        self.free_slots = torch.arange(
-            1, self.num_pages + 1, dtype=torch.int64, device="cpu"
-        )
-
-    def init_kv_buffer(self):
-        dims = (self.layer_num, self.size + self.page_size, self.kv_cache_total_dim)
-        requested_bytes = (
-            self.layer_num
-            * (self.size + self.page_size)
-            * self.kv_cache_total_dim
-            * self.dtype.itemsize
-        )
-        host_mem = psutil.virtual_memory()
-        # preserve at least 10GB for other usage
-        ten_gb = 10 * (1024**3)
-        available_bytes = host_mem.available - ten_gb
-        if requested_bytes > available_bytes:
+        self.reserved_buffer_tokens = buffer_tokens
+        buffer_columns = buffer_tokens + 1
+        rows, context = self.req_to_token.shape
+        layers = self.pool.layer_num
+        if buffer_tokens < top_k or buffer_tokens % self.page_size:
             raise ValueError(
-                f"Not enough host memory available. Requesting "
-                f"{requested_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free. Please reduce the "
-                f"size of the hierarchical cache."
+                "HiSparse HiCache backend buffer must be page-aligned and cover top_k"
             )
-        else:
-            logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+        if buffer_tokens > 32767:
+            raise ValueError("HiSparse HiCache backend LRU slots must fit int16")
+        self.index_buffers = [
+            b for b in self.pool.index_k_with_scale_buffer if b.shape[0] > 0
+        ]
+        self.base_pages = self.pool.size // self.page_size + 1
+        self.index_pages = self.index_buffers[0].shape[0]
+        if self.index_pages <= self.base_pages:
+            raise ValueError(
+                "HiSparse HiCache backend requires expanded indexer storage"
             )
+        self.host_locs = torch.full(
+            (rows, context), -1, dtype=torch.int64, device=device
+        )
+        self.protected_lens = torch.zeros(rows, dtype=torch.int64, device=device)
+        self.temp_locs = torch.full(
+            (layers, rows, buffer_columns), -1, dtype=torch.int32, device=device
+        )
+        self.residency = torch.full(
+            (layers, rows, buffer_columns),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._lru_init = torch.arange(buffer_tokens, dtype=torch.int16, device=device)
+        self.lru = self._lru_init.expand(layers, rows, -1).clone()
+        self.result = torch.full((rows, top_k), -1, dtype=torch.int32, device=device)
+        self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
+        # HiCache attaches after decode graphs are captured.
+        self.host_bindings = torch.zeros((layers, 2), dtype=torch.int64, device=device)
+        self.host_pool = None
 
-        host_pool = torch.empty(dims, dtype=self.dtype, device=self.device)
-        assert self.pin_memory, "DeepSeekV4SingleKVPoolHost requires pin_memory=True"
-        if self.pin_memory:
-            torch.cuda.cudart().cudaHostRegister(
-                host_pool.data_ptr(), host_pool.numel() * host_pool.element_size(), 0
+    def attach_host_pool(self, host_pool, *, layer_offset: int = 0) -> None:
+        if self.base_pages + host_pool.size // self.page_size > self.index_pages:
+            raise ValueError(
+                "HiSparse HiCache backend index expansion must cover the HiCache host pool; "
+                "increase expansion_ratio or reduce the host pool size"
             )
-        return host_pool
-
-    def backup_from_device_all_layer(
-        self, device_pool, host_indices, device_indices, io_backend="kernel"
-    ):
-        if io_backend != "kernel":
-            raise ValueError(f"Unsupported IO backend: {io_backend}")
-
-        from sglang.jit_kernel.deepseek_v4 import hisparse_offload_to_host
-
-        if host_indices.device != device_indices.device:
-            host_indices = host_indices.to(device=device_indices.device)
-        host_indices_i64 = (
-            host_indices.to(torch.int64)
-            if host_indices.dtype != torch.int64
-            else host_indices
-        )
-        device_indices_i64 = (
-            device_indices.to(torch.int64)
-            if device_indices.dtype != torch.int64
-            else device_indices
-        )
-        hisparse_offload_to_host(
-            gpu_ptrs=device_pool.data_ptrs,
-            cpu_ptrs=self.data_ptrs,
-            gpu_indices=device_indices_i64,
-            cpu_indices=host_indices_i64,
-        )
-
-    def available_size(self):
-        return len(self.free_slots)
-
-    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
-        if need_size > self.available_size():
-            return None
-
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-
-        return select_index
-
-    def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat([self.free_slots, indices.cpu()])
-        return len(indices)
-
-
-class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
-
-    def __init__(
-        self,
-        logical_attn_allocator: BaseTokenToKVPoolAllocator,
-    ):
-        assert isinstance(logical_attn_allocator._kvcache, DeepSeekV4TokenToKVPool)
-        assert isinstance(
-            logical_attn_allocator._kvcache.c4_kv_pool, HiSparseC4DevicePool
-        )
-        self.compress_ratio = 4
-
-        self.hisparse_kvcache = logical_attn_allocator._kvcache.c4_kv_pool
-        self._size_full = logical_attn_allocator.size_full
-        self._size_hisparse = self.hisparse_kvcache.size
-
-        self.dtype = self.hisparse_kvcache.dtype
-        self.device = self.hisparse_kvcache.device
-        self.page_size = self.hisparse_kvcache.page_size
-
-        self.logical_attn_allocator = logical_attn_allocator
-        self._kvcache = logical_attn_allocator._kvcache
-        self.hisparse_attn_allocator = PagedTokenToKVPoolAllocator(
-            self._size_hisparse,
-            self.page_size,
-            self.dtype,
-            self.device,
-            self.hisparse_kvcache,
-            logical_attn_allocator.need_sort,
-        )
-
-        self.full_to_hisparse_device_index_mapping = torch.cat(
-            [
-                torch.zeros(
-                    self._kvcache.c4_logical_size + self.page_size,
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                torch.tensor([-1], dtype=torch.int64, device=self.device),
-            ]
-        )
-
-        self.need_sort = logical_attn_allocator.need_sort
-        self.free_pages = None
-        self.release_pages = None
-        self.is_not_in_free_group = True
-        self.free_group = []
-        self.clear()
-
-        self.hisparse_kvcache.register_mapping(
-            weakref.proxy(self.full_to_hisparse_device_index_mapping)
-        )
-
-    @property
-    def size_full(self) -> int:
-        return self._size_full
-
-    @property
-    def size(self) -> int:
-        return self.logical_attn_allocator.size
-
-    @property
-    def size_swa(self) -> int:
-        return self.logical_attn_allocator.size_swa
-
-    @property
-    def full_to_swa_index_mapping(self):
-        return self.logical_attn_allocator.full_to_swa_index_mapping
-
-    def debug_print(self) -> str:
-        msg = self.logical_attn_allocator.debug_print()
-        msg += (
-            f"#hisparse-available-size: "
-            f"{self.hisparse_attn_allocator.available_size()}, "
-        )
-        return msg
-
-    def get_kvcache(self):
-        return self._kvcache
-
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
-        return self.logical_attn_allocator.translate_loc_from_full_to_swa(kv_indices)
-
-    def full_available_size(self):
-        return min(
-            self.logical_attn_allocator.full_available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
-
-    def swa_available_size(self):
-        return self.logical_attn_allocator.swa_available_size()
-
-    def free_swa(self, free_indices: torch.Tensor):
-        self.logical_attn_allocator.free_swa(free_indices)
-
-    def available_size(self) -> int:
-        return min(
-            self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size() * self.compress_ratio,
-        )
-
-    def alloc(self, need_size: int):
-        raise NotImplementedError(
-            "DeepSeek V4 HiSparse allocator does not support direct token allocation; "
-            "use alloc_extend or alloc_decode instead."
-        )
-
-    def alloc_device_buffer(self, allocated_indices, need_size: int):
-        assert need_size % self.page_size == 0
-        hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
-        self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
-
-        device_buffer_size = need_size - self.page_size
-        P = len(hisparse_indices)
-        if P > device_buffer_size + 1:
-            newest_src = hisparse_indices[P - 1].clone()
-            old_at_dbs = hisparse_indices[device_buffer_size].clone()
-            hisparse_indices[device_buffer_size] = newest_src
-            hisparse_indices[P - 1] = old_at_dbs
-
-        if len(hisparse_indices) >= need_size:
-            buffer_indices = hisparse_indices[:need_size]
-            surplus = hisparse_indices[need_size:]
-            if surplus.numel() > 0:
-                buffer_pages = torch.unique(buffer_indices // self.page_size)
-                surplus_pages = torch.unique(surplus // self.page_size)
-                pure_surplus = surplus_pages[~torch.isin(surplus_pages, buffer_pages)]
-                if pure_surplus.numel() > 0:
-                    self.hisparse_attn_allocator.is_not_in_free_group = True
-                    self.hisparse_attn_allocator.free(pure_surplus * self.page_size)
-        else:
-            page_residual_length = len(hisparse_indices) % self.page_size
-            if page_residual_length != 0:
-                hisparse_indices = torch.cat(
-                    [
-                        hisparse_indices,
-                        torch.arange(
-                            hisparse_indices[-1] + 1,
-                            hisparse_indices[-1]
-                            + self.page_size
-                            - page_residual_length
-                            + 1,
-                            device=self.device,
-                        ),
-                    ]
+        refs = host_pool.data_refs[layer_offset : layer_offset + self.pool.layer_num]
+        if len(refs) != self.pool.layer_num:
+            raise ValueError("HiSparse HiCache backend host/device layer counts differ")
+        bindings = []
+        for host, device in zip(refs, self.pool.kv_buffer):
+            host_u8, device_u8 = host.view(torch.uint8), device.view(torch.uint8)
+            if not host.is_pinned() or host_u8.stride(0) < device_u8.stride(0):
+                raise ValueError(
+                    "HiSparse HiCache backend needs pinned host rows covering device KV"
                 )
-            extra_indices = self.hisparse_attn_allocator.alloc(
-                need_size - len(hisparse_indices)
-            )
-            assert (
-                extra_indices is not None
-            ), "Hisparse allocation failed in alloc_device_buffer"
-            buffer_indices = torch.cat([hisparse_indices, extra_indices])
-        return buffer_indices
-
-    def free_hisparse_indices(self, buffer_indices: torch.Tensor):
-        self.hisparse_attn_allocator.is_not_in_free_group = True
-        self.hisparse_attn_allocator.free(buffer_indices[buffer_indices > 0])
-
-    def get_last_loc_compressed(self, last_locs: torch.Tensor):
-        return (last_locs - 3) // self.compress_ratio
-
-    def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
-        return self.hisparse_kvcache._translate_loc_to_hisparse_device(
-            self.get_last_loc_compressed(last_locs)
+            bindings.append((host_u8.data_ptr(), host_u8.stride(0)))
+        self.host_bindings.copy_(
+            torch.tensor(bindings, dtype=torch.int64, device=self.device)
         )
+        self.host_pool = host_pool
 
-    def alloc_extend(
-        self,
-        prefix_lens: torch.Tensor,
-        prefix_lens_cpu: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-        extend_num_tokens: int,
-    ):
-        assert self.page_size > 1
-
-        num_new_pages_logical = get_num_new_pages(
-            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
-        )
-        num_new_pages_hisparse = get_num_new_pages(
-            seq_lens=seq_lens_cpu // self.compress_ratio,
-            page_size=self.page_size,
-            prefix_lens=prefix_lens_cpu // self.compress_ratio,
-        )
-        if (
-            num_new_pages_logical
-            > self.logical_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-        if (
-            num_new_pages_hisparse
-            > self.hisparse_attn_allocator.available_size() // self.page_size
-        ):
-            return None
-
-        logical_indices = self.logical_attn_allocator.alloc_extend(
-            prefix_lens,
-            prefix_lens_cpu,
-            seq_lens,
-            seq_lens_cpu,
-            last_loc,
-            extend_num_tokens,
-        )
-        assert logical_indices is not None, "Logical allocation failed in alloc_extend"
-
-        compressed_logical_indices = (
-            self.hisparse_kvcache.translate_loc_from_full_to_compressed(logical_indices)
-        )
-        hisparse_last_loc = self.get_last_loc_hisparse_device(last_loc)
-        hisparse_indices = self.hisparse_attn_allocator.alloc_extend(
-            prefix_lens // self.compress_ratio,
-            prefix_lens_cpu // self.compress_ratio,
-            seq_lens // self.compress_ratio,
-            seq_lens_cpu // self.compress_ratio,
-            hisparse_last_loc,
-            len(compressed_logical_indices),
-        )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
-
-        self.full_to_hisparse_device_index_mapping[compressed_logical_indices] = (
-            hisparse_indices.to(torch.int64)
-        )
-        return logical_indices
-
-    def alloc_decode(
-        self,
-        seq_lens: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
-    ):
-        return self.logical_attn_allocator.alloc_decode(
-            seq_lens, seq_lens_cpu, last_loc
-        )
-
-    def free_compressed(self, compressed_indices: torch.Tensor):
-        hisparse_indices = self.hisparse_kvcache.translate_loc_to_hisparse_device(
-            compressed_indices
-        )
-        hisparse_indices = hisparse_indices[hisparse_indices > 0]
-        self.free_hisparse_indices(hisparse_indices)
-        self.full_to_hisparse_device_index_mapping[compressed_indices] = 0
-
-    def free_hisparse(self, free_indices: torch.Tensor):
-        compressed_indices = (
-            self.hisparse_kvcache.translate_loc_from_full_to_compressed(free_indices)
-        )
-        self.free_compressed(compressed_indices)
-
-    def clear(self):
-        self.logical_attn_allocator.clear()
-        self.hisparse_attn_allocator.clear()
-
-        self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
-        self.is_not_in_free_group = True
-        self.free_group = []
-
-    def free(self, free_index: torch.Tensor):
-        if free_index.numel() == 0:
+    def prepare_forward(self, forward_batch) -> None:
+        if self.num_real_reqs.is_cuda and torch.cuda.is_current_stream_capturing():
             return
+        self.num_real_reqs.fill_(
+            0 if forward_batch.forward_mode.is_idle() else forward_batch.batch_size
+        )
 
-        if self.is_not_in_free_group:
-            self.logical_attn_allocator.free(free_index)
-        else:
-            self.free_group.append(free_index)
-        assert (
-            self.logical_attn_allocator.available_size()
-            <= self.logical_attn_allocator.size
+    def assign_temp_locations(self, req_id: int, temp: torch.Tensor) -> None:
+        self.temp_locs[:, req_id, : self.buffer_tokens] = temp[: self.buffer_tokens].to(
+            torch.int32
         )
-        assert (
-            self.hisparse_attn_allocator.available_size()
-            <= self.hisparse_attn_allocator.size
+
+    def preserve_index(self, device_tokens: torch.Tensor, host_tokens: torch.Tensor):
+        source = device_tokens[:: self.page_size] // self.page_size
+        destination = self.base_pages + host_tokens[:: self.page_size] // self.page_size
+        # Host locks keep these rows alive for every request sharing the prefix.
+        for buffer in self.index_buffers:
+            buffer[destination] = buffer[source]
+
+    def release(self, req_id: int) -> None:
+        self.protected_lens[req_id] = 0
+        self.host_locs[req_id].fill_(-1)
+        self.temp_locs[:, req_id].fill_(-1)
+        self.residency[:, req_id].fill_(-1)
+        self.lru[:, req_id].copy_(self._lru_init)
+
+    def indexer_page_table(
+        self, *, req_pool_indices: torch.Tensor, num_pages: int
+    ) -> torch.Tensor:
+        req_ids = req_pool_indices.long()
+        tokens = self.req_to_token[
+            req_ids, : num_pages * self.page_size : self.page_size
+        ]
+        hosts = self.host_locs[req_ids, : num_pages * self.page_size : self.page_size]
+        host_pages = torch.where(
+            hosts >= 0, self.base_pages + hosts // self.page_size, -1
         )
+        pages = torch.where(tokens < 0, host_pages, tokens // self.page_size)
+        starts = torch.arange(num_pages, device=self.device) * self.page_size
+        protected = starts[None, :] < self.protected_lens[req_ids, None]
+        valid = (pages >= 0) & (pages < self.index_pages)
+        torch._assert_async(
+            (~protected | valid).all(),
+            "HiSparse HiCache backend lost an active index page",
+        )
+        return torch.where(valid, pages, 0).to(torch.int32)
+
+    def swap_in_selected_pages(
+        self, req_pool_indices, compressed_seq_lens, top_k_result, layer_id
+    ):
+        local_layer = layer_id - self.pool.start_layer
+        num_reqs = req_pool_indices.numel()
+        num_queries = top_k_result.shape[0]
+        num_query_steps = num_queries // num_reqs if num_reqs else 1
+        if num_query_steps > 1:
+            raise ValueError(
+                "HiSparse HiCache backend query count exceeds its reserved workspace"
+            )
+        result = self.result[:num_queries]
+        device_buffer = self.pool.kv_buffer[local_layer]
+        load_cache_to_device_buffer_mla(
+            top_k_tokens=top_k_result,
+            device_buffer_tokens=self.residency[local_layer],
+            host_cache_locs=self.host_locs,
+            device_buffer_locs=self.temp_locs[local_layer],
+            host_cache=None,
+            device_buffer=device_buffer,
+            top_k_device_locs=result,
+            req_pool_indices=req_pool_indices,
+            seq_lens=compressed_seq_lens,
+            lru_slots=self.lru[local_layer],
+            item_size_bytes=device_buffer.stride(0) * device_buffer.element_size(),
+            num_top_k=self.top_k,
+            hot_buffer_size=self.buffer_tokens,
+            page_size=1,
+            block_size=self.block_size,
+            num_real_reqs=self.num_real_reqs,
+            device_locs=self.req_to_token,
+            host_binding=self.host_bindings[local_layer],
+        )
+        return result

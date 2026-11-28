@@ -1,0 +1,38 @@
+[
+  {
+    "conversations": [
+      {
+        "from": "human",
+        "value": "Explain prefix caching in one concise sentence."
+      },
+      {
+        "from": "gpt",
+        "value": "Prefix caching reuses KV states shared by prompt prefixes."
+      }
+    ]
+  },
+  {
+    "conversations": [
+      {
+        "from": "human",
+        "value": "What does time to first token measure?"
+      },
+      {
+        "from": "gpt",
+        "value": "It measures latency from request arrival to the first generated token."
+      }
+    ]
+  },
+  {
+    "conversations": [
+      {
+        "from": "human",
+        "value": "Why does decode latency matter for serving?"
+      },
+      {
+        "from": "gpt",
+        "value": "Decode latency determines the cadence at which later tokens reach the user."
+      }
+    ]
+  }
+]

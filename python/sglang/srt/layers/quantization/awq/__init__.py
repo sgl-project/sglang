@@ -6,8 +6,8 @@ from .awq import (
     AWQLinearMethod,
     AWQMarlinConfig,
     AWQMoEMethod,
+    AWQXPUConfig,
 )
-from .awq_triton import awq_dequantize_decomposition, awq_dequantize_triton
 from .schemes import (
     AWQAscendLinearScheme,
     AWQAscendMoEScheme,
@@ -20,6 +20,7 @@ __all__ = [
     "AWQConfig",
     "AWQCPUConfig",
     "AWQMarlinConfig",
+    "AWQXPUConfig",
     "AWQLinearMethod",
     "AWQMoEMethod",
     "AWQLinearScheme",
@@ -27,6 +28,4 @@ __all__ = [
     "AWQAscendLinearScheme",
     "AWQMoEScheme",
     "AWQAscendMoEScheme",
-    "awq_dequantize_triton",
-    "awq_dequantize_decomposition",
 ]

@@ -5,8 +5,7 @@ import requests
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -20,8 +19,6 @@ from sglang.test.test_utils import (
 
 # FlashAttention3 integration tests (requires SM 90+ / H100)
 # Multiple test classes: FA3, FA3+MLA, FA3+SpecDecode variants
-register_cuda_ci(est_time=551, suite="stage-b-test-1-gpu-large")
-
 GSM_DATASET_PATH = None
 
 # In case of some machine lack internet connection, we can set OFFLINE_MODE to True.
@@ -48,7 +45,7 @@ if OFFLINE_MODE:
 # Default server arguments shared across all tests
 DEFAULT_SERVER_ARGS = [
     "--trust-remote-code",
-    "--cuda-graph-max-bs",
+    "--cuda-graph-max-bs-decode",
     "8",
     "--attention-backend",
     "fa3",
@@ -100,14 +97,11 @@ class BaseFlashAttentionTest(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=100,
             num_threads=128,
-            num_shots=4,
-            gsm8k_data_path=GSM_DATASET_PATH,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         # Use the appropriate metric key based on the test class
@@ -147,7 +141,7 @@ class TestFlashAttention3SpeculativeDecode(BaseFlashAttentionTest):
         args = DEFAULT_SERVER_ARGS
         args.extend(
             [
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--speculative-algorithm",
                 "EAGLE3",
@@ -181,7 +175,7 @@ class TestFlashAttention3SpeculativeDecodeTopk(BaseFlashAttentionTest):
         args = DEFAULT_SERVER_ARGS
         args.extend(
             [
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--speculative-algorithm",
                 "EAGLE3",
@@ -213,7 +207,7 @@ class TestFlashAttention3MLASpeculativeDecode(BaseFlashAttentionTest):
         args = DEFAULT_SERVER_ARGS
         args.extend(
             [
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--speculative-algorithm",
                 "EAGLE",
@@ -245,7 +239,7 @@ class TestFlashAttention3MLASpeculativeDecodeTopk(BaseFlashAttentionTest):
         args = DEFAULT_SERVER_ARGS
         args.extend(
             [
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "4",
                 "--speculative-algorithm",
                 "EAGLE",

@@ -1,16 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/utils/quant_utils.py
 
 from __future__ import annotations
 
 import re
 from copy import deepcopy
+from fractions import Fraction
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -48,6 +51,8 @@ def _module_path_match(ignored: str, prefix: str) -> bool:
     # match `mlp.gate_up_proj`. Needed for quant configs (e.g. Qwen3.6-FP8)
     # whose `modules_to_not_convert` lists MoE-template names like `mlp.gate`
     # that collide with fused dense MLP names by plain substring.
+    ignored = ignored.rstrip(".")
+    prefix = prefix.rstrip(".")
     if ignored == prefix:
         return True
     if prefix.startswith(ignored + "."):
@@ -61,6 +66,42 @@ _FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
 }
+
+
+def reads_scoped_fused_shards(quant_config: Optional[QuantizationConfig]) -> bool:
+    # Configs whose fused-layer lookup honors dotted packed_modules_mapping
+    # keys (AWQ's is_layer_skipped_awq, AutoRound's first-match fusion loop).
+    from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+    from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
+    from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+
+    if isinstance(quant_config, MoeWNA16Config):
+        return quant_config.linear_quant_method == "awq"
+    return isinstance(quant_config, (AWQConfig, AWQMarlinConfig, AutoRoundConfig))
+
+
+# GPTQ dynamic negative rules reference checkpoint-side shard names, including
+# split GDN projections (`in_proj_qkv`/`in_proj_z` and `in_proj_b`/`in_proj_a`)
+# that are fused into `in_proj_qkvz` and `in_proj_ba` in SGLang.
+_DYNAMIC_FUSED_SHARDS: Mapping[str, List[str]] = {
+    **_FALLBACK_FUSED_SHARDS,
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
+}
+
+
+def resolve_dynamic_fused_shards(
+    config: Optional[QuantizationConfig], proj_name: str
+) -> Optional[List[str]]:
+    packed_mapping = getattr(config, "packed_modules_mapping", None)
+    if isinstance(packed_mapping, Mapping) and proj_name in packed_mapping:
+        candidate = packed_mapping[proj_name]
+        # Hardware backends (e.g. NPU) may insert nested module-tree dicts
+        # into packed_modules_mapping; only flat shard sequences apply here.
+        if isinstance(candidate, (list, tuple)):
+            return list(candidate)
+    shards = _DYNAMIC_FUSED_SHARDS.get(proj_name)
+    return list(shards) if shards is not None else None
 
 
 def is_layer_skipped(
@@ -215,29 +256,6 @@ def replace_parameter(
         mod.register_parameter(name, torch.nn.Parameter(new, requires_grad=False))
 
 
-def assert_fp8_all_close(a: torch.Tensor, b: torch.Tensor):
-    assert a.shape == b.shape
-    assert a.dtype == b.dtype == torch.float8_e4m3fn
-
-    a_u8 = a.view(torch.uint8)
-    b_u8 = b.view(torch.uint8)
-    diff_u8 = (a_u8.to(torch.int16) - b_u8.to(torch.int16)).abs()
-
-    numel = a.numel()
-
-    count_diff_sign = ((a_u8 >= 0) & (b_u8 < 0)).sum().item()
-    count_tiny_diff = (diff_u8 >= 1).sum().item()
-    count_large_diff = (diff_u8 >= 2).sum().item()
-
-    assert (
-        (count_diff_sign == 0)
-        and (count_tiny_diff / numel < 0.005)
-        and (count_large_diff == 0)
-    ), f"{count_diff_sign=} {count_tiny_diff=} {count_large_diff=} {numel=}"
-
-
-# Match dynamic rules with module name (prefix) and override quantize
-# config if module (prefix) matches a rule
 def override_config(config: QuantizationConfig, prefix: str):
     weight_bits = get_dynamic_override(config, prefix, "bits", config.weight_bits)
     if isinstance(weight_bits, int):
@@ -249,12 +267,17 @@ def override_config(config: QuantizationConfig, prefix: str):
     if isinstance(desc_act, bool):
         config.desc_act = desc_act
 
-    config.pack_factor = 32 // config.weight_bits  # packed into int32
-    if config.get_name() == "gptq_marlin":
+    config.pack_factor = (
+        Fraction(32, config.weight_bits)
+        if config.get_name() == "gptq"
+        else 32 // config.weight_bits
+    )  # packed into int32
+    if config.get_name() in ("gptq", "gptq_marlin"):
         is_sym = get_dynamic_override(config, prefix, "sym", config.is_sym)
         if isinstance(is_sym, bool):
             config.is_sym = is_sym
 
+    if config.get_name() == "gptq_marlin":
         if (config.weight_bits, config.is_sym) not in config.TYPE_MAP:
             raise ValueError(
                 "Unsupported quantization config: "
@@ -270,25 +293,178 @@ def override_config(config: QuantizationConfig, prefix: str):
             )
 
 
+_DYNAMIC_OVERRIDE_MISSING = object()
+_DYNAMIC_DEFAULT_COMPARE_KEYS = ("bits", "group_size", "desc_act", "sym")
+
+
+def _normalize_dynamic_override_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return (bool, value)
+    return value
+
+
+def _get_effective_dynamic_override_value(
+    config: QuantizationConfig,
+    override_dict: Optional[Mapping[str, Any]],
+    key: str,
+) -> Any:
+    if override_dict is not None and key in override_dict:
+        return _normalize_dynamic_override_value(override_dict[key])
+    if key == "bits":
+        return _normalize_dynamic_override_value(
+            getattr(config, "weight_bits", _DYNAMIC_OVERRIDE_MISSING)
+        )
+    if key == "sym":
+        if hasattr(config, "is_sym"):
+            return _normalize_dynamic_override_value(config.is_sym)
+        if hasattr(config, "sym"):
+            return _normalize_dynamic_override_value(config.sym)
+        return _DYNAMIC_OVERRIDE_MISSING
+    return _normalize_dynamic_override_value(
+        getattr(config, key, _DYNAMIC_OVERRIDE_MISSING)
+    )
+
+
+def _get_single_dynamic_override(
+    dynamic: Dict[str, Dict[str, Union[int, bool]]],
+    fused_name: str,
+    target_name: str,
+    key: Optional[str] = None,
+    default_value: Union[int, bool, None] = None,
+) -> Union[Dict, int, bool, None]:
+    for pattern, pattern_dict in dynamic.items():
+        # Negative match: matched modules are excluded from quantized init
+        if pattern.startswith("-:"):
+            regex = pattern.removeprefix("-:")
+            if re.match(regex, target_name) or (
+                fused_name != target_name and re.match(regex, fused_name)
+            ):
+                return False
+        # Positive match: matched modules have quant properties overrides
+        # base quant config
+        else:
+            regex = pattern.removeprefix("+:")
+            if re.match(regex, target_name) or (
+                fused_name != target_name and re.match(regex, fused_name)
+            ):
+                if key is None:
+                    return pattern_dict
+                return pattern_dict.get(key, default_value)
+    return default_value
+
+
 def get_dynamic_override(
     config: QuantizationConfig,
     layer_name: str,
     key: Optional[str] = None,
     default_value: Union[int, bool, None] = None,
 ) -> Union[Dict, int, bool, None]:
-    for pattern, pattern_dict in config.dynamic.items():
-        # Negative match: matched modules are excluded from quantized init
-        if pattern.startswith("-:"):
-            if re.match(pattern.removeprefix("-:"), layer_name):
-                return False
-        # Positive match: matched modules have quant properties overrides
-        # base quant config
-        elif re.match(pattern.removeprefix("+:"), layer_name):
-            if key is None:
-                return pattern_dict
-            else:
-                return pattern_dict.get(key, default_value)
-    return default_value
+    dynamic = getattr(config, "dynamic", None) or {}
+    proj_name = layer_name.split(".")[-1]
+    fused_shards = resolve_dynamic_fused_shards(config, proj_name)
+    if not fused_shards:
+        return _get_single_dynamic_override(
+            dynamic,
+            fused_name=layer_name,
+            target_name=layer_name,
+            key=key,
+            default_value=default_value,
+        )
+
+    shard_names = [layer_name.removesuffix(proj_name) + shard for shard in fused_shards]
+    shard_results = [
+        _get_single_dynamic_override(
+            dynamic,
+            fused_name=layer_name,
+            target_name=shard_name,
+            key=None,
+            default_value=None,
+        )
+        for shard_name in shard_names
+    ]
+    shard_skipped = [result is False for result in shard_results]
+    if all(shard_skipped):
+        return False
+    if any(shard_skipped):
+        raise ValueError(
+            f"Detected some but not all shards of {layer_name} "
+            "are excluded in dynamic quantization config. All shards "
+            "of fused layers must share the same precision."
+        )
+    if all(result is None for result in shard_results):
+        return default_value
+
+    if any(
+        result is not None and not isinstance(result, Mapping)
+        for result in shard_results
+    ):
+        if any(result != shard_results[0] for result in shard_results[1:]):
+            raise ValueError(
+                f"Detected mixed dynamic quantization overrides across shards of {layer_name}."
+            )
+        agreed = shard_results[0]
+        if key is None:
+            return agreed
+        return default_value if agreed is None else agreed
+
+    compare_keys = list(_DYNAMIC_DEFAULT_COMPARE_KEYS)
+    extra_keys = sorted(
+        {
+            k
+            for result in shard_results
+            if isinstance(result, Mapping)
+            for k in result
+            if k not in _DYNAMIC_DEFAULT_COMPARE_KEYS
+        }
+    )
+    compare_keys.extend(extra_keys)
+
+    normalized_shards = [
+        tuple(
+            _get_effective_dynamic_override_value(config, result, cmp_key)
+            for cmp_key in compare_keys
+        )
+        for result in shard_results
+    ]
+    if any(norm != normalized_shards[0] for norm in normalized_shards[1:]):
+        raise ValueError(
+            f"Detected mixed dynamic quantization overrides across shards of {layer_name}."
+        )
+
+    merged_overrides: Dict[str, Any] = {}
+    for result in shard_results:
+        if isinstance(result, Mapping):
+            merged_overrides.update(result)
+    if key is None:
+        return merged_overrides
+    return merged_overrides.get(key, default_value)
+
+
+_QUANTIZED_PARAM_SUFFIXES = ("qweight", "qzeros", "scales", "g_idx")
+
+
+def validate_quant_param_compatibility(
+    name: str,
+    params_dict: Mapping[str, torch.nn.Parameter],
+) -> None:
+    """Reject checkpoint weights whose precision conflicts with model params."""
+    if name in params_dict or "." not in name:
+        return
+    module_prefix, suffix = name.rsplit(".", 1)
+    if suffix in _QUANTIZED_PARAM_SUFFIXES:
+        dense_param = f"{module_prefix}.weight"
+        if dense_param in params_dict:
+            raise ValueError(
+                f"Incompatible quantized checkpoint shard '{name}' cannot be "
+                f"loaded into unquantized dense layer '{module_prefix}'."
+            )
+    elif suffix == "weight":
+        quant_param = f"{module_prefix}.qweight"
+        if quant_param in params_dict:
+            raise ValueError(
+                f"Incompatible dense checkpoint shard '{name}' cannot be "
+                f"loaded into quantized layer '{module_prefix}'."
+            )
 
 
 def get_linear_quant_method(
@@ -449,9 +625,9 @@ def quantize_weights(
     zero_points: bool = False,
     ref_zero_points_after_scales: bool = False,
 ):
-    assert (
-        quant_type.is_integer()
-    ), "Floating point quantization may work but has not been tested"
+    assert quant_type.is_integer(), (
+        "Floating point quantization may work but has not been tested"
+    )
     assert not zero_points or group_size is not None, (
         "to have group zero points, group_size must be provided "
         "(-1 group_size is channelwise)"
@@ -551,12 +727,12 @@ def gptq_quantize_weights(
     size_k, _ = w.shape
 
     assert w.is_floating_point(), "w must be float"
-    assert (
-        quant_type in SUPPORTED_GPTQ_QUANT_TYPES
-    ), f"Unsupported gptq type = {quant_type}"
-    assert group_size in SUPPORTED_GROUP_SIZES + [
-        size_k
-    ], f"Unsupported groupsize = {group_size}"
+    assert quant_type in SUPPORTED_GPTQ_QUANT_TYPES, (
+        f"Unsupported gptq type = {quant_type}"
+    )
+    assert group_size in SUPPORTED_GROUP_SIZES + [size_k], (
+        f"Unsupported groupsize = {group_size}"
+    )
 
     w_ref, w_q, w_s, _ = quantize_weights(w, quant_type, group_size)
 
@@ -564,10 +740,10 @@ def gptq_quantize_weights(
     g_idx = torch.empty(0, dtype=torch.int, device=w.device)
     rand_perm = torch.empty(0, dtype=torch.int, device=w.device)
     if act_order:
-        assert (
-            group_size < size_k
-        ), "For act_order, groupsize = {} must be less than size_k = {}".format(
-            group_size, size_k
+        assert group_size < size_k, (
+            "For act_order, groupsize = {} must be less than size_k = {}".format(
+                group_size, size_k
+            )
         )
 
         w_ref, w_q, g_idx, rand_perm = permute_rows(w_q, w_ref, group_size, test_perm)
@@ -592,9 +768,9 @@ def sort_weights(q_w: torch.Tensor, g_idx: torch.Tensor):
 
 def swizzle_blockscale(scale: torch.Tensor):
     """
-    Swizzle the scale tensor into a blockwise interleaved format for NVFP4 quantization.
+    Swizzle NVFP4 (E4M3) or MXFP8 (UE8M0 as uint8) block scales into CUTLASS 128x4 atoms.
     """
-    assert scale.dtype == torch.float8_e4m3fn
+    assert scale.dtype in (torch.float8_e4m3fn, torch.uint8)
     # Pad and blockwise interleave weight_scale
     scale_ndim = scale.ndim
     if scale.ndim == 2:
@@ -604,14 +780,17 @@ def swizzle_blockscale(scale: torch.Tensor):
     round_up_multiple = lambda x, m: (x + m - 1) // m * m
     M_padded = round_up_multiple(M, 128)
     K_padded = round_up_multiple(K, 4)
-    padded_scale = torch.zeros((B, M_padded, K_padded), dtype=scale.dtype)
+    # Online weight updates do not necessarily run under a CUDA device context.
+    padded_scale = torch.zeros(
+        (B, M_padded, K_padded), dtype=scale.dtype, device=scale.device
+    )
     padded_scale[:B, :M, :K] = scale
     batches, rows, cols = padded_scale.shape
     assert rows % 128 == 0
     assert cols % 4 == 0
     padded_scale = padded_scale.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
     swizzled_scale = padded_scale.permute((0, 1, 4, 3, 2, 5))
-    swizzled_scale = swizzled_scale.contiguous().cuda()
+    swizzled_scale = swizzled_scale.contiguous().to(scale.device)
     return (
         swizzled_scale.reshape(M_padded, K_padded)
         if scale_ndim == 2
@@ -670,23 +849,40 @@ def prepare_static_weights_for_trtllm_fp4_moe(
     )  # packed fp4
     gemm1_scales_linear_fp4 = gemm1_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(
-        num_experts, gemm1_rows, hidden_size // 16
-    )  # fp8 scaling factors
+    ).reshape(num_experts, gemm1_rows, hidden_size // 16)  # fp8 scaling factors
 
     gemm2_weights_fp4 = gemm2_weights.view(torch.float8_e4m3fn).reshape(
         num_experts, hidden_size, intermediate_size // 2
     )  # packed fp4
     gemm2_scales_linear_fp4 = gemm2_scales_linear_fp4_bytes.view(
         torch.float8_e4m3fn
-    ).reshape(
-        num_experts, hidden_size, intermediate_size // 16
-    )  # fp8 scaling factors
+    ).reshape(num_experts, hidden_size, intermediate_size // 16)  # fp8 scaling factors
 
-    gemm1_weights_fp4_shuffled = []
-    gemm1_scales_fp4_shuffled = []
-    gemm2_weights_fp4_shuffled = []
-    gemm2_scales_fp4_shuffled = []
+    # Pre-allocate output tensors so per-expert shuffles write directly into
+    # contiguous slices instead of building lists + torch.stack().  This avoids
+    # O(num_experts) transient GPU allocations whose freed blocks fragment the
+    # CUDA address space
+    gemm1_weights_fp4_shuffled = torch.empty_like(gemm1_weights_fp4.view(torch.uint8))
+    gemm2_weights_fp4_shuffled = torch.empty_like(gemm2_weights_fp4.view(torch.uint8))
+
+    # Pre-allocate scale output tensors and a reusable scratch buffer for
+    # the permuted input to nvfp4_block_scale_interleave.
+    # nvfp4_block_scale_interleave flattens its input to 1-D, so the
+    # per-expert output size equals the per-expert input numel.
+    def _alloc_scale_buffers(scales):
+        per_expert_shape = scales[0].view(torch.uint8).shape
+        per_expert_numel = scales[0].numel()
+        output = scales.new_empty((num_experts, per_expert_numel), dtype=torch.uint8)
+        scratch = torch.empty(per_expert_shape, dtype=torch.uint8, device=scales.device)
+        return output, scratch
+
+    gemm1_scales_fp4_shuffled, g1s_scratch = _alloc_scale_buffers(
+        gemm1_scales_linear_fp4
+    )
+    gemm2_scales_fp4_shuffled, g2s_scratch = _alloc_scale_buffers(
+        gemm2_scales_linear_fp4
+    )
+
     for i in range(num_experts):
         permute_indices = _maybe_get_cached_w3_w1_permute_indices(
             _cache_permute_indices,
@@ -694,11 +890,9 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             epilogue_tile_m,
             is_gated_act_gemm=is_gated,
         )
-        gemm1_weights_fp4_shuffled.append(
-            gemm1_weights_fp4[i]
-            .view(torch.uint8)[permute_indices.to(gemm1_weights_fp4.device)]
-            .contiguous()
-        )
+        gemm1_weights_fp4_shuffled[i] = gemm1_weights_fp4[i].view(torch.uint8)[
+            permute_indices.to(gemm1_weights_fp4.device)
+        ]
 
         permute_sf_indices = _maybe_get_cached_w3_w1_permute_indices(
             _cache_permute_indices,
@@ -707,26 +901,23 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             num_elts_per_sf=16,
             is_gated_act_gemm=is_gated,
         )
-        gemm1_scales_fp4_shuffled.append(
-            nvfp4_block_scale_interleave(
-                gemm1_scales_linear_fp4[i]
-                .view(torch.uint8)[
-                    permute_sf_indices.to(gemm1_scales_linear_fp4.device)
-                ]
-                .contiguous()
-            )
+        # Reuse scratch buffer for the permuted scale input
+        torch.index_select(
+            gemm1_scales_linear_fp4[i].view(torch.uint8),
+            0,
+            permute_sf_indices.to(gemm1_scales_linear_fp4.device),
+            out=g1s_scratch,
         )
+        gemm1_scales_fp4_shuffled[i] = nvfp4_block_scale_interleave(g1s_scratch)
 
         permute_indices = get_w2_permute_indices_with_cache(
             _cache_permute_indices,
             gemm2_weights_fp4[i].view(torch.uint8),
             epilogue_tile_m,
         )
-        gemm2_weights_fp4_shuffled.append(
-            gemm2_weights_fp4[i]
-            .view(torch.uint8)[permute_indices.to(gemm2_weights_fp4.device)]
-            .contiguous()
-        )
+        gemm2_weights_fp4_shuffled[i] = gemm2_weights_fp4[i].view(torch.uint8)[
+            permute_indices.to(gemm2_weights_fp4.device)
+        ]
 
         permute_sf_indices = get_w2_permute_indices_with_cache(
             _cache_permute_indices,
@@ -734,30 +925,24 @@ def prepare_static_weights_for_trtllm_fp4_moe(
             epilogue_tile_m,
             num_elts_per_sf=16,
         )
-        gemm2_scales_fp4_shuffled.append(
-            nvfp4_block_scale_interleave(
-                gemm2_scales_linear_fp4[i]
-                .view(torch.uint8)[
-                    permute_sf_indices.to(gemm2_scales_linear_fp4.device)
-                ]
-                .contiguous()
-            )
+        torch.index_select(
+            gemm2_scales_linear_fp4[i].view(torch.uint8),
+            0,
+            permute_sf_indices.to(gemm2_scales_linear_fp4.device),
+            out=g2s_scratch,
         )
+        gemm2_scales_fp4_shuffled[i] = nvfp4_block_scale_interleave(g2s_scratch)
 
-    # Stack weights for all experts
-    gemm1_weights_fp4_shuffled = torch.stack(gemm1_weights_fp4_shuffled)
-    gemm1_scales_fp4_shuffled = (
-        torch.stack(gemm1_scales_fp4_shuffled)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_experts, gemm1_rows, hidden_size // 16)
-    )
+    del g1s_scratch, g2s_scratch
 
-    gemm2_weights_fp4_shuffled = torch.stack(gemm2_weights_fp4_shuffled)
-    gemm2_scales_fp4_shuffled = (
-        torch.stack(gemm2_scales_fp4_shuffled)
-        .view(torch.float8_e4m3fn)
-        .reshape(num_experts, hidden_size, intermediate_size // 16)
-    )
+    # Weight outputs stay as uint8 (FP4 packed) — the TRTLLM kernel expects this.
+    gemm1_scales_fp4_shuffled = gemm1_scales_fp4_shuffled.view(
+        torch.float8_e4m3fn
+    ).reshape(num_experts, gemm1_rows, hidden_size // 16)
+
+    gemm2_scales_fp4_shuffled = gemm2_scales_fp4_shuffled.view(
+        torch.float8_e4m3fn
+    ).reshape(num_experts, hidden_size, intermediate_size // 16)
     return (
         gemm1_weights_fp4_shuffled,
         gemm1_scales_fp4_shuffled,

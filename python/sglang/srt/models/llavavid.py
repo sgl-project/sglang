@@ -13,7 +13,10 @@
 # ==============================================================================
 """Inference-only LLaVa video model compatible with HuggingFace weights."""
 
-from typing import Iterable, List, Optional, Tuple
+from __future__ import annotations
+
+from array import array
+from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -22,11 +25,12 @@ from transformers import CLIPVisionModel, LlavaConfig
 from transformers.models.llava.modeling_llava import LlavaMultiModalProjector
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import MultimodalInputs, flatten_nested_list
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.managers.req_types import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import flatten_nested_list
 
 
 class LlavaVidForCausalLM(nn.Module):
@@ -57,8 +61,10 @@ class LlavaVidForCausalLM(nn.Module):
                 torch.empty(config.text_config.hidden_size, dtype=torch.float16)
             )
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
-        pad_values = [item.pad_value for item in image_inputs.mm_items]
+    def pad_input_ids(
+        self, input_ids: array[int], image_inputs: MultimodalInputs
+    ) -> array[int]:
+        pad_values = array("q", (item.pad_value for item in image_inputs.mm_items))
         new_image_feature_len = self.image_feature_len
 
         pad_ids = pad_values * (
@@ -82,7 +88,7 @@ class LlavaVidForCausalLM(nn.Module):
         if self.vision_feature_select_strategy in ["default", "patch"]:
             selected_image_feature = selected_image_feature[:, 1:]
         elif self.vision_feature_select_strategy == "full":
-            selected_image_feature = selected_image_feature
+            pass
         else:
             raise ValueError(
                 f"Unexpected select feature strategy: {self.config.vision_feature_select_strategy}"
@@ -152,18 +158,12 @@ class LlavaVidForCausalLM(nn.Module):
 
                 if pixel_values[0].ndim == 4:
                     # llava-hd: BS, num_patch, C=3, H=336, W=336, num_patch obtained from process_images
-                    np.concatenate(pixel_values, axis=0)
                     # ndim=4
                     concat_images = torch.tensor(
                         np.concatenate(pixel_values, axis=0),
                         device=self.vision_tower.device,
                     )
-                    # image_features = self.encode_images(concat_images)
-                    # split_sizes = [image.shape[0] for image in pixel_values]
-                    # image_features = torch.split(image_features, split_sizes, dim=0)
-                    image_features = self.encode_images(
-                        concat_images
-                    )  # , prompts)#, image_counts, long_video=long_video)
+                    image_features = self.encode_images(concat_images)
                     split_sizes = [image.shape[0] for image in pixel_values]
                     image_features = torch.split(image_features, split_sizes, dim=0)
 
@@ -223,9 +223,10 @@ class LlavaVidForCausalLM(nn.Module):
         # huggingface_name or path_of_clip_relative_to_llava_model_dir
         # We put the initialization here instead of __init__ to allow it being reused by other subclasses.
         vision_path = self.config.mm_vision_tower
+        device = next(self.language_model.parameters()).device
         self.vision_tower = CLIPVisionModel.from_pretrained(
             vision_path, torch_dtype=torch.float16
-        ).cuda()
+        ).to(device)
         self.vision_tower.eval()
 
         self.vision_feature_layer = self.config.mm_vision_select_layer

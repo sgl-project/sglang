@@ -5,8 +5,7 @@ from types import SimpleNamespace
 import requests
 
 from sglang.srt.utils import get_device_sm, kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -15,10 +14,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+
 # Local attention with FA3 (requires SM 90+ / H100, tp=4)
-register_cuda_ci(est_time=217, suite="stage-c-test-4-gpu-h100")
-
-
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
 class TestFlashAttention3LocalAttn(CustomTestCase):
     model = DEFAULT_MODEL_NAME_FOR_TEST_LOCAL_ATTENTION
@@ -28,7 +25,7 @@ class TestFlashAttention3LocalAttn(CustomTestCase):
     @classmethod
     def get_server_args(cls):
         return [
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "2",
             "--attention-backend",
             "fa3",
@@ -59,13 +56,11 @@ class TestFlashAttention3LocalAttn(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=100,
             num_threads=128,
-            num_shots=4,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
 
         # Use the appropriate metric key based on the test class

@@ -6,6 +6,14 @@ import pkgutil
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    serving_spec_for,
+    strategy_for,
+)
+from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
+    TokenSpaceSGLangProcessor,
+)
+from sglang.srt.runtime_context import get_mm, get_model
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -41,15 +49,10 @@ def import_processors(package_name: str, overwrite: bool = False):
                     PROCESSOR_MAPPING[arch] = cls
 
 
-def get_mm_processor(
-    hf_config,
-    server_args: ServerArgs,
-    processor,
-    transport_mode,
-    model_config=None,
-    **kwargs,
-) -> BaseMultimodalProcessor:
-    model_impl = str(getattr(server_args, "model_impl", "auto")).lower()
+def get_mm_processor_cls(hf_config, model_config=None):
+    """The class :func:`get_mm_processor` would instantiate, or ``None`` when the
+    architecture has no registered processor."""
+    model_impl = str(get_model().model_impl).lower()
     uses_transformers_backend = model_impl == "transformers"
     if model_impl == "auto" and model_config is not None:
         from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -58,26 +61,44 @@ def get_mm_processor(
             get_resolved_model_impl(model_config) == ModelImpl.TRANSFORMERS
         )
 
+    # The transformers backend keeps the legacy processors.
+    if get_mm().enable_token_space_processor and not uses_transformers_backend:
+        strategy_class = strategy_for(hf_config)
+        if strategy_class is not None:
+            return TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+                strategy_class, serving_spec_for(hf_config)
+            )
+
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
         if model_cls.__name__ not in hf_config.architectures:
             continue
         if not uses_transformers_backend or getattr(
             processor_cls, "supports_transformers_backend", False
         ):
-            return processor_cls(
-                hf_config, server_args, processor, transport_mode, **kwargs
-            )
+            return processor_cls
 
     if uses_transformers_backend:
         from sglang.srt.multimodal.processors.transformers_auto import (
             TransformersAutoMultimodalProcessor,
         )
 
-        return TransformersAutoMultimodalProcessor(
-            hf_config, server_args, processor, transport_mode, **kwargs
-        )
+        return TransformersAutoMultimodalProcessor
 
-    raise ValueError(
-        f"No processor registered for architecture: {hf_config.architectures}.\n"
-        f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
-    )
+    return None
+
+
+def get_mm_processor(
+    hf_config,
+    server_args: ServerArgs,
+    processor,
+    transport_mode,
+    model_config=None,
+    **kwargs,
+) -> BaseMultimodalProcessor:
+    processor_cls = get_mm_processor_cls(hf_config, model_config)
+    if processor_cls is None:
+        raise ValueError(
+            f"No processor registered for architecture: {hf_config.architectures}.\n"
+            f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
+        )
+    return processor_cls(hf_config, server_args, processor, transport_mode, **kwargs)

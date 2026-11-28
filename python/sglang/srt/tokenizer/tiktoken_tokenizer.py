@@ -2,15 +2,6 @@ import functools
 import json
 from typing import AbstractSet, Collection, List, Literal, Union
 
-
-class TiktokenProcessor:
-    def __init__(self, name: str):
-        self.tokenizer = TiktokenTokenizer(name)
-
-    def image_processor(self, image):
-        return {"pixel_values": [image]}
-
-
 RESERVED_TOKEN_TEXTS = [f"<|reserved_{i}|>" for i in range(3, 128)]
 CONTROL_TOKEN_TEXTS = [f"<|control{i}|>" for i in range(1, 705)]
 
@@ -19,7 +10,6 @@ PAD = "<|pad|>"
 EOS = "<|eos|>"
 SEP = "<|separator|>"
 
-DEFAULT_SPECIAL_TOKENS = [PAD, SEP, EOS]
 DEFAULT_CONTROL_TOKENS = {"pad": PAD, "sep": EOS, "eos": SEP}
 
 # default + separate each single digit
@@ -67,18 +57,14 @@ class TiktokenTokenizer:
 
         # Copy from train/xlm/tokenizers/tiktoken_wrapper.py::Encoding::__init__
         default_allowed_special = None
-        control_tokens = DEFAULT_CONTROL_TOKENS
         tokenizer = tiktoken.Encoding(**kwargs)
         tokenizer._default_allowed_special = default_allowed_special or set()
-        tokenizer._control_tokens = control_tokens
 
         def encode_patched(
             self,
             text: str,
             *,
-            allowed_special: Union[
-                Literal["all"], AbstractSet[str]
-            ] = set(),  # noqa: B006
+            allowed_special: Union[Literal["all"], AbstractSet[str]] = set(),  # noqa: B006
             disallowed_special: Union[Literal["all"], Collection[str]] = "all",
         ) -> List[int]:
             if isinstance(allowed_special, set):
@@ -105,13 +91,32 @@ class TiktokenTokenizer:
         self.vocab_size = tokenizer.n_vocab
         self.chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}{{ 'Human: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'system' %}{{ 'System: ' + message['content'].strip() + '<|separator|>\n\n' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: '  + message['content'] + '<|separator|>\n\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
         self.chat_template_jinja = Template(self.chat_template)
-        self.additional_stop_token_ids = None
+        # Turn-final markers some checkpoints ship without EOS metadata -- e.g.
+        # Inkling's <|content_model_end_sampling|>, whose bundled tokenizer
+        # config leaves eos_token unset. get_tokenizer()'s tiktoken load path
+        # returns before attach_additional_stop_token_ids() runs, so register
+        # them here from the same shared list (resolved against the special
+        # tokens, as with EOS above); otherwise generation runs to max_tokens.
+        from sglang.srt.hf_transformers.common import (
+            _ADDITIONAL_STOP_TOKEN_TEXTS,
+        )
+
+        stop_ids = {
+            tokenizer._special_tokens[text]
+            for text in _ADDITIONAL_STOP_TOKEN_TEXTS
+            if text in tokenizer._special_tokens
+        }
+        self.additional_stop_token_ids = stop_ids or None
 
     def encode(self, x, add_special_tokens=False):
         return self.tokenizer.encode(x)
 
     def decode(self, x, *args, **kwargs):
         return self.tokenizer.decode(x)
+
+    def num_special_tokens_to_add(self, *args, **kwargs) -> int:
+        # tiktoken's encode adds no special tokens (add_special_tokens is ignored).
+        return 0
 
     def batch_decode(
         self, batch, skip_special_tokens=True, spaces_between_special_tokens=False

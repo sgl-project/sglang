@@ -31,7 +31,7 @@ __Note__: The permissions to trigger CI tests are defined separately according t
 ## Pull Request Merge Process
 1. The author submits a pull request (PR) and fills out the PR checklist.
 2. A bot assigns this PR to a Merge Oncall and @-mentions them. At the same time, GitHub will automatically request reviews from Codeowners.
-3. Someone tags the PR with a `run-ci` label ([help](https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests)). Then the author can trigger CI by pushing new commits.
+3. A maintainer (write access, or `can_tag_run_ci_label` in `CI_PERMISSIONS.json`) comments `/tag-and-rerun-ci` ([help](https://docs.sglang.io/developer_guide/contribution_guide.html#how-to-trigger-ci-tests)), which adds the `run-ci` label and approves the PR's current commit. If the PR's author can approve (write access, or `can_tag_run_ci_label`), `run-ci` alone is enough: every push runs CI. Otherwise, after every push a maintainer reviews the new changes and approves the new commit with `/approve-ci`; adding `run-ci` in the UI approves nothing. A command approves only a head pushed before the comment was posted; an edited comment approves nothing.
 4. The Merge Oncall coordinates the review (e.g., asking people to review) and approves the PR; the Codeowners also approve the PR. If the assigned Merge Oncall is not responsive, the author can ping other related Merge Oncalls and Reviewers in the list below.
 5. The code can now be merged:
    - **Ideal case:** For each modified file, one Codeowner has approved the PR. The PR has also passed the required CI tests. Then, anyone with write permission can merge the PR.
@@ -80,7 +80,7 @@ related files
 [@BBuf](https://github.com/BBuf) (BBuf)
 
 related files
-- python/sglang/jit_kernel
+- python/sglang/kernels
 - sgl-kernel
 
 ### Speculative decoding
@@ -115,8 +115,6 @@ related files
 [@slin1237](https://github.com/slin1237) (Simo Lin)
 
 related files
-- sgl-model-gateway
-- python/sglang/srt/grpc
 - python/sglang/srt/entrypoints
 
 ### Other Notes
@@ -142,6 +140,17 @@ This section lists the oncalls for each hardware platform. The format is @github
 [@iforgetmyname](https://github.com/iforgetmyname) (Even Zhou)
 
 This list is based on the current situation. If you or someone you know would like to donate machines for CI, they can serve as the CI oncalls for their machines. Please ping [Lianmin Zheng](https://github.com/merrymercy) and [Ying Sheng](https://github.com/Ying1123) in the Slack channel. They will start a nomination and internal review process.
+
+## CI Control Labels
+
+`bypass-fail-fast`, `parallel-stages`, `max-concurrency` and `highest-priority`
+each relax one of the limits that keep a single PR from monopolizing the
+self-hosted GPU runners; `highest-priority` relaxes all of them at once. The
+[contribution guide](https://docs.sglang.io/developer_guide/contribution_guide.html#ci-control-labels)
+describes what each one does.
+
+Applying one spends other PRs' runner capacity. `parallel-stages` is the
+expensive one: a PR that cannot pass now runs its whole matrix.
 
 ## CI Maintenance Mode
 When the CI is unhealthy (e.g., the scheduled pr-test on `main` is broken for consecutive runs), the project enters **CI Maintenance Mode** by opening [issue #21065](https://github.com/sgl-project/sglang/issues/21065). While active:

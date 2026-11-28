@@ -23,7 +23,6 @@ def sgemm_lora_a_embedding_graph_fwd(
     )
 
     for lora_idx in range(num_loras):
-
         batch_token_mask = weight_indices[:total_seq_len] == lora_idx
 
         x_seq = torch.where(batch_token_mask, inputs, 0)
@@ -59,13 +58,12 @@ def sgemm_lora_a_graph_fwd(
     )
 
     for lora_idx in range(num_loras):
-
         batch_token_mask = (weight_indices[:total_seq_len] == lora_idx).unsqueeze(1)
 
         x_seq = torch.where(batch_token_mask, inputs, 0)
         w_seq = weights[lora_idx]
 
-        output.add_(scaling_tensor[lora_idx] * torch.mm(x_seq, w_seq.t(), 0))
+        output.add_(scaling_tensor[lora_idx] * torch.mm(x_seq, w_seq.t()))
 
     return output
 
@@ -98,7 +96,6 @@ def sgemm_lora_b_graph_fwd(
         )
 
     for lora_idx in range(num_loras):
-
         batch_token_mask = (weight_indices[:total_seq_len] == lora_idx).unsqueeze(1)
         inputs_masked = torch.where(batch_token_mask, inputs, 0)
 

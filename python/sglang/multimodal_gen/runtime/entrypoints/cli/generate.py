@@ -17,16 +17,17 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.utils import (
     RaiseNotImplementedAction,
+    add_resolved_pipeline_config_cli_args,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import GenerationResult
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     MemorySnapshot,
     PerformanceLogger,
     RequestMetrics,
 )
-from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 logger = init_logger(__name__)
 
@@ -83,6 +84,7 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
 
     parser = ServerArgs.add_cli_args(parser)
     parser = SamplingParams.add_cli_args(parser)
+    add_resolved_pipeline_config_cli_args(parser)
 
     parser.add_argument(
         "--text-encoder-configs",
@@ -137,6 +139,7 @@ def maybe_dump_performance(
             reserved_mb=snapshot_dict.get("reserved_mb", 0.0),
             peak_allocated_mb=snapshot_dict.get("peak_allocated_mb", 0.0),
             peak_reserved_mb=snapshot_dict.get("peak_reserved_mb", 0.0),
+            peak_host_anon_mb=snapshot_dict.get("peak_host_anon_mb", 0.0),
         )
         metrics.memory_snapshots[checkpoint_name] = snapshot
 
@@ -153,19 +156,31 @@ def maybe_dump_performance(
 
 def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the generate command."""
-    args.request_id = "mocked_fake_id_for_offline_generate"
-
-    server_args = ServerArgs.from_cli_args(args, unknown_args)
+    config_file = getattr(args, "config", None)
+    config_args = {}
+    if config_file:
+        config_args = ServerArgs.load_config_file(config_file) or {}
+    # A request for the diffusion decoder loads it, whether it comes from the
+    # CLI or the config file and whatever load_diffusion_decoder is set to.
+    # ServerArgs plans memory placement when it is built, so it has to know by
+    # then.
+    forced_args = None
+    if getattr(args, "use_diffusion_decoder", False) or config_args.get(
+        "use_diffusion_decoder"
+    ):
+        forced_args = {"load_diffusion_decoder": True}
+    server_args = ServerArgs.from_cli_args(args, unknown_args, forced_args=forced_args)
     sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
 
     sampling_params_kwargs = {}
-    config_file = getattr(args, "config", None)
     # respect config file by overriding args with args parsed from it
     if config_file:
-        config_args = ServerArgs.load_config_file(config_file) or {}
-        sampling_param_fields = {
-            field.name for field in dataclasses.fields(sampling_params_cls)
-        }
+        if hasattr(sampling_params_cls, "supported_override_fields"):
+            sampling_param_fields = sampling_params_cls.supported_override_fields()
+        else:
+            sampling_param_fields = {
+                field.name for field in dataclasses.fields(sampling_params_cls)
+            }
         sampling_params_kwargs.update(
             {
                 key: value
@@ -177,6 +192,8 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     sampling_params_kwargs.update(sampling_params_cls.get_cli_args(args))
     _apply_output_file_path_override(args, sampling_params_kwargs)
     sampling_params_kwargs["request_id"] = generate_request_id()
+    if sampling_params_kwargs.get("use_diffusion_decoder", False):
+        server_args.load_diffusion_decoder = True
 
     # Handle diffusers-specific kwargs passed via CLI
     if hasattr(args, "diffusers_kwargs") and args.diffusers_kwargs:
@@ -197,11 +214,15 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     generator = DiffGenerator.from_pretrained(
         model_path=server_args.model_path, server_args=server_args, local_mode=True
     )
+    try:
+        results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
+        if results is None:
+            raise RuntimeError("Generation produced no results. See the errors above.")
 
-    results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
-
-    prompt = sampling_params_kwargs.get("prompt")
-    maybe_dump_performance(args, server_args, prompt, results)
+        prompt = sampling_params_kwargs.get("prompt")
+        maybe_dump_performance(args, server_args, prompt, results)
+    finally:
+        generator.shutdown()
 
 
 class GenerateSubcommand(CLISubcommand):
@@ -210,16 +231,6 @@ class GenerateSubcommand(CLISubcommand):
     def __init__(self) -> None:
         self.name = "generate"
         super().__init__()
-        self.init_arg_names = self._get_init_arg_names()
-        self.generation_arg_names = self._get_generation_arg_names()
-
-    def _get_init_arg_names(self) -> list[str]:
-        """Get names of arguments for DiffGenerator initialization"""
-        return ["num_gpus", "tp_size", "sp_size", "model_path"]
-
-    def _get_generation_arg_names(self) -> list[str]:
-        """Get names of arguments for generate_video method"""
-        return [field.name for field in dataclasses.fields(SamplingParams)]
 
     def cmd(
         self, args: argparse.Namespace, unknown_args: list[str] | None = None

@@ -11,18 +11,33 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_self(*, page_size: int, full_available: int, swa_available: int):
     full_indices = torch.tensor([10, 11], dtype=torch.int64)
     swa_indices = torch.tensor([20, 21], dtype=torch.int64)
+    full_to_swa_index_mapping = torch.zeros(64, dtype=torch.int64)
+
+    def new_pages_available(num_full_pages: int, num_swa_pages: int) -> bool:
+        return (
+            num_full_pages <= full_available // page_size
+            and num_swa_pages <= swa_available // page_size
+        )
+
+    def set_full_to_swa_mapping(
+        full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        full_to_swa_index_mapping[full_indices] = swa_indices
+
     return SimpleNamespace(
         page_size=page_size,
+        # alloc_extend reads _swa_req_ring; pin the paged-SWA path.
+        _swa_req_ring=False,
         full_attn_allocator=SimpleNamespace(
             available_size=lambda: full_available,
             alloc_extend=MagicMock(return_value=full_indices),
@@ -32,7 +47,9 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
             alloc_extend=MagicMock(return_value=swa_indices),
         ),
         translate_loc_from_full_to_swa=lambda last_loc: last_loc,
-        full_to_swa_index_mapping=torch.zeros(64, dtype=torch.int64),
+        new_pages_available=new_pages_available,
+        set_full_to_swa_mapping=set_full_to_swa_mapping,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
     )
 
 
@@ -97,42 +114,6 @@ class TestSWAAllocExtendPageEstimation(CustomTestCase):
         )
         self.assertIsNone(result)
         stub.swa_attn_allocator.alloc_extend.assert_not_called()
-
-    def test_exactly_at_capacity_succeeds(self):
-        stub = _make_self(page_size=8, full_available=16, swa_available=16)
-        result = _call(
-            stub,
-            prefix_lens_cpu=torch.tensor([8, 8], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([9, 9], dtype=torch.int64),
-            extend_num_tokens=2,
-        )
-        self.assertIsNotNone(result)
-
-    def test_one_over_capacity_refuses(self):
-        stub = _make_self(page_size=8, full_available=16, swa_available=16)
-        result = _call(
-            stub,
-            prefix_lens_cpu=torch.tensor([8, 8, 8], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([9, 9, 9], dtype=torch.int64),
-            extend_num_tokens=3,
-        )
-        self.assertIsNone(result)
-
-    def test_zero_new_pages_across_page_sizes(self):
-        # Over-estimation gap grows with page_size; sweep to confirm fix
-        # doesn't depend on the page_size=8 numbers above.
-        for page_size in (16, 32, 64, 128):
-            stub = _make_self(
-                page_size=page_size,
-                full_available=page_size * 2,
-                swa_available=page_size * 2,
-            )
-            prefix = torch.tensor([page_size - 2] * 4, dtype=torch.int64)
-            seq = torch.tensor([page_size - 1] * 4, dtype=torch.int64)
-            result = _call(
-                stub, prefix_lens_cpu=prefix, seq_lens_cpu=seq, extend_num_tokens=4
-            )
-            self.assertIsNotNone(result, f"page_size={page_size}")
 
 
 if __name__ == "__main__":

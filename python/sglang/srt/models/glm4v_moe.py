@@ -1,37 +1,30 @@
 import logging
-from functools import lru_cache
 from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
-    get_tensor_model_parallel_world_size,
-)
-from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4_moe import Glm4MoeModel
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration, Glm4vVisionModel
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_device_sm, is_cuda, log_info_on_rank0
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.runtime_context import get_mm, get_parallel
+from sglang.srt.utils import get_device_sm, is_cuda, log_info_on_rank0
 
 _is_cuda = is_cuda()
 _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
@@ -43,14 +36,15 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
     ) -> None:
         nn.Module.__init__(self)
 
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
-        self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
+        self.use_data_parallel = get_mm().mm_enable_dp_encoder
         vision_utils.update_vit_attn_dummy_heads_config(self.config)
-        self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
-        self.num_fused_shared_experts = 0
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
+        if self.num_fused_shared_experts:
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
         self.model = Glm4MoeModel(
             config,
@@ -73,7 +67,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 )
         else:
             # ranks other than the last rank will have a placeholder layer
@@ -86,50 +80,31 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def determine_num_fused_shared_experts(self):
-        if get_global_server_args().disable_shared_experts_fusion:
-            return
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        """Why this checkpoint cannot fuse its shared expert, or None. Asked by
+        the loader before any layer is built."""
+        if not getattr(hf_config, "n_shared_experts", None):
+            return "No shared experts are defined in the config."
+        if not _is_cuda:
+            return "Shared experts fusion currently requires CUDA devices."
+        if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
+            return "Shared experts fusion requires SM80 or newer GPUs."
+        if get_parallel().moe_ep_size > 1:
+            return "Shared experts fusion is not supported together with expert parallelism yet."
+        if get_moe_a2a_backend().is_deepep():
+            return "Shared experts fusion is not supported when Deepep MoE backend is enabled."
+        return None
 
-        disable_reason = None
-        if not getattr(self.config, "n_shared_experts", None):
-            disable_reason = "No shared experts are defined in the config."
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
-        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
-            disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
-        elif get_moe_expert_parallel_world_size() > 1:
-            disable_reason = "Shared experts fusion is not supported together with expert parallelism yet."
-        elif get_moe_a2a_backend().is_deepep():
-            disable_reason = "Shared experts fusion is not supported when Deepep MoE backend is enabled."
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        assert hf_config.n_shared_experts == 1, (
+            "Only 1 fused shared expert is supported for Glm4vMoeForConditionalGeneration"
+        )
+        return hf_config.n_shared_experts
 
-        if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
-        assert (
-            self.num_fused_shared_experts == 1
-        ), "Only 1 fused shared expert is supported for Glm4vMoeForConditionalGeneration"
-        log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
-
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        if is_nextn:
-            if hasattr(self.config, "num_nextn_predict_layers"):
-                num_nextn_layers = self.config.num_nextn_predict_layers
-                assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                # compatible with old design
-                nextn_layer_id = (
-                    0
-                    if self.config.num_hidden_layers == 1
-                    else self.config.num_hidden_layers
-                )
-            else:
-                raise ValueError("num_nextn_predict_layers is not in the config")
-
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -146,17 +121,7 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
-        if is_nextn:
-            nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
-            nextn_spec_weight_names = [
-                "shared_head.norm",
-                "eh_proj",
-                "enorm",
-                "hnorm",
-            ]
-
         params_dict = dict(self.named_parameters())
-        weight_names = []
         for name, loaded_weight in weights:
             if "language_model." in name:
                 name = name.replace("language_model.", "")
@@ -165,8 +130,6 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            weight_names.append(name)
-
             if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
                 # Shared expert becomes expert ID = n_routed_experts
                 name = name.replace(
@@ -174,34 +137,15 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     f"mlp.experts.{self.config.n_routed_experts}",
                 )
 
-            if not is_nextn:
-                if hasattr(self.config, "num_nextn_predict_layers"):
-                    num_nextn_layers = self.config.num_nextn_predict_layers
-                    if num_nextn_layers > 0 and name.startswith("model.layers"):
-                        name_list = name.split(".")
-                        if (
-                            len(name_list) >= 3
-                            and int(name_list[2]) >= self.config.num_hidden_layers
-                        ):
-                            continue
-            else:
-                if not name.startswith(nextn_layer_prefix):
-                    continue
-
-                # Use shared head and embed weights from target model
-                if "shared_head.head" in name or "embed_tokens" in name:
-                    continue
-
-                is_decoder = True
-                # For nextn specific weights
-                for weight_name in nextn_spec_weight_names:
-                    if weight_name in name:
-                        name = name.replace(nextn_layer_prefix, "model")
-                        is_decoder = False
-                        break
-                # For decoder layer weights
-                if is_decoder:
-                    name = name.replace(nextn_layer_prefix, "model.decoder")
+            if hasattr(self.config, "num_nextn_predict_layers"):
+                num_nextn_layers = self.config.num_nextn_predict_layers
+                if num_nextn_layers > 0 and name.startswith("model.layers"):
+                    name_list = name.split(".")
+                    if (
+                        len(name_list) >= 3
+                        and int(name_list[2]) >= self.config.num_hidden_layers
+                    ):
+                        continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
@@ -268,18 +212,15 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
                     if name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    if "visual" in name:
+                        loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                            self.config, name, loaded_weight
                         )
-                        if "visual" in name:
-                            loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
-                                self.config, name, loaded_weight
-                            )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = [Glm4vMoeForConditionalGeneration]

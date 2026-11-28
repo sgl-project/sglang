@@ -120,7 +120,7 @@ class NExTQALoader(VideoLoader):
         video = Video(video_path, num_frames)
         prompt = entry["question"] + "?"
         if self.task == "MC":  # add choices
-            prompt += f' a0: {entry["a0"]}, a1: {entry["a1"]}, a2: {entry["a2"]}, a3: {entry["a3"]}'
+            prompt += f" a0: {entry['a0']}, a1: {entry['a1']}, a2: {entry['a2']}, a3: {entry['a3']}"
         return VideoPrompt(video_path, num_frames, prompt)
 
     def __iter__(self):

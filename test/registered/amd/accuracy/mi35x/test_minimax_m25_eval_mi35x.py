@@ -3,15 +3,11 @@
 Tests MiniMax-M2.5 with TP=8 + EP=8 configuration using few-shot completion
 benchmark on MI35x.
 
-Registry: nightly-amd-8-gpu-mi35x-minimax-m25 suite
+Registry: nightly-test-8-gpu-amd-mi35x-minimax-m25 suite
 """
 
 import ast
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -33,8 +29,9 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-minimax-m25",
+    suite="nightly-test-8-gpu-amd-mi35x-minimax-m25",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999
@@ -183,9 +180,9 @@ class TestMiniMaxM25EvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

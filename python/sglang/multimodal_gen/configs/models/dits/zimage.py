@@ -2,10 +2,9 @@
 
 # SPDX-License-Identifier: Apache-2.0
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Any, Tuple
 
 from sglang.multimodal_gen.configs.models.dits.base import DiTArchConfig, DiTConfig
-from sglang.multimodal_gen.configs.models.fsdp import is_zimage_layer
 
 
 @dataclass
@@ -26,8 +25,6 @@ class ZImageArchConfig(DiTArchConfig):
     t_scale: float = 1000.0
     axes_dims: Tuple[int, int, int] = (32, 48, 48)
     axes_lens: Tuple[int, int, int] = (1024, 512, 512)
-
-    _fsdp_shard_conditions: list = field(default_factory=lambda: [is_zimage_layer])
 
     stacked_params_mapping: list[tuple[str, str, str]] = field(
         default_factory=lambda: [
@@ -57,29 +54,29 @@ class ZImageArchConfig(DiTArchConfig):
                 2,
                 3,
             ),
-            r"(.*)\.attention\.to_q\.(lora_A|lora_B)$": (
+            r"(.*)\.attention\.to_q\.(lora_A|lora_B|alpha)$": (
                 r"\1.attention.to_qkv.\2",
                 0,
                 3,
             ),
-            r"(.*)\.attention\.to_k\.(lora_A|lora_B)$": (
+            r"(.*)\.attention\.to_k\.(lora_A|lora_B|alpha)$": (
                 r"\1.attention.to_qkv.\2",
                 1,
                 3,
             ),
-            r"(.*)\.attention\.to_v\.(lora_A|lora_B)$": (
+            r"(.*)\.attention\.to_v\.(lora_A|lora_B|alpha)$": (
                 r"\1.attention.to_qkv.\2",
                 2,
                 3,
             ),
             r"(.*)\.feed_forward\.w1\.weight$": (r"\1.feed_forward.w13.weight", 0, 2),
             r"(.*)\.feed_forward\.w3\.weight$": (r"\1.feed_forward.w13.weight", 1, 2),
-            r"(.*)\.feed_forward\.w1\.(lora_A|lora_B)$": (
+            r"(.*)\.feed_forward\.w1\.(lora_A|lora_B|alpha)$": (
                 r"\1.feed_forward.w13.\2",
                 0,
                 2,
             ),
-            r"(.*)\.feed_forward\.w3\.(lora_A|lora_B)$": (
+            r"(.*)\.feed_forward\.w3\.(lora_A|lora_B|alpha)$": (
                 r"\1.feed_forward.w13.\2",
                 1,
                 2,
@@ -99,3 +96,10 @@ class ZImageDitConfig(DiTConfig):
     arch_config: ZImageArchConfig = field(default_factory=ZImageArchConfig)
 
     prefix: str = "zimage"
+
+    # One block serves both the caption tokens (tens) and the image and unified
+    # streams (thousands), with a dynamic token dim, so its GEMMs get autotuned
+    # for one branch and run for all three -- 1.4x slower when that goes wrong.
+    torch_compile_inductor_config: dict[str, Any] = field(
+        default_factory=lambda: {"multi_kernel_hints": [64, 4096]}
+    )

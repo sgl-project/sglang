@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -37,7 +39,41 @@ from sglang.srt.models.internvl import InternVisionEncoder
 logger = logging.getLogger(__name__)
 
 input_dim_t: TypeAlias = int | tuple[int, int]
-norm_t: TypeAlias = tuple[float, float, float] | torch.Tensor
+
+
+def _map_hf_radio_weight_name(name: str) -> tuple[str, str | None] | None:
+    prefix = "radio_model.hf_model."
+    if not name.startswith(prefix):
+        return None
+
+    name = name.removeprefix(prefix)
+    if name == "summary_idxs":
+        return None
+
+    embedding_names = {
+        "embeddings.cls_register_token": "model.patch_generator.cls_token.token",
+        "embeddings.patch_projection": "model.patch_generator.embedder",
+        "embeddings.position_embedding": "model.patch_generator.pos_embed",
+        "embeddings.video_patch_projection": "model.patch_generator.video_embedder",
+    }
+    for source, target in embedding_names.items():
+        if name == source or name.startswith(f"{source}."):
+            return name.replace(source, target, 1), None
+
+    name = name.replace("encoder.layer.", "model.encoder.layers.", 1)
+    attention_names = {
+        ".attention.attention.query.": (".attn.attn.qkv_proj.", "q"),
+        ".attention.attention.key.": (".attn.attn.qkv_proj.", "k"),
+        ".attention.attention.value.": (".attn.attn.qkv_proj.", "v"),
+        ".attention.output.dense.": (".attn.attn.proj.", None),
+    }
+    for source, (target, shard_id) in attention_names.items():
+        if source in name:
+            return name.replace(source, target, 1), shard_id
+
+    name = name.replace(".layer_scale1.lambda1", ".ls1")
+    name = name.replace(".layer_scale2.lambda1", ".ls2")
+    return name, None
 
 
 def _ntuple(n):
@@ -49,11 +85,7 @@ def _ntuple(n):
     return parse
 
 
-to_1tuple = _ntuple(1)
 to_2tuple = _ntuple(2)
-to_3tuple = _ntuple(3)
-to_4tuple = _ntuple(4)
-to_ntuple = _ntuple
 
 
 class ClsToken(nn.Module):
@@ -180,7 +212,6 @@ class ViTPatchGenerator(nn.Module):
 
         self.video_temporal_patch_size = video_temporal_patch_size
         self.video_embedder = None
-        self._video_embedder_loaded = False
         if video_temporal_patch_size > 1 and separate_video_embedder:
             self.video_embedder = nn.Linear(
                 3 * video_temporal_patch_size * patch_size * patch_size,
@@ -200,9 +231,9 @@ class ViTPatchGenerator(nn.Module):
 
     def forward_video(self, x: torch.Tensor, temporal_patch_size: int) -> torch.Tensor:
         """Embed video frames with temporal compression via tubelet grouping."""
-        assert (
-            self.video_embedder is not None
-        ), "video_embedder is required for temporal compression"
+        assert self.video_embedder is not None, (
+            "video_embedder is required for temporal compression"
+        )
         T = temporal_patch_size
         num_frames = x.shape[0]
 
@@ -233,16 +264,8 @@ class ViTPatchGenerator(nn.Module):
         return patches
 
     @property
-    def apply_cls_token(self):
-        return self.cls_token.enabled
-
-    @property
     def num_cls_tokens(self):
         return self.cls_token.num_tokens
-
-    @property
-    def num_cls_patches(self):
-        return self.cls_token.num_patches
 
     @property
     def num_registers(self):
@@ -251,54 +274,6 @@ class ViTPatchGenerator(nn.Module):
     @property
     def num_skip(self):
         return self.num_cls_tokens + self.num_registers
-
-    def _load_embed(self, src_embed: torch.Tensor, targ_embed: nn.Parameter):
-        if src_embed.shape != targ_embed.shape:
-            src_size = int(math.sqrt(src_embed.shape[1]))
-
-            assert (
-                src_size**2 == src_embed.shape[1]
-            ), "Unable to interpolate non-square embedding"
-
-            src_embed = rearrange(
-                src_embed, "b (h w) c -> b c h w", h=src_size, w=src_size
-            )
-            src_embed = F.interpolate(
-                src_embed,
-                size=(self.num_rows, self.num_cols),
-                mode="bicubic",
-                align_corners=True,
-                antialias=False,
-            )
-            src_embed = rearrange(src_embed, "b c h w -> b (h w) c")
-        targ_embed.data.copy_(src_embed)
-
-    def _load_projection(
-        self, src_proj_weight: torch.Tensor, targ_proj_weight: torch.Tensor
-    ):
-        if src_proj_weight.shape != targ_proj_weight.shape:
-            src_patch_size = int(math.sqrt(src_proj_weight.shape[1] // 3))
-
-            assert (src_patch_size**2) * 3 == src_proj_weight.shape[
-                1
-            ], "Unable to interpolate non-square patch size"
-
-            src_proj_weight = rearrange(
-                src_proj_weight,
-                "b (c h w) -> b c h w",
-                c=3,
-                h=src_patch_size,
-                w=src_patch_size,
-            )
-            src_proj_weight = F.interpolate(
-                src_proj_weight,
-                size=(self.patch_size, self.patch_size),
-                mode="bicubic",
-                align_corners=True,
-                antialias=False,
-            )
-            src_proj_weight = rearrange(src_proj_weight, "b c h w -> b (c h w)")
-        targ_proj_weight.data.copy_(src_proj_weight)
 
     def embed_patches(self, x: torch.Tensor) -> torch.Tensor:
         patches = self.im_to_patches(x)
@@ -463,9 +438,6 @@ class RadioInternVisionModel(nn.Module):
         num_patches = grid_size[0] * grid_size[1]
         return img_size, grid_size, num_patches
 
-    def get_input_embeddings(self):
-        return self.embeddings
-
     def forward(self, x: torch.Tensor) -> torch.FloatTensor:
         assert self.patch_generator is not None
         hidden_states = self.patch_generator(x)
@@ -586,18 +558,32 @@ class RadioModel(nn.Module):
             weights_list = list(weights)
 
         for name, weight in weights_list:
-            if not name.startswith("radio_model."):
-                # Skip non-radio weights
-                continue
-            name = replace_substrings(name, remap_substrings)
-            name = replace_prefix(name, remap_prefixes)
+            source_name = name
+            is_hf_export = name.startswith("radio_model.hf_model.")
+            loaded_shard_id = None
+            if is_hf_export:
+                mapped_weight = _map_hf_radio_weight_name(name)
+                if mapped_weight is None:
+                    continue
+                name, loaded_shard_id = mapped_weight
+            else:
+                if not name.startswith("radio_model."):
+                    # Skip non-radio weights
+                    continue
+                name = replace_substrings(name, remap_substrings)
+                name = replace_prefix(name, remap_prefixes)
             if name and name in params_dict:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, weight)
+                if loaded_shard_id is None:
+                    weight_loader(param, weight)
+                else:
+                    weight_loader(param, weight, loaded_shard_id)
                 loaded_params.add(name)
-                if "video_embedder" in name:
-                    self.model.patch_generator._video_embedder_loaded = True
+            elif is_hf_export:
+                raise ValueError(
+                    f"Unexpected HF RADIO weight: {source_name} (mapped to {name})"
+                )
 
         return loaded_params
 

@@ -1,25 +1,30 @@
-"""
-Common utilities for testing and benchmarking on NPU.
+"""Common utilities for testing and benchmarking on NPU.
 
-This file contains the following weight path categories:
-- LLM model weights path
-- VLM model weights path
-- Embedding model weights path
-- Rerank model weights path
-- Reward model weights path
-
-Please remember to sort by variable name within each section.
+Keep the weight-path constants sorted by variable name within each section.
 """
 
 import asyncio
 import copy
+import importlib.util
+import json
+import logging
 import os
+import pathlib
+import random
+import socket
 import subprocess
+import sys
+import threading
+import time
 from types import SimpleNamespace
-from typing import Awaitable, Callable, NamedTuple, Optional
+from typing import Awaitable, Callable, List, NamedTuple, Optional
 
-from sglang.bench_serving import run_benchmark
+import requests
+
+from sglang.benchmark.serving import run_benchmark
+from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -28,6 +33,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
     write_github_step_summary,
 )
+
+logger = logging.getLogger(__name__)
+
+STDERR_FILENAME = "/tmp/stderr.txt"
+STDOUT_FILENAME = "/tmp/stdout.txt"
 
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
@@ -41,10 +51,12 @@ BAICHUAN2_13B_CHAT_WEIGHTS_PATH = os.path.join(
 C4AI_COMMAND_R_V01_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "CohereForAI/c4ai-command-r-v01"
 )
-C4AI_COMMAND_R_V01_CHAT_TEMPLATE_PATH = "/__w/sglang/sglang/test/registered/ascend/llm_models/tool_chat_template_c4ai_command_r_v01.jinja"
 CHATGLM2_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/chatglm2-6b")
 DBRX_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "AI-ModelScope/dbrx-instruct"
+)
+DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-R1-0528-W8A8"
 )
 DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "DeepSeek-V3.2-Exp-W8A8"
@@ -52,11 +64,21 @@ DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH = os.path.join(
 DEEPSEEK_V3_2_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-V3.2-W8A8"
 )
+DEEPSEEK_V4_FLASH_BF16_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-V4-Flash-BF16"
+)
 DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
 )
 DEEPSEEK_CODER_1_3_B_BASE_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-coder-1.3b-base"
+)
+DOTS_OCR_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "rednote-hilab/dots.ocr")
+ECO_TECH_QWEN3_32B_W4A4_LAOS_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-32B-w4a4-LAOS"
+)
+ECO_TECH_QWEN3_30B_A3B_W4A4_LAOS_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-30B-A3B-w4a4-LAOS"
 )
 ERNIE_4_5_21B_A3B_PT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "baidu/ERNIE-4.5-21B-A3B-PT"
@@ -65,7 +87,18 @@ EXAONE_3_5_7_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "LGAI-EXAONE/EXAONE-3.5-7.8B-Instruct"
 )
 GEMMA_3_4B_IT_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-3-4b-it")
+GEMMA_4_E2B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-4-E2B-it")
+GEMMA_4_E4B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-4-E4B-it")
+GEMMA_4_26B_A4B_IT_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "google/gemma-4-26B-A4B-it"
+)
+GEMMA_4_31B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-4-31B-it")
 GLM_4_9B_CHAT_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/glm-4-9b-chat")
+GLM_5_1_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/GLM-5.1-w4a8")
+GLM_5_2_BF16_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-5.2")
+GPT_OSS_120B_BF16_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "eigen-ai-labs/gpt-oss-120b-bf16"
+)
 GRANITE_3_0_3B_A800M_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "ibm-granite/granite-3.0-3b-a800m-instruct"
 )
@@ -73,10 +106,20 @@ GRANITE_3_1_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "ibm-granite/granite-3.1-8b-instruct"
 )
 GROK_2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "huihui-ai/grok-2")
+GROK_2_WEIGHTS_TOKENIZER_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "huihui-ai/grok-2/tokenizer.tok.json"
+)
 INTERNLM2_7B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Shanghai_AI_Laboratory/internlm2-7b"
 )
 KIMI_K2_THINKING_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Kimi/Kimi-K2-Thinking")
+KIMI_K2_5_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/Kimi-K2.5-w4a8")
+KIMI_K2_5_EAGLE3_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "lightseekorg/kimi-k2.5-eagle3"
+)
+KIMI_K3_W4A8_INT_MOE_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Kimi/Kimi-K3-w4a8-int-moe"
+)
 LING_LITE_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "inclusionAI/Ling-lite")
 LLAMA_2_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "LLM-Research/Llama-2-7B")
 LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
@@ -85,10 +128,20 @@ LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
 LLAMA_3_2_1B_INSTRUCT_TOOL_CALLING_LORA_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "codelion/Llama-3.2-1B-Instruct-tool-calling-lora"
 )
+LLAMA_3_2_1B_INSTRUCT_TOOL_FAST_LORA_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "suayptalha/FastLlama-3.2-LoRA"
+)
 LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-1B-Instruct"
 )
 LLAMA_3_2_1B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-1B")
+LLAMA_3_8B_EAGLE_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "lmsys/sglang-EAGLE-LLaMA3-Instruct-8B"
+)
+LLAMA_3_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "LLM-Research/Meta-Llama-3-8B-Instruct"
+)
+
 LLAMA_4_SCOUT_17B_16E_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 )
@@ -99,9 +152,20 @@ META_LLAMA_3_1_8B_INSTRUCT = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Meta-Llama-3.1-8B-Instruct"
 )
 MIMO_7B_RL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-7B-RL")
+MIMO_V2_FLASH_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-V2-Flash")
+MIMO_V2_5_PRO_FP4_DFLASH_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "XiaomiMiMo/MiMo-V2.5-Pro-FP4-DFlash"
+)
+MIMO_V2_5_PRO_FP4_DFLASH_DRAFT_WEIGHTS_PATH = os.path.join(
+    MIMO_V2_5_PRO_FP4_DFLASH_WEIGHTS_PATH, "dflash"
+)
+MIMO_V2_5_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "solinliu/MiMo-V2.5-W8A8")
 MINICPM3_4B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "OpenBMB/MiniCPM3-4B")
 MISTRAL_7B_INSTRUCT_V0_2_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "mistralai/Mistral-7B-Instruct-v0.2"
+)
+OLMO_2_1124_7B_INSTRUCT_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "allenai/OLMo-2-1124-7B-Instruct"
 )
 OLMOE_1B_7B_0924_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "allenai/OLMoE-1B-7B-0924"
@@ -116,11 +180,15 @@ QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen2.5-7B-Instruct"
 )
 QWEN3_0_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-0.6B")
+QWEN3_5_27B_MODEL_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3.5-27B")
 QWEN3_1_7B_GPTQ_INT8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-1.7B-GPTQ-Int8"
 )
 QWEN3_235B_A22B_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "vllm-ascend/Qwen3-235B-A22B-W8A8"
+)
+QWEN3_235B_A22B_EAGLE_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-235B-A22B-Eagle3"
 )
 QWEN3_30B_A3B_GPTQ_2507_INT4_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-GPTQ-Int4"
@@ -142,6 +210,10 @@ QWEN3_8B_INT4_AUTOROUND_WEIGHTS_PATH = os.path.join(
 )
 QWEN3_8B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-8B")
 QWEN3_8B_EAGLE3_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-8B_eagle3")
+QWEN3_8B_DECRYPTED_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "YZY/Qwen3-8B")
+QWEN3_8B_EAGLE3_DECRYPTED_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "YZY/Qwen3-8B_eagle3"
+)
 QWEN3_32B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-32B")
 QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot"
@@ -149,18 +221,33 @@ QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH = os.path.join(
 QWEN3_NEXT_80B_A3B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-Next-80B-A3B-Instruct"
 )
-QWEN3_32B_EAGLE3_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-32B-Eagle3")
+QWEN3_32B_EAGLE3_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh"
+)
 QWEN3_32B_W8A8_MINDIE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "aleoyang/Qwen3-32B-w8a8-MindIE"
 )
 QWQ_32B_W8A8_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "vllm-ascend/QWQ-32B-W8A8")
 SMOLLM_1_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "HuggingFaceTB/SmolLM-1.7B")
+SOLAR_10_7B_INSTRUCT_V1_0_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "upstage/SOLAR-10.7B-Instruct-v1.0"
+)
 STABLELM_2_1_6B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "stabilityai/stablelm-2-1_6b"
 )
-XVERSE_MOE_A36B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "xverse/XVERSE-MoE-A36B")
+STARCODER2_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "bigcode/starcoder2-7b")
 TRINITY_MINI_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/Trinity-Mini")
+XVERSE_MOE_A36B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "xverse/XVERSE-MoE-A36B")
 MINIMAX_M2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "cyankiwi/MiniMax-M2-BF16")
+MINIMAX_M2_5_W8A8_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
+)
+MINIMAX_M2_5_EAGLE3_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "sgl-npu/MiniMax-M2.5-eagel-model-0318"
+)
+EAGLE3_LLAMA3_1_INSTRUCT_8B_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "sglang-EAGLE3-LLaMA3.1-Instruct-8B"
+)
 
 # VLM model weights path
 DEEPSEEK_VL2_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/deepseek-vl2")
@@ -168,7 +255,7 @@ GLM_4_5V_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.5V")
 JANUS_PRO_1B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-1B")
 JANUS_PRO_7B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "deepseek-ai/Janus-Pro-7B")
 KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "Kimi/Kimi-VL-A3B-Instruct"
+    MODEL_WEIGHTS_DIR, "moonshotai/Kimi-VL-A3B-Instruct"
 )
 LLAMA_3_2_11B_VISION_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-11B-Vision-Instruct"
@@ -215,13 +302,24 @@ QWEN3_30B_A3B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B
 QWEN3_30B_A3B_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-30B-A3B-w8a8"
 )
+DEEPSEEK_V2_LITE_W8A8_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-V2-Lite-W8A8"
+)
 
 DEEPSEEK_R1_DISTILL_QWEN_7B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 )
-
-QWEN3_30B_MODELSLIM_INT4_WEIGHTS_PATH = os.path.join(
-    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-30B-A3B-w4a4-LAOS"
+DEEPSEEK_R1_0528_W4A8_PER_CHANNEL_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "DeepSeek-R1-0528-w4a8-per-channel"
+)
+DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-R1-0528-W8A8"
+)
+QWEN3_5_397B_W4A8_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3.5-397B-A17B-w4a8-mtp"
+)
+QWEN3_5_397B_W8A8_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp"
 )
 
 # Embedding model weights path
@@ -264,22 +362,28 @@ SKYWORK_REWARD_LLAMA_3_1_8B_V0_2_WEIGHTS_PATH = os.path.join(
     HF_MODEL_WEIGHTS_DIR,
     "models--Skywork--Skywork-Reward-Llama-3.1-8B-v0.2/snapshots/d4117fbfd81b72f41b96341238baa1e3e90a4ce1",
 )
+KIMI_K2_6_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/Kimi-K2.6-w4a8")
+KIMI_K2_6_EAGLE3_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "lightseekorg/kimi-k2.6-eagle3"
+)
+GLM_4_6V_FLASH_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-4.6V-Flash")
+QWEN3_VL_8B_THINKING_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-VL-8B-Thinking"
+)
+QWEN3_VL_30B_A3B_THINKING_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-VL-30B-A3B-Thinking"
+)
+QWEN3_OMNI_30B_A3B_THINKING_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "Qwen/Qwen3-Omni-30B-A3B-Thinking"
+)
 # fmt: on
 
 # Other
-DEEPSEEK_CODER_JSON_PATH = "/__w/sglang/sglang/test/registered/ascend/basic_function/parameter/deepseek_coder.json"
+FR_SPEC_TOKEN_MAP_PATH = "/root/.cache/sglang/FR-Spec/freq_32768.pt"
 
 
 class ModelTestConfig(NamedTuple):
-    """
-    Configuration for model testing.
-
-    Attributes:
-        model_path: Path to the model weights directory
-        mmlu_score: Weight for MMLU benchmark score
-        gsm8k_accuracy: Weight for GSM8K benchmark score
-        mmmu_accuracy: Weight for MMMU benchmark score
-    """
+    """Model weights path and the expected MMLU / GSM8K / MMMU scores."""
 
     model_path: str
     mmlu_score: Optional[float] = None
@@ -312,16 +416,7 @@ DEFAULT_WEIGHTS_FOR_TEST = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_FOR_TEST
 
 
 def run_command(cmd, shell=True):
-    """Execute system command and return stdout
-
-    parameter:
-        cmd: command to execute
-        shell:
-        True, Execute command in shell
-        False, Commands are invoked directly without shell parsing
-    return:
-        The result of executing the command
-    """
+    """Run ``cmd`` and return its stdout."""
     try:
         result = subprocess.run(
             cmd, shell=shell, capture_output=True, text=True, check=True
@@ -361,40 +456,6 @@ def get_benchmark_args(
     header=None,
     max_concurrency=None,
 ):
-    """Constructing the parameter objects needed for inference tests
-
-    Parameters:
-        base_url: url
-        backend: Inference backend
-        dataset_name: Data set name
-        dataset_path: Dataset path
-        tokenizer: tokenizer
-        num_prompts: Total number of test requests
-        sharegpt_output_len: Output the number of tokens
-        random_input_len: The length of the randomly generated input prompt
-        random_output_len: The length of the randomly generated output prompt
-        sharegpt_context_len: Sharegpt dataset context length
-        request_rate: Request rate
-        disable_stream: Disable streaming output
-        disable_ignore_eos: Should eos_token be ignored?
-        seed: random seed
-        device: Device type
-        pd_separated: Enable PD separation
-        lora_name: LoRA fine-tuning model path
-        lora_request_distribution: LoRA request distribution strategy
-        lora_zipf_alpha: Control request distribution skewness
-        gsp_num_groups: Grouped Sequence Parallelism
-        gsp_prompts_per_group: Number of parallel prompts within each group
-        gsp_system_prompt_len: GSP system prompts length
-        gsp_question_len: GSP question length
-        gsp_output_len: GSP output length
-        gsp_num_turns: GSP Dialogue Rounds
-        header: HTTP request header
-        max_concurrency: Maximum number of concurrent requests
-    Returns:
-        The return parameter is the same as the input.
-    """
-
     return SimpleNamespace(
         backend=backend,
         base_url=base_url,
@@ -436,6 +497,7 @@ def get_benchmark_args(
         gsp_num_turns=gsp_num_turns,
         header=header,
         max_concurrency=max_concurrency,
+        ready_check_timeout_sec=0,
     )
 
 
@@ -463,37 +525,9 @@ def run_bench_serving(
     max_concurrency=None,
     background_task: Optional[Callable[[str, asyncio.Event], Awaitable[None]]] = None,
     lora_name: Optional[str] = None,
+    timeout_for_server_launch=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
 ):
-    """Start the service and obtain the inference results.
-
-    Parameters:
-        model: Model name
-        num_prompts: Total number of test requests
-        request_rate: Request rate
-        other_server_args: Additional configuration when starting the service
-        dataset_name: Data set name
-        dataset_path: Dataset path
-        tokenizer: tokenizer
-        random_input_len: The length of the randomly generated input prompt
-        random_output_len: The length of the randomly generated output prompt
-        sharegpt_context_len: Sharegpt dataset context length
-        disable_stream: Disable streaming output
-        disable_ignore_eos: Should eos_token be ignored?
-        need_warmup: Preheating required
-        seed: random seed
-        device: Device type
-        gsp_num_groups: Grouped Sequence Parallelism
-        gsp_prompts_per_group: Number of parallel prompts within each group
-        gsp_system_prompt_len: GSP system prompts length
-        gsp_question_len: GSP question length
-        gsp_output_len: GSP output length
-        max_concurrency: Maximum number of concurrent requests
-        background_task: Background tasks
-        lora_name: LoRA fine-tuning model path
-    Returns:
-        res: Number of requests successfully completed
-
-    """
+    """Launch the server, run bench_serving against it, and return the result."""
 
     if device == "auto":
         device = auto_config_device()
@@ -502,7 +536,7 @@ def run_bench_serving(
     process = popen_launch_server(
         model,
         base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        timeout=timeout_for_server_launch,
         other_args=other_server_args,
     )
 
@@ -563,6 +597,240 @@ def run_bench_serving(
     return res
 
 
+# hook factory
+def create_attention_monitor_hook_factory(config):
+    """Return a forward hook that logs self-attention states of ``config["layer_index"]``."""
+    # Get target layer index from config, default to 0 if not specified
+    layer_index = config.get("layer_index", 0)
+
+    # Initialize logging configuration if no handlers are set
+    if not logging.root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+    def attention_monitor_hook(module, inputs, output):
+        """Log the attention layer's input/output statistics; returns ``output`` unchanged."""
+        # Record current timestamp for time-series tracking
+        timestamp = time.time()
+
+        # Extract hidden states from inputs (second input tensor of attention layer)
+        hidden_states = inputs[1] if inputs and len(inputs) > 1 else None
+
+        # Construct monitoring record with key statistics
+        monitor_record = {
+            "timestamp": timestamp,
+            "layer_index": layer_index,
+            "module_type": type(module).__name__,
+            # Compute sum of hidden states across last dim, take first 5 elements for logging
+            "inputs": hidden_states.sum(-1)[:5] if hidden_states is not None else None,
+            # Compute sum of output across last dim, take first 5 elements for logging
+            "outputs": output.sum(-1)[:5],
+        }
+
+        # Log the monitoring record
+        logging.info(f"hook effect: {monitor_record}")
+
+        # Return the original output to maintain normal model forward propagation
+        return output
+
+    return attention_monitor_hook
+
+
+def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
+    """Print the output in real time with another thread."""
+    while not os.path.exists(filename):
+        time.sleep(0.01)
+
+    pt = 0
+    while pt >= 0:
+        if pt > 0 and not os.path.exists(filename):
+            break
+        try:
+            lines = open(filename).readlines()
+        except FileNotFoundError:
+            print(f"{pt=}, {os.path.exists(filename)=}")
+            raise
+        for line in lines[pt:]:
+            print(line, end="", flush=True)
+            output_lines.append(line)
+            pt += 1
+        time.sleep(0.1)
+
+
+def run_and_check_memory_leak(
+    workload_func,
+    disable_radix_cache,
+    enable_mixed_chunk,
+    disable_overlap,
+    chunked_prefill_size,
+    assert_has_abort,
+    api_key: Optional[str] = None,
+):
+    other_args = [
+        "--chunked-prefill-size",
+        str(chunked_prefill_size),
+        "--log-level",
+        "debug",
+    ]
+    if disable_radix_cache:
+        other_args += ["--disable-radix-cache"]
+    if enable_mixed_chunk:
+        other_args += ["--enable-mixed-chunk"]
+    if disable_overlap:
+        other_args += ["--disable-overlap-schedule"]
+
+    model = LLAMA_3_1_8B_INSTRUCT_WEIGHTS_PATH
+    port = random.randint(4000, 5000)
+    base_url = f"http://127.0.0.1:{port}"
+
+    # Create files and launch the server
+    stdout = open(STDOUT_FILENAME, "w")
+    stderr = open(STDERR_FILENAME, "w")
+    process = popen_launch_server(
+        model,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=other_args,
+        return_stdout_stderr=(stdout, stderr),
+        api_key=api_key,
+    )
+
+    # Launch a thread to stream the output
+    output_lines = []
+    t = threading.Thread(target=read_output, args=(output_lines,))
+    t.start()
+
+    # Run the workload
+    workload_func(base_url, model)
+
+    # Clean up everything
+    kill_process_tree(process.pid)
+    stdout.close()
+    stderr.close()
+    if os.path.exists(STDOUT_FILENAME):
+        os.remove(STDOUT_FILENAME)
+    if os.path.exists(STDERR_FILENAME):
+        os.remove(STDERR_FILENAME)
+    kill_process_tree(process.pid)
+    t.join()
+
+    # Assert success
+    has_new_server = False
+    has_leak = False
+    has_abort = False
+    for line in output_lines:
+        if "Uvicorn running" in line:
+            has_new_server = True
+        if "leak" in line:
+            has_leak = True
+        if "Abort" in line:
+            has_abort = True
+
+    assert has_new_server
+    assert not has_leak
+    if assert_has_abort:
+        assert has_abort
+
+
+def run_mmlu_test(
+    disable_radix_cache=False,
+    enable_mixed_chunk=False,
+    disable_overlap=False,
+    chunked_prefill_size=32,
+):
+    def workload_func(base_url, model):
+        # Run the eval
+        args = SimpleNamespace(
+            base_url=base_url,
+            model=model,
+            eval_name="mmlu",
+            num_examples=128,
+            num_threads=128,
+        )
+
+        try:
+            metrics = run_sgl_eval(args)
+            assert metrics["score"] >= 0.65, f"{metrics=}"
+        finally:
+            pass
+
+    run_and_check_memory_leak(
+        workload_func,
+        disable_radix_cache,
+        enable_mixed_chunk,
+        disable_overlap,
+        chunked_prefill_size,
+        assert_has_abort=False,
+    )
+
+
+def send_concurrent_requests(
+    base_url: str,
+    num_requests: int,
+    num_concurrent: int = 8,
+    input_text: str = "The capital of France is",
+    max_new_tokens: int = 32,
+    temperature: float = 0.0,
+    request_timeout: int = 60,
+) -> list:
+    """Send ``num_requests`` concurrent POSTs to /generate; returns one result dict per request.
+
+    Uses threads: asyncio.gather() over synchronous requests.post() gives no real
+    parallelism for blocking I/O.
+    """
+
+    results: list = []
+    lock = threading.Lock()
+    semaphore = threading.Semaphore(num_concurrent)
+
+    def _send_one(task_id: int) -> None:
+        semaphore.acquire()
+        try:
+            response = requests.post(
+                f"{base_url}/generate",
+                json={
+                    "text": input_text,
+                    "sampling_params": {
+                        "temperature": temperature,
+                        "max_new_tokens": max_new_tokens,
+                    },
+                },
+                timeout=request_timeout,
+            )
+            with lock:
+                results.append(
+                    {
+                        "task_id": task_id,
+                        "status_code": response.status_code,
+                        "text": response.text,
+                    }
+                )
+        except Exception as exc:
+            with lock:
+                results.append(
+                    {
+                        "task_id": task_id,
+                        "status_code": -1,
+                        "text": str(exc),
+                    }
+                )
+        finally:
+            semaphore.release()
+
+    threads = [
+        threading.Thread(target=_send_one, args=(i,)) for i in range(num_requests)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    return results
+
+
 HEADER = """
 ### Models
 | Model | Server | Client | Output Throughput | Expected Output Throughput | Latency | Expected Latency | Accuracy | Expected Accuracy | Status |
@@ -604,3 +872,305 @@ def write_github_step_summary_once(summary: str):
         return
     write_github_step_summary_once.has_written = True
     write_github_step_summary(summary)
+
+
+# Mooncake + TENT + MemFabric KV transfer config. With ``metadata_type``
+# ``p2p`` every node runs its own metadata RPC server and must advertise its
+# own IP, so ``rpc_server_hostname`` is filled per node via
+# ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for single-machine runs).
+MEMFABRIC_TENT_CONF_TEMPLATE = {
+    "metadata_type": "p2p",
+    "rpc_server_hostname": "",
+    "rpc_server_port": 0,
+    "log_level": "info",
+    "transports": {
+        "memfabric": {"enable": True},
+        "ascend_direct": {"enable": False},
+        "rdma": {"enable": False},
+        "tcp": {"enable": False},
+        "shm": {"enable": False},
+        "gds": {"enable": False},
+        "hp_tcp": {"enable": False},
+        "fabric": {"enable": False},
+        "mnnvl": {"enable": False},
+        "nvlink": {"enable": False},
+    },
+    "policy": [
+        {
+            "name": "default_memory",
+            "segment_type": "memory",
+            "transports": ["memfabric"],
+        }
+    ],
+}
+
+
+def resolve_local_ip():
+    """Resolve the current node's IP for the memfabric metadata RPC server.
+
+    Multi-node cases run on k8s where ``POD_IP`` is injected via the downward
+    API. Single-machine cases run on GitHub Actions-allocated pods that do not
+    set ``POD_IP``; all participants then share one network namespace, so the
+    loopback address is reachable by every process.
+    """
+    host_ip = os.getenv("POD_IP")
+    if host_ip:
+        return host_ip
+    return "127.0.0.1"
+
+
+def write_memfabric_tent_conf(path="/tmp/memfabric_tent.json"):
+    """Write the Mooncake TENT/MemFabric config for the current node.
+
+    The IP comes from ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for
+    single-machine runs), so the same test works on every node of a multi-node
+    PD deployment and on non-k8s single-machine runs without manually editing
+    the file per node.
+
+    Returns:
+        str: Path of the generated config file.
+    """
+    conf = copy.deepcopy(MEMFABRIC_TENT_CONF_TEMPLATE)
+    conf["rpc_server_hostname"] = resolve_local_ip()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(conf, f, indent=2)
+    logger.info(f"Wrote memfabric tent config to {path}: {conf}")
+    return path
+
+
+# Default ports for the Ascend MemCache meta service components.
+MEMCACHE_META_SERVICE_PORT = 5007
+MEMCACHE_CONFIG_STORE_PORT = 6007
+MEMCACHE_METRICS_PORT = 8007
+
+
+def start_memcache_meta_service(
+    config_path="/tmp/metaservice_config.json",
+    meta_service_port=MEMCACHE_META_SERVICE_PORT,
+    config_store_port=MEMCACHE_CONFIG_STORE_PORT,
+    metrics_port=MEMCACHE_METRICS_PORT,
+    extra_config=None,
+):
+    """Start the Ascend MemCache MetaService on the current node.
+
+    The IP comes from ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for
+    single-machine runs), so a generated ``metaservice_config.json`` works both
+    on every node of a multi-node deployment and on single-machine runs.
+
+    The ports default to the ``MEMCACHE_*_PORT`` constants above, which avoid
+    clashes with the ports the test framework already uses.
+
+    Args:
+        config_path (str): Path of the generated JSON config.
+        meta_service_port (int): Port of ``meta_service_url``.
+        config_store_port (int): Port of ``config_store_url``.
+        metrics_port (int): Port of the HTTP ``metrics_url``.
+        extra_config (dict): Additional MetaConfig keys merged into the config.
+
+    Returns:
+        subprocess.Popen: The meta service process.
+    """
+    host_ip = resolve_local_ip()
+    meta_config = {
+        "meta_service_url": f"tcp://{host_ip}:{meta_service_port}",
+        "config_store_url": f"tcp://{host_ip}:{config_store_port}",
+        "metrics_url": f"http://{host_ip}:{metrics_port}",
+    }
+    if extra_config:
+        meta_config.update(extra_config)
+
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(meta_config, f, indent=2)
+    logger.info(f"Wrote metaservice config to {config_path}: {meta_config}")
+
+    command = [
+        sys.executable,
+        "-m",
+        "sglang.srt.mem_cache.storage.npu_memcache.start_meta_service",
+        "--config_path",
+        config_path,
+    ]
+    logger.info(f"Starting memcache meta service: {' '.join(command)}")
+    try:
+        process = subprocess.Popen(command)
+        logger.info(f"Memcache meta service started with PID: {process.pid}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to start memcache meta service: {e}")
+
+    return process
+
+
+HICACHE_STORAGE_BACKEND_ARG = "--hicache-storage-backend"
+
+# Default port of the Mooncake master service.
+MOONCAKE_MASTER_PORT = 50051
+
+
+def get_server_args_value(args_list, name):
+    """Return the value of the server arg ``name`` in ``args_list``.
+
+    Accepts both ``["--key", value]`` and ``["--key=value"]`` forms and returns
+    None when the flag is absent. ``name`` must be a flag that takes a value;
+    boolean switches have no value to return.
+    """
+    args = [str(arg) for arg in args_list or []]
+    for i, arg in enumerate(args):
+        if arg == name:
+            return args[i + 1] if i + 1 < len(args) else None
+        if arg.startswith(f"{name}="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _wait_for_tcp_port(process, port, timeout=30, poll_interval=0.5):
+    """Wait until ``port`` on this node accepts connections.
+
+    A Mooncake store client that connects before the master is listening fails
+    its setup, and the store does not retry, so every launch of the master has
+    to be followed by this check.
+
+    Args:
+        process (subprocess.Popen): The process expected to open the port.
+        port (int): Port the process listens on.
+        timeout (float): Seconds to wait before giving up.
+        poll_interval (float): Seconds between connection attempts.
+
+    Raises:
+        RuntimeError: If the process exits or the port never opens.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Process {process.pid} exited with code {process.returncode} "
+                f"before opening port {port}"
+            )
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                logger.info(f"Port {port} is ready")
+                return
+        except OSError:
+            time.sleep(poll_interval)
+
+    kill_process_tree(process.pid)
+    raise RuntimeError(f"Port {port} was not opened within {timeout}s")
+
+
+def start_mooncake_master(
+    master_port=MOONCAKE_MASTER_PORT,
+    eviction_high_watermark_ratio=0.95,
+):
+    """Start the Mooncake master service on the current node.
+
+    SGLang servers are Mooncake store clients: with a non-zero
+    ``global_segment_size`` they contribute their own memory, so no separate
+    store service is needed and the master is the only required process. The
+    metadata server keeps its ``P2PHANDSHAKE`` default, which avoids needing a
+    shared metadata endpoint (and its auth token) for multi-node runs.
+
+    The flags follow the standalone deployment scripts. The one difference is
+    the RPC bind address: those scripts bind loopback on a single host, while
+    prefill peers here may live in other pods and have to reach this one.
+
+    Args:
+        master_port (int): Port the master service listens on.
+        eviction_high_watermark_ratio (float): Watermark that triggers eviction.
+
+    Returns:
+        subprocess.Popen: The Mooncake master process.
+    """
+    metrics_port = envs.MOONCAKE_MASTER_METRICS_PORT.get()
+    command = [
+        "mooncake_master",
+        "--rpc_address=0.0.0.0",
+        f"--rpc_port={master_port}",
+        "--metrics_host=127.0.0.1",
+        f"--metrics_port={metrics_port}",
+        f"--eviction_high_watermark_ratio={eviction_high_watermark_ratio}",
+    ]
+    logger.info(f"Starting mooncake master: {' '.join(command)}")
+    try:
+        process = subprocess.Popen(command)
+        logger.info(f"Mooncake master started with PID: {process.pid}")
+    except Exception as e:
+        raise RuntimeError(f"Failed to start mooncake master: {e}")
+
+    _wait_for_tcp_port(process, master_port)
+    return process
+
+
+def set_mooncake_master_env(host_ip=None):
+    """Point the SGLang servers launched next at the Mooncake master.
+
+    ``MOONCAKE_MASTER`` is the environment form of
+    ``master_server_address``: the store reads it through
+    ``MooncakeStoreConfig.load_from_env()`` when
+    ``--hicache-storage-backend-extra-config`` carries no explicit address, so
+    each launching node only needs the resolved master address in its
+    environment.
+
+    Args:
+        host_ip (str): Node that runs the master. Defaults to this node.
+
+    Returns:
+        str: The ``<host>:<port>`` address written to the environment.
+    """
+    address = f"{host_ip or resolve_local_ip()}:{MOONCAKE_MASTER_PORT}"
+    os.environ["MOONCAKE_MASTER"] = address
+    logger.info(f"Setting ENV_VAR MOONCAKE_MASTER={address}")
+    return address
+
+
+def maybe_start_hicache_storage_service(other_args):
+    """Start the external service required by the HiCache L3 backend.
+
+    ``npu_memcache`` connects through the Ascend MemCache MetaService, while
+    ``mooncake`` connects through the Mooncake master service. Other backends
+    need no external process and are skipped.
+
+    For ``mooncake`` the master address is also exported as
+    ``MOONCAKE_MASTER`` so the server launched from this process picks it up
+    from the environment.
+
+    Args:
+        other_args (list): Server launch args.
+
+    Returns:
+        subprocess.Popen: The storage service process, or None if not started.
+    """
+    backend = get_server_args_value(other_args, HICACHE_STORAGE_BACKEND_ARG)
+    if backend == "npu_memcache":
+        process = start_memcache_meta_service()
+        logger.info(f"Memcache meta service started with PID: {process.pid}")
+        return process
+    if backend == "mooncake":
+        process = start_mooncake_master()
+        set_mooncake_master_env()
+        return process
+    return None
+
+
+def append_ld_library_path(*module_specs):
+    """Build ``LD_LIBRARY_PATH`` with the given modules' library dirs first.
+
+    Each spec is ``(module_name, lib_subdir)``. ``lib_subdir`` is joined under
+    the package directory when given (e.g. ``"lib"`` for ``memfabric_hybrid``);
+    otherwise the package directory itself is used. The new directories go
+    first so they win over stale copies already on the path, and missing
+    modules are skipped.
+
+    Returns:
+        str: The resulting ``LD_LIBRARY_PATH`` value.
+    """
+    entries = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+    new_entries = []
+    for module_name, lib_subdir in module_specs:
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or spec.origin is None:
+            logger.warning(f"Module {module_name} not found, skip LD_LIBRARY_PATH")
+            continue
+        lib_dir = pathlib.Path(spec.origin).parent
+        if lib_subdir:
+            lib_dir = lib_dir / lib_subdir
+        new_entries.append(str(lib_dir))
+    return ":".join(dict.fromkeys([*new_entries, *entries]))

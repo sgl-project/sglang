@@ -1,6 +1,5 @@
 import unittest
 
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     CustomTestCase,
@@ -8,12 +7,8 @@ from sglang.test.test_utils import (
     run_mmlu_test,
 )
 
-register_cuda_ci(est_time=131, suite="stage-b-test-1-gpu-large")
-register_amd_ci(est_time=108, suite="stage-b-test-1-gpu-small-amd")
-
 
 class TestNoChunkedPrefill(CustomTestCase):
-
     def test_no_chunked_prefill(self):
         run_mmlu_test(
             disable_radix_cache=False, enable_mixed_chunk=False, chunked_prefill_size=-1

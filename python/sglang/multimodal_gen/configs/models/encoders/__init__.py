@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 from sglang.multimodal_gen.configs.models.encoders.base import (
+    AudioEncoderConfig,
     BaseEncoderOutput,
     EncoderConfig,
     ImageEncoderConfig,
@@ -17,15 +18,29 @@ from sglang.multimodal_gen.configs.models.encoders.flux_2 import (
 )
 from sglang.multimodal_gen.configs.models.encoders.gemma2 import Gemma2Config
 from sglang.multimodal_gen.configs.models.encoders.gemma_3 import Gemma3Config
+from sglang.multimodal_gen.configs.models.encoders.gemma_4_unified import (
+    Gemma4UnifiedConfig,
+)
+from sglang.multimodal_gen.configs.models.encoders.ideogram import (
+    Ideogram4TextEncoderConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.llama import LlamaConfig
+from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+    MiniMaxH3Qwen3VLArchConfig,
+    MiniMaxH3Qwen3VLConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
+from sglang.multimodal_gen.configs.models.encoders.wan_s2v_audio import (
+    WanS2VAudioEncoderConfig,
+)
 
 __all__ = [
     "EncoderConfig",
     "TextEncoderConfig",
     "ImageEncoderConfig",
+    "AudioEncoderConfig",
     "BaseEncoderOutput",
     "CLIPTextConfig",
     "CLIPVisionConfig",
@@ -33,9 +48,14 @@ __all__ = [
     "Flux2MistralTextConfig",
     "build_flux2_text_messages",
     "LlamaConfig",
+    "MiniMaxH3Qwen3VLArchConfig",
+    "MiniMaxH3Qwen3VLConfig",
     "Qwen3TextConfig",
     "Qwen3VLConfig",
     "T5Config",
     "Gemma2Config",
     "Gemma3Config",
+    "Gemma4UnifiedConfig",
+    "Ideogram4TextEncoderConfig",
+    "WanS2VAudioEncoderConfig",
 ]

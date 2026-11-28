@@ -11,8 +11,9 @@ from diffusers.models.attention import FeedForward
 from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorConfig,
 )
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 
 def apply_interleaved_rotary_emb(
@@ -147,22 +148,6 @@ class LTX2Attention(torch.nn.Module):
         self.to_out = torch.nn.ModuleList([])
         self.to_out.append(torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias))
         self.to_out.append(torch.nn.Dropout(dropout))
-
-        # Scaled dot product attention
-        self.attn = USPAttention(
-            num_heads=heads,
-            head_size=self.head_dim,
-            dropout_rate=0,
-            softmax_scale=None,
-            causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.AITER,
-                AttentionBackendEnum.TORCH_SDPA,
-                AttentionBackendEnum.SAGE_ATTN,
-                AttentionBackendEnum.SAGE_ATTN_3,
-            },
-        )
 
     def forward(
         self,
@@ -394,8 +379,6 @@ class LTX2ConnectorTransformer1d(nn.Module):
     In LTX 2.0, this is used to process the text encoder hidden states for each of the video and audio streams.
     """
 
-    _supports_gradient_checkpointing = True
-
     def __init__(
         self,
         num_attention_heads: int = 30,
@@ -448,8 +431,6 @@ class LTX2ConnectorTransformer1d(nn.Module):
         self.norm_out = torch.nn.RMSNorm(
             self.inner_dim, eps=eps, elementwise_affine=False
         )
-
-        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -514,25 +495,26 @@ class LTX2ConnectorTransformer1d(nn.Module):
 
         # 3. Run 1D transformer blocks
         for block in self.transformer_blocks:
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, attention_mask, rotary_emb
-                )
-            else:
-                hidden_states = block(
-                    hidden_states, attention_mask=attention_mask, rotary_emb=rotary_emb
-                )
+            hidden_states = block(
+                hidden_states, attention_mask=attention_mask, rotary_emb=rotary_emb
+            )
 
         hidden_states = self.norm_out(hidden_states)
 
         return hidden_states, attention_mask
 
 
-class LTX2TextConnectors(nn.Module):
+class LTX2TextConnectors(nn.Module, LayerwiseOffloadableModuleMixin):
     """
     Text connector stack used by LTX 2.0 to process the packed text encoder hidden states for both the video and audio
     streams.
     """
+
+    layerwise_offload_dit_group_enabled = False
+    layer_names = [
+        "video_connector.transformer_blocks",
+        "audio_connector.transformer_blocks",
+    ]
 
     def __init__(
         self,
@@ -620,6 +602,11 @@ class LTX2TextConnectors(nn.Module):
         x: torch.Tensor, target_dim: int, source_dim: int
     ) -> torch.Tensor:
         return x * math.sqrt(target_dim / source_dim)
+
+    @property
+    def output_mask_is_all_valid(self) -> bool:
+        """Learned registers replace every padded text token, so the returned mask is all ones"""
+        return self.video_connector.learnable_registers is not None
 
     def forward(
         self,

@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
@@ -20,14 +21,14 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import normalize_e4m3fn_to_e4m3fnuz
 from sglang.srt.layers.quantization.utils import (
     all_close_1d,
     per_tensor_dequantize,
     swap_w13_to_w31,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -49,7 +50,6 @@ logger = logging.getLogger(__name__)
 
 
 class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
-
     def __init__(self, weight_quant, input_quant):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
@@ -99,7 +99,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         if self.block_quant:
             assert self.weight_block_size is not None
             layer.weight_block_size = self.weight_block_size
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = layer.moe_tp_size
             block_n, block_k = (
                 self.weight_block_size[0],
                 self.weight_block_size[1],
@@ -122,12 +122,15 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     f"weight quantization block_k = {block_k}."
                 )
 
+        # AITER pads only a concatenated w13 to match its padded w2.
+        concat_w13 = layer.moe_runner_config.is_gated or _use_aiter
         w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
             intermediate_size_per_partition,
             is_aiter_moe=_use_aiter,
-            is_concat=True,
+            is_concat=concat_w13,
             is_packed=False,
         )
+        w13_num_shards = 2 if concat_w13 else 1
 
         extra_weight_attrs.update(
             {"weight_padded": weight_padded},
@@ -161,10 +164,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         # WEIGHT_SCALES
         # per-tensor quantization
         if self.weight_quant.strategy == QuantizationStrategy.TENSOR:
-            # Allocate 2 scales for w1 and w3 respectively.
-            # They will be combined to a single scale after weight loading.
+            # One scale per w13 shard; gated layers combine theirs after loading.
             w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+                torch.ones(num_experts, w13_num_shards, dtype=torch.float32),
+                requires_grad=False,
             )
             w2_weight_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
@@ -189,7 +192,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    2 * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                    w13_num_shards
+                    * ((intermediate_size_per_partition + block_n - 1) // block_n),
                     (hidden_size + block_k - 1) // block_k,
                     dtype=torch.float32,
                 ),
@@ -220,9 +224,9 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         # INPUT_SCALES
         if self.static_input_scales:
-            assert (
-                self.input_quant.strategy == QuantizationStrategy.TENSOR
-            ), "Only per-tensor quantization is supported for static input scales"
+            assert self.input_quant.strategy == QuantizationStrategy.TENSOR, (
+                "Only per-tensor quantization is supported for static input scales"
+            )
             w13_input_scale = torch.nn.Parameter(
                 torch.ones(num_experts, dtype=torch.float32), requires_grad=False
             )
@@ -297,7 +301,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             max_w13_scales = layer.w13_weight_scale.max(dim=1).values
             for expert_id in range(layer.num_local_experts):
                 start = 0
-                for shard_id in range(2):
+                for shard_id in range(layer.w13_weight_scale.shape[1]):
                     dq_weight = per_tensor_dequantize(
                         layer.w13_weight[expert_id][start : start + shard_size, :],
                         layer.w13_weight_scale[expert_id][shard_id],
@@ -313,18 +317,24 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 max_w13_scales, requires_grad=False
             )
 
-        if self.weight_quant.strategy == QuantizationStrategy.CHANNEL and _use_aiter:
+        if (
+            self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+            and _use_aiter
+            and self.runner.runner_backend.is_aiter()
+        ):
             with torch.no_grad():
                 # Pre-shuffle weights
                 layer.w13_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w13_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w13_weight.is_shuffled = True
                 torch.cuda.empty_cache()
                 layer.w2_weight = torch.nn.Parameter(
                     shuffle_weight(layer.w2_weight.data, (16, 16)),
                     requires_grad=False,
                 )
+                layer.w2_weight.is_shuffled = True
                 torch.cuda.empty_cache()
 
         if (
@@ -349,7 +359,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             if (
                 _use_aiter
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and get_moe_a2a_backend().is_none()
+                and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
@@ -363,8 +373,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            raise ValueError(
+                "compressed-tensors FP8 MoE supports --moe-runner-backend auto, "
+                "aiter, triton, flashinfer_trtllm and flashinfer_trtllm_routed; "
+                f"got {moe_runner_backend.value}."
+            )
 
     def apply_weights(
         self,
@@ -400,7 +413,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     get_activation_type,
                 )
 
-                activation_type = get_activation_type(moe_runner_config.activation)
+                activation_type = get_activation_type(
+                    moe_runner_config.activation,
+                    is_gated=moe_runner_config.is_gated,
+                )
                 quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
@@ -416,27 +432,22 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     activation_type=activation_type,
                 )
             else:
-                quant_info = TritonMoeQuantInfo(
-                    w13_weight=layer.w13_weight,
-                    w2_weight=layer.w2_weight,
-                    use_fp8_w8a8=True,
-                    w13_scale=layer.w13_weight_scale,
-                    w2_scale=layer.w2_weight_scale,
-                    a13_scale=layer.w13_input_scale,
-                    a2_scale=layer.w2_input_scale,
-                    block_shape=self.weight_block_size,
-                )
+                quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
         else:
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8_w8a8=True,
-                per_channel_quant=self.weight_quant.strategy
-                == QuantizationStrategy.CHANNEL,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                a13_scale=layer.w13_input_scale,
-                a2_scale=layer.w2_input_scale,
-            )
-            return self.runner.run(dispatch_output, quant_info)
+            return self.runner.run(dispatch_output, self.get_triton_quant_info(layer))
+
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        # Shared with FusedMoEWithLoRA so both runners use the same base quantization.
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            use_fp8_w8a8=True,
+            per_channel_quant=self.weight_quant.strategy
+            == QuantizationStrategy.CHANNEL,
+            w13_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            a13_scale=layer.w13_input_scale,
+            a2_scale=layer.w2_input_scale,
+            block_shape=self.weight_block_size,
+        )

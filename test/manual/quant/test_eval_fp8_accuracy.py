@@ -2,8 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_ACCURACY_TEST_FP8,
     DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8,
@@ -13,9 +12,6 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
-
-register_cuda_ci(est_time=351, suite="stage-b-test-1-gpu-large")
-register_amd_ci(est_time=600, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestEvalFP8Accuracy(CustomTestCase):
@@ -41,7 +37,7 @@ class TestEvalFP8Accuracy(CustomTestCase):
             temperature=0.1,
         )
 
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         if is_hip():
             # Another threshold for AMD because fp8 dtype is difference
             self.assertGreaterEqual(metrics["score"], 0.60)
@@ -50,7 +46,6 @@ class TestEvalFP8Accuracy(CustomTestCase):
 
 
 class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
-
     def _run_test(self, model, other_args, expected_score):
         base_url = DEFAULT_URL_FOR_TEST
         other_args = other_args or []
@@ -72,7 +67,7 @@ class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
                 temperature=0.1,
             )
 
-            metrics = run_eval(args)
+            metrics = run_sgl_eval(args)
             self.assertGreaterEqual(metrics["score"], expected_score)
         finally:
             kill_process_tree(process.pid)
@@ -91,7 +86,6 @@ class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
             model=DEFAULT_MODEL_NAME_FOR_DYNAMIC_QUANT_ACCURACY_TEST_FP8,
             other_args=["--quantization", "w8a8_fp8"],
             # inference will use sgl kernel w/ online quant override
-            # we observed that the accuracy is higher then offline only
             expected_score=0.64,
         )
 
@@ -100,7 +94,6 @@ class TestEvalFP8DynamicQuantAccuracy(CustomTestCase):
         self._run_test(
             model=DEFAULT_MODEL_NAME_FOR_TEST,
             # inference will use sgl kernel w/ online quantization only
-            # we observed that the accuracy is higher then offline only
             other_args=["--quantization", "w8a8_fp8"],
             expected_score=0.64,
         )

@@ -1,0 +1,154 @@
+{
+  "meta": {
+    "device": "NVIDIA GB300",
+    "device_name": "NVIDIA_GB300",
+    "torch": "2.11.0+cu130",
+    "experts": 896,
+    "latent": 3584,
+    "topk": 16,
+    "inner": 50,
+    "reps": 20
+  },
+  "configs": {
+    "1": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "2": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "3": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "4": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "6": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": true
+    },
+    "8": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "12": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "16": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "24": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "32": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "48": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "64": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "96": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "128": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "192": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "256": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "384": {
+      "block_size": 448,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "512": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "768": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "1024": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "1536": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "2048": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "3072": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "4096": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "6144": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "8192": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "12288": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    },
+    "16384": {
+      "block_size": 224,
+      "cast_vec": 8,
+      "cast_first": false
+    }
+  }
+}

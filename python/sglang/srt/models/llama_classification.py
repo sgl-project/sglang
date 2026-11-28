@@ -25,10 +25,10 @@ from sglang.srt.layers.pooler import (
     score_and_pool,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
-from sglang.srt.utils import add_prefix
 
 
 class LlamaForClassification(nn.Module):
@@ -59,9 +59,9 @@ class LlamaForClassification(nn.Module):
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
     ) -> EmbeddingPoolerOutput:
-        assert (
-            get_embedding
-        ), "LlamaForClassification is only used for embedding. Please add --is-embedding when you launch the server."
+        assert get_embedding, (
+            "LlamaForClassification is only used for embedding. Please add --is-embedding when you launch the server."
+        )
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return score_and_pool(
@@ -83,7 +83,7 @@ class LlamaForClassification(nn.Module):
             elif "lm_head" in name:
                 continue
             else:
-                LlamaForCausalLM.load_weights(self, [(name, loaded_weight)])
+                LlamaForCausalLM._legacy_load_weights(self, [(name, loaded_weight)])
 
 
 EntryClass = LlamaForClassification

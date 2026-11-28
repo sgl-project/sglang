@@ -29,15 +29,28 @@ pip install -e . --no-build-isolation
 
 ## Use LMCache
 
-Firstly, setup LMCache config. An example config is set at `example_config.yaml`. For more settings please refer to https://docs.lmcache.ai/api_reference/configurations.html.
+SGLang uses `LMCacheUnifiedRadixCache` with LMCache's multiprocess connector.
+The standalone LMCache daemon owns the external cache and can survive SGLang
+process restarts. Daemon host and port come from the LMCache YAML config.
 
-Secondly, setup SGLang serving engine with lmcache:
+Terminal 1 — start the LMCache daemon:
 
 ```bash
-export LMCACHE_USE_EXPERIMENTAL=True
-export LMCACHE_CONFIG_FILE=example_config.yaml
+lmcache server \
+  --host 127.0.0.1 --port 5556 \
+  --l1-size-gb 4 \
+  --eviction-policy LRU
+```
 
+Use the bundled `example_config_mp.yaml` (or any YAML setting `mp_host` / `mp_port`):
+
+Terminal 2 — start SGLang:
+
+```bash
 python -m sglang.launch_server \
   --model-path MODEL \
-  --enable-lmcache
+  --enable-lmcache \
+  --lmcache-config-file example_config_mp.yaml
 ```
+
+For full LMCache config options see https://docs.lmcache.ai/api_reference/configurations.html.

@@ -1,11 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
 
+from sglang.srt.runtime_context import is_control_broadcast_local
+from sglang.srt.utils import broadcast_pyobj
+
 from .parallel_state import (
+    GroupCoordinator,
+    get_attn_cp_group,
     get_attn_tp_group,
     get_moe_ep_group,
     get_moe_tp_group,
@@ -38,18 +45,45 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
 
 
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_size: int = 128,
+    emit_bf16: bool = False,
+    transpose_scale: bool = False,
+) -> Optional[Tuple[torch.Tensor, ...]]:
+    """Fused TP all-reduce + RMSNorm + per-group FP8 quant (ROCm/aiter).
+
+    Returns ``(fp8_output, residual_out, per_group_scale)`` by default, or
+    ``(fp8_output, residual_out, per_group_scale, bf16_output)`` when
+    ``emit_bf16=True`` (kernel writes both fp8 and the pre-quantization bf16
+    normed output — no extra kernel). ``None`` when the backend cannot
+    service the request (non-AMD, custom AR disabled, shape unsupported).
+    Callers MUST handle ``None`` by falling back to the separate
+    fused-AR-RMSNorm + per-group-quant path.
+
+    ``transpose_scale=True`` asks the kernel to emit the per-group scale in the
+    column-major layout the gfx95 bpreshuffle GEMM consumes, so callers can skip
+    the post-kernel ``materialize_bpreshuffle_fp8_scale`` transpose.
+    """
+    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
+        input_,
+        residual_inp_,
+        weight_,
+        eps,
+        group_size,
+        emit_bf16=emit_bf16,
+        transpose_scale=transpose_scale,
+    )
+
+
 def tensor_model_parallel_all_gather(
     input_: torch.Tensor, dim: int = -1
 ) -> torch.Tensor:
     """All-gather the input tensor across model parallel group."""
     return get_tp_group().all_gather(input_, dim)
-
-
-def tensor_model_parallel_gather(
-    input_: torch.Tensor, dst: int = 0, dim: int = -1
-) -> Optional[torch.Tensor]:
-    """Gather the input tensor across model parallel group."""
-    return get_tp_group().gather(input_, dst, dim)
 
 
 def broadcast_tensor_dict(
@@ -58,6 +92,54 @@ def broadcast_tensor_dict(
     if not torch.distributed.is_initialized():
         return tensor_dict
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
+
+
+def attn_cp_tp_broadcast_pyobj(data: List[Any]) -> List[Any]:
+    """Broadcast from the (attn-TP 0, attn-CP 0) rank to every rank of its DP shard."""
+    # attn-TP and attn-CP are orthogonal factors of the shard and no single group
+    # covers both. The attn-TP 0 ranks first share it along CP, which makes every
+    # attn-TP group's first rank a source; then each attn-TP group broadcasts it.
+    tp_group = get_attn_tp_group()
+    cp_group = get_attn_cp_group()
+    if cp_group.world_size > 1 and tp_group.rank_in_group == 0:
+        data = broadcast_pyobj(
+            data, cp_group.rank, cp_group.cpu_group, src=cp_group.ranks[0]
+        )
+    if tp_group.world_size > 1:
+        data = broadcast_pyobj(
+            data, tp_group.rank, tp_group.cpu_group, src=tp_group.ranks[0]
+        )
+    return data
+
+
+def _control_request_groups() -> List[GroupCoordinator]:
+    """The groups spanning the ranks that run a control request in the same
+    step: the DP shard under local control broadcast, where each shard receives
+    it in its own step while the others run their per-step DP-attention
+    collectives; the whole TP group otherwise."""
+    if is_control_broadcast_local():
+        return [get_attn_tp_group(), get_attn_cp_group()]
+    return [get_tp_group()]
+
+
+def control_request_barrier() -> None:
+    """Barrier over the ranks that run a control request in the same step."""
+    for group in _control_request_groups():
+        if group.world_size > 1:
+            torch.distributed.barrier(group=group.cpu_group)
+
+
+def control_request_all_gather_object(obj: Any) -> List[Any]:
+    """obj from each rank that runs a control request in the same step, in rank order."""
+    gathered = [obj]
+    for group in _control_request_groups():
+        if group.world_size > 1:
+            per_rank = [None] * group.world_size
+            torch.distributed.all_gather_object(
+                per_rank, gathered, group=group.cpu_group
+            )
+            gathered = [o for rank_objs in per_rank for o in rank_objs]
+    return gathered
 
 
 def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:

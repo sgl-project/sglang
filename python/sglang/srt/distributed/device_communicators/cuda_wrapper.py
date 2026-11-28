@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/cuda_wrapper.py
 
 """This file is a pure Python wrapper for the cudart library.
@@ -7,6 +9,7 @@ convenient for use when we just need to call a few functions.
 
 import ctypes
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -45,24 +48,30 @@ def find_loaded_library(lib_name) -> Optional[str]:
     shared libraries loaded by the process. We can use this file to find the path of the
     a loaded library.
     """  # noqa
-    found = False
+    candidates = []
     with open("/proc/self/maps") as f:
         for line in f:
-            if lib_name in line:
-                found = True
-                break
-    if not found:
+            if lib_name not in line or "/" not in line:
+                continue
+            path = line[line.index("/") :].strip()
+            if path.endswith(" (deleted)"):
+                path = path[: -len(" (deleted)")]
+            filename = os.path.basename(path)
+            if filename.rpartition(".so")[0].startswith(lib_name):
+                candidates.append(path)
+
+    if not candidates:
         # the library is not loaded in the current process
         return None
-    # if lib_name is libcudart, we need to match a line with:
-    # address /path/to/libcudart-hash.so.11.0
-    start = line.index("/")
-    path = line[start:].strip()
-    filename = path.split("/")[-1]
-    assert filename.rpartition(".so")[0].startswith(
-        lib_name
-    ), f"Unexpected filename: {filename} for library {lib_name}"
-    return path
+
+    # TileLang ships a ``libcudart_stub.so`` that is only sufficient for its
+    # JIT loader.  It can precede the actual CUDA runtime in /proc/self/maps;
+    # choosing it makes CUDA IPC and FlashInfer all-reduce fail when resolving
+    # symbols such as cudaDeviceReset.
+    for path in candidates:
+        if "stub" not in os.path.basename(path):
+            return path
+    return candidates[0]
 
 
 class CudaRTLibrary:
@@ -83,6 +92,14 @@ class CudaRTLibrary:
         ),
         # ​cudaError_t 	cudaFree ( void* devPtr )
         Function("cudaFree", cudaError_t, [ctypes.c_void_p]),
+        # cudaError_t cudaHostAlloc ( void** pHost, size_t size, unsigned int flags )
+        Function(
+            "cudaHostAlloc",
+            cudaError_t,
+            [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_uint],
+        ),
+        # cudaError_t cudaFreeHost ( void* ptr )
+        Function("cudaFreeHost", cudaError_t, [ctypes.c_void_p]),
         # ​cudaError_t cudaMemset ( void* devPtr, int  value, size_t count )
         Function(
             "cudaMemset", cudaError_t, [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
@@ -158,6 +175,14 @@ class CudaRTLibrary:
 
     def cudaFree(self, devPtr: ctypes.c_void_p) -> None:
         self.CUDART_CHECK(self.funcs["cudaFree"](devPtr))
+
+    def cudaHostAlloc(self, size: int, flags: int = 0) -> ctypes.c_void_p:
+        ptr = ctypes.c_void_p()
+        self.CUDART_CHECK(self.funcs["cudaHostAlloc"](ctypes.byref(ptr), size, flags))
+        return ptr
+
+    def cudaFreeHost(self, ptr: ctypes.c_void_p) -> None:
+        self.CUDART_CHECK(self.funcs["cudaFreeHost"](ptr))
 
     def cudaMemset(self, devPtr: ctypes.c_void_p, value: int, count: int) -> None:
         self.CUDART_CHECK(self.funcs["cudaMemset"](devPtr, value, count))

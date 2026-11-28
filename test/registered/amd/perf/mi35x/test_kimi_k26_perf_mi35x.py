@@ -8,17 +8,13 @@ existing Kimi-K2.5 MI35x accuracy test (mixed aiter prefill + triton decode).
 
 The model path can be configured via KIMI_K26_MODEL_PATH environment variable.
 
-Registry: nightly-perf-8-gpu-mi35x-kimi-k26 suite
+Registry: nightly-perf-test-8-gpu-amd-mi35x-kimi-k26 suite
 
 Example usage:
     KIMI_K26_MODEL_PATH=moonshotai/Kimi-K2.6 python -m pytest test_kimi_k26_perf_mi35x.py -v
 """
 
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import unittest
 from typing import List
 
@@ -28,11 +24,16 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - Kimi K2.6 perf benchmark on MI35x (~90 min)
-register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-mi35x-kimi-k26", nightly=True)
+register_amd_ci(
+    est_time=5400,
+    suite="nightly-perf-test-8-gpu-amd-mi35x-kimi-k26",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
+)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -62,7 +63,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 
 KIMI_K26_MODEL_PATH = os.environ.get("KIMI_K26_MODEL_PATH", "moonshotai/Kimi-K2.6")
-PROFILE_DIR = "performance_profiles_kimi_k26_mi35x"
+RESULT_DIR = "performance_results_kimi_k26_mi35x"
 
 
 class TestNightlyKimiK26PerformanceMI35x(unittest.TestCase):
@@ -105,8 +106,8 @@ class TestNightlyKimiK26PerformanceMI35x(unittest.TestCase):
             },
         }
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_kimi_k26(self):
@@ -125,7 +126,6 @@ class TestNightlyKimiK26PerformanceMI35x(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,
                 timeout=5400,
             )
             results = result_tuple[0]

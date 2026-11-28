@@ -7,6 +7,7 @@ AST parsing to extract parametrized cases plus standalone files from source.
 """
 
 import argparse
+import ast
 import importlib.util
 import json
 import math
@@ -18,9 +19,14 @@ from diffusion_case_parser import (
     BASELINE_REL_PATH,
     RUN_SUITE_REL_PATH,
     DiffusionSuiteInfo,
+    DiffusionTestCaseVisitor,
     collect_diffusion_suites,
+    pr_model_families,
     resolve_case_config_path,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from hf_repo_scan import RepoIdScanner  # noqa: E402
 
 
 def _load_partitioning_helpers():
@@ -38,7 +44,16 @@ def _load_partitioning_helpers():
 PartitionItem, partition_items_by_lpt = _load_partitioning_helpers()
 
 SUITE_OUTPUT_NAMES = {"1-gpu": "1gpu", "2-gpu": "2gpu", "1-gpu-b200": "b200"}
+
+USE_NPU_CONFIGS = os.getenv("USE_NPU_CONFIGS", "0").lower() in ("1", "true")
+
+if USE_NPU_CONFIGS:
+    SUITE_OUTPUT_NAMES = {"1-npu": "1npu", "2-npu": "2npu"}
+
 DEFAULT_STANDALONE_EST_TIME_SECONDS = 300.0
+
+# The directory diffusion_suite_runner.py resolves standalone files against.
+STANDALONE_DIR_REL_PATH = "python/sglang/multimodal_gen/test/server"
 
 
 def validate_suite_case_coverage(suites: dict[str, DiffusionSuiteInfo]) -> None:
@@ -84,9 +99,10 @@ def compute_partition_count(
         fallback_count = math.ceil(total_time_seconds / target_time_seconds)
         return max(1, min(fallback_count, max_partitions))
 
-    preferred_count = math.ceil(total_time_seconds / target_time_seconds)
-    preferred_count = max(1, min(preferred_count, max_partitions))
-    return max(min_partition_count, min(preferred_count, max_partition_count))
+    return min(
+        range(min_partition_count, max_partition_count + 1),
+        key=lambda count: abs(total_time_seconds / count - target_time_seconds),
+    )
 
 
 def build_partition_items(
@@ -115,6 +131,31 @@ def build_partition_items(
     return items
 
 
+def item_repo_ids(
+    repo_root: Path, case_config_path: Path, standalone_files: set[str]
+) -> dict[str, set[str]]:
+    """`item_id -> Hugging Face repo ids` for the cases ``case_config_path``
+    builds and for ``standalone_files``."""
+    scanner = RepoIdScanner(str(repo_root))
+    tree = ast.parse(case_config_path.read_text(encoding="utf-8"))
+    visitor = DiffusionTestCaseVisitor()
+    visitor.visit(tree)
+    table = scanner.module_repo_ids(str(case_config_path), tree)
+    found = {
+        case_id: set().union(*(scanner.node_repo_ids(call, table) for call in calls))
+        for case_id, calls in visitor.case_calls.items()
+    }
+    for standalone_file in standalone_files:
+        path = os.path.normpath(repo_root / STANDALONE_DIR_REL_PATH / standalone_file)
+        found[standalone_file] = scanner.file_repo_ids(os.path.relpath(path, repo_root))
+    # The NVFP4 pipeline loads its shared components from a second Hub repo.
+    # Only partitions that load the Comfy checkpoint need to prefetch it.
+    for repos in found.values():
+        if "Comfy-Org/Ideogram-4" in repos:
+            repos.add("ideogram-ai/ideogram-4-fp8")
+    return found
+
+
 def build_matrix(partition_count: int) -> dict:
     if partition_count <= 0:
         return {"include": []}
@@ -124,6 +165,7 @@ def build_matrix(partition_count: int) -> dict:
 def build_partition_plan(
     suite_name: str,
     partitions: list[list[PartitionItem]],
+    repo_ids: dict[str, set[str]],
 ) -> dict:
     return {
         "suite": suite_name,
@@ -141,13 +183,16 @@ def build_partition_plan(
                     if item.kind == "standalone" and item.used_fallback_estimate
                 ],
                 "estimated_time": round(sum(item.est_time for item in partition), 1),
+                "repo_ids": sorted(
+                    set().union(*(repo_ids.get(item.item_id, ()) for item in partition))
+                ),
             }
             for idx, partition in enumerate(partitions)
         ],
     }
 
 
-def output_github_value(name: str, value: dict) -> None:
+def output_github_value(name: str, value: dict | tuple[str, ...]) -> None:
     value_json = json.dumps(value, separators=(",", ":"))
     github_output = os.environ.get("GITHUB_OUTPUT")
     if github_output:
@@ -192,7 +237,7 @@ def print_suite_summary(
         )
         for standalone_file in suite_info.missing_standalone_estimates:
             print(f"    - {standalone_file}")
-    print(f"  Total estimated time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print(f"  Total estimated time: {total_time:.1f}s ({total_time / 60:.1f} min)")
     print(f"  Selected partitions: {len(partitions)}")
     print()
 
@@ -201,7 +246,7 @@ def print_suite_summary(
         partition_time = sum(item.est_time for item in partition)
         print(f"    Partition {idx}:")
         print(
-            f"      Estimated time: {partition_time:.1f}s ({partition_time/60:.1f} min)"
+            f"      Estimated time: {partition_time:.1f}s ({partition_time / 60:.1f} min)"
         )
         for item in partition:
             fallback_suffix = (
@@ -249,6 +294,11 @@ def main():
         action="store_true",
         help="Only partition DiffusionTestCase parametrized cases.",
     )
+    parser.add_argument(
+        "--case-ids",
+        nargs="*",
+        help="Only schedule partitions containing these parametrized case IDs.",
+    )
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -261,22 +311,59 @@ def main():
         print(f"Error: Run suite not found: {run_suite_path}")
         sys.exit(1)
     try:
-        case_config_path = resolve_case_config_path(repo_root, run_suite_path)
+        if USE_NPU_CONFIGS:
+            case_config_path = (
+                repo_root
+                / "python/sglang/multimodal_gen/test/server/ascend/testcase_configs_npu.py"
+            )
+        else:
+            case_config_path = resolve_case_config_path(repo_root, run_suite_path)
     except (RuntimeError, FileNotFoundError) as exc:
         print(f"Error: {exc}")
         sys.exit(1)
 
+    families = ()
+    changed_files = os.environ.get("DIFFUSION_PR_FILES")
+    if changed_files and not args.case_ids and not USE_NPU_CONFIGS:
+        families = tuple(
+            sorted(pr_model_families(json.loads(Path(changed_files).read_text())))
+        )
+    output_github_value("h100-pr-families", families)
     suites = collect_diffusion_suites(
-        case_config_path,
-        run_suite_path,
-        baseline_path,
+        case_config_path, baseline_path, pr_families=families
     )
     validate_suite_case_coverage(suites)
 
+    # A scan problem leaves the prefetch without a list, never fails the plan.
+    try:
+        repo_ids = item_repo_ids(
+            repo_root,
+            case_config_path,
+            {f for info in suites.values() for f in info.standalone_files},
+        )
+    except Exception as exc:
+        print(f"::warning::cannot scan the diffusion cases for repo ids: {exc}")
+        repo_ids = {}
+
+    requested_case_ids = set(args.case_ids or [])
+    if requested_case_ids:
+        known_case_ids = {
+            case.case_id
+            for suite_name, suite_info in suites.items()
+            if suite_name in SUITE_OUTPUT_NAMES
+            for case in suite_info.cases
+        }
+        unknown_case_ids = sorted(requested_case_ids - known_case_ids)
+        if unknown_case_ids:
+            print(f"Error: Unknown case IDs: {' '.join(unknown_case_ids)}")
+            sys.exit(1)
+
     print("=== Diffusion Partition Computation ===")
-    print(f"Min partition time: {args.min_time}s ({args.min_time/60:.1f} min)")
-    print(f"Target partition time: {args.target_time}s ({args.target_time/60:.1f} min)")
-    print(f"Max partition time: {args.max_time}s ({args.max_time/60:.1f} min)")
+    print(f"Min partition time: {args.min_time}s ({args.min_time / 60:.1f} min)")
+    print(
+        f"Target partition time: {args.target_time}s ({args.target_time / 60:.1f} min)"
+    )
+    print(f"Max partition time: {args.max_time}s ({args.max_time / 60:.1f} min)")
     print()
 
     for suite_name, suite_info in suites.items():
@@ -304,10 +391,23 @@ def main():
         )
 
         output_name = SUITE_OUTPUT_NAMES[suite_name]
-        output_github_value(f"matrix-{output_name}", build_matrix(partition_count))
+        matrix = build_matrix(partition_count)
+        if requested_case_ids:
+            matrix = {
+                "include": [
+                    {"part": idx}
+                    for idx, partition in enumerate(partitions)
+                    if any(
+                        item.kind == "case" and item.item_id in requested_case_ids
+                        for item in partition
+                    )
+                ]
+            }
+        output_github_value(f"matrix-{output_name}", matrix)
         output_github_scalar(f"partition-count-{output_name}", str(partition_count))
         output_github_value(
-            f"plan-{output_name}", build_partition_plan(suite_name, partitions)
+            f"plan-{output_name}",
+            build_partition_plan(suite_name, partitions, repo_ids),
         )
 
 

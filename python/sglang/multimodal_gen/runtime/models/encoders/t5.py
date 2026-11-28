@@ -30,7 +30,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, T5Config
-from sglang.multimodal_gen.runtime.distributed import _get_folding_tp_group
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -43,8 +42,11 @@ from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
-from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
+from sglang.multimodal_gen.runtime.loader.weight_utils import load_stacked_weight
+from sglang.multimodal_gen.runtime.models.encoders.base import (
+    TextEncoder,
+    get_folding_tp_group,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
@@ -58,10 +60,6 @@ class AttentionType:
     DECODER = "decoder"
     # Encoder attention between previous layer Q/K/V for encoder-decoder
     ENCODER = "encoder"
-    # Encoder attention between previous layer Q/K/V
-    ENCODER_ONLY = "encoder_only"
-    # Attention between dec. Q and enc. K/V for encoder-decoder
-    ENCODER_DECODER = "encoder_decoder"
 
 
 @dataclass
@@ -69,13 +67,36 @@ class AttentionMetadata:
     attn_bias: torch.Tensor
 
 
-class T5DenseActDense(nn.Module):
+class T5LayerNorm(nn.Module):
+    """T5 RMS norm in plain PyTorch, as in HF / the Wan reference: fp32 statistics,
+    cast to the weight dtype, then scale. Runs on any device."""
 
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states * torch.rsqrt(
+            hidden_states.float().pow(2).mean(dim=-1, keepdim=True) + self.eps
+        )
+        if self.weight.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(self.weight.dtype)
+        return self.weight * hidden_states
+
+
+def _t5_layer_norm(config: T5Config) -> nn.Module:
+    if getattr(config, "reference_layer_norm", False):
+        return T5LayerNorm(config.d_model, eps=config.layer_norm_epsilon)
+    return RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+
+
+class T5DenseActDense(nn.Module):
     def __init__(
         self, config: T5Config, quant_config: QuantizationConfig | None = None
     ):
         super().__init__()
-        tp_group = _get_folding_tp_group(config)
+        tp_group = get_folding_tp_group(config)
         self.wi = MergedColumnParallelLinear(
             config.d_model, [config.d_ff], bias=False, tp_group=tp_group
         )
@@ -96,12 +117,11 @@ class T5DenseActDense(nn.Module):
 
 
 class T5DenseGatedActDense(nn.Module):
-
     def __init__(
         self, config: T5Config, quant_config: QuantizationConfig | None = None
     ):
         super().__init__()
-        tp_group = _get_folding_tp_group(config)
+        tp_group = get_folding_tp_group(config)
         self.wi_0 = MergedColumnParallelLinear(
             config.d_model,
             [config.d_ff],
@@ -136,7 +156,6 @@ class T5DenseGatedActDense(nn.Module):
 
 
 class T5LayerFF(nn.Module):
-
     def __init__(
         self, config: T5Config, quant_config: QuantizationConfig | None = None
     ):
@@ -148,7 +167,7 @@ class T5LayerFF(nn.Module):
         else:
             self.DenseReluDense = T5DenseActDense(config, quant_config=quant_config)
 
-        self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.layer_norm = _t5_layer_norm(config)
 
     def forward(self, hidden_states) -> torch.Tensor:
         forwarded_states = self.layer_norm(hidden_states)
@@ -159,10 +178,6 @@ class T5LayerFF(nn.Module):
 
 # T5 has attn_bias and does not use softmax scaling
 class T5MultiHeadAttention(nn.Module):
-
-    def __init__(self) -> None:
-        super().__init__()
-
     def forward(self, q, k, v, attn_bias=None):
         b, _, n, c = q.shape
         attn = torch.einsum("binc,bjnc->bnij", q, k)
@@ -176,7 +191,6 @@ class T5MultiHeadAttention(nn.Module):
 
 
 class T5Attention(nn.Module):
-
     def __init__(
         self,
         config: T5Config,
@@ -197,7 +211,7 @@ class T5Attention(nn.Module):
         self.total_num_heads = self.total_num_kv_heads = config.num_heads
 
         # Partition heads across multiple tensor parallel GPUs.
-        self.tp_group = _get_folding_tp_group(config)
+        self.tp_group = get_folding_tp_group(config)
         self.tp_world_size = get_group_size(self.tp_group)
         assert config.num_heads % self.tp_world_size == 0
         self.n_heads = config.num_heads // self.tp_world_size
@@ -376,7 +390,6 @@ class T5Attention(nn.Module):
 
 
 class T5LayerSelfAttention(nn.Module):
-
     def __init__(
         self,
         config,
@@ -392,7 +405,7 @@ class T5LayerSelfAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.SelfAttention",
         )
-        self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.layer_norm = _t5_layer_norm(config)
 
     def forward(
         self,
@@ -413,47 +426,15 @@ class T5LayerSelfAttention(nn.Module):
         return hidden_states
 
 
-class T5LayerCrossAttention(nn.Module):
-
-    def __init__(
-        self, config, quant_config: QuantizationConfig | None = None, prefix: str = ""
-    ):
-        super().__init__()
-        self.EncDecAttention = T5Attention(
-            config,
-            AttentionType.ENCODER_DECODER,
-            has_relative_attention_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.EncDecAttention",
-        )
-        self.layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
-        normed_hidden_states = self.layer_norm(hidden_states)
-        attention_output = self.EncDecAttention(
-            hidden_states=normed_hidden_states,
-            attn_metadata=attn_metadata,
-        )
-        hidden_states = hidden_states + attention_output
-        return hidden_states
-
-
 class T5Block(nn.Module):
-
     def __init__(
         self,
         config: T5Config,
-        is_decoder: bool,
         has_relative_attention_bias=False,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ):
         super().__init__()
-        self.is_decoder = is_decoder
         self.layer = nn.ModuleList()
         self.layer.append(
             T5LayerSelfAttention(
@@ -463,13 +444,6 @@ class T5Block(nn.Module):
                 prefix=f"{prefix}.self_attn",
             )
         )
-
-        if self.is_decoder:
-            self.layer.append(
-                T5LayerCrossAttention(
-                    config, quant_config=quant_config, prefix=f"{prefix}.cross_attn"
-                )
-            )
 
         self.layer.append(T5LayerFF(config, quant_config=quant_config))
 
@@ -491,11 +465,6 @@ class T5Block(nn.Module):
             attn_metadata=attn_metadata,
         )
 
-        if self.is_decoder:
-            hidden_states = self.layer[1](
-                hidden_states=hidden_states, attn_metadata=attn_metadata
-            )
-
         # Apply Feed Forward layer
         hidden_states = self.layer[-1](hidden_states)
 
@@ -503,11 +472,9 @@ class T5Block(nn.Module):
 
 
 class T5Stack(nn.Module):
-
     def __init__(
         self,
         config: T5Config,
-        is_decoder: bool,
         n_layers: int,
         embed_tokens=None,
         quant_config: QuantizationConfig | None = None,
@@ -516,13 +483,11 @@ class T5Stack(nn.Module):
     ):
         super().__init__()
         self.embed_tokens = embed_tokens
-        self.is_umt5 = is_umt5
         if is_umt5:
             self.block = nn.ModuleList(
                 [
                     T5Block(
                         config,
-                        is_decoder=is_decoder,
                         has_relative_attention_bias=True,
                         quant_config=quant_config,
                         prefix=f"{prefix}.blocks.{i}",
@@ -536,7 +501,6 @@ class T5Stack(nn.Module):
                 [
                     T5Block(
                         config,
-                        is_decoder=is_decoder,
                         has_relative_attention_bias=i == 0,
                         quant_config=quant_config,
                         prefix=f"{prefix}.blocks.{i}",
@@ -544,7 +508,7 @@ class T5Stack(nn.Module):
                     for i in range(n_layers)
                 ]
             )
-        self.final_layer_norm = RMSNorm(config.d_model, eps=config.layer_norm_epsilon)
+        self.final_layer_norm = _t5_layer_norm(config)
 
     def forward(
         self,
@@ -566,12 +530,17 @@ class T5Stack(nn.Module):
 
 
 class T5EncoderModel(TextEncoder):
+    # encoder-only: no tied lm_head, the table is reached only by its gather
+    host_resident_table_names = ["shared"]
+    # dp measured here: 1.9x on the encode stage at batch 2/4/8
+    # (2xH100, T5-XXL width), max_abs_diff=0 vs replicated
+    supports_dp_encode = True
 
     def __init__(self, config: T5Config, prefix: str = ""):
         super().__init__(config)
 
         quant_config = None
-        tp_group = _get_folding_tp_group(config)
+        tp_group = get_folding_tp_group(config)
         self.shared = VocabParallelEmbedding(
             config.vocab_size,
             config.d_model,
@@ -581,7 +550,6 @@ class T5EncoderModel(TextEncoder):
 
         self.encoder = T5Stack(
             config,
-            False,
             config.num_layers,
             self.shared,
             quant_config=quant_config,
@@ -620,47 +588,28 @@ class T5EncoderModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            loaded = False
             if "decoder" in name or "lm_head" in name:
                 continue
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded = True
-                break
-            if not loaded:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            name = load_stacked_weight(
+                name, loaded_weight, params_dict, stacked_params_mapping
+            )
+            if name is not None:
+                loaded_params.add(name)
         return loaded_params
 
 
 class UMT5EncoderModel(TextEncoder):
+    # encoder-only: no tied lm_head, the table is reached only by its gather
+    host_resident_table_names = ["shared"]
+    # dp measured here: 1.9x on the encode stage at batch 2/4/8
+    # (2xH100, T5-XXL width), max_abs_diff=0 vs replicated
+    supports_dp_encode = True
 
     def __init__(self, config: T5Config, prefix: str = ""):
         super().__init__(config)
 
         quant_config = None
-        tp_group = _get_folding_tp_group(config)
+        tp_group = get_folding_tp_group(config)
         self.shared = VocabParallelEmbedding(
             config.vocab_size,
             config.d_model,
@@ -670,7 +619,6 @@ class UMT5EncoderModel(TextEncoder):
 
         self.encoder = T5Stack(
             config,
-            False,
             config.num_layers,
             self.shared,
             quant_config=quant_config,
@@ -706,41 +654,42 @@ class UMT5EncoderModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            loaded = False
+            # Wan-native UMT5 checkpoint keys, remapped to this module's names.
+            if name.startswith("token_embedding."):
+                name = name.replace("token_embedding.weight", "shared.weight")
+            elif name == "norm.weight":
+                name = "encoder.final_layer_norm.weight"
+            elif name.startswith("blocks."):
+                name = name.replace("blocks.", "encoder.block.", 1)
+                name = name.replace(".norm1.weight", ".layer.0.layer_norm.weight")
+                name = name.replace(".attn.q.weight", ".layer.0.SelfAttention.q.weight")
+                name = name.replace(".attn.k.weight", ".layer.0.SelfAttention.k.weight")
+                name = name.replace(".attn.v.weight", ".layer.0.SelfAttention.v.weight")
+                name = name.replace(".attn.o.weight", ".layer.0.SelfAttention.o.weight")
+                name = name.replace(".norm2.weight", ".layer.1.layer_norm.weight")
+                name = name.replace(
+                    ".ffn.gate.0.weight", ".layer.1.DenseReluDense.wi_0.weight"
+                )
+                name = name.replace(
+                    ".ffn.fc1.weight", ".layer.1.DenseReluDense.wi_1.weight"
+                )
+                name = name.replace(
+                    ".ffn.fc2.weight", ".layer.1.DenseReluDense.wo.weight"
+                )
+                name = name.replace(
+                    ".pos_embedding.embedding.weight",
+                    ".layer.0.SelfAttention.relative_attention_bias.weight",
+                )
             if "decoder" in name or "lm_head" in name:
                 continue
-            for (
-                param_name,
-                weight_name,
-                shard_id,
-            ) in self.config.arch_config.stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                loaded = True
-                break
-            if not loaded:
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                if name not in params_dict:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+            name = load_stacked_weight(
+                name,
+                loaded_weight,
+                params_dict,
+                self.config.arch_config.stacked_params_mapping,
+            )
+            if name is not None:
+                loaded_params.add(name)
         return loaded_params
 
 

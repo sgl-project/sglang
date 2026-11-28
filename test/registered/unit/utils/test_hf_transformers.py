@@ -1,30 +1,740 @@
-"""Unit tests for the sglang.srt.utils.hf_transformers subpackage.
+"""Unit tests for the sglang.srt.hf_transformers subpackage.
 
 Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
 """
 
+import copy
+import inspect
+import io
+import json
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
+import numpy as np
+import torch
+from PIL import Image
 from transformers import PretrainedConfig
+from transformers.image_processing_backends import PilBackend
+from transformers.image_processing_utils import BaseImageProcessor
 
-from sglang.srt.utils.hf_transformers.common import (
+import sglang.srt.hf_transformers.config as config_utils
+import sglang.srt.hf_transformers.processor as processor_utils
+import sglang.srt.hf_transformers.tokenizer as tokenizer_utils
+from sglang.srt.configs.longcat_flash import LongcatFlashConfig
+from sglang.srt.configs.speculators import (
+    normalize_speculators_qwen3_dense_dspark_config,
+)
+from sglang.srt.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
     _patch_text_config,
+    attach_additional_stop_token_ids,
     check_gguf_file,
     get_context_length,
     get_hf_text_config,
     get_rope_config,
+    resolve_hf_gguf_reference,
 )
-from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.hf_transformers.config import (
+    _apply_gemma4_attention_overrides,
+    get_config,
+)
+from sglang.srt.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.speculative.dspark_components.dspark_config import (
+    parse_dspark_draft_config,
+    resolve_runtime_config,
+)
+from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+
+
+class TestSpeculatorsDsparkConfig(CustomTestCase):
+    @staticmethod
+    def _raw_config():
+        # Small synthetic decoder, with the published GLM DSpark window/layer
+        # convention. Target feature count and draft depth are independent;
+        # Qwen3 also permits an explicit head_dim != hidden_size / head count.
+        return {
+            "architectures": ["DSparkDraftModel"],
+            "auto_map": {"": "config.DSparkSpeculatorConfig"},
+            "speculators_model_type": "dspark",
+            "dtype": "bfloat16",
+            "block_size": 8,
+            "aux_hidden_state_layer_ids": [8, 23, 39, 55, 70],
+            "draft_vocab_size": 128,
+            "mask_token_id": 127,
+            "markov_rank": 4,
+            "markov_head_type": "vanilla",
+            "enable_confidence_head": True,
+            "confidence_head_with_markov": True,
+            "target_hidden_size": None,
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 3,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "vocab_size": 128,
+                "max_position_embeddings": 128,
+                "rope_parameters": {
+                    "rope_theta": 8000000,
+                    "rope_type": "default",
+                },
+                "layer_types": ["full_attention"] * 3,
+                "tie_word_embeddings": False,
+            },
+        }
+
+    def _load_local_config(self, raw):
+        with tempfile.TemporaryDirectory() as model_dir:
+            config_path = Path(model_dir) / "config.json"
+            original = json.dumps(raw)
+            config_path.write_text(original)
+            config = get_config(
+                model_dir,
+                trust_remote_code=False,
+                model_config_parser="hf",
+                local_files_only=True,
+            )
+            self.assertEqual(config_path.read_text(), original)
+            return config
+
+    def test_raw_checkpoint_reaches_dspark_runtime_with_capture_convention(self):
+        """A nested decoder previously had no HF model_type and failed to load;
+        merely flattening it must not leave target capture shifted by one.
+        """
+        raw = self._raw_config()
+        config = self._load_local_config(raw)
+        draft = parse_dspark_draft_config(draft_hf_config=config)
+        runtime = resolve_runtime_config(
+            draft_hf_config=config,
+            speculative_num_draft_tokens=None,
+            target_vocab_size=128,
+        )
+
+        self.assertEqual(config.architectures, ["DSparkDraftModel"])
+        self.assertEqual(config.model_type, "qwen3")
+        self.assertEqual(config.hidden_size, 32)
+        self.assertEqual(config.head_dim, 32)
+        self.assertEqual(get_rope_config(config)[0], 8000000)
+        self.assertIn(str(config.dtype), ("bfloat16", "torch.bfloat16"))
+        self.assertEqual(draft.num_hidden_layers, 3)
+        self.assertEqual(draft.target_layer_ids, [7, 22, 38, 54, 69])
+        self.assertEqual((draft.markov_rank, draft.markov_head_type), (4, "vanilla"))
+        self.assertEqual((runtime.gamma, runtime.verify_num_draft_tokens), (8, 9))
+        self.assertEqual(runtime.mask_token_id, 127)
+        self.assertTrue(config.enable_confidence_head)
+        self.assertTrue(config.confidence_head_with_markov)
+        self.assertEqual(
+            config.layer_types, raw["transformer_layer_config"]["layer_types"]
+        )
+        # Saving the translated HF config retains both canonical and native
+        # IDs; reloading it must not apply the offset to the native IDs again.
+        reloaded = self._load_local_config(config.to_dict())
+        self.assertEqual(reloaded.target_layer_ids, [7, 22, 38, 54, 69])
+
+    def test_conflicts_and_invalid_capture_ids_fail_before_loading(self):
+        """Competing aliases must not silently override trained tensor or layer
+        semantics; bool/float IDs must not be truncated into valid layer IDs.
+        """
+        overrides = [
+            {"hidden_size": 64},
+            {"target_layer_ids": [8, 23, 39, 55, 70]},
+            {"dflash_config": {"block_size": 9}},
+            {"dspark_target_layer_ids": [0]},
+            {"aux_hidden_state_layer_ids": []},
+            {"aux_hidden_state_layer_ids": [0, 2]},
+            {"aux_hidden_state_layer_ids": [True, 2]},
+            {"aux_hidden_state_layer_ids": [1.5, 2]},
+            {"aux_hidden_state_layer_ids": [2, 2]},
+            {"aux_hidden_state_layer_ids": [5, 2]},
+            {"mask_token_id": -1},
+            {"draft_vocab_size": 64},
+            {"target_hidden_size": 64},
+        ]
+        for override in overrides:
+            with self.subTest(override=override):
+                raw = self._raw_config()
+                raw.update(override)
+                with self.assertRaises(ValueError):
+                    normalize_speculators_qwen3_dense_dspark_config(raw)
+
+    def test_normalization_preserves_source_and_does_not_shift_ids_twice(self):
+        """Retained canonical IDs must not trigger another -1 on reload, and
+        editing an in-memory normalized config must not rewrite its source.
+        """
+        raw = self._raw_config()
+        raw.pop("speculators_model_type")
+        raw["aux_hidden_state_layer_ids"] = [2, 5]
+        raw["target_hidden_size"] = 32
+        original = copy.deepcopy(raw)
+
+        normalized = normalize_speculators_qwen3_dense_dspark_config(raw)
+        self.assertEqual(normalized["target_layer_ids"], [1, 4])
+        self.assertIsNone(normalize_speculators_qwen3_dense_dspark_config(normalized))
+        self.assertEqual(raw, original)
+
+        normalized["layer_types"][0] = "changed"
+        normalized["aux_hidden_state_layer_ids"][0] = 99
+        self.assertEqual(raw, original)
+
+    def test_null_nested_aliases_preserve_canonical_runtime_values(self):
+        """Optional null aliases must not hide capture IDs or runtime settings
+        in readers that use dict.get(key, canonical_value).
+        """
+        for section, name in (
+            ("dflash_config", "target_layer_ids"),
+            ("dflash_config", "block_size"),
+            ("dspark_config", "mask_token_id"),
+            ("dspark_config", "markov_rank"),
+            ("dspark_config", "markov_head_type"),
+        ):
+            with self.subTest(section=section, name=name):
+                raw = self._raw_config()
+                raw[section] = {name: None}
+                original = copy.deepcopy(raw)
+
+                normalized = normalize_speculators_qwen3_dense_dspark_config(raw)
+                self.assertNotIn(name, normalized[section])
+                self.assertEqual(raw, original)
+
+                config = self._load_local_config(raw)
+                reloaded = self._load_local_config(config.to_dict())
+                for loaded in (config, reloaded):
+                    draft = parse_dspark_draft_config(draft_hf_config=loaded)
+                    runtime = resolve_runtime_config(
+                        draft_hf_config=loaded,
+                        speculative_num_draft_tokens=None,
+                        target_vocab_size=128,
+                    )
+                    self.assertEqual(draft.target_layer_ids, [7, 22, 38, 54, 69])
+                    self.assertEqual(draft.markov_rank, 4)
+                    self.assertEqual(draft.markov_head_type, "vanilla")
+                    self.assertEqual(runtime.gamma, 8)
+                    self.assertEqual(runtime.verify_num_draft_tokens, 9)
+                    self.assertEqual(runtime.mask_token_id, 127)
+
+    def test_native_hf_and_flat_dspark_keep_their_existing_contract(self):
+        """The new nested-schema reader must not hijack ordinary HF configs or
+        subtract one from already-native DSpark target_layer_ids.
+        """
+        native = self._raw_config()["transformer_layer_config"]
+        native["architectures"] = ["Qwen3ForCausalLM"]
+        flat = self._raw_config()
+        flat.update(flat.pop("transformer_layer_config"))
+        flat.pop("aux_hidden_state_layer_ids")
+        flat["target_layer_ids"] = [4, 1]
+
+        for raw in (native, flat):
+            with self.subTest(architecture=raw["architectures"]):
+                original = copy.deepcopy(raw)
+                self.assertIsNone(normalize_speculators_qwen3_dense_dspark_config(raw))
+                self.assertEqual(raw, original)
+                config = self._load_local_config(raw)
+                self.assertEqual(config.architectures, raw["architectures"])
+                self.assertEqual(config.num_hidden_layers, 3)
+                self.assertEqual(config.head_dim, 32)
+                if raw is flat:
+                    draft = parse_dspark_draft_config(draft_hf_config=config)
+                    self.assertEqual(draft.target_layer_ids, [4, 1])
+                    self.assertEqual(draft.gamma, 8)
+
+    def test_other_architectures_keep_native_config_loading_with_nested_metadata(self):
+        """The nested field name alone must not activate DSpark conversion.
+
+        Calls still use the real HF loader; the spy records forwarded options
+        without supplying a replacement configuration.
+        """
+        for model_type, architecture in (
+            ("llama", "LlamaForCausalLM"),
+            ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+            ("qwen3", "Qwen3ForCausalLM"),
+        ):
+            for nested in (None, {"model_type": "other", "hidden_size": 999}):
+                with self.subTest(architecture=architecture, nested=nested):
+                    raw = self._raw_config()["transformer_layer_config"]
+                    raw.update(
+                        model_type=model_type,
+                        architectures=[architecture],
+                        transformer_layer_config=nested,
+                        speculators_model_type="other",
+                    )
+                    original = copy.deepcopy(raw)
+                    self.assertIsNone(
+                        normalize_speculators_qwen3_dense_dspark_config(raw)
+                    )
+                    self.assertEqual(raw, original)
+
+                    with tempfile.TemporaryDirectory() as model_dir:
+                        config_path = Path(model_dir) / "config.json"
+                        contents = json.dumps(raw)
+                        config_path.write_text(contents)
+                        with patch.object(
+                            config_utils.AutoConfig,
+                            "from_pretrained",
+                            wraps=config_utils.AutoConfig.from_pretrained,
+                        ) as load:
+                            config = get_config(
+                                model_dir,
+                                trust_remote_code=False,
+                                revision="local-revision",
+                                model_config_parser="hf",
+                                local_files_only=True,
+                                max_position_embeddings=256,
+                            )
+                        load.assert_called_once_with(
+                            model_dir,
+                            trust_remote_code=False,
+                            revision="local-revision",
+                            local_files_only=True,
+                            max_position_embeddings=256,
+                        )
+                        self.assertEqual(config_path.read_text(), contents)
+                    self.assertEqual(config.model_type, model_type)
+                    self.assertEqual(config.architectures, [architecture])
+                    self.assertEqual(config.transformer_layer_config, nested)
+                    self.assertEqual(config.speculators_model_type, "other")
+                    self.assertEqual(config.hidden_size, 32)
+                    self.assertEqual(config.max_position_embeddings, 256)
+
+    def test_longcat_keeps_its_existing_config_dispatch_with_nested_metadata(self):
+        """Adding a DSpark reader must retain Longcat's custom HF dispatch."""
+        for architecture in (
+            "LongcatCausalLM",
+            "LongcatFlashForCausalLM",
+            "LongcatFlashNgramForCausalLM",
+        ):
+            with self.subTest(architecture=architecture):
+                raw = {
+                    "architectures": [architecture],
+                    "model_type": "longcat_flash",
+                    "hidden_size": 32,
+                    "num_hidden_layers": 3,
+                    "transformer_layer_config": {"format": "unrelated"},
+                }
+                with tempfile.TemporaryDirectory() as model_dir:
+                    config_path = Path(model_dir) / "config.json"
+                    contents = json.dumps(raw)
+                    config_path.write_text(contents)
+                    with (
+                        patch.object(
+                            LongcatFlashConfig,
+                            "from_pretrained",
+                            wraps=LongcatFlashConfig.from_pretrained,
+                        ) as load,
+                        patch.object(
+                            config_utils.AutoConfig,
+                            "from_pretrained",
+                            wraps=config_utils.AutoConfig.from_pretrained,
+                        ) as auto_load,
+                    ):
+                        config = get_config(
+                            model_dir,
+                            trust_remote_code=False,
+                            revision="local-revision",
+                            model_config_parser="hf",
+                            local_files_only=True,
+                        )
+                    # The parser also reloads registered configs later. Check
+                    # the first dispatch, without changing that existing flow.
+                    self.assertEqual(load.call_args_list[0].args, (model_dir,))
+                    self.assertEqual(
+                        load.call_args_list[0].kwargs,
+                        {"revision": "local-revision", "local_files_only": True},
+                    )
+                    auto_load.assert_not_called()
+                    self.assertEqual(config_path.read_text(), contents)
+                self.assertIsInstance(config, LongcatFlashConfig)
+                # The existing parser canonicalizes all three Longcat names.
+                self.assertEqual(config.architectures, ["LongcatFlashForCausalLM"])
+                self.assertEqual(config.model_type, "longcat_flash")
+                self.assertEqual(config.hidden_size, 32)
+                self.assertEqual(config.num_hidden_layers, 3)
+                self.assertEqual(
+                    config.transformer_layer_config, raw["transformer_layer_config"]
+                )
+
+
+# ---------------------------------------------------------------------------
+# get_processor
+# ---------------------------------------------------------------------------
+
+
+class TestGetProcessor(CustomTestCase):
+    def test_applies_v5_bos_eos_fix_to_processor_tokenizer(self):
+        class ProcessorTokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self._add_bos_token = False
+                self._add_eos_token = False
+                self.update_post_processor_calls = 0
+
+            @property
+            def add_bos_token(self):
+                return self._add_bos_token
+
+            @property
+            def add_eos_token(self):
+                return self._add_eos_token
+
+            def update_post_processor(self):
+                self.update_post_processor_calls += 1
+
+        with tempfile.TemporaryDirectory() as model_path:
+            Path(model_path, "tokenizer_config.json").write_text(
+                json.dumps(
+                    {
+                        "tokenizer_class": "GemmaTokenizer",
+                        "add_bos_token": True,
+                        "add_eos_token": False,
+                    }
+                )
+            )
+            config = SimpleNamespace(model_type="test_vlm", auto_map={})
+            tokenizer = ProcessorTokenizer()
+            loaded_processor = SimpleNamespace(tokenizer=tokenizer)
+            auto_config = MagicMock()
+            auto_config.from_pretrained.return_value = config
+            auto_processor = MagicMock()
+            auto_processor.from_pretrained.return_value = loaded_processor
+
+            with patch.multiple(
+                processor_utils,
+                AutoConfig=auto_config,
+                AutoProcessor=auto_processor,
+                _install_tokenizer_warnings_filter=MagicMock(),
+                patch_mistral_common_tokenizer=MagicMock(),
+                _fix_special_tokens_pattern=MagicMock(),
+                _fix_added_tokens_encoding=MagicMock(),
+                attach_additional_stop_token_ids=MagicMock(),
+            ):
+                processor = processor_utils.get_processor(model_path)
+
+        self.assertIs(processor, loaded_processor)
+        self.assertTrue(tokenizer.add_bos_token)
+        self.assertFalse(tokenizer.add_eos_token)
+        self.assertEqual(tokenizer.update_post_processor_calls, 1)
+
+    def test_does_not_forward_backend_to_auto_processor(self):
+        config = SimpleNamespace(model_type="test_vlm", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.image_processor.backend = "torchvision"
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.return_value = loaded_processor
+        auto_image_processor = MagicMock()
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            AutoImageProcessor=auto_image_processor,
+        ):
+            processor_utils.get_processor(
+                "test-model", image_processor_backend="torchvision"
+            )
+
+        call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+        self.assertNotIn("backend", call_kwargs)
+        self.assertNotIn("use_fast", call_kwargs)
+        auto_image_processor.from_pretrained.assert_not_called()
+
+    def test_applies_pil_backend_only_to_image_processor(self):
+        config = SimpleNamespace(model_type="test_vlm", auto_map={})
+
+        for processor_kwargs in (
+            {"image_processor_backend": "pil"},
+            {"use_fast": False},
+        ):
+            with self.subTest(processor_kwargs=processor_kwargs):
+                loaded_processor = MagicMock()
+                loaded_processor.image_processor.backend = "torchvision"
+                loaded_processor.tokenizer.chat_template = "template"
+                pil_processor = MagicMock(backend="pil")
+                auto_config = MagicMock()
+                auto_config.from_pretrained.return_value = config
+                auto_processor = MagicMock()
+                auto_processor.from_pretrained.return_value = loaded_processor
+                auto_image_processor = MagicMock()
+                auto_image_processor.from_pretrained.return_value = pil_processor
+
+                with patch.multiple(
+                    processor_utils,
+                    AutoConfig=auto_config,
+                    AutoProcessor=auto_processor,
+                    AutoImageProcessor=auto_image_processor,
+                ):
+                    processor = processor_utils.get_processor(
+                        "test-model", **processor_kwargs
+                    )
+
+                call_kwargs = auto_processor.from_pretrained.call_args.kwargs
+                self.assertNotIn("backend", call_kwargs)
+                self.assertNotIn("use_fast", call_kwargs)
+                auto_image_processor.from_pretrained.assert_called_once_with(
+                    "test-model",
+                    trust_remote_code=False,
+                    revision=None,
+                    backend="pil",
+                )
+                self.assertIs(processor.image_processor, pil_processor)
+
+    def test_minimax_m3_vl_does_not_load_bundled_processor(self):
+        """MiniMax-M3.1-Flash bundles a MiniMaxVLProcessor that lacks the replace hooks
+        and breaks on video; its bundled code must not load, also on backend reload."""
+        config = SimpleNamespace(model_type="minimax_m3_vl", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.image_processor.backend = "torchvision"
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_image_processor = MagicMock()
+        m31_processor = MagicMock(return_value=loaded_processor)
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+            AutoImageProcessor=auto_image_processor,
+            _get_minimax_m31_processor=m31_processor,
+        ):
+            processor_utils.get_processor(
+                "test-model", trust_remote_code=True, image_processor_backend="pil"
+            )
+
+        m31_processor.assert_called_once()
+        auto_processor.from_pretrained.assert_not_called()
+        auto_image_processor.from_pretrained.assert_called_once_with(
+            "test-model", trust_remote_code=False, revision=None, backend="pil"
+        )
+
+    def test_resolves_model_name_before_loading_config(self):
+        remote_model = "s3://bucket/model"
+        local_model = "/cache/model"
+        config = SimpleNamespace(model_type="clip", auto_map={})
+        loaded_processor = MagicMock()
+        loaded_processor.tokenizer.chat_template = "template"
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.return_value = loaded_processor
+
+        def resolve_uri(path):
+            return local_model if path == remote_model else path
+
+        with patch.multiple(
+            processor_utils,
+            resolve_runai_obj_uri=MagicMock(side_effect=resolve_uri),
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+        ):
+            processor = processor_utils.get_processor(
+                "local-tokenizer",
+                model_name=remote_model,
+            )
+
+        self.assertIs(processor, loaded_processor)
+        auto_config.from_pretrained.assert_called_once_with(
+            local_model,
+            trust_remote_code=False,
+            revision=None,
+        )
+
+    def test_unlimited_ocr_loads_for_both_model_type_spellings(self):
+        """baidu/Unlimited-OCR was re-saved with model_type "unlimited_ocr"; that
+        checkpoint must still build its sub-configs and get SGLang's processor,
+        not a bare tokenizer."""
+        from sglang.srt.configs.unlimited_ocr import UnlimitedOCRHFProcessor
+
+        for model_type in ("unlimited-ocr", "unlimited_ocr"):
+            with (
+                self.subTest(model_type=model_type),
+                tempfile.TemporaryDirectory() as d,
+            ):
+                with open(f"{d}/config.json", "w") as f:
+                    json.dump(
+                        {
+                            "model_type": model_type,
+                            "architectures": ["UnlimitedOCRForCausalLM"],
+                            "language_config": {"vocab_size": 1234},
+                        },
+                        f,
+                    )
+                config = get_config(d, trust_remote_code=False)
+                self.assertEqual(config.text_config.vocab_size, 1234)
+
+                loaded_processor = MagicMock()
+                loaded_processor.tokenizer.chat_template = "template"
+                with patch.object(
+                    UnlimitedOCRHFProcessor,
+                    "from_pretrained",
+                    return_value=loaded_processor,
+                ) as from_pretrained:
+                    processor = processor_utils.get_processor(d)
+
+                self.assertIs(processor, loaded_processor)
+                from_pretrained.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _patch_image_processor_kwargs
+# ---------------------------------------------------------------------------
+
+
+class TestGetTokenizerRevision(CustomTestCase):
+    def _load(self, **revision_kwargs):
+        from tokenizers import Tokenizer, models
+        from transformers import PreTrainedTokenizerFast
+
+        # A named subclass, so the load is not retried as a generic TokenizersBackend.
+        class TinyTokenizer(PreTrainedTokenizerFast):
+            pass
+
+        vocab = {"a": 0, "[UNK]": 1}
+        loaded = TinyTokenizer(
+            tokenizer_object=Tokenizer(models.WordLevel(vocab, unk_token="[UNK]"))
+        )
+        cache_lookups = []
+
+        def fake_cache_lookup(model_name_or_path, filename, revision=None):
+            cache_lookups.append((filename, revision))
+            raise FileNotFoundError(filename)
+
+        auto_tokenizer = MagicMock()
+        auto_tokenizer.from_pretrained.return_value = loaded
+        tekken_probe = MagicMock(return_value=False)
+        with patch.multiple(
+            tokenizer_utils,
+            AutoTokenizer=auto_tokenizer,
+            is_bare_tekken_checkpoint=tekken_probe,
+            _resolve_local_or_cached_file=fake_cache_lookup,
+        ):
+            tokenizer_utils.get_tokenizer("org/model", **revision_kwargs)
+        return (
+            auto_tokenizer.from_pretrained.call_args.kwargs,
+            tekken_probe,
+            cache_lookups,
+        )
+
+    def test_revision_selects_the_branch_of_every_tokenizer_file(self):
+        """With `revision=`, the tekken probe and the post-load fix-ups must read
+        the files of that revision, not of the default branch."""
+        load_kwargs, tekken_probe, cache_lookups = self._load(revision="rev-a")
+
+        self.assertEqual(load_kwargs["revision"], "rev-a")
+        self.assertEqual(tekken_probe.call_args.args, ("org/model", "rev-a"))
+        self.assertEqual(
+            cache_lookups,
+            [("tokenizer.json", "rev-a"), ("tokenizer_config.json", "rev-a")],
+        )
+
+    def test_tokenizer_revision_is_loaded_as_the_revision(self):
+        """`tokenizer_revision=`, the spelling the processor reload passes, must
+        load that revision: AutoTokenizer only reads `revision`."""
+        load_kwargs, _, cache_lookups = self._load(tokenizer_revision="rev-a")
+
+        self.assertEqual(load_kwargs["revision"], "rev-a")
+        self.assertEqual({revision for _, revision in cache_lookups}, {"rev-a"})
+
+
+class TestMistralConfigRevision(CustomTestCase):
+    def test_params_json_is_fetched_at_the_requested_revision(self):
+        """A Mistral-format config must be parsed from the requested revision's
+        params.json, not from the default branch's."""
+        from sglang.srt.hf_transformers import common as hf_common
+        from sglang.srt.hf_transformers.mistral_utils import load_mistral_config
+
+        params = {"dim": 8, "n_layers": 1, "n_heads": 1, "hidden_dim": 16}
+        with tempfile.TemporaryDirectory() as snapshot_dir:
+            Path(snapshot_dir, "params.json").write_text(json.dumps(params))
+            with patch.object(
+                hf_common, "snapshot_download", return_value=snapshot_dir
+            ) as snapshot_download:
+                config = load_mistral_config(
+                    "org/mistral-revision-test", revision="rev-a"
+                )
+
+        self.assertEqual(config.hidden_size, 8)
+        self.assertEqual(snapshot_download.call_args.kwargs.get("revision"), "rev-a")
+
+
+class TestImageProcessorKwargsPatch(CustomTestCase):
+    def test_filters_unsupported_kwargs_and_caches_signature(self):
+        class StrictImageProcessor(BaseImageProcessor):
+            model_input_names = ["pixel_values"]
+
+            def preprocess(self, images, accepted=None):
+                return {"images": images, "accepted": accepted}
+
+        processor = StrictImageProcessor()
+        with patch.object(
+            hf_transformers_patches.inspect,
+            "signature",
+            wraps=inspect.signature,
+        ) as signature:
+            first = processor("first", accepted=True, device="cuda")
+            second = processor("second", accepted=False, device="cuda")
+
+        self.assertEqual(first, {"images": "first", "accepted": True})
+        self.assertEqual(second, {"images": "second", "accepted": False})
+        self.assertEqual(signature.call_count, 1)
+
+
+class TestPilImageProcessorTensorPatch(CustomTestCase):
+    def test_npu_tensor_is_copied_to_cpu_before_pil_processing(self):
+        tensor = MagicMock(spec=torch.Tensor)
+        tensor.device.type = "npu"
+        pixels = torch.arange(3 * 5 * 7, dtype=torch.uint8).reshape(3, 5, 7)
+        tensor.cpu.return_value = pixels
+
+        result = PilBackend().process_image(tensor, do_convert_rgb=False)
+        tensor.cpu.assert_called_once_with()
+        np.testing.assert_array_equal(result, pixels.numpy())
+
+    def test_grayscale_jpeg_tensor_matches_pil_rgb(self):
+        """A grayscale JPEG tensor should match the PIL RGB backend output."""
+        image = Image.new("L", (56, 56), 128)
+        encoded = io.BytesIO()
+        image.save(encoded, format="JPEG")
+        decoded = Image.open(io.BytesIO(encoded.getvalue()))
+        gray_tensor = torch.from_numpy(np.array(decoded)).unsqueeze(0)
+        self.assertEqual(gray_tensor.shape[0], 1)
+        backend = PilBackend()
+
+        actual = backend.process_image(gray_tensor, do_convert_rgb=True)
+        expected = backend.process_image(decoded.convert("RGB"), do_convert_rgb=True)
+
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_rgb_conversion_flag_and_channel_layout(self):
+        """Only requested RGB conversion may expand a grayscale tensor."""
+        backend = PilBackend()
+        gray = torch.full((1, 16, 16), 128, dtype=torch.uint8)
+        self.assertEqual(
+            backend.process_image(gray, do_convert_rgb=False).shape, (1, 16, 16)
+        )
+        self.assertEqual(backend.process_image(gray, True).shape, (3, 16, 16))
+
+        rgb_hwc = torch.zeros((1, 16, 3), dtype=torch.uint8)
+        self.assertEqual(
+            backend.process_image(rgb_hwc, True, "channels_last").shape,
+            (3, 1, 16),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +742,7 @@ register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
 # ---------------------------------------------------------------------------
 
 
-class TestNormalizeRopeScalingCompat(unittest.TestCase):
+class TestNormalizeRopeScalingCompat(CustomTestCase):
     def test_adds_type_from_rope_type(self):
         cfg = PretrainedConfig()
         cfg.rope_scaling = {"rope_type": "llama3", "factor": 8.0}
@@ -44,11 +754,6 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
         cfg.rope_scaling = {"rope_type": "llama3", "type": "custom", "factor": 8.0}
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling["type"], "custom")
-
-    def test_no_op_when_no_rope_scaling(self):
-        cfg = PretrainedConfig()
-        normalize_rope_scaling_compat(cfg)
-        self.assertIsNone(getattr(cfg, "rope_scaling", None))
 
     def test_no_op_when_rope_scaling_is_none(self):
         cfg = PretrainedConfig()
@@ -73,14 +778,12 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
         self.assertEqual(llm_cfg.rope_scaling["type"], "dynamic")
 
     def test_no_crash_on_non_dict_rope_scaling(self):
-        cfg = PretrainedConfig()
-        cfg.rope_scaling = "not_a_dict"
+        cfg = SimpleNamespace(rope_scaling="not_a_dict")
         normalize_rope_scaling_compat(cfg)
         self.assertEqual(cfg.rope_scaling, "not_a_dict")
 
     def test_no_crash_on_dict_without_rope_type(self):
-        cfg = PretrainedConfig()
-        cfg.rope_scaling = {"factor": 4.0}
+        cfg = SimpleNamespace(rope_scaling={"factor": 4.0})
         normalize_rope_scaling_compat(cfg)
         self.assertNotIn("type", cfg.rope_scaling)
 
@@ -90,7 +793,7 @@ class TestNormalizeRopeScalingCompat(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetRopeConfig(unittest.TestCase):
+class TestGetRopeConfig(CustomTestCase):
     def test_v5_rope_parameters(self):
         cfg = PretrainedConfig()
         cfg.rope_parameters = {"rope_theta": 10000.0, "rope_type": "default"}
@@ -120,7 +823,7 @@ class TestGetRopeConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPatchTextConfig(unittest.TestCase):
+class TestPatchTextConfig(CustomTestCase):
     def test_propagates_parent_to_text(self):
         parent = PretrainedConfig()
         parent.pad_token_id = 0
@@ -161,7 +864,7 @@ class TestPatchTextConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetContextLength(unittest.TestCase):
+class TestGetContextLength(CustomTestCase):
     def test_max_position_embeddings(self):
         cfg = PretrainedConfig()
         cfg.max_position_embeddings = 4096
@@ -204,7 +907,7 @@ class TestGetContextLength(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestCheckGgufFile(unittest.TestCase):
+class TestCheckGgufFile(CustomTestCase):
     def test_gguf_suffix(self):
         with tempfile.NamedTemporaryFile(suffix=".gguf") as f:
             self.assertTrue(check_gguf_file(f.name))
@@ -229,12 +932,49 @@ class TestCheckGgufFile(unittest.TestCase):
             self.assertFalse(check_gguf_file(d))
 
 
+class TestResolveHfGgufReference(CustomTestCase):
+    @patch("huggingface_hub.hf_hub_download", return_value="/cache/model-Q4_K.gguf")
+    @patch("huggingface_hub.HfApi")
+    def test_resolves_quant_type(self, api_cls, download):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="model-Q4_K.gguf"),
+            SimpleNamespace(rfilename="model-Q8_0.gguf"),
+        ]
+
+        resolved = resolve_hf_gguf_reference("owner/repo:Q4_K", revision="revision")
+
+        self.assertEqual(resolved, "/cache/model-Q4_K.gguf")
+        download.assert_called_once_with(
+            "owner/repo", "model-Q4_K.gguf", revision="revision"
+        )
+
+    @patch("huggingface_hub.HfApi")
+    def test_rejects_ambiguous_quant_type(self, api_cls):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="fl2va-Q4_K.gguf"),
+            SimpleNamespace(rfilename="ref2va-Q4_K.gguf"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            resolve_hf_gguf_reference("owner/repo:Q4_K")
+
+    @patch("huggingface_hub.HfApi")
+    def test_reports_available_files_when_quant_type_is_missing(self, api_cls):
+        api_cls.return_value.repo_info.return_value.siblings = [
+            SimpleNamespace(rfilename="model-Q4_K.gguf"),
+            SimpleNamespace(rfilename="README.md"),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "model-Q4_K.gguf"):
+            resolve_hf_gguf_reference("owner/repo:Q8_0")
+
+
 # ---------------------------------------------------------------------------
 # _is_deepseek_ocr_model / _is_deepseek_ocr2_model
 # ---------------------------------------------------------------------------
 
 
-class TestDeepseekOcrDetection(unittest.TestCase):
+class TestDeepseekOcrDetection(CustomTestCase):
     def test_ocr_model_detected(self):
         cfg = PretrainedConfig()
         cfg.auto_map = {"AutoModel": "modeling_deepseekocr.DeepseekOCRForCausalLM"}
@@ -268,7 +1008,7 @@ class TestDeepseekOcrDetection(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestOverrideVHeadDimIfZero(unittest.TestCase):
+class TestOverrideVHeadDimIfZero(CustomTestCase):
     def test_patches_zero_v_head_dim(self):
         text_cfg = SimpleNamespace(v_head_dim=0)
         cfg = PretrainedConfig()
@@ -306,7 +1046,7 @@ class TestOverrideVHeadDimIfZero(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestGetHfTextConfig(unittest.TestCase):
+class TestGetHfTextConfig(CustomTestCase):
     def test_returns_config_for_pure_text_model(self):
         cfg = PretrainedConfig()
         cfg.architectures = ["LlamaForCausalLM"]
@@ -386,11 +1126,47 @@ class TestGetHfTextConfig(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# attach_additional_stop_token_ids
+# ---------------------------------------------------------------------------
+
+
+class TestAttachAdditionalStopTokenIds(CustomTestCase):
+    """Bug regression: the Inkling bundle ships eos metadata unset while its
+    turn-final marker <|content_model_end_sampling|> sits in added_tokens; the
+    old detector only recognized <|eom_id|>, so generation ran to max length
+    (documented by the Inkling GSM8K test)."""
+
+    @staticmethod
+    def _tokenizer(added):
+        return SimpleNamespace(get_added_vocab=lambda: added)
+
+    def test_inkling_end_sampling_registers_as_stop(self):
+        tok = self._tokenizer({"<|content_model_end_sampling|>": 200006})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {200006})
+
+    def test_eom_id_still_registers_as_stop(self):
+        tok = self._tokenizer({"<|eom_id|>": 128008})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {128008})
+
+    def test_k2_horizon_im_end_registers_as_stop(self):
+        tok = self._tokenizer({"<|ifm|im_end|>": 64019})
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {64019})
+
+    def test_no_known_marker_yields_none(self):
+        tok = self._tokenizer({"<|other|>": 7})
+        attach_additional_stop_token_ids(tok)
+        self.assertIsNone(tok.additional_stop_token_ids)
+
+
+# ---------------------------------------------------------------------------
 # _fix_special_tokens_pattern
 # ---------------------------------------------------------------------------
 
 
-class TestFixSpecialTokensPattern(unittest.TestCase):
+class TestFixSpecialTokensPattern(CustomTestCase):
     def test_fixes_cls_sep_with_missing_tokens(self):
         tok = SimpleNamespace(
             special_tokens_pattern="cls_sep",
@@ -429,24 +1205,14 @@ class TestFixSpecialTokensPattern(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestModuleReExports(unittest.TestCase):
+class TestModuleReExports(CustomTestCase):
     def test_all_public_symbols_importable(self):
-        import sglang.srt.utils.hf_transformers as pkg
+        import sglang.srt.hf_transformers as pkg
 
         for name in pkg.__all__:
             self.assertTrue(
                 hasattr(pkg, name),
                 f"{name} listed in __all__ but not importable from package",
-            )
-
-    def test_shim_module_exports_match(self):
-        import sglang.srt.utils.hf_transformers as pkg
-        import sglang.srt.utils.hf_transformers_utils as shim
-
-        for name in pkg.__all__:
-            self.assertTrue(
-                hasattr(shim, name),
-                f"{name} not available through shim module hf_transformers_utils",
             )
 
 
@@ -455,7 +1221,7 @@ class TestModuleReExports(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestPatchRemovedSymbols(unittest.TestCase):
+class TestPatchRemovedSymbols(CustomTestCase):
     def test_llama_flash_attention2_exists(self):
         from transformers.models.llama import modeling_llama
 
@@ -464,80 +1230,32 @@ class TestPatchRemovedSymbols(unittest.TestCase):
             "LlamaFlashAttention2 should be patched onto modeling_llama",
         )
 
-    def test_is_flash_attn_greater_or_equal_2_10_callable(self):
-        import transformers.utils as _u
-
-        self.assertTrue(
-            hasattr(_u, "is_flash_attn_greater_or_equal_2_10"),
-            "is_flash_attn_greater_or_equal_2_10 should be patched onto transformers.utils",
-        )
-        self.assertIsInstance(_u.is_flash_attn_greater_or_equal_2_10(), bool)
-
 
 # ---------------------------------------------------------------------------
 # compat: _patch_rope_parameters_validation
 # ---------------------------------------------------------------------------
 
 
-class TestPatchRopeParametersValidation(unittest.TestCase):
-    def test_injects_rope_theta_into_rope_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertIn("rope_theta", rope_params)
+class TestRopeParametersValidationPatch(CustomTestCase):
+    def test_default_rope_type_survives_a_missing_max_position_embeddings(self):
+        class _AxialConfig(PretrainedConfig):
+            default_rope_type = "axial"
 
-    def test_no_injection_when_rope_theta_already_in_scaling(self):
-        config_dict = {
-            "model_type": "llama",
-            "rope_theta": 500000.0,
-            "max_position_embeddings": 131072,
-            "rope_scaling": {
-                "rope_type": "llama3",
-                "factor": 8.0,
-                "rope_theta": 999.0,
-                "low_freq_factor": 1.0,
-                "high_freq_factor": 4.0,
-                "original_max_position_embeddings": 8192,
-            },
-        }
-        config = PretrainedConfig.from_dict(config_dict)
-        rope_params = getattr(config, "rope_parameters", None)
-        if rope_params is not None:
-            self.assertEqual(rope_params["rope_theta"], 999.0)
+        config = _AxialConfig(rope_theta=10000.0)
+        self.assertFalse(hasattr(config, "max_position_embeddings"))
+        config.standardize_rope_params()
 
-    def test_no_crash_without_rope_scaling(self):
-        config_dict = {"model_type": "llama", "rope_theta": 10000.0}
-        config = PretrainedConfig.from_dict(config_dict)
-        self.assertIsNotNone(config)
+        self.assertEqual(config.rope_parameters["rope_type"], "axial")
 
+    def test_scaling_rope_type_without_max_position_embeddings_does_not_raise(self):
+        class _ScalingConfig(PretrainedConfig):
+            pass
 
-# ---------------------------------------------------------------------------
-# compat: _ensure_clean_up_tokenization_compat
-# ---------------------------------------------------------------------------
-
-
-class TestCleanUpTokenizationCompat(unittest.TestCase):
-    def test_clean_up_tokenization_exists(self):
-        from transformers import PreTrainedTokenizerBase
-
-        self.assertTrue(hasattr(PreTrainedTokenizerBase, "clean_up_tokenization"))
-
-    def test_clean_up_tokenization_callable(self):
-        from transformers import PreTrainedTokenizerBase
-
-        self.assertTrue(callable(PreTrainedTokenizerBase.clean_up_tokenization))
+        config = _ScalingConfig(
+            rope_parameters={"rope_type": "yarn", "rope_theta": 10000.0}
+        )
+        self.assertFalse(hasattr(config, "max_position_embeddings"))
+        config.standardize_rope_params()
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +1263,7 @@ class TestCleanUpTokenizationCompat(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestIsTorchFxAvailableCompat(unittest.TestCase):
+class TestIsTorchFxAvailableCompat(CustomTestCase):
     def test_is_torch_fx_available_exists(self):
         import transformers.utils.import_utils as _iu
 
@@ -553,33 +1271,269 @@ class TestIsTorchFxAvailableCompat(unittest.TestCase):
         self.assertTrue(_iu.is_torch_fx_available())
 
 
-# ---------------------------------------------------------------------------
-# compat: _patch_nemotron_h_pattern
-# ---------------------------------------------------------------------------
+# `inkling_mm_model` predates the invariant: `sglang.srt.configs.inkling` writes
+# `InklingMMConfig` straight into `_extra_content`, over a native `InklingConfig`.
+_KNOWN_NAME_MISMATCHES = {"inkling_mm_model"}
 
 
-class TestPatchNemotronHPattern(unittest.TestCase):
-    def test_pattern_to_list_skips_mlp_dash(self):
-        try:
-            from transformers.models.nemotron_h.configuration_nemotron_h import (
-                NemotronHConfig,
+class TestAutoConfigRegistration(CustomTestCase):
+    """`_LazyAutoMapping` keys on the config class `__name__`: a shadow under
+    another name drops out of PROCESSOR / TOKENIZER / MODEL_MAPPING."""
+
+    def test_shadowing_entries_keep_the_native_class_name(self):
+        from transformers.models.auto.configuration_auto import (
+            CONFIG_MAPPING,
+            CONFIG_MAPPING_NAMES,
+        )
+
+        import sglang.srt.configs.all_configs  # noqa: F401  (populates the registrations)
+
+        # `_extra_content` is exactly the set of classes SGLang registered, so
+        # this covers `_CONFIG_REGISTRY` and the standalone registrations alike.
+        for model_type, cls in CONFIG_MAPPING._extra_content.items():
+            native_name = CONFIG_MAPPING_NAMES.get(model_type)
+            if native_name is None or model_type in _KNOWN_NAME_MISMATCHES:
+                continue
+            with self.subTest(model_type=model_type):
+                self.assertEqual(
+                    cls.__name__,
+                    native_name,
+                    f"{cls.__name__} shadows the native {native_name} for "
+                    f"'{model_type}'; the Auto* mappings key on __name__ and "
+                    f"would stop resolving this model type",
+                )
+
+    def test_autoconfig_only_registrations_win_over_native(self):
+        """zaya / cosmos3-edge have no `_CONFIG_REGISTRY` re-parse to fall back on."""
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        from sglang.srt.configs.cosmos3 import Cosmos3EdgeConfig
+        from sglang.srt.configs.zaya import ZayaConfig
+
+        for model_type, expected in (
+            ("zaya", ZayaConfig),
+            ("cosmos3_edge", Cosmos3EdgeConfig),
+        ):
+            with self.subTest(model_type=model_type):
+                self.assertIs(CONFIG_MAPPING[model_type], expected)
+
+
+class TestPixtralVisionRope(CustomTestCase):
+    """The Pixtral tower takes its rope table from transformers: a changed axial
+    recomposition rotates every patch wrongly with the shapes still intact."""
+
+    def test_rope_table_matches_the_axial_closed_form(self):
+        import torch
+        from transformers import PixtralVisionConfig
+        from transformers.models.pixtral.modeling_pixtral import (
+            PixtralVisionRotaryEmbedding,
+        )
+
+        from sglang.srt.models.pixtral import position_meshgrid
+
+        config = PixtralVisionConfig(
+            hidden_size=64, num_attention_heads=4, image_size=32, patch_size=8
+        )
+        dim = config.head_dim
+        max_side = config.image_size // config.patch_size
+        base = config.rope_parameters["rope_theta"]
+
+        # Separate H and W frequency ladders over the full grid, indexed by the
+        # flattened patch offset, then duplicated for rotate_half.
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        freqs_h = torch.outer(torch.arange(max_side), freqs[::2]).float()
+        freqs_w = torch.outer(torch.arange(max_side), freqs[1::2]).float()
+        table = torch.cat(
+            [
+                freqs_h[:, None, :].repeat(1, max_side, 1),
+                freqs_w[None, :, :].repeat(max_side, 1, 1),
+            ],
+            dim=-1,
+        ).reshape(-1, dim // 2)
+        table = torch.cat((table, table), dim=-1)
+
+        # Two images of different aspect ratios, as the tower batches them.
+        grids = [torch.empty(1, 3, 4), torch.empty(1, 2, 2)]
+        position_ids = position_meshgrid(grids)
+        flat = position_ids[:, 0] * max_side + position_ids[:, 1]
+        expected = table[flat]
+
+        cos, sin = PixtralVisionRotaryEmbedding(config)(
+            torch.zeros(position_ids.shape[0], config.hidden_size), position_ids
+        )
+
+        torch.testing.assert_close(cos, expected.cos(), rtol=0, atol=1e-6)
+        torch.testing.assert_close(sin, expected.sin(), rtol=0, atol=1e-6)
+
+
+class TestGemma4AttentionOverrides(CustomTestCase):
+    """A parsed Gemma4 config carries the full-attention shape on its base
+    attributes, the sliding-window one on `swa_*`, and no per-layer spec."""
+
+    def _make_config(self, **text_overrides):
+        from transformers import Gemma4Config
+
+        text_config = dict(
+            num_hidden_layers=6,
+            head_dim=128,
+            global_head_dim=256,
+            num_key_value_heads=2,
+            num_global_key_value_heads=4,
+            # Gates the kv-head override; without it every layer keeps the base count.
+            attention_k_eq_v=True,
+        )
+        text_config.update(text_overrides)
+        return Gemma4Config(text_config=text_config)
+
+    def test_full_attention_values_come_from_the_per_layer_overrides(self):
+        config = self._make_config()
+        self.assertTrue(config.text_config.is_heterogeneous)
+
+        _apply_gemma4_attention_overrides(config)
+
+        text_config = config.text_config
+        self.assertEqual(text_config.head_dim, 256)
+        self.assertEqual(text_config.v_head_dim, 256)
+        self.assertEqual(text_config.num_key_value_heads, 4)
+        self.assertEqual(text_config.swa_head_dim, 128)
+        self.assertEqual(text_config.swa_v_head_dim, 128)
+        self.assertEqual(text_config.swa_num_key_value_heads, 2)
+
+    def test_per_layer_spec_is_dropped_so_later_reads_do_not_raise(self):
+        config = self._make_config()
+
+        _apply_gemma4_attention_overrides(config)
+
+        self.assertFalse(config.text_config.is_heterogeneous)
+        self.assertEqual(config.text_config.head_dim, 256)
+
+    def test_config_without_a_per_layer_spec_states_one_shape(self):
+        config = self._make_config(per_layer_config=None)
+        self.assertFalse(config.text_config.is_heterogeneous)
+
+        _apply_gemma4_attention_overrides(config)
+
+        text_config = config.text_config
+        self.assertEqual(text_config.head_dim, 128)
+        self.assertEqual(text_config.swa_head_dim, 128)
+        self.assertEqual(text_config.num_key_value_heads, 2)
+        self.assertEqual(text_config.swa_num_key_value_heads, 2)
+
+    def test_unflattenable_per_layer_attribute_is_rejected(self):
+        """An attribute the parser does not flatten would otherwise revert to
+        the global value and build the model with the wrong per-layer shapes."""
+        config = self._make_config(
+            intermediate_size=1024,
+            per_layer_config={
+                **{layer_idx: {"intermediate_size": 512} for layer_idx in range(5)},
+                5: {"head_dim": 256},
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, "intermediate_size"):
+            _apply_gemma4_attention_overrides(config)
+
+    def test_layer_type_with_more_than_one_shape_is_rejected(self):
+        """SGLang carries one shape per layer type, so such a config must be
+        rejected here rather than deep inside the transformers layer view."""
+        config = self._make_config(
+            per_layer_config={0: {"head_dim": 64}, 5: {"head_dim": 256}}
+        )
+
+        with self.assertRaisesRegex(ValueError, "single shape per layer type"):
+            _apply_gemma4_attention_overrides(config)
+
+
+class TestNormalizeTpStyle(CustomTestCase):
+    """Every style a shipped TP plan can name must normalize; a tied-embedding
+    plan naming an unknown one stops the model loading at all."""
+
+    def test_tied_embedding_plan_normalizes(self):
+        from transformers import AutoConfig, AutoModel
+
+        from sglang.srt.models.transformers import _normalize_tp_style
+
+        config = AutoConfig.for_model(
+            "llama",
+            tie_word_embeddings=True,
+            vocab_size=16,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+        )
+        plan = AutoModel.from_config(config).tp_plan
+        self.assertIn("embedding_rowwise", plan.values())
+        for pattern, style in plan.items():
+            with self.subTest(pattern=pattern):
+                _normalize_tp_style(style)
+
+    def test_unknown_style_still_raises(self):
+        from sglang.srt.models.transformers import _normalize_tp_style
+
+        with self.assertRaises(ValueError):
+            _normalize_tp_style("mla_kv_a_proj")
+
+
+class TestLayerTypesValidationPatch(CustomTestCase):
+    """Step-3.5-Flash lists a `layer_types` entry per main *and* next-n-predict
+    layer, which transformers' strict validator would otherwise reject."""
+
+    _SLIDING = ["sliding_attention"]
+
+    def test_layer_types_may_cover_the_mtp_layers(self):
+        config = PretrainedConfig(
+            num_hidden_layers=45,
+            num_nextn_predict_layers=3,
+            layer_types=self._SLIDING * 48,
+        )
+
+        self.assertEqual(len(config.layer_types), 48)
+
+    def test_a_length_the_mtp_layers_do_not_explain_still_raises(self):
+        with self.assertRaises(Exception):
+            PretrainedConfig(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=1,
+                layer_types=self._SLIDING * 6,
             )
 
-            result = NemotronHConfig._pattern_to_list("M-*-")
-            self.assertEqual(result, ["mamba", "attention"])
-        except ImportError:
-            self.skipTest("NemotronHConfig not available in this transformers version")
+    def test_an_unknown_layer_type_still_raises(self):
+        with self.assertRaises(Exception):
+            PretrainedConfig(num_hidden_layers=4, layer_types=["not_a_layer_type"] * 4)
 
-    def test_pattern_to_list_standard_chars(self):
-        try:
-            from transformers.models.nemotron_h.configuration_nemotron_h import (
-                NemotronHConfig,
+    def test_an_accepted_length_does_not_excuse_a_later_list(self):
+        """A rejected `layer_types` length aborts the original validator before
+        it reaches `mlp_layer_types`, whose entries must still be checked."""
+        with self.assertRaisesRegex(Exception, "`mlp_layer_types` entries must be in"):
+            PretrainedConfig(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=1,
+                layer_types=self._SLIDING * 5,
+                mlp_layer_types=["not_a_layer_type"] * 5,
             )
 
-            result = NemotronHConfig._pattern_to_list("ME*")
-            self.assertEqual(result, ["mamba", "moe", "attention"])
-        except ImportError:
-            self.skipTest("NemotronHConfig not available in this transformers version")
+    def test_each_list_keeps_its_own_vocabulary(self):
+        """`mlp_layer_types` takes only MLP names, so an attention name in it
+        must be rejected even though it is a valid `layer_types` entry."""
+        with self.assertRaisesRegex(Exception, "`mlp_layer_types` entries must be in"):
+            PretrainedConfig(
+                num_hidden_layers=4,
+                num_nextn_predict_layers=1,
+                layer_types=self._SLIDING * 5,
+                mlp_layer_types=self._SLIDING * 5,
+            )
+
+    def test_a_later_list_may_also_cover_the_mtp_layers(self):
+        config = PretrainedConfig(
+            num_hidden_layers=4,
+            num_nextn_predict_layers=1,
+            layer_types=self._SLIDING * 5,
+            mlp_layer_types=["dense"] * 5,
+        )
+
+        self.assertEqual(len(config.mlp_layer_types), 5)
 
 
 if __name__ == "__main__":

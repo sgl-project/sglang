@@ -1,0 +1,450 @@
+import unittest
+
+# TODO: use interface in cpu.py
+import sgl_kernel  # noqa: F401
+import torch
+import torch.nn as nn
+
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.cpu_test_utils import (
+    MXFP4QuantizeUtil,
+    convert_weight,
+    native_w8a8_per_token_matmul,
+    parametrize,
+    per_token_quant_int8,
+    precision,
+    unpack_and_dequant_awq,
+    unpack_and_dequant_gptq,
+)
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=9, suite="extra-test-cpu-intel")
+
+torch.manual_seed(1234)
+
+
+class Mod(nn.Module):
+    def __init__(self, input_channel, output_channel, has_bias):
+        super(Mod, self).__init__()
+        self.linear = torch.nn.Linear(input_channel, output_channel, has_bias)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class TestGemm(CustomTestCase):
+    @parametrize(
+        M=[1, 101],
+        N=[16, 32 * 13],
+        K=[32 * 16],
+        has_bias=[False, True],
+        dim=[2, 3, 4, 5],
+    )
+    def test_bf16_gemm(self, M, N, K, has_bias, dim):
+        mat1 = torch.randn(M, K, dtype=torch.bfloat16)
+        mat2 = torch.randn(N, K, dtype=torch.bfloat16)
+        if dim == 3:
+            mat1 = mat1.unsqueeze(0).repeat(2, 1, 1)
+        if dim == 4:
+            mat1 = mat1.unsqueeze(0).unsqueeze(0).repeat(2, 2, 1, 1)
+        if dim == 5:
+            mat1 = mat1.unsqueeze(0).unsqueeze(0).unsqueeze(0).repeat(2, 2, 2, 1, 1)
+
+        ref = torch.matmul(mat1.float(), mat2.float().t())
+        if has_bias:
+            bias = torch.randn(N, dtype=torch.float32)
+            ref.add_(bias.bfloat16())
+
+        ref = ref.bfloat16()
+
+        out = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1, mat2, bias if has_bias else None, False
+        )
+
+        packed_mat2 = torch.ops.sgl_kernel.convert_weight_packed(mat2)
+        out2 = torch.ops.sgl_kernel.weight_packed_linear(
+            mat1, packed_mat2, bias if has_bias else None, True
+        )
+
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+        torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
+
+    @parametrize(
+        M=[1, 8, 32, 1024],
+        N=[12, 1],
+        K=[32 * 16],
+        has_bias=[False, True],
+        use_post_sigmul=[False, True],
+    )
+    def bf16_gemm_with_small_oc(self, M, N, K, has_bias, use_post_sigmul):
+        use_post_sigmul = use_post_sigmul and N == 1
+        mat_mul = (
+            None if not use_post_sigmul else torch.randn(M, 2 * K, dtype=torch.bfloat16)
+        )
+        mat1 = torch.randn(M, K, dtype=torch.bfloat16)
+        mat2 = torch.randn(N, K, dtype=torch.bfloat16)
+
+        ref = torch.nn.functional.linear(mat1, mat2)
+        if has_bias:
+            bias = torch.randn(N, dtype=torch.float32)
+            ref.add_(bias)
+        if use_post_sigmul:
+            ref = torch.nn.functional.sigmoid(ref) * mat_mul
+            out = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
+                mat1,
+                torch.ops.sgl_kernel.convert_weight_packed(mat2),
+                bias if has_bias else None,
+                True,
+                mat_mul if use_post_sigmul else None,
+            )
+        else:
+            out = torch.ops.sgl_kernel.weight_packed_linear(
+                mat1,
+                torch.ops.sgl_kernel.convert_weight_packed(mat2),
+                bias if has_bias else None,
+                True,
+            )
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    @parametrize(M=[2, 128], N=[32 * 12], K=[32 * 17], has_bias=[False, True])
+    def test_int8_gemm(self, M, N, K, has_bias):
+        dtype = torch.bfloat16
+        A = torch.randn((M, K), dtype=dtype) / 10
+        Aq, As = per_token_quant_int8(A)
+
+        factor_for_scale = 1e-2
+        int8_max = 127
+        int8_min = -128
+
+        B = (torch.rand((N, K), dtype=torch.float32) - 0.5) * 2
+        Bq = (B * int8_max).clamp(min=int8_min, max=int8_max).to(torch.int8)
+        Bs = torch.rand(N) * factor_for_scale
+
+        bias = torch.randn(N) if has_bias else None
+        ref_out = native_w8a8_per_token_matmul(Aq, Bq, As, Bs, bias, dtype)
+
+        atol = rtol = precision[ref_out.dtype]
+
+        Aq2, As2 = torch.ops.sgl_kernel.per_token_quant_int8_cpu(A)
+        out = torch.ops.sgl_kernel.int8_scaled_mm_cpu(
+            Aq2, Bq, As2, Bs, bias if has_bias else None, torch.bfloat16, False
+        )
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+
+        # test the fused version
+        fused_out = torch.ops.sgl_kernel.int8_scaled_mm_with_quant(
+            A, Bq, Bs, bias if has_bias else None, torch.bfloat16, False
+        )
+        torch.testing.assert_close(ref_out, fused_out, atol=atol, rtol=rtol)
+
+    @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
+    def test_fp8_gemm(self, M, N, K, has_bias):
+        prepack = True
+        chunk = False
+        scale_block_size_N = 64
+        scale_block_size_K = 128
+        assert scale_block_size_N <= N
+        assert scale_block_size_K <= K
+        dtype = torch.bfloat16
+
+        model = Mod(K, N, has_bias).eval()
+        if chunk:
+            data = torch.randn(M, K + 6, dtype=dtype).narrow(1, 0, K)
+        else:
+            data = torch.randn(M, K, dtype=dtype)
+
+        weight = model.linear.weight  # (N, K)
+
+        if has_bias:
+            bias = model.linear.bias
+
+        fp8_weight, scales, dq_weight = convert_weight(
+            weight, [scale_block_size_N, scale_block_size_K], dtype
+        )
+
+        if has_bias:
+            ref = torch.matmul(data.to(dtype), dq_weight.T) + bias.to(dtype)
+        else:
+            ref = torch.matmul(data.to(dtype), dq_weight.T)
+
+        if prepack:
+            fp8_weight = torch.ops.sgl_kernel.convert_weight_packed(fp8_weight)
+
+        out = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+            data,
+            fp8_weight,
+            scales,
+            [scale_block_size_N, scale_block_size_K],
+            bias if has_bias else None,
+            data.dtype,
+            prepack,
+        )
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    @parametrize(
+        M=[1, 11, 97],
+        N=[128, 224],
+        K=[512, 576],
+        scale_as_vector=[False, True],
+        has_bias=[False, True],
+        prepack=[False, True],
+    )
+    def test_fp8_per_tensor_gemm(self, M, N, K, scale_as_vector, has_bias, prepack):
+        data = torch.randn(M, K, dtype=torch.bfloat16) / 10
+        weight = torch.randn(N, K).to(torch.float8_e4m3fn)
+        scale = torch.tensor(0.01, dtype=torch.float32)
+        scales = scale.reshape(1) if scale_as_vector else scale
+        bias = torch.randn(N, dtype=torch.float32) if has_bias else None
+
+        ref = torch.matmul(data.float(), weight.float().T) * scale
+        if bias is not None:
+            ref = ref + bias
+        ref = ref.bfloat16()
+
+        kernel_weight = (
+            torch.ops.sgl_kernel.convert_weight_packed(weight) if prepack else weight
+        )
+        out = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+            data,
+            kernel_weight,
+            scales,
+            bias,
+            data.dtype,
+            prepack,
+        )
+
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    @parametrize(rows=[0, 1, 7], columns=[32, 96, 4096], strided=[False, True])
+    def test_per_token_quant_fp8(self, rows, columns, strided):
+        generator = torch.Generator().manual_seed(1234)
+        input = torch.randn(rows, columns, generator=generator).bfloat16()
+        input[:, ::4] *= 1e-4
+        if rows > 1:
+            input[0].zero_()
+            input[1] *= 1e-6
+        if strided:
+            storage = torch.empty(rows, columns + 32, dtype=torch.bfloat16)
+            storage[:, :columns] = input
+            input = storage[:, :columns]
+
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        scales = input.float().abs().amax(dim=1) / fp8_max
+        inverse_scales = torch.where(scales == 0, 0, scales.reciprocal())
+        expected = (
+            (input.float() * inverse_scales.unsqueeze(1))
+            .clamp(-fp8_max, fp8_max)
+            .to(torch.float8_e4m3fn)
+        )
+        output, output_scales = torch.ops.sgl_kernel.per_token_quant_fp8_cpu(input)
+        torch.testing.assert_close(output_scales, scales, atol=0, rtol=0)
+        torch.testing.assert_close(
+            output.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
+        )
+
+    def test_per_token_quant_fp8_rounding_boundary(self):
+        """An FP16 intermediate must not move values across an E4M3 rounding midpoint."""
+        input = torch.full((2, 32), 2**-16, dtype=torch.bfloat16)
+        input[:, 0] = 1
+        input[1].neg_()
+        scales = input.float().abs().amax(dim=1) / 448
+        scaled = input.float() * scales.reciprocal().unsqueeze(1)
+        expected = scaled.to(torch.float8_e4m3fn)
+        self.assertFalse(
+            torch.equal(
+                expected.view(torch.uint8),
+                scaled.half().to(torch.float8_e4m3fn).view(torch.uint8),
+            )
+        )
+        output, output_scales = torch.ops.sgl_kernel.per_token_quant_fp8_cpu(input)
+        torch.testing.assert_close(output_scales, scales, atol=0, rtol=0)
+        torch.testing.assert_close(
+            output.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
+        )
+
+    def test_per_token_quant_fp8_rejects_invalid_input(self):
+        for input in (
+            torch.empty(32, dtype=torch.bfloat16),
+            torch.empty(1, 0, dtype=torch.bfloat16),
+            torch.empty(1, 48, dtype=torch.bfloat16),
+            torch.empty(1, 32, dtype=torch.float32),
+            torch.empty(32, 32, dtype=torch.bfloat16).t(),
+        ):
+            with self.subTest(shape=input.shape, dtype=input.dtype):
+                with self.assertRaises(RuntimeError):
+                    torch.ops.sgl_kernel.per_token_quant_fp8_cpu(input)
+
+    @parametrize(M=[1, 11], N=[128, 224], K=[512, 576], has_bias=[False, True])
+    def test_mxfp4_gemm(self, M, N, K, has_bias):
+        prepack = True
+        dtype = torch.bfloat16
+
+        A = torch.randn((M, K), dtype=dtype) / 10
+
+        # we randomly generate Bq and Bs, then dequantize it to BFloat16 as reference
+        Bq = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8)
+        Bs = torch.randint(126, 127, (N, K // 32), dtype=torch.uint8)
+
+        Bdq = MXFP4QuantizeUtil.dequantize(Bq, dtype, Bs)
+
+        B_packed = torch.ops.sgl_kernel.convert_weight_packed(Bq)
+        Bs_packed = torch.ops.sgl_kernel.convert_scale_packed(Bs)
+
+        bias = torch.randn(N) if has_bias else None
+
+        ref = torch.matmul(A.float(), Bdq.float().t()).bfloat16()
+        if bias is not None:
+            ref.add_(bias.view(1, -1))
+
+        out = torch.ops.sgl_kernel.mxfp4_scaled_mm_cpu(
+            A, B_packed, Bs_packed, bias, prepack
+        )
+
+        atol = rtol = precision[ref.dtype]
+        torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
+
+    @parametrize(
+        M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
+    )
+    def test_int4_awq_gemm(self, M, N, K, group_size, has_bias):
+        awq_weight = torch.randint(-128, 128, (K, N // 8)).to(torch.int)
+        awq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
+        awq_scales = torch.rand(int(K // group_size), N).to(torch.bfloat16)
+        bf16_weight, _ = unpack_and_dequant_awq(
+            awq_weight, awq_zero, awq_scales, 4, 128
+        )
+        if has_bias:
+            bias = torch.rand(bf16_weight.shape[0]).to(torch.float)
+        else:
+            bias = None
+        x = torch.rand(M, bf16_weight.size(-1)).to(torch.bfloat16)
+        ref_res = torch.nn.functional.linear(
+            x, bf16_weight, bias=bias.to(torch.bfloat16) if has_bias else None
+        )
+
+        packed_weight, packed_zero, packed_scales = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                awq_weight, awq_zero, awq_scales, 0, is_symmetric=False
+            )
+        )
+        target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x,
+            packed_weight,
+            packed_zero,
+            packed_scales,
+            bias,
+        )
+
+        atol = rtol = precision[ref_res.dtype]
+        torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
+
+    def test_int4_awq_ignores_is_symmetric(self):
+        """AWQ always reads qzeros as stored, so is_symmetric must not change the packing."""
+        torch.manual_seed(127)
+        weight = torch.randint(-128, 128, (256, 4)).to(torch.int)
+        zeros = torch.full((2, 4), 0x88888888 - (1 << 32), dtype=torch.int32)
+        scales = torch.rand(2, 32).to(torch.bfloat16)
+        asym = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            weight, zeros, scales, 0, is_symmetric=False
+        )
+        sym = torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+            weight, zeros, scales, 0, is_symmetric=True
+        )
+        for a, s in zip(asym, sym):
+            torch.testing.assert_close(a, s, rtol=0, atol=0)
+
+    @parametrize(
+        M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
+    )
+    def test_int4_gptq_gemm(self, M, N, K, group_size, has_bias):
+        torch.manual_seed(127)
+        gptq_weight = torch.randint(-128, 128, (K // 8, N)).to(torch.int)
+        gptq_zero = torch.randint(0, 10, (K // group_size, N // 8)).to(torch.int)
+        gptq_scales = (torch.rand(K // group_size, N) / 10 + 0.01).to(torch.bfloat16)
+
+        reference_weight = unpack_and_dequant_gptq(
+            gptq_weight, gptq_zero, gptq_scales.float()
+        )
+        if has_bias:
+            bias = torch.rand(reference_weight.shape[0]).to(torch.float)
+        else:
+            bias = None
+        x = torch.rand(M, reference_weight.size(-1)).to(torch.bfloat16)
+        ref_res = torch.nn.functional.linear(x.float(), reference_weight, bias=bias).to(
+            torch.bfloat16
+        )
+
+        packed_weight, packed_zero, packed_scales = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                gptq_weight, gptq_zero, gptq_scales, 1
+            )
+        )
+        target_res = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            x,
+            packed_weight,
+            packed_zero,
+            packed_scales,
+            bias,
+        )
+
+        atol = rtol = precision[ref_res.dtype]
+        torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
+
+    @parametrize(
+        batch_size=[1, 32],
+        packed_zero=[0x77777777, -2004318072],
+        has_bias=[False, True],
+    )
+    def test_int4_gptq_symmetric_gemm(self, batch_size, packed_zero, has_bias):
+        """Symmetric GPTQ must use zero point eight for both checkpoint encodings."""
+        generator = torch.Generator().manual_seed(127)
+        input_size, output_size, group_size = 256, 32, 128
+        quantized_weight = torch.randint(
+            0, 16, (input_size, output_size), generator=generator, dtype=torch.int32
+        )
+        shifts = torch.arange(8, dtype=torch.int64).view(1, 8, 1) * 4
+        gptq_weight = (
+            (quantized_weight.reshape(input_size // 8, 8, output_size).long() << shifts)
+            .sum(dim=1)
+            .to(torch.int32)
+        )
+        gptq_zero = torch.full(
+            (input_size // group_size, output_size // 8),
+            packed_zero,
+            dtype=torch.int32,
+        )
+        original_zero = gptq_zero.clone()
+        scales = (
+            torch.rand(input_size // group_size, output_size, generator=generator) / 32
+            + 0.03125
+        ).to(torch.bfloat16)
+        expanded_scales = scales.float().repeat_interleave(group_size, dim=0)
+        reference_weight = (quantized_weight.float() - 8) * expanded_scales
+        inputs = torch.ones(batch_size, input_size, dtype=torch.bfloat16)
+        bias = torch.rand(output_size, generator=generator) if has_bias else None
+        reference = torch.nn.functional.linear(
+            inputs.float(), reference_weight.t(), bias
+        ).to(torch.bfloat16)
+
+        packed_weight, packed_zero_points, packed_scales = (
+            torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
+                gptq_weight, gptq_zero, scales, 1, is_symmetric=True
+            )
+        )
+        torch.testing.assert_close(
+            packed_zero_points, torch.full_like(packed_zero_points, 8)
+        )
+        torch.testing.assert_close(gptq_zero, original_zero, rtol=0, atol=0)
+        actual = torch.ops.sgl_kernel.int4_scaled_mm_cpu(
+            inputs, packed_weight, packed_zero_points, packed_scales, bias
+        )
+        atol = rtol = precision[reference.dtype]
+        torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
+
+
+if __name__ == "__main__":
+    unittest.main()

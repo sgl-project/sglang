@@ -7,8 +7,8 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from sglang.srt.environ import temp_set_env
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_cuda, kill_process_tree
+from sglang.srt.utils.common import temp_set_env
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -55,11 +55,22 @@ def _cleanup_mmmu_dataset_cache():
         return False
 
 
+# lmms-eval logs its evaluation-tracker arguments, including the Hugging Face
+# token, at INFO level. MMMU is a public dataset, so run it without one.
+_HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+
+
+def _lmms_eval_env() -> dict:
+    """The current environment without Hugging Face tokens, read at call time."""
+    return {k: v for k, v in os.environ.items() if k not in _HF_TOKEN_ENV_VARS}
+
+
 def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
     """Run lmms_eval command with automatic retry on MMMU parquet corruption."""
     try:
         result = subprocess.run(
             cmd,
+            env=_lmms_eval_env(),
             check=True,
             timeout=timeout,
             capture_output=True,
@@ -79,7 +90,12 @@ def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
                     HF_DATASETS_DOWNLOAD_MODE="force_redownload",
                 ):
                     retry_result = subprocess.run(
-                        cmd, check=True, timeout=timeout, capture_output=True, text=True
+                        cmd,
+                        env=_lmms_eval_env(),
+                        check=True,
+                        timeout=timeout,
+                        capture_output=True,
+                        text=True,
                     )
                     # Print retry output
                     if retry_result.stdout:
@@ -108,7 +124,12 @@ def _run_lmms_eval_with_retry(cmd: list[str], timeout: int = 3600) -> None:
                     HF_DATASETS_DOWNLOAD_MODE="force_redownload",
                 ):
                     retry_result = subprocess.run(
-                        cmd, check=True, timeout=timeout, capture_output=True, text=True
+                        cmd,
+                        env=_lmms_eval_env(),
+                        check=True,
+                        timeout=timeout,
+                        capture_output=True,
+                        text=True,
                     )
                     # Print retry output
                     if retry_result.stdout:
@@ -161,7 +182,7 @@ class MMMUMixin:
         os.makedirs(output_path, exist_ok=True)
 
         # -------- compose --model_args --------
-        model_args = f'model_version="{model_version}",' f"tp={tp}"
+        model_args = f'model_version="{model_version}",tp={tp}'
 
         # -------- build command list --------
         cmd = [
@@ -293,7 +314,7 @@ class MMMUMultiModelTestBase(CustomTestCase):
         os.makedirs(output_path, exist_ok=True)
 
         # -------- compose --model_args --------
-        model_args = f'model_version="{model_version}",' f"tp={tp}"
+        model_args = f'model_version="{model_version}",tp={tp}'
 
         # -------- build command list --------
         cmd = [
@@ -349,8 +370,6 @@ class MMMUMultiModelTestBase(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
-            # if test vlm with cuda_ipc feature, open this env_var
-            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
             # Prepare stdout/stderr redirection if needed
             stdout_file = None
@@ -366,8 +385,12 @@ class MMMUMultiModelTestBase(CustomTestCase):
                 timeout=self.time_out,
                 api_key=self.api_key,
                 other_args=[
+                    # CUDA IPC multimodal-feature transport is NVIDIA-only; on
+                    # ROCm/HIP it makes ServerArgs raise "requires NVIDIA CUDA".
+                    # Only opt in on CUDA so AMD exercises CPU transport.
+                    *(["--mm-feature-transport", "cuda_ipc"] if is_cuda() else []),
                     "--trust-remote-code",
-                    "--cuda-graph-max-bs",
+                    "--cuda-graph-max-bs-decode",
                     "64",
                     "--enable-multimodal",
                     "--mem-fraction-static",
@@ -464,7 +487,3 @@ class MMMUMultiModelTestBase(CustomTestCase):
                 print(f"Error reading {tag.lower()} file: {e}")
 
         return "\n".join(output_lines)
-
-
-# Backward compatibility alias
-MMMUVLMTestBase = MMMUMultiModelTestBase

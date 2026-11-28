@@ -4,7 +4,7 @@ This test benchmarks MiniMax-M2.7 with TP=8 + EP=8 configuration.
 
 The model path can be configured via MINIMAX_M27_MODEL_PATH environment variable.
 
-Registry: nightly-perf-8-gpu-minimax-m27 suite
+Registry: nightly-perf-test-8-gpu-amd-minimax-m27 suite
 
 Example usage:
     python -m pytest test_minimax_m27_perf_amd.py -v
@@ -19,11 +19,13 @@ from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-minimax-m27", nightly=True)
+register_amd_ci(
+    est_time=5400, suite="nightly-perf-test-8-gpu-amd-minimax-m27", nightly=True
+)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
-    """Generate a simplified markdown report without traces and cost columns.
+    """Generate a simplified markdown report without cost columns.
 
     Skips the first result if it's a warmup run (duplicate batch_size).
     """
@@ -55,7 +57,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 MINIMAX_M27_MODEL_PATH = os.environ.get(
     "MINIMAX_M27_MODEL_PATH", "MiniMaxAI/MiniMax-M2.7"
 )
-PROFILE_DIR = "performance_profiles_minimax_m27"
+RESULT_DIR = "performance_results_minimax_m27"
 
 
 class TestNightlyMiniMaxM27Performance(unittest.TestCase):
@@ -94,8 +96,8 @@ class TestNightlyMiniMaxM27Performance(unittest.TestCase):
             },
         }
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_minimax_m27(self):
@@ -115,7 +117,6 @@ class TestNightlyMiniMaxM27Performance(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,
                 timeout=5400,
             )
             results = result_tuple[0]

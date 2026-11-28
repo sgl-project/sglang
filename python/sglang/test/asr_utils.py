@@ -108,6 +108,7 @@ class ASRTestBase(CustomTestCase):
         response_format: Optional[str] = None,
         timestamp_granularities: Optional[List[str]] = None,
         timeout: float = 180,
+        audio_bytes: Optional[bytes] = None,
     ) -> requests.Response:
         """Raw POST to ``/v1/audio/transcriptions``.
 
@@ -120,7 +121,10 @@ class ASRTestBase(CustomTestCase):
         ``_transcribe_json`` / ``_transcribe_stream`` wrappers default to
         ``audio_case.language`` when the caller doesn't specify one.
         """
-        audio_bytes = download_audio_bytes(audio_case.url, audio_case.local_cache_path)
+        if audio_bytes is None:
+            audio_bytes = download_audio_bytes(
+                audio_case.url, audio_case.local_cache_path
+            )
         data = {"model": self.served_model_name}
         if stream:
             data["stream"] = "true"

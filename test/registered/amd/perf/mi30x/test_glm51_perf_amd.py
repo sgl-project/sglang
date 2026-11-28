@@ -1,11 +1,11 @@
 """Nightly performance benchmark for GLM-5.1 on MI30x.
 
-Tests GLM-5.1-FP8 with NSA attention backend using bench_one_batch
+Tests GLM-5.1-FP8 with DSA attention backend using bench_one_batch
 on 8 GPUs with TP=8, FP8 KV cache.
 
 Model path can be configured via GLM51_MODEL_PATH environment variable.
 
-Registry: nightly-perf-8-gpu-glm51 suite
+Registry: nightly-perf-test-8-gpu-amd-glm51 suite
 """
 
 import os
@@ -17,7 +17,12 @@ from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
-register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-glm51", nightly=True)
+register_amd_ci(
+    est_time=5400,
+    suite="nightly-perf-test-8-gpu-amd-glm51",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
+)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
@@ -47,13 +52,13 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
 
 
 GLM51_MODEL_PATH = os.environ.get("GLM51_MODEL_PATH", "zai-org/GLM-5.1-FP8")
-PROFILE_DIR = "performance_profiles_glm51"
+RESULT_DIR = "performance_results_glm51"
 
 
 class TestNightlyGLM51Performance(unittest.TestCase):
     """Nightly performance benchmark for GLM-5.1 on MI30x.
 
-    Tests GLM-5.1-FP8 with NSA attention backend on TP=8.
+    Tests GLM-5.1-FP8 with DSA attention backend on TP=8.
     """
 
     @classmethod
@@ -74,9 +79,9 @@ class TestNightlyGLM51Performance(unittest.TestCase):
                 "glm47",
                 "--tp",
                 "8",
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
                 "--kv-cache-dtype",
                 "fp8_e4m3",
@@ -94,8 +99,8 @@ class TestNightlyGLM51Performance(unittest.TestCase):
             },
         }
 
-        cls.runner = NightlyBenchmarkRunner(PROFILE_DIR, cls.__name__, cls.base_url)
-        cls.runner.setup_profile_directory()
+        cls.runner = NightlyBenchmarkRunner(RESULT_DIR, cls.__name__, cls.base_url)
+        cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
     def test_bench_glm51(self):
@@ -113,7 +118,6 @@ class TestNightlyGLM51Performance(unittest.TestCase):
                 other_args=self.model_config["other_args"],
                 variant=self.model_config["name"],
                 extra_bench_args=["--trust-remote-code"],
-                enable_profile=False,
                 timeout=5400,
             )
             results = result_tuple[0]

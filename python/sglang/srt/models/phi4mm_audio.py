@@ -20,10 +20,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointWrapper,
-)
-from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel
 from transformers import PretrainedConfig
 
 from sglang.srt.models.phi4mm_utils import (
@@ -36,11 +32,8 @@ from sglang.srt.models.phi4mm_utils import (
     NemoConvSubsampling,
     T5RelativeAttentionLogitBias,
     adaptive_enc_mask,
-    get_offset,
     unfold_tensor,
 )
-
-_AUDIO_PLACEHOLDER_TOKEN_ID = 200011  # <|endoftext11|>
 
 
 class ConformerEncoderLayer(nn.Module):
@@ -383,9 +376,9 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
             if nemo_conv_settings:
                 default_nemo_conv_settings.update(nemo_conv_settings)
                 for i in ["subsampling_factor", "feat_in", "feat_out"]:
-                    assert (
-                        i not in nemo_conv_settings
-                    ), "{i} should be specified outside of the NeMo dictionary"
+                    assert i not in nemo_conv_settings, (
+                        "{i} should be specified outside of the NeMo dictionary"
+                    )
 
             self.embed = NemoConvSubsampling(
                 **default_nemo_conv_settings,
@@ -403,9 +396,9 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
             else None
         )
         if self.relative_attention_bias_type == "t5":
-            assert (
-                self.num_heads % self.attention_group_size == 0
-            ), "attention_group_size must divide n_head"
+            assert self.num_heads % self.attention_group_size == 0, (
+                "attention_group_size must divide n_head"
+            )
             self.relative_attention_bias_layer = T5RelativeAttentionLogitBias(
                 self.num_heads // self.attention_group_size,
                 max_distance=relative_attention_bias_args.get(
@@ -477,8 +470,7 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
                 )
             if len(left_chunk) != len(chunk_size):
                 raise ValueError(
-                    "The length of left_chunk must be the same as length of "
-                    "chunk_size."
+                    "The length of left_chunk must be the same as length of chunk_size."
                 )
             left_chunk_train_eff = left_chunk[chunk_size_index]
         else:
@@ -487,20 +479,7 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
 
         return chunk_size_train_eff, left_chunk_train_eff
 
-    def _get_embed_class(self, embed):
-        # pylint: disable=protected-access
-        is_embed_using_act_chkpt = isinstance(embed, CheckpointWrapper)
-        is_embed_fsdp_wrapped = isinstance(embed, FullyShardedDataParallel)
-        embed_class = embed
-        if is_embed_using_act_chkpt:
-            embed_class = embed._checkpoint_wrapped_module
-        if is_embed_fsdp_wrapped:
-            embed_class = embed.module
-        return embed_class
-
     def _forward_embeddings_core(self, input_tensor, masks):
-        embed_class = self._get_embed_class(self.embed)
-        assert isinstance(embed_class, NemoConvSubsampling)
         input_tensor, masks = self.embed(input_tensor, masks)
         return input_tensor, masks
 
@@ -561,9 +540,7 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
             seq_len, batch_size, self.chunk_size, self.left_chunk
         )
 
-        if xs_pad.is_cuda:
-            enc_streaming_mask = enc_streaming_mask.cuda()
-            xs_pad = xs_pad.cuda()
+        enc_streaming_mask = enc_streaming_mask.to(xs_pad.device)
 
         input_tensor = xs_pad
         input_tensor, masks = self._forward_embeddings_core(input_tensor, masks)
@@ -580,8 +557,7 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
             enc_streaming_mask_nc = self._streaming_mask(
                 seq_len, batch_size, chunk_size_nc, left_chunk_nc
             )
-            if xs_pad.is_cuda:
-                enc_streaming_mask_nc = enc_streaming_mask_nc.cuda()
+            enc_streaming_mask_nc = enc_streaming_mask_nc.to(xs_pad.device)
             if masks is not None:
                 hs_mask_nc = masks & enc_streaming_mask_nc
             else:
@@ -594,15 +570,6 @@ class TransformerEncoderBase(abc.ABC, nn.Module):
         if chunk_size_nc is None:
             return input_tensor, pos_k, pos_v, hs_mask, masks
         return input_tensor, pos_k, pos_v, hs_mask, masks, hs_mask_nc
-
-    def get_offset(self):
-        """Returns offset used when retaining inputs for decoding.
-
-        This is essentially, how many additional frames have to be added to
-        the front-end CNN input to ensure it can produce a single output.
-        So if the "padding" parameter is 0, typically offset will be > 0.
-        """
-        return get_offset(self.input_layer, self.time_reduction)
 
 
 class ConformerEncoder(TransformerEncoderBase):
@@ -840,9 +807,9 @@ class ConformerEncoder(TransformerEncoderBase):
         self.replication_pad_for_subsample_embedding: bool = (
             replication_pad_for_subsample_embedding
         )
-        assert (
-            self.num_heads % attention_group_size == 0
-        ), "attention_group_size must divide n_head"
+        assert self.num_heads % attention_group_size == 0, (
+            "attention_group_size must divide n_head"
+        )
         self.num_heads_k = self.num_heads // attention_group_size
 
         self.encoders = MultiSequential(
@@ -1117,9 +1084,9 @@ class AudioEmbedding(nn.Module):
             self.qformer = None
 
         if kwargs.get("use_conv_downsample", False):
-            assert (
-                self.qformer is None
-            ), "don't support use qformer and conv downsample together"
+            assert self.qformer is None, (
+                "don't support use qformer and conv downsample together"
+            )
             nemo_conv_settings = kwargs.get("nemo_conv_settings", {})
             default_nemo_conv_settings = {
                 "subsampling": "dw_striding",
@@ -1135,9 +1102,9 @@ class AudioEmbedding(nn.Module):
             if nemo_conv_settings:
                 default_nemo_conv_settings.update(nemo_conv_settings)
                 for i in ["subsampling_factor", "feat_in", "feat_out"]:
-                    assert (
-                        i not in nemo_conv_settings
-                    ), "{i} should be specified outside of the NeMo dictionary"
+                    assert i not in nemo_conv_settings, (
+                        "{i} should be specified outside of the NeMo dictionary"
+                    )
 
             self.conv_ds = NemoConvSubsampling(
                 **default_nemo_conv_settings,
@@ -1176,14 +1143,6 @@ class AudioEmbedding(nn.Module):
 
         # TODO: audio sequence compression - Qformer
         self.vocab_size = config.vocab_size
-        self.input_embeds = None
-        self.audio_embed_sizes = None
-
-    def set_audio_embeds(self, input_embeds: torch.FloatTensor) -> None:
-        self.input_embeds = input_embeds
-
-    def set_audio_embed_sizes(self, audio_embed_sizes: torch.LongTensor) -> None:
-        self.audio_embed_sizes = audio_embed_sizes
 
     def get_audio_features(
         self,
@@ -1234,7 +1193,7 @@ class AudioEmbedding(nn.Module):
             audio_set_tensor = self.audio_projection_for_vision(audio_features)
         else:
             raise ValueError(
-                f"audio_projection_mode = {audio_projection_mode} not " "implemented"
+                f"audio_projection_mode = {audio_projection_mode} not implemented"
             )
 
         return audio_set_tensor

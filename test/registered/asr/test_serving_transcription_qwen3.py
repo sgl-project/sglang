@@ -12,7 +12,7 @@ import unittest
 from sglang.test.asr_utils import ASRTestBase, AudioTestCase
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestServingTranscriptionQwen3(ASRTestBase):
@@ -20,7 +20,6 @@ class TestServingTranscriptionQwen3(ASRTestBase):
 
     model = "Qwen/Qwen3-ASR-0.6B"
     served_model_name = "Qwen/Qwen3-ASR-0.6B"
-    extra_args = ["--trust-remote-code"]
     streaming_exact_match = False
     audio_cases = [
         AudioTestCase(

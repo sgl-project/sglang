@@ -3,8 +3,8 @@ import json
 import openai
 import requests
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.parser.reasoning_parser import ReasoningParser
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
 class ReasoningTokenUsageMixin:
@@ -27,7 +27,7 @@ class ReasoningTokenUsageMixin:
     def init_reasoning_token_verifier(cls):
         assert cls.reasoning_parser_name, "reasoning_parser_name must be set"
         cls.tokenizer = get_tokenizer(cls.model)
-        parser = ReasoningParser(cls.reasoning_parser_name)
+        parser = ReasoningParser(cls.reasoning_parser_name, tokenizer=cls.tokenizer)
         cls.think_end_token_id = cls.tokenizer.convert_tokens_to_ids(
             parser.detector.think_end_token
         )

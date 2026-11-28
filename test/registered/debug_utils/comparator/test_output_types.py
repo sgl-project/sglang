@@ -2,14 +2,6 @@ import sys
 from io import StringIO
 
 import pytest
-from registered.debug_utils.comparator.testing_helpers import (
-    assert_rich_tags_balanced,
-)
-from registered.debug_utils.comparator.testing_helpers import make_diff as _make_diff
-from registered.debug_utils.comparator.testing_helpers import make_stats as _make_stats
-from registered.debug_utils.comparator.testing_helpers import (
-    make_tensor_info as _make_tensor_info,
-)
 from rich.console import Console, Group
 from rich.panel import Panel
 
@@ -37,6 +29,7 @@ from sglang.srt.debug_utils.comparator.aligner.unsharder.types import (
     UnsharderPlan,
 )
 from sglang.srt.debug_utils.comparator.dims_spec import ParallelAxis, TokenLayout
+from sglang.srt.debug_utils.comparator.output_formatter import _format_aligner_plan
 from sglang.srt.debug_utils.comparator.output_types import (
     BundleFileInfo,
     BundleSideInfo,
@@ -49,13 +42,18 @@ from sglang.srt.debug_utils.comparator.output_types import (
     LogRecord,
     RecordLocation,
     SummaryRecord,
-    _format_aligner_plan,
     _split_logs,
 )
 from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.comparator_test_utils import (
+    assert_rich_tags_balanced,
+)
+from sglang.test.comparator_test_utils import make_diff as _make_diff
+from sglang.test.comparator_test_utils import make_stats as _make_stats
+from sglang.test.comparator_test_utils import make_tensor_info as _make_tensor_info
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=10, stage="weekly", runner_config="cpu")
 
 
 def _render_rich(renderable: object) -> str:
@@ -586,9 +584,7 @@ class TestFormatAlignerPlan:
         )
         result: str = _format_aligner_plan(_wrap_plan(plan))
 
-        assert result == (
-            "Aligner Plan:\n" "  baseline: (no steps)\n" "  target: (no steps)"
-        )
+        assert result == ("Aligner Plan:\n  baseline: (no steps)\n  target: (no steps)")
 
     def test_unsharder(self) -> None:
         unsharder: UnsharderPlan = UnsharderPlan(
@@ -609,9 +605,7 @@ class TestFormatAlignerPlan:
         result: str = _format_aligner_plan(_wrap_plan(plan))
 
         assert result == (
-            "Aligner Plan:\n"
-            "  baseline: (no steps)\n"
-            "  target: [step=0: unsharder(tp)]"
+            "Aligner Plan:\n  baseline: (no steps)\n  target: [step=0: unsharder(tp)]"
         )
 
     def test_reorderer(self) -> None:

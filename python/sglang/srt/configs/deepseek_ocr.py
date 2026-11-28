@@ -1,9 +1,11 @@
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from PIL import Image, ImageOps
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 from transformers import (
     AutoProcessor,
     LlamaTokenizerFast,
@@ -11,60 +13,89 @@ from transformers import (
     ProcessorMixin,
 )
 
+from sglang.srt.configs.deepseekvl2 import DeepseekV2Config, DictOutput
 from sglang.srt.multimodal.customized_mm_processor_utils import (
     register_customized_processor,
 )
-from sglang.srt.sampling.custom_logit_processor import (
-    DeepseekOCRNoRepeatNGramLogitProcessor,
-)
+
+DeepseekOCRImage = Union[Image.Image, torch.Tensor]
 
 BASE_SIZE = 1024
-IMAGE_SIZE = 640
-CROP_MODE = True
+IMAGE_SIZE = 640  # DeepSeek-OCR local crop; OCR-2 uses OCR2_IMAGE_SIZE
+OCR2_IMAGE_SIZE = 768
 MIN_CROPS = 2
 MAX_CROPS = 6  # max:9; If your GPU memory is small, it is recommended to set it to 6.
-MAX_CONCURRENCY = 100  # If you have limited GPU memory, lower the concurrency count.
-NUM_WORKERS = 64  # image pre-process (resize/padding) workers
-PRINT_NUM_VIS_TOKENS = False
-SKIP_REPEAT = True
-MODEL_PATH = "deepseek-ai/DeepSeek-OCR"  # change to your model path
-
-NGRAM_NO_REPEAT_SIZE = 30
-NGRAM_NO_REPEAT_WINDOW = 90
-# Whitelist `<td>` and `</td>` token ids to allow table structures.
-NGRAM_NO_REPEAT_WHITELIST = (128821, 128822)
-
-DEFAULT_CUSTOM_LOGIT_PROCESSOR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
 
 
-def get_default_ngram_custom_params() -> Dict[str, Any]:
-    """Return default custom params for the DeepSeek-OCR n-gram no repeat processor."""
-
-    return {
-        "ngram_size": NGRAM_NO_REPEAT_SIZE,
-        "window_size": NGRAM_NO_REPEAT_WINDOW,
-        "whitelist_token_ids": list(NGRAM_NO_REPEAT_WHITELIST),
-    }
-
-
-PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
+def get_image_size(img: DeepseekOCRImage) -> Tuple[int, int]:
+    """Return (width, height) for both PIL.Image and torch.Tensor (CHW)."""
+    if isinstance(img, Image.Image):
+        return img.size
+    if isinstance(img, torch.Tensor):
+        if img.ndim != 3:
+            raise TypeError(f"Expected CHW image tensor, got shape {tuple(img.shape)}")
+        return int(img.shape[-1]), int(img.shape[-2])
+    raise TypeError(f"Unsupported image type: {type(img)}")
 
 
-class DictOutput(object):
-    def items(self):
-        return self.__dict__.items()
+def resize_image(img: DeepseekOCRImage, size: Tuple[int, int]) -> DeepseekOCRImage:
+    """Resize image to (width, height) for both PIL and tensor."""
+    if isinstance(img, Image.Image):
+        return img.resize(size, Image.BICUBIC)
+    return TF.resize(
+        img,
+        [size[1], size[0]],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    ).contiguous()
 
-    def keys(self):
-        return self.__dict__.keys()
 
-    def __getitem__(self, item):
-        return self.__dict__[item]
+def crop_image(
+    img: DeepseekOCRImage, box: Tuple[int, int, int, int]
+) -> DeepseekOCRImage:
+    """Crop image with box=(left, upper, right, lower) for both PIL and tensor."""
+    if isinstance(img, Image.Image):
+        return img.crop(box)
+    left, upper, right, lower = box
+    return img[:, upper:lower, left:right].contiguous()
 
-    def __contains__(self, key):
-        return key in self.__dict__
 
-    def __setitem__(self, key, value):
-        self.__dict__[key] = value
+def pad_image(
+    img: DeepseekOCRImage,
+    target_size: Tuple[int, int],
+    fill_color: Tuple[int, int, int],
+) -> DeepseekOCRImage:
+    """Fit-and-center-pad image to target_size=(width, height).
+
+    Replaces ImageOps.pad for tensor inputs.
+    """
+    if isinstance(img, Image.Image):
+        return ImageOps.pad(img, target_size, color=fill_color)
+    # tensor path: CHW format
+    _, h, w = img.shape
+    target_w, target_h = target_size
+    scale = min(target_w / w, target_h / h)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    resized = TF.resize(
+        img,
+        [new_h, new_w],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    )
+    pad_left = (target_w - new_w) // 2
+    pad_top = (target_h - new_h) // 2
+    if img.dtype == torch.uint8:
+        fill_tensor = torch.tensor(
+            list(fill_color), device=img.device, dtype=torch.uint8
+        ).view(3, 1, 1)
+    else:
+        fill_tensor = torch.tensor(
+            [c / 255.0 for c in fill_color], device=img.device, dtype=img.dtype
+        ).view(3, 1, 1)
+    result = fill_tensor.expand(3, target_h, target_w).clone()
+    result[:, pad_top : pad_top + new_h, pad_left : pad_left + new_w] = resized
+    return result.contiguous()
 
 
 @dataclass
@@ -110,8 +141,19 @@ class ImageTransform(object):
 
         self.transform = T.Compose(transform_pipelines)
 
-    def __call__(self, pil_img: Image.Image):
-        x = self.transform(pil_img)
+    def __call__(self, img):
+        if isinstance(img, torch.Tensor):
+            x = img
+            if x.dtype == torch.uint8:
+                x = x.to(torch.float32).div(255)
+            elif not x.is_floating_point():
+                x = x.to(torch.float32)
+            if self.normalize:
+                import torchvision.transforms as T
+
+                x = T.Normalize(self.mean, self.std)(x)
+            return x
+        x = self.transform(img)
         return x
 
 
@@ -132,9 +174,13 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
 
 
 def dynamic_preprocess(
-    image, min_num=MIN_CROPS, max_num=MAX_CROPS, image_size=640, use_thumbnail=False
+    image,
+    min_num=MIN_CROPS,
+    max_num=MAX_CROPS,
+    image_size=IMAGE_SIZE,
+    use_thumbnail=False,
 ):
-    orig_width, orig_height = image.size
+    orig_width, orig_height = get_image_size(image)
     aspect_ratio = orig_width / orig_height
 
     # calculate the existing image aspect ratio
@@ -158,7 +204,7 @@ def dynamic_preprocess(
     blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
 
     # resize the image
-    resized_img = image.resize((target_width, target_height))
+    resized_img = resize_image(image, (target_width, target_height))
     processed_images = []
     for i in range(blocks):
         box = (
@@ -168,13 +214,35 @@ def dynamic_preprocess(
             ((i // (target_width // image_size)) + 1) * image_size,
         )
         # split the image
-        split_img = resized_img.crop(box)
+        split_img = crop_image(resized_img, box)
         processed_images.append(split_img)
     assert len(processed_images) == blocks
     if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
+        thumbnail_img = resize_image(image, (image_size, image_size))
         processed_images.append(thumbnail_img)
     return processed_images, target_aspect_ratio
+
+
+def is_ocr2_config(config) -> bool:
+    """Whether a checkpoint is DeepSeek-OCR-2.
+
+    Both checkpoints ship identical processor configs, so identity comes from the
+    model config: the DeepEncoder V2 vision encoder, or its 896-dim projector.
+    Both lookups are guarded because the projector clause is what covers derived
+    checkpoints that drop `model_name` -- reading it unguarded would raise before
+    that clause is reached.
+    """
+    vision_config = getattr(config, "vision_config", None)
+    projector_config = getattr(config, "projector_config", None)
+    return (
+        str(getattr(vision_config, "model_name", "")).lower() == "deepencoderv2"
+        or getattr(projector_config, "input_dim", None) == 896
+    )
+
+
+def local_crop_size(config) -> int:
+    """Local-crop pixel size: 768 for OCR-2, 640 for DeepSeek-OCR."""
+    return OCR2_IMAGE_SIZE if is_ocr2_config(config) else IMAGE_SIZE
 
 
 class DeepseekOCRProcessor(ProcessorMixin):
@@ -201,6 +269,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
     ):
 
         self.candidate_resolutions = candidate_resolutions
+        # The checkpoint config carries the *global* base here, not the local
+        # crop; the SGLang processor patches the real crop size per model.
         self.image_size = candidate_resolutions[0][0]
         self.patch_size = patch_size
         self.image_mean = image_mean
@@ -251,9 +321,8 @@ class DeepseekOCRProcessor(ProcessorMixin):
             **kwargs,
         )
 
-    def format_messages_v2(self, messages: str, pil_images, max_req_input_len=-1):
+    def format_messages_v2(self, messages: str, pil_images):
         """play the role of format_messages_v2 and get_images_info in the last version"""
-        tokenized_data = []
         masked_tokenized_data = []  # labels
         images_list = []
         images_seq_mask = []
@@ -324,7 +393,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
-        max_req_input_len: int = -1,
         cropping: bool = True,
         **kwargs,
     ):
@@ -357,7 +425,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
             images_seq_mask,
             images_spatial_crop,
             images_crop,
-        ) = self.format_messages_v2(prompt, images, max_req_input_len)
+        ) = self.format_messages_v2(prompt, images)
 
         target_ids = torch.LongTensor(masked_tokenized_str)
 
@@ -399,7 +467,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
-        max_req_input_len: int = -1,
         text: list[str] = None,
         **kwargs,
     ):
@@ -413,17 +480,9 @@ class DeepseekOCRProcessor(ProcessorMixin):
             apply_sft_format=apply_sft_format,
             inference_mode=inference_mode,
             system_prompt=system_prompt,
-            max_req_input_len=max_req_input_len,
         )
 
         return prepare
-
-    def find_all_indices(self, messages, target_value):
-        indices = []
-        for index, item in enumerate(messages):
-            if item == target_value:
-                indices.append(index)
-        return indices
 
     def tokenize_with_images(
         self,
@@ -435,7 +494,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
     ):
         """Tokenize text with <image> tags."""
 
-        conversation = conversation
         assert conversation.count(self.image_token) == len(images)
         text_splits = conversation.split(self.image_token)
         images_list, images_crop_list, images_seq_mask, images_spatial_crop = (
@@ -454,26 +512,32 @@ class DeepseekOCRProcessor(ProcessorMixin):
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
-            image_shapes.append(image.size)
+            img_w, img_h = get_image_size(image)
+            image_shapes.append((img_w, img_h))
 
-            if image.size[0] <= 640 and image.size[1] <= 640:
+            # Both official processors threshold on their own crop size (640 for
+            # OCR-1, 768 for OCR-2), which is what `image_size` holds here.
+            if img_w <= self.image_size and img_h <= self.image_size:
                 crop_ratio = [1, 1]
             else:
                 if cropping:
                     images_crop_raw, crop_ratio = dynamic_preprocess(
-                        image, image_size=IMAGE_SIZE
+                        image, image_size=self.image_size
                     )
                 else:
                     crop_ratio = [1, 1]
 
             """process the global view"""
-            if self.image_size <= 640 and not cropping:
-                image = image.resize((self.image_size, self.image_size))
+            # Upstream compares against the model's own crop constant, which is
+            # exactly what `image_size` holds, so the test is always true and the
+            # guard reduces to `not cropping`.
+            if not cropping:
+                image = resize_image(image, (self.image_size, self.image_size))
 
-            global_view = ImageOps.pad(
+            global_view = pad_image(
                 image,
                 (self.base_size, self.base_size),
-                color=tuple(int(x * 255) for x in self.image_transform.mean),
+                tuple(int(x * 255) for x in self.image_transform.mean),
             )
             images_list.append(self.image_transform(global_view))
 
@@ -532,9 +596,9 @@ class DeepseekOCRProcessor(ProcessorMixin):
             tokenized_str = tokenized_str + [self.eos_id]
             images_seq_mask = images_seq_mask + [False]
 
-        assert len(tokenized_str) == len(
-            images_seq_mask
-        ), f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        assert len(tokenized_str) == len(images_seq_mask), (
+            f"tokenize_with_images func: tokenized_str's length {len(tokenized_str)} is not equal to imags_seq_mask's length {len(images_seq_mask)}"
+        )
 
         masked_tokenized_str = []
         for token_index in tokenized_str:
@@ -559,14 +623,11 @@ class DeepseekOCRProcessor(ProcessorMixin):
         )
         input_ids[input_ids < 0] = self.pad_id
 
-        inference_mode = True
-
-        if inference_mode:
-            # Remove the ending eos token
-            assert input_ids[-1] == self.eos_id
-            input_ids = input_ids[:-1]
-            target_ids = target_ids[:-1]
-            images_seq_mask = images_seq_mask[:-1]
+        # Remove the ending eos token
+        assert input_ids[-1] == self.eos_id
+        input_ids = input_ids[:-1]
+        target_ids = target_ids[:-1]
+        images_seq_mask = images_seq_mask[:-1]
 
         if len(images_list) == 0:
             pixel_values = torch.zeros((1, 3, self.base_size, self.base_size))
@@ -675,106 +736,6 @@ class MlpProjectorConfig(PretrainedConfig):
         self.downsample_ratio = downsample_ratio
 
         super().__init__(**kwargs)
-
-
-class DeepseekV2Config(PretrainedConfig):
-    model_type = "deepseek_v2"
-    keys_to_ignore_at_inference = ["past_key_values"]
-
-    def __init__(
-        self,
-        vocab_size=102400,
-        hidden_size=4096,
-        intermediate_size=11008,
-        moe_intermediate_size=1407,
-        num_hidden_layers=30,
-        num_attention_heads=32,
-        num_key_value_heads=32,
-        n_shared_experts=None,
-        n_routed_experts=None,
-        ep_size=1,
-        routed_scaling_factor=1.0,
-        kv_lora_rank=512,
-        q_lora_rank=1536,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        qk_nope_head_dim=128,
-        topk_method="gready",
-        n_group=None,
-        topk_group=None,
-        num_experts_per_tok=None,
-        moe_layer_freq=1,
-        first_k_dense_replace=0,
-        norm_topk_prob=False,
-        scoring_func="softmax",
-        aux_loss_alpha=0.001,
-        seq_aux=True,
-        hidden_act="silu",
-        max_position_embeddings=2048,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=100000,
-        eos_token_id=100001,
-        pretraining_tp=1,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        attention_bias=False,
-        attention_dropout=0.0,
-        use_mla=True,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.moe_intermediate_size = moe_intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.n_shared_experts = n_shared_experts
-        self.n_routed_experts = n_routed_experts
-        self.ep_size = ep_size
-        self.routed_scaling_factor = routed_scaling_factor
-        self.kv_lora_rank = kv_lora_rank
-        self.q_lora_rank = q_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.topk_method = topk_method
-        self.n_group = n_group
-        self.topk_group = topk_group
-        self.num_experts_per_tok = num_experts_per_tok
-        self.moe_layer_freq = moe_layer_freq
-        self.first_k_dense_replace = first_k_dense_replace
-        self.norm_topk_prob = norm_topk_prob
-        self.scoring_func = scoring_func
-        self.aux_loss_alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
-        # for backward compatibility
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = float(rms_norm_eps)
-        self.pretraining_tp = pretraining_tp
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.attention_bias = attention_bias
-        self.attention_dropout = attention_dropout
-        self.use_mla = use_mla
-
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
 
 
 @register_customized_processor(processor_class=DeepseekOCRProcessor)

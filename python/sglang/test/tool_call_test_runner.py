@@ -263,14 +263,14 @@ def _test_reasoning_usage(client, model):
     )
     usage = response.usage
     assert usage is not None, "usage should not be None"
-    assert (
-        usage.reasoning_tokens and usage.reasoning_tokens > 0
-    ), f"expected reasoning_tokens > 0, got {usage.reasoning_tokens}"
+    assert usage.reasoning_tokens and usage.reasoning_tokens > 0, (
+        f"expected reasoning_tokens > 0, got {usage.reasoning_tokens}"
+    )
     if usage.completion_tokens_details:
         detail_reasoning = usage.completion_tokens_details.get("reasoning_tokens", 0)
-        assert (
-            detail_reasoning > 0
-        ), f"expected completion_tokens_details.reasoning_tokens > 0, got {detail_reasoning}"
+        assert detail_reasoning > 0, (
+            f"expected completion_tokens_details.reasoning_tokens > 0, got {detail_reasoning}"
+        )
 
 
 def _test_parallel(client, model):
@@ -340,8 +340,9 @@ def run_tool_call_test(
     model: ModelLaunchSettings,
     params: ToolCallTestParams,
     base_url: Optional[str] = None,
+    skip_server_launch: bool = False,
 ) -> ToolCallTestResult:
-    """Launch server, run enabled test cases, return results."""
+    """Run enabled tests, optionally reusing a caller-owned server."""
     base_url = base_url or DEFAULT_URL_FOR_TEST
 
     print(f"\n{'=' * 60}")
@@ -352,13 +353,14 @@ def run_tool_call_test(
 
     process = None
     try:
-        process = popen_launch_server(
-            model.model_path,
-            base_url,
-            other_args=model.extra_args,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env=model.env,
-        )
+        if not skip_server_launch:
+            process = popen_launch_server(
+                model.model_path,
+                base_url,
+                other_args=model.extra_args,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                env=model.env,
+            )
         client = openai.Client(api_key="sk-test", base_url=base_url + "/v1")
 
         passed_list = []

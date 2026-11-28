@@ -2,12 +2,12 @@ import logging
 import os
 import time
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,12 +39,13 @@ class MMMUServerBase(CustomTestCase):
 
         # Prepare environment variables
         process_env = os.environ.copy()
-        process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
 
         # Build server args with MMMU-specific settings
         server_args = [
+            "--mm-feature-transport",
+            "cuda_ipc",
             "--trust-remote-code",
-            "--cuda-graph-max-bs",
+            "--cuda-graph-max-bs-decode",
             "64",
             "--enable-multimodal",
             "--mem-fraction-static",
@@ -65,7 +66,7 @@ class MMMUServerBase(CustomTestCase):
     def tearDownClass(cls):
         if cls.process is not None and cls.process.poll() is None:
             try:
-                kill_process_tree(cls.process.pid, wait_timeout=60)
+                terminate_and_kill_process_tree(cls.process, wait_timeout=60)
             except Exception as e:
                 logger.error(f"Error killing process: {e}")
         time.sleep(2)

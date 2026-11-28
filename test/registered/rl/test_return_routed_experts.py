@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=400, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=396, stage="extra-b", runner_config="4-gpu-h100")
 
 # FP8 variant of Qwen3-30B-A3B: required because DeepEP normal/LL fast paths in
 # ep_moe/layer.py only run for {Fp8Config (via deep_gemm), W4AFp8Config, aiter,
@@ -44,8 +44,8 @@ class TestReturnRoutedExperts(CustomTestCase):
     under DeepEP a2a + attn_tp_size > 1, across overlap/cuda-graph/radix
     optimisations.
 
-    Both servers run ``--tp 4 --dp 2 --enable-dp-attention --moe-a2a-backend
-    deepep`` so attn_tp_size=2 and the all-gather hot path in
+    Both servers run ``--tp 4 --attn-dp-size 2 --moe-a2a-backend deepep``
+    so attn_tp_size=2 and the all-gather hot path in
     RoutedExpertsCapturer.capture is hit on every step. Baseline disables
     overlap/cuda-graph/radix to give a deterministic ground truth; reference
     leaves them on. If the gather were skipping a rank or racing against the
@@ -59,24 +59,50 @@ class TestReturnRoutedExperts(CustomTestCase):
             "--enable-deterministic-inference",
             "--tp",
             4,
-            "--dp",
+            "--attn-dp-size",
             2,
-            "--enable-dp-attention",
             "--moe-a2a-backend",
             "deepep",
             # Force normal-mode dispatch: deepep auto routes decode through
             # low_latency mode whose buffer (num_max_dispatch_tokens_per_rank)
-            # is undersized for cuda graph capture at default --cuda-graph-max-bs.
+            # is undersized for cuda graph capture at default --cuda-graph-max-bs-decode.
             "--deepep-mode",
             "normal",
         ]
         cls.baseline_args = common + [
             "--disable-overlap-schedule",
-            "--disable-cuda-graph",
+            "--disable-decode-cuda-graph",
+            "--disable-prefill-cuda-graph",
             "--disable-radix-cache",
         ]
         cls.reference_args = common
         cls.sampling_args = {"temperature": 0}
+        cls.texts = None
+        cls.baseline_results = None
+        cls.reference_results = None
+        cls._endpoints = [
+            (
+                "/generate",
+                cls._build_generate_payload,
+                extract_routed_experts_from_meta_info,
+            ),
+            (
+                "/v1/chat/completions",
+                cls._build_chat_payload,
+                extract_routed_experts_from_openai_response,
+            ),
+            (
+                "/v1/completions",
+                cls._build_completion_payload,
+                extract_routed_experts_from_openai_response,
+            ),
+        ]
+
+    @classmethod
+    def _ensure_comparison_results(cls):
+        if cls.baseline_results is not None and cls.reference_results is not None:
+            return
+
         # prepare ShareGPT dataset
         dataset_path = download_and_cache_hf_file(SHAREGPT_REPO_ID, SHAREGPT_FILENAME)
         with open(dataset_path) as f:
@@ -96,23 +122,6 @@ class TestReturnRoutedExperts(CustomTestCase):
         if not cls.texts:
             raise ValueError("No valid texts found in the dataset")
         cls.texts = cls.texts[:100]
-        cls._endpoints = [
-            (
-                "/generate",
-                cls._build_generate_payload,
-                extract_routed_experts_from_meta_info,
-            ),
-            (
-                "/v1/chat/completions",
-                cls._build_chat_payload,
-                extract_routed_experts_from_openai_response,
-            ),
-            (
-                "/v1/completions",
-                cls._build_completion_payload,
-                extract_routed_experts_from_openai_response,
-            ),
-        ]
         cls.baseline_results = cls._collect_results(cls.baseline_args)
         cls.reference_results = cls._collect_results(cls.reference_args)
 
@@ -128,8 +137,13 @@ class TestReturnRoutedExperts(CustomTestCase):
     def test_return_routed_experts_completions(cls):
         cls._run_endpoint_test("/v1/completions")
 
+    def test_mixed_return_routed_experts_batch_alignment(self):
+        self._run_mixed_batch_alignment_case([])
+        self._run_mixed_batch_alignment_case(["--tokenizer-worker-num", 2])
+
     @classmethod
     def _run_endpoint_test(cls, endpoint):
+        cls._ensure_comparison_results()
         captured_baseline_experts = cls.baseline_results[endpoint]
         captured_reference_experts = cls.reference_results[endpoint]
 
@@ -146,14 +160,14 @@ class TestReturnRoutedExperts(CustomTestCase):
             captured_baseline_experts, captured_reference_experts
         )
         logger.info(
-            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches / num_baseline_topks:.4%})"
         )
         print(
-            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+            f"Total mismatches report: {num_mismatches} out of {num_baseline_topks} ({num_mismatches / num_baseline_topks:.4%})"
         )
-        assert (
-            num_mismatches / num_baseline_topks < 0.10
-        ), f"Too many mismatches: {num_mismatches} out of {num_baseline_topks} ({num_mismatches/num_baseline_topks:.4%})"
+        assert num_mismatches / num_baseline_topks < 0.10, (
+            f"Too many mismatches: {num_mismatches} out of {num_baseline_topks} ({num_mismatches / num_baseline_topks:.4%})"
+        )
 
     @classmethod
     def _collect_results(
@@ -170,6 +184,73 @@ class TestReturnRoutedExperts(CustomTestCase):
             return asyncio.run(cls._collect_results_async())
         finally:
             kill_process_tree(process.pid)
+
+    @classmethod
+    def _run_mixed_batch_alignment_case(cls, other_args):
+        process = popen_launch_server(
+            DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
+            DEFAULT_URL_FOR_TEST,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--tp",
+                2,
+                "--enable-return-routed-experts",
+                "--disable-decode-cuda-graph",
+                "--disable-prefill-cuda-graph",
+                "--cuda-graph-backend-prefill=disabled",
+                *other_args,
+            ],
+        )
+        try:
+            responses = asyncio.run(cls._send_mixed_batch())
+            cls._assert_mixed_batch_result(responses)
+        finally:
+            kill_process_tree(process.pid)
+
+    @classmethod
+    async def _send_mixed_batch(cls):
+        payload_no_rr = {
+            "text": "The quick brown fox jumps over the lazy dog.",
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 16,
+                "ignore_eos": True,
+            },
+            "return_routed_experts": False,
+        }
+        payload_with_rr = {
+            "text": "The quick brown fox jumps over the lazy dog.",
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 16,
+                "ignore_eos": True,
+            },
+            "return_routed_experts": True,
+        }
+
+        async with aiohttp.ClientSession() as session:
+            return await asyncio.gather(
+                cls._post_generate(session, payload_no_rr),
+                cls._post_generate(session, payload_with_rr),
+            )
+
+    @staticmethod
+    async def _post_generate(session, payload):
+        async with session.post(
+            f"{DEFAULT_URL_FOR_TEST}/generate", json=payload
+        ) as response:
+            body = await response.json()
+            if response.status != 200:
+                raise AssertionError(f"HTTP {response.status}: {body}")
+            if "error" in body:
+                raise AssertionError(f"generate returned error: {body['error']}")
+            return body
+
+    @classmethod
+    def _assert_mixed_batch_result(cls, responses):
+        no_rr, with_rr = responses
+        assert "routed_experts" not in no_rr.get("meta_info", {})
+        assert "routed_experts" in with_rr.get("meta_info", {})
 
     @classmethod
     async def _collect_results_async(cls):
@@ -392,6 +473,23 @@ class TestRoutedExpertsStartLen(CustomTestCase):
             self._build_payload(routed_experts_start_len=prompt_tokens + 1)
         )
         self._assert_aborted(too_big, "is higher than the number of input tokens")
+
+    def test_negative_start_len_survives_intake_abort(self):
+        """A request rejected by an intake check that runs before the
+        routed-experts check (here an out-of-range logprob_start_len) keeps its
+        negative start; it must be aborted on its own and leave the server
+        serving."""
+        aborted = self._send(
+            self._build_payload(
+                routed_experts_start_len=-5,
+                return_logprob=True,
+                logprob_start_len=1_000_000,
+            )
+        )
+        self._assert_aborted(aborted, "is higher than the number of input tokens")
+
+        resp = self._send(self._build_payload())
+        self.assertEqual(resp.status_code, 200, resp.text)
 
     def test_start_len_with_cache_hit(self):
         """`start_len` must allow the radix prefix to extend past it. The

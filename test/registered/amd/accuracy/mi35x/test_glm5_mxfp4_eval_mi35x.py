@@ -6,15 +6,11 @@ completion benchmark on MI35x.
 Model: amd/GLM-5-MXFP4 (MOE-only MXFP4 quantization of zai-org/GLM-5)
 Reference: https://huggingface.co/amd/GLM-5-MXFP4
 
-Registry: nightly-amd-8-gpu-mi35x-glm5-mxfp4 suite
+Registry: nightly-test-8-gpu-amd-mi35x-glm5-mxfp4 suite
 """
 
 import ast
 import os
-
-os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
-os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
-
 import re
 import time
 import unittest
@@ -36,24 +32,12 @@ from sglang.utils import download_and_cache_file, read_jsonl
 
 register_amd_ci(
     est_time=5400,
-    suite="nightly-amd-8-gpu-mi35x-glm5-mxfp4",
+    suite="nightly-test-8-gpu-amd-mi35x-glm5-mxfp4",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999
-
-GLM5_MXFP4_LOCAL_PATH = "/data2/models/amd-GLM-5-MXFP4"
-GLM5_MXFP4_HF_MODEL_ID = "amd/GLM-5-MXFP4"
-
-
-def get_model_path() -> str:
-    """Get effective model path: env var > local path > HF model ID."""
-    env_path = os.environ.get("GLM5_MXFP4_MODEL_PATH")
-    if env_path:
-        return env_path
-    if os.path.exists(GLM5_MXFP4_LOCAL_PATH):
-        return GLM5_MXFP4_LOCAL_PATH
-    return GLM5_MXFP4_HF_MODEL_ID
 
 
 @dataclass
@@ -82,10 +66,9 @@ class ModelConfig:
 
 def get_glm5_mxfp4_models() -> List[ModelConfig]:
     """Get GLM-5-MXFP4 model configurations for MI35x."""
-    model_path = get_model_path()
     return [
         ModelConfig(
-            model_path=model_path,
+            model_path="amd/GLM-5-MXFP4",
             tp_size=8,
             accuracy_threshold=0.90,
             timeout=5400,
@@ -191,22 +174,10 @@ class TestGLM5MXFP4EvalMI35x(unittest.TestCase):
     def setUpClass(cls):
         cls.models = get_glm5_mxfp4_models()
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "200"))
+        cls.num_questions = int(os.environ.get("GSM8K_NUM_QUESTIONS", "1319"))
 
     def test_glm5_mxfp4_accuracy(self):
         """Test GLM-5-MXFP4 with GSM8K completion benchmark."""
-        model_path = get_model_path()
-        is_local_path = model_path.startswith("/")
-        if is_local_path and not os.path.exists(model_path):
-            print(f"\nSKIPPING: Local model not found at {model_path}")
-            self.skipTest(f"Local model not found at {model_path}")
-            return
-
-        if is_local_path:
-            print(f"Using local model: {model_path}")
-        else:
-            print(f"Using HuggingFace model: {model_path}")
-
         all_results = []
         summary = "### GLM-5-MXFP4 Models (MI35x)\n\n"
         summary += "| Model | Variant | TP | Accuracy | Threshold | Status |\n"
@@ -215,9 +186,9 @@ class TestGLM5MXFP4EvalMI35x(unittest.TestCase):
         for config in self.models:
             display_name = config.get_display_name()
             with self.subTest(model=display_name):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {display_name}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

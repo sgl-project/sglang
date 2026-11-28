@@ -3,7 +3,7 @@
 import unittest
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.kits.server_sanity_kit import ServerSanityMixin
+from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -46,7 +46,10 @@ _EAGLE_SPEC_ARGS = [
 ]
 
 
-class TestDSV4FlashTP4DP4(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP4DP4(
+    BasicDecodeCorrectnessMixin,
+    CustomTestCase,
+):
     """TP4 + DP4 + deepep + EAGLE MTP."""
 
     @classmethod
@@ -57,12 +60,11 @@ class TestDSV4FlashTP4DP4(ServerSanityMixin, CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "128",
                 "--max-running-requests",
                 "256",
@@ -79,7 +81,10 @@ class TestDSV4FlashTP4DP4(ServerSanityMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashTP4EP(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP4EP(
+    BasicDecodeCorrectnessMixin,
+    CustomTestCase,
+):
     """TP attn + EP MoE (no DP attn) — exercises the DeepEP + TP-attn path."""
 
     @classmethod
@@ -92,10 +97,10 @@ class TestDSV4FlashTP4EP(ServerSanityMixin, CustomTestCase):
                 "4",
                 "--ep",
                 "4",
-                # No --enable-dp-attention by design: covers TP-attn path.
+                # No --attn-dp-size by design: covers TP-attn path.
                 "--moe-a2a-backend",
                 "deepep",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "128",
                 "--max-running-requests",
                 "64",
@@ -112,7 +117,10 @@ class TestDSV4FlashTP4EP(ServerSanityMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashTP4DP4ChunkedPrefillLarge(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashTP4DP4ChunkedPrefillLarge(
+    BasicDecodeCorrectnessMixin,
+    CustomTestCase,
+):
     """TP4 + DP4 with --chunked-prefill-size 16384 — large chunked prefill."""
 
     @classmethod
@@ -123,14 +131,13 @@ class TestDSV4FlashTP4DP4ChunkedPrefillLarge(ServerSanityMixin, CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
                 "--chunked-prefill-size",
                 "16384",
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 "128",
                 "--max-running-requests",
                 "256",

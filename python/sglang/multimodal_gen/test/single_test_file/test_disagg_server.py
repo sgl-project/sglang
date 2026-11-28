@@ -1,0 +1,998 @@
+"""End-to-end tests for disaggregated diffusion.
+
+Launches encoder / denoiser / decoder role instances plus a DiffusionServer
+head, sends a generation request through the HTTP front-end, and verifies
+that a non-empty output comes back.
+
+Two configurations are covered:
+
+1. :class:`TestDisaggZImage1Rank` — 1 rank per role (baseline disagg path).
+2. :class:`TestDisaggZImage2RankDenoiser` — denoiser with
+   ``--denoiser-sp 2`` across 2 GPUs. Exercises the multi-rank receive path
+   where only rank 0 owns the RDMA TransferManager and must broadcast
+   prompt/image tensors to non-rank-0 ranks before
+   ``execute_forward`` — without that broadcast the denoising stage fails
+   ``verify_input`` on an empty ``prompt_embeds``.
+
+Run directly:
+
+    pytest -v python/sglang/multimodal_gen/test/single_test_file/test_disagg_server.py
+    pytest -v ... -k ZImage1Rank              # one class
+    pytest -v ... -k test_generates_image     # one test
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import subprocess
+import time
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import requests
+import torch
+
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+    find_free_port,
+    wait_for_server_health,
+)
+from sglang.srt.utils.network import get_free_port_below_ephemeral, is_port_available
+from sglang.test.test_utils import CustomTestCase, terminate_and_kill_process_tree
+
+HOST = "127.0.0.1"
+_LOG_DIR = Path(os.environ.get("SGLANG_TEST_LOG_DIR", "/tmp"))
+
+# Env knob: bump if a cold HF download is needed on a fresh CI runner.
+_STARTUP_TIMEOUT_S = float(os.environ.get("SGLANG_DISAGG_STARTUP_TIMEOUT", "600"))
+
+
+# ---------------------------------------------------------------------------
+# Process management
+# ---------------------------------------------------------------------------
+
+
+def _wait_for_log(path: Path, message: str, timeout: float, process=None) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if path.exists():
+            try:
+                if message in path.read_text(errors="ignore"):
+                    return True
+            except OSError:
+                pass
+        if process is not None and process.poll() is not None:
+            return False
+        time.sleep(2)
+    return False
+
+
+def _tail_log(path: Path, n: int = 50) -> str:
+    if not path.exists():
+        return f"<no log at {path}>"
+    try:
+        lines = path.read_text(errors="ignore").splitlines()
+    except OSError as e:
+        return f"<log read failed: {e}>"
+    return "\n".join(lines[-n:])
+
+
+# ---------------------------------------------------------------------------
+# Disagg cluster helper
+# ---------------------------------------------------------------------------
+
+
+class DisaggCluster:
+    """Launch encoder / denoiser / decoder / server as separate processes.
+
+    ``gpu_layout`` is a mapping role → list of physical GPU ids. The length
+    of each list determines ``--num-gpus`` for that role, and the first id is
+    passed as ``--base-gpu-id``. For a multi-rank role the GPUs must be
+    contiguous starting from ``base-gpu-id`` (sglang derives local_rank from
+    ``base-gpu-id + rank``).
+    """
+
+    def __init__(
+        self,
+        model: str,
+        name: str,
+        gpu_layout: dict[str, list[int]],
+        extra_role_args: dict[str, list[str]] | None = None,
+        startup_timeout: float = _STARTUP_TIMEOUT_S,
+        warmup_kwargs: dict | None = None,
+        stage_groups: dict[str, list[str | int]] | None = None,
+        stage_outputs: tuple[str, ...] | None = None,
+        stage_contracts: list[dict] | None = None,
+    ) -> None:
+        self.model = model
+        self.name = name
+        self.gpu_layout = gpu_layout
+        self.extra_role_args = extra_role_args or {}
+        self.startup_timeout = startup_timeout
+        self.warmup_kwargs = warmup_kwargs or {}
+        self.stage_groups = stage_groups
+        self.stage_outputs = stage_outputs
+        self.stage_contracts = stage_contracts
+        self._procs: list[subprocess.Popen] = []
+        self._fhs: list = []
+        self._logs: dict[str, Path] = {}
+        self._alloc_ports()
+
+    def _alloc_ports(self) -> None:
+        # The head binds its result sockets at fixed offsets from its frontend.
+        first_work_offset = max(ServerArgs.DISAGG_RESULT_PORT_OFFSETS.values()) + 1
+        api_offset = first_work_offset + len(self.gpu_layout)
+        # give every process its own rendezvous port after the service endpoints
+        last_offset = api_offset + 1 + len(self.gpu_layout)
+        for _ in range(64):
+            base = get_free_port_below_ephemeral()
+            if all(is_port_available(base + i) for i in range(last_offset + 1)):
+                self.base_port = base
+                self.api_port = base + api_offset
+                self._role_ports = {
+                    role: base + i
+                    for i, role in enumerate(self.gpu_layout, start=first_work_offset)
+                }
+                self._master_ports = {
+                    role: self.api_port + i
+                    for i, role in enumerate(("server", *self.gpu_layout), start=1)
+                }
+                break
+        else:
+            raise RuntimeError(f"No free port block for {self.name}")
+
+        if self.stage_groups:
+            self.deployment_path = _LOG_DIR / f"disagg_{self.name}.json"
+            deployment = {
+                "roles": {
+                    role: {
+                        "stages": self.stage_groups[role],
+                        "endpoints": [f"tcp://{HOST}:{port}"],
+                    }
+                    for role, port in self._role_ports.items()
+                }
+            }
+            if self.stage_outputs is not None:
+                deployment["outputs"] = self.stage_outputs
+            if self.stage_contracts is not None:
+                deployment["stages"] = self.stage_contracts
+            self.deployment_path.write_text(json.dumps(deployment))
+
+    # -- context manager -----------------------------------------------------
+
+    def __enter__(self) -> DisaggCluster:
+        for attempt in range(3):
+            try:
+                self._launch_servers()
+                self._warmup()
+                return self
+            except Exception as e:
+                print(
+                    f"[disagg-test] Cluster {self.name} attempt {attempt + 1} "
+                    f"failed: {e}",
+                    flush=True,
+                )
+                self.stop()
+                if attempt == 2:
+                    raise
+                self._alloc_ports()
+        return self  # unreachable
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+    # -- internals -----------------------------------------------------------
+
+    def _start_proc(self, cmd: list[str], log_path: Path) -> subprocess.Popen:
+        fh = open(log_path, "w")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=fh,
+            stderr=subprocess.STDOUT,
+            preexec_fn=os.setsid,
+            env=os.environ.copy(),
+        )
+        self._procs.append(proc)
+        self._fhs.append(fh)
+        return proc
+
+    def _launch_servers(self) -> None:
+        if self.stage_groups:
+            self._launch_roles()
+            self._launch_server_head()
+            return
+        # preset workers send their transfer registration once, at startup
+        head = self._launch_server_head()
+        self._launch_roles(head)
+
+    def _launch_roles(self, head: subprocess.Popen | None = None) -> None:
+        for role in self.gpu_layout:
+            port = self._role_ports[role]
+            gpus = self.gpu_layout[role]
+            log = _LOG_DIR / f"disagg_{self.name}_{role}.log"
+            self._logs[role] = log
+
+            mode_args = [
+                "--disagg-role",
+                role,
+                "--strict-ports",
+                "--disagg-server-addr",
+                f"tcp://{HOST}:{self.base_port}",
+            ]
+            if self.stage_groups:
+                mode_args = [
+                    "--stage-deployment",
+                    str(self.deployment_path),
+                    "--stage-role",
+                    role,
+                    "--stage-endpoint",
+                    f"tcp://{HOST}:{port}",
+                ]
+            cmd = [
+                "sglang",
+                "serve",
+                "--model-path",
+                self.model,
+                *mode_args,
+                "--scheduler-port",
+                str(find_free_port(HOST) if self.stage_groups else port),
+                "--num-gpus",
+                str(len(gpus)),
+                "--base-gpu-id",
+                str(gpus[0]),
+                "--master-port",
+                str(self._master_ports[role]),
+                "--log-level",
+                "info",
+                *self.extra_role_args.get(role, []),
+            ]
+            proc = self._start_proc(cmd, log)
+
+            ready_msg = (
+                f"Stage role {role} ready"
+                if self.stage_groups
+                else f"Role {role.upper()} ready"
+            )
+            if not _wait_for_log(log, ready_msg, self.startup_timeout, proc):
+                raise RuntimeError(
+                    f"{role} failed to start for {self.name}. Log tail:\n"
+                    f"{_tail_log(log)}"
+                )
+            if head is None:
+                continue
+            head_log = self._logs["server"]
+            registration = f"work_endpoint=tcp://{HOST}:{port} session="
+            if not _wait_for_log(head_log, registration, self.startup_timeout, head):
+                raise RuntimeError(
+                    f"Head did not receive {role} registration. Head log:\n"
+                    f"{_tail_log(head_log)}\nWorker log:\n{_tail_log(log)}"
+                )
+
+    def _launch_server_head(self) -> subprocess.Popen:
+        log = _LOG_DIR / f"disagg_{self.name}_server.log"
+        self._logs["server"] = log
+        # Match the literal hostname advertised by the workers.
+        mode_args = (
+            ["--stage-deployment", str(self.deployment_path)]
+            if self.stage_groups
+            else ["--disagg-role", "server"]
+        )
+        cmd = [
+            "sglang",
+            "serve",
+            "--model-path",
+            self.model,
+            *mode_args,
+            "--strict-ports",
+            "--master-port",
+            str(self._master_ports["server"]),
+            "--scheduler-port",
+            str(self.base_port),
+            "--port",
+            str(self.api_port),
+            "--host",
+            HOST,
+            "--disagg-timeout",
+            "120",
+            "--log-level",
+            "info",
+            *self.extra_role_args.get("server", []),
+        ]
+        if not self.stage_groups:
+            for role, port in self._role_ports.items():
+                cmd.extend([f"--{role.replace('_', '-')}-urls", f"tcp://{HOST}:{port}"])
+        head = self._start_proc(cmd, log)
+        try:
+            wait_for_server_health(
+                f"http://{HOST}:{self.api_port}",
+                path="/v1/models",
+                timeout=self.startup_timeout,
+                process=head,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"server head failed to become healthy for {self.name}: {e}\n"
+                f"Server log tail:\n{_tail_log(log)}"
+            ) from e
+        return head
+
+    def _warmup(self) -> None:
+        """Send a warmup request to establish RDMA connections."""
+        try:
+            _generate_image(self.api_port, self.model, **self.warmup_kwargs)
+        except Exception as e:
+            raise RuntimeError(
+                f"Warmup request failed for {self.name}: {e}\n"
+                f"Server log tail:\n{_tail_log(self._logs.get('server', Path('/dev/null')))}"
+            ) from e
+
+    def stop(self) -> None:
+        for proc in reversed(self._procs):
+            terminate_and_kill_process_tree(proc)
+        for fh in self._fhs:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        # Give OS a moment to release ports before the next test.
+        time.sleep(3)
+        self._procs.clear()
+        self._fhs.clear()
+
+
+# ---------------------------------------------------------------------------
+# Request helpers
+# ---------------------------------------------------------------------------
+
+
+def _generate_image(api_port: int, model: str, **overrides) -> bytes:
+    # Use raw requests (openai SDK pulls in a lot and complicates CI deps).
+    resp = requests.post(
+        f"http://{HOST}:{api_port}/v1/images/generations",
+        json={
+            "model": model,
+            "prompt": "A sunset over mountains",
+            "n": 1,
+            "size": "1024x1024",
+            "response_format": "b64_json",
+            **overrides,
+        },
+        timeout=600,
+    )
+    if resp.status_code != 200:
+        print(
+            f"[disagg-test] Server returned {resp.status_code}: {resp.text[:2000]}",
+            flush=True,
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    return base64.b64decode(data["data"][0]["b64_json"])
+
+
+# ---------------------------------------------------------------------------
+# Test classes
+# ---------------------------------------------------------------------------
+
+
+def _require_gpus(n: int) -> None:
+    available = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if available < n:
+        raise unittest.SkipTest(f"need {n} GPUs, have {available}")
+
+
+class _DisaggTestBase(CustomTestCase):
+    """Shared setup: launch cluster once per class, tear down at the end."""
+
+    model: str = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    required_gpus: int = 2
+    cluster_name: str = ""
+    gpu_layout: dict[str, list[int]] = {}
+    extra_role_args: dict[str, list[str]] = {}
+    warmup_kwargs: dict = {}
+    stage_groups: dict[str, list[str | int]] | None = None
+    stage_outputs: tuple[str, ...] | None = None
+
+    cluster: DisaggCluster | None = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        _require_gpus(cls.required_gpus)
+        cls.cluster = DisaggCluster(
+            model=cls.model,
+            name=cls.cluster_name,
+            gpu_layout=cls.gpu_layout,
+            extra_role_args=cls.extra_role_args,
+            warmup_kwargs=cls.warmup_kwargs,
+            stage_groups=cls.stage_groups,
+            stage_outputs=cls.stage_outputs,
+        )
+        cls.cluster.__enter__()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.cluster is not None:
+            # Dump log tails for debugging CI failures
+            for role_name, log_path in cls.cluster._logs.items():
+                print(
+                    f"\n=== [{cls.cluster_name}] {role_name} log tail ===",
+                    flush=True,
+                )
+                print(_tail_log(log_path, n=80), flush=True)
+            cls.cluster.stop()
+            cls.cluster = None
+        super().tearDownClass()
+
+
+class TestDisaggZImage1Rank(_DisaggTestBase):
+    """Baseline: 1 rank per role, 2 physical GPUs."""
+
+    cluster_name = "zimage_1rank"
+    required_gpus = 2
+    gpu_layout = {
+        "encoder": [0],
+        "denoiser": [1],
+        "decoder": [0],
+    }
+
+    def test_generates_image(self) -> None:
+        assert self.cluster is not None
+        img = _generate_image(self.cluster.api_port, self.model)
+        # A real PNG is well above 1 KB; catches empty / error responses.
+        self.assertGreater(len(img), 1_000, f"image too small: {len(img)} bytes")
+
+
+class TestDisaggZImage2RankDenoiser(_DisaggTestBase):
+    """Multi-rank denoiser (``--denoiser-sp 2``) on 2 GPUs.
+
+    Regression guard for the bug where non-rank-0 denoiser ranks entered
+    ``execute_forward`` with an empty Req because ``ParallelExecutor``'s
+    REPLICATED stage does not broadcast the batch. With the fix, rank 0
+    broadcasts both scalar and tensor fields over NCCL before compute.
+    """
+
+    cluster_name = "zimage_sp2"
+    required_gpus = 2
+    gpu_layout = {
+        "encoder": [0],
+        "denoiser": [0, 1],
+        "decoder": [0],
+    }
+    extra_role_args = {
+        "denoiser": ["--denoiser-sp", "2"],
+    }
+
+    def test_generates_image_with_sp2_denoiser(self) -> None:
+        assert self.cluster is not None
+        img = _generate_image(self.cluster.api_port, self.model)
+        self.assertGreater(len(img), 1_000, f"image too small: {len(img)} bytes")
+
+
+class TestDisaggFlux3Image(_DisaggTestBase):
+    """Real four-role T2I/i2i versus the same monolithic model and workload."""
+
+    model = "black-forest-labs/flux-3-image-klein"
+    cluster_name = "flux3_split"
+    gpu_layout = {
+        "prompt_encoder": [0],
+        "image_encoder": [0],
+        "denoiser": [1],
+        "decoder": [0],
+    }
+    warmup_kwargs = dict(
+        size="256x256", num_inference_steps=2, seed=42, quality="exact"
+    )
+    extra_role_args = {
+        role: ["--warmup-mode", "off"] for role in (*gpu_layout, "server")
+    }
+
+    def test_t2i_and_edit_match_monolithic(self):
+        from io import BytesIO
+
+        import numpy as np
+        from PIL import Image
+
+        cluster = self.cluster
+        assert cluster is not None
+        kwargs = self.warmup_kwargs
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            generated, repeated = list(
+                executor.map(
+                    lambda _: _generate_image(cluster.api_port, self.model, **kwargs),
+                    range(2),
+                )
+            )
+        np.testing.assert_array_equal(
+            np.asarray(Image.open(BytesIO(generated))),
+            np.asarray(Image.open(BytesIO(repeated))),
+        )
+        reference = BytesIO()
+        Image.open(BytesIO(generated)).crop((0, 0, 247, 239)).save(
+            reference, format="PNG"
+        )
+        reference = reference.getvalue()
+
+        def edit(port):
+            response = requests.post(
+                f"http://{HOST}:{port}/v1/images/edits",
+                files={"image": ("reference.png", reference, "image/png")},
+                data=dict(
+                    model=self.model,
+                    prompt="Turn the scene into a watercolor painting",
+                    seed=42,
+                    num_inference_steps=2,
+                    quality="exact",
+                    response_format="b64_json",
+                ),
+                timeout=600,
+            )
+            response.raise_for_status()
+            return base64.b64decode(response.json()["data"][0]["b64_json"])
+
+        edited = edit(cluster.api_port)
+        self.assertEqual(Image.open(BytesIO(edited)).size, (247, 239))
+        cluster.stop()
+        port = find_free_port(HOST)
+        log = _LOG_DIR / "disagg_flux3_monolithic.log"
+        cluster._logs["monolithic"] = log
+        cluster._start_proc(
+            [
+                "sglang",
+                "serve",
+                "--model-path",
+                self.model,
+                "--port",
+                str(port),
+                "--num-gpus",
+                "1",
+                "--base-gpu-id",
+                "1",
+                "--warmup-mode",
+                "off",
+            ],
+            log,
+        )
+        wait_for_server_health(
+            f"http://{HOST}:{port}", path="/v1/models", timeout=cluster.startup_timeout
+        )
+        for actual, expected in (
+            (generated, _generate_image(port, self.model, **kwargs)),
+            (edited, edit(port)),
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(Image.open(BytesIO(actual))),
+                np.asarray(Image.open(BytesIO(expected))),
+            )
+
+
+class TestStageDeploymentFlux3(TestDisaggFlux3Image):
+    """Arbitrary role names, parallel encoding, tensor return, and full generation."""
+
+    cluster_name = "flux3_stages"
+    stage_groups = {
+        "text": ["flux3_text_encode"],
+        "reference": ["flux3_condition_encode"],
+        "sample": ["flux3_denoise"],
+        "render": ["flux3_decode", "flux3_postprocess"],
+    }
+    gpu_layout = {"text": [0], "reference": [0], "sample": [1], "render": [0]}
+    stage_outputs = ("result.output", "extra.flux3_text", "extra.flux3_condition")
+    extra_role_args = {
+        role: ["--warmup-mode", "off"] for role in (*gpu_layout, "server")
+    }
+
+    def test_encoder_tensor_return(self):
+        from io import BytesIO
+
+        from PIL import Image
+        from torch.utils._pytree import tree_leaves
+
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.client import (
+            EncodingClient,
+        )
+
+        reference = BytesIO()
+        Image.new("RGB", (64, 64), "teal").save(reference, format="PNG")
+        uri = "data:image/png;base64," + base64.b64encode(reference.getvalue()).decode()
+        fields = ["extra.flux3_text", "extra.flux3_condition"]
+        request = {
+            "prompt": "A mountain landscape",
+            "image_path": [uri],
+            "quality": "exact",
+        }
+
+        async def check():
+            async with EncodingClient(
+                f"tcp://{HOST}:{self.cluster.base_port}", device="cuda:0"
+            ) as client:
+                first, second = await asyncio.gather(
+                    client.encode(request, fields),
+                    client.encode(
+                        {**request, "prompt": "A watercolor landscape"}, fields
+                    ),
+                )
+                tensors = [
+                    value
+                    for value in tree_leaves(first)
+                    if isinstance(value, torch.Tensor)
+                ]
+                self.assertTrue(tensors)
+                self.assertTrue(
+                    all(value.device == torch.device("cuda:0") for value in tensors)
+                )
+                with self.assertRaises(RuntimeError):
+                    await client.encode(
+                        {
+                            **request,
+                            "image_path": ["/nonexistent/encoding-reference.png"],
+                        },
+                        fields,
+                    )
+                third = await client.encode(request, fields)
+                torch.testing.assert_close(first, third, rtol=0, atol=0)
+                fourth = await client.encode(
+                    {**request, "prompt": "A watercolor landscape"}, fields
+                )
+                torch.testing.assert_close(second, fourth, rtol=0, atol=0)
+
+        asyncio.run(check())
+
+
+class TestStageEncoderPools(CustomTestCase):
+    """Public checkpoints, 2:1 replicas, targeted tensor returns, and bounded prefetch.
+
+    Shares one GPU for this functional test; use separate GPUs for throughput tests.
+    """
+
+    def test_targeted_encoders_and_prefetch(self):
+        from io import BytesIO
+        from tempfile import TemporaryDirectory
+
+        from PIL import Image
+        from torch.utils._pytree import tree_leaves
+
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.client import (
+            EncodingClient,
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
+            DeploymentServer,
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
+            Deployment,
+            ExecutionPlan,
+        )
+
+        _require_gpus(1)
+        model = "Tongyi-MAI/Z-Image-Turbo"
+        cluster = DisaggCluster(model, "encoder_pools", {})
+        text_endpoints = [f"tcp://{HOST}:{find_free_port(HOST)}" for _ in range(2)]
+        deployment = {
+            "stages": [
+                {"name": "InputValidationStage", "after": []},
+                {
+                    "name": "TextEncodingStage",
+                    "outputs": ["prompt_embeds"],
+                    "components": ["text_encoder", "tokenizer"],
+                    "after": [],
+                },
+                {
+                    "name": "ImageVAEEncodingStage",
+                    "outputs": ["image_latent"],
+                    "components": ["vae"],
+                    "after": ["InputValidationStage"],
+                },
+            ],
+            "roles": {
+                "text": {
+                    "stages": ["TextEncodingStage"],
+                    "node": "text",
+                    "endpoints": text_endpoints,
+                },
+                "image": {
+                    "stages": ["InputValidationStage", "ImageVAEEncodingStage"],
+                    "node": "image",
+                    "endpoints": [f"tcp://{HOST}:{find_free_port(HOST)}"],
+                    "server_args": {
+                        "model_path": "black-forest-labs/FLUX.2-klein-4B",
+                        "num_gpus": 1,
+                        "disable_conditioning_cache": True,
+                    },
+                },
+            },
+            "outputs": ["prompt_embeds", "image_latent"],
+        }
+        samples = []
+        for index, width in enumerate((256, 320)):
+            reference = BytesIO()
+            Image.new("RGB", (width, 256), "teal").save(reference, format="PNG")
+            samples.append(
+                {
+                    "prompt": "A red teapot"
+                    + " on a wooden table in the morning" * index,
+                    "width": width,
+                    "height": 256,
+                    "seed": 42 + index,
+                    "image_path": [
+                        "data:image/png;base64,"
+                        + base64.b64encode(reference.getvalue()).decode()
+                    ],
+                }
+            )
+        endpoint = f"tcp://{HOST}:{cluster.base_port}"
+
+        async def check():
+            async with EncodingClient(endpoint, max_in_flight=2) as client:
+                references = []
+                for request in samples:
+                    text, image = await asyncio.gather(
+                        client.encode(request, role="text"),
+                        client.encode(request, role="image"),
+                    )
+                    expected = {**text, **image}
+                    self.assertTrue(
+                        all(
+                            t.is_cuda and torch.isfinite(t).all()
+                            for t in tree_leaves(expected)
+                        )
+                    )
+                    torch.testing.assert_close(
+                        await client.encode(request), expected, rtol=0, atol=0
+                    )
+                    references.append(text)
+                self.assertNotEqual(
+                    tree_leaves(references[0])[0].shape,
+                    tree_leaves(references[1])[0].shape,
+                )
+                async with client.prefetch(
+                    samples * 3, role="text", depth=3
+                ) as batches:
+                    count = 0
+                    async for result in batches:
+                        torch.testing.assert_close(
+                            result, references[count % 2], rtol=0, atol=0
+                        )
+                        count += 1
+                    self.assertEqual(count, 6)
+                async with client.prefetch(
+                    samples * 10, role="image", depth=3
+                ) as batches:
+                    await anext(batches)
+                self.assertFalse(client.pending)
+                with self.assertRaises(RuntimeError):
+                    await client.encode(samples[0], role="missing")
+                torch.testing.assert_close(
+                    await client.encode(samples[0], role="text"),
+                    references[0],
+                    rtol=0,
+                    atol=0,
+                )
+
+        with TemporaryDirectory(prefix="encoder-pools-") as directory:
+            path = Path(directory) / "deployment.json"
+            path.write_text(json.dumps(deployment))
+            server = DeploymentServer(
+                ExecutionPlan.compile(Deployment.load(path)), timeout=120, capacity=4
+            )
+            try:
+                # Exercise both node-level model overrides and independently launched replicas.
+                for index, (role, address) in enumerate(
+                    [("image", None), *[("text", e) for e in text_endpoints]]
+                ):
+                    mode = (
+                        ["--stage-node", "image"]
+                        if role == "image"
+                        else ["--stage-role", role, "--stage-endpoint", address]
+                    )
+                    log = _LOG_DIR / f"disagg_encoder_pools_{index}.log"
+                    proc = cluster._start_proc(
+                        [
+                            "sglang",
+                            "serve",
+                            "--model-path",
+                            model,
+                            "--stage-deployment",
+                            str(path),
+                            *mode,
+                            "--num-gpus",
+                            "1",
+                            "--warmup-mode",
+                            "off",
+                            "--disable-conditioning-cache",
+                            "--master-port",
+                            str(find_free_port(HOST)),
+                            "--scheduler-port",
+                            str(find_free_port(HOST)),
+                        ],
+                        log,
+                    )
+                    self.assertTrue(
+                        _wait_for_log(
+                            log,
+                            f"Stage role {role} ready",
+                            cluster.startup_timeout,
+                            proc,
+                        ),
+                        _tail_log(log),
+                    )
+                server.start(endpoint)
+                asyncio.run(check())
+                self.assertFalse(server.leases)
+                self.assertFalse(server.jobs)
+            finally:
+                if server.thread is not None:
+                    server.stop()
+                cluster.stop()
+
+
+# ---------------------------------------------------------------------------
+# Disagg + OTel tracing
+# ---------------------------------------------------------------------------
+
+
+def _generate_image_with_traceparent(
+    api_port: int, model: str, trace_id_hex: str, span_id_hex: str
+) -> tuple[int, bytes]:
+    """Same as :func:`_generate_image` but seeds a known W3C traceparent.
+
+    Returns ``(status_code, image_bytes)``. Kept separate so the tracing test
+    can tolerate non-200 responses while still reporting useful diagnostics.
+    """
+    traceparent = f"00-{trace_id_hex}-{span_id_hex}-01"
+    resp = requests.post(
+        f"http://{HOST}:{api_port}/v1/images/generations",
+        headers={"traceparent": traceparent},
+        json={
+            "model": model,
+            "prompt": "A sunset over mountains",
+            "n": 1,
+            "size": "1024x1024",
+            "response_format": "b64_json",
+        },
+        timeout=600,
+    )
+    if resp.status_code != 200:
+        return resp.status_code, b""
+    return resp.status_code, base64.b64decode(resp.json()["data"][0]["b64_json"])
+
+
+def _as_hex(v) -> str:
+    """OTLP span trace_id/span_id/parent_span_id come back as raw bytes over
+    gRPC and as hex strings over HTTP; normalize to lowercase hex."""
+    if isinstance(v, (bytes, bytearray)):
+        return v.hex()
+    if isinstance(v, str):
+        return v.lower()
+    return ""
+
+
+class TestDisaggZImageTracing(_DisaggTestBase):
+    """End-to-end verification of OTel trace propagation across disagg roles.
+
+    Spins up the same 1-rank cluster as :class:`TestDisaggZImage1Rank` with
+    ``--enable-trace`` wired to an in-process OTLP collector on every role and
+    the server head, sends one image-generation request with a controlled
+    ``traceparent``, and asserts the server head plus all three role worker
+    processes emit per-role ``scheduler_dispatch``/``gpu_forward`` spans under
+    the same trace_id. This is the regression guard for trace-context
+    propagation over the encoder→denoiser→decoder JSON hops.
+    """
+
+    cluster_name = "zimage_trace"
+    required_gpus = 2
+    gpu_layout = {
+        "encoder": [0],
+        "denoiser": [1],
+        "decoder": [0],
+    }
+
+    # Populated in setUpClass so the collector port is known before
+    # DisaggCluster launches.
+    collector = None
+    collector_port: int = 0
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Fast batch-span-processor flush so the test doesn't wait for the
+        # default 5s schedule. Must be set before sglang imports OTel.
+        os.environ.setdefault("SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", "50")
+        os.environ.setdefault("SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", "4")
+
+        from sglang.test.otel_collector import LightweightOtlpCollector
+
+        cls.collector_port = find_free_port(HOST)
+        cls.collector = LightweightOtlpCollector(port=cls.collector_port)
+        cls.collector.start()
+
+        trace_args = [
+            "--enable-trace",
+            "--otlp-traces-endpoint",
+            f"127.0.0.1:{cls.collector_port}",
+        ]
+        cls.extra_role_args = {
+            "encoder": list(trace_args),
+            "denoiser": list(trace_args),
+            "decoder": list(trace_args),
+            "server": list(trace_args),
+        }
+
+        # If super().setUpClass() raises, CustomTestCase's safe-setUpClass
+        # wrapper will invoke tearDownClass, which stops the collector.
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            super().tearDownClass()
+        finally:
+            if cls.collector is not None:
+                cls.collector.stop()
+                cls.collector = None
+
+    def test_disagg_spans_share_trace_id(self) -> None:
+        assert self.cluster is not None
+        assert self.collector is not None
+
+        trace_id = os.urandom(16).hex()
+        span_id = os.urandom(8).hex()
+
+        # Warmup was sent (without traceparent) by DisaggCluster.__enter__;
+        # clear those spans so the assertions only consider this request.
+        self.collector.clear()
+
+        status, img = _generate_image_with_traceparent(
+            self.cluster.api_port, self.model, trace_id, span_id
+        )
+        self.assertEqual(status, 200, "request did not complete cleanly")
+        self.assertGreater(len(img), 1_000, f"image too small: {len(img)} bytes")
+
+        # Spans flush asynchronously from each role's BatchSpanProcessor. Poll
+        # briefly until we see the expected shape.
+        deadline = time.time() + 30
+        spans = []
+        while time.time() < deadline:
+            spans = [
+                s for s in self.collector.get_spans() if _as_hex(s.trace_id) == trace_id
+            ]
+            # Expect: root Req span + >=3 scheduler_dispatch + >=3 gpu_forward
+            n_dispatch = sum(1 for s in spans if s.name == "scheduler_dispatch")
+            n_forward = sum(1 for s in spans if s.name == "gpu_forward")
+            if n_dispatch >= 3 and n_forward >= 3:
+                break
+            time.sleep(1)
+
+        names = [s.name for s in spans]
+        self.assertGreaterEqual(
+            sum(1 for n in names if n == "scheduler_dispatch"),
+            3,
+            f"expected >=3 scheduler_dispatch spans (one per disagg role), "
+            f"got names={names!r}",
+        )
+        self.assertGreaterEqual(
+            sum(1 for n in names if n == "gpu_forward"),
+            3,
+            f"expected >=3 gpu_forward spans (one per disagg role), "
+            f"got names={names!r}",
+        )
+
+        # All spans we saw must share the propagated trace_id. This is the
+        # actual regression guard for this PR: it proves the W3C carrier
+        # survives encoder→denoiser→decoder JSON hops (via ``_trace_state``).
+        # The HTTP-level carrier extraction (root Req parented under the
+        # client's span_id) is intentionally not asserted here: the server
+        # head's BatchSpanProcessor may not flush the Req span before role
+        # spans reach the collector, since the role spans close first.
+        trace_ids = {_as_hex(s.trace_id) for s in spans}
+        self.assertEqual(
+            trace_ids,
+            {trace_id},
+            f"spans split across multiple traces: {trace_ids}",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

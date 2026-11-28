@@ -16,14 +16,7 @@
 # limitations under the License.
 """EXAONE model configuration"""
 
-from typing import Any, Dict
-
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
-
-logger = logging.get_logger(__name__)
-
-EXAONE_PRETRAINED_CONFIG_ARCHIVE_MAP: Dict[str, Any] = {}
 
 
 # ruff: noqa: E501
@@ -161,7 +154,7 @@ class ExaoneConfig(PretrainedConfig):
         bos_token_id=0,
         eos_token_id=2,
         tie_word_embeddings=True,
-        **kwargs
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
@@ -192,5 +185,5 @@ class ExaoneConfig(PretrainedConfig):
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
             tie_word_embeddings=tie_word_embeddings,
-            **kwargs
+            **kwargs,
         )

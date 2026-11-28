@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/communication_op.py
 
 import torch
@@ -45,7 +46,7 @@ def sequence_model_parallel_all_gather(
 
 
 def sequence_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
-    """All-reduce the input tensor across model parallel group."""
+    """All-reduce the input tensor across sequence parallel group."""
     return get_sp_group().all_reduce(input_)
 
 

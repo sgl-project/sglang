@@ -6,7 +6,6 @@ import unittest
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 
@@ -29,8 +28,6 @@ from sglang.test.test_utils import CustomTestCase, get_similarities, is_in_ci
 # python -m unittest test_encoder_embedding_models.TestEncoderEmbeddingModels.test_prefill_logits
 
 
-register_cuda_ci(est_time=444, suite="stage-b-test-1-gpu-small")
-
 MODELS = [("BAAI/bge-small-en", 1, 1e-5), ("BAAI/bge-m3", 1, 1e-5)]
 
 ATTENTION_BACKEND = ["torch_native", "triton", "flashinfer"]
@@ -40,7 +37,6 @@ sgl_to_st_ratio = []
 
 
 class TestEncoderEmbeddingModels(CustomTestCase):
-
     @classmethod
     def setUpClass(cls):
         mp.set_start_method("spawn", force=True)
@@ -118,9 +114,9 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             # print("similarity diff", abs(similarity - 1))
 
             if len(truncated_prompts[i]) <= 1000:
-                assert torch.all(
-                    abs(similarity - 1) < prefill_tolerance
-                ), "embeddings are not all close"
+                assert torch.all(abs(similarity - 1) < prefill_tolerance), (
+                    "embeddings are not all close"
+                )
 
     def test_prefill_logits(self):
         models_to_test = MODELS

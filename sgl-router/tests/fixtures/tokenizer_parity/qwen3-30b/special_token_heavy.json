@@ -1,0 +1,30 @@
+{
+  "model_id": "Qwen/Qwen3-30B-A3B",
+  "shape": "special_token_heavy",
+  "prompt_text": "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello<|im_end|>\n<|endoftext|>",
+  "expected_token_ids": [
+    151644,
+    8948,
+    198,
+    2610,
+    525,
+    10950,
+    13,
+    151645,
+    198,
+    151644,
+    872,
+    198,
+    13048,
+    151645,
+    198,
+    151644,
+    77091,
+    198,
+    9707,
+    151645,
+    198,
+    151643
+  ],
+  "skip_special_tokens": false
+}

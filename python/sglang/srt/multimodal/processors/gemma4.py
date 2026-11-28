@@ -12,18 +12,22 @@
 # limitations under the License.
 # ==============================================================================
 
+import re
 from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
 
-from sglang.srt.managers.multimodal_processor import (
-    BaseMultimodalProcessor as SGLangBaseProcessor,
-)
-from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.gemma4_audio import _SSCP_CONV_STRIDE_SIZES
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
-from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
+)
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 
@@ -38,12 +42,22 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         self.IM_START_TOKEN_ID = hf_config.boi_token_id
         self.IM_END_TOKEN_ID = hf_config.eoi_token_id
 
-        self.AUDIO_START_TOKEN_ID = hf_config.boa_token_id
-        self.AUDIO_END_TOKEN_ID = hf_config.eoa_token_id
         self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<|image|>",
             image_token_id=hf_config.image_token_id,
+            image_token_regex=re.compile(
+                r"<\|image>(?:<\|image\|>)+<image\|>|<\|image\|>"
+            ),
+            video_token="<|video|>",
             video_token_id=hf_config.video_token_id,
+            video_token_regex=re.compile(
+                r"<\|image>(?:<\|video\|>)+<image\|>|<\|video\|>"
+            ),
+            audio_token="<|audio|>",
             audio_token_id=hf_config.audio_token_id,
+            audio_token_regex=re.compile(
+                r"<\|audio>(?:<\|audio\|>)+<audio\|>|<\|audio\|>"
+            ),
         ).build(_processor)
 
         # Register image-processor and video-processor outputs so they are stored on
@@ -124,7 +138,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         """Process multimodal data including images, video, and audio."""
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data if request_obj else None,
@@ -132,7 +146,7 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+        mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens
         )
 

@@ -2,12 +2,12 @@
 """
 Generate diffusion CI outputs for consistency testing.
 
-This script reuses the CI test code by calling run_suite.py with SGLANG_GEN_GT=1,
+This script reuses the CI test adapter with SGLANG_GEN_GT=1,
 ensuring that GT generation uses exactly the same code path as CI tests.
 
 Usage:
     python gen_diffusion_ci_outputs.py --suite 1-gpu --partition-id 0 --total-partitions 2 --out-dir ./output
-    python gen_diffusion_ci_outputs.py --suite 1-gpu --case-ids qwen_image_t2i flux_image_t2i --out-dir ./output
+    python gen_diffusion_ci_outputs.py --suite 1-gpu --case-ids qwen_image_t2i flux_2_klein_image_t2i --out-dir ./output
     python gen_diffusion_ci_outputs.py --suite 1-gpu-b200 --out-dir ./output
 """
 
@@ -17,15 +17,20 @@ import sys
 from pathlib import Path
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.run_suite import (
-    SUITES,
+from sglang.multimodal_gen.test.partitioning import (
     PartitionItem,
+    partition_items_by_lpt,
+)
+from sglang.multimodal_gen.test.runner.diffusion_suite_runner import (
+    SUITES,
+    _get_dynamic_suite_cases,
     _maybe_pin_update_weights_model_pair,
-    collect_test_items,
     get_case_est_time,
     get_suite_files_rel,
     parse_partition_plan,
-    partition_items_by_lpt,
+)
+from sglang.multimodal_gen.test.runner.pytest_runner import (
+    collect_test_items,
     run_pytest,
 )
 
@@ -73,6 +78,11 @@ def main():
         help="Specific case IDs to run (space-separated). If provided, only these cases will be run.",
     )
     parser.add_argument(
+        "--consistency-only",
+        action="store_true",
+        help="Generate GT only for consistency-enabled cases unless case IDs are supplied.",
+    )
+    parser.add_argument(
         "--partition-plan-json",
         type=str,
         required=False,
@@ -105,7 +115,7 @@ def main():
         "1"  # Skip consistency checks in GT gen mode
     )
 
-    logger.info(f"GT generation mode enabled")
+    logger.info("GT generation mode enabled")
     logger.info(f"Output directory: {out_dir}")
 
     # Resolve test files path (same as run_suite.py)
@@ -200,6 +210,19 @@ def main():
 
         partitions = partition_items_by_lpt(partition_items, total_partitions)
         my_items = [item.item_id for item in partitions[partition_id]]
+
+    # Keep the partition assignment stable while excluding cases without GT checks.
+    if args.consistency_only and not args.case_ids:
+        consistency_case_ids = {
+            case.id
+            for case in _get_dynamic_suite_cases(args.suite)
+            if case.run_consistency_check
+        }
+        my_items = [
+            item
+            for item in my_items
+            if item[item.index("[") + 1 : item.rindex("]")] in consistency_case_ids
+        ]
 
     logger.info(
         f"Partition {partition_id}/{total_partitions}: "

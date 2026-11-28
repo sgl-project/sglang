@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
-    get_tp_group,
-)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs as _envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
     is_allocation_symmetric,
+    is_dp_max_padding,
+    mask_dp_pad_moe_topk_ids,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -30,17 +28,13 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.utils.common import (
-    get_bool_env_var,
-    get_device,
-    is_hip,
-)
+from sglang.srt.runtime_context import get_lora, get_parallel
+from sglang.srt.utils.device import get_device
 
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.utils import MoeRunnerBackendLike
 
 
 try:
@@ -48,7 +42,7 @@ try:
         nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
     )
 
-    from sglang.srt.layers.quantization.modelopt_quant import (
+    from sglang.srt.layers.quantization.fp4_utils import (
         fp4_quantize as fp4_quantize_flashinfer,
     )
 except ImportError:
@@ -62,6 +56,10 @@ class StandardDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
+    # Pre-quantized activation for ``hidden_states``, which itself stays bf16:
+    # either a (q, scale) pair (per-token-group-128 fp8, q rows padded to a
+    # multiple of 4) or an ``Mxfp8RoutedInputPreQuant``.
+    hidden_states_pre_quant: Optional[Tuple] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -84,39 +82,117 @@ class StandardCombineInput(NamedTuple):
 assert isinstance(StandardCombineInput, CombineInput)
 
 
-class StandardDispatcher(BaseDispatcher):
+def _map_topk_ids_to_local_experts(
+    topk_ids: torch.Tensor, local_expert_mapping: torch.Tensor
+) -> torch.Tensor:
+    """Map global expert ids while preserving the ``-1`` drop sentinel."""
+    return torch.where(
+        topk_ids < 0,
+        -1,
+        local_expert_mapping[topk_ids.clamp_min(0)],
+    )
 
+
+def _keeps_global_expert_ids(backend: Optional[MoeRunnerBackendLike]) -> bool:
+    return backend is not None and (
+        backend.is_flashinfer_cutlass()
+        or backend.is_flashinfer_cutedsl()
+        or backend.is_flashinfer_trtllm()
+        or backend.is_flashinfer_trtllm_routed()
+        or backend.is_hpc_ops()
+        or backend.is_flashinfer_megamoe()
+        or backend.is_flashinfer_mxfp4()
+    )
+
+
+class StandardDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
-        backend = get_moe_runner_backend()
-        self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
-        self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
-        self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
-        # Skip local expert mapping when the backend handles EP with global expert IDs:
-        # - cutlass / cutedsl / trtllm_routed handle EP internally
-        # - mxfp4 dispatcher mapping is already global
-        self.skip_local_expert_mapping = (
-            backend.is_flashinfer_cutlass()
-            or backend.is_flashinfer_cutedsl()
-            or backend.is_flashinfer_trtllm_routed()
-            or self.enable_flashinfer_mxfp4_moe
+        self.moe_ep_size = get_parallel().moe_ep_size
+        backend = moe_runner_config.runner_backend
+        self.runner_backend = backend
+        self.enable_flashinfer_cutlass_moe = (
+            backend is not None and backend.is_flashinfer_cutlass()
         )
+        self.use_aiter_moe_runner = backend is not None and backend.is_aiter()
+        self.skip_local_expert_mapping = _keeps_global_expert_ids(backend)
+        if (
+            self.moe_ep_size > 1
+            and (
+                _keeps_global_expert_ids(get_moe_runner_backend())
+                != self.skip_local_expert_mapping
+            )
+            and (get_lora().enable_lora or get_lora().lora_paths)
+        ):
+            raise ValueError(
+                "LoRA with expert parallelism requires the layer's MoE runner "
+                "to use the requested runner's expert-ID convention."
+            )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_experts = moe_runner_config.num_local_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
         self.num_local_routed_experts = (
             self.num_local_experts - self.num_local_shared_experts
         )
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
+        self.moe_ep_rank = get_parallel().moe_ep_rank
         self.local_expert_mapping = None
         self.expert_mask_gpu = None
+
+    @property
+    def prebuild_pending(self) -> bool:
+        # Not for aiter, whose expert_mask_gpu follows the mapping;
+        # the lazy build skips both for non-standard top-k, known only at dispatch.
+        return (
+            self.moe_ep_size > 1
+            and not self.skip_local_expert_mapping
+            and not self.use_aiter_moe_runner
+            and self.local_expert_mapping is None
+        )
+
+    def prebuild(self) -> None:
+        if self.prebuild_pending:
+            self.local_expert_mapping = self._build_local_expert_mapping()
+
+    def _build_local_expert_mapping(self) -> torch.Tensor:
+        # Global expert id -> local slot, -1 for experts held elsewhere;
+        # fused shared experts take the last ids, behind the routed slots.
+        device = get_device()
+        routed = self.num_local_routed_experts
+        mapping = torch.full((self.num_experts,), -1, dtype=torch.int32, device=device)
+        mapping[self.moe_ep_rank * routed : (self.moe_ep_rank + 1) * routed] = (
+            torch.arange(0, routed, dtype=torch.int32, device=device)
+        )
+        if self.num_local_shared_experts > 0:
+            mapping[-self.num_local_shared_experts :] = torch.arange(
+                routed,
+                routed + self.num_local_shared_experts,
+                dtype=torch.int32,
+                device="cpu",
+            )
+        return mapping
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
 
-        if should_use_flashinfer_cutlass_moe_fp4_allgather():
+        needs_dp_allgather = should_use_flashinfer_cutlass_moe_fp4_allgather()
+        use_fp4_payload = (
+            needs_dp_allgather
+            and self.enable_flashinfer_cutlass_moe
+            and self.quant_config.get("input_global_scale") is not None
+        )
+        if needs_dp_allgather and not use_fp4_payload:
+            if TopKOutputChecker.format_is_bypassed(topk_output):
+                topk_output = topk_output.to_standard()
+            topk_weights, topk_ids, hidden_states = get_parallel().tp_group.all_gatherv(
+                [topk_output.topk_weights, topk_output.topk_ids, hidden_states],
+                sizes=get_dp_global_num_tokens(),
+            )
+            topk_output = StandardTopKOutput(
+                topk_weights, topk_ids, topk_output.router_logits
+            )
+            hidden_states_scale = None
+        elif needs_dp_allgather:
             # all-gather fp4 hidden states
             if (
                 fp4_quantize_flashinfer is None
@@ -133,7 +209,7 @@ class StandardDispatcher(BaseDispatcher):
 
             # Quantize before comm, swizzle after.
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 if hidden_states.shape[0] > 0:
                     x, x_sf = fp4_quantize_flashinfer(
@@ -147,7 +223,7 @@ class StandardDispatcher(BaseDispatcher):
                     x_sf = torch.zeros(
                         0, x_col // 16, dtype=torch.uint8, device=hidden_states.device
                     )
-            topk_weights, topk_ids, x, x_sf = get_tp_group().all_gatherv(
+            topk_weights, topk_ids, x, x_sf = get_parallel().tp_group.all_gatherv(
                 [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
             )
             # TODO: fuse into cutlass moe
@@ -161,40 +237,18 @@ class StandardDispatcher(BaseDispatcher):
                 router_logits=topk_output.router_logits,  # never tested
             )
         else:
-            hidden_states = hidden_states
             hidden_states_scale = None
 
         if (
             self.moe_ep_size > 1
             and not self.skip_local_expert_mapping
             and TopKOutputChecker.format_is_standard(topk_output)
+            and self.local_expert_mapping is None
         ):
-            if self.local_expert_mapping is None:
-                device = get_device()
-                self.local_expert_mapping = torch.full(
-                    (self.num_experts,), -1, dtype=torch.int32, device=device
-                )
-                self.local_expert_mapping[
-                    self.moe_ep_rank
-                    * self.num_local_routed_experts : (self.moe_ep_rank + 1)
-                    * self.num_local_routed_experts
-                ] = torch.arange(
-                    0, self.num_local_routed_experts, dtype=torch.int32, device=device
-                )
-
-                if self.num_local_shared_experts > 0:
-                    self.local_expert_mapping[-self.num_local_shared_experts :] = (
-                        torch.arange(
-                            self.num_local_routed_experts,
-                            self.num_local_routed_experts
-                            + self.num_local_shared_experts,
-                            dtype=torch.int32,
-                            device="cpu",
-                        )
-                    )
+            self.local_expert_mapping = self._build_local_expert_mapping()
 
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
-            if _use_aiter:
+            if self.use_aiter_moe_runner and self.expert_mask_gpu is None:
                 self.expert_mask_gpu = (
                     (
                         (self.local_expert_mapping >= 0)
@@ -203,13 +257,20 @@ class StandardDispatcher(BaseDispatcher):
                     .to(torch.int32)
                     .to(device="cuda")
                 )
-            else:
+            elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_output = topk_output._replace(
-                        topk_ids=self.local_expert_mapping[topk_output.topk_ids]
+                    topk_ids_local = _map_topk_ids_to_local_experts(
+                        topk_output.topk_ids, self.local_expert_mapping
                     )
-                elif TopKOutputChecker.format_is_triton_kernels(topk_output):
-                    raise NotImplementedError()
+                    # Drop dp-attention MAX_LEN pad rows from the dispatch:
+                    # pad rows carry stale hidden through the router and
+                    # their expert outputs are discarded downstream — pure
+                    # wasted compute (and a masked-grouped-GEMM workspace
+                    # blow-up when they collide on the same top-k). -1 is the
+                    # drop sentinel both the triton and deep_gemm runners honor.
+                    if _MASK_DP_PAD_MOE and is_dp_max_padding():
+                        mask_dp_pad_moe_topk_ids(topk_ids_local)
+                    topk_output = topk_output._replace(topk_ids=topk_ids_local)
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,
@@ -220,8 +281,11 @@ class StandardDispatcher(BaseDispatcher):
     def combine(self, combine_input: StandardCombineInput) -> torch.Tensor:
         (hidden_states,) = combine_input
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
-            hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
-            get_tp_group().reduce_scatterv(
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_parallel().tp_group),
+                hidden_states,
+            )
+            get_parallel().tp_group.reduce_scatterv(
                 global_hidden_states,
                 output=hidden_states,
                 sizes=get_dp_global_num_tokens(),

@@ -1,11 +1,10 @@
-import logging
 from typing import Optional
 
 import torch
 
-logger = logging.getLogger(__name__)
+from sglang.srt.platforms import current_platform
 
-SUPPORTED_DEVICES = ["cuda", "xpu", "hpu", "cpu", "npu", "musa", "mps"]
+SUPPORTED_DEVICES = ["cuda", "xpu", "hpu", "cpu", "npu", "musa", "mps", "mlu"]
 
 
 class DeviceConfig:
@@ -13,7 +12,7 @@ class DeviceConfig:
     gpu_id: Optional[int]
 
     def __init__(self, device: str = "cuda", gpu_id: int = -1) -> None:
-        if device in SUPPORTED_DEVICES:
+        if device in SUPPORTED_DEVICES or current_platform.is_out_of_tree():
             self.device_type = device
         else:
             raise RuntimeError(f"Not supported device type: {device}")

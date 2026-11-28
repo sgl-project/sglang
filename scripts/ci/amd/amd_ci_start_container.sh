@@ -1,34 +1,35 @@
 #!/bin/bash
 set -euo pipefail
+# Container the CI steps run in. Spur jobs that share a node give each job its
+# own; everywhere else it stays ci_sglang.
+CI_CONTAINER_NAME="${CI_CONTAINER_NAME:-ci_sglang}"
 
 # Get version from git tags
 SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are found
 
-# Fetch tags from origin to ensure we have the latest
-if git fetch --tags origin; then
-  # Use the shared helper so stable/post releases sort above rc tags.
-  VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only || true)
-  if [ -n "$VERSION_FROM_TAG" ]; then
-    SGLANG_VERSION="$VERSION_FROM_TAG"
-    echo "Using SGLang version from git tags: $SGLANG_VERSION"
-  else
-    echo "Warning: No version tags found; using default $SGLANG_VERSION" >&2
-  fi
+# List the release tags on origin rather than fetching them: `git fetch --tags`
+# also pulls every branch head (~30 s per job) just to read one tag name.
+# The shared helper sorts stable/post releases above rc tags.
+VERSION_FROM_TAG=$(python3 scripts/release/get_version_tag.py --tag-only --remote || true)
+if [ -n "$VERSION_FROM_TAG" ]; then
+  SGLANG_VERSION="$VERSION_FROM_TAG"
+  echo "Using SGLang version from git tags: $SGLANG_VERSION"
 else
-  echo "Warning: Failed to fetch tags from origin; using default $SGLANG_VERSION" >&2
+  echo "Warning: Failed to list version tags on origin; using default $SGLANG_VERSION" >&2
 fi
 
 
-# Default base tags (can be overridden by command line arguments)
-ROCM_VERSION="rocm700"
+# Default base tags (can be overridden by command line arguments).
+# Keep this aligned with the default AMD PR and Nightly CI lane.
+ROCM_VERSION="rocm10"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
+LOCAL_DOCKER_REGISTRY="10.44.14.109:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE=""
+CUSTOM_IMAGE="${AMD_CI_IMAGE:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 
@@ -50,10 +51,18 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
       echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
-      echo "  --custom-image IMAGE       Use a specific Docker image directly"
+      echo "  --custom-image IMAGE       Use a specific Docker image directly (or set AMD_CI_IMAGE)"
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
-      echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
-      echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
+      echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm1000)"
+      echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm10)"
+      echo ""
+      echo "Environment:"
+      echo "  ENABLE_CACHE_HOST=1|0"
+      echo "      Mount the host cache (AMD_CI_CACHE_HOST) to /sgl-data. Defaults to 1 when AMD_CI_CACHE_HOST is set or RUNNER_NAME contains 300 or 35x, otherwise 0. Missing host cache falls back to container-local /sgl-data."
+      echo "  AMD_CI_CACHE_HOST=PATH"
+      echo "      Host directory for the persistent cache. Default: /home/runner/sglang-data."
+      echo "  AMD_CI_GPU_ARCH=mi35x|mi30x"
+      echo "      GPU architecture for runners whose hostname is not linux-<arch>-gpu-N (non-ARC hosts)."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -67,7 +76,11 @@ HOSTNAME_VALUE=$(hostname)
 GPU_ARCH="mi30x"   # default
 
 # Host names look like: linux-mi35x-gpu-1-xxxxx-runner-zzzzz
-if [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
+# Non-ARC runners have no such hostname and set AMD_CI_GPU_ARCH instead.
+if [[ -n "${AMD_CI_GPU_ARCH:-}" ]]; then
+  GPU_ARCH="${AMD_CI_GPU_ARCH}"
+  echo "Using GPU architecture from AMD_CI_GPU_ARCH: ${GPU_ARCH}"
+elif [[ "${HOSTNAME_VALUE}" =~ ^linux-(mi[0-9]+[a-z]*)-gpu-[0-9]+ ]]; then
   GPU_ARCH="${BASH_REMATCH[1]}"
   echo "Detected GPU architecture from hostname: ${GPU_ARCH}"
 else
@@ -90,8 +103,15 @@ case "${GPU_ARCH}" in
 esac
 
 
-# Set up DEVICE_FLAG based on Kubernetes pod info
-if [[ -f /etc/podinfo/gha-render-devices ]]; then
+# Set up DEVICE_FLAG based on Kubernetes pod info. AMD_CI_RENDER_DEVICES (space-
+# separated /dev/dri/renderD* paths) does the same for Spur jobs that hold only
+# some of a node's GPUs; unset, nothing changes.
+if [[ -n "${AMD_CI_RENDER_DEVICES:-}" ]]; then
+  DEVICE_FLAG=""
+  for dev in ${AMD_CI_RENDER_DEVICES}; do
+    DEVICE_FLAG+=" --device ${dev}"
+  done
+elif [[ -f /etc/podinfo/gha-render-devices ]]; then
   DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
 else
   DEVICE_FLAG="--device /dev/dri"
@@ -143,7 +163,7 @@ find_latest_image() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  # First, check local cache on the runner.
+  # Prefer the newest date, checking both local and remote before falling back.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
@@ -152,32 +172,26 @@ find_latest_image() {
       echo "rocm/sgl-dev:${image_tag}"
       return 0
     fi
-  done
-
-  # If not found locally, fall back to pulling from public registry.
-  # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} here with
-  # `docker manifest inspect --insecure` because that command runs in the
-  # runner pod's network namespace, which on every observed AMD scale set
-  # cannot reach 10.245.143.50:5000 (every probe either fast-fails with TLS
-  # reject or hits a 30s TCP timeout, multiplied across 7 daily candidates).
-  # The actual local-registry pull still happens in the call site below via
-  # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
-  # docker daemon on the host and inherits its insecure-registries config.
-  for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
     if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
       echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
       echo "rocm/sgl-dev:${image_tag}"
       return 0
     fi
+    echo "Image unavailable: rocm/sgl-dev:${image_tag}; checking older dates" >&2
   done
 
-  # If still not found, try finding any image matching ROCm+arch from remote registry
-  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  # Docker Hub's `name=` filter is fuzzy; only accept official version tags.
+  echo "Exact version not found. Searching remote registry for versioned ${ROCM_VERSION}-${gpu_arch} images…" >&2
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
+    local sgl_tag_regex="^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-${target_date}$"
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | while read -r tag; do
+      if [[ "${tag}" =~ ${sgl_tag_regex} ]]; then
+        echo "${tag}"
+        break
+      fi
+    done || true)
     if [[ -n "$remote_tags" ]]; then
       echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
       echo "rocm/sgl-dev:${remote_tags}"
@@ -185,9 +199,14 @@ find_latest_image() {
     fi
   done
 
-  echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
+  echo "No recent images found. Searching cached local versioned images matching ROCm+arch…" >&2
   local any_local
-  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:*${ROCM_VERSION}*${gpu_arch}*" | sort -r | head -n 1)
+  any_local=$(docker images --format '{{.Repository}}:{{.Tag}}' --filter "reference=rocm/sgl-dev:v*-${ROCM_VERSION}-${gpu_arch}-*" | while read -r image; do
+    local tag="${image#rocm/sgl-dev:}"
+    if [[ "${tag}" =~ ^v[0-9][A-Za-z0-9._-]*-${ROCM_VERSION}-${gpu_arch}-[0-9]{8}$ ]]; then
+      echo "${image}"
+    fi
+  done | sort -r | head -n 1)
   if [[ -n "$any_local" ]]; then
       echo "Using cached fallback image: ${any_local}" >&2
       echo "${any_local}"
@@ -202,13 +221,6 @@ find_latest_image() {
         echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi35x-20260211-preview"
       else
         echo "rocm/sgl-dev:v0.5.8.post1-rocm720-mi30x-20260211-preview"
-      fi
-      ;;
-    rocm700)
-      if [[ "${gpu_arch}" == "mi35x" ]]; then
-        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi35x-20260211"
-      else
-        echo "rocm/sgl-dev:v0.5.8.post1-rocm700-mi30x-20260211"
       fi
       ;;
     *)
@@ -246,7 +258,7 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
   IMAGE="sglang-ci:${GPU_ARCH_BUILD}-$(date +%Y%m%d)"
   echo "Building Docker image from ${DOCKERFILE} with GPU_ARCH=${GPU_ARCH_BUILD}..."
 
-  # Pass full GPU_ARCH (e.g., gfx950-rocm720) - Dockerfile handles stripping suffix
+  # Pass full GPU_ARCH (e.g., gfx950-rocm1000) - Dockerfile handles stripping suffix
   docker build \
     --build-arg GPU_ARCH="${GPU_ARCH_BUILD}" \
     --build-arg SGL_BRANCH="main" \
@@ -257,30 +269,47 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  # Try the local docker registry first (avoids Docker Hub rate limits and is
-  # faster on the LAN); if that fails for any reason, fall back to the
-  # public registry with exponential-backoff retries. Capture stderr so the
-  # real failure reason (TLS handshake, 404, connection refused, etc.) is
-  # visible in the job log instead of being silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+  # Temporarily bypass the shared local registry while concurrent CI pulls
+  # saturate it. Keep using the authenticated, retried public-registry path.
+  retry_with_backoff 6 docker pull "${IMAGE}"
+fi
+
+# Non-ARC hosts have no /home/runner; setting AMD_CI_CACHE_HOST also turns the mount on.
+CACHE_HOST="${AMD_CI_CACHE_HOST:-/home/runner/sglang-data}"
+if [[ -z "${ENABLE_CACHE_HOST:-}" && -n "${AMD_CI_CACHE_HOST:-}" ]]; then
+  ENABLE_CACHE_HOST="1"
+fi
+if [[ -z "${ENABLE_CACHE_HOST:-}" ]]; then
+  RUNNER_NAME_LOWER="${RUNNER_NAME:-}"
+  RUNNER_NAME_LOWER="${RUNNER_NAME_LOWER,,}"
+  if [[ "${RUNNER_NAME_LOWER}" == *300* || "${RUNNER_NAME_LOWER}" == *35x* ]]; then
+    ENABLE_CACHE_HOST="1"
   else
-    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-    retry_with_backoff 6 docker pull "${IMAGE}"
+    ENABLE_CACHE_HOST="0"
   fi
 fi
-
-# CACHE_HOST=/home/runner/sgl-data
-CACHE_HOST=/home/runner/sglang-data
-if [[ -d "$CACHE_HOST" ]]; then
-    CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
-else
+case "${ENABLE_CACHE_HOST,,}" in
+  1|true|yes|on|pvc|persistent)
+    if [[ -d "$CACHE_HOST" ]]; then
+      CACHE_VOLUME="-v $CACHE_HOST:/sgl-data"
+      echo "Mounting persistent CI data: ${CACHE_HOST} -> /sgl-data"
+    else
+      CACHE_VOLUME=""
+      echo "Warning: ${CACHE_HOST} does not exist; using container-local /sgl-data." >&2
+    fi
+    ;;
+  0|false|no|off|"")
     CACHE_VOLUME=""
-fi
+    echo "Not mounting ${CACHE_HOST}; /sgl-data will be container-local."
+    ;;
+  *)
+    echo "Error: unsupported ENABLE_CACHE_HOST='${ENABLE_CACHE_HOST}'" >&2
+    echo "Use 1/true/pvc/persistent or 0/false/off." >&2
+    exit 1
+    ;;
+esac
 
-echo "Launching container: ci_sglang"
+echo "Launching container: $CI_CONTAINER_NAME"
 docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --ulimit nofile=65536:65536 \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
@@ -297,10 +326,15 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -e PYTHONPATH="/opt/tilelang:${PYTHONPATH:-}" \
   --security-opt seccomp=unconfined \
   -w /sglang-checkout \
-  --name ci_sglang \
+  --name "$CI_CONTAINER_NAME" \
   "${IMAGE}"
+
+docker exec "$CI_CONTAINER_NAME" mkdir -p \
+  /sgl-data/hf-cache/hub \
+  /sgl-data/pip-cache \
+  /sgl-data/miopen-cache
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
 # setuptools-scm / vcs_versioning can resolve the package version.
-docker exec ci_sglang git config --global --add safe.directory /sglang-checkout
+docker exec "$CI_CONTAINER_NAME" git config --global --add safe.directory /sglang-checkout
