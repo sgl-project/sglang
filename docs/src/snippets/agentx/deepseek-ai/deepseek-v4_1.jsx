@@ -380,6 +380,7 @@ export const agentx = {
         "SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION": "1",
         "SGLANG_NVIDIA_MEGAKERNEL_SLOTS": "hop_a,moe,gate,attn,embed,two_shot,markov,draft_lm_head,aux_mean_stats,gate_wide,shared_ll,hop_a_batch2,engram,attn_qkv_a,attn_qkv_a_bf16,index_q_mxfp8_in,attn_indexer,hc_prenorm,hop_b,hop_b_wide,early_trigger,hop_b_start_trigger,draft,draft_moe,draft_gate,draft_tail,draft_post,draft_seam,draft_attn,draft_qfront,draft_wo_a,draft_swapab,draft_qkv_a,draft_prenorm,draft_qkv_a_ll,draft_wo_b_ll,sched_ahead,req_pos_once,kv_before_wait,target_lm_head,hop_b_quad_trigger,lm_head_pinned_tactic",
         "SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD": "1",
+        "SGLANG_RUST_SERVER": "1",
         "SGLANG_SPEC_TP_SYNC": "rng,-dspark-accept-sample"
        },
        "args": [
@@ -449,6 +450,9 @@ export const agentx = {
         "args": {
          "--grpc-port": null,
          "--incremental-streaming-output": null
+        },
+        "env": {
+         "SGLANG_RUST_SERVER": null
         }
        }
       },
@@ -1199,6 +1203,7 @@ export const agentx = {
         "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK": "65536",
         "SGLANG_OPT_DSV41_BF16_INDEX_LOGITS": "1",
         "SGLANG_OPT_DSV41_MEGA_MHC_PREFILL": "1",
+        "SGLANG_RUST_SERVER": "1",
         "WITH_NVIDIA_PEERMEM": "0"
        },
        "args": [
@@ -1285,6 +1290,7 @@ export const agentx = {
         "SGLANG_OPT_DSV41_BF16_INDEX_LOGITS": "1",
         "SGLANG_OPT_DSV41_BLOCKWISE_REJECTION": "1",
         "SGLANG_OPT_DSV41_MEGA_MHC_PREFILL": "1",
+        "SGLANG_RUST_SERVER": "1",
         "WITH_NVIDIA_PEERMEM": "0"
        },
        "args": [
@@ -1361,6 +1367,9 @@ export const agentx = {
          "--kv-events-config": null,
          "--grpc-port": null,
          "--incremental-streaming-output": null
+        },
+        "env": {
+         "SGLANG_RUST_SERVER": null
         }
        }
       },
@@ -1370,6 +1379,9 @@ export const agentx = {
         "args": {
          "--grpc-port": null,
          "--incremental-streaming-output": null
+        },
+        "env": {
+         "SGLANG_RUST_SERVER": null
         }
        }
       },
@@ -1558,6 +1570,9 @@ export const agentx = {
          "--kv-events-config": null,
          "--grpc-port": null,
          "--incremental-streaming-output": null
+        },
+        "env": {
+         "SGLANG_RUST_SERVER": null
         }
        }
       },
@@ -1567,6 +1582,9 @@ export const agentx = {
         "args": {
          "--grpc-port": null,
          "--incremental-streaming-output": null
+        },
+        "env": {
+         "SGLANG_RUST_SERVER": null
         }
        }
       },
@@ -1746,6 +1764,9 @@ export const agentx = {
          "--kv-events-config": null,
          "--grpc-port": null,
          "--incremental-streaming-output": null
+        },
+        "env": {
+         "SGLANG_RUST_SERVER": null
         }
        }
       },
@@ -1755,6 +1776,9 @@ export const agentx = {
         "args": {
          "--grpc-port": null,
          "--incremental-streaming-output": null
+        },
+        "env": {
+         "SGLANG_RUST_SERVER": null
         }
        }
       },
@@ -1942,6 +1966,9 @@ export const agentx = {
          "--kv-events-config": null,
          "--grpc-port": null,
          "--incremental-streaming-output": null
+        },
+        "env": {
+         "SGLANG_RUST_SERVER": null
         }
        }
       },
@@ -1951,6 +1978,9 @@ export const agentx = {
         "args": {
          "--grpc-port": null,
          "--incremental-streaming-output": null
+        },
+        "env": {
+         "SGLANG_RUST_SERVER": null
         }
        }
       },

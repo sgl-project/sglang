@@ -231,7 +231,7 @@ def _run_tlx_moe(
         reason = f"unsupported shapes w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
     else:
         from sglang.kernels.jit.utils.tlx_runtime import add_missing_hip_options
-        from sglang.kernels.tlx_ops.kernels.moe.gfx950 import moe
+        from sglang.kernels.ops.moe.tlx_moe import moe
 
         add_missing_hip_options()
         return moe(

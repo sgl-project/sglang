@@ -16,7 +16,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+    NPUDSATokenToKVPool,
+    NPUMLATokenToKVPool,
+)
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
 from sglang.srt.runtime_context import get_parallel
@@ -88,7 +91,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         my_start, my_end = self._owned_local_layer_range()
         logger.info(
             "Layer shard plan (continuous, NPU): "
-            f"layer_num={self.layer_num}, shard_size={self.layer_shard_size}, "
+            f"pool={type(self).__name__}, layer_num={self.layer_num}, shard_size={self.layer_shard_size}, "
             f"rank={self.layer_shard_rank}, local=[{my_start},{my_end}), "
             f"global=[{self.start_layer + my_start},{self.start_layer + my_end}), "
             f"partitions={'; '.join(partitions)}"
@@ -234,6 +237,19 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         # below the batch's patch-write region.
         self._kv_used_bound = 0
         self._idx_used_bound = 0
+
+    def get_kv_size_bytes(self):
+        # Scratch storage is persistent and must be included in memory reports.
+        size = super().get_kv_size_bytes()
+        for name in (
+            "remote_kv_all",
+            "remote_index_k_buffer",
+            "remote_index_k_scale_buffer",
+        ):
+            buffer = getattr(self, name, None)
+            if buffer is not None:
+                size += buffer.nbytes
+        return size
 
     def _kv_local_offset(self, layer_id: int) -> int:
         owned_start, _ = self._owned_local_layer_range()
@@ -805,3 +821,11 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     assert cpu.shape[0] == len(target_indices)
                     buffer[target_indices] = cpu.to(buffer.device, non_blocking=True)
         torch.npu.synchronize()
+
+
+class LayerSplitNPUDSATokenToKVPool(LayerSplitNPUMLATokenToKVPool, NPUDSATokenToKVPool):
+    """Hybrid DSA constructor/layout with the NPU layer-split storage contract.
+
+    The DSA constructor translates skipped indexer layers before the common
+    NPU MLA constructor calls the split buffer allocator.
+    """

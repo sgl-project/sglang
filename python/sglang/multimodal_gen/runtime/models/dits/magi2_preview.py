@@ -41,7 +41,8 @@ from sglang.multimodal_gen.runtime.models.dits.magi2_layers import (
     Magi2SegmentLayout,
     apply_partial_rope,
     gather_packed_rows,
-    shard_packed_rows,
+    local_row_range,
+    pad_local_rows,
     sharded_cu_seqlens,
     swiglu7_interleaved,
 )
@@ -111,6 +112,9 @@ class Magi2PreviewDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             raise TypeError(f"unexpected forward kwargs: {sorted(unexpected)}")
 
         layout: Magi2SegmentLayout = kwargs["layout"]
+        # Each rank embeds and projects only its own rows: the adapters are per-row,
+        # and the full fp32 residual stream is 4x hidden wide.
+        plan, row_range = local_row_range(layout.total_tokens)
         rows, rope = self.pre_adapter(
             video=kwargs["video_latents"],
             audio=kwargs["audio_latents"],
@@ -120,13 +124,14 @@ class Magi2PreviewDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
             timestep=kwargs["timestep"],
             ref_patches=kwargs.get("ref_patches"),
             ref_special=kwargs.get("ref_special"),
+            row_range=row_range,
         )
 
         streams = rows.view(-1, self.num_stream, self.hidden_size)
         streams = streams.to(self.blocks[0].attention.linear_qkv.weight.dtype)
-
-        (streams, rope, modality_ids), plan = shard_packed_rows(
-            streams, rope, layout.modality_ids
+        lo, hi = row_range or (0, layout.total_tokens)
+        streams, rope, modality_ids = pad_local_rows(
+            plan, streams, rope, layout.modality_ids[lo:hi]
         )
         # Not layout.cu_seqlens: pad rows from an uneven split get their own varlen
         # segment so real tokens cannot attend to them.
@@ -141,8 +146,10 @@ class Magi2PreviewDiT(CachableDiT, LayerwiseOffloadableModuleMixin):
                 max_seqlen=max_seqlen,
             )
 
-        rows = gather_packed_rows(streams.reshape(streams.shape[0], -1), plan=plan)
-        return self.post_adapter(rows, layout=layout)
+        projected = self.post_adapter.project(streams.reshape(streams.shape[0], -1))
+        return self.post_adapter(
+            gather_packed_rows(projected, plan=plan), layout=layout
+        )
 
 
 class Magi2PreviewBlock(nn.Module):

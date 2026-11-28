@@ -321,7 +321,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
             **kwargs,
         )
 
-    def format_messages_v2(self, messages: str, pil_images, max_req_input_len=-1):
+    def format_messages_v2(self, messages: str, pil_images):
         """play the role of format_messages_v2 and get_images_info in the last version"""
         masked_tokenized_data = []  # labels
         images_list = []
@@ -393,7 +393,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
-        max_req_input_len: int = -1,
         cropping: bool = True,
         **kwargs,
     ):
@@ -426,7 +425,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
             images_seq_mask,
             images_spatial_crop,
             images_crop,
-        ) = self.format_messages_v2(prompt, images, max_req_input_len)
+        ) = self.format_messages_v2(prompt, images)
 
         target_ids = torch.LongTensor(masked_tokenized_str)
 
@@ -468,7 +467,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
-        max_req_input_len: int = -1,
         text: list[str] = None,
         **kwargs,
     ):
@@ -482,7 +480,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
             apply_sft_format=apply_sft_format,
             inference_mode=inference_mode,
             system_prompt=system_prompt,
-            max_req_input_len=max_req_input_len,
         )
 
         return prepare

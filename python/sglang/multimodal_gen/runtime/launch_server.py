@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
+    configure_media_url_policy,
     prepare_server_args,
     set_global_server_args,
 )
@@ -223,7 +224,13 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     server_args_payload = ServerArgsPayload.capture(server_args)
     processes = _start_scheduler_processes(
         server_args_payload,
-        [(i, rank_offset + i) for i in range(local_num_gpus)],
+        [
+            (
+                server_args.base_gpu_id + i if server_args.stage_role else i,
+                rank_offset + i,
+            )
+            for i in range(local_num_gpus)
+        ],
         "sglang-diffusionWorker-",
     )
 
@@ -470,6 +477,7 @@ def launch_http_server_only(
 
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
+    configure_media_url_policy(server_args)
     app = create_app(server_args, worker_pids=worker_pids, disagg_server=disagg_server)
     uvicorn.run(
         app,
@@ -692,6 +700,14 @@ def dispatch_launch(server_args: ServerArgs):
 
     if "NCCL_NVLS_ENABLE" not in os.environ or server_args.enable_nccl_nvls:
         os.environ["NCCL_NVLS_ENABLE"] = str(int(server_args.enable_nccl_nvls))
+
+    if server_args.stage_deployment:
+        from sglang.multimodal_gen.runtime.disaggregation.deployment.launch import (
+            launch_stage_deployment,
+        )
+
+        launch_stage_deployment(server_args)
+        return
 
     role = server_args.disagg_role
     if role == RoleType.MONOLITHIC:

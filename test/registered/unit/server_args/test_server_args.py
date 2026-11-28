@@ -66,7 +66,10 @@ from sglang.srt.arg_groups.mamba_hook import (
     handle_int8_mamba_checkpoint,
     handle_mamba_backend,
 )
-from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.memory_hook import (
+    finalize_prefill_token_budget,
+    handle_gpu_memory_settings,
+)
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -130,7 +133,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
     get_context,
-    get_serving,
     override_platform,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
@@ -139,7 +141,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
-    enter_scope,
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -3850,6 +3851,47 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 
+class TestPrefillTokenBudget(CustomTestCase):
+    def test_cli_budget_covers_a_chunk_and_preserves_larger_caps(self):
+        cases = (
+            (None, None, 16384),
+            (-1, 8192, 8192),
+            (8192, None, 16384),
+            (32000, None, 32000),
+            (32000, 16000, 32000),
+            (32000, 64000, 64000),
+        )
+        for chunk, cap, expected in cases:
+            with self.subTest(chunk=chunk, cap=cap):
+                argv = ["--model-path", "dummy"]
+                if chunk is not None:
+                    argv += ["--chunked-prefill-size", str(chunk)]
+                if cap is not None:
+                    argv += ["--max-prefill-tokens", str(cap)]
+                args = prepare_server_args(argv)
+                args.resolve_once()
+                self.assertEqual(
+                    resolution_result(args, "max_prefill_tokens"), expected
+                )
+                self.assertEqual(args.max_prefill_tokens, cap or 16384)
+
+    def test_rerun_after_a_chunk_shrink_refits_to_the_raw_cap(self):
+        args = ServerArgs(model_path="dummy", chunked_prefill_size=128000)
+        declare_resolution(args, "attention_dp", chunked_prefill_size=32000)
+        with self.assertLogs("sglang.srt.arg_groups.memory_hook", "INFO") as logs:
+            finalize_prefill_token_budget(args)
+        self.assertIn("from 16384 to the chunked prefill size 32000", logs.output[0])
+        self.assertEqual(resolution_result(args, "max_prefill_tokens"), 32000)
+
+        declare_resolution(args, "shrink", chunked_prefill_size=8192)
+        finalize_prefill_token_budget(args)
+        self.assertEqual(resolution_result(args, "max_prefill_tokens"), 16384)
+        self.assertEqual(args.max_prefill_tokens, 16384)
+        decisions = len(args._resolved_overrides)
+        finalize_prefill_token_budget(args)
+        self.assertEqual(len(args._resolved_overrides), decisions)
+
+
 class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
     def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None, **overrides):
         args = ServerArgs(
@@ -4559,9 +4601,8 @@ class TestHandleCrashDumpEnv(CustomTestCase):
 
 
 class TestGrpcServerArgs(CustomTestCase):
-    """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
-    alongside HTTP; --grpc-mode serves the encoder over gRPC. Worker-threads /
-    max-prefill-tokens are env-only knobs.
+    """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT), which only
+    the Rust server serves; --grpc-mode serves the encoder over gRPC.
 
     The gRPC setup lives in `serving_hook.handle_grpc_args`, which
     __post_init__ skips for dummy models, so these tests build a dummy
@@ -4578,16 +4619,20 @@ class TestGrpcServerArgs(CustomTestCase):
         handle_grpc_args(sa)
         self.assertIsNone(resolution_result(sa, "grpc_port"))
 
-    def test_grpc_port_enables_native_and_env_knobs(self):
+    def test_grpc_port_requires_the_rust_server(self):
+        with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER=1"):
+            handle_grpc_args(self._args(grpc_port=50051))
         sa = self._args(grpc_port=50051)
-        with envs.SGLANG_GRPC_WORKER_THREADS.override(8):
+        with envs.SGLANG_RUST_SERVER.override(True):
             handle_grpc_args(sa)
         self.assertEqual(resolution_result(sa, "grpc_port"), 50051)
-        self.assertEqual(resolution_result(sa, "grpc_worker_threads"), 8)
 
     def test_env_grpc_port_enables_native(self):
         sa = self._args(port=30000)
-        with envs.SGLANG_GRPC_PORT.override(45000):
+        with (
+            envs.SGLANG_GRPC_PORT.override(45000),
+            envs.SGLANG_RUST_SERVER.override(True),
+        ):
             handle_grpc_args(sa)
         self.assertEqual(resolution_result(sa, "grpc_port"), 45000)
 
@@ -4785,11 +4830,6 @@ class TestGrpcServerArgs(CustomTestCase):
         proc.join.assert_called_once_with(timeout=42.0)
         kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
 
-    def test_native_grpc_rejects_multi_tokenizer(self):
-        sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
-        with self.assertRaises(ValueError):
-            handle_grpc_args(sa)
-
     def test_rust_server_grpc_accepts_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=4)
         with envs.SGLANG_RUST_SERVER.override(True):
@@ -4816,12 +4856,6 @@ class TestGrpcServerArgs(CustomTestCase):
             source.index("run_hook(handle_grpc_args"),
         )
 
-    def test_invalid_grpc_worker_threads_rejected(self):
-        sa = self._args(grpc_port=40000)
-        with envs.SGLANG_GRPC_WORKER_THREADS.override(0):
-            with self.assertRaises(ValueError):
-                handle_grpc_args(sa)
-
     def test_grpc_response_timeout(self):
         parser = self._sidecar_parser()
         for value in (300, 1800, 0, -1):
@@ -4836,62 +4870,11 @@ class TestGrpcServerArgs(CustomTestCase):
                     ):
                         handle_grpc_args(sa)
                 else:
-                    handle_grpc_args(sa)
+                    with envs.SGLANG_RUST_SERVER.override(True):
+                        handle_grpc_args(sa)
                     self.assertEqual(
                         resolution_result(sa, "grpc_response_timeout_secs"), value
                     )
-
-    def test_start_server_call_site_matches_native_signature(self):
-        """Regression for the startup blocker: the native start_server binding
-        only accepts (host, port, runtime_handle, worker_threads, ...). The
-        arg-parsing tests above never call start_server, so a stray kwarg (e.g.
-        the removed max_prefill_tokens) would only surface as a TypeError at
-        launch. This mocks the native extension and locks the kwarg set."""
-        from sglang.srt.entrypoints import http_server
-
-        fake_core = SimpleNamespace(start_server=MagicMock(return_value="handle"))
-        fake_bridge = SimpleNamespace(RuntimeHandle=MagicMock(return_value="rt"))
-        override = get_context().override_server_args(
-            host="127.0.0.1",
-            grpc_port=50051,
-            grpc_worker_threads=4,
-            grpc_response_timeout_secs=1800,
-        )
-        server_args = override.install()
-        self.addCleanup(override.restore)
-        with (
-            patch(
-                "sglang.srt.rust_extensions.load_rust_extension",
-                return_value=fake_core,
-            ) as load_rust_extension,
-            patch.dict(
-                "sys.modules", {"sglang.srt.entrypoints.grpc_bridge": fake_bridge}
-            ),
-        ):
-            handle = http_server._start_native_grpc_server_for_runtime(
-                server_args=server_args,
-                tokenizer_manager=MagicMock(),
-                template_manager=MagicMock(),
-                scheduler_info={},
-                grpc_port=get_serving().grpc_port,
-            )
-
-        self.assertEqual(handle, "handle")
-        load_rust_extension.assert_called_once_with("sglang.srt.rust_extensions._grpc")
-        _, kwargs = fake_core.start_server.call_args
-        self.assertEqual(
-            set(kwargs),
-            {
-                "host",
-                "port",
-                "runtime_handle",
-                "worker_threads",
-                "response_timeout_secs",
-            },
-        )
-        self.assertEqual(kwargs["worker_threads"], 4)
-        self.assertEqual(kwargs["response_timeout_secs"], 1800)
-        self.assertNotIn("max_prefill_tokens", kwargs)
 
 
 class TestTwoBatchOverlapBackend(CustomTestCase):
@@ -4951,13 +4934,6 @@ class TestIntelXpuLoRABackend(CustomTestCase):
 
 
 class TestKvCacheShardingCompatibility(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        # Sharding currently requires Python, independent of the default backend.
-        enter_scope(
-            self, envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python")
-        )
-
     def _args(self, **overrides):
         model_config = overrides.pop("model_config", None)
         args = ServerArgs(
@@ -5002,22 +4978,22 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ]
         return args
 
-    def test_sharding_defaults_to_python_when_backend_is_unset(self):
-        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
-        with patch.dict(os.environ), envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
-            handle_kv_cache_sharding(args, 80 * 1024)
-            self.assertEqual(
-                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "python"
-            )
-
-    def test_unsharded_launch_keeps_the_general_backend_default(self):
-        args = self._args(enable_kv_cache_sharding=False)
-        with patch.dict(os.environ):
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
-            handle_kv_cache_sharding(args, 80 * 1024)
-            self.assertFalse(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set())
-            self.assertEqual(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "rust")
+    def test_launch_keeps_the_general_backend_default(self):
+        for sharded in (True, False):
+            with self.subTest(sharded=sharded):
+                args = self._rounding_args(
+                    raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                )
+                args.enable_kv_cache_sharding = sharded
+                with (
+                    patch.dict(os.environ),
+                    envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+                ):
+                    envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+                    handle_kv_cache_sharding(args, 80 * 1024)
+                    self.assertFalse(
+                        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set()
+                    )
 
     def test_encoder_decoder_is_rejected_before_backend_setup(self):
         args = self._args(model_config=SimpleNamespace(is_encoder_decoder=True))
@@ -5120,21 +5096,24 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     handle_kv_cache_sharding(self._args(**overrides))
 
-    def test_rust_unified_tree_core_is_rejected(self):
-        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
-            with self.assertRaisesRegex(ValueError, "requires the Python"):
-                handle_kv_cache_sharding(self._args())
-
-    def test_rust_tree_core_is_allowed_with_radix_disabled(self):
-        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
-        args.disable_radix_cache = True
-        with (
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"),
-            envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
-        ):
-            handle_kv_cache_sharding(args, 80 * 1024)
-
-        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
+    def test_both_tree_cores_are_accepted(self):
+        for backend in ("python", "rust"):
+            for disable_radix_cache in (False, True):
+                with self.subTest(
+                    backend=backend, disable_radix_cache=disable_radix_cache
+                ):
+                    args = self._rounding_args(
+                        raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                    )
+                    args.disable_radix_cache = disable_radix_cache
+                    with (
+                        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend),
+                        envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+                    ):
+                        handle_kv_cache_sharding(args, 80 * 1024)
+                    self.assertEqual(
+                        resolution_result(args, "chunked_prefill_size"), 2112
+                    )
 
     def test_dynamic_chunking_is_rejected_only_when_pipeline_parallelism_uses_it(self):
         for pp_size in (1, 2):
@@ -5921,6 +5900,7 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "ssl_keyfile_password": ["--ssl-keyfile-password", "pw"],
         "enable_ssl_refresh": ["--enable-ssl-refresh"],
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
+        "allow_private_media_hosts": ["--allow-private-media-hosts"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
         "enable_trace": ["--enable-trace"],
         "completion_template": ["--completion-template", "deepseek_coder"],

@@ -14,7 +14,7 @@ use crate::message::types::OneOrMany;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
-pub(crate) use crate::tokenizer_manager::to_scheduler_validation::fit_input;
+pub(crate) use crate::tokenizer_manager::to_scheduler_validation::input_length_error;
 use crate::tokenizer_manager::to_scheduler_validation::{
     check_total_tokens, validate, validate_input_ids,
 };
