@@ -1802,6 +1802,10 @@ STANDALONE_FILES = {
         "../unit/test_qwen_image21_distributed.py",
         "../unit/test_text_encoding_cache.py",
     ],
+    # BMG lane: native ConvRot INT8 forward, offload and loading on sgl-kernel-xpu.
+    "1-gpu-xpu": [
+        "../unit/test_convrot_int8_xpu.py",
+    ],
 }
 
 # the CI planner reads the CUDA registry before platform-specific list replacements
@@ -1903,6 +1907,10 @@ STANDALONE_FILE_EST_TIMES = {
         "../unit/test_qwen_image21_distributed.py": 40.0,
         # 2x GB300: 101 s, mostly the spawned DP/FSDP cases
         "../unit/test_text_encoding_cache.py": 120.0,
+    },
+    "1-gpu-xpu": {
+        # B60: 13 s full process (54 cases in under 3 s)
+        "../unit/test_convrot_int8_xpu.py": 30.0,
     },
 }
 
