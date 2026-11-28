@@ -191,6 +191,15 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(manager.requests, [])
 
+    async def test_text_query_with_token_items_is_rejected(self):
+        """A text query with token-ID items must not score the items' list repr as text."""
+        manager = ScoringManager()
+        with self.assertRaisesRegex(ValueError, "Invalid combination"):
+            await manager.score_request(
+                query="Rate:", items=[[4], [5]], label_token_ids=[7, 4]
+            )
+        self.assertEqual(manager.requests, [])
+
     async def test_http_out_of_vocabulary_error(self):
         for enable_mis in (False, True):
             for token_id in (8, 999999):
