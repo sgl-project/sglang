@@ -904,7 +904,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _can_skip_verify_logits(self, verify: VerifyStep) -> bool:
         """The accept reads only the target argmax: the vocab shards stay ungathered."""
-        if verify.batch.return_logprob or verify.route.adjusts_logits:
+        if verify.batch.return_logprob or verify.facts.edits_logits:
             return False
         sampling_info = verify.batch.sampling_info
         if sampling_info is None:

@@ -20,10 +20,9 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.grammar_mask import build_grammar_mask
 from sglang.srt.sampling.penalties import StepPenalties
-from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.sampling.sampling_pipeline import (
     SamplingPipeline,
-    VerifyRoute,
     VerifyStep,
     _adjust_before_watermark,
 )
@@ -111,7 +110,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
             positions=torch.tensor([0]),
             forward_mode=SimpleNamespace(is_decode=lambda: True),
         )
-        info.has_custom_logit_processor = True
+        info.facts = SamplingFacts(custom_logit_processor=True)
         module = "sglang.srt.sampling.sampling_pipeline"
         with (
             patch(
@@ -165,11 +164,13 @@ class TestSamplingPipelineOrder(CustomTestCase):
 
         step = VerifyStep(
             batch=SimpleNamespace(
-                sampling_info=_make_info(has_custom_logit_processor=True),
+                sampling_info=_make_info(
+                    facts=SamplingFacts(custom_logit_processor=True)
+                ),
                 req_pool_indices=None,
                 return_logprob=False,
             ),
-            route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+            facts=SamplingFacts(custom_logit_processor=True),
             watermark=SimpleNamespace(apply=apply_watermark),
             watermark_full_mask=True,
         )
@@ -431,7 +432,7 @@ class TestStepBuilds(CustomTestCase):
         )
         info = _make_info()
         info.set_step_state([req])
-        self.assertTrue(info.has_custom_logit_processor)
+        self.assertTrue(info.facts.custom_logit_processor)
         logits = torch.zeros(1, VOCAB_SIZE)
         apply_custom_logit_processor(logits, info)
         self.assertEqual(torch.isfinite(logits[0]).nonzero().flatten().tolist(), [1])
@@ -442,18 +443,34 @@ class TestStepBuilds(CustomTestCase):
         info = _make_info()
         info.set_step_state(reqs)
         self.assertIsNone(info.grammars)
+        self.assertFalse(info.facts.grammar)
 
         grammar = object()
         reqs[1].grammar = grammar
         info.set_step_state(reqs)
         self.assertEqual(info.grammars, [None, grammar])
+        self.assertTrue(info.facts.grammar)
+
+    def test_stage_facts_follow_the_rows_and_keep_the_param_facts(self):
+        info = _make_info(facts=SamplingFacts(all_greedy=True))
+        info.set_step_state([self._make_req()])
+        self.assertEqual(info.facts, SamplingFacts(all_greedy=True))
+
+        info.step_penalties = object()
+        info.watermark = object()
+        info.sampling_seed = torch.zeros(1, dtype=torch.int64)
+        info.set_step_state([self._make_req()])
+        self.assertEqual(
+            info.facts,
+            SamplingFacts(all_greedy=True, watermark=True, penalties=True, seeded=True),
+        )
 
     def test_external_processor_still_requires_the_enable_flag(self):
         req = self._make_req()
         req.custom_logit_processor = DisallowedTokensLogitsProcessor.to_str()
         info = _make_info()
         info.set_step_state([req])
-        self.assertFalse(info.has_custom_logit_processor)
+        self.assertFalse(info.facts.custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
 
     def test_custom_logit_processor_grouping(self):
@@ -471,7 +488,7 @@ class TestStepBuilds(CustomTestCase):
         info = _make_info()
         info.set_step_state([req1, req2])
 
-        self.assertTrue(info.has_custom_logit_processor)
+        self.assertTrue(info.facts.custom_logit_processor)
         self.assertIsNotNone(info.custom_logit_processor)
         self.assertEqual(len(info.custom_logit_processor), 1)
         key = list(info.custom_logit_processor.keys())[0]

@@ -43,7 +43,6 @@ def _decode_batch():
     sampling.facts = SamplingFacts(all_greedy=True)
     sampling.logit_bias = None
     sampling.grammars = None
-    sampling.has_custom_logit_processor = False
     sampling.step_penalties = None
     sampling.watermark = None
     batch = Mock()
@@ -100,16 +99,10 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
 
         sampling.facts = SamplingFacts(all_greedy=False)
         self.assertFalse(graph_io.can_defer(batch))
+        for stage in ("logit_bias", "watermark", "grammar"):
+            sampling.facts = SamplingFacts(all_greedy=True, **{stage: True})
+            self.assertFalse(graph_io.can_defer(batch))
         sampling.facts = SamplingFacts(all_greedy=True)
-        sampling.logit_bias = torch.ones(1)
-        self.assertFalse(graph_io.can_defer(batch))
-        sampling.logit_bias = None
-        sampling.watermark = object()
-        self.assertFalse(graph_io.can_defer(batch))
-        sampling.watermark = None
-        sampling.grammars = [object()]
-        self.assertFalse(graph_io.can_defer(batch))
-        sampling.grammars = None
         batch.return_logprob = True
         self.assertFalse(graph_io.can_defer(batch))
 
@@ -132,8 +125,7 @@ class TestUOCRDecodeGraphIO(CustomTestCase):
         self.assertEqual(graph_io.relay[indices].tolist(), [47, 53])
 
         # watermarking samples after graph argmax; relay the actual sampled ids
-        batch.sampling_info.facts = SamplingFacts(all_greedy=True)
-        batch.sampling_info.watermark = object()
+        batch.sampling_info.facts = SamplingFacts(all_greedy=True, watermark=True)
         result.next_token_ids = torch.tensor([59, 61])
         graph_io.relay_result(batch, result, indices)
         self.assertEqual(graph_io.relay[indices].tolist(), [59, 61])
@@ -239,7 +231,7 @@ class TestUocrGreedyGraph(CustomTestCase):
         graph = UocrGreedyGraph(max_bs=4, device="cpu")
         logits = Mock(next_token_logits=torch.zeros(2, 5))
         batch = _decode_batch()
-        batch.sampling_info.grammars = [object(), None]
+        batch.sampling_info.facts = SamplingFacts(all_greedy=True, grammar=True)
         graph.before_forward(batch, replays_graph=True, decode_graph_runner=None)
         self.assertIsNone(graph.recorded_ids(logits, batch))
 

@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.arg_groups.model_override_base import resolving_view
@@ -234,7 +235,7 @@ class TestSynthIDEngine(CustomTestCase):
         sample = engine.bind_sample(forward_batch)
 
         self.assertTrue(sample._can_fuse(keep_logits=False))
-        info.has_custom_logit_processor = True
+        info.facts = msgspec.structs.replace(info.facts, custom_logit_processor=True)
         self.assertFalse(sample._can_fuse(keep_logits=False))
 
     def test_sample_watermarks_on_rows_and_commits_their_slots(self):

@@ -32,6 +32,7 @@ from sglang.srt.sampling.custom_logit_processor import (
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
+    SamplingFacts,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -67,7 +68,7 @@ class TestApplyCustomLogitProcessor(CustomTestCase):
             top_ks=torch.zeros(batch_size, dtype=torch.int32),
             min_ps=torch.zeros(batch_size),
             vocab_size=4,
-            has_custom_logit_processor=True,
+            facts=SamplingFacts(custom_logit_processor=True),
             custom_params=params,
             custom_logit_processor={
                 0: ProcessorEntry(

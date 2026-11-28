@@ -20,7 +20,7 @@ from sglang.srt.layers.sampler import top_k_top_p_min_p_filter_sorted_probs_torc
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.dflash_utils import (
     _adjust_top_p_for_top_k,
@@ -250,7 +250,6 @@ def test_eagle_dense_verify_applies_min_p():
         sampling_seed=None,
         step_penalties=None,
         logit_bias=None,
-        has_custom_logit_processor=False,
     )
     verify_input = SimpleNamespace(
         draft_token_num=width,
@@ -273,7 +272,7 @@ def test_eagle_dense_verify_applies_min_p():
     )
     verify = VerifyStep(
         batch=batch,
-        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=True),
+        facts=info.facts,
         watermark=None,
         watermark_full_mask=True,
     )

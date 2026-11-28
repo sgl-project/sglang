@@ -273,13 +273,9 @@ class VerifySamplingView(msgspec.Struct, frozen=True):
     max_top_k: Optional[int]
     device: torch.device
 
-    # Compatibility names read by the stock verifier, properties so the view's
-    # fields stay exact: the view carries no custom logit processors, and its
-    # flags are the batch's sampling facts.
-    @property
-    def has_custom_logit_processor(self) -> bool:
-        return False
-
+    # The batch's sampling facts the view's fields carry, read by the stock
+    # verifier; a property so the view's fields stay exact. The view carries no
+    # custom logit processors, and neither the grammar nor the watermark stage.
     @property
     def facts(self) -> SamplingFacts:
         # lazy: the provider ABI does not import the runtime at module load.
@@ -291,6 +287,9 @@ class VerifySamplingView(msgspec.Struct, frozen=True):
             need_top_p=self.need_top_p_sampling,
             need_min_p=self.need_min_p_sampling,
             max_top_k=self.max_top_k,
+            penalties=self.step_penalties is not None,
+            logit_bias=self.logit_bias is not None,
+            seeded=self.sampling_seed is not None,
         )
 
 

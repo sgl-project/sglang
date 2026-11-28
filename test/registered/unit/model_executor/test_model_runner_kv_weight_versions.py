@@ -151,7 +151,6 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
             sampling_info=SimpleNamespace(
                 step_penalties=None,
                 logit_bias=None,
-                has_custom_logit_processor=False,
                 watermark=None,
                 facts=SamplingFacts(),
             ),

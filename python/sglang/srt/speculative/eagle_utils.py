@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+    from sglang.srt.sampling.sampling_pipeline import VerifyStep
     from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
 _is_cuda = is_cuda()
@@ -462,8 +462,6 @@ def eagle_prepare_for_verify(
     req_to_token_pool: ReqToTokenPool,
     batch: ScheduleBatch,
     target_worker: TpModelWorker,
-    *,
-    route: VerifyRoute,
 ):
     # Imports must stay lazy (import-cycle safety) but only need to resolve
     # once, not on every decode cycle of this hot path.
@@ -556,7 +554,6 @@ def eagle_prepare_for_verify(
         return_hidden_states_before_norm=False,
         spec_mrope_positions=verify_input.prepared_mrope_positions,
         iteration_ids=verify_input.iteration_ids,
-        verify_route=route,
     )
 
     # Run attention backend plan and cuda graph preparation
@@ -676,7 +673,7 @@ def _can_use_sparse_uno_tree_target_sampling(
     return bool(
         _is_cuda
         and max_top_k <= _SPARSE_TOP_K_LIMIT
-        and sampling_info.sampling_seed is None
+        and not sampling_info.facts.seeded
         and not sampling_info.facts.need_min_p
         and not get_spec().speculative_use_rejection_sampling
     )
@@ -779,15 +776,13 @@ def _sharded_sampling_applies(
     rows require a local key policy; a policy that declines returns to the stock
     gathered path before sampling. Anything that reads or edits full logits also
     stays on the stock gathered path. A padded CUDA-graph replay keeps the shards
-    whatever the route says, so this gate still gathers them.
+    whatever the facts say, so this gate still gathers them.
     """
     return (
         _is_cuda
         and verify_input.tree_topk == 1
         and sampling_allows_vocab_shards(
-            verify.batch.sampling_info,
-            adjusts_logits=verify.route.adjusts_logits,
-            need_truncated_sampling=verify.route.need_truncated_sampling,
+            verify.facts,
             return_logprob=verify.batch.return_logprob,
             has_local_keys=has_local_keys,
         )
@@ -808,7 +803,7 @@ def eagle_sample(
 ):
     """
     Verify and find accepted tokens based on logits output and the verify step:
-    its batch (which contains spec decoding information), the route the shard
+    its batch (which contains spec decoding information), the facts the shard
     gate reads, and the stages (`VerifyStep.adjust`). simulated_acc_len: the
     injected acceptance length already drawn on the host, as a device int64 [1],
     so a CUDA graph can replay the injection. simulated_acc_len_rng: the

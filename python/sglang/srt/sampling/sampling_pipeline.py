@@ -9,7 +9,7 @@ Two entries run it:
 - decode: `SamplingPipeline.sample`, which binds, applies, samples, and commits
   in one call;
 - verify: `SamplingPipeline.plan_verify` returns a `VerifyStep` before the
-  target forward launches; its route picks the verify's fast paths. After the
+  target forward launches; its facts pick the verify's fast paths. After the
   launch the verify worker calls `build_grammar_mask`, the stages
   (`VerifyStep.adjust`, inside `eagle_sample` for a tree), its accept core, and
   `commit`.
@@ -43,7 +43,10 @@ if TYPE_CHECKING:
     from sglang.srt.layers.sampler import Sampler
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.sampling.sampling_batch_info import (
+        SamplingBatchInfo,
+        SamplingFacts,
+    )
     from sglang.srt.sampling.sampling_observer import SamplingObserver
     from sglang.srt.sampling.verify_accept import VerifyAccept
     from sglang.srt.sampling.watermarking.interface import (
@@ -140,9 +143,9 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
     def plan_verify(
         self, batch: ScheduleBatch, *, watermark_full_mask: bool
     ) -> VerifyStep:
-        """Plan a target verify's sampling: derive its route and bind its watermark.
-        Call it before the target forward launches, so the route can pick the
-        forward's own fast paths.
+        """Plan a target verify's sampling: take the batch's facts and bind its
+        watermark. Call it before the target forward launches, so the facts can
+        pick the forward's own fast paths.
 
         `watermark_full_mask`: the verify's custom mask has the FULL_MASK layout,
         prefix columns included.
@@ -155,11 +158,7 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             )
         return VerifyStep(
             batch=batch,
-            route=VerifyRoute.derive(
-                info,
-                has_grammar=batch.has_grammar,
-                has_watermark=info is not None and info.watermark is not None,
-            ),
+            facts=info.facts,
             watermark=watermark,
             watermark_full_mask=watermark_full_mask,
         )
@@ -254,46 +253,14 @@ def _custom_logit_processor_stage(
         )
 
 
-class VerifyRoute(msgspec.Struct, frozen=True):
-    """The sampling facts that pick a target verify's fast paths."""
-
-    # Some stage edits the logits before the accept reads them.
-    adjusts_logits: bool
-    # Some row truncates its distribution with top-k, top-p, or min-p.
-    need_truncated_sampling: bool
-
-    @classmethod
-    def derive(
-        cls,
-        info: Optional[SamplingBatchInfo],
-        *,
-        has_grammar: bool,
-        has_watermark: bool,
-    ) -> VerifyRoute:
-        """`has_grammar` and `has_watermark` come from the caller: verify builds
-        its grammar mask over the draft tree, and the provider's sampling view
-        carries neither stage's state."""
-        if info is None:
-            return cls(adjusts_logits=has_grammar, need_truncated_sampling=False)
-        return cls(
-            adjusts_logits=(
-                has_grammar
-                or has_watermark
-                or info.step_penalties is not None
-                or info.logit_bias is not None
-                or info.has_custom_logit_processor
-            ),
-            need_truncated_sampling=info.facts.truncates,
-        )
-
-
 class VerifyStep(msgspec.Struct):
     """One target verify's sampling state, from `SamplingPipeline.plan_verify`:
-    the route its fast paths read, the bound watermark, and the grammar mask,
+    the facts its fast paths read, the bound watermark, and the grammar mask,
     built after the target forward launches."""
 
     batch: ScheduleBatch
-    route: VerifyRoute
+    # The batch's facts; the provider's stock verifier builds them from its view.
+    facts: SamplingFacts
     watermark: Optional[VerifyWatermark]
     watermark_full_mask: bool
     grammar_mask: Optional[GrammarMask] = None
@@ -347,8 +314,6 @@ class VerifyStep(msgspec.Struct):
             next_sibling=None if tree is None else tree.retrieve_next_sibling,
             grammar_mask=self.grammar_mask,
         )
-        # Read before the watermark, which may replace the sampling info.
-        has_custom_logit_processor = sampling_info.has_custom_logit_processor
         verify_logits = logits
         if self.watermark is not None:
             if tree is None:
@@ -370,7 +335,7 @@ class VerifyStep(msgspec.Struct):
                 keep_logits=batch.return_logprob,
                 **geometry,
             )
-        if has_custom_logit_processor:
+        if self.facts.custom_logit_processor:
             _custom_logit_processor_stage(
                 verify_logits,
                 sampling_info,

@@ -13,7 +13,6 @@ from sglang.kernels.ops.speculative.reject_sampling import (
     speculative_sampling_classic_kernel,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingFacts
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     accept_draft_tokens,
@@ -475,7 +474,6 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
                 facts=SamplingFacts(any_greedy=any_greedy),
                 temperatures=torch.ones(batch, 1, device=DEVICE),
             ),
-            route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
             draft_input=SimpleNamespace(max_top_k=1, uniform_top_k_value=None),
             gamma=2,
             verify_num_draft_tokens=3,
@@ -529,7 +527,6 @@ def test_ragged_cutoff_preserves_distribution(block):
             facts=SamplingFacts(),
             temperatures=torch.ones(batch, 1, device=DEVICE),
         ),
-        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
         draft_input=SimpleNamespace(max_top_k=1, uniform_top_k_value=None),
         gamma=gamma,
         verify_num_draft_tokens=gamma + 1,

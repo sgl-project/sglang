@@ -188,7 +188,7 @@ def accept_draft_tree(
     # The provider's sampling view carries no custom logit processors.
     if (
         envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
-        and not batch.sampling_info.has_custom_logit_processor
+        and not verify.facts.custom_logit_processor
     ):
         # Without its forced length on the device, eagle_sample would leave the fused
         # chain for the tree kernels and draw the length on the host instead.
@@ -797,7 +797,6 @@ def run_eagle_verify(
             req_to_token_pool,
             batch,
             target_worker,
-            route=verify.route,
         )
 
     # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
@@ -867,7 +866,6 @@ def run_eagle_verify(
         if post_verify_graphs is None or clears_c128
         else post_verify_graphs.run(
             batch=batch,
-            route=verify.route,
             verify_input=verify_input,
             logits_output=logits_output,
             can_run_cuda_graph=can_run_cuda_graph,

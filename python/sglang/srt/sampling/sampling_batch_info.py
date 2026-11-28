@@ -37,9 +37,10 @@ class ProcessorEntry:
 
 
 class SamplingFacts(msgspec.Struct, frozen=True):
-    """Facts over one launch's sampler params, derived from the host side of
-    `SamplingParamsPool` in `gather`. The defaults describe a sampled batch with
-    no truncation."""
+    """Facts over one launch's sampling, derived once. The param facts come from
+    the host side of `SamplingParamsPool` in `gather`, the stage facts from the
+    step state (`set_step_state`). The defaults describe a sampled batch with no
+    truncation and no stage."""
 
     # Every row is greedy (top_k 1); `SamplingRows.empty` sets it for no rows.
     all_greedy: bool = False
@@ -53,9 +54,29 @@ class SamplingFacts(msgspec.Struct, frozen=True):
     # The largest top_k, or None when some row samples from the whole vocabulary.
     max_top_k: Optional[int] = None
 
+    # Which stages run this step, each set when some row has one.
+    grammar: bool = False
+    watermark: bool = False
+    penalties: bool = False
+    logit_bias: bool = False
+    custom_logit_processor: bool = False
+    # Some row samples with its own seed (deterministic mode seeds every row).
+    seeded: bool = False
+
     @property
     def truncates(self) -> bool:
         return self.need_top_k or self.need_top_p or self.need_min_p
+
+    @property
+    def edits_logits(self) -> bool:
+        """Whether some stage edits the logits the sampler or accept reads."""
+        return (
+            self.grammar
+            or self.watermark
+            or self.penalties
+            or self.logit_bias
+            or self.custom_logit_processor
+        )
 
 
 @dataclasses.dataclass
@@ -67,6 +88,8 @@ class SamplingBatchInfo:
     top_ps: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
     min_ps: Optional[torch.Tensor] = None
+    # The param facts from set_rows, then the stage facts from set_step_state,
+    # which follows it at each launch.
     facts: SamplingFacts = SamplingFacts()
 
     # Hashed request ids for the KV canary's token oracle; set in ForwardBatch.
@@ -77,7 +100,6 @@ class SamplingBatchInfo:
     step_penalties: Optional[StepPenalties] = None
 
     # Set by the scheduler at each launch (set_step_state).
-    has_custom_logit_processor: bool = False
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
 
@@ -112,7 +134,8 @@ class SamplingBatchInfo:
 
     def set_step_state(self, reqs: List[Req]) -> None:
         """Build the stages' step state from the step's requests: logit_bias, the
-        grammars, the custom logit processors, and the sampling-mask rows."""
+        grammars, the custom logit processors, and the sampling-mask rows; then
+        the stage facts, over it and the rows `set_rows` set."""
         self.logit_bias = build_logit_bias(
             reqs, vocab_size=self.vocab_size, device=self.device
         )
@@ -121,7 +144,7 @@ class SamplingBatchInfo:
 
         # Group the step's requests by custom logit processor.
         enable_custom_processor = get_exec().features.enable_custom_logit_processor
-        self.has_custom_logit_processor = any(
+        has_custom_logit_processor = any(
             r.custom_logit_processor
             and (
                 enable_custom_processor
@@ -129,7 +152,7 @@ class SamplingBatchInfo:
             )
             for r in reqs
         )
-        if self.has_custom_logit_processor:
+        if has_custom_logit_processor:
             rows_by_processor: Dict[str, List[int]] = {}
             for i, r in enumerate(reqs):
                 if r.custom_logit_processor is not None:
@@ -169,6 +192,16 @@ class SamplingBatchInfo:
             [r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs]
             if mask_rows
             else None
+        )
+
+        self.facts = msgspec.structs.replace(
+            self.facts,
+            grammar=self.grammars is not None,
+            watermark=self.watermark is not None,
+            penalties=self.step_penalties is not None,
+            logit_bias=self.logit_bias is not None,
+            custom_logit_processor=has_custom_logit_processor,
+            seeded=self.sampling_seed is not None,
         )
 
     def copy_for_forward(self):

@@ -20,7 +20,7 @@ from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
 from sglang.srt.model_executor.runner_utils import pool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_batch_info import SamplingFacts
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.speculative import dflash_utils, dflash_worker_v2, eagle_utils
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -178,7 +178,6 @@ class TestGraphPoolBorrow(CustomTestCase):
         sampling_info = SimpleNamespace(
             step_penalties=None,
             logit_bias=None,
-            has_custom_logit_processor=False,
             facts=SamplingFacts(),
             temperatures=torch.ones((1, 1)),
             sampling_seed=None,
@@ -191,7 +190,7 @@ class TestGraphPoolBorrow(CustomTestCase):
         )
         verify = VerifyStep(
             batch=batch,
-            route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
+            facts=sampling_info.facts,
             watermark=None,
             watermark_full_mask=True,
         )

@@ -309,7 +309,7 @@ class MlxTpModelWorker(TpModelWorker):
         """
         if not (
             self._sampling_active(batch)
-            and batch.sampling_info.has_custom_logit_processor
+            and batch.sampling_info.facts.custom_logit_processor
         ):
             return None
         sinfo = batch.sampling_info

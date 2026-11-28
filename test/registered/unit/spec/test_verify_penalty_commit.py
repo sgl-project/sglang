@@ -7,7 +7,7 @@ import torch
 from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
+from sglang.srt.sampling.sampling_pipeline import VerifyStep
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.sampling_test_utils import build_step_penalties
@@ -74,7 +74,7 @@ class TestVerifyPenaltyCommit(CustomTestCase):
         )
         VerifyStep(
             batch=batch,
-            route=VerifyRoute(adjusts_logits=True, need_truncated_sampling=False),
+            facts=batch.sampling_info.facts,
             watermark=watermark,
             watermark_full_mask=False,
         ).commit(accept, logits_output=None)
