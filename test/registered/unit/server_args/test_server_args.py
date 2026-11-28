@@ -3554,13 +3554,10 @@ class TestInt8KvCacheCompatibility(CustomTestCase):
                 self._check(arch="Qwen3ForCausalLM")
             self._check()
 
-    def test_the_reader_rope_width_and_compute_dtype_are_required(self):
-        """The sparse attention reading the INT8 record takes a 64-wide RoPE
-        and a BF16 query: a NoPE DSA model or an FP16 run fails at startup,
-        not on the first forward."""
+    def test_compute_dtype_is_required(self):
         with override_platform(is_npu=True):
-            with self.assertRaisesRegex(ValueError, "qk_rope_head_dim=0"):
-                self._check(arch="Glm5NextForConditionalGeneration", qk_rope_head_dim=0)
+            self._check(arch="Glm5NextForConditionalGeneration", qk_rope_head_dim=0)
+            self._check(qk_rope_head_dim=32)
             with self.assertRaisesRegex(ValueError, "bfloat16 model dtype"):
                 self._check(dtype=torch.float16)
 

@@ -1055,17 +1055,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
-        if host_pool_name == PoolName.DRAFT:
-            self.registered_pools[host_pool_name] = host_pool
-            super().register_buffer(host_pool.kv_buffer)
-            return
-
         # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
+        if host_pool_name == PoolName.DRAFT and not isinstance(
+            host_pool, MLATokenToKVPoolHost
+        ):
+            # MHA draft K and V are views of the same allocation.
+            super().register_buffer(host_pool.kv_buffer)
+            return
 
-        # Non-anchor pools are either sidecar-specific pools with their own
-        # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
             super().register_buffer(buf)
 

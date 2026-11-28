@@ -15,7 +15,8 @@ from sglang.srt.mem_cache.kv_cache_dtype import (
     QUANT_MODE_TOKEN_INT8,
     resolve_indexer_quant_mode,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel, override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -105,8 +106,12 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
             (None, torch.bfloat16, 1, 256),
             (None, torch.bfloat16, 4, 64),
             ("int8", torch.bfloat16, 1, 130),
+            (None, torch.int8, 1, 130),
+            (None, torch.int8, 4, 33),
+            ("int8", torch.bfloat16, 4, 33),
             (None, torch.float8_e4m3fn, 1, 132),
-        ]
+            (None, torch.float8_e4m3fn, 4, 33),
+        ]  # (indexer_kv_cache_dtype, kv_cache_dtype, index_kpool, expected bytes/token/layer)
         for indexer_dtype, kv_dtype, kpool, expected in cases:
             with self.subTest(
                 indexer_dtype=indexer_dtype, kv_dtype=kv_dtype, kpool=kpool
@@ -154,19 +159,21 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
     """--indexer-kv-cache-dtype=int8 may replace only the BF16 indexer cache."""
 
     def _build_pool(
-        self, dtype, kv_cache_dim=None, indexer_quant_mode=None, hierarchical=False
+        self,
+        dtype,
+        kv_cache_dim=None,
+        indexer_quant_mode=None,
+        hierarchical=False,
+        index_kpool=1,
     ):
         with (
             get_context().override_server_args(enable_hierarchical_cache=hierarchical),
-            patch.object(
-                memory_pool_npu,
-                "get_parallel",
-                return_value=SimpleNamespace(attn_dcp_size=1, attn_dcp_rank=0),
-            ),
+            get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0),
         ):
+            page_size = 128 * index_kpool
             return memory_pool_npu.NPUMLATokenToKVPool(
-                256,
-                page_size=128,
+                2 * page_size,
+                page_size=page_size,
                 dtype=dtype,
                 kv_lora_rank=512,
                 qk_rope_head_dim=64,
@@ -176,27 +183,38 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 index_head_dim=128,
                 kv_cache_dim=kv_cache_dim,
                 indexer_quant_mode=indexer_quant_mode,
+                index_kpool=index_kpool,
+                index_kpool_compress=index_kpool > 1,
+                max_running_requests=4 if index_kpool > 1 else None,
             )
 
-    def test_int8_mode_rejects_hierarchical_cache_in_server_args(self):
+    def test_int8_mode_supports_hierarchical_cache_in_server_args(self):
         from sglang.srt.arg_groups import kv_cache_hook
 
-        cfg = SimpleNamespace(
-            indexer_kv_cache_dtype="int8", enable_hierarchical_cache=True
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="int8",
+            indexer_kv_cache_dtype="int8",
+            enable_hierarchical_cache=True,
         )
         with (
-            patch.object(kv_cache_hook, "resolving_view", return_value=cfg),
-            self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"),
+            override_platform(is_npu=True),
+            patch.object(
+                kv_cache_hook,
+                "model_config_of",
+                return_value=SimpleNamespace(index_head_dim=128),
+            ),
         ):
-            kv_cache_hook.handle_indexer_kv_cache_compatibility(object())
+            kv_cache_hook.handle_indexer_kv_cache_compatibility(args)
 
-    def test_int8_mode_rejects_hierarchical_cache_in_pool(self):
-        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
-            self._build_pool(
-                torch.bfloat16,
-                indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
-                hierarchical=True,
-            )
+    def test_int8_mode_supports_hierarchical_cache_in_pool(self):
+        pool = self._build_pool(
+            torch.bfloat16,
+            indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
+            hierarchical=True,
+        )
+        self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
 
     def test_int8_mode_swaps_only_the_bf16_indexer_cache(self):
         fp8_kv_cache_dim = 512 + 512 // 128 * 4 + 64 * 2
@@ -231,6 +249,40 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 scale = pool.index_k_scale_buffer
                 self.assertEqual(pool.index_k_buffer.dtype, key_dtype)
                 self.assertEqual(None if scale is None else scale.dtype, scale_dtype)
+
+    def test_int8_mode_with_kpool_stores_int8_pooled_keys(self):
+        pool = self._build_pool(
+            torch.int8,
+            kv_cache_dim=512 + 512 // 128 * 4 + 64 * 2,
+            index_kpool=4,
+        )
+        self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
+        self.assertEqual(pool.index_page_size, 128)
+        self.assertEqual(
+            pool.index_k_scale_buffer.shape,
+            (*pool.index_k_buffer.shape[:-2], 1),
+        )
+
+    def test_kpool_bf16_accepts_int8_indexer_recipe(self):
+        pool = self._build_pool(
+            torch.bfloat16,
+            indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
+            index_kpool=4,
+        )
+        self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
+
+    def test_int8_main_defaults_lightning_indexer_to_int8(self):
+        for hierarchical in (False, True):
+            with self.subTest(hierarchical=hierarchical):
+                pool = self._build_pool(
+                    torch.int8,
+                    kv_cache_dim=512 + 512 // 128 * 4 + 64 * 2,
+                    hierarchical=hierarchical,
+                )
+                self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+                self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
 
     def test_resolve_indexer_quant_mode(self):
         self.assertIsNone(resolve_indexer_quant_mode(None, torch.bfloat16))

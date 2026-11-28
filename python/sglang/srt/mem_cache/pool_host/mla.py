@@ -240,6 +240,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                             * index_layers
                             // index_compress_ratio
                         )
+                    if native.index_k.dtype == torch.int8:
+                        self.storage_format_tag = (
+                            f"npu-index-int8-kpool{index_compress_ratio}"
+                        )
                 self.device_kv_buffers = ()
                 self.device_data_ptrs = None
             else:
@@ -373,6 +377,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             return super().get_mapping_lengths()
         native = self._native_buffers
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
+        v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
         lengths = [
             self.page_num
             * self.page_size
@@ -382,7 +387,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.page_num
             * self.page_size
             * self.layer_num
-            * self.qk_rope_head_dim
+            * v_width
             * self._v_dtype.itemsize,
         ]
         index_layers = len(native.index_layer_indices)
@@ -453,7 +458,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             indexer_dims = (
                 len(native.index_layer_indices),
                 self.page_num,
-                self.page_size,
+                native.index_k.shape[2]
+                if native.index_k is not None
+                else self.page_size,
                 1,
             )
             return self._init_kv_split_buffer(
@@ -1315,7 +1322,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             scale_buffer_data_ptr = (
                 scale_buffer.data_ptr() if scale_buffer is not None else None
             )
-            # k row width mirrors the device pool (packed dim for FP8 DSA).
+            # k row width mirrors the device pool (packed dim for DSA).
             k_width = self.k_buffer.shape[-1]
             k_item_size = self.k_buffer.element_size()
             # Indexer buffers cover only physical Indexer layers, which can be

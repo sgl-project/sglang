@@ -48,16 +48,19 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
     return (_create_hadamard_128_cpu().to(device=device) / (128**0.5)).contiguous()
 
 
-def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
+def _quantize_npu_indexer_activation(
+    x, hadamard, dst_type, scale_type, *, kpool_query=False
+):
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
             torch.empty_like(x, dtype=dst_type),
             torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
         )
-    rotated = x @ hadamard
+    if not (kpool_query and dst_type == torch.int8):
+        x = x @ hadamard
     quantized, scale = torch_npu.npu_dynamic_quant(
-        rotated.reshape(-1, 128), dst_type=dst_type
+        x.reshape(-1, 128), dst_type=dst_type
     )
     return quantized.reshape(x.shape), scale.to(scale_type).reshape(x.shape[:-1])
 

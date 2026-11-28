@@ -2047,6 +2047,30 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv,
     ):
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
+        actual_seq_qlen = actual_seq_qlen.to(device=q_nope.device, dtype=torch.int32)
+        actual_seq_lengths_kv = actual_seq_lengths_kv.to(
+            device=q_nope.device, dtype=torch.int32
+        )
+
+        if self.qk_rope_head_dim == 0:
+            from sgl_kernel_npu.operators.attention import (
+                kv_quant_sparse_flash_attention,
+            )
+
+            if packed_kv.dtype == torch.float8_e4m3fn:
+                packed_kv = packed_kv.view(torch.uint8)
+            return kv_quant_sparse_flash_attention(
+                query=q_nope,
+                query_rope=q_pe,
+                packed_kv=packed_kv,
+                sparse_indices=topk_indices,
+                block_table=self.forward_metadata.block_tables,
+                actual_seq_lengths_query=actual_seq_qlen,
+                actual_seq_lengths_kv=actual_seq_lengths_kv,
+                scale_value=layer.scaling,
+                return_softmax_lse=False,
+            )[0]
+
         # A packed pool hands back its K buffer in the record's one-byte dtype.
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
@@ -2058,12 +2082,8 @@ class AscendAttnBackend(AttentionBackend):
             value_quant_mode=2,
             key_dequant_scale=None,
             value_dequant_scale=None,
-            actual_seq_lengths_query=actual_seq_qlen.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
-            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                device=q_nope.device, dtype=torch.int32
-            ),
+            actual_seq_lengths_query=actual_seq_qlen,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
             block_table=self.forward_metadata.block_tables,
             sparse_block_size=1,
             layout_query="TND",
@@ -2192,20 +2212,17 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        # SFA's MLA interface requires a fixed 64-dimensional query_rope even
-        # for models without RoPE.
-        if self.qk_rope_head_dim == 0 and is_npu_arch35():
-            k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
-            q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
-        elif self.qk_rope_head_dim == 0:
-            k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
-            q_pe = q_nope.new_zeros(
-                (
-                    q.shape[0],
-                    layer.tp_q_head_num,
-                    64,
-                )
-            )
+        # Non-packed SFA requires 64-dimensional RoPE for NoPE.
+        if (
+            self.qk_rope_head_dim == 0
+            and not self.token_to_kv_pool.dsa_kv_cache_store_fp8
+        ):
+            if is_npu_arch35():
+                k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
+                q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
+            else:
+                k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
+                q_pe = q_nope.new_zeros((q.shape[0], layer.tp_q_head_num, 64))
 
         # The token shard replaces the query lengths, built once per forward.
         dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)

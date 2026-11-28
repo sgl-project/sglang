@@ -25,9 +25,6 @@ from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
 
-# RoPE width npu_kv_quant_sparse_flash_attention reads from the packed record.
-_INT8_KV_ROPE_HEAD_DIM = 64
-
 _NVFP4_PREFILL_BACKEND = {
     "fp8_e4m3": "flashinfer",
     "nvfp4": "trtllm_mha",
@@ -186,16 +183,6 @@ def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
             f"{hf_config.architectures[0]} is not a DSA model. Use "
             "--kv-cache-dtype bf16 or auto."
         )
-    # The kernel reading the INT8 record takes a 64-wide RoPE; the record keeps
-    # its RoPE in BF16 and the reader asserts a BF16 query next to it.
-    if model_config.qk_rope_head_dim != _INT8_KV_ROPE_HEAD_DIM:
-        raise ValueError(
-            "--kv-cache-dtype int8 needs a DSA model with qk_rope_head_dim="
-            f"{_INT8_KV_ROPE_HEAD_DIM}, which is what the sparse attention "
-            "reading the packed record supports; this model has "
-            f"qk_rope_head_dim={model_config.qk_rope_head_dim}. Use "
-            "--kv-cache-dtype bf16 or auto."
-        )
     if model_config.dtype != torch.bfloat16:
         raise ValueError(
             "--kv-cache-dtype int8 needs a bfloat16 model dtype: the packed "
@@ -203,9 +190,6 @@ def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
             f"{model_config.dtype}. Use --dtype bfloat16, or --kv-cache-dtype "
             "bf16 or auto."
         )
-    # SGLANG_NPU_USE_MLAPO needs no check here: MLAProlog writes the INT8
-    # record from dynamic INT8 projections, and NPUFusedMLAPreprocess rejects
-    # other projection weights once they are loaded, as it does for FP8.
 
 
 def handle_kv4_compatibility(server_args: Any) -> None:
@@ -429,13 +413,6 @@ def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
 
     if cfg.indexer_kv_cache_dtype is None:
         return
-
-    if cfg.enable_hierarchical_cache:
-        raise ValueError(
-            f"--indexer-kv-cache-dtype={cfg.indexer_kv_cache_dtype} is not "
-            "supported with --enable-hierarchical-cache. Disable hierarchical "
-            "cache or use the default BF16 indexer cache."
-        )
 
     if not get_platform().is_npu:
         raise RuntimeError(

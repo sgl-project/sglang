@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -765,8 +765,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         if use_fp4_indexer:
             raise ValueError("FP4 indexer KV cache is not supported on NPU.")
-        if index_kpool > 1 and indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
-            raise ValueError("INT8 indexer KV cache is not supported with NPU KPool.")
         self.kv_scale_ue8m0 = kv_scale_ue8m0
         self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
         assert index_kpool <= 1 or self.kpool_use_compress, (
@@ -851,17 +849,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_cache_dim = kv_cache_dim if self.dsa_kv_cache_store_c8 else kv_lora_rank
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_c8 else qk_rope_head_dim
 
-        # --indexer-kv-cache-dtype=int8 opts into the INT8 indexer K cache
-        if (
-            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
-            and get_memory().enable_hierarchical_cache
-        ):
-            raise ValueError(
-                "--indexer-kv-cache-dtype=int8 is not supported with "
-                "--enable-hierarchical-cache"
-            )
-        # The recipe applies wherever the main KV does not already quantize the
-        # indexer: the arch35 FP8 record does, the INT8 record does not.
+        if dtype == torch.int8 and indexer_quant_mode is None:
+            indexer_quant_mode = QUANT_MODE_TOKEN_INT8
         self.indexer_kv_store_int8 = (
             indexer_quant_mode == QUANT_MODE_TOKEN_INT8
             and index_head_dim is not None

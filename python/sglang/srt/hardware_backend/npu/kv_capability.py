@@ -95,8 +95,7 @@ def resolve_kv_capability(
             kv_cache_dtype=kv_cache_dtype,
             main_kv_packed=True,
             main_kv_scale_dtype=torch.float32,
-            # The record does not quantize the indexer: its K cache stays BF16
-            # unless --indexer-kv-cache-dtype int8 selects the INT8 recipe.
+            # Indexer quantization is selected separately by the NPU pool.
             indexer_quant=False,
             indexer_kv_dtype=torch.bfloat16,
             indexer_scale_dtype=None,
