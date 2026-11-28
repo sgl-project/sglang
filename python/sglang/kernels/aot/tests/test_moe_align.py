@@ -143,11 +143,11 @@ def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
 
 
-@pytest.mark.parametrize("topk", [2, 3, 4])
+@pytest.mark.parametrize("topk", [2, 6])
 @pytest.mark.parametrize("strided", ["input", "output"])
 @pytest.mark.skipif(_is_hip, reason="Skip for AMD GPU")
 def test_moe_sum_rejects_non_contiguous(topk: int, strided: str):
-    # Slices of wider buffers, e.g. base[..., :k] (#53583).
+    # Slices of wider buffers, e.g. base[..., :k].
     m, k, padded_k = 4, 64, 96
     dtype = torch.bfloat16
     if strided == "input":
