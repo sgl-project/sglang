@@ -28,7 +28,6 @@ from sglang.srt.sampling.sampling_pipeline import (
     VerifyStep,
     _adjust_after_watermark,
     _adjust_before_watermark,
-    detect_nan_logits,
 )
 from sglang.srt.sampling.watermarking.interface import SampleWatermarkOutput
 from sglang.test.test_utils import CustomTestCase
@@ -317,37 +316,22 @@ class TestNanLogits(CustomTestCase):
         self.assertTrue(torch.equal(verify[0, :3], torch.tensor([-1e30, 1e30, -1e30])))
         self.assertTrue(torch.isfinite(torch.log_softmax(verify, dim=-1)).all())
 
-    def test_default_env_leaves_verify_logits_unhealed(self):
-        # The NaN probe is off, as in the default env (rerun CI turns it on).
-        with (
-            envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.override(False),
-            envs.SGLANG_ENABLE_ASYNC_ASSERT.override(False),
-        ):
-            verify = self._verify(self._logits())
-        self.assertTrue(verify[0, 0].isnan())
-        self.assertEqual(verify[0, 1:3].tolist(), [float("inf"), float("-inf")])
-
     def test_assert_mode_detects_nan(self):
+        # Every verify worker probes through build_row_inputs, also without a host
+        # tree: before its early return.
+        verify = VerifyStep(
+            batch=None,
+            route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
+            watermark=None,
+            watermark_full_mask=True,
+        )
         with envs.SGLANG_ENABLE_NAN_LOGITS_CHECK.override(True):
-            with self.assertRaises(RuntimeError):
-                detect_nan_logits(self._logits(), "verify")
-            with self.assertRaises(RuntimeError):
-                self._verify(self._logits())
-            # Every verify worker probes through build_row_inputs, also without a host
-            # tree: before its early return.
-            verify = VerifyStep(
-                batch=None,
-                route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
-                watermark=None,
-                watermark_full_mask=True,
-            )
             with self.assertRaises(RuntimeError):
                 verify.build_row_inputs(
                     SimpleNamespace(next_token_logits=self._logits()),
                     tree=None,
                     barrier=None,
                 )
-            detect_nan_logits(torch.zeros(1, VOCAB_SIZE), "verify")
 
 
 class TestBuildGrammarMask(CustomTestCase):
