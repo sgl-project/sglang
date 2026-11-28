@@ -266,11 +266,47 @@ def _update_and_read_residual_aiter_fp8_per_token(
     )
 
 
+def _update_and_read_residual_npu_mxfp8(
+    norm, hidden_states, residual, post_residual_addition
+):
+    """Ascend 950 fused (add +) RMSNorm + dynamic MXFP8 quantization."""
+    if hidden_states.dtype != torch.bfloat16 or (
+        isinstance(norm, GemmaRMSNorm)
+        and envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.get()
+    ):
+        return _update_and_read_residual_plain(
+            norm, hidden_states, residual, post_residual_addition
+        )
+    weight = norm.gemma_weight if isinstance(norm, GemmaRMSNorm) else norm.weight
+    if weight.dtype != hidden_states.dtype:
+        weight = weight.to(hidden_states.dtype)
+    if residual is None:
+        qx, xs, _ = torch.ops.npu.npu_rms_norm_dynamic_mx_quant(
+            hidden_states,
+            weight,
+            epsilon=norm.variance_epsilon,
+            dst_type=torch.float8_e4m3fn,
+        )
+        return (qx, xs), hidden_states
+    if post_residual_addition is not None:
+        residual = residual + post_residual_addition
+    qx, residual_out, xs, _ = torch.ops.npu.npu_add_rms_norm_dynamic_mx_quant(
+        residual,
+        hidden_states,
+        weight,
+        epsilon=norm.variance_epsilon,
+        dst_type=torch.float8_e4m3fn,
+    )
+    return (qx, xs), residual_out
+
+
 def _norm_quant_kernel(quant_format: str):
     """Add the previous layer's output to the residual and read the attention
     input from it: the input norm, fused with the quantization this format
     wants. Without a residual (the first layer, or one already folded into
     hidden_states) the input itself becomes the residual."""
+    if quant_format == "npu_mxfp8":
+        return _update_and_read_residual_npu_mxfp8
     if _use_aiter and _is_gfx95_supported and "mxfp4" in quant_format:
         return _update_and_read_residual_aiter_mxfp4
     if _use_aiter and _is_gfx95_supported and quant_format == "fp8":

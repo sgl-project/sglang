@@ -157,7 +157,8 @@ def _layout_npu_arch35_e4m3_weights(
 
     # Layout mirrors _layout_npu_arch35_ue8m0_weights: weight [in, out] and
     # scale [in//64, out, 2] as strided transpose views — DO NOT call
-    # .contiguous() (the Ascend 950 kernel scans the row-major source K-major).
+    # .contiguous(). Cold-L2 HBM profiling on Ascend 950PR confirms strided
+    # views are faster on both large prefill (-31ms at c=16) and decode.
     layer.weight.data = qw.transpose(0, 1)
     if w_scale.dim() == 2:
         # Older torch_npu builds return [out, in//32]; reshape to 3D.

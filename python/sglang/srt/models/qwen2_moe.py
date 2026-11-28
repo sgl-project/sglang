@@ -225,6 +225,27 @@ class Qwen2MoeMLP(nn.Module):
         # Lazily derived after weight load (input_scale_inv does not exist yet
         # at construction time); the fused kernel requires a 1-D global scale.
         self._down_input_scale_inv_1d = None
+        self._enable_npu_swiglu_mx_quant = None
+
+    def _can_run_npu_swiglu_mx_quant(self, gate_up: torch.Tensor) -> bool:
+        if not _is_npu or gate_up.ndim != 2 or gate_up.dtype != torch.bfloat16:
+            return False
+        # LoRA wrappers expect floating-point activations rather than (qx, xs) tuples.
+        if hasattr(self.down_proj, "base_layer"):
+            return False
+        if self._enable_npu_swiglu_mx_quant is None:
+            enabled = False
+            if envs.SGLANG_NPU_ENABLE_MXFP8_FUSION.get() and hasattr(
+                getattr(torch.ops, "npu", None), "npu_swiglu_mx_quant"
+            ):
+                qm = getattr(self.down_proj, "quant_method", None)
+                w8a8_fn = getattr(qm, "w8a8_block_fp8_linear", None)
+                if getattr(w8a8_fn, "__name__", "") == "npu_w8a8_mxfp8_linear":
+                    enabled = True
+                elif qm is not None and qm.__class__.__name__ == "NPUMXFP8LinearMethod":
+                    enabled = True
+            self._enable_npu_swiglu_mx_quant = enabled
+        return self._enable_npu_swiglu_mx_quant
 
     def forward(
         self,
@@ -233,6 +254,15 @@ class Qwen2MoeMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         if can_run_silu_fp4_quant_fusion(self, gate_up):
             x, _ = self.down_proj(silu_and_mul_fp4_quant(self, gate_up))
+            return x
+        if self._can_run_npu_swiglu_mx_quant(gate_up):
+            qx, xs = torch.ops.npu.npu_swiglu_mx_quant(
+                gate_up,
+                activate_dim=-1,
+                activate_left=True,
+                dst_type=torch.float8_e4m3fn,
+            )
+            x, _ = self.down_proj((qx, xs))
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
