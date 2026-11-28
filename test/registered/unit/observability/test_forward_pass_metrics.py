@@ -550,6 +550,45 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertEqual(metric.queued_requests.num_prefill_requests, 2)
         self.assertEqual(metric.queued_requests.sum_prefill_tokens, 384)
 
+    def test_decode_batch_viewed_as_extend_is_reported_as_decode(self):
+        """When DP attention runs a decode step as 1-token extends,
+        it must report as that plain decode step, not as prefill requests."""
+        reqs = [
+            FakeReq(
+                origin_input_ids=list(range(num_prompt_tokens)),
+                refresh_fill_ids=lambda: None,
+            )
+            for num_prompt_tokens in (8, 20)
+        ]
+        batch = ScheduleBatch(reqs=reqs, forward_mode=ForwardMode.DECODE)
+        batch.seq_lens_cpu = torch.tensor([11, 25])
+        self._emit_ready(batch)
+        batch.convert_decode_to_extend()
+        # The overlap loop reports a step from its copy.
+        self._emit_ready(batch.copy())
+
+        as_decode, as_extend = (
+            metrics.scheduled_requests
+            for metrics in self.scheduler._fpm_publisher.metrics
+        )
+        self.assertEqual(as_decode.num_decode_requests, 2)
+        self.assertEqual(as_decode.sum_decode_kv_tokens, 36)
+        self.assertEqual(as_extend, as_decode)
+
+    def test_prefill_batch_in_extend_mode_is_reported_as_prefill(self):
+        # The same mode without decoding requests is real prefill work.
+        batch = self._make_batch(
+            forward_mode=ForwardMode.EXTEND,
+            reqs=[_FakeReq(10), _FakeReq(14)],
+            decoding_reqs=None,
+            prefix_lens=[2, 3],
+        )
+        self._emit_ready(batch)
+        scheduled = self.scheduler._fpm_publisher.metrics[0].scheduled_requests
+        self.assertEqual(scheduled.num_prefill_requests, 2)
+        self.assertEqual(scheduled.sum_prefill_kv_tokens, 5)
+        self.assertEqual(scheduled.num_decode_requests, 0)
+
     def test_scheduler_state_controls_heartbeat_with_metrics_disabled(self):
         self.reporter.record_scheduler_active(event_ns=0)
         self.assertFalse(self.scheduler._fpm_publisher.idle)
