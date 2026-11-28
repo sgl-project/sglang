@@ -17,6 +17,7 @@ from sglang.multimodal_gen.configs.minimax_h3_metadata import (
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_pipeline import (
     FastH3Pipeline,
     MiniMaxH3Pipeline,
+    PiH3Pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines.minimax_h3_vdn_pipeline import (
     VDNH3Pipeline,
@@ -133,6 +134,24 @@ class TestMiniMaxH3Metadata(CustomTestCase):
                                 ):
                                     obj._load_config()
                                 download.assert_not_called()
+
+    def test_overlay_partition_defers_validation_to_materialized_index(self):
+        # pi-H3's variant folders exist only once its overlay is materialized,
+        # so the preflight must not fetch them from the source repo.
+        obj = pipeline("Lakonik/pi-H3", variant="2step", cls=PiH3Pipeline)
+        with (
+            patch(f"{H3}.hf_hub_download") as fetch,
+            patch(f"{H3}.snapshot_download") as snapshot,
+            patch(
+                f"{BASE}.maybe_download_model",
+                side_effect=RuntimeError("materialize overlay"),
+            ) as download,
+            self.assertRaisesRegex(RuntimeError, "materialize overlay"),
+        ):
+            obj._load_config()
+        fetch.assert_not_called()
+        snapshot.assert_not_called()
+        self.assertTrue(download.call_args.kwargs["force_diffusers_model"])
 
     def test_parser_rejects_invalid_scales_before_float_coercion(self):
         for modality in ("video", "audio"):

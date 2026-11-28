@@ -61,6 +61,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.model_overlay import (
+    is_model_overlay,
     maybe_load_overlay_model_index,
 )
 
@@ -139,9 +140,9 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             ) from exc
 
     def _preflight_model_config(self, model_subfolder: str | None) -> None:
-        # The base loader resolves overlays only for root-level pipelines.
-        # FastH3/VDN-H3 source repos obtain their index from overlay metadata,
-        # which can be fetched without downloading or materializing weights.
+        # FastH3/VDN-H3 source repos obtain their root index from overlay
+        # metadata, which can be fetched without downloading or materializing
+        # weights.
         if model_subfolder is None:
             model_index = maybe_load_overlay_model_index(
                 self.model_path,
@@ -151,6 +152,10 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
             if model_index is not None:
                 validate_minimax_h3_sigma_shift_scales(model_index)
                 return
+        elif is_model_overlay(self.model_path):
+            # An overlay partition's index (e.g. pi-H3's 2step) exists only
+            # after materialization; its release metadata validates it there.
+            return
         filename = (
             f"{model_subfolder}/model_index.json"
             if model_subfolder is not None
