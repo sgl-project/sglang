@@ -42,7 +42,13 @@ def pull_files_from_db(
 ) -> None:
     prefix = f"{model_name}/files/"
     local_dir = connector.get_local_dir()
-    files = connector.list(prefix)
+    files = [
+        file
+        for file in connector.list(prefix)
+        if (rel := file.removeprefix(prefix).lstrip("/"))
+        and (allow_pattern is None or bool(filter_allow([rel], allow_pattern)))
+        and (ignore_pattern is None or bool(filter_ignore([rel], ignore_pattern)))
+    ]
 
     for file in files:
         destination_file = os.path.join(local_dir, file.removeprefix(prefix))
