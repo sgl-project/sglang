@@ -14,7 +14,23 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#ifdef USE_ROCM
+#include <hip/hip_fp8.h>
+// gfx942 stores fp8 as FNUZ; gfx950/CUDA use OCP E4M3. hipcc defines
+// HIP_FP8_TYPE_FNUZ per target, so pick the encoding from it rather than
+// hardcoding one and silently changing the numerics on the other arch.
+#if defined(HIP_FP8_TYPE_FNUZ) && HIP_FP8_TYPE_FNUZ
+#define SGL_FP8_E4M3_INTERP __HIP_E4M3_FNUZ
+#else
+#define SGL_FP8_E4M3_INTERP __HIP_E4M3
+#endif
+#define __nv_fp8x2_storage_t __hip_fp8x2_storage_t
+#define __nv_cvt_float2_to_fp8x2(v, sat, interp) __hip_cvt_float2_to_fp8x2(v, sat, interp)
+#define __NV_SATFINITE __HIP_SATFINITE
+#define __NV_E4M3 SGL_FP8_E4M3_INTERP
+#else
 #include <cuda_fp8.h>
+#endif
 #include <type_traits>
 
 namespace sglang {
@@ -82,8 +98,13 @@ struct DtypeInfo<int8_t> {
 };
 template <>
 struct DtypeInfo<fp8_e4m3_t> {
-  static constexpr float MIN = -448;
-  static constexpr float MAX = 448;
+  // 448 is the e4m3fn max; gfx942 stores e4m3fnuz, which tops out at
+  // 224. Clamping to 448 pushed a quarter of the range past what the format can
+  // hold, and __HIP_SATFINITE then folded it onto 240 -- sgl_kernel/type.cuh already
+  // carries the arch-aware value, so use it (calculate_fp8_scales reads the same
+  // trait, so the scale divisor is fixed along with the clamp).
+  static constexpr float MIN = -::sglang::kFP8E4M3Max;
+  static constexpr float MAX = ::sglang::kFP8E4M3Max;
 };
 
 template <bool ROUND_SCALE, typename dtype_info>
@@ -329,7 +350,16 @@ __global__ void per_token_group_quant_8bit_v2_kernel(
             float2 outputx2 = fmul2_rn(inputx2, y_scale_repeated);
             outputx2.x = fminf(fmaxf(outputx2.x, dst_dtype_info::MIN), dst_dtype_info::MAX);
             outputx2.y = fminf(fmaxf(outputx2.y, dst_dtype_info::MIN), dst_dtype_info::MAX);
-            output_buf_ptr[j / 2] = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+            auto packed_fp8x2 = __nv_cvt_float2_to_fp8x2(outputx2, __NV_SATFINITE, __NV_E4M3);
+#ifdef USE_ROCM
+            // e4m3fnuz has no negative zero -- 0x80 is its NaN. The HIP
+            // conversion still emits that pattern for negative inputs that round to
+            // zero, so ~7% of a normal activation tensor came back NaN. Flush both
+            // lanes to +0.
+            if ((packed_fp8x2 & 0x00FFu) == 0x0080u) packed_fp8x2 &= 0xFF00u;
+            if ((packed_fp8x2 & 0xFF00u) == 0x8000u) packed_fp8x2 &= 0x00FFu;
+#endif
+            output_buf_ptr[j / 2] = packed_fp8x2;
           }
         } else {
           const auto output_buf_ptr = reinterpret_cast<DST_DTYPE*>(&output_buf);

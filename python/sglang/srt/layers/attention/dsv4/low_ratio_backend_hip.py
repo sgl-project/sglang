@@ -191,6 +191,20 @@ def _indexer_inputs(layer, x, q_lora, pos):
     return q_fp4, q_scale, weights
 
 
+@functools.lru_cache(maxsize=1)
+def _use_triton_mqa_logits() -> bool:
+    arch = torch.cuda.get_device_properties(0).gcnArchName
+    return arch.startswith("gfx942")
+
+
+def _indexer_inputs_bf16(layer, x, q_lora, pos):
+    """Logical bf16 query and pre-scaled head weights for the gfx942 scorer."""
+    indexer = layer.indexer
+    assert indexer.n_local_heads == indexer.n_heads
+    q = indexer.queries(q_lora, layer.freqs_cis, positions=pos)
+    return q, _indexer_head_weights(indexer, x)
+
+
 def build_low_ratio_decode_workspaces(
     metadata_by_ratio: Dict[int, PagedIndexerMetadata],
     *,
@@ -396,52 +410,131 @@ def low_ratio_index_topk_hip_decode(
             backend.candidate_masks = None
         two_level = False
 
-    q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
-    k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
-    k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
-    page8 = pool.low_ratio_index_k_page8(layer.layer_id)
-    if two_level and indexer.uses_candidates:
-        candidates = backend.candidate_masks
-        assert (
-            isinstance(candidates, CandidateBlocks)
-            and candidates.ids.shape[0] == q_fp4.shape[0]
-            and candidates.block_size == indexer.candidate_block_size
-        ), "candidate blocks missing for decode"
-        if page8:
-            topk_within_candidate_blocks_page8(
-                q_fp4=q_fp4,
-                q_scale=q_scale,
+    if _use_triton_mqa_logits():
+        # gfx942: the Triton scorer reads the plain (non page-8) index-K layout
+        assert not pool.low_ratio_index_k_page8(layer.layer_id)
+        page8 = False
+        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+            _guard_page_table,
+        )
+        from sglang.kernels.ops.attention.dsv4.triton_mqa_logits_gfx942 import (
+            triton_paged_mqa_logits,
+        )
+
+        q_bf16, weights = _indexer_inputs_bf16(layer, x, q_lora, pos)
+        workspace = metadata.fp4_low_ratio_decode_workspaces.get(ratio)
+        if (
+            workspace is not None
+            and workspace.guarded_page_table.shape[0] == q_bf16.shape[0]
+        ):
+            page_table = workspace.guarded_page_table
+            max_seq_len = workspace.max_seq_len
+        else:
+            page_table, max_seq_len = _guard_page_table(
+                indexer_metadata.page_table,
+                page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            )
+        if two_level and indexer.uses_candidates:
+            from sglang.kernels.ops.attention.dsv4.candidate_blocks_hip import (
+                topk_compact_candidate_rows,
+            )
+            from sglang.kernels.ops.attention.dsv4.triton_mqa_logits_gfx942 import (
+                triton_candidate_mqa_logits,
+            )
+
+            candidates = backend.candidate_masks
+            assert (
+                isinstance(candidates, CandidateBlocks)
+                and candidates.ids.shape[0] == q_bf16.shape[0]
+                and candidates.block_size == indexer.candidate_block_size
+            ), "candidate blocks missing for decode"
+            # score only the candidate positions: the compact row gather_candidate_blocks
+            # would cut from full-context logits, bit for bit
+            compact = triton_candidate_mqa_logits(
+                q=q_bf16,
                 weights=weights,
-                k_payload=k_payload,
-                k_scale=k_scale,
-                candidates=candidates,
-                seq_lens=indexer_metadata.compressed_seq_lens,
+                k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
+                k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+                page_table=page_table,
+                c4_seq_lens=indexer_metadata.compressed_seq_lens,
+                ids=candidates.ids,
+                block_size=candidates.block_size,
+                page_size=indexer_metadata.compressed_page_size,
+            )
+            topk_compact_candidate_rows(
+                compact,
+                candidates.compact_lens,
+                candidates.ids,
+                candidates,
+                indexer_metadata.compressed_seq_lens,
                 page_table=indexer_metadata.page_table,
                 page_size=indexer_metadata.compressed_page_size,
                 page_indices=core.sparse_page_indices(ratio),
                 raw_indices=core.sparse_raw_indices(ratio),
-                is_decode=True,
             )
             return
-    logits = aiter_fp4_paged_mqa_logits(
-        q_fp4=q_fp4,
-        q_scale=q_scale,
-        k_payload=k_payload,
-        k_scale=k_scale,
-        weights=weights,
-        page_table=indexer_metadata.page_table,
-        c4_seq_lens=indexer_metadata.compressed_seq_lens,
-        weight_scale=1.0,
-        page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
-        is_decode=True,
-        decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
-        page8=page8,
-        rowgroup_table_columns=rowgroup_table_columns(
-            backend.max_kv_len,
-            ratio,
-            LOW_RATIO_PAGE_TABLE_BUCKET,
-        ),
-    )
+        logits = triton_paged_mqa_logits(
+            q=q_bf16,
+            weights=weights,
+            k_payload=pool.get_index_k_fp4_payload_buffer(layer.layer_id),
+            k_scale=pool.get_index_k_fp4_scale_buffer(layer.layer_id),
+            page_table=page_table,
+            c4_seq_lens=indexer_metadata.compressed_seq_lens,
+            max_seq_len=max_seq_len,
+            page_size=indexer_metadata.compressed_page_size,
+        )
+        if two_level and indexer.uses_candidates:
+            candidates = backend.candidate_masks
+            assert (
+                isinstance(candidates, CandidateBlocks)
+                and candidates.ids.shape[0] == q_bf16.shape[0]
+                and candidates.block_size == indexer.candidate_block_size
+            ), "candidate blocks missing for decode"
+    else:
+        q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
+        k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
+        k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
+        page8 = pool.low_ratio_index_k_page8(layer.layer_id)
+        if two_level and indexer.uses_candidates:
+            candidates = backend.candidate_masks
+            assert (
+                isinstance(candidates, CandidateBlocks)
+                and candidates.ids.shape[0] == q_fp4.shape[0]
+                and candidates.block_size == indexer.candidate_block_size
+            ), "candidate blocks missing for decode"
+            if page8:
+                topk_within_candidate_blocks_page8(
+                    q_fp4=q_fp4,
+                    q_scale=q_scale,
+                    weights=weights,
+                    k_payload=k_payload,
+                    k_scale=k_scale,
+                    candidates=candidates,
+                    seq_lens=indexer_metadata.compressed_seq_lens,
+                    page_table=indexer_metadata.page_table,
+                    page_size=indexer_metadata.compressed_page_size,
+                    page_indices=core.sparse_page_indices(ratio),
+                    raw_indices=core.sparse_raw_indices(ratio),
+                    is_decode=True,
+                )
+                return
+        logits = aiter_fp4_paged_mqa_logits(
+            q_fp4=q_fp4,
+            q_scale=q_scale,
+            k_payload=k_payload,
+            k_scale=k_scale,
+            weights=weights,
+            page_table=indexer_metadata.page_table,
+            c4_seq_lens=indexer_metadata.compressed_seq_lens,
+            weight_scale=1.0,
+            page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            is_decode=True,
+            decode_workspace=metadata.fp4_low_ratio_decode_workspaces.get(ratio),
+            page8=page8,
+            rowgroup_table_columns=rowgroup_table_columns(
+                backend.max_kv_len, ratio, LOW_RATIO_PAGE_TABLE_BUCKET
+            ),
+        )
     # level one is bounded on device by the compressed lengths: a captured step cannot read them back
     if two_level and indexer.uses_candidates:
         topk_within_candidate_blocks_hip(
@@ -637,7 +730,12 @@ def low_ratio_index_topk_hip_extend(
     assert indexer_metadata is not None, f"no prefill indexer metadata for {ratio = }"
     num_tokens = pos.shape[0]
     assert indexer_metadata.page_table.shape[0] >= num_tokens
-    q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
+    if _use_triton_mqa_logits():
+        q_fp4 = q_scale = None
+        q_bf16, weights = _indexer_inputs_bf16(layer, x, q_lora, pos)
+    else:
+        q_fp4, q_scale, weights = _indexer_inputs(layer, x, q_lora, pos)
+        q_bf16 = None
     k_payload = pool.get_index_k_fp4_payload_buffer(layer.layer_id)
     k_scale = pool.get_index_k_fp4_scale_buffer(layer.layer_id)
     prefill_workspace = metadata.fp4_low_ratio_prefill_workspaces.get(ratio)
@@ -660,6 +758,33 @@ def low_ratio_index_topk_hip_extend(
     def score_rows(
         rows: slice, req_lo: int, rows_per_request: List[int]
     ) -> torch.Tensor:
+        if q_bf16 is not None:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                _alloc_logits,
+                _guard_page_table,
+            )
+            from sglang.kernels.ops.attention.dsv4.triton_mqa_logits_gfx942 import (
+                triton_paged_mqa_logits,
+            )
+
+            page_table, max_seq_len = _guard_page_table(
+                indexer_metadata.page_table[rows],
+                page_table_bucket=LOW_RATIO_PAGE_TABLE_BUCKET,
+            )
+            q_rows = q_bf16[rows]
+            return triton_paged_mqa_logits(
+                q=q_rows,
+                weights=weights[rows],
+                k_payload=k_payload,
+                k_scale=k_scale,
+                page_table=page_table,
+                c4_seq_lens=indexer_metadata.compressed_seq_lens[rows],
+                max_seq_len=max_seq_len,
+                page_size=indexer_metadata.compressed_page_size,
+                out=_alloc_logits(
+                    q_rows.shape[0], max_seq_len, q_rows.device, is_decode=False
+                ),
+            )
         if page8:
             return _score_requests_page8(
                 q_fp4=q_fp4[rows],
@@ -673,6 +798,7 @@ def low_ratio_index_topk_hip_extend(
                 rows_per_request=rows_per_request,
                 row_ends=indexer_metadata.compressed_seq_lens[rows],
             )
+        assert q_fp4 is not None and q_scale is not None
         return aiter_fp4_paged_mqa_logits(
             q_fp4=q_fp4[rows],
             q_scale=q_scale[rows],
