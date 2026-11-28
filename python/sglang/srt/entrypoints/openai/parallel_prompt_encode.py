@@ -30,8 +30,12 @@ segments with their special tokens on their own. Those are the cut points, so
 the prompt is not scanned and no length threshold applies, and the ids of the
 text between them are cached per tokenizer: text that recurs across requests,
 like the system prompt, the tool list and earlier turns, is encoded once.
+Segments of caller text (``OrdinaryText``) are not searched for added tokens:
+the text between two added tokens of the template is encoded with the base
+vocabulary, the way vLLM's GLM-5.3 renderer encodes it.
 
-Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.
+Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS;
+the ``OrdinaryText`` encoding by SGLANG_ENABLE_ORDINARY_TEXT_CONTENT.
 """
 
 import json
@@ -45,6 +49,7 @@ from collections import OrderedDict
 from itertools import chain
 
 from sglang.srt.environ import envs
+from sglang.srt.parser.glm53_chat_template import OrdinaryText
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +322,16 @@ def _cuts_at(token, added_tokens):
     )
 
 
+def _without_added_tokens(backend):
+    """A copy of ``backend`` that encodes added-token spellings with the base
+    vocabulary, like any other text."""
+    from tokenizers import Tokenizer
+
+    config = json.loads(backend.to_str())
+    config["added_tokens"] = []
+    return Tokenizer.from_str(json.dumps(config))
+
+
 class _SegmentEncoder:
     def __init__(self, plan):
         (
@@ -336,6 +351,7 @@ class _SegmentEncoder:
         self.lock = threading.Lock()
         self.cache = OrderedDict()
         self.cached_tokens = 0
+        self.ordinary_backend = None
 
     def cut_id(self, segment):
         token_id = self.raw_ids.get(segment)
@@ -346,7 +362,9 @@ class _SegmentEncoder:
             cuts = self.cuts[segment] = _cuts_at(segment, self.added_tokens)
         return token_id if cuts else None
 
-    def encode(self, segments):
+    def encode(self, segments, ordinary_text=False):
+        if ordinary_text and self.pattern is not None and self.npattern is None:
+            return self._ids(self._ordinary_text_layout(segments), ordinary=True)
         layout, run = [], []
         for segment in segments:
             if len(segment) <= self.max_cut_len:
@@ -361,18 +379,44 @@ class _SegmentEncoder:
                 run.append(segment)
         if run:
             layout.append("".join(run))
+        return self._ids(layout, ordinary=False)
 
+    def _ordinary_text_layout(self, segments):
+        """Template segments are cut at their added tokens, which become ids;
+        ``OrdinaryText`` segments are not searched. The text between two ids,
+        template-written or not, is one run for the base vocabulary."""
+        layout, run = [], []
+        for segment in segments:
+            if isinstance(segment, OrdinaryText):
+                run.append(segment)
+                continue
+            start = 0
+            for match in self.pattern.finditer(segment):
+                run.append(segment[start : match.start()])
+                if any(run):
+                    layout.append("".join(run))
+                run = []
+                layout.append(self.raw_ids[match.group()])
+                start = match.end()
+            run.append(segment[start:])
+        if any(run):
+            layout.append("".join(run))
+        return layout
+
+    def _ids(self, layout, ordinary):
+        """Ids of a layout of texts and token ids; ``ordinary`` texts are
+        encoded with the base vocabulary and cached apart."""
         texts = [item for item in layout if isinstance(item, str)]
         known = {}
         with self.lock:
             for text in texts:
-                ids = self.cache.get(text)
+                ids = self.cache.get((ordinary, text))
                 if ids is not None:
-                    self.cache.move_to_end(text)
+                    self.cache.move_to_end((ordinary, text))
                     known[text] = ids
         missing = list(dict.fromkeys(text for text in texts if text not in known))
         if missing:
-            known.update(self._encode(missing))
+            known.update(self._encode(missing, ordinary))
 
         ids = []
         for item in layout:
@@ -382,18 +426,25 @@ class _SegmentEncoder:
                 ids.append(item)
         return ids
 
-    def _encode(self, texts):
+    def _encode(self, texts, ordinary):
         min_chars = envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+        backend, pattern, npattern = self.backend, self.pattern, self.npattern
+        if ordinary:
+            if self.ordinary_backend is None:
+                self.ordinary_backend = _without_added_tokens(self.backend)
+            # Spellings are not matched in ordinary text, so their ends are not
+            # cut points.
+            backend, pattern, npattern = self.ordinary_backend, None, None
         chunks, counts = [], []
         for text in texts:
             pieces = (
-                split_prompt(text, self.pattern, self.npattern, self.intra)
+                split_prompt(text, pattern, npattern, self.intra)
                 if len(text) >= min_chars
                 else [text]
             )
             chunks.extend(pieces)
             counts.append(len(pieces))
-        encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
+        encodings = backend.encode_batch(chunks, add_special_tokens=False)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
             encoded[text] = tuple(
@@ -403,11 +454,10 @@ class _SegmentEncoder:
 
         with self.lock:
             for text, ids in encoded.items():
-                if (
-                    text not in self.cache
-                    and len(ids) <= _SEGMENT_CACHE_MAX_ENTRY_TOKENS
-                ):
-                    self.cache[text] = ids
+                if (ordinary, text) not in self.cache and len(
+                    ids
+                ) <= _SEGMENT_CACHE_MAX_ENTRY_TOKENS:
+                    self.cache[(ordinary, text)] = ids
                     self.cached_tokens += len(ids)
             while self.cached_tokens > _SEGMENT_CACHE_MAX_TOKENS:
                 self.cached_tokens -= len(self.cache.popitem(last=False)[1])
@@ -429,10 +479,13 @@ def _segment_encoder_for(tokenizer):
 
 def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
     """Drop-in for ``parallel_prompt_encode(tokenizer, "".join(segments),
-    encode_kwargs)``."""
+    encode_kwargs)``, except that ``OrdinaryText`` is encoded as text."""
     encode_kwargs = encode_kwargs or {}
+    ordinary_text = envs.SGLANG_ENABLE_ORDINARY_TEXT_CONTENT.get() and any(
+        isinstance(segment, OrdinaryText) for segment in segments
+    )
     encoder = None
-    if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get() and not (
+    if (envs.SGLANG_PARALLEL_PROMPT_ENCODE.get() or ordinary_text) and not (
         set(encode_kwargs) - {"add_special_tokens"}
     ):
         encoder = _segment_encoder_for(tokenizer)
@@ -444,4 +497,4 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
         or encoder.backend.encode_special_tokens
     ):
         return parallel_prompt_encode(tokenizer, "".join(segments), encode_kwargs)
-    return encoder.encode(segments)
+    return encoder.encode(segments, ordinary_text)
