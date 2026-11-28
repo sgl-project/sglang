@@ -17,13 +17,19 @@ register_npu_ci(est_time=90, suite="nightly-acc-test-4-npu-a5", nightly=True)
 def a5():
     from sgl_kernel_npu.operators.utils.generation import Generation, get_hardware
 
-    from sglang.srt.hardware_backend.npu.attention.mla_preprocess import is_fia_nz
+    from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+        is_fia_nz,
+        is_mla_preprocess_enabled,
+    )
 
     assert get_hardware().generation is Generation.ARCH35
     with pytest.MonkeyPatch.context() as env:
         env.setenv("SGLANG_USE_FIA_NZ", "0")
+        env.setenv("SGLANG_NPU_USE_MLAPO", "0")
+        is_mla_preprocess_enabled.cache_clear()
         is_fia_nz.cache_clear()
         yield torch.device("npu")
+    is_mla_preprocess_enabled.cache_clear()
     is_fia_nz.cache_clear()
 
 
@@ -36,10 +42,12 @@ def test_paged_mla_decode(a5, heads, modelslim):
         AscendAttnBackend,
         ForwardMetadata,
     )
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.layers.quantization.modelslim.schemes import (
         ModelSlimQFP8DynamicKVFP8Scheme,
     )
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.runtime_context import get_parallel
 
     # DeepSeek-V2 MLA uses the pre-absorption QK scale, including YaRN.
     latent, rope, page = 512, 64, 128
@@ -85,8 +93,38 @@ def test_paged_mla_decode(a5, heads, modelslim):
         ref_kv = cache[..., :latent].float()
         operator = "fused_infer_attention_score"
 
-    # Only the model runner's pool and its batch metadata are supplied by the
-    # test. Dispatch, head padding, the registered FIA kernel and cropping run.
+    with get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0):
+        pool = NPUMLATokenToKVPool(
+            size=(cache.shape[0] - 1) * page,  # The pool adds a padding page.
+            page_size=page,
+            dtype=kv.dtype,
+            kv_lora_rank=latent,
+            qk_rope_head_dim=rope,
+            layer_num=1,
+            device=a5.type,
+            enable_memory_saver=False,
+            modelslim_cache_layout=(
+                scheme.get_cache_layout(use_mla_backend=True) if modelslim else None
+            ),
+        )
+    key_buffer = pool.get_key_buffer(layer.layer_id)
+    rope_buffer = pool.get_value_buffer(layer.layer_id)
+    key_buffer.copy_(kv)
+    rope_buffer.copy_(k_rope)
+
+    # Leave the newest token in each request for forward_decode to write.
+    slots = [
+        int(table[i, (length - 1) // page]) * page + (length - 1) % page
+        for i, length in enumerate(lengths)
+    ]
+    for slot in slots:
+        key_buffer.flatten(0, 1)[slot].view(torch.uint8).zero_()
+        rope_buffer.flatten(0, 1)[slot].zero_()
+    current_k, current_rope = (
+        t.contiguous().to(a5)
+        for t in cache.flatten(0, 1)[slots].split((latent, rope), dim=-1)
+    )
+
     backend = AscendAttnBackend.__new__(AscendAttnBackend)
     backend.use_mla = backend.use_fia = True
     backend.graph_mode = backend.dense_mla_dcp_target = False
@@ -98,21 +136,26 @@ def test_paged_mla_decode(a5, heads, modelslim):
     backend.forward_metadata = ForwardMetadata(
         block_tables=table.to(a5), seq_lens_cpu_list=lengths
     )
-    backend.token_to_kv_pool = SimpleNamespace(
-        get_key_buffer=lambda _: kv, get_value_buffer=lambda _: k_rope
+    backend.token_to_kv_pool = pool
+    batch = SimpleNamespace(
+        batch_size=len(lengths),
+        out_cache_loc=torch.tensor(slots, dtype=torch.int64, device=a5),
     )
     with patch.object(attention, operator, wraps=getattr(attention, operator)) as fia:
         result = backend.forward_decode(
             q,
-            None,
-            None,
+            current_k,
+            current_k,
             layer,
-            SimpleNamespace(batch_size=len(lengths)),
-            save_kv_cache=False,
+            batch,
             q_rope=q_rope,
+            k_rope=current_rope,
             q_descale=q_descale,
         )
     fia.assert_called_once()
+    # Exact storage checks also catch a missing write when attention weights are tiny.
+    assert torch.equal(key_buffer.view(torch.uint8).cpu(), kv.view(torch.uint8).cpu())
+    assert torch.equal(rope_buffer.cpu(), k_rope.cpu())
 
     expected = []
     for i, length in enumerate(lengths):

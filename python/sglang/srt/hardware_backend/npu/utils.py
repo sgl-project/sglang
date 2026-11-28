@@ -43,9 +43,20 @@ def _is_npu_arch(arch: int) -> bool:
     if not is_npu():
         return False
 
-    import acl
+    try:
+        import acl
 
-    return acl.rt.get_device_info(0, 601) == (arch, 0)
+        arch_id, ret = acl.rt.get_device_info(0, 601)
+    except Exception:
+        pass
+    else:
+        if ret == 0:
+            return arch_id == arch
+
+    # The kernel registry also recognizes SoC families when ACL lacks attribute 601.
+    from sgl_kernel_npu.operators.utils.generation import get_hardware
+
+    return get_hardware().arch_id == arch
 
 
 @functools.lru_cache(maxsize=1)

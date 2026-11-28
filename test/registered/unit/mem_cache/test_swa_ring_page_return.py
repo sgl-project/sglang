@@ -12,6 +12,7 @@ wrong KV instead of a crash.
 """
 
 import unittest
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -69,6 +70,16 @@ def _make_self(*, swa_req_ring: bool, page_size: int = PAGE_SIZE):
 
 
 class TestSWARingPageReturn(CustomTestCase):
+    def test_ring_decode_without_npu_kernels(self):
+        alloc = _make_self(swa_req_ring=True)
+        token = torch.tensor([1])
+        alloc.full_attn_allocator.alloc_decode = Mock(return_value=token)
+        with patch.dict("sys.modules", {"sgl_kernel_npu.operators.mem_cache": None}):
+            self.assertIs(alloc.alloc_decode(token, token, token), token)
+        alloc.full_attn_allocator.alloc_decode.assert_called_once_with(
+            token, token, token
+        )
+
     def test_group_drain_keeps_paged_credit_within_size_in_ring_mode(self):
         """Pre-fix this over-credits and the production assert raises."""
         alloc = _make_self(swa_req_ring=True)
