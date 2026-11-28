@@ -540,6 +540,22 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows_text))
         self.assertTrue(all(isinstance(row.prompt, list) for row in rows_ids))
 
+    def test_random_sampler_reports_token_totals_for_sampled_rows(self):
+        with patch("builtins.print") as print_mock:
+            rows = sample_random_requests(
+                input_len=8,
+                output_len=4,
+                num_prompts=5,
+                range_ratio=1.0,
+                tokenizer=self.tokenizer,
+                dataset_path=self._write_sharegpt_json(),
+                return_text=False,
+            )
+
+        self.assertEqual(len(rows), 3)
+        print_mock.assert_any_call("#Input tokens: 24")
+        print_mock.assert_any_call("#Output tokens: 12")
+
     def test_custom_sampler(self):
         dataset_path = self._write_custom_jsonl()
         rows = sample_custom_requests(
