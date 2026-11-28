@@ -824,6 +824,26 @@ def _build_dsv4_rope_entry(
     )
 
 
+def _sidecar_draft_swa_layer_bytes(
+    params: CacheInitParams, *, swa_num_host_pages: int
+) -> list[int]:
+    """Host bytes of each sidecar DSpark SWA layer, matching build_swa_draft_pools."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    layer_bytes = []
+    for pool in params.sidecar_draft_device_pools:
+        if not isinstance(pool, DeepSeekV4TokenToKVPool):
+            continue
+        draft_swa = _dsv4_pool_infos(pool).get(PoolName.SWA)
+        if draft_swa is None or not draft_swa.layer_ids:
+            continue
+        layer_bytes.extend(
+            [swa_num_host_pages * draft_swa.buffer_info.page_bytes]
+            * len(draft_swa.buffer_info.buffers)
+        )
+    return layer_bytes
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -910,6 +930,9 @@ def build_deepseek_v4_hicache_stack(
         swa_num_host_pages=swa_num_host_pages,
         c128_num_host_pages=c128_num_host_pages,
         num_draft_swa_layers=len(mtp_swa_device_buffers),
+        sidecar_draft_swa_layer_bytes=_sidecar_draft_swa_layer_bytes(
+            params, swa_num_host_pages=swa_num_host_pages
+        ),
     )
 
     logical_host_pool = LogicalHostPool(

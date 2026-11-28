@@ -578,6 +578,41 @@ class TestDSV4HostViews(CustomTestCase):
             )
         backend.ensure_capacity.assert_called_once_with(expected, 0)
 
+    def test_sidecar_draft_swa_bytes_are_reserved(self):
+        swa = SimpleNamespace(
+            layer_ids=(0, 1),
+            buffer_info=SimpleNamespace(
+                buffers=(object(), object()),
+                page_bytes=128 * 544,
+                page_slots=128,
+            ),
+        )
+        backend = MagicMock()
+        with (
+            patch.object(npu_host_memory, "is_npu", return_value=True),
+            patch.object(
+                npu_host_memory,
+                "get_memory",
+                return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+            ),
+            patch.object(
+                npu_host_memory, "get_host_memory_backend", return_value=backend
+            ),
+            patch.object(
+                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+            ),
+        ):
+            npu_host_memory.reserve_dsv4_paged_host_memory(
+                infos={PoolName.SWA: swa},
+                num_host_pages=4,
+                swa_num_host_pages=4,
+                c128_num_host_pages=0,
+                num_draft_swa_layers=0,
+                sidecar_draft_swa_layer_bytes=[4 * 128 * 608] * 3,
+            )
+        expected = 2 * (4 * 128 * 544) + 3 * (4 * 128 * 608)
+        backend.ensure_capacity.assert_called_once_with(expected, 0)
+
     def test_non_npu_skips_host_memory_reservation(self):
         with (
             patch.object(npu_host_memory, "is_npu", return_value=False),

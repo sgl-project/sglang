@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -368,6 +368,7 @@ def reserve_dsv4_paged_host_memory(
     swa_num_host_pages: int,
     c128_num_host_pages: int,
     num_draft_swa_layers: int,
+    sidecar_draft_swa_layer_bytes: Sequence[int] = (),
 ) -> None:
     """Reserve DSV4 paged buffers before constructing the host pools."""
     if not is_npu():
@@ -398,6 +399,9 @@ def reserve_dsv4_paged_host_memory(
             )
 
     add_paged(PoolName.SWA, swa_num_host_pages, num_draft_swa_layers)
+    # Sidecar DSpark SWA rows can differ from the target's, so reserve them
+    # with the draft's own page bytes instead of the target SWA block.
+    add_blocks(list(sidecar_draft_swa_layer_bytes))
 
     # V4.1 indexer pages are K-slot native pages; one host full page covers I.
     for kv_name, index_names in (
