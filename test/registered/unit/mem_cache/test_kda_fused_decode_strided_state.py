@@ -26,7 +26,9 @@ Two things are pinned here (both CPU-checkable without the CUDA kernel):
      Hardcoding the dense pitch back into the ``.cuh`` turns test (2) red.
 
 Runs on CPU: only the Python gate and the (dtype/stride-only) addressing
-arithmetic execute — no CUDA kernel is launched.
+arithmetic execute — no CUDA kernel is launched. ``covered()`` rejects
+non-CUDA tensors first, so the gate checks run with the tensors reporting
+CUDA; ``test_covered_rejects_non_cuda_tensors`` pins that rejection itself.
 
     python -m pytest test/registered/unit/mem_cache/test_kda_fused_decode_strided_state.py -v
 """
@@ -36,6 +38,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -97,6 +100,13 @@ def _make_strided_temporal_view(heads: int):
     return raw, temporal
 
 
+def _report_cuda():
+    """Make tensors report CUDA so covered() reaches its shape/stride checks."""
+    return mock.patch.object(
+        torch.Tensor, "is_cuda", new_callable=mock.PropertyMock, return_value=True
+    )
+
+
 def _make_covered_side_args(batch: int, heads: int):
     """The non-ssm covered() arguments, in the exact K3 shapes/dtypes so the
     gate turns solely on the ssm_states view under test."""
@@ -148,26 +158,49 @@ class TestKdaFusedDecodeStridedState(unittest.TestCase):
                 # (1) Accept the envelope-strided view — pre-fix
                 # .view(...).is_contiguous() would reject this and drop decode
                 # to the unfused chain.
-                self.assertTrue(
-                    covered(mixed_qkv, a, b, conv_states, ssm, cache_indices, onorm_g),
-                    "covered() rejected the envelope-strided ssm pool (fused decode "
-                    "would silently fall back to the unfused chain)",
-                )
+                with _report_cuda():
+                    self.assertTrue(
+                        covered(
+                            mixed_qkv, a, b, conv_states, ssm, cache_indices, onorm_g
+                        ),
+                        "covered() rejected the envelope-strided ssm pool (fused "
+                        "decode would silently fall back to the unfused chain)",
+                    )
 
                 # Still reject a view whose inner dims are NOT contiguous: the
                 # kernel cannot float4-load a transposed [.., V, K] state.
                 ssm_bad = ssm.transpose(-1, -2)  # stride(-1) == K, not 1
+                with _report_cuda():
+                    self.assertFalse(
+                        covered(
+                            mixed_qkv,
+                            a,
+                            b,
+                            conv_states,
+                            ssm_bad,
+                            cache_indices,
+                            onorm_g,
+                        ),
+                        "covered() must reject a non-inner-contiguous ssm view",
+                    )
+
+    def test_covered_rejects_non_cuda_tensors(self):
+        # The kernel is JIT-compiled CUDA: inputs that pass every shape and
+        # stride check are still rejected on another device.
+        for heads in _KDA_HEADS:
+            with self.subTest(kda_heads=heads):
+                _raw, temporal = _make_strided_temporal_view(heads)
+                ssm = temporal[_LAYER_UNDER_TEST]
+                (
+                    mixed_qkv,
+                    a,
+                    b,
+                    conv_states,
+                    onorm_g,
+                    cache_indices,
+                ) = _make_covered_side_args(batch=2, heads=heads)
                 self.assertFalse(
-                    covered(
-                        mixed_qkv,
-                        a,
-                        b,
-                        conv_states,
-                        ssm_bad,
-                        cache_indices,
-                        onorm_g,
-                    ),
-                    "covered() must reject a non-inner-contiguous ssm view",
+                    covered(mixed_qkv, a, b, conv_states, ssm, cache_indices, onorm_g)
                 )
 
 

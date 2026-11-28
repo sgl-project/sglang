@@ -1,14 +1,20 @@
 import ast
+import glob
+import json
+import os
 import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
     "HWBackend",
     "CIRegistry",
+    "registered_test_files",
     "collect_tests",
+    "filter_tests",
     "auto_partition",
+    "load_live_est",
     "register_cpu_ci",
     "register_cuda_ci",
     "register_amd_ci",
@@ -19,6 +25,7 @@ __all__ = [
     "register_mps_ci",
     "register_ppu_ci",
     "register_mlu_ci",
+    "declare_models",
     "ut_parse_one_file",
 ]
 
@@ -191,6 +198,13 @@ def register_mlu_ci(
     runner_config: Optional[str] = None,
 ):
     """Marker for MLU CI registration (parsed via AST; runtime no-op)."""
+    return None
+
+
+def declare_models(*, skip_models: Sequence[str] = ()) -> None:
+    """Repo ids this test file names but does not load on CUDA, so CI does not
+    prefetch them. Read statically by scripts/ci/hf_repo_scan.py from a
+    top-level call (literals or module-level names); no-op at runtime."""
     return None
 
 
@@ -422,6 +436,34 @@ def auto_partition(
     return []
 
 
+def load_live_est(
+    partition_model_file: Optional[str], suites: List[str], repo_root: str
+) -> Optional[Dict[str, float]]:
+    """`CIRegistry.filename -> est seconds` from `model.json est[suite]`,
+    merged across all requested `suites`; None if no suite yielded any entry
+    (caller then falls back to in-source `est_time`)."""
+    if not partition_model_file or not os.path.exists(partition_model_file):
+        return None
+    try:
+        with open(partition_model_file) as f:
+            partition_model = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(partition_model, dict):
+        return None
+    est_by_suite = partition_model.get("est", {})
+    if not isinstance(est_by_suite, dict):
+        return None
+    merged: Dict[str, float] = {}
+    for suite in suites:
+        suite_est = est_by_suite.get(suite)
+        if not isinstance(suite_est, dict):
+            continue
+        for relpath, elapsed in suite_est.items():
+            merged[os.path.join(repo_root, relpath)] = float(elapsed)
+    return merged or None
+
+
 def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistry]:
     ci_tests = []
     for file in files:
@@ -451,3 +493,38 @@ def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistr
         ci_tests.extend(registries)
 
     return ci_tests
+
+
+def registered_test_files(repo_root: str) -> List[str]:
+    return [
+        f
+        for f in glob.glob(
+            os.path.join(repo_root, "test", "registered", "**", "*.py"),
+            recursive=True,
+        )
+        # conftest.py / __init__.py are pytest+package structure, never
+        # registered tests, and must not be executed as one.
+        if os.path.basename(f) not in ("conftest.py", "__init__.py")
+    ]
+
+
+def filter_tests(
+    ci_tests: List[CIRegistry],
+    hw: HWBackend,
+    suites: List[str],
+    nightly: bool = False,
+) -> Tuple[List[CIRegistry], List[CIRegistry]]:
+    """`(enabled, disabled)` tests of backend `hw` in any of `suites`.
+
+    `suites` may hold more than one suite (comma-separated --suite): the
+    matched tests are unioned so a single runner can partition several
+    suites as one balanced pool (e.g. base-b + base-c on a Xeon SPR box)."""
+    suite_set = set(suites)
+    ci_tests = [
+        t
+        for t in ci_tests
+        if t.backend == hw and t.effective_suite in suite_set and t.nightly == nightly
+    ]
+    enabled_tests = [t for t in ci_tests if t.disabled is None]
+    skipped_tests = [t for t in ci_tests if t.disabled is not None]
+    return enabled_tests, skipped_tests

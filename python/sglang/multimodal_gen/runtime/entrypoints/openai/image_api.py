@@ -454,7 +454,6 @@ async def edits(
                 input_path = await save_image_to_path(
                     img,
                     os.path.join(uploads_dir, f"{request_id}_{idx}_{safe_name}"),
-                    prefer_remote_source=server_args.input_save_path is None,
                     uploads_root=uploads_dir,
                 )
                 input_paths.append(input_path)
