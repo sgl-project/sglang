@@ -304,19 +304,20 @@ def sample_generated_shared_prefix_requests(
             else None
         )
         turn_questions = questions[src_g][src_p]
+        first_question = turn_questions[0]
         if input_ids:
-            turn_prompts = [system_prompt + turn_questions[0]]
+            if first_question:
+                full_prompt = system_prompt + first_question
+            else:
+                # The client only reads these IDs, so rows can share the group's list.
+                full_prompt = system_prompt
+            prompt_len = len(full_prompt)
         else:
-            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
-                1:
-            ]
-        full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
-        if input_ids:
-            prompt_len = len(turn_prompts[0])
-        elif fast_prepare:
-            prompt_len = 1
-        else:
-            prompt_len = len(tokenizer.encode(turn_prompts[0]))
+            first_turn = f"{system_prompt}\n\n{first_question}"
+            full_prompt = (
+                first_turn if num_turns == 1 else [first_turn, *turn_questions[1:]]
+            )
+            prompt_len = 1 if fast_prepare else len(tokenizer.encode(first_turn))
         output_len_val = int(output_lens[src_g, src_p])
 
         input_requests.append(
