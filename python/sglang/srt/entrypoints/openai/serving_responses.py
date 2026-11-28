@@ -1548,19 +1548,48 @@ class OpenAIServingResponses(OpenAIServingChat):
         parts = [p for p in output if isinstance(p, dict)]
         if not any(p.get("type") in ("input_image", "image_url") for p in parts):
             return "".join(p.get("text", "") for p in parts)
-        # Non-media parts keep only their text, as in the string path above, so
+        # Other parts keep only their text, as in the string path above, so
         # parts chat validation rejects (input_file, untyped, refusal) drop out.
         chat_parts = []
+        skipped_image = False
         for part in parts:
-            if part.get("type") in _TOOL_OUTPUT_MEDIA_PART_TYPES:
+            part_type = part.get("type")
+            if part_type == "tool_reference":
+                if part.get("name"):
+                    chat_parts.append(part)
+            elif part_type in _TOOL_OUTPUT_MEDIA_PART_TYPES:
                 media = cls._normalize_response_content_part_for_chat(part)
                 image_url = media.get("image_url") or {}
                 if media["type"] == "image_url" and not image_url.get("url"):
-                    continue  # A file_id-only image has no URL to load.
+                    skipped_image = True  # A file_id-only image has no URL to load.
+                    continue
                 chat_parts.append(media)
             elif "text" in part:
                 chat_parts.append({"type": "text", "text": part["text"]})
+        if skipped_image and not any(
+            p["type"] != "text" or p["text"] for p in chat_parts
+        ):
+            raise _MediaInputValidationError(
+                "function_call_output has no usable content: its image has no "
+                "image_url, and file_id images are not supported."
+            )
         return chat_parts
+
+    @staticmethod
+    def _split_tool_reference_runs(message: dict) -> list[dict]:
+        # GLM templates expand tool_reference parts only at the start of a tool
+        # message, so each run of them gets its own message, as in the
+        # Anthropic endpoint.
+        content = message.get("content")
+        if message.get("role") != "tool" or not isinstance(content, list):
+            return [message]
+        runs: list[list[dict]] = []
+        for part in content:
+            is_reference = part["type"] == "tool_reference"
+            if not runs or (runs[-1][0]["type"] == "tool_reference") != is_reference:
+                runs.append([])
+            runs[-1].append(part)
+        return [{**message, "content": run} for run in runs]
 
     @staticmethod
     def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:
@@ -1780,7 +1809,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 input_item, tool_call_parser=self.tool_call_parser
             )
             if normalized is not None:
-                messages.append(normalized)
+                messages.extend(self._split_tool_reference_runs(normalized))
 
         # One Responses-API assistant turn maps to multiple input items
         # (message + function_call(s)); collapse them into one chat message

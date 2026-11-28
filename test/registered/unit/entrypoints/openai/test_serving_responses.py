@@ -46,8 +46,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
+    _MediaInputValidationError,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.glm53_chat_template import _IMAGE_TOKENS, render_glm53_flash
 from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     process_content_for_template_format,
@@ -1338,6 +1340,7 @@ class InputItemNormalizationTestCase(CustomTestCase):
                     {"type": "input_image", "file_id": "file-123"},
                     {"type": "refusal", "refusal": "no"},
                     {"note": "untyped"},
+                    {"type": "tool_reference"},
                     image,
                 ],
             }
@@ -1354,6 +1357,89 @@ class InputItemNormalizationTestCase(CustomTestCase):
                 },
             ],
         )
+
+    def test_function_call_output_with_only_a_file_id_image_is_rejected(self):
+        file_id_image = {"type": "input_image", "file_id": "file-123"}
+        for output in [
+            [file_id_image],
+            [file_id_image, {"type": "input_text", "text": ""}],
+        ]:
+            with self.subTest(output=output):
+                with self.assertRaises(_MediaInputValidationError):
+                    OpenAIServingResponses._normalize_response_message_for_chat(
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_abc",
+                            "output": output,
+                        }
+                    )
+
+        kept = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [{"type": "input_text", "text": "No screen."}, file_id_image],
+            }
+        )
+        self.assertEqual(kept["content"], [{"type": "text", "text": "No screen."}])
+
+    def test_tool_reference_beside_an_image_renders_both_in_glm(self):
+        tools = [
+            {"type": "function", "name": name, "parameters": {"type": "object"}}
+            for name in ("screenshot", "crop")
+        ]
+        request = ResponsesRequest(
+            model="m",
+            tools=tools,
+            input=[
+                {"type": "message", "role": "user", "content": "Take a screenshot."},
+                {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "screenshot",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": [
+                        {"type": "tool_reference", "name": "crop"},
+                        {"type": "input_text", "text": "Screenshot captured."},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AA",
+                        },
+                    ],
+                },
+            ],
+        )
+        messages = make_serving(is_multimodal=True)._construct_input_messages(request)
+        image_data = []
+        for message in messages:
+            for call in message.get("tool_calls") or []:
+                call["function"]["arguments"] = orjson.loads(
+                    call["function"]["arguments"]
+                )
+        prompt = render_glm53_flash(
+            [
+                process_content_for_template_format(
+                    message, "openai", image_data, [], [], []
+                )
+                for message in messages
+            ],
+            tools=[
+                {"type": "function", "function": {"name": t["name"]}} for t in tools
+            ],
+            add_generation_prompt=True,
+        )
+
+        # The GLM template renders only the references when a tool message
+        # starts with one, so the image needs a tool message of its own.
+        tool_turns = prompt[prompt.index("<|observation|>") :]
+        self.assertIn('"name": "crop"', tool_turns)
+        self.assertIn("Screenshot captured.", tool_turns)
+        self.assertEqual(prompt.count(_IMAGE_TOKENS), len(image_data))
+        self.assertEqual(len(image_data), 1)
 
     def test_tool_output_image_keeps_its_slot_before_a_user_image(self):
         template = (
