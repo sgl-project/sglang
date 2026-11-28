@@ -200,14 +200,12 @@ class LayerSplitNPUMLATokenToKVPool(NPULayerSplitMixin, NPUMLATokenToKVPool):
     def get_kv_size_bytes(self):
         # Scratch storage is persistent and must be included in memory reports.
         size = super().get_kv_size_bytes()
-        for name in (
-            "remote_kv_all",
-            "remote_index_k_buffer",
-            "remote_index_k_scale_buffer",
-        ):
-            buffer = getattr(self, name, None)
-            if buffer is not None:
-                size += buffer.nbytes
+        for st in self._ls_states.values():
+            if st.scratch is not None:
+                size += st.scratch.nbytes
+        scale = getattr(self, "remote_index_k_scale_buffer", None)
+        if scale is not None:
+            size += scale.nbytes
         return size
 
     def _kv_local_offset(self, layer_id: int) -> int:
