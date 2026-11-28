@@ -6,8 +6,9 @@ Fetches recent scheduled runs of one workflow (default: Nvidia PR Test),
 identifies consistently failing tests, and calls Claude to classify each as
 regression/flaky/hardware/environment.
 
-Self-contained: does its own lightweight GitHub API analysis instead of running
-the full ci_failures_analysis.py, keeping API usage to ~30-40 calls.
+Does its own lightweight GitHub API analysis instead of running the full
+ci_failures_analysis.py, keeping API usage to ~30-40 calls. It reuses only that
+script's log parser.
 
 Usage:
     python ci_auto_bisect.py \
@@ -31,6 +32,7 @@ from typing import Dict, List, Optional, Tuple
 
 import anthropic
 import requests
+from ci_failures_analysis import SGLangFailuresAnalyzer
 
 REPO = "sgl-project/sglang"
 GITHUB_API = "https://api.github.com"
@@ -62,12 +64,6 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 # GitHub job-log line prefix, e.g. "2026-11-19T17:41:00.2402142Z "
 _LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z ", re.MULTILINE)
-# Diffusion pytest_runner retries a pytest session up to 7 times, then prints this tail
-_PYTEST_ATTEMPT_RE = re.compile(r"^Starting pytest attempt \d+/\d+", re.MULTILINE)
-_PYTEST_TAIL_MARKER = "Pytest Tail Summary"
-_PYTEST_SUMMARY_HEADER_RE = re.compile(r"^=+ short test summary info =+$")
-_PYTEST_RESULT_RE = re.compile(r"^(?:FAILED|ERROR) (\S+?\.py(?:::.+?)?)(?: - .*)?$")
-_PYTEST_STATS_RE = re.compile(r"^=+ (.*\bin [\d.]+s\b.*?) =+$")
 
 
 # ---------------------------------------------------------------------------
@@ -233,138 +229,18 @@ def fetch_job_logs(job_id: int, token: str, max_chars: int = 2000000) -> str:
 
 
 def parse_test_summary(logs: str) -> Optional[Dict]:
-    """Parse the test summary block from job logs.
-
-    Returns dict with passed/total counts and list of failed tests,
-    or None if no summary found.
-    """
-    # Strip ANSI escape codes
-    logs = _ANSI_ESCAPE_RE.sub("", logs)
-
-    summary_match = re.search(r"Test Summary:\s*(\d+)/(\d+)\s*passed", logs)
-    if not summary_match:
-        pytest_summary = parse_pytest_summary(logs)
-        if pytest_summary and pytest_summary["failed_tests"]:
-            return pytest_summary
-        # Try to find the last running test (timeout scenario)
-        last_test = _find_last_running_test(logs)
-        if last_test:
-            return {"passed": 0, "total": 0, "failed_tests": [last_test]}
-        return None
-
-    try:
-        passed = int(summary_match.group(1))
-        total = int(summary_match.group(2))
-    except (ValueError, TypeError):
+    """Parse job logs, listing each failed pytest node ID as its own entry."""
+    summary = SGLangFailuresAnalyzer.parse_test_summary(logs)
+    if summary is None:
         return None
 
     failed_tests = []
-    failed_section_match = re.search(
-        r".?\s*FAILED:\s*\n(.*?)(?:={10,}|$)", logs, re.DOTALL
-    )
-    if failed_section_match:
-        for match in re.finditer(r"(\S+\.py)", failed_section_match.group(1)):
-            full_path = match.group(1)
-            test_file = full_path.split("/")[-1] if "/" in full_path else full_path
-            failed_tests.append({"test_file": test_file, "full_path": full_path})
-
-    return {"passed": passed, "total": total, "failed_tests": failed_tests}
-
-
-def _final_pytest_blocks(logs: str) -> List[List[str]]:
-    """Return the lines after each final pytest "short test summary info" header.
-
-    With diffusion retry markers, only the last block of each session's final
-    attempt counts; without them, every block is its own session's result.
-    """
-    starts = [m.start() for m in _PYTEST_ATTEMPT_RE.finditer(logs)]
-    if starts:
-        bounds = starts + [len(logs)]
-        attempts = [logs[a:b] for a, b in zip(bounds, bounds[1:])]
-        attempts = [
-            text
-            for i, text in enumerate(attempts)
-            if _PYTEST_TAIL_MARKER in text or i == len(attempts) - 1
-        ]
-    else:
-        attempts = [logs]
-
-    blocks = []
-    for text in attempts:
-        lines = text.splitlines()
-        headers = [i for i, l in enumerate(lines) if _PYTEST_SUMMARY_HEADER_RE.match(l)]
-        if starts:
-            # A passing final attempt has no header; keep it for the stats line
-            headers = headers[-1:] or [-1]
-        blocks.extend(lines[h + 1 :] for h in headers)
-    return blocks
-
-
-def parse_pytest_summary(logs: str) -> Optional[Dict]:
-    """Parse final pytest failure summaries, keeping node IDs.
-
-    Items that passed on a diffusion retry are not reported.
-    Returns None if the log has no pytest failure summary.
-    """
-    logs = _LOG_TIMESTAMP_RE.sub("", _ANSI_ESCAPE_RE.sub("", logs))
-    blocks = _final_pytest_blocks(logs)
-    if not blocks:
-        return None
-
-    passed = total = 0
-    failed_tests: List[Dict] = []
-    seen = set()
-    for block in blocks:
-        for line in block:
-            stats = _PYTEST_STATS_RE.match(line)
-            if stats:
-                for n, kind in re.findall(
-                    r"(\d+) (passed|failed|errors?)", stats.group(1)
-                ):
-                    total += int(n)
-                    passed += int(n) if kind == "passed" else 0
-                break
-            result = _PYTEST_RESULT_RE.match(line)
-            if not result:
-                continue
-            full_path, _, rest = result.group(1).partition("::")
-            test_file = full_path.rsplit("/", 1)[-1]
-            test_id = f"{test_file}::{rest}" if rest else ""
-            if (full_path, test_id) not in seen:
-                seen.add((full_path, test_id))
-                failed_tests.append(
-                    {"test_file": test_file, "full_path": full_path, "test_id": test_id}
-                )
-
-    return {"passed": passed, "total": total, "failed_tests": failed_tests}
-
-
-def _find_last_running_test(logs: str) -> Optional[Dict]:
-    """Find the last test running before logs cut off (timeout scenarios)."""
-    lines = logs.split("\n")
-    test_patterns = [r"(\S+\.py)::", r"python3?\s+(\S+\.py)"]
-
-    # Find last "server_args:" and look above it for test file
-    server_args_idx = None
-    for i in range(len(lines) - 1, -1, -1):
-        if "server_args:" in lines[i].lower() or "server_args =" in lines[i]:
-            server_args_idx = i
-            break
-
-    if server_args_idx is not None:
-        for j in range(1, 11):
-            line_idx = server_args_idx - j
-            if line_idx >= 0:
-                for pattern in test_patterns:
-                    match = re.search(pattern, lines[line_idx])
-                    if match:
-                        full_path = match.group(1)
-                        test_file = (
-                            full_path.split("/")[-1] if "/" in full_path else full_path
-                        )
-                        if test_file.endswith(".py"):
-                            return {"test_file": test_file, "full_path": full_path}
-    return None
+    for test in summary["failed_tests"]:
+        if "test_ids" in test:
+            failed_tests.extend({**test, "test_id": i} for i in test["test_ids"])
+        else:
+            failed_tests.append(test)
+    return {**summary, "failed_tests": failed_tests}
 
 
 def analyze_scheduled_failures(
