@@ -1,6 +1,7 @@
 import subprocess
 from types import SimpleNamespace
 
+from sglang.test.ascend.npu_eval_accuracy_kit import honor_local_sgl_eval_archive
 from sglang.test.ascend.test_ascend_utils import write_results_to_github_step_summary
 from sglang.test.sgl_eval_utils import run_sgl_eval
 
@@ -28,6 +29,7 @@ class TestMMLU:
                 num_threads=32,
             )
             print("Starting mmlu test...")
+            honor_local_sgl_eval_archive()
             metrics = run_sgl_eval(args)
             model_metrics["accuracy"] = metrics["score"]
             model_metrics["latency"] = metrics.get("latency", "-")
