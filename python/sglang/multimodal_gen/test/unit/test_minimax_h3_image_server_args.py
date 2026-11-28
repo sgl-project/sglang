@@ -377,3 +377,20 @@ def test_video_config_auto_offloads_auxiliary_components_layerwise(make_server):
     assert {"text_encoder", "image_encoder", "vae"}.issubset(
         args.layerwise_offload_components
     )
+
+
+def test_rocm_auto_selects_layerwise_offload_only_below_the_resident_threshold(
+    make_server,
+):
+    assert not SimulatedROCm(32).is_cuda() and SimulatedROCm(32).is_cuda_alike()
+    small = make_server(32, platform_cls=SimulatedROCm)
+    assert {"text_encoder", "vae"} <= set(small.layerwise_offload_components)
+    small_memory = make_server(
+        32, platform_cls=SimulatedROCm, performance_mode="memory"
+    )
+    assert "dit" in small_memory.layerwise_offload_components
+    # 192 GiB is above keep_resident_min_available_gb (130): placement stays resident.
+    large = make_server(192, platform_cls=SimulatedROCm)
+    assert not {"dit", "text_encoder", "vae"} & set(
+        large.layerwise_offload_components or ()
+    )

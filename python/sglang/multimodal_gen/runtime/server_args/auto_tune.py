@@ -393,7 +393,7 @@ class ServerArgsAutoTuner:
             or args.dit_layerwise_offload is True
         ):
             return
-        if not current_platform.is_cuda():
+        if not current_platform.is_cuda_alike():
             return
 
         layerwise_components = self._default_layerwise_components_for_unset_placement()
@@ -470,7 +470,7 @@ class ServerArgsAutoTuner:
         if (
             not self.could_override_server_args()
             or current_platform.is_cpu()
-            or not current_platform.is_cuda()
+            or not current_platform.is_cuda_alike()
             or envs.SGLANG_CACHE_DIT_ENABLED
             or args.use_fsdp_inference
             or args.layerwise_offload_components is not None
@@ -810,7 +810,7 @@ class ServerArgsAutoTuner:
             args.image_encoder_cpu_offload = False
 
     def _can_apply_default_layerwise_offload_policy(self) -> bool:
-        return current_platform.is_cuda()
+        return current_platform.is_cuda_alike()
 
     def _default_layerwise_components_for_unset_placement(self) -> list[str]:
         args = self.server_args

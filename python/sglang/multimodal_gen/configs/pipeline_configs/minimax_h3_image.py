@@ -95,7 +95,13 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         # nothing for CFG parallelism, so with no other
         # parallel flag `--num-gpus N` runs Ulysses N over the packed sequence.
         return ModelDeploymentConfig(
-            auto_auxiliary_layerwise_offload=False,
+            # ROCm cards below keep_resident_min_available_gb (32 GB Radeon) cannot
+            # hold the ~62 GB text encoder whole, so stream it and, in memory mode,
+            # the DiT. CUDA keeps its validated placement.
+            auto_auxiliary_layerwise_offload=current_platform.is_rocm(),
+            dit_layerwise_offload_modes=(
+                ("memory",) if current_platform.is_rocm() else ()
+            ),
             # H200 keeps headroom even with AdaLN weights resident. GB10 uses
             # online AdaLN to fit native 4K in its shared pool; validation below
             # refuses a resident GB10 launch that keeps those projection weights.

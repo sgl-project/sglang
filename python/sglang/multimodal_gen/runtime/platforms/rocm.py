@@ -585,4 +585,4 @@ class RocmPlatform(Platform):
     @classmethod
     def enable_dit_layerwise_offload_by_default(cls) -> bool:
         """Whether automatic DiT layerwise offload is enabled on this platform."""
-        return False
+        return True
