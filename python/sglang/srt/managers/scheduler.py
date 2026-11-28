@@ -124,7 +124,7 @@ from sglang.srt.distributed.parallel_state import (
     close_custom_all_reduce,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, freeze_env_reads
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import (
@@ -249,6 +249,8 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
+    schedule_batch_field_names,
+    schedule_batch_field_values,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -2127,6 +2129,7 @@ class Scheduler(
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
+            "max_req_len": self.max_req_len,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
@@ -2195,6 +2198,7 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_war_barrier_enabled()
+        freeze_env_reads()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
@@ -3159,12 +3163,7 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # max_req_len is the largest number of tokens that can be forwarded for
-        # one request. The last generated token is sampled but never forwarded,
-        # so a request may generate max_req_len - input_len + 1 tokens.
-        context_max_new_tokens = self.max_req_len - input_len + 1
-
-        # Keep this bound consistent with PrefillAdder's admission budget.
+        context_max_new_tokens = self.max_req_len - input_len
         max_new_tokens = max(
             0,
             min(
@@ -3757,17 +3756,6 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
-                )
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
-
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
@@ -3777,6 +3765,7 @@ class Scheduler(
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
             self._embedding_preserve_last_token_id,
+            is_multimodal=recv_req.mm_inputs is not None,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -4287,24 +4276,16 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
-                )
-                self._add_request_to_queue(req)
-                return
-
         # Validate prompts length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
             self._embedding_preserve_last_token_id,
+            is_multimodal=recv_req.mm_inputs is not None,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
@@ -5424,9 +5405,7 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        attr_snapshot = schedule_batch_field_values(batch)
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         retired = self.batch_record_buf[self.batch_record_ct]
         # List (not tuple) so that workers can register additional refs via
@@ -5460,7 +5439,12 @@ class Scheduler(
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
         sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+            dict(
+                zip(
+                    schedule_batch_field_names(type(batch)),
+                    schedule_batch_field_values(batch),
+                )
+            )
             if snapshot_v2_full
             else None
         )
@@ -5478,8 +5462,8 @@ class Scheduler(
             yield
         finally:
             if snapshot_v2_full:
-                for name, value in sched_snapshot.items():
-                    setattr(batch, name, value)
+                # Plain dataclass fields (no descriptors, no __setattr__ hook).
+                batch.__dict__.update(sched_snapshot)
             else:
                 batch.sampling_info = sched_sampling_info
 

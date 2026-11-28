@@ -435,7 +435,7 @@ def _run_eagle_draft_eager(
     else:
         worker.draft_attn_backend.init_forward_metadata(batch)
     batch.mark_forward_metadata_ready()  # mirror production: pre-plan marks
-    return worker.draft_forward(batch)
+    return worker.draft_forward(batch, greedy=False)
 
 
 def _run_frozen_kv_mtp_eager(
