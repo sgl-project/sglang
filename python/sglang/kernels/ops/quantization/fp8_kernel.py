@@ -290,7 +290,7 @@ def _per_token_group_quant_8bit(
     y_ptr,
     y_q_ptr,
     y_s_ptr,
-    # Stride of input
+    # Stride of input (group size)
     y_stride,
     # Columns of input
     N,
@@ -307,15 +307,19 @@ def _per_token_group_quant_8bit(
 
     This function converts the tensor values into float8 values.
     """
-    # Map the program id to the row of X and Y it should compute. Row offsets
+    # Map the program id to the row and group it should compute. Row offsets
     # pass int32 once numel > 2^31.
     g_id = tl.program_id(0).to(tl.int64)
-    y_ptr += g_id * y_stride
-    y_q_ptr += g_id * y_stride
+    blocks_per_row = tl.cdiv(N, y_stride)
+    row_id = g_id // blocks_per_row
+    group_col = g_id % blocks_per_row
+    row_offset = row_id * N + group_col * y_stride
+    y_ptr += row_offset
+    y_q_ptr += row_offset
     y_s_ptr += g_id
 
-    cols = tl.arange(0, BLOCK)  # N <= BLOCK
-    mask = cols < N
+    cols = tl.arange(0, BLOCK)  # y_stride <= BLOCK
+    mask = (cols < y_stride) & (group_col * y_stride + cols < N)
 
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     # Quant
@@ -352,20 +356,22 @@ def _per_token_group_quant_8bit_colmajor(
     quantization on a tensor.
     This function converts the tensor values into float8 values.
     """
-    # Map the program id to the row of X and Y it should compute.
-    g_id = tl.program_id(0)
-    y_ptr += g_id.to(tl.int64) * group_size
-    y_q_ptr += g_id.to(tl.int64) * group_size
+    # Map the program id to the row and group it should compute. Row offsets
+    # pass int32 once numel > 2^31.
+    g_id = tl.program_id(0).to(tl.int64)
 
     # Convert g_id the flattened block coordinate to 2D so we can index
     # into the output y_scales matrix
-    blocks_per_row = y_num_columns // group_size
+    blocks_per_row = tl.cdiv(y_num_columns, group_size)
     scale_col = g_id % blocks_per_row
     scale_row = g_id // blocks_per_row
+    row_offset = scale_row * y_num_columns + scale_col * group_size
+    y_ptr += row_offset
+    y_q_ptr += row_offset
     y_s_ptr += scale_col * y_s_col_stride + scale_row
 
     cols = tl.arange(0, BLOCK)  # group_size <= BLOCK
-    mask = cols < group_size
+    mask = (cols < group_size) & (scale_col * group_size + cols < y_num_columns)
 
     y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
     # Quant
@@ -405,8 +411,8 @@ def _per_token_group_quant_8bit_raw(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
     """
-    assert x.shape[-1] % group_size == 0, (
-        "the last dimension of `x` cannot be divisible by `group_size`"
+    assert x.shape[-1] > 0 and group_size > 0, (
+        "the last dimension of `x` and `group_size` must be positive"
     )
     assert x.is_contiguous(), "`x` is not contiguous"
 
@@ -445,44 +451,48 @@ def _per_token_group_quant_8bit_raw(
         )
     )
 
-    M = x.numel() // group_size
+    K = x.shape[-1]
+    num_groups_per_row = triton.cdiv(K, group_size)
+    M = (x.numel() // K) * num_groups_per_row
     N = group_size
 
     BLOCK = triton.next_power_of_2(N)
     # heuristics for number of warps
     num_warps = min(max(BLOCK // 256, 1), 8)
     num_stages = 1
-    if column_major_scales:
-        _per_token_group_quant_8bit_colmajor[(M,)](
-            x,
-            x_q,
-            x_s,
-            group_size,
-            x.shape[1],
-            x_s.stride(1),
-            eps,
-            bit8_min=bit8_min,
-            bit8_max=bit8_max,
-            BLOCK=BLOCK,
-            num_warps=num_warps,
-            num_stages=num_stages,
-            SCALE_UE8M0=scale_ue8m0,
-        )
-    else:
+    if not column_major_scales:
         assert not scale_ue8m0
-        _per_token_group_quant_8bit[(M,)](
-            x,
-            x_q,
-            x_s,
-            group_size,
-            N,
-            eps,
-            bit8_min=bit8_min,
-            bit8_max=bit8_max,
-            BLOCK=BLOCK,
-            num_warps=num_warps,
-            num_stages=num_stages,
-        )
+    if M > 0:
+        if column_major_scales:
+            _per_token_group_quant_8bit_colmajor[(M,)](
+                x,
+                x_q,
+                x_s,
+                group_size,
+                K,
+                x_s.stride(1),
+                eps,
+                bit8_min=bit8_min,
+                bit8_max=bit8_max,
+                BLOCK=BLOCK,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                SCALE_UE8M0=scale_ue8m0,
+            )
+        else:
+            _per_token_group_quant_8bit[(M,)](
+                x,
+                x_q,
+                x_s,
+                group_size,
+                K,
+                eps,
+                bit8_min=bit8_min,
+                bit8_max=bit8_max,
+                BLOCK=BLOCK,
+                num_warps=num_warps,
+                num_stages=num_stages,
+            )
 
     if scale_ue8m0:
         from deep_gemm import transform_sf_into_required_layout
@@ -507,10 +517,11 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_tma_aligned: bool,
     scale_ue8m0: bool,
 ):
+    num_groups = triton.cdiv(x_shape[-1], group_size)
     if scale_ue8m0:
         if column_major_scales and scale_tma_aligned:
-            *x_batch, x_q_mn, x_q_k = x_shape
-            x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
+            *x_batch, x_q_mn, _ = x_shape
+            x_s_mn, x_s_k = x_q_mn, num_groups
             aligned_mn = ceil_align(x_s_mn, 4)
             aligned_k = ceil_align(x_s_k, 4)
             # TODO(FIXME): Fix cuda kernel and recover here to empty.
@@ -527,7 +538,7 @@ def create_per_token_group_quant_fp8_output_scale(
             # Row-major UE8M0 keeps the scale as float32 power-of-two values,
             # matching deep_gemm.ceil_to_ue8m0 and deep_gemm.fp8_einsum.
             return torch.empty(
-                x_shape[:-1] + (x_shape[-1] // group_size,),
+                x_shape[:-1] + (num_groups,),
                 device=device,
                 dtype=torch.float32,
             )
@@ -539,19 +550,19 @@ def create_per_token_group_quant_fp8_output_scale(
             # `...` so batched (e.g. masked [E, T, H]) shapes slice the token
             # axis, not dim 0.
             return torch.empty(
-                x_shape[:-2] + (x_shape[-1] // group_size, aligned_size),
+                x_shape[:-2] + (num_groups, aligned_size),
                 device=device,
                 dtype=torch.float32,
             ).transpose(-1, -2)[..., : x_shape[-2], :]
         else:
             return torch.empty(
-                (x_shape[-1] // group_size,) + x_shape[:-1],
+                (num_groups,) + x_shape[:-1],
                 device=device,
                 dtype=torch.float32,
             ).permute(-1, -2)
     else:
         return torch.empty(
-            x_shape[:-1] + (x_shape[-1] // group_size,),
+            x_shape[:-1] + (num_groups,),
             device=device,
             dtype=torch.float32,
         )
@@ -652,10 +663,23 @@ def sglang_per_token_group_quant_fp8(
     output_q: Optional[torch.Tensor] = None,
     output_s: Optional[torch.Tensor] = None,
 ):
-    assert x.shape[-1] % group_size == 0, (
-        "the last dimension of `x` cannot be divisible by `group_size`"
-    )
     assert x.is_contiguous(), "`x` is not contiguous"
+    if x.shape[-1] % group_size != 0:
+        assert not fuse_silu_and_mul and masked_m is None and not scale_ue8m0, (
+            f"unaligned last dimension {x.shape[-1]} % {group_size} != 0 is not "
+            "supported with fuse_silu_and_mul, masked_m, or scale_ue8m0"
+        )
+        return _per_token_group_quant_8bit_raw(
+            x,
+            group_size,
+            eps=eps,
+            dtype=output_q.dtype if output_q is not None else fp8_dtype,
+            column_major_scales=column_major_scales,
+            scale_tma_aligned=scale_tma_aligned,
+            scale_ue8m0=False,
+            output_q=output_q,
+            output_s=output_s,
+        )
 
     if (
         group_size == x.shape[-1]

@@ -15,6 +15,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.fp8_kernel import (
     fp8_dtype,
+    fp8_max,
     is_fp8_fnuz,
     per_token_group_quant_fp8,
     scaled_fp8_quant,
@@ -1565,6 +1566,239 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
 
+def _compute_block_quant_alignment(
+    n: int,
+    block_size: List[int],
+    tp_rank: int = 0,
+) -> tuple[int, int, int, bool]:
+    """Compute aligned partition width and in-block offset for a TP rank."""
+    block_n, block_k = int(block_size[0]), int(block_size[1])
+    align_unit = math.lcm(block_n, block_k)
+    n_aligned = ((n + align_unit - 1) // align_unit) * align_unit
+    g0 = tp_rank * n
+    in_block_offset = g0 % align_unit
+    can_shift_pad = (block_n == block_k == align_unit) and (
+        in_block_offset + n <= n_aligned
+    )
+    lead_pad = in_block_offset if can_shift_pad else 0
+    return n_aligned, align_unit, lead_pad, can_shift_pad
+
+
+def _pad_moe_shards(
+    tensor: torch.Tensor,
+    num_shards: int,
+    target_shard_size: int,
+    dim: int = 1,
+    lead_pad: int = 0,
+    fill_value: float = 0.0,
+) -> torch.Tensor:
+    """Pad equal-sized contiguous shards along ``dim`` to ``target_shard_size``."""
+    orig_shard_size = tensor.shape[dim] // num_shards
+    copy_len = min(orig_shard_size, target_shard_size - lead_pad)
+    out_shape = list(tensor.shape)
+    out_shape[dim] = num_shards * target_shard_size
+    out = (
+        torch.zeros(out_shape, dtype=tensor.dtype, device=tensor.device)
+        if fill_value == 0.0
+        else torch.full(out_shape, fill_value, dtype=tensor.dtype, device=tensor.device)
+    )
+    for s in range(num_shards):
+        out.narrow(dim, s * target_shard_size + lead_pad, copy_len).copy_(
+            tensor.narrow(dim, s * orig_shard_size, copy_len)
+        )
+    return out
+
+
+def _requantize_block_fp8_3d_slice(
+    w_3d: torch.Tensor,
+    s_3d: torch.Tensor,
+    target_rows: int,
+    target_cols: int,
+    block_n: int,
+    block_k: int,
+    row_off: int,
+    col_off: int,
+    q_max: float,
+    scale_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize batched expert slices with overlapping block scales and
+    re-quantize into zero-padded ``(E, target_rows, target_cols)`` blocks."""
+    e_cnt, r, c = w_3d.shape
+    s_r = (target_rows + block_n - 1) // block_n
+    s_c = (target_cols + block_k - 1) // block_k
+    s_exp = (
+        s_3d.float().repeat_interleave(block_n, dim=1).repeat_interleave(block_k, dim=2)
+    )
+    w_fp32 = w_3d.float() * s_exp[:, row_off : row_off + r, col_off : col_off + c]
+    buf = torch.zeros(
+        (e_cnt, s_r * block_n, s_c * block_k),
+        dtype=torch.float32,
+        device=w_3d.device,
+    )
+    buf[:, :r, :c] = w_fp32
+    buf_blocks = buf.view(e_cnt, s_r, block_n, s_c, block_k)
+    amax = buf_blocks.abs().amax(dim=(2, 4))
+    new_s = torch.where(amax > 0, amax / q_max, torch.ones_like(amax))
+    q = (
+        (buf_blocks / new_s[:, :, None, :, None])
+        .clamp(-q_max, q_max)
+        .to(w_3d.dtype)
+        .reshape(e_cnt, s_r * block_n, s_c * block_k)[:, :target_rows, :target_cols]
+    )
+    return q, new_s.to(scale_dtype)
+
+
+def align_fp8_moe_weights_for_block_quant(
+    w13_weight: torch.Tensor,
+    w13_scale: Optional[torch.Tensor],
+    w2_weight: torch.Tensor,
+    w2_scale: Optional[torch.Tensor],
+    block_size: List[int],
+    is_gated: bool = True,
+    tp_rank: int = 0,
+) -> tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    torch.Tensor,
+    Optional[torch.Tensor],
+    int,
+]:
+    """Align MoE intermediate size N to a multiple of lcm(block_n, block_k) via zero-padding.
+
+    Used when finer TP block refinement cannot apply (e.g. Hopper SM90 DeepGEMM
+    without UE8M0 scales, CUTLASS, or gcd(block_k, shard) < 32):
+    1. When ``(tp_rank * N) % align_unit + N <= N_aligned`` and ``block_n == block_k``,
+       applies lossless in-block shift-padding (``lead_pad = (tp_rank * N) % align_unit``)
+       so valid weights stay aligned to their original checkpoint scale blocks.
+    2. When a rank's shard straddles a checkpoint scale block boundary beyond ``N_aligned``
+       (e.g., ``TP=8, N=96`` ranks 1, 2, 5, 6), re-quantizes each expert tile from its
+       exact checkpoint scales into aligned ``[block_n, block_k]`` blocks.
+    Because padding zeroes pre-activations and ``w2`` columns, zero-padded channels do
+    not alter MoE outputs while satisfying 128-element kernel alignment constraints.
+    """
+    block_n, block_k = int(block_size[0]), int(block_size[1])
+    N = w2_weight.shape[2]
+    N_aligned, _, lead_pad, can_shift_pad = _compute_block_quant_alignment(
+        N, block_size, tp_rank=tp_rank
+    )
+    num_shards = 2 if is_gated else 1
+    _, _, H = w13_weight.shape
+
+    expected_w13_scale_n = num_shards * (N_aligned // block_n)
+    expected_w2_scale_k = N_aligned // block_k
+
+    w13_needs_pad = w13_weight.shape[1] != num_shards * N_aligned
+    w2_needs_pad = w2_weight.shape[2] != N_aligned
+    w13_scale_needs_pad = (
+        w13_scale is not None
+        and w13_scale.dim() == 3
+        and w13_scale.shape[1] != expected_w13_scale_n
+    )
+    w2_scale_needs_pad = (
+        w2_scale is not None
+        and w2_scale.dim() == 3
+        and w2_scale.shape[2] != expected_w2_scale_k
+    )
+
+    if not (w13_needs_pad or w2_needs_pad or w13_scale_needs_pad or w2_scale_needs_pad):
+        return w13_weight, w13_scale, w2_weight, w2_scale, N_aligned
+
+    if can_shift_pad:
+        if w13_needs_pad:
+            w13_weight = _pad_moe_shards(
+                w13_weight, num_shards, N_aligned, dim=1, lead_pad=lead_pad
+            )
+        if w13_scale_needs_pad:
+            if w13_scale.shape[1] % num_shards == 0:
+                w13_scale = _pad_moe_shards(
+                    w13_scale,
+                    num_shards,
+                    N_aligned // block_n,
+                    dim=1,
+                    fill_value=1.0,
+                )
+            else:
+                w13_scale = _pad_moe_shards(
+                    w13_scale, 1, expected_w13_scale_n, dim=1, fill_value=1.0
+                )
+        if w2_needs_pad:
+            w2_weight = _pad_moe_shards(
+                w2_weight, 1, N_aligned, dim=2, lead_pad=lead_pad
+            )
+        if w2_scale_needs_pad:
+            w2_scale = _pad_moe_shards(
+                w2_scale, 1, expected_w2_scale_k, dim=2, fill_value=1.0
+            )
+        return w13_weight, w13_scale, w2_weight, w2_scale, N_aligned
+
+    # Straddled block-boundary path: re-quantize batched experts using exact scales.
+    g0 = tp_rank * N
+    g1 = g0 + N
+    fp8_types = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_w = w13_weight.dtype in fp8_types and w2_weight.dtype in fp8_types
+    q_max = (
+        float(fp8_max)
+        if w13_weight.dtype == fp8_dtype
+        else (
+            float(torch.finfo(w13_weight.dtype).max)
+            if w13_weight.dtype in fp8_types
+            else 0.0
+        )
+    )
+
+    if w13_scale is not None and w13_scale.dim() == 3 and is_fp8_w:
+        orig_shard_n = w13_weight.shape[1] // num_shards
+        span_n = ((g1 + block_n - 1) // block_n) - (g0 // block_n)
+        if w13_scale.shape[1] == num_shards * span_n:
+            local_row_off = g0 - (g0 // block_n) * block_n
+            scale_shard_blocks = span_n
+        else:
+            local_row_off = 0
+            scale_shard_blocks = w13_scale.shape[1] // num_shards
+        q_shards, s_shards = [], []
+        for s in range(num_shards):
+            q_tile, s_tile = _requantize_block_fp8_3d_slice(
+                w13_weight[:, s * orig_shard_n : (s + 1) * orig_shard_n, :],
+                w13_scale[:, s * scale_shard_blocks : (s + 1) * scale_shard_blocks, :],
+                N_aligned,
+                H,
+                block_n,
+                block_k,
+                local_row_off,
+                0,
+                q_max,
+                w13_scale.dtype,
+            )
+            q_shards.append(q_tile)
+            s_shards.append(s_tile)
+        w13_weight = torch.cat(q_shards, dim=1) if num_shards > 1 else q_shards[0]
+        w13_scale = torch.cat(s_shards, dim=1) if num_shards > 1 else s_shards[0]
+    elif w13_needs_pad:
+        w13_weight = _pad_moe_shards(w13_weight, num_shards, N_aligned, dim=1)
+
+    if w2_scale is not None and w2_scale.dim() == 3 and is_fp8_w:
+        span_k = ((g1 + block_k - 1) // block_k) - (g0 // block_k)
+        local_col_off = (
+            g0 - (g0 // block_k) * block_k if w2_scale.shape[2] == span_k else 0
+        )
+        w2_weight, w2_scale = _requantize_block_fp8_3d_slice(
+            w2_weight,
+            w2_scale,
+            H,
+            N_aligned,
+            block_n,
+            block_k,
+            0,
+            local_col_off,
+            q_max,
+            w2_scale.dtype,
+        )
+    elif w2_needs_pad:
+        w2_weight = _pad_moe_shards(w2_weight, 1, N_aligned, dim=2)
+
+    return w13_weight, w13_scale, w2_weight, w2_scale, N_aligned
+
+
 def _tp_refined_moe_block_sizes(
     *,
     weight_block_size: List[int],
@@ -1656,6 +1890,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # weight_block_size (then w13's) for a TP shard that splits checkpoint
         # blocks; see _tp_refined_moe_block_sizes. None means weight_block_size.
         self.w2_weight_block_size: Optional[List[int]] = None
+        self.weights_padded_for_block_quant: bool = False
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
@@ -1737,6 +1972,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and not self.is_deepgemm_moe_runner_backend_enabled()
         )
 
+    def _supports_blockwise_fp8_padding(self, layer: Module) -> bool:
+        """Whether unaligned block-FP8 MoE weights can be zero-padded after loading."""
+        return (
+            self.block_quant
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+            and not self._supports_blockwise_fp8_tail(layer)
+            and not _use_aiter
+            and not _is_cpu
+            and not (_is_xpu and not get_moe_runner_backend().is_triton())
+        )
+
     @staticmethod
     def create_fp8_moe_weight_(
         layer: Module,
@@ -1754,6 +2001,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         weight_block_size: Optional[List[int]] = None,
         w2_weight_block_size: Optional[List[int]] = None,
         allow_fp8_blockwise_tail: bool = False,
+        allow_fp8_blockwise_pad: bool = False,
         **extra_weight_attrs,
     ):
         """
@@ -1788,17 +2036,30 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 (_use_aiter and padding_size == block_n == block_k)
                 or allow_fp8_blockwise_tail
             ):
-                # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-                # Required by column parallel or enabling merged weights
-                if intermediate_size_per_partition % block_n != 0:
-                    raise ValueError(
-                        f"The output_size of gate's and up's weight = "
-                        f"{intermediate_size_per_partition} is not divisible by "
-                        f"weight quantization block_n = {block_n}."
-                    )
-                if tp_size > 1:
-                    # Required by row parallel
-                    if intermediate_size_per_partition % block_k != 0:
+                if intermediate_size_per_partition % block_n != 0 or (
+                    tp_size > 1 and intermediate_size_per_partition % block_k != 0
+                ):
+                    if allow_fp8_blockwise_pad:
+                        logger.warning_once(
+                            "MoE intermediate_size_per_partition=%d is not divisible by "
+                            "FP8 weight_block_size=(%d, %d) at tp_size=%d; weights and "
+                            "scales will be zero-padded to block alignment in "
+                            "process_weights_after_loading.",
+                            intermediate_size_per_partition,
+                            block_n,
+                            block_k,
+                            tp_size,
+                        )
+                    elif intermediate_size_per_partition % block_n != 0:
+                        # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
+                        # Required by column parallel or enabling merged weights
+                        raise ValueError(
+                            f"The output_size of gate's and up's weight = "
+                            f"{intermediate_size_per_partition} is not divisible by "
+                            f"weight quantization block_n = {block_n}."
+                        )
+                    else:
+                        # Required by row parallel
                         raise ValueError(
                             f"The input_size of down's weight = "
                             f"{intermediate_size_per_partition} is not divisible by "
@@ -1927,14 +2188,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
             w13_block_n, w13_block_k = weight_block_size
             w2_block_n, w2_block_k = w2_weight_block_size
-            # A blockwise tail keeps one merged w13 grid of ceil(2 * I / block_n) rows.
-            w13_scale_rows = (
-                (w13_num_shards * intermediate_size_per_partition + w13_block_n - 1)
-                // w13_block_n
-                if allow_fp8_blockwise_tail
-                else w13_num_shards
-                * ((intermediate_size_per_partition + w13_block_n - 1) // w13_block_n)
-            )
+            if allow_fp8_blockwise_tail:
+                # A blockwise tail keeps one merged w13 grid of ceil(2 * I / block_n) rows.
+                w13_scale_rows = (
+                    w13_num_shards * intermediate_size_per_partition + w13_block_n - 1
+                ) // w13_block_n
+                w2_blocks_k = (
+                    intermediate_size_per_partition + w2_block_k - 1
+                ) // w2_block_k
+            else:
+                tp_rank = (
+                    0
+                    if (use_mxfp8 or getattr(layer, "use_presharded_weights", False))
+                    else getattr(layer, "moe_tp_rank", 0)
+                )
+                g0 = tp_rank * intermediate_size_per_partition
+                g1 = g0 + intermediate_size_per_partition
+                w13_blocks_per_shard = ((g1 + w13_block_n - 1) // w13_block_n) - (
+                    g0 // w13_block_n
+                )
+                w13_scale_rows = w13_num_shards * w13_blocks_per_shard
+                w2_blocks_k = ((g1 + w2_block_k - 1) // w2_block_k) - (g0 // w2_block_k)
             w13_weight_scale = torch.nn.Parameter(
                 scale_init(
                     num_experts,
@@ -1948,7 +2222,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 scale_init(
                     num_experts,
                     (hidden_size + w2_block_n - 1) // w2_block_n,
-                    (intermediate_size_per_partition + w2_block_k - 1) // w2_block_k,
+                    w2_blocks_k,
                     dtype=scale_dtype,
                 ),
                 requires_grad=False,
@@ -2068,6 +2342,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
         )
+        allow_fp8_blockwise_pad = (
+            self.w2_weight_block_size is None
+            and self.weight_block_size == self.quant_config.weight_block_size
+            and self._supports_blockwise_fp8_padding(layer)
+        )
         Fp8MoEMethod.create_fp8_moe_weight_(
             layer=layer,
             num_experts=num_experts,
@@ -2083,6 +2362,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             weight_block_size=self.weight_block_size,
             w2_weight_block_size=self.w2_weight_block_size,
             allow_fp8_blockwise_tail=self._supports_blockwise_fp8_tail(layer),
+            allow_fp8_blockwise_pad=allow_fp8_blockwise_pad,
             **extra_weight_attrs,
         )
 
@@ -2423,6 +2703,76 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         runner_backend = self.get_moe_runner_backend(layer)
         runner_is_aiter = runner_backend is not None and runner_backend.is_aiter()
+
+        if (
+            not self.is_fp4_expert
+            and self.quant_config.weight_block_size is not None
+            and self.w2_weight_block_size is None
+            and self.weight_block_size == self.quant_config.weight_block_size
+            and self._supports_blockwise_fp8_padding(layer)
+        ):
+            is_gated = (
+                layer.moe_runner_config.is_gated
+                if hasattr(layer, "moe_runner_config")
+                else True
+            )
+            orig_n = layer.w2_weight.shape[2]
+            tp_rank = (
+                0
+                if getattr(layer, "use_presharded_weights", False)
+                else getattr(layer, "moe_tp_rank", 0)
+            )
+            block_size = self.quant_config.weight_block_size
+            w13_w, w13_s, w2_w, w2_s, aligned_n = align_fp8_moe_weights_for_block_quant(
+                layer.w13_weight.data,
+                layer.w13_weight_scale_inv.data,
+                layer.w2_weight.data,
+                layer.w2_weight_scale_inv.data,
+                block_size,
+                is_gated=is_gated,
+                tp_rank=tp_rank,
+            )
+            if (
+                aligned_n != orig_n
+                or w13_w is not layer.w13_weight.data
+                or w2_w is not layer.w2_weight.data
+                or w13_s is not layer.w13_weight_scale_inv.data
+                or w2_s is not layer.w2_weight_scale_inv.data
+            ):
+                layer.w13_weight.data = w13_w
+                layer.w2_weight.data = w2_w
+                layer.w13_weight_scale_inv.data = w13_s
+                layer.w2_weight_scale_inv.data = w2_s
+                if (
+                    aligned_n != orig_n
+                    and getattr(layer, "w13_weight_bias", None) is not None
+                ):
+                    num_shards = 2 if is_gated else 1
+                    _, _, bias_lead_pad, _ = _compute_block_quant_alignment(
+                        orig_n, block_size, tp_rank=tp_rank
+                    )
+                    layer.w13_weight_bias.data = _pad_moe_shards(
+                        layer.w13_weight_bias.data,
+                        num_shards,
+                        aligned_n,
+                        dim=1,
+                        lead_pad=bias_lead_pad,
+                    )
+                self.weights_padded_for_block_quant = aligned_n != orig_n
+                layer.intermediate_pad = aligned_n - orig_n
+                layer.intermediate_size_per_partition = aligned_n
+                if hasattr(layer, "moe_runner_config"):
+                    layer.moe_runner_config.intermediate_size_per_partition = aligned_n
+                if (
+                    hasattr(self, "moe_runner_config")
+                    and self.moe_runner_config is not None
+                ):
+                    self.moe_runner_config.intermediate_size_per_partition = aligned_n
+                if aligned_n != orig_n and getattr(
+                    self, "_cutlass_buffers_ready", False
+                ):
+                    self._cutlass_buffers_ready = False
+                    self._ensure_cutlass_buffers_initialized(layer)
 
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
