@@ -612,6 +612,14 @@ def async_h2d(args: List, *, dtype: torch.dtype, device: torch.device) -> torch.
     return torch.tensor(args, dtype=dtype, pin_memory=pin).to(device, non_blocking=pin)
 
 
+def rows_where(mask: torch.Tensor, count: int) -> torch.Tensor:
+    """The indices of the 1-D ``mask``'s True entries, ascending. The caller knows
+    their ``count`` on the host, so unlike ``nonzero`` this never syncs."""
+    if count == mask.numel():
+        return torch.arange(count, device=mask.device)
+    return torch.argsort(mask.logical_not().to(torch.uint8), stable=True)[:count]
+
+
 def async_h2d_stack(
     tensors: List[torch.Tensor], *, device: torch.device
 ) -> torch.Tensor:

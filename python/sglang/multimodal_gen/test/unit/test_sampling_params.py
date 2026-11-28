@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import importlib
+import logging
 import math
 import pkgutil
 import unittest
@@ -685,6 +686,154 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
 
         self.assertEqual((cloned.width, cloned.height), (1024, 1024))
         self.assertEqual((cloned.requested_width, cloned.requested_height), (1000, 999))
+
+
+# Request sizes fed to every model below; "float" pins how a non-int size is handled.
+_SIZE_CASES = {
+    "aligned": (1024, 512),
+    "unaligned": (1000, 520),
+    "below_multiple": (10, 1000),
+    "width_none": (None, 520),
+    "height_none": (1000, None),
+    "both_none": (None, None),
+    "zero": (0, 520),
+    "negative": (-16, 520),
+    "negative_and_none": (-16, None),
+    "float": (1000.0, 520),
+}
+_SIZE_CASES_WITHOUT_NONE = (
+    "aligned",
+    "unaligned",
+    "below_multiple",
+    "zero",
+    "negative",
+)
+
+# Final (width, height, warned) per case.
+_UNCHANGED = {name: (*size, False) for name, size in _SIZE_CASES.items()}
+# A missing or non-positive side leaves both sides alone.
+_KEEP_16 = {
+    **_UNCHANGED,
+    "unaligned": (992, 512, True),
+    "below_multiple": (16, 992, True),
+    "float": (992.0, 512, True),
+}
+
+
+def _size_alignment_models():
+    """(row id, label, multiple, sampling params cls, pipeline config, {path: expected})."""
+    from sglang.multimodal_gen.configs.pipeline_configs.anima import (
+        AnimaPipelineConfig,
+    )
+    from sglang.multimodal_gen.configs.pipeline_configs.diffusers_generic import (
+        DiffusersGenericPipelineConfig,
+    )
+    from sglang.multimodal_gen.configs.sample.anima import AnimaSamplingParams
+
+    diffusers = DiffusersGenericPipelineConfig()
+
+    def both(table):
+        return {"adjust": table, "warmup": table, "init": _UNCHANGED}
+
+    unchanged = both(_UNCHANGED)
+    return [
+        (
+            "anima",
+            "Anima",
+            16,
+            AnimaSamplingParams,
+            AnimaPipelineConfig(),
+            both(_KEEP_16),
+        ),
+        ("anima-diffusers", "Anima", 16, AnimaSamplingParams, diffusers, unchanged),
+    ]
+
+
+class _WarningCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        message = record.getMessage()
+        if "requires dimensions divisible by" in message:
+            self.messages.append(message)
+
+
+class TestRequestSizeAlignment(unittest.TestCase):
+    """Characterizes request-size alignment for every model that rounds sizes to a grid.
+
+    Each model rounds an unaligned request down so its DiT does not reject the size
+    with an HTTP 500. Covers the _adjust hook, the warmup hook (which overwrites sizes
+    after _adjust) and construction, on the native and the non-matching backends.
+    """
+
+    def _run(self, path, cls, pipeline_config, size):
+        width, height = size
+        if path == "init":
+            return cls(width=width, height=height)
+        params = cls()
+        params.width, params.height = width, height
+        if path == "adjust":
+            server_args = SimpleNamespace(
+                pipeline_config=pipeline_config, num_gpus=1, comfyui_mode=True
+            )
+            params._adjust_visual_fields(server_args, pipeline_config)
+        else:
+            req = SimpleNamespace(extra={}, image_path=None)
+            server_args = SimpleNamespace(pipeline_config=pipeline_config)
+            params.prepare_synthetic_warmup_request_for_queue(req, server_args)
+        return params
+
+    def test_request_size_alignment(self):
+        capture = _WarningCapture()
+        # An earlier ServerArgs leaves the root level at its log_level, so set the
+        # emitting logger's own level instead of inheriting it.
+        emitter = logging.getLogger(
+            "sglang.multimodal_gen.configs.sample.sampling_params"
+        )
+        self.addCleanup(emitter.setLevel, emitter.level)
+        emitter.setLevel(logging.WARNING)
+        emitter.addHandler(capture)
+        self.addCleanup(emitter.removeHandler, capture)
+        for (
+            row_id,
+            label,
+            multiple,
+            cls,
+            pipeline_config,
+            expected_by_path,
+        ) in _size_alignment_models():
+            for path, expected_table in expected_by_path.items():
+                case_names = _SIZE_CASES_WITHOUT_NONE if path == "init" else _SIZE_CASES
+                for case in case_names:
+                    with self.subTest(model=row_id, path=path, case=case):
+                        capture.messages.clear()
+                        params = self._run(
+                            path, cls, pipeline_config, _SIZE_CASES[case]
+                        )
+                        width, height, warned = expected_table[case]
+                        defaults = cls().supported_resolutions
+                        if path == "adjust" and case == "both_none" and defaults:
+                            # _adjust fills an unset size from the first supported one.
+                            width, height = defaults[0]
+                        actual = (params.width, params.height)
+                        self.assertEqual(actual, (width, height))
+                        self.assertEqual(
+                            [type(v) for v in actual], [type(width), type(height)]
+                        )
+                        if not warned:
+                            self.assertEqual(capture.messages, [])
+                            continue
+                        requested = _SIZE_CASES[case]
+                        self.assertEqual(
+                            capture.messages,
+                            [
+                                f"{label} requires dimensions divisible by {multiple}; "
+                                f"adjusted requested resolution from "
+                                f"{requested[0]}x{requested[1]} to {width}x{height}"
+                            ],
+                        )
 
 
 if __name__ == "__main__":

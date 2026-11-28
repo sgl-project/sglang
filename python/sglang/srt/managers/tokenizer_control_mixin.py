@@ -83,6 +83,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateCacheLinkerReqInput,
+    UpdateCacheLinkerReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -141,6 +143,7 @@ _COMMUNICATOR_SPECS = [
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
     ("clear_hicache_storage", ClearHiCacheReqOutput),
+    ("update_cache_linker", UpdateCacheLinkerReqOutput),
     ("attach_hicache_storage", AttachHiCacheStorageReqOutput),
     ("detach_hicache_storage", DetachHiCacheStorageReqOutput),
     ("profile", ProfileReqOutput),
@@ -186,6 +189,16 @@ def _lora_load_needs_cleanup(results: List[LoRAUpdateOutput], lora_name: str) ->
         result.success or lora_name in (result.loaded_adapters or {})
         for result in results
     )
+
+
+def check_one_payload_per_engine_rank(payloads: List[bytes]) -> None:
+    parallel = get_parallel()
+    expected = parallel.tp_size * parallel.pp_size
+    if len(payloads) != expected:
+        raise ValueError(
+            "serialized_named_tensors must hold one payload per engine rank "
+            f"(tp_size * pp_size = {expected}), got {len(payloads)}"
+        )
 
 
 class TokenizerControlMixin:
@@ -432,6 +445,16 @@ class TokenizerControlMixin:
             )
         return out
 
+    async def update_cache_linker(
+        self: TokenizerManager, attach: bool
+    ) -> UpdateCacheLinkerReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.update_cache_linker_communicator(
+            UpdateCacheLinkerReqInput(attach=attach)
+        )
+        success, message = FanOutCommunicator.merge_results(results)
+        return UpdateCacheLinkerReqOutput(success=success, message=message)
+
     async def start_profile(
         self: TokenizerManager,
         req: Optional[ProfileReq] = None,
@@ -633,6 +656,10 @@ class TokenizerControlMixin:
         obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
             obj.serialized_named_tensors
         )
+        try:
+            check_one_payload_per_engine_rank(obj.serialized_named_tensors)
+        except ValueError as e:
+            return False, str(e)
 
         async with self.is_pause_cond:
             is_paused = self.is_pause
@@ -832,6 +859,7 @@ class TokenizerControlMixin:
             obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
                 obj.serialized_named_tensors
             )
+            check_one_payload_per_engine_rank(obj.serialized_named_tensors)
 
             async with self.lora_update_lock:
                 return await self._load_lora_adapter_locked(obj, lora_path="__tensor__")

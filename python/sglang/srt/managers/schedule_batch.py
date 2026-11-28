@@ -50,6 +50,7 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import operator
 import re
 import sys
 import weakref
@@ -149,10 +150,10 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.logit_bias import LogitBiasEntries
-from sglang.srt.sampling.sampler_params import SamplerParams
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_mask import SamplingMaskRows
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params_pool import SamplingRows
 from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
 
 if TYPE_CHECKING:
@@ -3185,8 +3186,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             vocab_size=self.model_config.vocab_size, device=self.device
         )
         # Workers launch some idle batches themselves, without the scheduler's builds.
-        self.sampling_info.set_sampler_params(SamplerParams.empty(self.device))
-        self.sampling_info.set_seeds_and_mask_rows([])
+        self.sampling_info.set_rows(SamplingRows.empty(self.device))
+        self.sampling_info.set_step_state([])
 
     def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:
         return alloc_tracking_slots(
@@ -3695,6 +3696,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
+
+
+@lru_cache(maxsize=None)
+def schedule_batch_field_names(cls: type) -> Tuple[str, ...]:
+    """The dataclass field names of a ScheduleBatch class, computed once."""
+    return tuple(f.name for f in dataclasses.fields(cls))
+
+
+@lru_cache(maxsize=None)
+def _schedule_batch_field_getter(cls: type):
+    return operator.itemgetter(*schedule_batch_field_names(cls))
+
+
+def schedule_batch_field_values(batch: ScheduleBatch) -> tuple:
+    """Every field value of ``batch``, in field order (the per-step snapshot of the
+    overlap scheduler), read in one C-level call."""
+    try:
+        return _schedule_batch_field_getter(type(batch))(batch.__dict__)
+    except KeyError:
+        # A field never assigned on this instance reads as None.
+        fields = batch.__dict__
+        names = schedule_batch_field_names(type(batch))
+        return tuple(fields.get(name) for name in names)
 
 
 class NextBatchPlan(msgspec.Struct):
