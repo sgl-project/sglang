@@ -17,6 +17,7 @@ import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.ops.diffusion.norm.channel_rmsnorm_silu_nhwc_jit import (
+    has_same_layout,
     is_channels_last_dense,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -39,14 +40,6 @@ def _jit_module(channels_inner: bool) -> Module:
     )
 
 
-def _same_layout(y: torch.Tensor, h: torch.Tensor) -> bool:
-    # strides of size-1 dims are arbitrary (a squeezed frame dim differs between
-    # a permuted view and a fresh tensor) and do not change the element order
-    return all(
-        hs == ys for size, hs, ys in zip(y.shape, h.stride(), y.stride()) if size > 1
-    )
-
-
 def _layout(y: torch.Tensor, bias: torch.Tensor, h: torch.Tensor) -> str | None:
     if not (
         y.is_cuda
@@ -60,7 +53,7 @@ def _layout(y: torch.Tensor, bias: torch.Tensor, h: torch.Tensor) -> str | None:
         and h.device == y.device
         and bias.device == y.device
         and h.shape == y.shape
-        and _same_layout(y, h)
+        and has_same_layout(y, h)
         and bias.numel() == y.shape[1]
         and bias.is_contiguous()
         and y.data_ptr() % _ALIGN == 0

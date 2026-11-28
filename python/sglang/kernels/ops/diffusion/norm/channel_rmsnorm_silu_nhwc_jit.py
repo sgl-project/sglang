@@ -69,6 +69,14 @@ def is_channels_last_dense(x: torch.Tensor) -> bool:
     )
 
 
+def has_same_layout(y: torch.Tensor, h: torch.Tensor) -> bool:
+    # strides of size-1 dims are arbitrary (a squeezed frame dim differs between
+    # a permuted view and a fresh tensor) and do not change the element order
+    return all(
+        hs == ys for size, hs, ys in zip(y.shape, h.stride(), y.stride()) if size > 1
+    )
+
+
 def _is_channel_vector(t: torch.Tensor, x: torch.Tensor, align: int) -> bool:
     return (
         t.device == x.device

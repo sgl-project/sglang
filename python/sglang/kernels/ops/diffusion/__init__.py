@@ -545,9 +545,21 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     ),
     (
         "diffusion.channel_rmsnorm_silu_nhwc",
+        KernelBackend.TRITON,
+        "norm.vae_channel_norm_triton:channel_rmsnorm_silu_nhwc_triton",
+        _HIP,
+    ),
+    (
+        "diffusion.channel_rmsnorm_silu_nhwc",
         KernelBackend.JIT,
         "norm.channel_rmsnorm_silu_nhwc_jit:channel_rmsnorm_silu_nhwc",
         _CUDA,
+    ),
+    (
+        "diffusion.bias_residual_add",
+        KernelBackend.TRITON,
+        "norm.vae_channel_norm_triton:bias_residual_add_triton",
+        _HIP,
     ),
     (
         "diffusion.bias_residual_add",
@@ -685,7 +697,7 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         "diffusion.nearest_upsample_nhwc",
         KernelBackend.TRITON,
         "layout.nearest_upsample_nhwc_triton:nearest_upsample_nhwc",
-        _CUDA,
+        frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
     ),
     (
         "diffusion.flux2_token_cat_nvfp4",
@@ -767,6 +779,10 @@ _EXPORTS: dict[str, str] = {
     "channel_rmsnorm_silu_nhwc": "norm.channel_rmsnorm_silu_nhwc_jit",
     "is_channels_last_dense": "norm.channel_rmsnorm_silu_nhwc_jit",
     "bias_residual_add": "norm.bias_residual_add_jit",
+    "bias_residual_add_triton": "norm.vae_channel_norm_triton",
+    "can_use_bias_residual_add_triton": "norm.vae_channel_norm_triton",
+    "can_use_channel_rmsnorm_silu_nhwc_triton": "norm.vae_channel_norm_triton",
+    "channel_rmsnorm_silu_nhwc_triton": "norm.vae_channel_norm_triton",
     "can_use_bias_residual_add": "norm.bias_residual_add_jit",
     "can_use_fused_rmsnorm_modulation": "norm.rmsnorm_scale_shift_bitexact",
     "can_use_fused_rmsnorm_scale_shift": "norm.rmsnorm_scale_shift_bitexact",
