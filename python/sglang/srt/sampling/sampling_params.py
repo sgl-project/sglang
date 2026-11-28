@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Union
 
 import msgspec
 
+from sglang.srt.constrained.grammar_limits import validate_grammar_limits
 from sglang.srt.environ import envs
 from sglang.srt.sampling.stop_regex import validate_stop_regex
 from sglang.srt.sampling.watermarking.config import (
@@ -358,6 +359,15 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             raise ValueError(
                 "Only one of json_schema, regex, ebnf, or structural_tag can be set."
             )
+
+        for grammar_type, grammar_value in (
+            ("json_schema", self.json_schema),
+            ("regex", self.regex),
+            ("ebnf", self.ebnf),
+            ("structural_tag", self.structural_tag),
+        ):
+            if grammar_value is not None:
+                validate_grammar_limits(grammar_type, grammar_value)
 
     def normalize(self, tokenizer):
         # Process stop strings

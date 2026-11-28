@@ -418,6 +418,43 @@ class TestNulByteGrammarRejection(unittest.TestCase):
                 dispatch.assert_called_once_with(key_string)
 
 
+class TestGrammarLimitsRejection(unittest.TestCase):
+    def setUp(self):
+        self.backend = BaseGrammarBackend()
+
+    def tearDown(self):
+        self.backend.executor.shutdown(wait=True)
+
+    def test_oversized_or_complex_payload_never_reaches_backend(self):
+        cases = (
+            ("json", "dispatch_json", '{"type":"string","pattern":"(a{100}){200}"}'),
+            ("regex", "dispatch_regex", "a|b|c|" * 20000),
+            ("ebnf", "dispatch_ebnf", "\n".join(f'r{i} ::= "x"' for i in range(600))),
+            (
+                "full_assistant_ebnf",
+                "dispatch_ebnf",
+                "\n".join(f'r{i} ::= "x"' for i in range(600)),
+            ),
+            (
+                "structural_tag",
+                "dispatch_structural_tag",
+                '{"structures":[{"begin":"<a>","schema":"{}","end":"</a>"}],'
+                '"triggers":["' + "x" * 300000 + '"]}',
+            ),
+        )
+        for key_type, dispatch_name, key_string in cases:
+            with self.subTest(key_type=key_type):
+                dispatch = MagicMock()
+                setattr(self.backend, dispatch_name, dispatch)
+
+                result = self.backend._init_value_dispatch(
+                    (key_type, key_string), False
+                )
+
+                self.assertIsInstance(result, InvalidGrammarObject)
+                dispatch.assert_not_called()
+
+
 class TestGrammarObjectRepr(unittest.TestCase):
     def test_repr_matches_across_instances(self):
         first = ReasonerGrammarObject(None, think_end_ids=[1])

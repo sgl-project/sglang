@@ -429,6 +429,33 @@ class TestSamplingParamsVerify(CustomTestCase):
             with self.subTest(grammar=grammar):
                 self._make(**{grammar: value}).verify(self.VOCAB_SIZE)
 
+    def test_grammar_size_and_complexity_limits(self):
+        """Oversized or pathological grammar constraints are rejected at verify()."""
+        cases = (
+            ("json_schema", '{"type": "string", "pattern": "(a{100}){200}"}'),
+            ("regex", "a|b|c|" * 20000),
+            ("ebnf", "\n".join(f'r{i} ::= "x"' for i in range(600))),
+            (
+                "structural_tag",
+                '{"type":"structural_tag","format":{"type":"regex","pattern":"(a{100}){200}"}}',
+            ),
+        )
+        for field, value in cases:
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    self._make(**{field: value}).verify(self.VOCAB_SIZE)
+
+        with envs.SGLANG_GRAMMAR_MAX_BYTES.override(16):
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                self._make(regex="a" * 17).verify(self.VOCAB_SIZE)
+            self._make(regex="a" * 16).verify(self.VOCAB_SIZE)
+
+        with envs.SGLANG_GRAMMAR_STRUCTURAL_TAG_MAX_BYTES.override(32):
+            with self.assertRaisesRegex(ValueError, "byte limit"):
+                self._make(structural_tag='{"triggers": ["' + "x" * 30 + '"]}').verify(
+                    self.VOCAB_SIZE
+                )
+
 
 class TestSamplingParamsNormalize(CustomTestCase):
     def _mock_tokenizer(self, encode_map=None):
