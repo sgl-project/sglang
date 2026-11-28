@@ -113,6 +113,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    _is_fake_transfer,
     decode_offloads_kvcache,
     get_dsa_seed_metadata_dim,
     lacks_decode_peer,
@@ -3681,10 +3682,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self._lacks_decode_peer(req) and req.sampling_params.max_new_tokens not in (
-            0,
-            1,
-        ):
+        standalone_prefill = self._lacks_decode_peer(req)
+        if standalone_prefill and req.sampling_params.max_new_tokens not in (0, 1):
             self._reject_bad_request(
                 req,
                 "A prefill request without a bootstrap host has no decode to "
@@ -3692,6 +3691,12 @@ class Scheduler(
                 f"max_new_tokens={req.sampling_params.max_new_tokens}.",
             )
             return
+        if req.sampling_params.max_new_tokens == 0 and (
+            self.disaggregation_mode == DisaggregationMode.NULL or standalone_prefill
+        ):
+            # The tokenizer returns empty rows. Capture has no output token,
+            # even in a mixed batch where another request runs the sampler.
+            req.return_sampling_mask = False
 
         if (
             self.disaggregation_mode != DisaggregationMode.NULL
@@ -3710,8 +3715,18 @@ class Scheduler(
             return
 
         if req.return_sampling_mask:
+            if self.disaggregation_mode == DisaggregationMode.DECODE and (
+                _is_fake_transfer(req)
+            ):
+                self._reject_bad_request(
+                    req,
+                    "Fake PD decode synthesizes its first token without a sampler. "
+                    "return_sampling_mask requires a real prefill result.",
+                )
+                return
             if (
                 self.disaggregation_mode != DisaggregationMode.NULL
+                and not standalone_prefill
                 and not self.disagg_metadata_buffers.enable_sampling_mask
             ):
                 self._reject_bad_request(

@@ -11,6 +11,7 @@ import openai
 import requests
 from transformers import AutoTokenizer
 
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv_cache_builder import BACKUP_ONLY_HICACHE_RATIO
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -187,6 +188,50 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         # Nothing would continue a longer request.
         longer = generate(self.prefill_url, prompt, 2)
         self.assertEqual(longer.status_code, 400, longer.text)
+
+    def test_sampling_mask_without_a_real_handoff(self):
+        payload = {
+            "text": "The capital of France is",
+            "sampling_params": {"temperature": 0, "max_new_tokens": 1},
+            "return_sampling_mask": True,
+            "sampling_logprobs_mode": "support",
+        }
+        response = requests.post(
+            self.prefill_url + "/generate", json=payload, timeout=60
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        (sampled_token,) = result["output_ids"]
+        self.assertEqual(
+            result["meta_info"]["output_token_sampling_mask"], [[sampled_token]]
+        )
+        self.assertEqual(result["meta_info"]["output_token_sampling_logprobs"], [[0.0]])
+
+        empty = requests.post(
+            self.prefill_url + "/generate",
+            json={
+                **payload,
+                "sampling_params": {"temperature": 0, "max_new_tokens": 0},
+            },
+            timeout=60,
+        )
+        self.assertEqual(empty.status_code, 200, empty.text)
+        result = empty.json()
+        self.assertEqual(result["output_ids"], [])
+        self.assertEqual(result["meta_info"]["output_token_sampling_mask"], [])
+        self.assertEqual(result["meta_info"]["output_token_sampling_logprobs"], [])
+
+        response = requests.post(
+            self.decode_url + "/generate",
+            json={
+                **payload,
+                "bootstrap_host": FAKE_BOOTSTRAP_HOST,
+                "bootstrap_room": 7,
+            },
+            timeout=60,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("synthesizes its first token", response.text)
 
     def test_first_token_finish(self):
         client = openai.Client(api_key="empty", base_url=f"{self.lb_url}/v1")

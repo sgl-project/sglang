@@ -1010,7 +1010,9 @@ class MetadataBuffers:
                     dtype=torch.int32,
                     device="cpu",
                 )
-        if req.return_sampling_mask:
+        # A standalone prefill returns its sampled row directly to the client.
+        # Only a real handoff requires the optional wire buffers at admission.
+        if req.return_sampling_mask and self.enable_sampling_mask:
             # Prefill streams a request only once its KV transfer ends or it aborts,
             # so the first token's row is the only one queued here.
             chunk = req.sampling_mask_rows.view()

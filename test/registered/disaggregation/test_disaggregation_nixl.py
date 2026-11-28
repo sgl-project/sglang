@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import unittest
 import uuid
@@ -213,7 +214,71 @@ class TestDisaggregationNixlBasic(NixlPDDisaggregationServerBase):
         super().setUpClass()
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         configure_nixl_pd_backend(cls)
+        cls.extra_prefill_env = cls.extra_decode_env = {
+            "SGLANG_ENABLE_DISAGG_SAMPLING_MASK": "1"
+        }
+        cls.extra_prefill_args = cls.extra_decode_args = [
+            "--sampling-mask-max-tokens",
+            "2",
+            "--sampling-backend",
+            "flashinfer",
+        ]
         cls.launch_all()
+
+    def test_sampling_mask_across_prefill_and_decode(self):
+        def generate(url, biased_ids, mode, tokens, return_logprob=False):
+            # Equal float32 logits give a known distribution on both workers.
+            return requests.post(
+                url + "/generate",
+                json={
+                    "text": "The capital of France is",
+                    "sampling_params": {
+                        "top_k": 2,
+                        "top_p": 0.95,
+                        "ignore_eos": True,
+                        "max_new_tokens": tokens,
+                        "logit_bias": {str(i): 1e20 for i in biased_ids},
+                    },
+                    "return_sampling_mask": True,
+                    "sampling_logprobs_mode": mode,
+                    "return_logprob": return_logprob,
+                },
+                timeout=90,
+            )
+
+        # FlashInfer retains ties at the top-k cutoff. All three tokens belong
+        # to the first row, which cannot be sent through the two-entry wire buffer.
+        direct = generate(self.prefill_url, [10, 11, 12], "support", 1)
+        self.assertEqual(direct.status_code, 400, direct.text)
+        self.assertIn("Sampling support exceeds", direct.text)
+        # Merging prompt logprobs makes the router wait for prefill and pass its
+        # rejection through even if decode reports the failed transfer first.
+        overflow = generate(
+            self.lb_url, [10, 11, 12], "support", 3, return_logprob=True
+        )
+        self.assertEqual(overflow.status_code, 400, overflow.text)
+        self.assertIn("Sampling support exceeds", overflow.text)
+        self.assertNotIn("output_token_sampling_mask", overflow.text)
+
+        for mode in ("selected", "support"):
+            with self.subTest(mode=mode):
+                response = generate(self.lb_url, [10, 11], mode, 3)
+                self.assertEqual(response.status_code, 200, response.text)
+                result = response.json()
+                self.assertEqual(len(result["output_ids"]), 3)
+                meta = result["meta_info"]
+                for token, ids, logprobs in zip(
+                    result["output_ids"],
+                    meta["output_token_sampling_mask"],
+                    meta["output_token_sampling_logprobs"],
+                    strict=True,
+                ):
+                    self.assertCountEqual(ids, [10, 11])
+                    self.assertIn(token, ids)
+                    values = logprobs if mode == "support" else [logprobs]
+                    self.assertEqual(len(values), 2 if mode == "support" else 1)
+                    for value in values:
+                        self.assertAlmostEqual(value, -math.log(2), places=5)
 
     def test_completion_returns_text_and_workers_stay_alive(self):
         response = requests.post(
