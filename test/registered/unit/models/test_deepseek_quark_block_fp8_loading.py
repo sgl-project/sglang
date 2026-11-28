@@ -66,7 +66,7 @@ def _weight_updater(model):
         tp_rank=0,
         device="cpu",
         gpu_id=0,
-        model_config=SimpleNamespace(dtype=torch.float32),
+        model_config=SimpleNamespace(dtype=torch.float32, model_path="unused"),
         custom_weight_loaders={},
         get_model=lambda: model,
         update_model_fields=MagicMock(),

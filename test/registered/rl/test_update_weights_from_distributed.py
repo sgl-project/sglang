@@ -1,4 +1,8 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 """Test distributed weight updates.
 
@@ -29,7 +33,8 @@ import torch.multiprocessing as mp
 from transformers import AutoModelForCausalLM
 
 import sglang as sgl
-from sglang.srt.utils import init_custom_process_group
+from sglang.srt.distributed.parallel_state import get_default_distributed_backend
+from sglang.srt.utils import get_device, get_device_module, init_custom_process_group
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
     ADMIN_HEADERS_FOR_TEST,
@@ -48,6 +53,7 @@ from sglang.utils import terminate_process
 
 register_cuda_ci(est_time=110, stage="extra-a", runner_config="2-gpu-large")
 register_amd_ci(est_time=160, suite="extra-a-test-2-gpu-large-amd")
+register_xpu_ci(est_time=200, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
 mp.set_start_method("spawn", force=True)
 
@@ -141,7 +147,7 @@ def init_process(
     barrier,
     pause_generation_mode,
 ):
-    torch.cuda.set_device(rank)
+    get_device_module().set_device(rank)
 
     if rank == 0:
         init_process_hf(
@@ -196,13 +202,13 @@ def init_process_hf(
         model_name,
         torch_dtype="bfloat16",
         tie_word_embeddings=tie_word_embeddings,
-    ).to("cuda:0")
+    ).to(get_device(0))
     base_model_name = model_name.replace("-Instruct", "")
     hf_base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
         torch_dtype="bfloat16",
         tie_word_embeddings=tie_word_embeddings,
-    ).to("cuda:0")
+    ).to(get_device(0))
 
     hf_instruct_params = []
     hf_base_params = []
@@ -234,13 +240,13 @@ def init_process_hf(
     init_method = f"tcp://localhost:{port}"
     print(f"[hf] {rank=} {world_size=} init custom process group. {init_method=}")
     group = init_custom_process_group(
-        backend="nccl",
+        backend=get_default_distributed_backend(get_device()),
         init_method=init_method,
         world_size=world_size,
         rank=rank,
         group_name="test_parameter_update_group",
     )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     barrier.wait()
 
     # Warmup: trigger RCCL initialization so it's excluded from timing
@@ -252,7 +258,7 @@ def init_process_hf(
             load_format,
             group,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
 
     time_begin_broadcast = time.perf_counter()
 
@@ -280,7 +286,7 @@ def init_process_hf(
                 src=0,
                 group=group,
             )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     time_end_broadcast = time.perf_counter()
 
     # Measure the latency of broadcasting/weights update.
@@ -295,7 +301,7 @@ def init_process_hf(
     del hf_instruct_model
     del hf_base_model
     gc.collect()
-    torch.cuda.empty_cache()
+    get_device_module().empty_cache()
 
 
 def init_process_sgl(
@@ -313,8 +319,8 @@ def init_process_sgl(
     barrier,
     pause_generation_mode,
 ):
-    torch.cuda.set_device(rank)
-    torch.cuda.synchronize()
+    get_device_module().set_device(rank)
+    get_device_module().synchronize()
     base_gpu_id = 1 if rank == 1 else 1 + tp_size
     if backend == "Engine":
         print(f"[sgl] rank {rank} init engine")
@@ -346,7 +352,7 @@ def init_process_sgl(
                 *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ),
         )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
 
     # Get weights of instruct model, i.e. pre-training weights.
     instruct_params = []
@@ -373,7 +379,7 @@ def init_process_sgl(
             rank_offset=base_gpu_id,
             world_size=world_size,
             group_name="test_parameter_update_group",
-            backend="nccl",
+            backend=get_default_distributed_backend(get_device()),
         )
     else:
         admin_post(
@@ -384,7 +390,7 @@ def init_process_sgl(
                 "rank_offset": base_gpu_id,
                 "world_size": world_size,
                 "group_name": "test_parameter_update_group",
-                "backend": "nccl",
+                "backend": get_default_distributed_backend(get_device()),
             },
         )
 
@@ -429,7 +435,7 @@ def init_process_sgl(
             url + "/pause_generation",
             json={"mode": pause_generation_mode},
         )
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     barrier.wait()
 
     # Warmup: trigger RCCL initialization so it's excluded from timing
@@ -444,7 +450,7 @@ def init_process_sgl(
             load_format,
             pause_generation_mode,
         )
-        torch.cuda.synchronize()
+        get_device_module().synchronize()
 
     time_begin_update = time.perf_counter()
     if backend == "Engine":
@@ -471,7 +477,7 @@ def init_process_sgl(
             },
         )
         admin_post(f"{url}/end_weight_update", json={})
-    torch.cuda.synchronize()
+    get_device_module().synchronize()
     time_end_update = time.perf_counter()
     if pause_generation_mode in ["in_place", "retract"]:
         admin_post(
@@ -720,13 +726,17 @@ def test_update_weights_from_distributed(
     param_queue.close()
     param_queue.join_thread()
     gc.collect()
-    torch.cuda.empty_cache()
+    get_device_module().empty_cache()
+
+
+# Helper, not a case: pytest collects it by name and then wants a tp_size fixture.
+test_update_weights_from_distributed.__test__ = False
 
 
 class TestUpdateWeightsFromDistributed(CustomTestCase):
     def test_update_weights_from_distributed(self):
 
-        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
+        assert get_device_module().device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend
         if is_in_ci():
             mode = random.choice(["Engine", "Server"])
@@ -765,7 +775,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                 ),
             ]
 
-            if torch.cuda.device_count() >= 4:
+            if get_device_module().device_count() >= 4:
                 test_suits.extend(
                     [
                         (
@@ -787,7 +797,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
                     ]
                 )
 
-            if torch.cuda.device_count() >= 5:
+            if get_device_module().device_count() >= 5:
                 test_suits.extend(
                     [
                         (
@@ -815,7 +825,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
         for model_name in test_models:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name, torch_dtype="bfloat16"
-            ).to("cuda:0")
+            ).to(get_device(0))
             state_dict = model.state_dict()
             state_dict_keys = list(state_dict.keys())
             model_state_dict_shapes[model_name] = {
@@ -823,7 +833,7 @@ class TestUpdateWeightsFromDistributed(CustomTestCase):
             }
             del model
             gc.collect()
-            torch.cuda.empty_cache()
+            get_device_module().empty_cache()
 
         truncate_size = 10
         checking_parameters = [
