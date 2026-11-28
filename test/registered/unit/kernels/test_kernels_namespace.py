@@ -273,6 +273,19 @@ class TestCakeSoftmaxCapability(CustomTestCase):
         self.assertFalse(spec.is_available(_CPU))
         self.assertFalse(spec.is_available(_HIP))
 
+    def test_sampling_softmax_triton_registry_capabilities(self):
+        spec = K.select_kernel("sampling.softmax", backend=KernelBackend.TRITON)
+        self.assertEqual(
+            spec.target,
+            "sglang.kernels.ops.sampling.softmax_triton:temperature_softmax",
+        )
+        self.assertTrue(spec.is_available(_SM90))
+        self.assertTrue(spec.is_available(_SM100))
+        self.assertTrue(spec.is_available(_HIP))
+        self.assertFalse(spec.is_available(_CPU))
+        self.assertFalse(spec.is_available(_MUSA))
+        self.assertFalse(spec.is_available(PlatformInfo(device_type="npu")))
+
 
 @pytest.mark.parametrize(
     "relative_path",

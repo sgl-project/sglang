@@ -279,11 +279,12 @@ class Sampler(nn.Module):
                         logprobs_via_logsoftmax_kernel = (
                             torch.nn.functional.log_softmax(logits, dim=-1)
                         )
-                    logits[:] = torch.softmax(logits, dim=-1)
+                    probs = torch.softmax(logits, dim=-1)
                 else:
                     # Temperature fused; the probs overwrite the logits in place.
-                    sampler_softmax(logits, sampling_info.temperatures, out=logits)
-                probs = logits
+                    probs = sampler_softmax(
+                        logits, sampling_info.temperatures, out=logits
+                    )
 
                 batch_next_token_ids, sampling_mask_capture = self._sample_from_probs(
                     probs,
