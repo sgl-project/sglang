@@ -10,11 +10,19 @@ values that loading changed, and checks the result. Nothing is ever
 post-processed again, nothing is imported by a name in a snapshot, and no
 code in a snapshot runs.
 
+Loading may add objects, if they are data (format 2): a module of a listed
+SGLang class (the reader makes an empty one, without running its constructor,
+and gets its parameters, buffers and attributes like any other module's), a
+NamedTuple of a listed class, and a reference to an object the model was
+built with that loading moved to another place unchanged (the reader's own).
+A module that loading replaced or re-classed is still refused.
+
 It shares nothing with the validator but the schema.
 """
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import logging
 import sys
@@ -38,6 +46,7 @@ from sglang.srt.weight_cache.load_diff_format import (
     Local,
     Manifest,
     ModuleLevel,
+    NewModule,
     Place,
     Registration,
     Registry,
@@ -59,11 +68,14 @@ from sglang.srt.weight_cache.load_diff_format import (
     encode_value,
     first_paths,
     is_data_leaf,
+    is_named_tuple,
     items_of,
     leaf_key,
     make_view,
+    object_state,
     parse_dtype,
     path_str,
+    rebuildable_class,
     resolve_path,
     step_into,
     storage_digests,
@@ -96,7 +108,19 @@ def record_construction(model: nn.Module) -> Any:
         name: tuple((f, k, _weak(h) or h) for f, k, h in _hooks(m))
         for name, m in model.named_modules()
     }
+    states = {
+        path: object_state(walk.objects[path])
+        for path, desc in walk.values.items()
+        if desc[0] == "o" and path in refs
+    }
+    int_tensors = {
+        path: digest
+        for path, tensor in walk.tensors.items()
+        if (digest := _int_digest(tensor)) is not None
+    }
     return Baseline(
+        states=states,
+        int_tensors=int_tensors,
         model=weakref.ref(model),
         structure=structure_digest(model),
         modules={name: (type(m), _weak(m)) for name, m in walk.modules},
@@ -118,9 +142,9 @@ def export(
     one allocation (contiguous, offset 0) on the model's device or the CPU,
     named by first use; storages of no bytes are left out (the reader makes
     them). Raises SnapshotError listing everything a reader could not get: a
-    value that is not data, a module added or replaced, hooks added or
-    removed, a tensor on another device, a module-level object that loading
-    changed."""
+    value that is not data, a module replaced, or added and not one a reader
+    can make again, hooks added or removed, a tensor on another device, a
+    module-level object that loading changed."""
     if not isinstance(constructed, Baseline) or constructed.model() is not model:
         raise SnapshotError(
             "cannot hand the loaded model to a reader",
@@ -129,14 +153,18 @@ def export(
     tic = time.perf_counter()
     device = _model_device(model)
     after = walk_model(model, module_level=constructed.module_level, keep_objects=True)
-    modules_now, removed, problems = _module_changes(constructed, after, model)
+    modules_now, removed, new_modules, problems = _module_changes(
+        constructed, after, model
+    )
     problems += _localize(after, device)
     table = build_storage_table(after.tensors, device)
     problems += table.problems
     tensor_ids, tensors = _tensor_entries(after, table)
     ctx = _encode_context(constructed, after, table, tensor_ids, device)
-    ops = _diff(constructed, after, ctx, modules_now, problems)
+    ops = _diff(constructed, after, ctx, modules_now, new_modules, problems)
+    problems += _moved_problems(constructed, after, ctx)
     problems += _address_keys(after, ctx)
+    problems += _address_tensors(constructed, after, ctx)
     if problems:
         raise SnapshotError("cannot hand the loaded model to a reader", problems)
     t_digest = time.perf_counter()
@@ -156,6 +184,8 @@ def export(
         boundaries=[encode_path(path) for path in after.boundaries],
         removed_modules=removed,
         local=_locals(after),
+        new_modules=new_modules,
+        built=[encode_path(path) for path in ctx.moved],
     )
     payload = encode_manifest(manifest)
     decode_manifest(payload)  # what a reader gets passes a reader's checks
@@ -202,9 +232,11 @@ def install(
     byte and leaves the skeleton and the process as they are. It checks what
     can be known before any byte moves: the manifest decodes and is valid,
     the storages are the manifest's by name and size, the reader built the
-    owner's structure, and every module the manifest writes to exists. It
-    does not replay the value operations: one that cannot be applied fails
-    in the real install, as do the storages' devices and the digests.
+    owner's structure, every module the manifest writes to exists or is one
+    loading added (of a class this reader makes again, under a parent it
+    has), and the reader holds an object at every ``built`` path. It does
+    not replay the value operations: one that cannot be applied fails in the
+    real install, as do the storages' devices and the digests.
 
     ``storages`` must be exactly ``manifest.storages``: the same names, sizes
     and devices. A registered tensor keeps the identity of the one the reader
@@ -218,8 +250,9 @@ def install(
         _dry_run(skeleton, m, manifest.storages, storages)
         return skeleton
     device = _check_storages(m, manifest.storages, storages)
-    tensors, swapped = _install(skeleton, m, storages, device)
-    stats = check_install(skeleton, m, tensors, device)
+    built = _built_objects(skeleton, m)  # before anything is changed
+    tensors, swapped = _install(skeleton, m, storages, device, built)
+    stats = check_install(skeleton, m, tensors, device, built)
     stats.update(
         tensors=len(tensors), swapped=swapped, ops=len(m.ops), local=len(m.local)
     )
@@ -286,6 +319,8 @@ class Baseline(msgspec.Struct):
     refs: Dict[tuple, Any]
     module_level: ModuleLevel
     problems: List[str]
+    states: Dict[tuple, Any] = {}  # object_state of each object in refs
+    int_tensors: Dict[tuple, bytes] = {}  # _int_digest of the tensors that have one
 
     def same(self, path: tuple, value: Any) -> bool:
         """Whether ``value`` is the object the model held at ``path`` when it
@@ -299,24 +334,46 @@ class Baseline(msgspec.Struct):
 
 def _module_changes(
     baseline: Baseline, after: Walk, model: nn.Module
-) -> Tuple[Dict[str, int], List[str], List[str]]:
-    """The modules now (name -> id), the names loading removed, and the
-    problems: modules added, replaced or re-classed, hooks changed, and what
-    the walks could not read."""
+) -> Tuple[Dict[str, int], List[str], List[NewModule], List[str]]:
+    """The modules now (name -> id), the names loading removed, the modules
+    loading added that a reader can make again (parents first), and the
+    problems: modules replaced, re-classed or added otherwise, hooks changed,
+    and what the walks could not read."""
     problems = list(after.problems) + list(baseline.problems)
+    built_ids = {
+        id(ref())
+        for _, ref in baseline.modules.values()
+        if ref is not None and ref() is not None
+    }
+    # Also one that the model held outside its module tree (in a list, say)
+    built_ids.update(
+        id(ref()) for ref in baseline.refs.values() if isinstance(ref(), nn.Module)
+    )
     modules_now: Dict[str, int] = {}
+    added: Dict[int, Tuple[nn.Module, List[str]]] = {}
     for name, module in after.modules:
         modules_now[name] = id(module)
         built = baseline.modules.get(name)
-        if built is None or built[1] is None or built[1]() is not module:
-            what = "added" if built is None else "replaced"
-        elif built[0] is not type(module):
+        cls = type(module)
+        if built is not None and built[1] is not None and built[1]() is module:
+            if built[0] is cls:
+                continue
             what = "re-classed"
+        elif built is not None:
+            what = "replaced"
+        elif id(module) in built_ids:
+            what = "put under another name"
         else:
-            continue
+            try:
+                known = rebuildable_class(cls.__module__, cls.__qualname__, nn.Module)
+            except KeyError:
+                known = None
+            if known is cls:
+                added.setdefault(id(module), (module, []))[1].append(name)
+                continue
+            what = "added"
         problems.append(
-            f"{name or '<model>'}: a {type(module).__qualname__} module that "
-            f"loading {what}"
+            f"{name or '<model>'}: a {cls.__qualname__} module that loading {what}"
         )
     removed = [name for name in baseline.modules if name not in modules_now]
     for name, module in model.named_modules():
@@ -324,7 +381,61 @@ def _module_changes(
             problems.append(
                 f"{name or '<model>'}: loading added, removed or reordered hooks"
             )
-    return modules_now, removed, problems
+    new_modules = [
+        NewModule(
+            names,
+            type(module).__module__,
+            type(module).__qualname__,
+            bool(vars_of(module).get("training", True)),
+        )
+        for module, names in added.values()
+    ]
+    problems += _replay_problems(baseline, after, modules_now, new_modules)
+    return modules_now, removed, new_modules, problems
+
+
+def _replay_problems(
+    baseline: Baseline,
+    after: Walk,
+    modules_now: Dict[str, int],
+    new_modules: Sequence[NewModule],
+) -> List[str]:
+    """A reader puts the added modules under their names in the manifest's
+    order, after the children it built: the problems are a parent whose
+    children are in another order on the owner (a container runs them in
+    order), and an added module with an empty child slot, which no name of
+    the model reaches."""
+    by_name = dict(after.modules)
+    children: Dict[str, List[str]] = {}
+    for new in new_modules:
+        for name in new.names:
+            parent, _, leaf = name.rpartition(".")
+            children.setdefault(parent, []).append(leaf)
+    problems = []
+    for parent, leaves in children.items():
+        prefix = parent + "." if parent else ""
+        built = [
+            name[len(prefix) :]
+            for name in baseline.modules
+            if name
+            and name.startswith(prefix)
+            and "." not in name[len(prefix) :]
+            and name in modules_now
+        ]
+        held = vars_of(by_name[parent])["_modules"]
+        if built + leaves != [key for key, child in held.items() if child is not None]:
+            problems.append(
+                f"{parent or '<model>'}: loading added modules among its children "
+                "in an order a reader would not repeat"
+            )
+    for new in new_modules:
+        slots = vars_of(by_name[new.names[0]])["_modules"]
+        if any(child is None for child in slots.values()):
+            problems.append(
+                f"{new.names[0]}: a {new.qualname} module that loading added, "
+                "with an empty child slot"
+            )
+    return problems
 
 
 def _class_name(tensor: torch.Tensor) -> str:
@@ -373,6 +484,57 @@ def _address_keys(after: Walk, ctx: EncodeContext) -> List[str]:
         except Unencodable as e:
             problems.append(
                 f"{path_str(path)}: loading left {e}; a reader cannot get it"
+            )
+    return problems
+
+
+_MAX_KEPT_INTS = 1 << 22
+
+
+def _int_digest(tensor: torch.Tensor) -> Optional[bytes]:
+    """A digest of the values of a tensor of 64-bit integers; None for any
+    other tensor, and for one too large to keep track of."""
+    if (
+        tensor.dtype not in (torch.int64, torch.uint64)
+        or not 0 < tensor.numel() <= _MAX_KEPT_INTS
+        or tensor.device.type == "meta"
+    ):
+        return None
+    values = tensor.detach().contiguous().view(torch.int64).reshape(-1).cpu()
+    return hashlib.blake2b(values.numpy().tobytes(), digest_size=16).digest()
+
+
+def _address_tensors(baseline: Baseline, after: Walk, ctx: EncodeContext) -> List[str]:
+    """Every tensor of 64-bit integers that loading made or changed and that
+    holds an address inside a storage of the model (a table of pointers that
+    a kernel follows, such as the bases of shards mapped from other ranks): a
+    reader's addresses differ, and following the owner's is an illegal
+    access. It sees only addresses inside the model's own storages."""
+    if not ctx.addresses:
+        return []
+    starts = torch.tensor([start for start, _ in ctx.addresses], dtype=torch.int64)
+    ends = torch.tensor([end for _, end in ctx.addresses], dtype=torch.int64)
+    problems = []
+    for path in after.homes.values():
+        tensor = after.tensors.get(path)
+        if (
+            tensor is None
+            or tensor.dtype not in (torch.int64, torch.uint64)
+            or not tensor.numel()
+            or tensor.device.type == "meta"
+        ):
+            continue
+        built = baseline.int_tensors.get(path)
+        if built is not None and built == _int_digest(tensor):
+            continue  # the values the model was built with
+        values = tensor.detach().contiguous().view(torch.int64).reshape(-1).cpu()
+        slot = torch.bucketize(values, starts, right=True) - 1
+        inside = (slot >= 0) & (values < ends[slot.clamp(min=0)])
+        if bool(inside.any()):
+            problems.append(
+                f"{path_str(path)}: loading left a tensor that holds "
+                f"{int(values[inside][0]):#x}, an address inside a storage of "
+                "the model; a reader cannot get it"
             )
     return problems
 
@@ -487,11 +649,20 @@ def _encode_context(
     for path, desc in reversed(list(after.values.items())):
         if (
             desc[0] == "c"
-            and desc[1] in MUTABLE_CONTAINERS
+            and (desc[1] in MUTABLE_CONTAINERS or is_named_tuple(desc[1]))
             and baseline.same(path, after.objects[path])
         ):
             paths[desc[2]] = path
+    # The objects the model was built with, by id: one that loading moved to
+    # a place where nothing else describes it is the reader's own from there.
+    built_paths: Dict[int, tuple] = {}
+    for path, desc in baseline.values.items():
+        ref = baseline.refs.get(path)
+        if desc[0] == "o" and ref is not None and ref() is not None:
+            built_paths.setdefault(id(ref()), path)
     return EncodeContext(
+        built_paths=built_paths,
+        moved={},
         tensor_ids=tensor_ids,
         first_paths=paths,
         module_names={id(m): name for name, m in reversed(after.modules)},
@@ -548,6 +719,7 @@ def _diff(
     after: Walk,
     ctx: EncodeContext,
     modules_now: Dict[str, int],
+    new_modules: Sequence[NewModule],
     problems: List[str],
 ) -> List[list]:
     """The operations that turn a model as built into ``after``: set a value
@@ -567,6 +739,10 @@ def _diff(
     registered = {
         (name, key) for name, registry in after.registries for key, *_ in registry
     }
+    # A plain attribute that became a module loading added is not deleted.
+    registered.update(
+        tuple(name.rpartition(".")[::2]) for new in new_modules for name in new.names
+    )
 
     def shadowed(path):
         if path in apart:
@@ -645,13 +821,64 @@ def _keep_paths(encoded: Any, path: tuple, out: Set[tuple]) -> Set[tuple]:
     if type(encoded) is list and encoded:
         if encoded[0] == "keep":
             out.add(path)
-        elif encoded[0] in ("tuple", "list"):
-            for i, item in enumerate(encoded[1]):
+        elif encoded[0] in ("tuple", "list", "ntuple"):
+            for i, item in enumerate(encoded[-1]):
                 _keep_paths(item, path + (("i", i),), out)
         elif encoded[0] in ("dict", "odict", "ddict"):
             for key, item in encoded[-1]:
                 _keep_paths(item, path + (("k", decode_key(key)),), out)
     return out
+
+
+def _moved_problems(baseline: Baseline, after: Walk, ctx: EncodeContext) -> List[str]:
+    """An object the model was built with that loading moved is the reader's
+    own, as built: one that loading also changed is a problem."""
+    roots = {new: built for built, (_, new) in ctx.moved.items()}
+    lengths = sorted({len(root) for root in roots})
+    changed: Dict[tuple, tuple] = {}
+    for path, desc in after.values.items():  # the moved objects and those in them
+        if desc[0] != "o":
+            continue
+        for n in lengths:
+            root = path[:n]
+            if root in roots and root not in changed:
+                held = after.objects[path]
+                state = baseline.states.get(ctx.built_paths.get(id(held)))
+                if state is None or state != object_state(held):
+                    changed[root] = path
+    problems = [
+        f"{path_str(path)}: loading moved the object built at "
+        f"{path_str(roots[root])} to {path_str(root)} and changed it; a reader "
+        "cannot get it"
+        for root, path in changed.items()
+    ]
+
+    def moved_root(path: tuple) -> Optional[tuple]:
+        return next((path[:n] for n in lengths if path[:n] in roots), None)
+
+    # A list, dict or NamedTuple inside a moved object stays the reader's own;
+    # one that loading also put at a new place outside it would be made again
+    # there by value, and the two would no longer be one object.
+    inside: Dict[int, tuple] = {}
+    outside: List[tuple] = []
+    for path, desc in after.values.items():
+        if desc[0] != "c" or not (
+            desc[1] in MUTABLE_CONTAINERS or is_named_tuple(desc[1])
+        ):
+            continue
+        if moved_root(path) is not None:
+            inside.setdefault(desc[2], path)
+        elif not baseline.same(path, after.objects[path]):
+            outside.append(path)
+    for path in outside:
+        held = inside.get(after.values[path][2])
+        if held is not None:
+            problems.append(
+                f"{path_str(path)}: loading put here what the moved object at "
+                f"{path_str(moved_root(held))} holds at {path_str(held)}; a "
+                "reader cannot get it"
+            )
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +970,14 @@ def _dry_run(
     )
     names = {registry.module for registry in m.registered}
     names.update(decode_path(path)[0] for path in paths)
-    missing = sorted(name for name in names if name not in modules)
+    known = set(modules)
+    for new in m.new_modules:  # parents first, as the owner listed them
+        with _at((new.names[0],)):
+            rebuildable_class(new.module, new.qualname, nn.Module)
+        names.update(name.rpartition(".")[0] for name in new.names)
+        known.update(new.names)
+    _built_objects(model, m)
+    missing = sorted(name for name in names if name not in known)
     if missing:
         raise SnapshotError(
             "cannot install",
@@ -756,13 +990,16 @@ def _install(
     m: Manifest,
     given: Mapping[str, torch.Tensor],
     device: torch.device,
+    built: Sequence[Any] = (),
 ) -> Tuple[List[torch.Tensor], int]:
-    """Install ``m`` in ``model``: the tensors (views of the storages), the
-    registries, the modules loading removed, then the places and operations.
+    """Install ``m`` in ``model``: the modules loading added (empty), the
+    tensors (views of the storages), the registries, the modules loading
+    removed, then the places and operations. ``built`` is _built_objects().
     Returns the tensors by tensor id, and how many kept the identity of the
     tensor the reader built."""
     _check_structure(model, m.structure)
     modules = dict(model.named_modules(remove_duplicate=False))
+    _add_modules(modules, m.new_modules)
     storages = [
         given[str(sid)]
         if e.nbytes
@@ -777,7 +1014,7 @@ def _install(
         parent, _, leaf = name.rpartition(".")
         if parent in modules:
             _dict_pop(modules[parent]._modules, leaf)
-    _apply_changes(modules, m, tensors, device)
+    _apply_changes(modules, m, tensors, device, built)
     return tensors, swapped
 
 
@@ -791,6 +1028,36 @@ def _check_structure(model: nn.Module, want: Structure) -> None:
                 f"{want.modules} and {want.registrations} there"
             ],
         )
+
+
+def _built_objects(model: nn.Module, m: Manifest) -> List[Any]:
+    """The objects ``model``, as built, holds at the manifest's ``built``
+    paths: what ``["built", n]`` values stand for. Taken before anything is
+    installed, since an operation may clear the place an object was built at."""
+    modules = dict(model.named_modules(remove_duplicate=False))
+    out = []
+    for encoded in m.built:
+        path = decode_path(encoded)
+        with _at(path):
+            out.append(resolve_path(modules, path))
+    return out
+
+
+def _add_modules(modules: Dict[str, nn.Module], new_modules: Sequence[NewModule]):
+    """Make each module that loading added, empty and without running its
+    constructor, and put it under its names (also in ``modules``). A plain
+    attribute of that name gives way, as it did on the owner."""
+    for new in new_modules:
+        with _at((new.names[0],)):
+            cls = rebuildable_class(new.module, new.qualname, nn.Module)
+            module = object.__new__(cls)
+            nn.Module.__init__(module)
+            vars_of(module)["training"] = new.training
+            for name in new.names:
+                parent, _, leaf = name.rpartition(".")
+                _dict_pop(vars_of(modules[parent]), leaf)
+                _dict_set(modules[parent]._modules, leaf, module)
+                modules[name] = module
 
 
 def _build_tensors(
@@ -902,13 +1169,14 @@ def _apply_changes(
     m: Manifest,
     tensors: Sequence[torch.Tensor],
     device: torch.device,
+    built: Sequence[Any] = (),
 ) -> None:
     """The places whose holder exists already (so that the operations on a
     tensor's attributes find the tensor), the operations in the owner's walk
     order (each one's holder comes before it), then the places in what the
     operations made. A process-local tensor is the reader's own, zeroed."""
     boundaries = {decode_path(path) for path in m.boundaries}
-    ctx = DecodeContext(modules, tensors, device)
+    ctx = DecodeContext(modules, tensors, device, built)
     local = [
         torch.zeros(
             e.shape,
@@ -1097,6 +1365,16 @@ def _holds(want: Any, value: Any, ctx: DecodeContext) -> bool:
             return value is resolve_path(ctx.modules, decode_path(args[0]))
         except (KeyError, IndexError, TypeError):
             return False
+    if tag == "built":
+        return value is ctx.built[args[0]]
+    if tag == "ntuple":
+        kind = type(value)
+        return (
+            issubclass(kind, tuple)
+            and (kind.__module__, kind.__qualname__) == (args[0], args[1])
+            and len(value) == len(args[2])
+            and all(_holds(w, v, ctx) for w, v in zip(args[2], tuple.__iter__(value)))
+        )
     if tag in ("tuple", "list"):
         kind = tuple if tag == "tuple" else list
         return (
@@ -1121,15 +1399,20 @@ def _holds(want: Any, value: Any, ctx: DecodeContext) -> bool:
 
 
 def check_install(
-    model: nn.Module, m: Manifest, tensors: Sequence[torch.Tensor], device
+    model: nn.Module,
+    m: Manifest,
+    tensors: Sequence[torch.Tensor],
+    device,
+    built: Sequence[Any] = (),
 ) -> Dict[str, Any]:
     """The self-test: walk the installed model as the owner walked it, and
     require, from the tensors actually there, every place to hold the
     tensor the manifest names, as the same view (storage, byte offset,
     dtype, shape, stride) of a storage with the owner's BLAKE3 digest; every
-    registration as the owner's; every value loading set to read back as
-    set, and every deleted one gone. It shows that install repeated export;
-    it does not validate the owner. Raises SnapshotError."""
+    registration as the owner's; every module loading added under its names;
+    every value loading set to read back as set, and every deleted one gone.
+    It shows that install repeated export; it does not validate the owner.
+    Raises SnapshotError."""
     tic = time.perf_counter()
     boundaries = {decode_path(path) for path in m.boundaries}
     walk = walk_model(model, boundaries=boundaries, keep_objects=True)
@@ -1168,7 +1451,16 @@ def check_install(
         if owner is not None and (owner.nbytes, owner.where) != (nbytes, where):
             problems.append(f"storage {sids[sid]}: {nbytes} bytes on {where} here")
     problems += _registration_problems(walk, m, tensors)
-    ctx = DecodeContext(modules, tensors, device)
+    for new in m.new_modules:
+        held = [modules.get(name) for name in new.names]
+        cls = type(held[0])
+        if not (
+            all(module is held[0] for module in held)
+            and (cls.__module__, cls.__qualname__) == (new.module, new.qualname)
+            and vars_of(held[0]).get("training") is new.training
+        ):
+            problems.append(f"{new.names[0]}: not the module the owner added")
+    ctx = DecodeContext(modules, tensors, device, built)
     for op in m.ops:
         path = decode_path(op[1])
         try:

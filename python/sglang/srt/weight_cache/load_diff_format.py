@@ -63,7 +63,7 @@ from torch import nn
 
 logger = logging.getLogger(__name__)
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # nn.Module's own bookkeeping (_parameters, _buffers, _modules, hooks, ...):
 # never a module's plain attribute.
@@ -367,6 +367,43 @@ def _global_state(value: Any) -> tuple:
         return (kind, id(v), tuple(pairs) if ordered else frozenset(pairs))
 
     return state(value, 0)
+
+
+def object_state(value: Any) -> Optional[tuple]:
+    """What the object ``value`` holds itself: its ``__dict__``,
+    with data by value, builtin containers item by item, and anything else
+    (tensors, modules, functions, other objects) by identity. Equal before
+    and after loading for an object that loading left as it was built. None
+    for one it cannot say that of: too large or too deep, with ``__slots__``,
+    or holding a value that is none of these."""
+    budget = [_MAX_ITEMS]
+
+    def state(v: Any, depth: int) -> tuple:
+        budget[0] -= 1
+        if budget[0] < 0 or depth > MAX_DEPTH:
+            raise OverflowError
+        if is_data_leaf(v):
+            return ("v", leaf_key(v))
+        kind = type(v)
+        if issubclass(kind, functools.partial):  # what it calls, and with what
+            parts = (v.func, v.args, v.keywords)
+            return ("partial", tuple(state(x, depth + 1) for x in parts))
+        if issubclass(kind, (tuple, list, dict)):
+            factory = id(v.default_factory) if issubclass(kind, defaultdict) else 0
+            items = tuple((k, state(x, depth + 1)) for k, x in items_of(v))
+            return (kind, factory, items)
+        if issubclass(kind, (torch.Tensor, nn.Module) + _OPAQUE) or _has_dict(v):
+            return ("x", kind, id(v))
+        raise TypeError  # e.g. a bytearray: it may change in place, unseen
+
+    if any(
+        _TYPE_DICT.__get__(k).get("__slots__") for k in _TYPE_MRO.__get__(type(value))
+    ):
+        return None  # state outside its __dict__
+    try:
+        return tuple((k, state(x, 1)) for k, x in vars_of(value).items())
+    except (TypeError, OverflowError):
+        return None
 
 
 class Walk(msgspec.Struct):
@@ -735,12 +772,12 @@ def structure_digest(model: nn.Module) -> Tuple[bytes, int, int]:
 # ---------------------------------------------------------------------------
 
 
-def _lookup_enum(module_name: Any, qualname: Any) -> type:
-    """The enum class that a module this process has already imported defines
-    at ``qualname``. Reads module and class ``__dict__``s only; imports
+def _lookup(module_name: Any, qualname: Any) -> Any:
+    """What a module this process has already imported defines at
+    ``qualname``. Reads module and class ``__dict__``s only; imports
     nothing. Raises KeyError."""
     if type(module_name) is not str or type(qualname) is not str:
-        raise KeyError("an enum is named by two strings")
+        raise KeyError("a class is named by two strings")
     obj = sys.modules.get(module_name)
     if not issubclass(type(obj), types.ModuleType):
         raise KeyError(f"module {module_name} is not imported in this process")
@@ -751,9 +788,52 @@ def _lookup_enum(module_name: Any, qualname: Any) -> type:
             obj = vars(obj)[part]
         except KeyError:
             raise KeyError(f"{module_name}:{qualname} does not exist here") from None
+    return obj
+
+
+def _lookup_enum(module_name: Any, qualname: Any) -> type:
+    """The enum class that a module this process has already imported defines
+    at ``qualname``. Raises KeyError."""
+    obj = _lookup(module_name, qualname)
     if not issubclass(type(obj), enum.EnumMeta):
         raise KeyError(f"{module_name}:{qualname} is not an enum")
     return obj
+
+
+# The classes of the objects loading may add, as (module, qualname): a reader
+# makes one again from its state, without running its constructor. Each was
+# read (its constructor leaves nothing outside the instance's __dict__ and
+# registries, and it holds no state besides its tuple items) and its model
+# measured against a load from the checkpoint.
+REBUILDABLE_CLASSES = {
+    ("sglang.srt.models.minimax_m3", "_FusedQKVIndexProj"),
+    (
+        "sglang.kernels.ops.communication.muse_spark_moe_finalize_all_reduce",
+        "FusedPostExpertNormWeightedSumTRTLLM",
+    ),
+    ("sglang.srt.models.deepseek_v4_mhc", "HcSubLayer"),
+}
+
+
+def is_named_tuple(kind: type) -> bool:
+    return issubclass(kind, tuple) and kind is not tuple
+
+
+def rebuildable_class(module_name: Any, qualname: Any, base: type) -> type:
+    """The class of an object that loading made and that a reader makes again
+    from its state: one of REBUILDABLE_CLASSES, a NamedTuple (``base`` is
+    tuple) or a module (``base`` is nn.Module), as a module this process has
+    already imported defines it. Raises KeyError."""
+    if (
+        type(module_name) is not str
+        or type(qualname) is not str
+        or (module_name, qualname) not in REBUILDABLE_CLASSES
+    ):
+        raise KeyError(f"{module_name}:{qualname} is not a class a reader makes again")
+    cls = _lookup(module_name, qualname)
+    if not (isinstance(cls, type) and issubclass(cls, base)):
+        raise KeyError(f"{module_name}:{qualname} is not a {base.__name__} class")
+    return cls
 
 
 class EncodeContext(msgspec.Struct, kw_only=True):
@@ -770,6 +850,9 @@ class EncodeContext(msgspec.Struct, kw_only=True):
     ``addresses``: sorted (start, end) byte ranges of the model's storages
     (exported or process-local); an int inside one is refused, as an address
     that means nothing elsewhere.
+    ``built_paths``: id(object) -> the path where the model held it when it
+    was built; ``moved`` collects those that loading moved to a place where
+    nothing else describes them: built path -> (number, new path).
     """
 
     tensor_ids: Dict[int, int] = {}
@@ -778,6 +861,8 @@ class EncodeContext(msgspec.Struct, kw_only=True):
     device: torch.device = torch.device("cpu")
     keep: Optional[Callable[[tuple, Any], bool]] = None
     addresses: Sequence[Tuple[int, int]] = ()
+    built_paths: Dict[int, tuple] = {}
+    moved: Dict[tuple, Tuple[int, tuple]] = {}
 
 
 def _in_ranges(value: int, ranges: Sequence[Tuple[int, int]]) -> bool:
@@ -847,6 +932,19 @@ def encode_value(value: Any, path: tuple, ctx: EncodeContext) -> Any:
             if here[: len(first)] == first:
                 raise Unencodable("a container that holds itself")
             return ["ref", encode_path(first, ctx)]
+        if issubclass(kind, tuple) and kind is not tuple:
+            name = kind.__module__, kind.__qualname__
+            try:
+                known = rebuildable_class(*name, tuple) is kind
+            except KeyError:
+                known = False
+            if not known:
+                raise Unencodable(f"a {name[0]}.{name[1]}")
+            items = [
+                enc(item, here + (("i", i),))
+                for i, item in enumerate(tuple.__iter__(v))
+            ]
+            return ["ntuple", name[0], name[1], items]
         if kind in (tuple, list, dict, OrderedDict, defaultdict):
             if id(v) in building:
                 raise Unencodable("a container that holds itself")
@@ -875,6 +973,9 @@ def encode_value(value: Any, path: tuple, ctx: EncodeContext) -> Any:
                 return ["odict" if kind is OrderedDict else "dict", pairs]
             finally:
                 building.pop()
+        built = ctx.built_paths.get(id(v))
+        if built is not None:  # the object built there, which loading moved here
+            return ["built", ctx.moved.setdefault(built, (len(ctx.moved), here))[0]]
         raise Unencodable(f"a {kind.__module__}.{kind.__qualname__}")
 
     return enc(value, path)
@@ -885,7 +986,10 @@ def first_paths(walk: Walk) -> Dict[int, tuple]:
     list or dict it saw (EncodeContext.first_paths)."""
     out: Dict[int, tuple] = {}
     for path, desc in walk.values.items():
-        if desc[0] == "o" or (desc[0] == "c" and desc[1] in MUTABLE_CONTAINERS):
+        if desc[0] == "o" or (
+            desc[0] == "c"
+            and (desc[1] in MUTABLE_CONTAINERS or is_named_tuple(desc[1]))
+        ):
             out.setdefault(desc[2], path)
     return out
 
@@ -922,11 +1026,13 @@ def encode_path(path: tuple, ctx: Optional[EncodeContext] = None) -> list:
 
 class DecodeContext(msgspec.Struct):
     """What a reader's decoder refers to: its modules by every name, the
-    tensors it installed by number, and its model's device."""
+    tensors it installed by number, its model's device, and the objects its
+    model was built with at the manifest's ``built`` paths."""
 
     modules: Dict[str, nn.Module] = {}
     tensors: Sequence[torch.Tensor] = ()
     device: torch.device = torch.device("cpu")
+    built: Sequence[Any] = ()
 
 
 def decode_path(encoded: list) -> tuple:
@@ -951,7 +1057,7 @@ def decode_value(encoded: Any, path: tuple, ctx: DecodeContext) -> Any:
 
     def dec(e, here):
         out = dec_one(e, here)
-        if type(e) is list and e[0] in ("list", "dict", "odict", "ddict"):
+        if type(e) is list and e[0] in ("list", "dict", "odict", "ddict", "ntuple"):
             made[here] = out
         return out
 
@@ -980,6 +1086,14 @@ def decode_value(encoded: Any, path: tuple, ctx: DecodeContext) -> Any:
             if target in made:
                 return made[target]
             return resolve_path(ctx.modules, target)
+        if tag == "built":
+            return ctx.built[args[0]]
+        if tag == "ntuple":
+            cls = rebuildable_class(args[0], args[1], tuple)
+            items = [dec(item, here + (("i", i),)) for i, item in enumerate(args[2])]
+            if len(items) != len(cls._fields):
+                raise KeyError(f"{args[1]} has {len(cls._fields)} fields here")
+            return tuple.__new__(cls, items)
         if tag in ("tuple", "list"):
             items = [dec(item, here + (("i", i),)) for i, item in enumerate(args[0])]
             return tuple(items) if tag == "tuple" else items
@@ -1079,13 +1193,30 @@ class Structure(
     registrations: Count
 
 
+class NewModule(
+    msgspec.Struct, array_like=True, frozen=True, forbid_unknown_fields=True
+):
+    """A module that loading added: every name the model holds it by (the
+    first one first) and its class. A reader makes it empty, without running
+    its constructor; its parameters, buffers and attributes are installed
+    like any other module's."""
+
+    names: List[str]
+    module: str
+    qualname: str
+    training: bool
+
+
 class Manifest(msgspec.Struct, kw_only=True):
     """What a reader installs. ``ops`` are what loading changed, in the
     owner's walk order: ["set", path, value], ["fill", path, value] or
     ["del", path], with paths from encode_path and values from encode_value.
     ``boundaries`` are the paths of the module-level objects the walk did not
     enter; ``removed_modules`` the modules loading removed; ``local`` the
-    process-local tensors."""
+    process-local tensors. Since version 2: ``new_modules`` are the modules
+    loading added, parents first, and ``built`` the paths where the model as
+    built held the objects that ``["built", n]`` values refer to (loading
+    moved them)."""
 
     version: int
     structure: Structure
@@ -1097,6 +1228,8 @@ class Manifest(msgspec.Struct, kw_only=True):
     boundaries: List[list]
     removed_modules: List[str]
     local: List[Local]
+    new_modules: List[NewModule] = []
+    built: List[list] = []
 
 
 def encode_manifest(manifest: Manifest) -> bytes:
@@ -1178,6 +1311,12 @@ def validate_manifest(m: Manifest) -> None:
     for i, path in enumerate(m.boundaries):
         if not _valid_path(path):
             problems.append(f"boundaries[{i}]")
+    for i, path in enumerate(m.built):
+        if not _valid_path(path):
+            problems.append(f"built[{i}]")
+    for i, new in enumerate(m.new_modules):
+        if not new.names or not all(new.names):
+            problems.append(f"new_modules[{i}]")
     if problems:
         raise SnapshotError("invalid load-diff manifest", problems[:20])
 
@@ -1251,7 +1390,7 @@ def _valid_key(e: Any, depth: int) -> bool:
 _TAGS = {
     "keep": 0, "dtype": 1, "device": 1, "size": 1, "enum": 3, "set": 1,
     "fset": 1, "tensor": 1, "module": 1, "ref": 1, "tuple": 1, "list": 1,
-    "dict": 1, "odict": 1, "ddict": 2,
+    "dict": 1, "odict": 1, "ddict": 2, "ntuple": 3, "built": 1,
 }  # fmt: skip
 
 
@@ -1286,6 +1425,15 @@ def _valid_encoding(e: Any, n_tensors: int, depth: int) -> bool:
         return type(args[0]) is str
     if tag == "ref":
         return _valid_path(args[0], depth + 1)
+    if tag == "built":
+        return _is_int(args[0])
+    if tag == "ntuple":
+        return (
+            type(args[0]) is str
+            and type(args[1]) is str
+            and type(args[2]) is list
+            and all(_valid_encoding(v, n_tensors, depth + 1) for v in args[2])
+        )
     if tag in ("tuple", "list"):
         return type(args[0]) is list and all(
             _valid_encoding(v, n_tensors, depth + 1) for v in args[0]

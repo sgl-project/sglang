@@ -156,6 +156,11 @@ def choose_algo(
 
 
 class CustomAllReduceV2:
+    # The pointers of this process's graph inputs, written after graph
+    # capture: valid in this process only, so a weight snapshot of a model
+    # that refers to this communicator gives each reader its own.
+    _process_local_fields = frozenset({"_peer_ptr_table"})
+
     def __init__(
         self,
         group: ProcessGroup,

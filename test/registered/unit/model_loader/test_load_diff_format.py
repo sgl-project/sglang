@@ -394,6 +394,8 @@ def manifest(**overrides):
         "boundaries": [],
         "removed_modules": [],
         "local": [],
+        "new_modules": [],
+        "built": [],
     }
     m.update(overrides)
     return m
