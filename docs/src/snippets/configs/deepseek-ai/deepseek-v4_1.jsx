@@ -130,9 +130,11 @@ export const config = {
     },
 
     // GPU → CPU KV offload (L2 only; no storage tier). Hidden on MI355X: not
-    // validated on ROCm for this model yet.
+    // validated on ROCm for this model yet. PD decode on the paged V4.1 KV
+    // layout cannot enable HiCache (the generic axis would add decode radix).
     hicache: {
       excludesHw: ["mi355x"],
+      excludesPdModes: ["decode"],
       writePolicies: [
         { id: "auto",                    label: "Auto" },
         { id: "write_through",           label: "Write-through" },
