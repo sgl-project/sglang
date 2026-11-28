@@ -1,5 +1,6 @@
 """Unit tests for DeepSeekV32Detector DSML streaming — no server, no model loading."""
 
+import re
 import unittest
 from unittest.mock import patch
 
@@ -108,6 +109,50 @@ class TestDeepSeekV32Streaming(unittest.TestCase):
         self.assertEqual(
             detector.streamed_args_for_tool, [complete.calls[0].parameters]
         )
+
+    def test_long_argument_is_not_rescanned_on_every_chunk(self):
+        body = "line of code\n" * 400
+        text = "Writing.\n\n" + _weather_call(body)
+        detector = DeepSeekV32Detector()
+        scans = []
+        real_search = re.search
+
+        def search(pattern, string, flags=0):
+            if pattern == detector.invoke_regex:
+                scans.append(len(string))
+            return real_search(pattern, string, flags)
+
+        normal, calls = "", []
+        with patch.object(re, "search", side_effect=search):
+            for i in range(0, len(text), 5):
+                result = detector.parse_streaming_increment(text[i : i + 5], self.tools)
+                normal += result.normal_text
+                calls.extend(result.calls)
+
+        self.assertEqual(normal, "Writing.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0].parameters, f'{{"city": "{body.strip()}"}}'.replace("\n", "\\n")
+        )
+        # once when the end tag arrives, once more to look for a next invoke
+        self.assertLessEqual(len(scans), 2)
+
+    def test_self_closing_invoke_completes_without_an_end_tag(self):
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="submit", parameters={"type": "object", "properties": {}}
+                ),
+            )
+        ]
+        text = f'<{DSML}function_calls>\n<{DSML}invoke name="submit"/>'
+        detector = DeepSeekV32Detector()
+        calls = []
+        for char in text:
+            calls.extend(detector.parse_streaming_increment(char, tools).calls)
+
+        self.assertEqual([(c.name, c.parameters) for c in calls], [("submit", "{}")])
 
     def test_streaming_matches_complete_parse_at_every_chunk_width(self):
         tools = [
