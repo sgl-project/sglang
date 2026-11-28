@@ -12,7 +12,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 from sglang.benchmark.datasets.common import DatasetRow
-from sglang.benchmark.serving import benchmark, get_request, set_global_args
+from sglang.benchmark.serving import (
+    RequestFuncOutput,
+    benchmark,
+    calculate_metrics,
+    get_request,
+    set_global_args,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -164,6 +170,44 @@ class TestBenchServingCiCacheFlush(_BenchmarkRunTestCase):
                 self.server.flushes.clear()
                 self._run([row], backend="sglang-oai-chat")
                 self.assertEqual(len(self.server.flushes), flushes)
+
+
+class TestBenchServingMetrics(CustomTestCase):
+    def test_retokenized_itl_carries_the_gap_for_zero_token_chunks(self):
+        from tokenizers import Tokenizer
+        from tokenizers.models import WordLevel
+        from tokenizers.pre_tokenizers import WhitespaceSplit
+        from transformers import PreTrainedTokenizerFast
+
+        backend_tokenizer = Tokenizer(
+            WordLevel({"[UNK]": 0, "one": 1, "two": 2, "three": 3}, unk_token="[UNK]")
+        )
+        backend_tokenizer.pre_tokenizer = WhitespaceSplit()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend_tokenizer, unk_token="[UNK]"
+        )
+        output = RequestFuncOutput(
+            success=True,
+            generated_text="one two three",
+            text_chunks=[" ", "two three"],
+            itl=[0.125, 0.375],
+            ttft=0.125,
+            latency=0.625,
+            output_len=4,
+        )
+
+        metrics, _ = calculate_metrics(
+            input_requests=None,
+            outputs=[output],
+            dur_s=1.0,
+            tokenizer=tokenizer,
+            backend="sglang-oai-chat",
+            accept_length=2.0,
+        )
+
+        self.assertEqual(metrics.completed, 1)
+        self.assertEqual(metrics.total_output_retokenized, 3)
+        self.assertEqual(metrics.mean_itl_ms, 250.0)
 
 
 if __name__ == "__main__":
