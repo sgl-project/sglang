@@ -2609,7 +2609,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             x, forward_batch, in_piecewise_or_breakable_cuda_graph, weights_proj_lora
         ):
             q_fp8, weights = self.rocm_nope_prologue.forward(
-                self, x, q_lora, forward_batch, layer_id, act_quant
+                indexer=self,
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                act_quant=act_quant,
+                weights_proj_lora=weights_proj_lora,
+                wk_proj_lora=getattr(self.wk, "set_lora", False),
             )
         elif is_graph_dsa_split_op_surface(forward_batch):
             # Prefill under PCG/BCG (including CP) runs the whole indexer as one eager,

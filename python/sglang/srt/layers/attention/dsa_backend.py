@@ -819,6 +819,7 @@ class DeepseekSparseAttnBackend(
     ):
         super().__init__()
         self.forward_metadata: DSAMetadata
+        self.decode_cuda_graph_metadata: Dict = {}
         self.device = model_runner.device
         assert isinstance(model_runner.page_size, int)
         self.num_splits = (
@@ -2132,7 +2133,7 @@ class DeepseekSparseAttnBackend(
                     device=self.device,
                 )
             )
-        self.decode_cuda_graph_metadata: Dict = {
+        self.decode_cuda_graph_metadata = {
             "cache_seqlens": torch.ones(
                 max_num_tokens, dtype=torch.int32, device=self.device
             ),

@@ -233,7 +233,7 @@ def gather_fp4_index_k_rows(
     return out
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1024)
 def _rowgroup_plan(
     num_seqs: int, max_qlen: int, num_rows: int, heads: int, max_seq_len: int
 ):
@@ -438,25 +438,40 @@ def _fp4_request_runs(
 # ---- the DSA pool's FP4 index-K (DSATokenToKVPool with --enable-dsa-fp4-indexer)
 
 
+@lru_cache(maxsize=1)
+def aiter_has_fp4_mqa_logits() -> bool:
+    """Whether the installed AITER ships both FP4 MQA logits kernels (rowgroup + prefill)."""
+    try:
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (  # noqa: F401
+            flydsl_pa_mqa_logits_fp4_prefill,
+        )
+        from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_rowgroup import (  # noqa: F401
+            flydsl_pa_mqa_logits_fp4_rowgroup,
+            make_fp4_mqa_plan,
+        )
+    except ImportError:
+        return False
+    return True
+
+
 def check_pool(dcp_replicated: bool, index_kpool: int, page_size: int) -> None:
-    """Refuse a pool these keys cannot serve."""
+    """Refuse a pool geometry or host installation these FP4 kernels cannot serve."""
     from sglang.srt.layers.attention.dsa.utils import (
         aiter_can_use_preshuffle_paged_mqa,
     )
-    from sglang.srt.layers.dcp.layout import dsa_shards_index_k
     from sglang.srt.utils import is_gfx95_supported
 
     if not (
         is_gfx95_supported()
         and aiter_can_use_preshuffle_paged_mqa()
-        and dsa_shards_index_k()
+        and aiter_has_fp4_mqa_logits()
         and not dcp_replicated
         and index_kpool == 1
         and page_size == 64
     ):
         raise ValueError(
-            "--enable-dsa-fp4-indexer needs AITER's FP4 logits (ROCm gfx950) and index-K "
-            "sharded by DCP on 64-key pages, as Kimi-K3.1 runs it"
+            "--enable-dsa-fp4-indexer needs AITER's FP4 logits (ROCm gfx950) on 64-key "
+            "pages with index_kpool=1 and non-replicated index-K"
         )
 
 
