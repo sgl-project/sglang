@@ -430,13 +430,13 @@ class Gemma4VisionPatchEmbedder(nn.Module):
         self, patch_positions: torch.Tensor, padding_positions: torch.Tensor
     ) -> torch.Tensor:
         clamped_positions = patch_positions.clamp(min=0)
-        one_hot = F.one_hot(clamped_positions, num_classes=self.position_embedding_size)
-        one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)
-        position_embeddings = one_hot @ self.position_embedding_table
-        position_embeddings = position_embeddings.sum(dim=1)
-        position_embeddings = torch.where(
-            padding_positions.unsqueeze(-1), 0.0, position_embeddings
+        position_embeddings = F.embedding(
+            clamped_positions[..., 0], self.position_embedding_table[0]
         )
+        position_embeddings.add_(
+            F.embedding(clamped_positions[..., 1], self.position_embedding_table[1])
+        )
+        position_embeddings.masked_fill_(padding_positions.unsqueeze(-1), 0.0)
         return position_embeddings
 
     def _patch_projection(self, pixel_values: torch.Tensor) -> torch.Tensor:
@@ -446,7 +446,8 @@ class Gemma4VisionPatchEmbedder(nn.Module):
             pixel_values: [batch, num_patches, patch_pixels] — already patchified
                           by the image processor, values in [0, 1].
         """
-        patches = 2 * (pixel_values - 0.5)
+        patches = pixel_values.sub(0.5)
+        patches.mul_(2.0)
         return self.input_proj(patches.to(self.input_proj.weight.dtype))
 
     def forward(
