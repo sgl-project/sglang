@@ -89,6 +89,8 @@ _is_cpu = is_cpu()
 class DsV3MLA(DeepseekV2AttentionMLA):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        # forward_cuda calls a rope kernel that rotary_embedding/base.py imports on
+        # CUDA only; XPU keeps its own forward_xpu dispatch.
         if kwargs["rope_scaling"] and not _is_xpu:
             self.rotary_emb.forward = self.rotary_emb.forward_cuda
 

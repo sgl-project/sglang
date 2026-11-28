@@ -14,10 +14,11 @@ from sglang.srt.layers.quantization.utils import get_scalar_types
 ScalarType, scalar_types = get_scalar_types()
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu, is_xpu
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_xpu = is_xpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
 _CPU_AMX_REQUIRED_MSG = (
@@ -513,7 +514,17 @@ class AutoRoundConfig(QuantizationConfig):
 
             return None
 
-        if backend == "auto" or "marlin" in backend:
+        if _is_xpu and is_linear:
+            # No Marlin on XPU: dense int4 runs the XPU int4pack linear; MoE layers fall
+            # through to MoeWNA16 below.
+            from sglang.srt.layers.quantization.gptq import GPTQXPUConfig
+
+            quant_args = GPTQXPUConfig(
+                **self.get_gptq_config_kwargs(weight_bits, group_size),
+            )
+            return GPTQLinearMethod(quant_args)
+
+        if (backend == "auto" or "marlin" in backend) and not _is_xpu:
             GPTQ_TYPE_MAP = {
                 (4, True): scalar_types.uint4b8,
                 (8, True): scalar_types.uint8b128,
