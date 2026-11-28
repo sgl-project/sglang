@@ -667,16 +667,6 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_DRAFT_PREP_FORK = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # DSpark static verify: the verify graph scatters new seq lens and the bonus into
-    # the FutureMap's slots; the host skips those scatters for folded accepts.
-    SGLANG_OPT_DSV41_DSPARK_POST_FOLD = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # DSpark target verify: a pre-planned replay skips re-copying input_ids / positions
-    # the plan-time load already copied from the same tensors.
-    SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # DSpark: draw the simulated acceptance length (and the sim bonus seed) before the
     # draft launch instead of between the draft and the target verify.
     SGLANG_OPT_DSV41_DSPARK_SIM_DRAW_AHEAD = EnvBool(False)
@@ -2338,16 +2328,6 @@ class Envs:
     SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
-    # DSpark decode: build the verify window and the draft anchor column in one
-    # launch instead of two adds, assign_extend_cache_locs and a copy.
-    SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
-    # into the sampler's own buffer, so the step skips its eager concat.
-    SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # DSpark static verify: run the target verify runner's metadata prep through the
     # metadata glue graph where its backend declares the prep host-free.
     SGLANG_OPT_DSV41_TARGET_VERIFY_METADATA_GLUE = EnvBool(
@@ -2875,7 +2855,15 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    name: _DeprecatedEnv(note="DSpark always runs this path now; unset it.")
+    for name in (
+        "SGLANG_OPT_DSV41_DSPARK_PREPARE_INPUTS_ONCE",
+        "SGLANG_OPT_DSV41_DSPARK_MID_FOLD",
+        "SGLANG_OPT_DSV41_DSPARK_POST_FOLD",
+        "SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS",
+    )
+}
 
 
 def _handle_deprecated_envs():

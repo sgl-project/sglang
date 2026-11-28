@@ -570,7 +570,7 @@ class TestPrePlannedReplayRestage(CustomTestCase):
 
 
 class TestSkipPrefilledInputs(CustomTestCase):
-    """SGLANG_OPT_DSV41_DSPARK_SKIP_PREFILLED_INPUTS: a pre-planned verify replay skips
+    """DSpark target verify: a pre-planned verify replay skips
     re-copying input_ids / positions only when they are the very tensors the plan-time
     load copied; any other source, even with equal values, is copied."""
 
