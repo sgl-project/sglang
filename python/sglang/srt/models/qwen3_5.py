@@ -117,6 +117,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
+    resolve_expert_param_name,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import (
@@ -2282,6 +2283,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                     # attempted to load as other weights later
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    resolved = resolve_expert_param_name(name_mapped, params_dict)
+                    if resolved is not None:
+                        name_mapped = resolved
                     if is_fused_expert:
                         # is_fused_expert is True, the checkpoint contains gate_up_proj and down_proj for each expert
                         if "experts.gate_up_proj" in name:
@@ -2879,6 +2883,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     # attempted to load as other weights later
                     is_expert_weight = True
                     name_mapped = name.replace(weight_name, param_name)
+                    resolved = resolve_expert_param_name(name_mapped, params_dict)
+                    if resolved is not None:
+                        name_mapped = resolved
                     if is_fused_expert:
                         # is_fused_expert is True, the checkpoint contains gate_up_proj and down_proj for each expert
                         if "experts.gate_up_proj" in name:

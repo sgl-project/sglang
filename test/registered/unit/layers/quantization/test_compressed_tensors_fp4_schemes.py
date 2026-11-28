@@ -18,12 +18,15 @@ import torch
 
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE as _FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeA2ABackend
+from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
 from sglang.srt.layers.quantization.compressed_tensors import compressed_tensors
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Fp4,
+    CompressedTensorsW4A4Mxfp4MegaMoE,
     CompressedTensorsW4A4Nvfp4MoE,
     CompressedTensorsW4A16Fp4,
     CompressedTensorsW4A16Mxfp4,
@@ -131,8 +134,8 @@ SELECTION_CASES = [
     ("linear", "mxfp4", SM100, CompressedTensorsW4A16Mxfp4, {"has_input_activations": True}),
     # Likewise for MXFP4 MoE.
     ("moe", "mxfp4a16", SM90, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": False, "group_size": 32}),
-    ("moe", "mxfp4", SM90, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": True}),
-    ("moe", "mxfp4", SM100, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": True}),
+    ("moe", "mxfp4", SM90, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": False}),
+    ("moe", "mxfp4", SM100, CompressedTensorsW4A16Mxfp4MoE, {"has_input_global_scale": False}),
     # Neighbours of the fp4 predicates. The int4 type check keeps fp4 out of
     # WNA16; a weight-only MoE config has no input_activations, which the w8a8
     # predicates used to dereference.
@@ -156,6 +159,35 @@ class TestFp4SchemeSelection(CustomTestCase):
                     self.assertIsInstance(scheme, expected)
                 for name, value in attrs.items():
                     self.assertEqual(getattr(scheme, name), value, name)
+
+    def test_split_mxfp4_megamoe_requires_sm100_and_explicit_w4a4(self):
+        launch_options = SimpleNamespace(enable_w4a4_mxfp4_megamoe=True)
+        with (
+            mock.patch.object(
+                compressed_tensors,
+                "get_moe_a2a_backend",
+                return_value=MoeA2ABackend.MEGAMOE,
+            ),
+            mock.patch.object(
+                compressed_tensors,
+                "get_exec",
+                return_value=SimpleNamespace(moe=launch_options),
+            ),
+            override_platform(is_sm100=True),
+        ):
+            for variant in ("mxfp4a16", "mxfp4"):
+                with self.subTest(variant=variant):
+                    result = _get_scheme("moe", _make_config(variant), SM100)
+                    self.assertIsInstance(result, CompressedTensorsW4A4Mxfp4MegaMoE)
+            static_activations = dict(MXFP4_WEIGHTS, dynamic=False)
+            with self.assertRaisesRegex(ValueError, "dynamic group-32"):
+                _get_scheme("moe", _make_config("mxfp4", static_activations), SM100)
+            with override_platform(is_sm100=False):
+                with self.assertRaisesRegex(ValueError, "requires SM100"):
+                    _get_scheme("moe", _make_config("mxfp4a16"), SM90)
+            launch_options.enable_w4a4_mxfp4_megamoe = False
+            with self.assertRaisesRegex(ValueError, "enable-w4a4-mxfp4-megamoe"):
+                _get_scheme("moe", _make_config("mxfp4a16"), SM100)
 
     def test_weight_only_downgrade_warns_and_a16_does_not(self):
         """warning_once is lru_cache-wrapped; clear it to stay order-independent."""
@@ -201,10 +233,8 @@ class TestFp4SchemeSelection(CustomTestCase):
         with self.assertRaisesRegex(NotImplementedError, "NVFP4"):
             _get_scheme("linear", config, SM90)
 
-    def test_fused_layout_model_still_bypasses_to_mxfp4_moe_method(self):
-        """The split-expert MXFP4 scheme is reached only through FusedMoE's
-        serves_fused_mxfp4 opt-out: GraniteMoe and Kimi-K3 ship indistinguishable
-        configs, so a model keeping the default must still get Mxfp4MoEMethod."""
+    def test_split_metadata_and_cli_preserve_fused_mxfp4_dispatch(self):
+        """Selecting AutoRound must not change the checkpoint's expert layout."""
 
         class RealFusedMoE(_FusedMoE):
             # get_quant_method checks isinstance(layer, FusedMoE); skip the
@@ -213,13 +243,28 @@ class TestFp4SchemeSelection(CustomTestCase):
                 torch.nn.Module.__init__(self)
                 self.serves_fused_mxfp4 = serves_fused_mxfp4
 
-        for variant in ("mxfp4a16", "mxfp4"):
-            for serves_fused in (True, False):
-                with self.subTest(variant=variant, serves_fused=serves_fused):
+        cases = (
+            (True, None, None, True),
+            (False, None, None, False),
+            (True, "split", None, False),
+            (True, None, "auto-round", False),
+            (True, "fused", "auto-round", True),
+        )
+        for config_class in (CompressedTensorsConfig, AutoRoundConfig):
+            for serves_fused, layout, provider, expect_fused in cases:
+                with self.subTest(
+                    config_class=config_class,
+                    serves_fused=serves_fused,
+                    layout=layout,
+                    provider=provider,
+                ):
                     layer = RealFusedMoE(serves_fused)
-                    quant_config = CompressedTensorsConfig.from_config(
-                        _make_config(variant)
-                    )
+                    config = _make_config("mxfp4a16")
+                    if layout is not None:
+                        config["expert_layout"] = layout
+                    if provider is not None:
+                        config["provider"] = provider
+                    quant_config = config_class.from_config(config)
                     with (
                         mock.patch(
                             "torch.cuda.get_device_capability", return_value=SM90
@@ -231,7 +276,7 @@ class TestFp4SchemeSelection(CustomTestCase):
                     ):
                         fused_method.return_value = "fused"
                         method = quant_config.get_quant_method(layer, prefix=MOE_LAYER)
-                    if serves_fused:
+                    if expect_fused:
                         self.assertEqual(method, "fused")
                     else:
                         self.assertIsInstance(

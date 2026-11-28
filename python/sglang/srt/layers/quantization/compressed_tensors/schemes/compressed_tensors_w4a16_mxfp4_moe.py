@@ -9,16 +9,19 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.utils import route_dropped_experts_to_local
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils import is_xpu
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["CompressedTensorsW4A16Mxfp4MoE"]
 
 MXFP4_GROUP_SIZE = 32
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -28,8 +31,7 @@ if TYPE_CHECKING:
 
 
 class CompressedTensorsW4A16Mxfp4MoE(CompressedTensorsMoEScheme):
-    """Weight-only MXFP4 MoE via the FP4 Marlin runner: fp4 experts, bf16
-    activations.
+    """Split-expert MXFP4 MoE with BF16 activations on CUDA and Intel XPU.
 
     Serves a compressed-tensors ``mxfp4-pack-quantized`` checkpoint whose experts
     are stored **split per expert** (``experts.{e}.{gate,up,down}_proj.*``), which
@@ -37,11 +39,9 @@ class CompressedTensorsW4A16Mxfp4MoE(CompressedTensorsMoEScheme):
     and ``Mxfp4MarlinMoEMethod`` handle -- those register ``w13/w2_weight``, so a
     split-expert checkpoint dies on ``KeyError: ...experts.w2_weight_packed``.
 
-    Serves mxfp4a16 (no ``input_activations``) and mxfp4 w4a4, whose activation
-    quantization is dropped: the Marlin MoE kernel is weight-only. A w4a4
-    checkpoint still ships the input global scales, and the split-expert loader
-    raises KeyError on a tensor with no registered destination, so they must be
-    registered first and only then dropped.
+    Serves mxfp4a16 and mxfp4 w4a4. Both backends keep activations unquantized.
+    If the checkpoint stores static activation scales, they are loaded and
+    dropped; dynamic activation quantization has no serialized scale.
 
     Unlike NVFP4 there is no ``weight_global_scale``: MXFP4's E8M0 scales are
     absolute powers of two, so no outer scale is stored and none is passed to the
@@ -158,17 +158,24 @@ class CompressedTensorsW4A16Mxfp4MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+        if _is_xpu:
+            logger.info_once("Using Intel XPU grouped GEMM for weight-only MXFP4 MoE")
+        else:
+            logger.info_once("Using FP4 Marlin for weight-only MXFP4 MoE")
+            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return None if _is_xpu else MoeRunnerBackend.MARLIN
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        self._drop_input_global_scales(layer)
+
+        if _is_xpu:
+            return
+
         from sglang.srt.layers.quantization.marlin_utils_fp4 import (
             prepare_moe_mxfp4_layer_for_marlin,
         )
-
-        # The activation scales are meaningless for a weight-only kernel.
-        if self.has_input_global_scale:
-            delattr(layer, "w13_input_global_scale")
-            delattr(layer, "w2_input_global_scale")
 
         # prepare_moe_mxfp4_layer_for_marlin reads `w13/w2_weight`;
         # compressed-tensors uses the `_packed` names.
@@ -204,15 +211,112 @@ class CompressedTensorsW4A16Mxfp4MoE(CompressedTensorsMoEScheme):
 
         prepare_moe_mxfp4_layer_for_marlin(layer)
 
+    def _drop_input_global_scales(self, layer: torch.nn.Module) -> None:
+        if self.has_input_global_scale:
+            delattr(layer, "w13_input_global_scale")
+            delattr(layer, "w2_input_global_scale")
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if _is_xpu:
+            from sgl_kernel import fused_experts
+
+            from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            topk_weights, topk_ids = route_dropped_experts_to_local(
+                topk_weights=topk_weights, topk_ids=topk_ids
+            )
+            return StandardCombineInput(
+                hidden_states=fused_experts(
+                    dispatch_output.hidden_states,
+                    layer.w13_weight_packed,
+                    layer.w2_weight_packed,
+                    topk_weights,
+                    topk_ids,
+                    use_mxfp4_w4a16=True,
+                    w1_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    activation=self.moe_runner_config.activation,
+                    routed_scaling_factor=self.moe_runner_config.routed_scaling_factor,
+                    swiglu_limit=self.moe_runner_config.swiglu_limit,
+                )
+            )
+
+        return self.runner.run(dispatch_output, self.get_marlin_quant_info(layer))
+
+    def get_marlin_quant_info(self, layer):
         from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
             build_marlin_moe_quant_info,
         )
 
-        # MXFP4 passes no global scales; build_marlin_moe_quant_info leaves them
-        # None, which is what the fused mxfp4 Marlin path does too.
-        return self.runner.run(dispatch_output, build_marlin_moe_quant_info(layer))
+        return build_marlin_moe_quant_info(layer)
+
+
+class CompressedTensorsW4A4Mxfp4MegaMoE(CompressedTensorsW4A16Mxfp4MoE):
+    """Split-expert MXFP4 with dynamic MXFP4 activations on SM100 MegaMoE."""
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 100
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ) -> None:
+        if not moe_runner_config.is_gated or moe_runner_config.activation != "silu":
+            raise ValueError("Split MXFP4 MegaMoE requires gated SiLU experts.")
+        logger.info_once("Using DeepGEMM MegaMoE (mxf4xmxf4) for split MXFP4 MoE")
+
+    def get_moe_runner_backend(self, layer: torch.nn.Module) -> None:
+        return None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from deep_gemm import (
+            transform_sf_into_required_layout,
+            transform_weights_for_mega_moe,
+        )
+
+        from sglang.srt.layers.moe.mega_moe import check_mega_moe_shapes
+
+        mma_type = "mxf4xmxf4"
+        check_mega_moe_shapes(
+            hidden=layer.hidden_size,
+            intermediate=layer.intermediate_size_per_partition,
+            mma_type=mma_type,
+        )
+
+        def pack(weight: torch.Tensor, scale: torch.Tensor):
+            num_experts, rows, packed_columns = weight.shape
+            scales = transform_sf_into_required_layout(
+                scale.view(torch.float8_e8m0fnu).float(),
+                mn=rows,
+                k=packed_columns * 2,
+                recipe=(1, MXFP4_GROUP_SIZE),
+                num_groups=num_experts,
+                disable_ue8m0_cast=False,
+            )
+            return weight.view(torch.int8), scales
+
+        layer.mega_l1_weights, layer.mega_l2_weights = transform_weights_for_mega_moe(
+            pack(layer.w13_weight_packed.data, layer.w13_weight_scale.data),
+            pack(layer.w2_weight_packed.data, layer.w2_weight_scale.data),
+            mma_type=mma_type,
+        )
+        layer.w13_weight_packed.data, layer.w13_weight_scale.data = (
+            layer.mega_l1_weights
+        )
+        layer.w2_weight_packed.data, layer.w2_weight_scale.data = layer.mega_l2_weights
+        self._drop_input_global_scales(layer)
+        layer._mega_moe_weights_built = True
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        raise RuntimeError(
+            "Split MXFP4 MegaMoE must run through the model's MegaMoE forward."
+        )

@@ -2366,6 +2366,8 @@ class ModelConfig:
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
             "auto-round-int8": ["compressed-tensors", "compressed_tensors"],
+            # AutoRound's llm_compressor export writes quant_method="compressed-tensors".
+            "auto-round": ["compressed-tensors", "compressed_tensors"],
         }
         if self.quantization is not None:
             self.quantization = self.quantization.lower()

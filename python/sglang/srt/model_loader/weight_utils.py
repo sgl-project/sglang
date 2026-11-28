@@ -2330,3 +2330,19 @@ def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
         return torch.cat(loaded_weight_pad, dim=output_dim)
     else:
         return loaded_weight
+
+
+def resolve_expert_param_name(
+    name: str, params_dict: Dict[str, torch.nn.Parameter]
+) -> Optional[str]:
+    """The registered parameter an expert checkpoint tensor loads into.
+
+    Mxfp4MoEMethod fuses the experts into `w13_weight` / `w2_weight` while
+    compressed-tensors names the packed tensor `weight_packed`; a scheme that
+    registers the packed name, such as NPU's MXFP4 MoE, matches before the
+    rename. Returns None when no parameter claims the tensor.
+    """
+    if name in params_dict:
+        return name
+    unpacked = name.replace("weight_packed", "weight")
+    return unpacked if unpacked in params_dict else None
