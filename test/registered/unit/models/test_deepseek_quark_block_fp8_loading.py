@@ -174,6 +174,25 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
         )
         self.assertEqual(loader.discard_pending_weight_halves(), [])
 
+    def test_a_load_that_pairs_every_half_leaves_no_holder(self):
+        """A weight snapshot hands over what loading changed on the model, to a
+        process that never loads: a complete load must not leave the holder."""
+        target = _FakeParam()
+        loader = _FakeDeepseekLoader({_FUSED_QKV_A_SCALE: target})
+        built = set(vars(loader))
+
+        loader.do_load_weights(
+            [(_Q_A_SCALE, torch.ones((2, 3))), (_KV_A_SCALE, torch.ones((1, 3)))]
+        )
+        self.assertIsNotNone(target.loaded)
+        self.assertEqual(set(vars(loader)), built)
+
+        # A half that still waits keeps its holder, until it is discarded
+        loader.do_load_weights([(_Q_A_SCALE, torch.ones((2, 3)))])
+        self.assertEqual(set(vars(loader)) - built, {"_pending_weight_halves"})
+        self.assertEqual(loader.discard_pending_weight_halves(), [_Q_A_SCALE])
+        self.assertEqual(set(vars(loader)), built)
+
     def test_begin_weight_update_drops_a_half_left_by_an_earlier_load(self):
         """A half startup left must not pair with the session's other half."""
         target = _FakeParam()
