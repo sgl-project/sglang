@@ -66,6 +66,8 @@ class FakeReq:
 
 
 class FakeTreeCache:
+    page_size = 1
+
     def __init__(self, disable=True):
         self.disable = disable
 
