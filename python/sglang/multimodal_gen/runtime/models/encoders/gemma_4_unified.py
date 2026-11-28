@@ -248,6 +248,24 @@ class Gemma4UnifiedDecoderLayer(nn.Module):
         return hidden_states * self.layer_scalar
 
 
+def _vocab_embedding(text_config) -> nn.Module:
+    """The vocab table, whole on every rank when the encoder is folded.
+
+    Folded across ranks, a vocab-parallel table would stay on the device (its
+    gather feeds an all-reduce), 1 GB per rank at fold 2 for LTX-2.5's Gemma 4.
+    Every rank keeps the whole table instead, so layerwise offload parks it on
+    the host as for the unfolded encoder. The rows are the same: the sharded
+    gather only adds zeros from the other ranks.
+    """
+    if get_tp_world_size() > 1:
+        return nn.Embedding(text_config.vocab_size, text_config.hidden_size)
+    return VocabParallelEmbedding(
+        text_config.vocab_size,
+        text_config.hidden_size,
+        org_num_embeddings=text_config.vocab_size,
+    )
+
+
 class Gemma4UnifiedTextModel(nn.Module):
     def __init__(self, text_config, quant_config: QuantizationConfig | None) -> None:
         super().__init__()
@@ -261,11 +279,7 @@ class Gemma4UnifiedTextModel(nn.Module):
             )
         self.layer_types = list(text_config.layer_types)
         self.sliding_window = text_config.sliding_window
-        self.embed_tokens = VocabParallelEmbedding(
-            text_config.vocab_size,
-            text_config.hidden_size,
-            org_num_embeddings=text_config.vocab_size,
-        )
+        self.embed_tokens = _vocab_embedding(text_config)
         # upstream casts sqrt(hidden) to the table dtype before scaling
         self.register_buffer(
             "embed_scale",
