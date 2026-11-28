@@ -99,8 +99,16 @@ class PythonicDetector(BaseFormatDetector):
                 # to escape to the outer handler and drop every parseable
                 # sibling call in the block.
                 try:
+                    if call.args:
+                        raise ValueError(
+                            "Positional arguments are not supported in pythonic tool calls"
+                        )
                     arguments = {}
                     for keyword in call.keywords:
+                        if keyword.arg is None:
+                            raise ValueError(
+                                "Keyword argument unpacking (**kwargs) is not supported in pythonic tool calls"
+                            )
                         arguments[keyword.arg] = self._get_parameter_value(
                             keyword.value
                         )
@@ -230,12 +238,28 @@ class PythonicDetector(BaseFormatDetector):
             raise ValueError(
                 f"Constant has no JSON representation: {type(val.value).__name__}"
             )
+        elif isinstance(val, ast.UnaryOp) and isinstance(val.op, (ast.UAdd, ast.USub)):
+            if (
+                isinstance(val.operand, ast.Constant)
+                and isinstance(val.operand.value, (int, float))
+                and not isinstance(val.operand.value, bool)
+            ):
+                return (
+                    -val.operand.value
+                    if isinstance(val.op, ast.USub)
+                    else +val.operand.value
+                )
+            raise ValueError("Unary operator is only supported on numeric literals")
         elif isinstance(val, ast.Dict):
-            return {
-                k.value: self._get_parameter_value(v)
-                for k, v in zip(val.keys, val.values)
-            }
-        elif isinstance(val, ast.List):
+            result = {}
+            for k, v in zip(val.keys, val.values):
+                if not isinstance(k, ast.Constant):
+                    raise ValueError(
+                        "Dict keys in tool call arguments must be constant literals"
+                    )
+                result[self._get_parameter_value(k)] = self._get_parameter_value(v)
+            return result
+        elif isinstance(val, (ast.List, ast.Tuple)):
             return [self._get_parameter_value(v) for v in val.elts]
         else:
             raise ValueError("Tool call arguments must be literals")
