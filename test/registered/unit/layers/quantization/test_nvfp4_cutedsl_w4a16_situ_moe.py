@@ -45,6 +45,7 @@ class TestNvFp4CuteDslW4A16SituMoe(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         init_single_process_dist(master_port=29633)
+        cls.addClassCleanup(torch.set_default_device, torch.get_default_device())
         torch.set_default_device("cuda")
 
     def _build_layer(self):

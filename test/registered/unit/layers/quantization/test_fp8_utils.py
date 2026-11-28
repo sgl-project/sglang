@@ -252,6 +252,7 @@ class TestApplyFp8LinearScaleDispatch(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
+        cls.addClassCleanup(torch.set_default_device, torch.get_default_device())
         torch.set_default_device("cuda")
 
     @staticmethod
@@ -457,6 +458,7 @@ class TestApplyFp8LinearPrequantOutputDtype(CustomTestCase):
     def setUpClass(cls):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
+        cls.addClassCleanup(torch.set_default_device, torch.get_default_device())
         torch.set_default_device("cuda")
 
     def _run(self, dtype):

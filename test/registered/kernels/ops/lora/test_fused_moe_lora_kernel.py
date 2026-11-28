@@ -222,12 +222,21 @@ CASES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _default_device():
+    # Restore the process-wide default device, or every later test file in the
+    # same pytest process allocates on the GPU and CPU generators reject it.
+    previous = torch.get_default_device()
+    torch.set_default_device(get_device(0))
+    yield
+    torch.set_default_device(previous)
+
+
 @pytest.mark.parametrize(
     ("launch", "max_lora_rank", "dtype", "top_k_num", "max_loras"), CASES
 )
 def test_fused_moe_lora_kernel(launch, max_lora_rank, dtype, top_k_num, max_loras):
     device = get_device(0)
-    torch.set_default_device(device)
     set_random_seed(42)
     num_tokens, num_sequences, num_experts, N, K = 100, 10, 64, 1408, 2048
     topk_ids, topk_weights = assign_experts_to_tokens(

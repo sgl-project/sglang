@@ -33,6 +33,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         init_single_process_dist(master_port=29631)
+        cls.addClassCleanup(torch.set_default_device, torch.get_default_device())
         torch.set_default_device("cuda")
 
     def _run_backend(

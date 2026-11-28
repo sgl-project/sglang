@@ -105,6 +105,7 @@ class TestFp8MoETpBlockRefine(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         init_single_process_dist(master_port=29634)
+        cls.addClassCleanup(torch.set_default_device, torch.get_default_device())
         torch.set_default_device("cuda")
 
     @contextmanager
