@@ -5,6 +5,8 @@ from typing import Iterable
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from sglang.kernels.ops.attention.dsa.dfly_kv import gather_dfly_kv
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -18,7 +20,6 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_parallel
-from torch import nn
 
 
 # The DFly mHC arithmetic follows the public DFly2 implementation in PR #53538.
