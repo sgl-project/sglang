@@ -405,29 +405,37 @@ class MiMoProcessor:
         merge_size = vget("spatial_merge_size", 2)
         f = patch_size * merge_size
 
+        def _coalesce(*vals):
+            for v in vals:
+                if v is not None:
+                    return v
+            return None
+
         kwargs = {
             "tokenizer": None,
             "patch_size": patch_size,
             "merge_size": merge_size,
             "temporal_patch_size": vget("temporal_patch_size", 2),
-            "image_min_pixels": pc.get("image_min_pixels") or 4 * f * f,
-            "image_max_pixels": pc.get("image_max_pixels") or 4096 * f * f,
-            "video_min_pixels": pc.get("video_min_pixels") or 4 * f * f,
-            "video_max_pixels": pc.get("video_max_pixels") or 4096 * f * f,
-            "video_total_max_pixels": pc.get("video_total_max_pixels") or 16384 * f * f,
-            "fps": pc.get("fps") or 2,
+            "image_min_pixels": _coalesce(pc.get("image_min_pixels"), 4 * f * f),
+            "image_max_pixels": _coalesce(pc.get("image_max_pixels"), 4096 * f * f),
+            "video_min_pixels": _coalesce(pc.get("video_min_pixels"), 4 * f * f),
+            "video_max_pixels": _coalesce(pc.get("video_max_pixels"), 4096 * f * f),
+            "video_total_max_pixels": _coalesce(
+                pc.get("video_total_max_pixels"), 16384 * f * f
+            ),
+            "fps": _coalesce(pc.get("fps"), 2),
             "num_frames": pc.get("num_frames"),
-            "max_frames": pc.get("max_frames") or 256,
-            "min_frames": pc.get("min_frames") or 8,
+            "max_frames": _coalesce(pc.get("max_frames"), 256),
+            "min_frames": _coalesce(pc.get("min_frames"), 8),
             "video_audio_interleave_length": pc.get("video_audio_interleave_length", 0),
             "use_per_grid_t_timestamps": pc.get("use_per_grid_t_timestamps", False),
             "use_video_timestamps": pc.get("use_video_timestamps", False),
         }
         # audio_sampling_rate: processor_config > audio_config > mm_config.audio.
-        asr = (
-            pc.get("audio_sampling_rate")
-            or ac.get("sampling_rate")
-            or ac.get("sample_rate")
+        asr = _coalesce(
+            pc.get("audio_sampling_rate"),
+            ac.get("sampling_rate"),
+            ac.get("sample_rate"),
         )
         if asr is not None:
             kwargs["audio_sampling_rate"] = asr
@@ -763,11 +771,16 @@ class MiMoProcessor:
                 if isinstance(timestamps_seg[0], torch.Tensor)
                 else timestamps_seg[0]
             )
+            frame_duration = 1 / fps_sampled
             end_time_seg = (
                 timestamps_seg[-1].item()
                 if isinstance(timestamps_seg[-1], torch.Tensor)
                 else timestamps_seg[-1]
-            ) + (1 / fps_sampled).item()
+            ) + (
+                frame_duration.item()
+                if isinstance(frame_duration, torch.Tensor)
+                else frame_duration
+            )
 
         video_meta = {
             "fps_sampled": fps_sampled,
