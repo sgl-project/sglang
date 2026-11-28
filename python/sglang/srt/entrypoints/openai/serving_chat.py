@@ -2007,8 +2007,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # copy of a long history is not free.
         has_custom_encoder = (
             self._encoding_adapter is not None
-            or getattr(self._encode_messages, "__func__", None)
-            is not OpenAIServingChat._encode_messages
+            or type(self)._encode_messages is not OpenAIServingChat._encode_messages
         )
         prompt_ids = (
             self._encode_messages(
