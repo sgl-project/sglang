@@ -397,15 +397,18 @@ struct KpoolTopKTransformKernel {
 
     const auto out_cols = static_cast<int32_t>(out_cols_sym.unwrap());
     const auto tail_cols = seq_lens_opt.has_value() ? static_cast<int32_t>(pool_size) - 1 : 0;
-    RuntimeCheck(out_cols > tail_cols, "dst_token_indices columns ", out_cols, " must exceed tail ", tail_cols);
-    const auto token_topk = out_cols - tail_cols;
-    RuntimeCheck(token_topk % static_cast<int32_t>(pool_size) == 0, "token_topk must be a multiple of pool_size");
+    // The kernel writes token_topk history columns, then up to tail_cols live tail
+    // tokens, then -1 up to out_cols. Columns past token_topk + tail_cols are
+    // padding a consumer may ask for (TileLang reads 64-column blocks).
+    const auto token_topk = kGroupTopK * static_cast<int32_t>(pool_size);
     RuntimeCheck(
-        token_topk / static_cast<int32_t>(pool_size) == kGroupTopK,
-        "this module is built for group_topk=",
+        out_cols >= token_topk + tail_cols,
+        "dst_token_indices has ",
+        out_cols,
+        " columns; this module (group_topk=",
         kGroupTopK,
-        " but got ",
-        token_topk / static_cast<int32_t>(pool_size));
+        ") needs at least ",
+        token_topk + tail_cols);
 
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
 
