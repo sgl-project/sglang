@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 from sglang.test.unified_allocator_fixtures import arena_of, stand_in_views
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 PHYSICAL = 690240
 CONTEXT = 1048576

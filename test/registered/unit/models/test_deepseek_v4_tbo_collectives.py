@@ -13,7 +13,7 @@ from sglang.srt.models.deepseek_common import moe_transport
 from sglang.srt.models.deepseek_v4 import _tbo_collective_sizes
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestDeepseekV4TboCollectiveSizes(unittest.TestCase):

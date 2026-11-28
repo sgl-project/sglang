@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     popen_launch_pd_server,
 )
 
-register_cuda_ci(est_time=545, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=641, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase):

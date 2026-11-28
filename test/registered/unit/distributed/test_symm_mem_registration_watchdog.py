@@ -13,7 +13,7 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 FAKE_CTX = SimpleNamespace(
     _comm_ptr=1, group_coordinator=SimpleNamespace(unique_name="tp:0")

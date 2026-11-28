@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="extra-a", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

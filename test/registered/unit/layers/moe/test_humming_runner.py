@@ -17,7 +17,7 @@ pytest.importorskip("humming")
 from sglang.srt.layers.moe import fused_moe_triton  # noqa: E402
 from sglang.srt.layers.moe.moe_runner import humming  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @pytest.fixture

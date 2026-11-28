@@ -12,7 +12,7 @@ from sglang.srt import utils as srt_utils
 from sglang.srt.mem_cache.pool_host import _kvcacheio
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 # The ops `_kvcacheio` binds on XPU, read from its `_bind("...")` calls: off XPU
 # (CPU CI) the module binds nothing.

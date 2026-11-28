@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 # test/manual/spec/test_spec_standalone_backends.py, and their spec verify
 # numerics live in attention/unittests/dense/test_{triton,flashinfer}.py.
 # Non-V2 backends moved to test_spec_standalone_extra.py.
-register_cuda_ci(est_time=86, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=91, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestStandaloneV2SpeculativeDecodingBase(

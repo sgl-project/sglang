@@ -24,7 +24,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraft
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 NVFP4 = SimpleNamespace(
     architectures=["MiniMaxM3SparseForConditionalGeneration"],

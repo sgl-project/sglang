@@ -13,7 +13,7 @@ from sglang.srt.layers import logits_processor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _VOCAB = 32
 _HIDDEN = 16

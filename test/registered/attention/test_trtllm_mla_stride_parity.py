@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="4-gpu-b200")
 
 _PAGES = 4
 _PAGE_SIZE = 64

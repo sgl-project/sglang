@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=94, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=93, stage="extra-a", runner_config="1-gpu-small")
 register_amd_ci(est_time=130, stage="extra-a", runner_config="1-gpu-small-amd")
 
 KIMI_LINEAR_MODEL = "yujiepan/kimi-linear-tiny-random"

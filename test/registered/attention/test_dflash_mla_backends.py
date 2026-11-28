@@ -26,7 +26,7 @@ from sglang.test.kits.attention_unittest.attention_methods.mla_attention import 
 )
 from sglang.test.parallel_groups import publish
 
-register_cuda_ci(est_time=40, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 HIDDEN, HEADS, RANK, NOPE, ROPE, VALUE, BLOCK = 128, 32, 512, 128, 64, 128, 8
 CAPACITY = 256

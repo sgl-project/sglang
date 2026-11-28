@@ -35,7 +35,7 @@ from sglang.test.test_utils import (
 
 # Full GLM-5.3 weights require the same runner as the existing B200 recipe.
 # Provisional wall time including startup; calibrate with the B200 CI timing.
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=667, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL_PATH = "zai-org/GLM-5.3-Flash"
 TRACK_INTERVAL = 256

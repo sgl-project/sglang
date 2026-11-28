@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # This uses one GPU; the pool supplies the required Blackwell FP8 kernels.
-register_cuda_ci(est_time=20, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=16, stage="extra-b", runner_config="4-gpu-b200")
 
 
 @unittest.skipUnless(

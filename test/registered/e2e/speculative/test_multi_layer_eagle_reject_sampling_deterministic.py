@@ -9,7 +9,7 @@ from sglang.test.test_deterministic import (
 from sglang.test.test_deterministic import test_deterministic as run_deterministic
 from sglang.test.test_utils import DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
 
-register_cuda_ci(est_time=480, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=322, stage="extra-b", runner_config="8-gpu-h200")
 
 STEP3P5_FLASH_MODEL_PATH = "stepfun-ai/Step-3.5-Flash"
 

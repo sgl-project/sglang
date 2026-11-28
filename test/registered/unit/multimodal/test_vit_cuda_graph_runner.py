@@ -6,7 +6,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.runtime_context import get_parallel
