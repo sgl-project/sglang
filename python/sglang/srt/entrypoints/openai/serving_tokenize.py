@@ -154,51 +154,26 @@ class OpenAIServingDetokenize(OpenAIServingBase):
         raw_request: Request,
     ) -> Union[DetokenizeResponse, ErrorResponse]:
         try:
+            tokens = request.tokens
+            if not tokens:
+                return DetokenizeResponse(text="")
+
             tokenizer = self.tokenizer_manager.tokenizer
-
-            if (
-                isinstance(request.tokens, list)
-                and request.tokens
-                and isinstance(request.tokens[0], int)
-            ):
-                if not all(isinstance(t, int) for t in request.tokens):
-                    return self.create_error_response(
-                        "Invalid input: 'tokens' must be a list of integers."
-                    )
-                if (error := self._out_of_vocab_error(request.tokens)) is not None:
+            skip_special_tokens = request.skip_special_tokens
+            if isinstance(tokens[0], int):
+                if (error := self._out_of_vocab_error(tokens)) is not None:
                     return error
-                tokens_to_decode = [int(t) for t in request.tokens]
-                text = tokenizer.decode(
-                    tokens_to_decode, skip_special_tokens=request.skip_special_tokens
-                )
-                text_out: Union[str, List[str]] = text
-            elif (
-                isinstance(request.tokens, list)
-                and request.tokens
-                and isinstance(request.tokens[0], list)
-            ):
-                texts: List[str] = []
-                for token_list in request.tokens:
-                    if not all(isinstance(t, int) for t in token_list):
-                        return self.create_error_response(
-                            f"Invalid input: Sublist in 'tokens' must contain only integers. Found: {token_list}"
-                        )
-                    if (error := self._out_of_vocab_error(token_list)) is not None:
-                        return error
-                    decoded_text = tokenizer.decode(
-                        [int(t) for t in token_list],
-                        skip_special_tokens=request.skip_special_tokens,
-                    )
-                    texts.append(decoded_text)
-                text_out = texts
-            elif isinstance(request.tokens, list) and not request.tokens:
-                text_out = ""
-            else:
-                return self.create_error_response(
-                    f"Invalid tokens type: {type(request.tokens)}. Expected List[int] or List[List[int]]."
-                )
+                text = tokenizer.decode(tokens, skip_special_tokens=skip_special_tokens)
+                return DetokenizeResponse(text=text)
 
-            return DetokenizeResponse(text=text_out)
+            texts = []
+            for row in tokens:
+                if (error := self._out_of_vocab_error(row)) is not None:
+                    return error
+                texts.append(
+                    tokenizer.decode(row, skip_special_tokens=skip_special_tokens)
+                )
+            return DetokenizeResponse(text=texts)
         except Exception as e:
             logger.error("Error during detokenization", exc_info=True)
             if "decode" in str(e).lower():
