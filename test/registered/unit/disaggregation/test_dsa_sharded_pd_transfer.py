@@ -13,6 +13,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll, KVTransferMetric, StateType
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.nixl.buffers import BufferKeys
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
@@ -229,34 +230,39 @@ class TestDSANIXLShardedPDTransfer(_FragmentedPagesTestMixin, CustomTestCase):
             state_data_ptrs=[[x.ctypes.data for x in src]],
             state_item_lens=[[_INDEX_PAGE_BYTES] * len(src)],
         )
-        mgr.agent = Mock()
-        mgr.agent.get_xfer_descs.side_effect = lambda descs, kind: descs
+        mgr._local_keys = BufferKeys.for_buffers([], [], [list(range(len(src)))])
+        peer_keys = BufferKeys.for_buffers([], [], [list(range(len(dst)))])
+        mgr._peers = {"decode": SimpleNamespace(keys=peer_keys)}
+        src_by_key = dict(zip(mgr._local_keys.state[0], src))
+        dst_by_key = dict(zip(peer_keys.state[0], dst))
+        byte_count = 0
+
+        # Apply exactly the byte ranges submitted to the transport.
+        def transfer_copies(peer, copies):
+            nonlocal byte_count
+            self.assertEqual(peer, "decode")
+            for copy in copies:
+                s_buf = src_by_key[copy.src].reshape(-1)
+                d_buf = dst_by_key[copy.dst].reshape(-1)
+                for s, d, n in copy.ranges.tolist():
+                    self.assertTrue(0 <= s <= s_buf.size - n)
+                    self.assertTrue(0 <= d <= d_buf.size - n)
+                    d_buf[d : d + n] = s_buf[s : s + n]
+                    byte_count += n
+            return [SimpleNamespace(xfer=object(), result=None, error=None)]
+
+        mgr._transfer_copies = transfer_copies
         handles = list(
             mgr.maybe_send_extra(
                 "decode",
                 [logical],
                 [[x.ctypes.data for x in dst]],
                 [dst_pages],
-                dst_gpu_id=1,
                 decode_tp_size=1,
                 dst_state_item_lens=[[_INDEX_PAGE_BYTES] * len(dst)],
             )
         )
         self.assertEqual(len(handles), int(np.any(logical % size == rank)))
-        byte_count = 0
-        # Apply exactly the byte ranges submitted to the NIXL agent.
-        for call in mgr.agent.initialize_xfer.call_args_list:
-            op, src_descs, dst_descs, peer = call.args
-            self.assertEqual((op, peer), ("WRITE", "decode"))
-            for (s, n, _), (d, m, _) in zip(
-                src_descs.tolist(), dst_descs.tolist(), strict=True
-            ):
-                self.assertEqual(n, m)
-                byte_count += n
-                s -= src.ctypes.data
-                d -= dst.ctypes.data
-                self.assertTrue(0 <= s <= src.nbytes - n and 0 <= d <= dst.nbytes - n)
-                dst.reshape(-1)[d : d + n] = src.reshape(-1)[s : s + n]
         return byte_count
 
 

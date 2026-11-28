@@ -72,7 +72,6 @@ Run this command on the prefill node. It enables interleave CP, page-based KV sh
 
 ```bash Prefill worker
 source ./kv-shard.env
-export SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python
 python -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
   --revision "$MODEL_REVISION" \

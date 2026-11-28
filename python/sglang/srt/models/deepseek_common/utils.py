@@ -22,7 +22,6 @@ from sglang.srt.layers.moe import get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     get_device_sm,
     get_hip_version,
     is_cpu,
@@ -30,6 +29,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
+    is_mlu,
     is_musa,
     is_npu,
     is_nvidia_cublas_version_ge_12_9,
@@ -39,11 +39,12 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_mlu = is_mlu()
 _is_npu = is_npu()
 _is_musa = is_musa()
 _is_sail = is_sail()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
@@ -104,7 +105,7 @@ def awq_dequantize_func():
         - None if the current device is not supported.
     """
     if _is_cuda:
-        from sglang.kernel_api_logging import debug_kernel_api
+        from sglang.kernels.kernel_api_logging import debug_kernel_api
         from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
 
         return debug_kernel_api(awq_dequantize, op_name="DeepseekCommon.awq_dequantize")
