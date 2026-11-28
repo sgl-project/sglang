@@ -55,6 +55,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
+    QwenImage21PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import (
     SanaWMPipelineConfig,
     SanaWMRealtimeConfig,
@@ -2865,6 +2868,22 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                     self.assertEqual(
                         args.residency_mode("transformer"), LAYERWISE_OFFLOAD
                     )
+
+    def test_auto_qwen_image_21_streams_a_dit_that_overflows_the_card(self):
+        """Whole-DiT offload OOMed with 16 GiB free; 24 GiB still holds it."""
+        for memory_gb, mode in ((16, LAYERWISE_OFFLOAD), (24, COMPONENT_OFFLOAD)):
+            with self.subTest(memory_gb=memory_gb):
+                args = self._from_dict_with_pipeline_config(
+                    QwenImage21PipelineConfig(),
+                    memory_gb=memory_gb,
+                    dit_parameter_count=7_140_000_000,
+                    kwargs={
+                        "model_path": "Qwen/Qwen-Image-2.1",
+                        "performance_mode": "auto",
+                    },
+                )
+
+                self.assertEqual(args.residency_mode("transformer"), mode)
 
     def test_auto_sizes_the_dit_at_the_precision_it_loads_in(self):
         # 16B parameters fit a 48 GB card in BF16 but not in FP32
