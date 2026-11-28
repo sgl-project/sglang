@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import glob
+import hashlib
 import json
 import os
 import threading
@@ -321,23 +322,21 @@ def generate(
     temperature: float = 0.0,
     ignore_eos: bool = True,
     return_logprob: bool = False,
+    lora_path: Optional[str] = None,
     timeout: float = 180,
 ) -> Dict[str, Any]:
-    response = post(
-        base_url,
-        "/generate",
-        {
-            "text": prompt,
-            "sampling_params": {
-                "max_new_tokens": max_new_tokens,
-                "temperature": temperature,
-                "ignore_eos": ignore_eos,
-            },
-            "return_logprob": return_logprob,
+    body: Dict[str, Any] = {
+        "text": prompt,
+        "sampling_params": {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "ignore_eos": ignore_eos,
         },
-        timeout=timeout,
-    )
-    return response.json()
+        "return_logprob": return_logprob,
+    }
+    if lora_path is not None:
+        body["lora_path"] = lora_path
+    return post(base_url, "/generate", body, timeout=timeout).json()
 
 
 def stream_generate(
@@ -451,6 +450,7 @@ def logprob_signature(
     prompts: Sequence[str],
     *,
     max_new_tokens: int = 8,
+    lora_path: Optional[str] = None,
 ) -> Tuple[Tuple[Tuple[int, ...], Tuple[float, ...]], ...]:
     """Return ``(output_ids, output_token_logprobs)`` for each prompt.
 
@@ -460,7 +460,11 @@ def logprob_signature(
     signature = []
     for prompt in prompts:
         result = generate(
-            base_url, prompt, max_new_tokens=max_new_tokens, return_logprob=True
+            base_url,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            return_logprob=True,
+            lora_path=lora_path,
         )
         meta = result.get("meta_info", {})
         token_logprobs = tuple(
@@ -771,3 +775,258 @@ def update_full_checkpoint_per_rank(
             end_weight_update(base_url)
     finally:
         del keepalive, payloads
+
+
+def update_weight_version(
+    base_url: str,
+    new_version: str,
+    *,
+    abort_all_requests: bool = False,
+    timeout: float = 120,
+) -> None:
+    post(
+        base_url,
+        "/update_weight_version",
+        {"new_version": new_version, "abort_all_requests": abort_all_requests},
+        timeout=timeout,
+    )
+
+
+def current_weight_version(base_url: str) -> str:
+    return get(base_url, "/get_model_info").json()["weight_version"]
+
+
+def abort_all_requests(base_url: str, *, timeout: float = 120) -> None:
+    post(base_url, "/abort_request", {"abort_all": True}, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# LoRA helpers
+# ---------------------------------------------------------------------------
+
+
+LORA_RANK = 8
+LORA_ALPHA = 16
+# Adapter weight scale: large enough that the adapted model must answer
+# differently, small enough to stay in a sane numeric range.
+LORA_A_STD = 0.1
+LORA_B_STD = 0.1
+_LORA_ADAPTER_SEED = 20261021
+_LORA_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
+LORA_TEST_PROMPTS = (
+    "The capital of France is",
+    "1 + 1 =",
+    "def hello():\n    return",
+)
+LORA_TEST_SERVER_ARGS = (
+    "--trust-remote-code",
+    "--attention-backend",
+    "ascend",
+    "--disable-decode-cuda-graph",
+    "--disable-prefill-cuda-graph",
+    "--disable-overlap-schedule",
+    "--disable-radix-cache",
+    "--context-length",
+    "2048",
+    "--max-running-requests",
+    "8",
+    "--mem-fraction-static",
+    "0.5",
+    "--enable-lora",
+    "--max-lora-rank",
+    str(LORA_RANK),
+    "--lora-target-modules",
+    "all",
+    # The default csgmv backend is Triton-only; Ascend needs its own kernels.
+    "--lora-backend",
+    "ascend",
+)
+
+
+def _lora_adapter_seed(name: str) -> int:
+    digest = hashlib.sha256(f"{_LORA_ADAPTER_SEED}:{name}".encode()).hexdigest()
+    return int(digest[:16], 16) % (2**63 - 1)
+
+
+def _lora_target_linears(model_path: str):
+    """``(module_name, in_features, out_features)`` for the adapter targets.
+
+    Building the model on the meta device keeps this cheap: only the config is
+    needed to know which projections exist and how wide they are.
+    """
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+    targets = []
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if name.rsplit(".", 1)[-1] not in _LORA_TARGET_MODULES:
+            continue
+        targets.append((name, module.in_features, module.out_features))
+    if not targets:
+        raise AssertionError(f"{model_path}: no LoRA target projections found")
+    return targets
+
+
+def lora_adapter_tensors(model_path: str):
+    """Deterministic PEFT adapter for ``model_path``, in the same key layout a
+    ``save_pretrained`` adapter directory uses."""
+    tensors = {}
+    for name, in_features, out_features in _lora_target_linears(model_path):
+        key = f"base_model.model.{name}"
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(_lora_adapter_seed(key + ".lora_A.weight"))
+        a = (
+            torch.empty(LORA_RANK, in_features, dtype=torch.float32)
+            .normal_(0.0, LORA_A_STD, generator=generator)
+            .to(torch.bfloat16)
+        )
+        generator.manual_seed(_lora_adapter_seed(key + ".lora_B.weight"))
+        b = (
+            torch.empty(out_features, LORA_RANK, dtype=torch.float32)
+            .normal_(0.0, LORA_B_STD, generator=generator)
+            .to(torch.bfloat16)
+        )
+        tensors[key + ".lora_A.weight"] = a
+        tensors[key + ".lora_B.weight"] = b
+    return tensors
+
+
+def lora_adapter_config(model_path: str) -> dict:
+    return {
+        "peft_type": "LORA",
+        "task_type": "CAUSAL_LM",
+        "base_model_name_or_path": model_path,
+        "r": LORA_RANK,
+        "lora_alpha": LORA_ALPHA,
+        "lora_dropout": 0.0,
+        "bias": "none",
+        "fan_in_fan_out": False,
+        "inference_mode": True,
+        "target_modules": list(_LORA_TARGET_MODULES),
+        "use_dora": False,
+    }
+
+
+def write_lora_adapter(destination: str, tensors, config: dict) -> str:
+    from safetensors.torch import save_file
+
+    os.makedirs(destination, exist_ok=True)
+    with open(
+        os.path.join(destination, "adapter_config.json"), "w", encoding="utf-8"
+    ) as handle:
+        json.dump(config, handle, indent=2)
+        handle.write("\n")
+    save_file(
+        {name: tensor.contiguous() for name, tensor in tensors.items()},
+        os.path.join(destination, "adapter_model.safetensors"),
+        metadata={"format": "pt"},
+    )
+    return destination
+
+
+def load_lora_adapter(
+    base_url: str,
+    lora_name: str,
+    lora_path: str,
+    *,
+    pinned: bool = False,
+    timeout: float = 300,
+) -> None:
+    result = post(
+        base_url,
+        "/load_lora_adapter",
+        {"lora_name": lora_name, "lora_path": lora_path, "pinned": pinned},
+        timeout=timeout,
+    ).json()
+    if not result.get("success"):
+        raise RuntimeError(
+            f"load_lora_adapter({lora_name}) failed: {result.get('error_message')}"
+        )
+
+
+def load_lora_adapter_from_tensors(
+    base_url: str,
+    lora_name: str,
+    tensors: Dict[str, torch.Tensor],
+    config_dict: Dict[str, Any],
+    *,
+    load_format: Optional[str] = None,
+    tp_size: int = 1,
+    timeout: float = 300,
+) -> None:
+    """Send one serialized copy of the adapter per TP rank.
+
+    The tensors are moved to each rank's NPU first: ``ForkingPickler`` reduces
+    CPU tensors through a shared-memory handshake whose authkey only survives
+    inside one process tree, so a server in another process cannot rebuild
+    them (it fails with ``AuthenticationError: digest sent was rejected``).
+    """
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    keepalive = []
+    payloads = []
+    try:
+        for rank in range(max(1, tp_size)):
+            device = f"npu:{rank}"
+            on_device = {
+                name: tensor.to(device).contiguous() for name, tensor in tensors.items()
+            }
+            keepalive.append(on_device)
+            if load_format == "flattened_bucket":
+                from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+
+                bucket = FlattenedTensorBucket(named_tensors=list(on_device.items()))
+                keepalive.append(bucket)
+                payloads.append(
+                    MultiprocessingSerializer.serialize(
+                        {
+                            "flattened_tensor": bucket.get_flattened_tensor(),
+                            "metadata": bucket.get_metadata(),
+                        },
+                        output_str=True,
+                    )
+                )
+            else:
+                payloads.append(
+                    MultiprocessingSerializer.serialize(on_device, output_str=True)
+                )
+
+        body: Dict[str, Any] = {
+            "lora_name": lora_name,
+            "config_dict": config_dict,
+            "serialized_named_tensors": payloads,
+        }
+        if load_format is not None:
+            body["load_format"] = load_format
+        result = post(
+            base_url, "/load_lora_adapter_from_tensors", body, timeout=timeout
+        ).json()
+        if not result.get("success"):
+            raise RuntimeError(
+                f"load_lora_adapter_from_tensors({lora_name}) failed: "
+                f"{result.get('error_message')}"
+            )
+    finally:
+        del keepalive, payloads
+
+
+def unload_lora_adapter(base_url: str, lora_name: str, *, timeout: float = 120) -> None:
+    post(
+        base_url,
+        "/unload_lora_adapter",
+        {"lora_name": lora_name},
+        timeout=timeout,
+    )
