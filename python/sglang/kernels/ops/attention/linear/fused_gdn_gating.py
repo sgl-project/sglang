@@ -81,3 +81,72 @@ def fused_gdn_gating(
         num_warps=1,
     )
     return g, beta_output
+
+
+@triton.jit
+def fused_gdn_gating_blocked_kernel(
+    g,
+    beta_output,
+    A_log,
+    a,
+    b,
+    dt_bias,
+    num_tokens,
+    stride_a,
+    stride_b,
+    NUM_HEADS: tl.constexpr,
+    beta: tl.constexpr,
+    threshold: tl.constexpr,
+    BLK_TOKENS: tl.constexpr,
+    BLK_HEADS: tl.constexpr,
+):
+    # fused_gdn_gating_kernel's values on a [BLK_TOKENS, BLK_HEADS] block.
+    token = tl.program_id(0) * BLK_TOKENS + tl.arange(0, BLK_TOKENS)[:, None]
+    head_off = tl.arange(0, BLK_HEADS)[None, :]
+    head_mask = head_off < NUM_HEADS
+    mask = (token < num_tokens) & head_mask
+    off = token * NUM_HEADS + head_off
+    blk_A_log = tl.load(A_log + head_off, mask=head_mask)
+    blk_a = tl.load(a + token * stride_a + head_off, mask=mask)
+    blk_b = tl.load(b + token * stride_b + head_off, mask=mask)
+    blk_bias = tl.load(dt_bias + head_off, mask=head_mask)
+    blk_g, blk_beta_output = _gdn_gating_values(
+        blk_A_log, blk_a, blk_b, blk_bias, beta, threshold
+    )
+    tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
+
+
+def fused_gdn_gating_blocked(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    beta: float = 1.0,
+    threshold: float = 20.0,
+    block_tokens: int = 32,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fused_gdn_gating's outputs, bit for bit, from a grid of ``block_tokens``
+    tokens x all heads a program instead of one token x 8 heads: fewer, larger
+    programs for prefill-sized batches."""
+    batch, num_heads = a.shape
+    g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
+    beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
+    fused_gdn_gating_blocked_kernel[(triton.cdiv(batch, block_tokens),)](
+        g,
+        beta_output,
+        A_log,
+        a,
+        b,
+        dt_bias,
+        batch,
+        a.stride(0),
+        b.stride(0),
+        num_heads,
+        beta,
+        threshold,
+        block_tokens,
+        triton.next_power_of_2(num_heads),
+        num_warps=4,
+    )
+    return g, beta_output
