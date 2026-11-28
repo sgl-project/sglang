@@ -18,7 +18,7 @@ from sglang.kernels.ops.attention.dsa.tilelang_kernel import _pick_inner_iter
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 # (cu, block_per_cu) of the tilelang_sparse_fwd branches, passed explicitly so
 # the tests are device-independent: 132 and 148 SMs, then ROCm gfx942 and gfx950.

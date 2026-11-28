@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.layout.paged_view import paged_view
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=32, stage="base-c", runner_config="4-gpu-gb300")
 
 hopper_or_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,

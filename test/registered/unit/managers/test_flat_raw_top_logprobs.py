@@ -60,7 +60,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.json_response import dumps_json
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 # Synthetic per-position top-k rows (k=2). The leading None mirrors the first
 # prompt position, which has no top logprobs.

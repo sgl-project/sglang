@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=270, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=189, stage="base-b", runner_config="1-gpu-small")
 
 TOKENIZER_WORKER_NUM = 4
 NUM_WARMUP_REQUESTS = 32

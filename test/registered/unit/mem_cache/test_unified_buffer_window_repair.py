@@ -34,7 +34,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-small")
 
 PAGE = 4
 WINDOW = 2 * PAGE

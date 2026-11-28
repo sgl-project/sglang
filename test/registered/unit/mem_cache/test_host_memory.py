@@ -11,7 +11,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 _cgroup_memory_headroom = host_memory._cgroup_memory_headroom
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=0, suite="base-a-test-cpu")
 
 
 class TestHostMemory(unittest.TestCase):

@@ -30,7 +30,7 @@ from sglang.srt.constrained.reasoner_grammar_backend import ReasonerGrammarObjec
 from sglang.srt.runtime_context import get_context  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(2.0, "base-a-test-cpu")
+register_cpu_ci(3, "base-a-test-cpu")
 
 
 class TestBaseGrammarBackend(unittest.TestCase):

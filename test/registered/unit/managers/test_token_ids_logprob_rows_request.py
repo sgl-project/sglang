@@ -14,7 +14,7 @@ from sglang.srt.managers.schedule_batch import token_id_rows_for_extend
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 MALFORMED_ROWS = {
     "too-few-rows": [[4, 2]],

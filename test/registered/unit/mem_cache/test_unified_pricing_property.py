@@ -35,7 +35,7 @@ from sglang.test.unified_allocator_trace import (
     draw_op,
 )
 
-register_cuda_ci(est_time=40, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=24, stage="extra-a", runner_config="1-gpu-small")
 
 _SEEDS = (0, 1, 2, 3)
 _STEPS = 60

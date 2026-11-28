@@ -29,7 +29,7 @@ from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=91, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=108, stage="extra-a", runner_config="1-gpu-small")
 
 _SEQCLS_MODEL = os.environ.get(
     "TEST_CLASSIFICATION_BASE_MODEL",

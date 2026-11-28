@@ -17,7 +17,7 @@ from sglang.kernels.ops.attention.unlimited_ocr_dash import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _TRITON_ENTRY_POINTS = {
     "dash_sparse_attn": attend.dash_sparse_attn,

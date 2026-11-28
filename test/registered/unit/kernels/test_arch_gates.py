@@ -16,7 +16,7 @@ from sglang.kernels.ops.gemm import bf16_fp32, hopper_bf16_gemv
 from sglang.kernels.ops.moe import inkling2_moe_lowm_sm120
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _cuda_arch(major: int, minor: int) -> CudaArch:

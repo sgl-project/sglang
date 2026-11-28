@@ -13,7 +13,7 @@ from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "base-a-test-cpu")
+register_cpu_ci(3, "base-a-test-cpu")
 
 
 class TestXGrammarJSONSchemaValidation(unittest.TestCase):

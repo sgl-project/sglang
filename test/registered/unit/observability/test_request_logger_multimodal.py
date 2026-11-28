@@ -11,7 +11,7 @@ from sglang.srt.observability import request_logger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 IMAGE_B64 = "data:image/png;base64," + "A" * 4000
 IMAGE_URL = "https://example.com/cat.png"

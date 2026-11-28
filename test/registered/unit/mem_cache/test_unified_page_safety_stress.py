@@ -8,7 +8,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_page_safety_harness import replay_case, run_seed
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 # Seeds of generated chains (mixed page sizes, one or two floating windows,
 # decode context parallelism on some) whose sequences run in a few seconds.

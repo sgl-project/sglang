@@ -25,7 +25,7 @@ from sglang.test.scheduler_test_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class _ReqStub(FakeReq):

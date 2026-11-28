@@ -47,7 +47,7 @@ from sglang.test.unified_allocator_fixtures import (
 # test takes rows for one.
 _NO_ROW_REQ = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=None))
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 # Window rows retire at once in these tests, which price chunks and
 # admission; the scheduler's window retirement is priced in

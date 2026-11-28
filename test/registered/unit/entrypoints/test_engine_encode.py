@@ -8,7 +8,7 @@ from sglang.srt.managers.io_struct import EmbeddingReqInput
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _RESULT = {"embedding": [0.1, 0.2], "meta_info": {"prompt_tokens": 3}}
 

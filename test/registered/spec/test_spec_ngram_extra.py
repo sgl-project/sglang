@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
 
 # Extra: Triton + Flashinfer NGRAM backends + non-overlap (sync V2) variant.
 # Sibling per-commit file (test_spec_ngram.py) keeps the Paged variant.
-register_cuda_ci(est_time=216, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=267, stage="extra-a", runner_config="1-gpu-small")
 # AMD: flashinfer is not built in the ROCm sgl_kernel, so only the
 # triton-backend class runs on ROCm.
 register_amd_ci(est_time=130, suite="extra-a-test-1-gpu-large-amd")

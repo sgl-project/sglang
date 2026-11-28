@@ -23,7 +23,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 from sglang.srt.runtime_context import publish, reset_context  # noqa: E402
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 NO_REPLY_REQUESTS = [
     PauseGenerationReqInput(mode="in_place"),

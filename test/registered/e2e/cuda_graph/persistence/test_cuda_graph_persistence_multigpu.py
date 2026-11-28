@@ -10,7 +10,7 @@ import test_cuda_graph_persistence as e2e
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=900, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=679, stage="base-b", runner_config="2-gpu-large")
 
 # Dummy weights, no download;
 # the graphs, their restore and output agreement are exercised, model quality is not.

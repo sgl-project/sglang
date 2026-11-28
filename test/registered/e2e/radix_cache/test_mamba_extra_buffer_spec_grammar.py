@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=72, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=76, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=180, stage="base-b", runner_config="1-gpu-small-amd")
 
 MODEL = "Qwen/Qwen3.5-0.8B"

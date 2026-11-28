@@ -14,7 +14,7 @@ from test_npu_flash_mla import mod
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=3, suite="extra-a-test-npu")
+register_npu_ci(est_time=2, suite="extra-a-test-npu")
 
 SOURCE = Path(__file__).resolve().parents[5] / "python/sglang/srt"
 

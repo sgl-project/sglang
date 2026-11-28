@@ -11,7 +11,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.runtime_context import get_parallel
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 LOGGER = "sglang.srt.managers.scheduler"
 

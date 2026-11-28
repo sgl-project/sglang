@@ -87,7 +87,7 @@ from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.nixl_utils import attach_nixl_transport
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 def _static_storage(pool, draft=None, total_kv_layers=None) -> StaticKVStorage:

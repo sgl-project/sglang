@@ -17,7 +17,7 @@ from sglang.srt.managers.tokenizer_manager import (
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _FLAT_KEYS = (
     "output_token_sampling_mask_flat",

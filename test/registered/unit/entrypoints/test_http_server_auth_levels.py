@@ -5,7 +5,7 @@ from sglang.srt.utils.auth import AUTH_LEVELS, _iter_leaf_routes, undeclared_rou
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 # Declared routes neither imported app has: the dumper's (registered under
 # DUMPER_SERVER_PORT=reuse), the metrics mount (added at launch) and the Rust

@@ -15,7 +15,7 @@ import pytest
 from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 _EXPERT_KEY = "model.layers.0.mlp.experts.0.w1.weight"
 

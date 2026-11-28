@@ -37,7 +37,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
 # SM90 only, like the model's gate; 8 GPUs cover TP2, TP4 and TP8
-register_cuda_ci(est_time=120, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=83, stage="extra-b", runner_config="8-gpu-h200")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),

@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import arena_of
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _spec(heads=1, draft=None):

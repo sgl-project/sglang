@@ -8,7 +8,7 @@ from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "base-a-test-cpu")
+register_cpu_ci(2, "base-a-test-cpu")
 
 DSML = "｜DSML｜"
 

@@ -9,7 +9,7 @@ from sglang.kernels.ops.speculative.dspark import dspark_verify_window
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class TestNpuBuildOutTokens(CustomTestCase):

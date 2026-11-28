@@ -16,7 +16,7 @@ from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=1, suite="extra-a-test-npu")
+register_npu_ci(est_time=2, suite="extra-a-test-npu")
 
 _DUMMY_STATE = 999
 

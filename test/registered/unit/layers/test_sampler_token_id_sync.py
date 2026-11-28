@@ -17,7 +17,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers import sampler as sampler_module
 from sglang.srt.layers.sampler import Sampler
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 _GRAMMAR_BATCH = SimpleNamespace(grammars=[object()])
 _PLAIN_BATCH = SimpleNamespace(grammars=None)

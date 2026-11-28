@@ -24,7 +24,7 @@ from sglang.test.unified_allocator_fixtures import (
     tri_sub_pool_specs,
 )
 
-register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=17, stage="extra-a", runner_config="1-gpu-small")
 
 _ROLES = ChainRoles(owner="full", window="swa", state="mamba")
 

@@ -22,7 +22,7 @@ from sglang.test.ci.ci_register import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
 # backend-specific: XPU CPU-offload loads host Gemma weights into device buffers
 # and must retain cached GDN/KDA views after checkpoint loading.
 register_xpu_ci(est_time=10, suite="extra-test-1-gpu-xpu")

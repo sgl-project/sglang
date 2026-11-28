@@ -54,7 +54,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import idle_penalty_status_pool
 from sglang.test.test_utils import CustomTestCase, enter_override
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 SMALL_POOL = 16384
 ROWS = 16

@@ -35,7 +35,7 @@ from sglang.test.unified_allocator_fixtures import setup_allocator_context
 # keep it to this module's tests so later tests in the process see none.
 _kit._parallel_override.__exit__(None, None, None)
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 _HEADS, _KV_HEADS, _HEAD_DIM = 4, 2, 64
 _DTYPE = torch.bfloat16

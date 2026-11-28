@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
-register_npu_ci(est_time=5, suite="extra-a-test-npu")
+register_npu_ci(est_time=2, suite="extra-a-test-npu")
 
 
 class _FakePPGroup:
