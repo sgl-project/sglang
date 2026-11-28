@@ -1,7 +1,7 @@
 export const config = {
   modelName: "Muse Glimmer",
 
-  supportedHardware: ["b200", "h200", "rtx5090", "rtxpro6000", "dgx-spark", "mac"],
+  supportedHardware: ["b200", "h200", "h100", "rtx5090", "rtxpro6000", "dgx-spark", "mac"],
 
   hardware: [
     // RTX 5090 and RTX PRO 6000 are Blackwell-generation but not in the shared
@@ -104,6 +104,7 @@ export const config = {
   dockerImages: {
     b200:    "lmsysorg/sglang:dev-muse-glimmer",
     h200:    "lmsysorg/sglang:dev-muse-glimmer",
+    h100:    "lmsysorg/sglang:dev-muse-glimmer",
     rtx5090: "lmsysorg/sglang:dev-muse-glimmer",
     rtxpro6000: "lmsysorg/sglang:dev-muse-glimmer",
     // GB10 needs an aarch64 manifest under this tag to resolve natively
@@ -380,6 +381,35 @@ export const config = {
     {
       match: { hw: "h200", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
       verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser muse",
+        "--tool-call-parser muse",
+        "--speculative-algorithm DFLASH",
+        "--speculative-draft-model-path {{DRAFT_PATH}}",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "standard", nodes: "single" },
+      verified: false,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--reasoning-parser muse",
+        "--tool-call-parser muse",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "h100", variant: "default", quant: "bf16", strategy: "dflash", nodes: "single" },
+      verified: false,
       env: [],
       flags: [
         "--model-path {{MODEL_NAME}}",
