@@ -79,12 +79,57 @@ def test_zimage_forward_joint_sp_shards_blocks_and_runs_final_layer_before_gathe
 ):
     import threading
 
+    from sglang.multimodal_gen.configs.models.dits.zimage import (
+        ZImageArchConfig,
+        ZImageDitConfig,
+    )
     from sglang.multimodal_gen.runtime.models.dits import zimage as zimage_mod
+
+    ctor_cfg = ZImageDitConfig(
+        arch_config=ZImageArchConfig(
+            all_patch_size=(),
+            all_f_patch_size=(),
+            dim=16,
+            num_layers=0,
+            n_refiner_layers=0,
+            num_attention_heads=2,
+            n_kv_heads=2,
+            cap_feat_dim=8,
+            axes_dims=(2, 3, 3),
+            axes_lens=(4, 4, 4),
+        )
+    )
+    monkeypatch.setattr(
+        zimage_mod,
+        "TimestepEmbedder",
+        lambda *args, **kwargs: torch.nn.Identity(),
+    )
+    monkeypatch.setattr(
+        zimage_mod,
+        "ReplicatedLinear",
+        lambda *args, **kwargs: torch.nn.Identity(),
+    )
+    with torch.device("meta"):
+        default_model = zimage_mod.ZImageTransformer2DModel(
+            config=ctor_cfg, hf_config={}
+        )
+        joint_model = zimage_mod.ZImageTransformer2DModel(
+            config=ctor_cfg, hf_config={}, shard_joint_sequence=True
+        )
+    assert default_model.shard_joint_sequence is False
+    assert joint_model.shard_joint_sequence is True
 
     local_rank = threading.local()
     local_rank.rank = 0
     observed = {
-        rank: {"events": [], "noise_shapes": [], "layer_calls": []} for rank in (0, 1)
+        rank: {
+            "events": [],
+            "noise_shapes": [],
+            "noise_rope": [],
+            "layer_calls": [],
+            "layer_rope": [],
+        }
+        for rank in (0, 1)
     }
 
     class _LinearStub(torch.nn.Module):
@@ -111,9 +156,11 @@ def test_zimage_forward_joint_sp_shards_blocks_and_runs_final_layer_before_gathe
             rec = observed[local_rank.rank]
             if self.tag == "noise":
                 rec["noise_shapes"].append(tuple(x.shape))
+                rec["noise_rope"].append(rope_cos_sin_cache.clone())
                 return x + 1.0
             if self.tag == "layer":
                 rec["layer_calls"].append((tuple(x.shape), num_replicated_suffix))
+                rec["layer_rope"].append(rope_cos_sin_cache.clone())
                 return x + 2.0
             return x
 
@@ -123,9 +170,9 @@ def test_zimage_forward_joint_sp_shards_blocks_and_runs_final_layer_before_gathe
             return (x[..., :4] + x[..., 4:]) * 1.5
 
     class _Host(zimage_mod.ZImageTransformer2DModel):
-        def __init__(self):
+        def __init__(self, *, shard_joint_sequence: bool = True):
             torch.nn.Module.__init__(self)
-            self.shard_joint_sequence = True
+            self.shard_joint_sequence = shard_joint_sequence
             self.all_patch_size = (2,)
             self.all_f_patch_size = (1,)
             self.t_scale = 1.0
@@ -144,10 +191,11 @@ def test_zimage_forward_joint_sp_shards_blocks_and_runs_final_layer_before_gathe
 
     hidden = torch.arange(256, dtype=torch.float32).view(1, 1, 1, 8, 32)
     cap = [torch.arange(128, dtype=torch.float32).view(32, 4)]
-    freqs = (
-        (torch.ones(32, 4), torch.zeros(32, 4)),
-        (torch.ones(64, 4), torch.zeros(64, 4)),
-    )
+    cap_cos = torch.arange(128, dtype=torch.float32).view(32, 4)
+    cap_sin = torch.arange(128, 256, dtype=torch.float32).view(32, 4)
+    img_cos = torch.arange(256, 512, dtype=torch.float32).view(64, 4)
+    img_sin = torch.arange(512, 768, dtype=torch.float32).view(64, 4)
+    freqs = ((cap_cos, cap_sin), (img_cos, img_sin))
     t = torch.tensor([0.5])
 
     _fake_sp(monkeypatch, 1, 0)
@@ -157,7 +205,9 @@ def test_zimage_forward_joint_sp_shards_blocks_and_runs_final_layer_before_gathe
     for rec in observed.values():
         rec["events"].clear()
         rec["noise_shapes"].clear()
+        rec["noise_rope"].clear()
         rec["layer_calls"].clear()
+        rec["layer_rope"].clear()
     monkeypatch.setattr(sps, "get_sp_world_size", lambda: 2)
     monkeypatch.setattr(sps, "get_sp_parallel_rank", lambda: local_rank.rank)
     monkeypatch.setattr(zimage_mod, "get_sp_world_size", lambda: 2)
@@ -175,32 +225,71 @@ def test_zimage_forward_joint_sp_shards_blocks_and_runs_final_layer_before_gathe
         return gathered
 
     monkeypatch.setattr(sps, "gather_seq", _gather)
-    outs: dict[int, torch.Tensor] = {}
-    errors: list[BaseException] = []
 
-    def _run_rank(rank: int) -> None:
-        local_rank.rank = rank
-        try:
-            outs[rank] = _Host()(hidden, cap, t, freqs_cis=freqs)
-        except BaseException as exc:
-            errors.append(exc)
-            barrier.abort()
+    def _run_two_ranks(
+        *,
+        shard_joint_sequence: bool,
+        img: torch.Tensor,
+        rotary: tuple,
+    ) -> dict[int, torch.Tensor]:
+        for rec in observed.values():
+            rec["events"].clear()
+            rec["noise_shapes"].clear()
+            rec["noise_rope"].clear()
+            rec["layer_calls"].clear()
+            rec["layer_rope"].clear()
+        outs: dict[int, torch.Tensor] = {}
+        errors: list[BaseException] = []
 
-    threads = [threading.Thread(target=_run_rank, args=(r,)) for r in (0, 1)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5.0)
-        assert not thread.is_alive()
-    assert not errors
+        def _run_rank(rank: int) -> None:
+            local_rank.rank = rank
+            try:
+                outs[rank] = _Host(shard_joint_sequence=shard_joint_sequence)(
+                    img, cap, t, freqs_cis=rotary
+                )
+            except BaseException as exc:
+                errors.append(exc)
+                barrier.abort()
 
+        threads = [threading.Thread(target=_run_rank, args=(r,)) for r in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5.0)
+            assert not thread.is_alive()
+        assert not errors
+        return outs
+
+    outs = _run_two_ranks(shard_joint_sequence=True, img=hidden, rotary=freqs)
+
+    expected_img_rope = torch.cat([img_cos, img_sin], dim=-1)
+    expected_joint_rope = torch.cat(
+        [expected_img_rope, torch.cat([cap_cos, cap_sin], dim=-1)], dim=0
+    )
     for rank in (0, 1):
         assert observed[rank]["noise_shapes"] == [(1, 32, 8)]
+        assert torch.equal(
+            observed[rank]["noise_rope"][0],
+            expected_img_rope[rank * 32 : (rank + 1) * 32],
+        )
         assert observed[rank]["layer_calls"] == [((1, 48, 8), 0)]
+        assert torch.equal(
+            observed[rank]["layer_rope"][0],
+            expected_joint_rope[rank * 48 : (rank + 1) * 48],
+        )
         assert observed[rank]["events"][0] == ("gather", (1, 32, 8), 64)
         assert observed[rank]["events"][1] == ("final_layer", (1, 48, 8))
         assert observed[rank]["events"][2] == ("gather", (1, 48, 4), 96)
         torch.testing.assert_close(outs[rank], ref)
+
+    spatial_freqs = ((cap_cos, cap_sin), (img_cos[:32], img_sin[:32]))
+    _run_two_ranks(
+        shard_joint_sequence=False, img=hidden[..., :16], rotary=spatial_freqs
+    )
+    for rank in (0, 1):
+        assert observed[rank]["noise_shapes"] == [(1, 32, 8)]
+        assert observed[rank]["layer_calls"] == [((1, 64, 8), 32)]
+        assert observed[rank]["events"] == [("final_layer", (1, 64, 8))]
 
 
 def test_plan_shard_divisible(monkeypatch):
