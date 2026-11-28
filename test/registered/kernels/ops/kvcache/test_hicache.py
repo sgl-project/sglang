@@ -4,8 +4,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
+    can_use_hicache_jit_kernel,
     can_use_page_unified_load_back_jit_kernel,
     can_use_write_back_jit_kernel,
+    transfer_hicache_one_layer_mla,
     transfer_hicache_one_layer_mla_page_unified_lf,
     transfer_hicache_one_layer_page_unified_lf,
 )
@@ -587,6 +589,38 @@ def test_hicache_transfer_mha(layout: str, element_dim: int) -> None:
 @pytest.mark.parametrize("element_dim", MLA_ELEMENT_DIMS)
 def test_hicache_transfer_mla(layout: str, element_dim: int) -> None:
     _run_transfer_roundtrip_mla(layout, element_dim)
+
+
+# DSA indexer host pool: one uint8 row per page, 132 B per token for the fp8
+# index key (128 B key + 4 B scale) and 68 B for fp4, times the page size.
+DSA_INDEXER_ROW_BYTES = [132 * 64, 68 * 64, 132 * 16]
+
+
+@pytest.mark.parametrize("row_bytes", DSA_INDEXER_ROW_BYTES)
+def test_hicache_one_layer_mla_dsa_indexer_rows(row_bytes: int) -> None:
+    if not can_use_hicache_jit_kernel(element_size=row_bytes):
+        pytest.skip(f"JIT HiCache kernel does not take {row_bytes} B rows here")
+    num_pages = 8
+    generator = torch.Generator().manual_seed(row_bytes)
+    host = torch.empty((num_pages, row_bytes), dtype=torch.uint8, pin_memory=True)
+    host.copy_(torch.randint(0, 256, host.shape, generator=generator).to(torch.uint8))
+    device = torch.zeros((num_pages, row_bytes), dtype=torch.uint8, device=DEVICE)
+    # unordered host pages with a repeat, distinct device pages
+    host_pages = torch.tensor([5, 0, 3, 5, 6], dtype=torch.int64, device=DEVICE)
+    device_pages = torch.tensor([1, 7, 2, 4, 0], dtype=torch.int64, device=DEVICE)
+
+    transfer_hicache_one_layer_mla(
+        cache_dst=device,
+        indices_dst=device_pages,
+        cache_src=host,
+        indices_src=host_pages,
+        element_dim=row_bytes,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.zeros_like(device, device="cpu")
+    expected[device_pages.cpu()] = host[host_pages.cpu()]
+    assert torch.equal(device.cpu(), expected)
 
 
 @pytest.mark.parametrize("layout", ["page_first"])
