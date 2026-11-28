@@ -214,6 +214,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateCacheLinkerReqInput,
+    UpdateCacheLinkerReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -2019,6 +2021,7 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
+                (UpdateCacheLinkerReqInput, self.update_cache_linker_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
@@ -3886,7 +3889,10 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.enable_unified_cache_external_linker:
+        if (
+            self.enable_unified_cache_external_linker
+            and self.tree_cache.linker is not None
+        ):
             return self.tree_cache.linker.prefetch(req)
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -4423,7 +4429,10 @@ class Scheduler(
         if (
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
-            or self.enable_unified_cache_external_linker
+            or (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker is not None
+            )
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
@@ -6304,6 +6313,7 @@ class Scheduler(
                 or self.deferred_responses.has_pending()
                 or (
                     self.enable_unified_cache_external_linker
+                    and self.tree_cache.linker is not None
                     and self.tree_cache.linker.prefetches
                 )
             ):
@@ -6442,7 +6452,10 @@ class Scheduler(
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
-            if self.enable_unified_cache_external_linker:
+            if (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker is not None
+            ):
                 idle &= not self.tree_cache.linker.prefetches
 
         return idle
@@ -6556,6 +6569,18 @@ class Scheduler(
             )
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
+
+    def update_cache_linker_wrapped(
+        self, recv_req: UpdateCacheLinkerReqInput
+    ) -> UpdateCacheLinkerReqOutput:
+        if not self.enable_unified_cache_external_linker:
+            message = "Launch with --enable-unified-cache-external-linker to manage an external linker."
+        elif not self.is_fully_idle():
+            message = "Reject external linker update: scheduler is not idle."
+        else:
+            success, message = self.tree_cache.linker_attachment.update(recv_req.attach)
+            return UpdateCacheLinkerReqOutput(success=success, message=message)
+        return UpdateCacheLinkerReqOutput(success=False, message=message)
 
     def flush_cache(
         self, empty_cache: bool = True, *, pp_all_idle: bool = False

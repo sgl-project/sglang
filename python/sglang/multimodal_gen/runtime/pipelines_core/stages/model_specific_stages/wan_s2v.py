@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import os
-import shutil
 from contextlib import ExitStack
-from urllib.parse import urlparse
-from urllib.request import urlopen
 
 import PIL.Image
 import torch
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torchvision import transforms
+
+from sglang.srt.multimodal.media_io import (
+    media_url_timeout,
+    open_remote_media,
+)
 
 try:
     import soundfile as sf
@@ -46,7 +48,6 @@ from sglang.multimodal_gen.runtime.utils.precision import (
 logger = init_logger(__name__)
 V = StageValidators
 
-# Per blocking socket operation, as urlopen applies it; matches vision.py's video download.
 _REMOTE_INPUT_TIMEOUT_S = 60
 
 
@@ -97,20 +98,20 @@ class WanS2VBeforeDenoisingStage(PipelineStage):
             raise ValueError(f"Wan S2V expects {field_name} as a non-empty string")
         if value.lower().startswith(("http://", "https://")):
             directory = files.enter_context(temporary_media_directory())
-            suffix = (
-                os.path.splitext(urlparse(value).path)[1]
-                or {
-                    "image_path": ".jpg",
-                    "audio_path": ".wav",
-                    "pose_video_path": ".mp4",
-                }[field_name]
-            )
+            suffix = {
+                "image_path": ".jpg",
+                "audio_path": ".wav",
+                "pose_video_path": ".mp4",
+            }[field_name]
             path = os.path.join(directory, "input" + suffix)
             with (
-                urlopen(value, timeout=_REMOTE_INPUT_TIMEOUT_S) as response,
+                open_remote_media(
+                    value, media_url_timeout(_REMOTE_INPUT_TIMEOUT_S)
+                ) as (_, chunks),
                 open(path, "xb") as output,
             ):
-                shutil.copyfileobj(response, output)
+                for chunk in chunks:
+                    output.write(chunk)
             return path
         if not os.path.exists(value):
             raise FileNotFoundError(f"{field_name} not found: {value}")
