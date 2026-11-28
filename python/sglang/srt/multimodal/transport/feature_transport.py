@@ -6,6 +6,7 @@ import torch
 
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.multimodal.transport.cuda_ipc import (
+    _TRANSPORT_NAME,
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
     CudaIpcTensorTransportProxy,
@@ -19,7 +20,7 @@ from sglang.srt.utils import envs, logger
 
 def keeps_mm_features_on_device(mm_feature_transport: str) -> bool:
     """Whether a feature transport expects processor outputs to stay on GPU."""
-    return mm_feature_transport in ("cuda_ipc", "cuda_vmm")
+    return mm_feature_transport in ("cuda_ipc", "cuda_vmm", "npu_ipc")
 
 
 class MultimodalFeatureTransport:
@@ -33,10 +34,10 @@ class MultimodalFeatureTransport:
     ):
         self.mm_feature_transport = (
             mm_feature_transport
-            if mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm")
+            if mm_feature_transport in ("cpu", "cuda_ipc", "cuda_vmm", "npu_ipc")
             else "cpu"
         )
-        self.use_cuda_ipc = self.mm_feature_transport == "cuda_ipc"
+        self.use_cuda_ipc = self.mm_feature_transport in ("cuda_ipc", "npu_ipc")
         self.keep_mm_features_on_device = keeps_mm_features_on_device(
             self.mm_feature_transport
         )
@@ -105,11 +106,16 @@ class MultimodalFeatureTransport:
                 )
                 raise error from rollback_errors[0]
             raise
+
+        # NPU: proxies must not leave this process before their pool copies
+        # have completed; the fence is a no-op on CUDA.
+        if self.cudaipc_mmfeature_pool is not None:
+            self.cudaipc_mmfeature_pool.fence_for_dispatch()
         return mm_items
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
         """helper function to turn a tensor into a cuda-ipc tensor"""
-        if not tensor.is_cuda:
+        if tensor.device.type not in ("cuda", "npu"):
             return tensor
 
         proxy = self.cudaipc_mmfeature_pool.wrap_tensor(
@@ -129,9 +135,10 @@ def _create_cuda_ipc_pool(base_gpu_id: int) -> MmItemMemoryPool:
     )
     total_pool_size = per_worker_pool_size * worker_num
     logger.info(
-        "CUDA IPC multimodal feature pools reserve %.0f MiB total on "
-        "GPU %d (%.0f MiB per tokenizer worker × %d; configured "
+        "%s multimodal feature pools reserve %.0f MiB total on "
+        "device %d (%.0f MiB per tokenizer worker × %d; configured "
         "budget %.0f MiB).",
+        _TRANSPORT_NAME,
         total_pool_size / (1024 * 1024),
         base_gpu_id,
         per_worker_pool_size / (1024 * 1024),
