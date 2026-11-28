@@ -83,7 +83,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    _ClosingStreamingResponse,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -153,21 +156,6 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
-
-
-class _ClosingStreamingResponse(StreamingResponse):
-    """Close the body iterator however streaming ends.
-
-    Starlette leaves the iterator suspended when a send fails, and on ASGI
-    spec >= 2.4 it also skips the background task, so nothing would abort the
-    request until the generator is garbage collected.
-    """
-
-    async def stream_response(self, send) -> None:
-        try:
-            await super().stream_response(send)
-        finally:
-            await self.body_iterator.aclose()
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:

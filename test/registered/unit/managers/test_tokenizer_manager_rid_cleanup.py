@@ -3179,6 +3179,39 @@ class TestChatStreamDisconnect(CustomTestCase):
         asyncio.run(drive())
 
 
+class TestCompletionStreamDisconnect(TestChatStreamDisconnect):
+    """A /v1/completions stream must honor the same disconnect contract."""
+
+    @staticmethod
+    def _make_handler(tm):
+        from sglang.srt.entrypoints.openai.serving_completions import (
+            OpenAIServingCompletion,
+        )
+
+        return OpenAIServingCompletion(tm, Mock())
+
+    async def _start_stream(self, tm, rid):
+        """Return the StreamingResponse once the first chunk is ready."""
+        from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+
+        handler = self._make_handler(tm)
+        request = CompletionRequest(model="m", prompt="hi", stream=True)
+        task = asyncio.create_task(
+            handler._handle_streaming_request(
+                self._make_obj(rid), request, self._make_raw_request()
+            )
+        )
+        for _ in range(100):
+            await asyncio.sleep(0)
+            if rid in tm.rid_to_state and tm.rid_to_state[rid].dispatched:
+                break
+        self.assertTrue(tm.rid_to_state[rid].dispatched)
+        await tm._handle_batch_output(
+            _make_batch_str_output(rid, finished_reason=_NOT_FINISHED)
+        )
+        return await task
+
+
 class TestReadsInputIdsLate(CustomTestCase):
     def _manager(self, *, log=False, level=2, exporter=False, dump="", crash=None):
         return SimpleNamespace(
