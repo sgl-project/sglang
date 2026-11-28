@@ -16,6 +16,7 @@ runner is free to make; `_parallel_ok` is pinned per test so the id
 comparisons do not depend on it.
 """
 
+import importlib.util
 import random
 import sys
 import unittest
@@ -382,6 +383,39 @@ def _post_processor_sequence(backend, duplicate=False):
 class _WrappedTokenizer(PreTrainedTokenizerFast):
     def encode(self, text, **kwargs):
         return super().encode(text, **kwargs)
+
+
+@unittest.skipUnless(
+    importlib.util.find_spec("fastokens"), "fastokens package not installed"
+)
+class TestFastokensBackend(_EncodeCase):
+    def test_long_prompts_preserve_ids_and_special_tokens(self):
+        from fastokens._compat import _TokenizerShim
+
+        text = "<|user|>hello world\n<|assistant|>goodbye\n" * 1000
+        self.assertGreaterEqual(
+            len(text), envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+        )
+        for name, mutate, specials in (
+            ("no post-processor", None, 0),
+            (
+                "ByteLevel",
+                lambda b: setattr(b, "post_processor", processors.ByteLevel()),
+                0,
+            ),
+            ("TemplateProcessing", _post_processor_adds_bos, 1),
+        ):
+            with self.subTest(post_processor=name):
+                tokenizer = _tokenizer(mutate)
+                tokenizer._tokenizer = _TokenizerShim(tokenizer._tokenizer)
+                plan = ppe._plan_for(tokenizer)
+                self.assertIsNotNone(plan)
+                self.assertEqual(plan[1], specials)
+                _, _, pattern, npattern, intra = plan
+                self.assertGreater(
+                    len(ppe.split_prompt(text, pattern, npattern, intra)), 1
+                )
+                self._assert_matches_encode(tokenizer, text)
 
 
 class _SlowWordTokenizer(PreTrainedTokenizer):
