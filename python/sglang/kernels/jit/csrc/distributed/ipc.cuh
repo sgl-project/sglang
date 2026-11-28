@@ -36,7 +36,11 @@ inline PFN_cuMemGetAddressRange_v3020 get_address_range_fn() {
   static const auto fn = [] {
     void* sym = nullptr;
     cudaDriverEntryPointQueryResult status;
+#if CUDART_VERSION >= 12050
     CHECK_CUDA(cudaGetDriverEntryPointByVersion("cuMemGetAddressRange", &sym, 3020, cudaEnableDefault, &status));
+#else  // the ByVersion query is CUDA 12.5+; older headers only have the unversioned one
+    CHECK_CUDA(cudaGetDriverEntryPoint("cuMemGetAddressRange", &sym, cudaEnableDefault, &status));
+#endif
     RuntimeCheck(status == cudaDriverEntryPointSuccess && sym != nullptr, "cuMemGetAddressRange unavailable");
     return reinterpret_cast<PFN_cuMemGetAddressRange_v3020>(sym);
   }();
