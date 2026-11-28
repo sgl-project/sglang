@@ -112,6 +112,11 @@ class SchedulerDllmMixin:
             "FDFO dLLM result is missing accept lengths."
         )
 
+        if self.dllm_config.inherits_next_token:
+            # Prefill-only rounds emit no tokens but still predict the next one.
+            for req, state in zip(batch.reqs, result.dllm_algo_state):
+                req.dllm_algo_state = state
+
         # FDFO also commits unresolved blocks so their KV can be reused.
         if fdfo_mode or result.next_token_ids:
             block_size = self.dllm_config.block_size
