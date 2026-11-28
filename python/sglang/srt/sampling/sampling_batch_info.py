@@ -107,8 +107,7 @@ class SamplingBatchInfo:
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
 
     def set_rows(self, rows: SamplingRows) -> None:
-        """Set the step's state read from its rows of `SamplingParamsPool`: the
-        sampler params, the per-row seeds, the penalties, and the watermark rows."""
+        """Set the step's state from its rows of `SamplingParamsPool`."""
         for name, value in zip(rows._fields, rows):
             setattr(self, name, value)
 
