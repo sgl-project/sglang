@@ -796,10 +796,10 @@ class Envs:
     # ===================================================================
     # Shared-prompt decode attention for wide beam batches (FlashInfer MHA only).
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
-    # Replay the trie beam selection step as a CUDA graph.
-    SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
     # Run shared-context attention with the split-KV kernel (prompt split across CTAs).
     SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV = EnvBool(False)
+    # Replay the trie beam selection step as a CUDA graph.
+    SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
     # Replay decode batches made only of beam requests as CUDA graphs.
     SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
     # Beam width of the shared-context beam graphs.
@@ -1798,7 +1798,8 @@ class Envs:
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
-    # SM120 dense gated MLPs: fuse SiLU-and-mul into the gate_up GEMM (quack).
+    # SM120: fuse SiLU-and-mul into unquantized bf16 gate_up GEMMs through DualGemm
+    # (Llama and Qwen2/3 MLPs) (quack).
     SGLANG_USE_QUACK_SWIGLU_GEMM = EnvBool(False)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)

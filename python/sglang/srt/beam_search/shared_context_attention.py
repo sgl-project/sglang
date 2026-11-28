@@ -240,7 +240,7 @@ def forward(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
     kv_layers: KVLayerRouter,
-    attention_kernel: Callable,  # from resolve_attention_kernel()
+    shared_context_kernel: Callable,  # from resolve_attention_kernel()
 ) -> Optional[torch.Tensor]:
     if forward_batch.beam is None:
         return None
@@ -258,7 +258,7 @@ def forward(
     flat_q = q.contiguous().view(metadata.num_rows, q_heads, head_dim)
     output = torch.empty_like(flat_q)
     for bucket in metadata.buckets:
-        attention_kernel(
+        shared_context_kernel(
             flat_q,
             k_buffer,
             v_buffer,

@@ -323,6 +323,16 @@ def dual_gemm_swiglu(
     )
 
 
+def dual_gemm_swiglu_quack(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+) -> torch.Tensor:
+    """SM120 BF16 gate/up projection with SwiGLU in the GEMM epilogue (QuACK)."""
+    return get_kernel("gemm.quack_swiglu_gemm", KernelBackend.CUTE_DSL)(
+        x, gate_up_weight
+    )
+
+
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -381,6 +391,7 @@ __all__ = [
     "bmm_fp8",
     "dual_gemm_swiglu",
     "dual_gemm_swiglu_fp8",
+    "dual_gemm_swiglu_quack",
     "fp8_scaled_mm",
     "kimi_k3_tiny_gemm",
     "npu_w8a8_block_fp8_grouped_matmul",

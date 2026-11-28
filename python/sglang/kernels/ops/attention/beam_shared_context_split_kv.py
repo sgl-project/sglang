@@ -435,7 +435,7 @@ def partial_buffers(
     return kept[1], kept[2]
 
 
-def num_kv_splits(
+def pick_num_splits(
     num_tiles: int,
     wave: int,
 ) -> int:
@@ -455,7 +455,8 @@ class _Plan(msgspec.Struct, frozen=True):
     grid: tuple[int, int, int]
     args: tuple
     constexprs: dict
-    partial_numel: int  # 0 with one split
+    write_partials: bool  # False with one split
+    partial_numel: int
     lse_numel: int
     merge_grid: tuple[int]
     merge_args: tuple
@@ -557,7 +558,7 @@ def _make_plan(
                 **constexprs,
             ),
         )
-        num_splits = num_kv_splits(num_groups * q_heads * beam_blocks, wave)
+        num_splits = pick_num_splits(num_groups * q_heads * beam_blocks, wave)
     if (
         max(
             max_element_offset(q),
@@ -577,8 +578,9 @@ def _make_plan(
         grid=(num_groups * num_splits, q_heads, beam_blocks),
         args=(num_splits, *strides, *partial_strides),
         constexprs=dict(WRITE_PARTIALS=write_partials, **constexprs),
-        partial_numel=num_splits * rows * q_heads * head_dim * write_partials,
-        lse_numel=num_splits * rows * q_heads * write_partials,
+        write_partials=write_partials,
+        partial_numel=num_splits * rows * q_heads * head_dim,
+        lse_numel=num_splits * rows * q_heads,
         merge_grid=(rows,),
         merge_args=(
             num_splits,
@@ -611,7 +613,7 @@ def shared_context_attention_split_kv(
     *,
     output: torch.Tensor | None = None,
     softmax_scale: float,
-    num_splits: Optional[int] = None,  # None picks num_kv_splits
+    num_splits: Optional[int] = None,  # None picks pick_num_splits
 ) -> torch.Tensor:
     """`shared_context_attention` with the prompt split across programs; same contract."""
     if output is None:
@@ -645,7 +647,7 @@ def shared_context_attention_split_kv(
         if len(_PLANS) >= _MAX_PLANS:
             _PLANS.clear()
         _PLANS[key] = plan
-    if plan.partial_numel:
+    if plan.write_partials:
         partial_output, partial_lse = partial_buffers(
             q.device, plan.partial_numel, plan.lse_numel
         )
@@ -668,7 +670,7 @@ def shared_context_attention_split_kv(
         *plan.args,
         **plan.constexprs,
     )
-    if plan.partial_numel:
+    if plan.write_partials:
         _merge_splits_kernel[plan.merge_grid](
             partial_output,
             partial_lse,

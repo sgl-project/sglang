@@ -11,7 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Beam member rows riding a decode batch: layout, append/strip, retract.
+"""Beam helpers over ScheduleBatch: member-row tail layout, append/strip, retract,
+beam-only check.
 
 Everything here mutates or reads ScheduleBatch, but lives outside it so the
 batch class carries only the beam_tail field and one-line hook calls.

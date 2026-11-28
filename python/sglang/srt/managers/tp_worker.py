@@ -756,8 +756,9 @@ class TpModelWorker(BaseTpWorker):
                 return batch_result
 
             if batch is not None and is_beam_only_batch(batch):
-                # Beam coordinator selects the tokens; this placeholder sets
-                # has_sampled_token_ids, which gates the scheduler's relay.
+                # The beam coordinator selects the tokens. The placeholder sets
+                # has_sampled_token_ids, which gates the scheduler's relay, CPU
+                # copy and result processing; beam reqs never read its values.
                 batch_result.next_token_ids = torch.zeros(
                     len(batch.reqs), dtype=torch.int64
                 )

@@ -1,6 +1,6 @@
 """Reusable model-layer integration for the small-batch dual GEMM kernel."""
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -16,6 +16,9 @@ if TYPE_CHECKING:
         RowParallelLinear,
     )
 
+# DualGemm.mode for the SM120 QuACK GEMM; the other modes are the CuteDSL kernel's.
+QUACK_SWIGLU = "quack_swiglu"
+
 
 class DualGemm:
     """Dispatch fused gate/up projection and activation for compatible layers."""
@@ -29,13 +32,12 @@ class DualGemm:
         self.down_proj = down_proj
         self.tp_size = get_parallel().tp_size
         self.max_tokens = 0
-        self.use_quack_swiglu_gemm = self._use_quack_swiglu_gemm(gate_up_proj)
-        if self.use_quack_swiglu_gemm:
-            from sglang.kernels.ops.gemm.cutedsl_dual_gemm import DualGemmQuantMode
-
-            self.mode = DualGemmQuantMode.UNQUANT
-        else:
-            self.mode = self._select_mode(gate_up_proj, hidden_size)
+        # None turns DualGemm off.
+        self.mode: Optional[Union[DualGemmQuantMode, str]] = (
+            QUACK_SWIGLU
+            if self._use_quack_swiglu_gemm(gate_up_proj)
+            else self._select_mode(gate_up_proj, hidden_size)
+        )
 
     @staticmethod
     def _use_quack_swiglu_gemm(gate_up_proj: "MergedColumnParallelLinear") -> bool:
@@ -132,7 +134,7 @@ class DualGemm:
             or (self.tp_size > 1 and get_forward().sp_active)
         ):
             return False
-        if self.use_quack_swiglu_gemm:
+        if self.mode == QUACK_SWIGLU:
             from sglang.kernels.ops.gemm.quack_swiglu_gemm import (
                 quack_swiglu_gemm_supported,
             )
@@ -143,10 +145,10 @@ class DualGemm:
         return 1 <= input_tensor.shape[0] <= self.max_tokens
 
     def __call__(self, x, gate_up_proj: "MergedColumnParallelLinear"):
-        if self.use_quack_swiglu_gemm:
-            from sglang.kernels.ops.gemm.quack_swiglu_gemm import quack_swiglu_gemm
+        if self.mode == QUACK_SWIGLU:
+            from sglang.kernels.ops.gemm import dual_gemm_swiglu_quack
 
-            return quack_swiglu_gemm(x, gate_up_proj.weight)
+            return dual_gemm_swiglu_quack(x, gate_up_proj.weight)
 
         if not self.mode.is_quantized:
             from sglang.kernels.ops.gemm import dual_gemm_swiglu

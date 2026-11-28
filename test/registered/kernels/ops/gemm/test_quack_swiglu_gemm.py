@@ -67,11 +67,11 @@ class TestQuackSwigluGemm(CustomTestCase):
         return mlp
 
     def _run(self, mlp, m):
-        import sglang.kernels.ops.gemm.quack_swiglu_gemm as quack_module
+        import sglang.kernels.ops.gemm as gemm_ops
 
         x = torch.randn(m, HIDDEN, device="cuda", dtype=torch.bfloat16)
         with mock.patch.object(
-            quack_module, "quack_swiglu_gemm", wraps=quack_module.quack_swiglu_gemm
+            gemm_ops, "dual_gemm_swiglu_quack", wraps=gemm_ops.dual_gemm_swiglu_quack
         ) as fused:
             out = mlp(x)
         return x, out, fused.called

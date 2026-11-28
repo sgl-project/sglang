@@ -1027,8 +1027,9 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     def __init__(self) -> None:
         self._varlen_plans: OrderedDict[tuple, _VarlenLaunchPlan] = OrderedDict()
-        self._paged_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
-        # Keyed on the exact max_seqlen_k: prefill and decode shapes not in _keys_on_kv_blocks.
+        # Keyed on KV blocks: shapes in _keys_on_kv_blocks.
+        self._paged_block_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
+        # Keyed on the exact max_seqlen_k: shapes not in _keys_on_kv_blocks.
         self._paged_exact_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
         self._paged_plan_tiles: OrderedDict[tuple, tuple[int, int]] = OrderedDict()
         self._paged_workspaces: OrderedDict[
@@ -1332,10 +1333,10 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     @staticmethod
     def _paged_exact_key(base_key: tuple, max_seqlen_k: int) -> tuple:
-        # get_fwd_tile_size reads the exact seqlen_k, so prefill keys on it.
+        # get_fwd_tile_size reads the exact seqlen_k, so exact-keyed plans key on it.
         return (*base_key, max_seqlen_k)
 
-    def _paged_decode_plan(
+    def _paged_block_plan(
         self,
         base_key: tuple,
         *,
@@ -1354,10 +1355,10 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             window_size_left,
             window_size_right,
         )
-        plan = self._paged_plans.get(selection_key)
+        plan = self._paged_block_plans.get(selection_key)
         if plan is None:
             return None
-        self._paged_plans.move_to_end(selection_key)
+        self._paged_block_plans.move_to_end(selection_key)
         return plan
 
     def _paged_exact_plan(
@@ -1454,7 +1455,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             requested_num_splits=requested_num_splits,
         )
         if keys_on_kv_blocks:
-            plan = self._paged_decode_plan(
+            plan = self._paged_block_plan(
                 base_key,
                 max_seqlen_k=actual_max_seqlen_k,
                 window_size_left=window_size_left,
@@ -1548,7 +1549,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
         )
-        # SplitKV prefill keeps the generic path.
+        # Exact-keyed shapes plan only single-split launches; SplitKV keeps the generic path.
         if not keys_on_kv_blocks and actual_num_splits != 1:
             return
         base_key = self._paged_base_key(
@@ -1592,20 +1593,20 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         while len(self._paged_plan_tiles) > _LAUNCH_PLAN_CAPACITY:
             stale_base_key, _ = self._paged_plan_tiles.popitem(last=False)
             stale_selection_keys = [
-                key for key in self._paged_plans if key[:-1] == stale_base_key
+                key for key in self._paged_block_plans if key[:-1] == stale_base_key
             ]
             for key in stale_selection_keys:
-                del self._paged_plans[key]
-        self._paged_plans[selection_key] = _PagedLaunchPlan(
+                del self._paged_block_plans[key]
+        self._paged_block_plans[selection_key] = _PagedLaunchPlan(
             compiled_fn=compiled_fn,
             compile_key=compile_key,
             actual_num_splits=actual_num_splits,
             compiled_combine=compiled_combine,
             partial_dtype=(out_partial.dtype if out_partial is not None else q.dtype),
         )
-        self._paged_plans.move_to_end(selection_key)
-        while len(self._paged_plans) > _LAUNCH_PLAN_CAPACITY:
-            self._paged_plans.popitem(last=False)
+        self._paged_block_plans.move_to_end(selection_key)
+        while len(self._paged_block_plans) > _LAUNCH_PLAN_CAPACITY:
+            self._paged_block_plans.popitem(last=False)
 
         if out_partial is None or lse_partial is None:
             return
@@ -1684,7 +1685,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     def clear_launch_plans(self) -> None:
         self._varlen_plans.clear()
-        self._paged_plans.clear()
+        self._paged_block_plans.clear()
         self._paged_exact_plans.clear()
         self._paged_plan_tiles.clear()
         self._paged_workspaces.clear()
