@@ -972,7 +972,11 @@ class TestPromptSegments(_EncodeCase):
         self.assertLessEqual(encoder.cached_bytes, budget)
         self.assertEqual(
             encoder.cached_bytes,
-            sum(ppe._entry_bytes(*entry) for entry in encoder.cache.items()),
+            sum(
+                ppe._entry_bytes(*entry)
+                for lru in (encoder.cache, encoder.probation)
+                for entry in lru.items()
+            ),
         )
 
     def test_the_cache_keeps_to_its_byte_budget(self):
@@ -990,6 +994,47 @@ class TestPromptSegments(_EncodeCase):
         encoder = ppe._segment_encoder_for(self.tokenizer)
         self._assert_within_byte_budget(encoder, 4096)
         self.assertNotIn((None, "hello world " * 100), encoder.cache)
+        self.assertNotIn((None, "hello world " * 100), encoder.probation)
+
+    def test_a_text_is_packed_only_once_it_is_used_again(self):
+        """A prompt whose text never recurs must not pay for the uint32 copy:
+        new text waits in `probation` as the list encode_batch returned, and
+        only a reused text moves to the packed cache."""
+        once, again = "the quick brown fox " * 20, "hello world " * 20
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        with unittest.mock.patch.object(ppe, "array", wraps=ppe.array) as pack:
+            self._assert_segments_match_encode(
+                self.tokenizer, ["<|user|>", once, "<|assistant|>", again], ({},)
+            )
+            # The helper encodes twice; the second call reuses both texts.
+            self.assertEqual(pack.call_count, 2)
+            pack.reset_mock()
+            self._assert_segments_match_encode(
+                self.tokenizer, ["<|user|>", "new text"], ({},)
+            )
+        self.assertEqual(pack.call_count, 1)
+        self.assertIsInstance(encoder.cache[(None, once)], ppe.array)
+        self.assertEqual(list(encoder.probation), [])
+        self._assert_within_byte_budget(encoder, ppe._SEGMENT_CACHE_MAX_BYTES)
+
+    def test_new_text_is_evicted_before_text_that_recurred(self):
+        reused, budget = "hello world " * 20, 6000
+        with unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_BYTES", budget):
+            for _ in range(2):
+                self._assert_segments_match_encode(
+                    self.tokenizer, ["<|user|>", reused], ({},)
+                )
+            for i in range(30):
+                self.assertEqual(
+                    ppe.encode_prompt_segments(
+                        self.tokenizer, ["<|user|>", f"one-off prompt {i} " * 10]
+                    ),
+                    self.tokenizer.encode(f"<|user|>{f'one-off prompt {i} ' * 10}"),
+                )
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        self.assertIn((None, reused), encoder.cache)
+        self.assertLess(len(encoder.probation), 30)
+        self._assert_within_byte_budget(encoder, budget)
 
     def test_text_that_encodes_to_no_ids_still_counts_against_the_budget(self):
         # WhitespaceSplit drops whitespace: each of these texts has no ids, so
@@ -1012,8 +1057,9 @@ class TestPromptSegments(_EncodeCase):
             )
         encoder = ppe._segment_encoder_for(tokenizer)
         self._assert_within_byte_budget(encoder, 8192)
-        self.assertLess(len(encoder.cache), 100)
+        self.assertLess(len(encoder.cache) + len(encoder.probation), 100)
         self.assertNotIn((None, " " * 4096), encoder.cache)
+        self.assertNotIn((None, " " * 4096), encoder.probation)
 
 
 class TestRenderedPrompt(_EncodeCase):

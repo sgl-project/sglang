@@ -65,13 +65,17 @@ logger = logging.getLogger(__name__)
 _MIN_CHUNK_CHARS = 2048
 _MAX_CHUNKS = 64
 
-# Per tokenizer, counting the bytes of each entry's key text and its ids (kept
-# as uint32 arrays): a text can encode to no ids at all, so a token count would
-# not bound the memory. An entry over the entry limit is encoded but not kept.
+# Per tokenizer, counting the bytes of each entry's key text and its ids: a
+# text can encode to no ids at all, so a token count would not bound the
+# memory. An entry over the entry limit is encoded but not kept.
 _SEGMENT_CACHE_MAX_BYTES = 64 << 20
 _SEGMENT_CACHE_MAX_ENTRY_BYTES = _SEGMENT_CACHE_MAX_BYTES // 8
 # The dict slot, the LRU links and the key tuple of one entry, roughly.
 _SEGMENT_CACHE_ENTRY_OVERHEAD = 256
+# A new text is kept as the list of ints encode_batch returned (a list slot
+# and an int object per id); only a text that is used again is converted to a
+# uint32 array, 4 bytes per id.
+_LIST_ID_BYTES = 28
 
 # Pre-tokenizers that act on each piece independently of its position in the
 # sequence. Metaspace (prepend_scheme="first") and anything unknown are not.
@@ -361,7 +365,13 @@ class _SegmentEncoder:
         self.max_cut_len = max(map(len, self.raw_ids), default=0)
         self.cuts = {}
         self.lock = threading.Lock()
+        # Two LRU segments under one byte budget. A text enters `probation` as
+        # the list encode_batch returned; one that is used again moves to
+        # `cache` as a uint32 array. Eviction empties `probation` first, so
+        # prompts whose text never recurs do not pay for the conversion and
+        # do not push out text that does recur.
         self.cache = OrderedDict()
+        self.probation = OrderedDict()
         # Key -> _InFlightEncode of the call that is encoding the text now.
         self.in_flight = {}
         self.cached_bytes = 0
@@ -417,14 +427,12 @@ class _SegmentEncoder:
             # encoding is waited for, not encoded again.
             own, waits = self._claim(texts, known, cache_salt)
             if own:
-                encoded = lists = {}
+                encoded = {}
                 try:
-                    lists = self._encode(own, cache_salt)
-                    encoded = {text: array("I", ids) for text, ids in lists.items()}
+                    encoded = self._encode(own, cache_salt)
                 finally:
                     self._publish(own, encoded, cache_salt)
-                # This call's own ids as lists: extending from them is cheaper.
-                known.update(lists)
+                known.update(encoded)
             for text, pending in waits.items():
                 pending.done.wait()
                 ids = pending.ids.get(text)
@@ -452,6 +460,13 @@ class _SegmentEncoder:
                 ids = self.cache.get(key)
                 if ids is not None:
                     self.cache.move_to_end(key)
+                    known[text] = ids
+                elif (ids := self.probation.pop(key, None)) is not None:
+                    packed = array("I", ids)
+                    self.cached_bytes += _entry_bytes(key, packed) - _entry_bytes(
+                        key, ids
+                    )
+                    self.cache[key] = packed
                     known[text] = ids
                 elif key in self.in_flight:
                     waits[text] = self.in_flight[key]
@@ -495,14 +510,20 @@ class _SegmentEncoder:
                 ids = encoded.get(text)
                 if ids is not None:
                     size = _entry_bytes(key, ids)
-                    if key not in self.cache and size <= _SEGMENT_CACHE_MAX_ENTRY_BYTES:
-                        self.cache[key] = ids
+                    lru = self.probation
+                    if size > _SEGMENT_CACHE_MAX_ENTRY_BYTES:
+                        # Too big as a list: keep it packed, if that fits.
+                        ids, lru = array("I", ids), self.cache
+                        size = _entry_bytes(key, ids)
+                    if size <= _SEGMENT_CACHE_MAX_ENTRY_BYTES:
+                        lru[key] = ids
                         self.cached_bytes += size
                 claim = self.in_flight.pop(key)
             claim.ids = encoded
             claim.done.set()
             while self.cached_bytes > _SEGMENT_CACHE_MAX_BYTES:
-                self.cached_bytes -= _entry_bytes(*self.cache.popitem(last=False))
+                lru = self.probation if self.probation else self.cache
+                self.cached_bytes -= _entry_bytes(*lru.popitem(last=False))
 
 
 class _InFlightEncode:
@@ -523,6 +544,8 @@ def _samples_merges(backend):
 def _entry_bytes(key, ids):
     cache_salt, text = key
     size = sys.getsizeof(text) + sys.getsizeof(ids) + _SEGMENT_CACHE_ENTRY_OVERHEAD
+    if isinstance(ids, list):
+        size += _LIST_ID_BYTES * len(ids)
     return size if cache_salt is None else size + sys.getsizeof(cache_salt)
 
 
