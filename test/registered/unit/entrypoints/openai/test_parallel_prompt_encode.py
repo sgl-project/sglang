@@ -410,6 +410,27 @@ class _SlowWordTokenizer(PreTrainedTokenizer):
         return list(self._vocab)[index]
 
 
+class _MissingNumSpecialsBackendProxy:
+    """Wraps a fast tokenizer backend while exposing a post_processor that
+    lacks `num_special_tokens_to_add` (e.g. third-party fastokens post-processors)."""
+
+    def __init__(self, backend):
+        self._backend = backend
+
+    @property
+    def post_processor(self):
+        return object()
+
+    def __getattr__(self, name):
+        return getattr(self._backend, name)
+
+
+def _tokenizer_with_post_processor_missing_num_specials():
+    tok = _tokenizer()
+    tok._tokenizer = _MissingNumSpecialsBackendProxy(tok._tokenizer)
+    return tok
+
+
 class TestUnsafeTokenizersFallBack(_EncodeCase):
     def setUp(self):
         super().setUp()
@@ -445,6 +466,9 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
             "split_special_tokens": _tokenizer(split_special_tokens=True),
             "wrapped encode": _WrappedTokenizer(
                 tokenizer_object=Tokenizer.from_str(_safe_backend_json())
+            ),
+            "post-processor lacks num_special_tokens_to_add": (
+                _tokenizer_with_post_processor_missing_num_specials()
             ),
             "slow tokenizer": _SlowWordTokenizer(),
         }

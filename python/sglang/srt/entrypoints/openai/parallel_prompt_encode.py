@@ -200,7 +200,16 @@ def _build_plan(tokenizer):
     if pattern is None and npattern is None and intra is None:
         return None
     pp = backend.post_processor
-    specials_added = pp.num_special_tokens_to_add(False) if pp is not None else 0
+    if pp is not None:
+        num_special = getattr(pp, "num_special_tokens_to_add", None)
+        if not callable(num_special):
+            return None
+        try:
+            specials_added = num_special(False)
+        except Exception:
+            return None
+    else:
+        specials_added = 0
     return backend, specials_added, pattern, npattern, intra
 
 
