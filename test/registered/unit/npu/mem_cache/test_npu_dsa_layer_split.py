@@ -29,10 +29,10 @@ from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.static_kv_storage import _static_owner_region
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_npu_ci(est_time=9, suite="extra-a-test-npu")
 
 POOL = LayerSplitNPUMLATokenToKVPool
 

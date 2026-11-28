@@ -17,11 +17,11 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_npu_ci(est_time=5, suite="extra-a-test-npu")
 
 
 class _FakePPGroup:
