@@ -99,7 +99,7 @@ class TestNightlyKimiK31ProPerformanceMI35x(unittest.TestCase):
                 "PYTORCH_HIP_ALLOC_CONF": "garbage_collection_threshold:0.95",
                 "SGLANG_ROCM_RUNTIME_RESERVE_GB": "6",
                 "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK": "1",
-                "HSA_USERPTR_FOR_PAGED_MEM": "0",
+                "SGLANG_USE_HIP_HOST_MALLOC_FOR_HICACHE": "1",
             },
         }
 
