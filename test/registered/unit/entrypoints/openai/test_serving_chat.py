@@ -4246,6 +4246,35 @@ class ServingChatTestCase(CustomTestCase):
         serving_chat = OpenAIServingChat(tm, TemplateManager())
         self.assertEqual(serving_chat.chat_encoding_spec, "kimi_k3")
 
+    def test_inkling_falls_back_to_chat_template_without_tml(self):
+        """A torch build that cannot bind tml-renderers serves the checkpoint's Jinja
+        chat template instead of failing startup."""
+        import sglang.srt.entrypoints.openai.chat_encoding as chat_encoding
+
+        hf_config = Mock()
+        hf_config.architectures = ["Inkling2ForConditionalGeneration"]
+        tokenizer = Mock(chat_template="{{ messages }}")
+
+        with patch.object(
+            chat_encoding, "_tml_renderers_available", return_value=False
+        ):
+            self.assertIsNone(
+                resolve_chat_encoding_spec(hf_config=hf_config, tokenizer=tokenizer)
+            )
+            # Without a Jinja template there is nothing to fall back to.
+            self.assertEqual(
+                resolve_chat_encoding_spec(
+                    hf_config=hf_config, tokenizer=Mock(chat_template=None)
+                ),
+                "inkling2",
+            )
+
+        with patch.object(chat_encoding, "_tml_renderers_available", return_value=True):
+            self.assertEqual(
+                resolve_chat_encoding_spec(hf_config=hf_config, tokenizer=tokenizer),
+                "inkling2",
+            )
+
     def test_custom_encoders_own_reasoning_history(self):
         """Every custom encoding spec takes reasoning history natively.
 

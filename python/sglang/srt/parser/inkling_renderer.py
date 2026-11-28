@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import math
 import uuid
 from collections.abc import Mapping, Sequence
@@ -19,6 +20,8 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
+
+logger = logging.getLogger(__name__)
 
 INKLING_DEFAULT_REASONING_EFFORT = 0.9
 
@@ -68,6 +71,21 @@ def load_tml_renderers(spec: str = "inkling") -> SimpleNamespace:
             tokenizer.encode_special(name) for name in _UNUSED_SPECIALS[spec]
         ),
     )
+
+
+@functools.cache
+def tml_renderers_available(spec: str = "inkling") -> bool:
+    """Whether tml-renderers binds against this torch build.
+
+    Its extension resolves libtorch's stable ABI symbols, which torch builds older
+    than 2.11 do not export, so the import fails even with the package installed.
+    """
+    try:
+        load_tml_renderers(spec)
+    except ImportError as exc:
+        logger.debug("tml-renderers is unavailable: %s", exc)
+        return False
+    return True
 
 
 _TOKENIZER_PROBE = "Hello, 世界! def f(x): return x**2\n\t  naïve 👩‍🚀 12345678901"
