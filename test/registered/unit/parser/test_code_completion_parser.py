@@ -101,6 +101,27 @@ class TestGenerateCompletionPromptFromRequest(CustomTestCase):
         result = generate_completion_prompt_from_request(request)
         self.assertEqual(result, "just code")
 
+    def test_none_suffix_returns_prompt_directly(self):
+        """Test that omitted/None suffix bypasses FIM formatting even when template is set."""
+        with patch(
+            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            "deepseek_coder",
+        ):
+            request = CompletionRequest(prompt="def f():\n    pass")
+            self.assertIsNone(request.suffix)
+            result = generate_completion_prompt_from_request(request)
+            self.assertEqual(result, "def f():\n    pass")
+
+    def test_nonempty_suffix_without_template_returns_prompt_directly(self):
+        """Test that non-empty suffix returns prompt when completion_template_name is None."""
+        with patch(
+            "sglang.srt.parser.code_completion_parser.completion_template_name",
+            None,
+        ):
+            request = CompletionRequest(prompt="prefix", suffix="suffix")
+            result = generate_completion_prompt_from_request(request)
+            self.assertEqual(result, "prefix")
+
     def test_nonempty_suffix_uses_fim_template(self):
         """Test that non-empty suffix triggers FIM formatting."""
         with patch(
