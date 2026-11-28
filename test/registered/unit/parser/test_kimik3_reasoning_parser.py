@@ -283,6 +283,34 @@ def test_streaming_skipped_think_ignores_delayed_think_close(
     assert content == _SKIPPED_THINK_REPLY
 
 
+@pytest.mark.parametrize("chunk_size", [1, 3, 1000])
+@pytest.mark.parametrize(
+    ("text", "content"),
+    [
+        (
+            f"I should list them. Respond only.{THINK_CLOSE}1,2,3",
+            "I should list them. Respond only.1,2,3",
+        ),
+        # Only the first close is the model's own; one the answer quotes
+        # afterwards is answer text.
+        (
+            f"Respond only.{THINK_CLOSE}The marker is {THINK_CLOSE} here.",
+            f"Respond only.The marker is {THINK_CLOSE} here.",
+        ),
+    ],
+)
+def test_streaming_reasoning_off_drops_unrequested_think_close(
+    chunk_size: int, text: str, content: str
+) -> None:
+    """With reasoning off the model can still reason and then close the think
+    channel. The text before the marker has already streamed as content, so it
+    stays there, but the marker itself must never reach content."""
+    detector = KimiK3Detector(force_reasoning=False)
+    reasoning, streamed = _stream(detector, _chunks(text, chunk_size))
+    assert reasoning == ""
+    assert streamed == content
+
+
 def test_reasoning_parser_registration() -> None:
     assert isinstance(ReasoningParser("kimi_k3").detector, KimiK3Detector)
 

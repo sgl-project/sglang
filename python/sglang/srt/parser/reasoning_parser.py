@@ -797,6 +797,7 @@ class KimiK3Detector(BaseReasoningFormatDetector):
         self._streamed_reasoning: list[str] = []
         self.replayed_reasoning_chars = 0
         self._discard_delayed_think_close = False
+        self._unrequested_think_close_pending = False
 
     def _clean_content(self, text: str) -> str:
         tools_idx = text.find(TOOLS_OPEN)
@@ -890,6 +891,10 @@ class KimiK3Detector(BaseReasoningFormatDetector):
                 return StreamingParseResult()
             else:
                 self._reasoning_done = True
+                # With reasoning off the model can still reason and then close
+                # the think channel; that marker must not reach content.
+                self._discard_delayed_think_close = True
+                self._unrequested_think_close_pending = True
 
         if self._in_reasoning:
             buf = self._buffer
@@ -961,6 +966,15 @@ class KimiK3Detector(BaseReasoningFormatDetector):
             self._streamed_reasoning.append(emit)
             return StreamingParseResult(reasoning_text=emit)
 
+        if (
+            self._unrequested_think_close_pending
+            and self.think_end_token in self._buffer
+        ):
+            # Only the first close is the model's own; a later one is answer
+            # text quoting the marker and stays.
+            self._buffer = self._buffer.replace(self.think_end_token, "", 1)
+            self._unrequested_think_close_pending = False
+            self._discard_delayed_think_close = False
         return StreamingParseResult(normal_text=self._drain_content())
 
     def finish(self) -> StreamingParseResult:
