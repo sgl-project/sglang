@@ -1700,6 +1700,8 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
+    # Full KV is written by the attention backend, not by the QKV/RoPE prologue.
+    supports_hicache_write_back_overlap = True
     decoder_layer_types = ALL_DECODER_LAYER_TYPES
 
     packed_modules_mapping = {
@@ -2390,6 +2392,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    supports_hicache_write_back_overlap = True
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
@@ -2610,6 +2613,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
+    supports_hicache_write_back_overlap = True
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 

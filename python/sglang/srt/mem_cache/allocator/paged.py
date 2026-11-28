@@ -297,11 +297,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: Optional[torch.Tensor],
         req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         swa: Optional[Tuple[PagedTokenToKVPoolAllocator, torch.Tensor]] = None,
+        reserved_pages: Optional[torch.Tensor] = None,
     ):
         """req_to_token_write=(req_to_token, req_pool_indices): read last_loc from
         and write the new slot to req_to_token in the same launch (last_loc unused).
         swa=(swa_allocator, full_to_swa): also allocate and map the SWA slot."""
-        if self.debug_mode:
+        if self.debug_mode and last_loc is not None:
             assert torch.all(
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
             )
@@ -317,8 +318,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             page_size=self.page_size,
             decode=True,
         )
-        if any(num_new_pages > len(a.free_pages) for a in allocators):
+        num_free_pages = num_new_pages
+        if reserved_pages is not None:
+            assert swa is None and len(reserved_pages) <= num_new_pages
+            num_free_pages -= len(reserved_pages)
+        if any(num_free_pages > len(a.free_pages) for a in allocators):
             return None
+        pages = self.free_pages
+        if reserved_pages is not None:
+            pages = torch.cat((pages[:num_free_pages], reserved_pages))
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
         if req_to_token_write is not None:
@@ -326,7 +334,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_decode_kernel[(bs,)](
                 seq_lens,
                 None,
-                self.free_pages,
+                pages,
                 out_indices,
                 self.page_size,
                 swa_free_page_ptr=None if swa is None else swa[0].free_pages,
@@ -341,7 +349,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_decode_kernel[(bs,)](
                 seq_lens,
                 last_loc,
-                self.free_pages,
+                pages,
                 out_indices,
                 self.page_size,
             )
@@ -349,7 +357,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             alloc_decode_naive(
                 seq_lens,
                 last_loc,
-                self.free_pages,
+                pages,
                 out_indices,
                 self.page_size,
                 num_new_pages,
@@ -359,7 +367,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             assert len(torch.unique(out_indices)) == len(out_indices)
 
         for a in allocators:
-            a.free_pages = a.free_pages[num_new_pages:]
+            a.free_pages = a.free_pages[num_free_pages:]
         return out_indices
 
     def free(self, free_index: torch.Tensor):

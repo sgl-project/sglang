@@ -1843,6 +1843,7 @@ class Scheduler(
         )
 
     def init_overlap(self):
+        self.write_back_overlap = None
         self.device_module = torch.get_device_module(self.device)
 
         # FutureMap is always-on: input_ids relay used in both modes.
@@ -1922,6 +1923,23 @@ class Scheduler(
 
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
+
+        if envs.SGLANG_HICACHE_WRITE_BACK_OVERLAP.get():
+            from sglang.srt.mem_cache.hybrid_cache.write_back_overlap import (
+                WriteBackOverlap,
+            )
+
+            self.write_back_overlap = WriteBackOverlap.create(self)
+            if self.write_back_overlap is not None:
+                self.tree_cache.write_back_overlap = self.write_back_overlap
+                logger.info("HiCache write-back/decode overlap enabled")
+            else:
+                logger.warning(
+                    "HiCache write-back/decode overlap is unavailable for this "
+                    "configuration. It requires NVIDIA CUDA, a compatible "
+                    "Triton KV writer, the Python TreeCore, and direct "
+                    "page_first_direct write_back without L3. Using stock HiCache."
+                )
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
@@ -2316,12 +2334,32 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            overlap = self.write_back_overlap
+            if overlap is not None:
+                # A plan that decode did not consume expires at this decision.
+                overlap.cancel_lookahead()
 
             # Launch the current batch
             if batch:
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
+                if (
+                    overlap is not None
+                    and not TEST_RETRACT
+                    and batch.forward_mode.is_decode()
+                ):
+                    overlap.prepare_lookahead(
+                        batch,
+                        allow_new_overlap=(
+                            batch is self.running_batch
+                            and batch_result.delay_sample_func is None
+                            and not self.waiting_queue
+                            and self.chunked_req is None
+                            and not self.grammar_manager.has_waiting_grammars()
+                            and not self._reqs_finishing_inflight(batch)
+                        ),
+                    )
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -2415,6 +2453,9 @@ class Scheduler(
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
+        if recv_reqs and self.write_back_overlap is not None:
+            # Input dispatch can change the batch or reset/release the KV pools.
+            self.write_back_overlap.cancel_lookahead()
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
 
@@ -4442,6 +4483,17 @@ class Scheduler(
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
+        overlap = self.write_back_overlap
+        if (
+            overlap is not None
+            and overlap.lookahead is not None
+            and (
+                self.waiting_queue
+                or self.chunked_req is not None
+                or self.grammar_manager.has_waiting_grammars()
+            )
+        ):
+            overlap.cancel_lookahead()
         self.process_pending_chunked_abort()
         self._process_hicache_events()
 
@@ -4612,6 +4664,14 @@ class Scheduler(
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        overlap = self.write_back_overlap
+        if overlap is not None and (overlap.background or overlap.pending):
+            if running_batch.is_empty():
+                self.tree_cache.writing_check(write_back=True)
+            else:
+                # The detached Full pages already belong to decode, but their
+                # CPU prefix must not be matched before its Full/state ACK.
+                return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -5333,7 +5393,16 @@ class Scheduler(
         if self.uocr_runtime is not None:
             # Retained document windows yield to running requests before retraction.
             self.uocr_runtime.free_for_decode(batch)
-        kv_full_retract_flag = not batch.check_decode_mem()
+        batch.write_back_overlap_pages = None
+        overlap = self.write_back_overlap
+        decision = None
+        if overlap is not None and not TEST_RETRACT:
+            decision = overlap.prepare_decode(
+                batch, allow_new_overlap=not finishing_reqs
+            )
+        kv_full_retract_flag = (
+            not batch.check_decode_mem() if decision is None else not decision
+        )
         if kv_full_retract_flag and finishing_reqs:
             # The queued result frees the finishing requests' KV at the end of
             # this step; decode the rest next step instead of retracting them.
@@ -5356,7 +5425,7 @@ class Scheduler(
                 else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.request_retirer
+                self.request_retirer, defer_extra_eviction=decision is False
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
@@ -5607,9 +5676,16 @@ class Scheduler(
                             fwd_kwargs["input_ids_from_graph"] = True
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
+                        overlap = self.write_back_overlap
+                        overlap_ctx = (
+                            overlap.forward(batch)
+                            if overlap is not None
+                            else nullcontext()
                         )
+                        with overlap_ctx:
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
                         # Deferred decode graph I/O owns this step's relay.
                         if batch.spec_algorithm.is_none() and not input_ids_from_graph:
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
@@ -5990,6 +6066,9 @@ class Scheduler(
             return_logprob=batch.return_logprob,
             return_hidden_states=batch.return_hidden_states,
         )
+        overlap = self.write_back_overlap
+        if overlap is not None:
+            overlap.submit_background()
         self.copy_stream.wait_stream(self.forward_stream)
         if batch_result.side_stream_done is not None:
             self.copy_stream.wait_event(batch_result.side_stream_done)
@@ -6003,6 +6082,8 @@ class Scheduler(
                 copy_fn()
             else:
                 batch_result.copy_done = self.async_d2h_worker.submit(copy_fn)
+        if overlap is not None:
+            overlap.previous_readback = batch_result.copy_done
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult, cur_batch: ScheduleBatch

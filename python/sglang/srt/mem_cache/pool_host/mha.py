@@ -747,6 +747,28 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def backup_from_device_layer_direct(self, layer, host_indices, device_indices):
+        """Enqueue a batch of page-first D2H copies for one Full KV layer."""
+        k = self.k_buffer[:, layer : layer + 1]
+        v = self.v_buffer[:, layer : layer + 1]
+        src_k, src_v = self.device_k_buffers[layer], self.device_v_buffers[layer]
+        # Keep the original page stride in the one-layer host views. The
+        # direct op infers the layer count from the source list, and uses the
+        # first buffer's strides for both K and V in the symmetric case.
+        pairs = (
+            (([src_k, src_v], [k, v]),)
+            if self.head_dim == self.v_head_dim
+            else (([src_k], [k]), ([src_v], [v]))
+        )
+        for src, dst in pairs:
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=src,
+                dst_ptrs=dst,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         if self.layout == "page_unified":
             page_id = index // self.page_size

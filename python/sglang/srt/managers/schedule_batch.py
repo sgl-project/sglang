@@ -1850,12 +1850,14 @@ def release_req(
     tree_cache: BasePrefixCache,
     request_retirer: RequestRetirer,
     offload_kv: bool = True,
+    defer_extra_eviction: bool = False,
 ) -> bool:
     """Returns whether the request can be resumed."""
     resumable = request_retirer.retract(req, offload_kv=offload_kv)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
-    num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-    evict_from_tree_cache(tree_cache, num_tokens)
+    if not defer_extra_eviction:
+        num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+        evict_from_tree_cache(tree_cache, num_tokens)
 
     req.reset_for_retract()
     return resumable
@@ -2135,6 +2137,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Config / flags crossing to ForwardBatch (by-value) ===
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
+    # Only this decode owns these pages. An empty tuple selects exact allocation
+    # without the usual speculative eviction of one page per request.
+    write_back_overlap_pages: Optional[torch.Tensor | tuple] = None
 
     # Full-DP metadata from the existing scheduler gather.
     dp_spec_prefill_coordination_metadata: Optional[tuple] = None
@@ -3016,7 +3021,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     @capacity_decision
     def retract_decode(
-        self, request_retirer: RequestRetirer
+        self, request_retirer: RequestRetirer, *, defer_extra_eviction: bool = False
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
@@ -3024,10 +3029,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
+
+        def fits():
+            if defer_extra_eviction:
+                needed = self.new_tokens_required_next_decode(sorted_indices)
+                if self.token_to_kv_pool_allocator.available_size() >= needed:
+                    return True
+            return self.check_decode_mem(selected_indices=sorted_indices)
+
         first_iter = True
-        while first_iter or (
-            not self.check_decode_mem(selected_indices=sorted_indices)
-        ):
+        while first_iter or not fits():
             if len(sorted_indices) == 1:
                 # Always keep at least one request
                 break
@@ -3054,7 +3065,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
                 continue
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices), request_retirer):
+            if self.release_req(
+                idx,
+                len(sorted_indices),
+                request_retirer,
+                defer_extra_eviction=defer_extra_eviction,
+            ):
                 retracted_reqs.append(req)
             else:
                 # No backup or rebuild exists and the device KV is already freed.
@@ -3078,9 +3094,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     "retract_decode: aborted request %s: %s", req.rid, message
                 )
 
-        if len(sorted_indices) <= 1 and not self.check_decode_mem(
-            selected_indices=sorted_indices
-        ):
+        if len(sorted_indices) <= 1 and not fits():
             # Even the last remaining request cannot fit in memory.
             # Instead of crashing the scheduler, gracefully abort it.
             last_idx = sorted_indices.pop()
@@ -3158,6 +3172,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         remaing_req_count: int,
         request_retirer: RequestRetirer,
         offload_kv: bool = True,
+        *,
+        defer_extra_eviction: bool = False,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
@@ -3165,6 +3181,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             tree_cache=self.tree_cache,
             request_retirer=request_retirer,
             offload_kv=offload_kv,
+            defer_extra_eviction=defer_extra_eviction,
         )
 
     def prepare_encoder_info_decode(self):
