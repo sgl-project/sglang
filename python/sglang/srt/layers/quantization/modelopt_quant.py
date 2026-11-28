@@ -2584,6 +2584,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         skip_swizzled_blockscales = (
             self.enable_flashinfer_trtllm_moe
             or moe_runner_backend.is_flashinfer_megamoe()
+            or moe_runner_backend.is_flashinfer_cutedsl()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_lora_marlin()
             or moe_runner_backend.is_auto()

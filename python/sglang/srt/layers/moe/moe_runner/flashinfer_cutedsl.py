@@ -13,6 +13,13 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferCombineInput
+from sglang.srt.layers.moe.token_dispatcher.standard import (
+    StandardCombineInput,
+    StandardDispatchOutput,
+)
+from sglang.srt.layers.moe.topk import TopKOutputChecker
+from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
@@ -443,10 +450,6 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-
     assert runner_config.activation in (
         "silu",
         "situ",
@@ -527,13 +530,6 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     - bf16 input (SGLANG_MOE_NVFP4_DISPATCH=0): quantize with cutedsl's scale
     - FP4 input (SGLANG_MOE_NVFP4_DISPATCH=1): pass through (same fp4_quantize params)
     """
-    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
-        FlashinferCombineInput,
-    )
-    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
-    from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
-
     # Eager prefill uses all-gather, including idle ranks in a prefill batch.
     # Preserve the standard combine format so the dispatcher reduce-scatters it.
     if isinstance(dispatch_output, StandardDispatchOutput):
