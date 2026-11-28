@@ -1602,6 +1602,21 @@ class ShardedStateLoader(BaseModelLoader):
     """
 
     DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
+    _INKLING2_QKVR_LAYOUT_KEY = "inkling2_qkvr_layout"
+    _INKLING2_QKVR_LAYOUT = "kvqr"
+
+    @staticmethod
+    def _inkling2_qkvr_param_names(model: nn.Module) -> set[str]:
+        names: set[str] = set()
+        for module_name, module in model.named_modules():
+            if (
+                getattr(module, "QKVR_LAYOUT", None)
+                == ShardedStateLoader._INKLING2_QKVR_LAYOUT
+            ):
+                prefix = f"{module_name}.qkvr." if module_name else "qkvr."
+                for key in module.qkvr.state_dict():
+                    names.add(f"{prefix}{key}")
+        return names
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
@@ -1713,8 +1728,26 @@ class ShardedStateLoader(BaseModelLoader):
                     f"pre-sharded checkpoints are currently supported!"
                 )
             state_dict = self._filter_subtensors(model.state_dict())
+            kvqr_params = self._inkling2_qkvr_param_names(model)
             for path in filepaths:
                 with safe_open(path, framework="pt") as f:
+                    if kvqr_params:
+                        matched_kvqr = kvqr_params.intersection(f.keys())
+                        if matched_kvqr:
+                            file_layout = (f.metadata() or {}).get(
+                                self._INKLING2_QKVR_LAYOUT_KEY
+                            )
+                            if file_layout != self._INKLING2_QKVR_LAYOUT:
+                                sample_key = min(matched_kvqr)
+                                raise ValueError(
+                                    f"Sharded checkpoint '{path}' contains Inkling2 "
+                                    f"qkvr parameter '{sample_key}' with layout "
+                                    f"{file_layout!r} (expected "
+                                    f"{self._INKLING2_QKVR_LAYOUT!r}). Pre-existing "
+                                    "sharded_state dumps use the legacy [q, k, v, r] "
+                                    "row order and must be regenerated with "
+                                    "save_sharded_model."
+                                )
                     for key in f.keys():  # noqa: SIM118
                         tensor = f.get_tensor(key)
                         # If loading with LoRA enabled, additional padding may
@@ -1757,6 +1790,15 @@ class ShardedStateLoader(BaseModelLoader):
         part_idx = 0
         total_size = 0
         state_dict = ShardedStateLoader._filter_subtensors(model.state_dict())
+        metadata = (
+            {
+                ShardedStateLoader._INKLING2_QKVR_LAYOUT_KEY: (
+                    ShardedStateLoader._INKLING2_QKVR_LAYOUT
+                )
+            }
+            if ShardedStateLoader._inkling2_qkvr_param_names(model)
+            else None
+        )
         state_dict_part: Dict[str, torch.Tensor] = {}
         for key, tensor in state_dict.items():
             param_size = tensor.nelement() * tensor.element_size()
@@ -1765,6 +1807,7 @@ class ShardedStateLoader(BaseModelLoader):
                 save_file(
                     state_dict_part,
                     os.path.join(path, filename),
+                    metadata=metadata,
                 )
                 part_idx += 1
                 total_size = 0
@@ -1776,6 +1819,7 @@ class ShardedStateLoader(BaseModelLoader):
             save_file(
                 state_dict_part,
                 os.path.join(path, filename),
+                metadata=metadata,
             )
 
 
@@ -1909,6 +1953,15 @@ class PreshardedModelLoader(DefaultModelLoader):
             # distinguish old up64/gate64 weights from swap-AB up16/gate16.
             shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
                 target_device or torch.device(current_platform.device_type)
+            )
+        from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
+        architectures = model_config.hf_config.architectures or ()
+        if any(arch in INKLING2_ARCHS for arch in architectures):
+            # Presharded files store raw qkvr rows;
+            # equal shapes do not distinguish legacy qkvr from source-grouped kvqr.
+            shard_config[ShardedStateLoader._INKLING2_QKVR_LAYOUT_KEY] = (
+                ShardedStateLoader._INKLING2_QKVR_LAYOUT
             )
         return shard_config
 

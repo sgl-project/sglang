@@ -14,6 +14,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.layers.moe.utils import MoeA2ABackend, MoeRunnerBackend
 from sglang.srt.model_loader.loader import PreshardedModelLoader
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -810,7 +811,11 @@ class TestShardConfig(unittest.TestCase):
         # `_collect_shard_config` is the exact failure mode that left
         # moe_dense_tp_size / LM-head flags out of the cache key before.
         loader = object.__new__(PreshardedModelLoader)
-        model_config = SimpleNamespace(quantization="fp8", dtype=torch.bfloat16)
+        model_config = SimpleNamespace(
+            quantization="fp8",
+            dtype=torch.bfloat16,
+            hf_config=SimpleNamespace(architectures=[]),
+        )
         required = {
             "tp",
             "dp",
@@ -904,7 +909,9 @@ class TestShardConfig(unittest.TestCase):
     def test_cutedsl_layout_separates_processed_weight_caches(self):
         loader = object.__new__(PreshardedModelLoader)
         model_config = SimpleNamespace(
-            quantization="modelopt_fp4", dtype=torch.bfloat16
+            quantization="modelopt_fp4",
+            dtype=torch.bfloat16,
+            hf_config=SimpleNamespace(architectures=[]),
         )
         target_device = torch.device("cuda:2")
         configs = {}
@@ -954,6 +961,50 @@ class TestShardConfig(unittest.TestCase):
                 json.dump({"shard_config": old_config}, f)
             for cfg in configs.values():
                 self.assertFalse(loader._shard_config_matches(tmp, cfg))
+
+    def test_inkling2_qkvr_layout_separates_processed_weight_caches(self):
+        loader = object.__new__(PreshardedModelLoader)
+        configs = {}
+        with (
+            get_context().override_server_args(model_path="dummy"),
+            mock.patch.object(
+                loader, "_compute_structural_signature", return_value="sig"
+            ),
+            mock.patch(
+                "sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1
+            ),
+        ):
+            for arch in INKLING2_ARCHS:
+                with self.subTest(arch=arch):
+                    cfg = loader._collect_shard_config(
+                        SimpleNamespace(
+                            quantization=None,
+                            dtype=torch.bfloat16,
+                            hf_config=SimpleNamespace(architectures=[arch]),
+                        )
+                    )
+                    self.assertEqual(cfg["inkling2_qkvr_layout"], "kvqr")
+                    configs[arch] = cfg
+            other_cfg = loader._collect_shard_config(
+                SimpleNamespace(
+                    quantization=None,
+                    dtype=torch.bfloat16,
+                    hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+                )
+            )
+            self.assertNotIn("inkling2_qkvr_layout", other_cfg)
+
+        cfg = next(iter(configs.values()))
+        old_config = dict(cfg)
+        del old_config["inkling2_qkvr_layout"]
+        self.assertNotEqual(
+            loader._build_subfolder_name(cfg),
+            loader._build_subfolder_name(old_config),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, loader.CHECKSUM_FILENAME), "w") as f:
+                json.dump({"shard_config": old_config}, f)
+            self.assertFalse(loader._shard_config_matches(tmp, cfg))
 
     def test_shard_config_matches_equality_and_missing(self):
         # Match must require exact stored equality; missing/mismatched
