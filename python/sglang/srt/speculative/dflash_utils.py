@@ -1260,22 +1260,11 @@ def commit_accept(candidates, accept_len, bonus_tokens):
 
 
 def validate_dflash_request(
-    req: Req,
-    enable_overlap: bool,
-    bound_runtime: bool,
-    *,
-    supports_grammar: bool = True,
+    req: Req, enable_overlap: bool, bound_runtime: bool
 ) -> Optional[str]:
     """bound_runtime is the same on every rank, so every rank rejects alike."""
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
-    params = req.sampling_params
-    if not supports_grammar and any(
-        x is not None
-        for x in (params.json_schema, params.regex, params.ebnf, params.structural_tag)
-    ):
-        return "This speculative algorithm does not support constrained decoding."
-
     if bound_runtime and uses_penalty(req.sampling_params):
         return (
             "DFLASH speculative decoding with the megakernel decode runtime does "

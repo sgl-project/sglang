@@ -45,7 +45,12 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.dfly_utils import DFlyRequestState
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    commit_mamba_states_after_verify,
+    record_stream_each,
+    record_stream_for_v2_verify,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +220,7 @@ class DFlyWorkerV2(BaseSpecWorker):
             return self._forward_prefill(batch, on_publish)
         if batch.forward_mode.is_idle():
             return self._forward_idle(on_publish)
-        return self._forward_decode(batch, on_publish)
+        return self._forward_decode(batch, on_publish, grammar_barrier)
 
     def _forward_prefill(self, batch: ScheduleBatch, on_publish):
         result = self.target_worker.forward_batch_generation(
@@ -258,12 +263,13 @@ class DFlyWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
-    def _forward_decode(self, batch: ScheduleBatch, on_publish):
+    def _forward_decode(self, batch: ScheduleBatch, on_publish, grammar_barrier):
         draft_input = batch.spec_info
         if not isinstance(draft_input, DFlashDraftInputV2):
             raise RuntimeError("DFLY expects DFlashDraftInputV2 on the running batch.")
-        if batch.seq_lens.is_cuda:
-            batch.seq_lens.record_stream(torch.cuda.current_stream())
+        fwd_stream = torch.cuda.current_stream()
+        record_stream_for_v2_verify(batch, None, fwd_stream)
+        record_stream_each((draft_input.bonus_tokens,), fwd_stream)
         bs = len(batch.seq_lens)
         width = self.block_size
         prefix_lens = batch.seq_lens
@@ -272,6 +278,10 @@ class DFlyWorkerV2(BaseSpecWorker):
         )
 
         verify_forward_batch = self._prepare_verify(batch, draft_input)
+        record_stream_each(
+            (batch.input_ids, batch.out_cache_loc, verify_forward_batch.positions),
+            fwd_stream,
+        )
         target_out = self.target_worker.forward_batch_generation(
             batch=None, forward_batch=verify_forward_batch, is_verify=True
         )
@@ -286,10 +296,22 @@ class DFlyWorkerV2(BaseSpecWorker):
                 logits_output.next_token_logits
             )
         candidates = self.dfly.candidates_out[: bs * width].view(bs, width)
-        if batch.sampling_info is not None:
-            verify.adjust(logits_output.next_token_logits, candidates)
+        grammar_tree = (
+            GrammarTree.from_linear_chain(candidates) if batch.has_grammar else None
+        )
+        verify.build_grammar_mask(
+            grammar_tree, logits_output=logits_output, barrier=grammar_barrier
+        )
+        sampling_info = batch.sampling_info
+        verify_logits = logits_output.next_token_logits
+        if sampling_info is not None:
+            verify_logits, sampling_info = verify.adjust(
+                verify_logits,
+                candidates,
+                positions=verify_forward_batch.positions.view_as(candidates),
+            )
         num_correct_drafts, bonus_tokens = self._accept(
-            batch, draft_input, candidates, logits_output.next_token_logits
+            sampling_info, draft_input, candidates, verify_logits
         )
         out_tokens, commit_lens = commit_accept(
             candidates, num_correct_drafts, bonus_tokens
@@ -381,14 +403,15 @@ class DFlyWorkerV2(BaseSpecWorker):
         elif draft_input.nxt_kv_lens_cpu is not None:
             batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
             batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker, defer_metadata_init=True
-        )
-        batch.seq_lens_cpu, batch.seq_lens_sum = seq_lens_cpu, seq_lens_sum
+        try:
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                batch, self.target_worker, defer_metadata_init=True
+            )
+        finally:
+            batch.seq_lens_cpu, batch.seq_lens_sum = seq_lens_cpu, seq_lens_sum
         return verify_forward_batch
 
-    def _accept(self, batch, draft_input, candidates, next_token_logits):
-        sampling_info = batch.sampling_info
+    def _accept(self, sampling_info, draft_input, candidates, next_token_logits):
         if sampling_info is not None and not sampling_info.is_all_greedy:
             if not is_dflash_sampling_verify_available():
                 raise RuntimeError(
