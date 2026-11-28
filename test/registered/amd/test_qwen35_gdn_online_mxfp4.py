@@ -17,6 +17,22 @@ SHAPES = ((4608, 8192), (8192, 2048))
 ROWS = (1, 4, 16, 31, 32, 64, 65, 256)
 
 
+class TestBlockHadamard32(CustomTestCase):
+    def test_hadamard_keeps_products(self):
+        from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+            _block_hadamard32,
+        )
+
+        x, w = torch.randn(4, 256), torch.randn(8, 256)
+        default = torch.get_default_dtype()
+        torch.set_default_dtype(torch.bfloat16)  # as in the model loader
+        try:
+            xh, wh = _block_hadamard32(x), _block_hadamard32(w)
+        finally:
+            torch.set_default_dtype(default)
+        torch.testing.assert_close(xh @ wh.T, x @ w.T, rtol=1e-4, atol=1e-4)
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.version.hip and is_gfx95_supported(),
     "requires AMD gfx95",
@@ -27,17 +43,19 @@ class TestQwen35GdnOnlineMxfp4(CustomTestCase):
 
         from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
             AiterMxfp4OnlineLinearMethod,
+            _block_hadamard32,
             _dequant_mxfp4_to_bf16,
             _dynamic_mxfp4_quant_orig,
         )
 
-        for (n, k), m in itertools.product(SHAPES, ROWS):
-            with self.subTest(n=n, k=k, m=m):
+        for (n, k), m, had in itertools.product(SHAPES, ROWS, (False, True)):
+            with self.subTest(n=n, k=k, m=m, hadamard=had):
                 torch.manual_seed(m)
                 w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
-                w_q, w_s = _dynamic_mxfp4_quant_orig(w)
-                x_q, x_s = per_1x32_f4_quant_hip(x, shuffle=False)
+                rot = _block_hadamard32 if had else (lambda t: t)
+                w_q, w_s = _dynamic_mxfp4_quant_orig(rot(w))
+                x_q, x_s = per_1x32_f4_quant_hip(rot(x), shuffle=False)
                 ref = torch.nn.functional.linear(
                     _dequant_mxfp4_to_bf16(
                         x_q.view(torch.uint8), x_s.view(torch.uint8)[:m]
@@ -47,7 +65,7 @@ class TestQwen35GdnOnlineMxfp4(CustomTestCase):
 
                 layer = torch.nn.Module()
                 layer.weight = torch.nn.Parameter(w, requires_grad=False)
-                layer.quant_method = AiterMxfp4OnlineLinearMethod()
+                layer.quant_method = AiterMxfp4OnlineLinearMethod(had)
                 # The second call must not quantize the MXFP4 weight again.
                 layer.quant_method.process_weights_after_loading(layer)
                 layer.quant_method.process_weights_after_loading(layer)
