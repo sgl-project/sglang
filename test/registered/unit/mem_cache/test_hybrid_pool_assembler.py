@@ -38,6 +38,8 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
+    _select_strategy,
+    _StateFreeMambaStrategy,
     _SwaStrategy,
     build_full_draft_pools,
     build_host_pool_group,
@@ -68,6 +70,7 @@ from sglang.srt.mem_cache.pool_host.mha import (
     MHATokenToKVPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
@@ -414,6 +417,87 @@ class TestHybridStageLayerMappings(CustomTestCase):
                         kvcache.full_attention_layer_id_mapping, global_maps["full"]
                     )
                     self.assertEqual(kvcache.layers_mapping, layers_mapping)
+
+
+class TestStateFreeMambaStack(CustomTestCase):
+    @staticmethod
+    def _hybrid_pool():
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        return HybridLinearKVPool(
+            size=8,
+            page_size=1,
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=4,
+            full_attention_layer_ids=[1, 3],
+            device="cpu",
+            mamba_pool=None,
+        )
+
+    def test_a_full_only_tree_selects_the_state_free_stack(self):
+        kvcache = self._hybrid_pool()
+        strategy = _select_strategy(kvcache, {ComponentType.FULL})
+        self.assertIsInstance(strategy, _StateFreeMambaStrategy)
+        self.assertNotIsInstance(
+            _select_strategy(kvcache, {ComponentType.FULL, ComponentType.MAMBA}),
+            _StateFreeMambaStrategy,
+        )
+        with self.assertRaisesRegex(ValueError, "direct external linker"):
+            strategy.build_direct_linker_pool_group(
+                kvcache=kvcache, params=None, page_size=1
+            )
+
+    def test_state_free_stack_holds_kv_only_and_takes_the_whole_host_size(self):
+        kvcache = self._hybrid_pool()
+        params = SimpleNamespace(
+            page_size=1,
+            mtp_draft_device_pools=(),
+            token_to_kv_pool_allocator=SimpleNamespace(),
+            tp_cache_group=None,
+            pp_cache_group=None,
+            attn_cp_cache_group=None,
+            attn_tp_cache_group=None,
+        )
+        memory = SimpleNamespace(
+            hicache_size=4,
+            hicache_ratio=2,
+            hicache_mem_layout="layer_first",
+            hicache_write_policy="write_through",
+            hicache_io_backend="kernel",
+            hicache_host_memory_mode="cache",
+            enable_unified_memory=False,
+        )
+        host = SimpleNamespace(
+            layer_num=2,
+            layout="layer_first",
+            page_size=1,
+            device="cpu",
+            size=16,
+            logical_size=16,
+            can_use_write_back_jit=False,
+        )
+        with (
+            patch.object(hybrid_pool_assembler, "get_memory", return_value=memory),
+            patch.object(
+                hybrid_pool_assembler, "build_kv_host_pool", return_value=host
+            ) as build_kv_host_pool,
+            patch.object(
+                hybrid_pool_assembler, "_get_allocator_type", return_value="default"
+            ),
+            patch.object(hybrid_pool_assembler, "HybridCacheController"),
+        ):
+            result = _StateFreeMambaStrategy().build(
+                cache=SimpleNamespace(page_size=1),
+                kvcache=kvcache,
+                params=params,
+                server_args=None,
+                load_cache_event=None,
+            )
+        self.assertEqual(build_kv_host_pool.call_args.kwargs["host_size"], 4)
+        self.assertNotIn(PoolName.MAMBA, result.host_pool_group.entry_map)
+        self.assertEqual(set(result.component_host_pools), {ComponentType.FULL})
+        self.assertFalse(result.loads_state_layer_wise)
 
 
 class TestMambaInfoRouting(CustomTestCase):
