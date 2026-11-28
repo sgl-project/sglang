@@ -40,7 +40,6 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         image_data: List[Union[str, bytes]],
         input_text,
         request_obj,
-        max_req_input_len,
         *args,
         **kwargs,
     ):
@@ -52,7 +51,6 @@ class DeepseekVL2ImageProcessor(BaseMultimodalProcessor):
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
             base_output,
             self.mm_tokens,
-            max_req_input_len=max_req_input_len,
             conversations=base_output.input_text,
         )
 

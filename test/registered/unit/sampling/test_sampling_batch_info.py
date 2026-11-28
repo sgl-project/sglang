@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="extra-test-cpu-intel")
 
+import dataclasses
 import unittest
 from functools import partial
 from types import SimpleNamespace
@@ -328,24 +329,24 @@ class TestBuildGrammarMask(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-    def test_returns_copy(self):
-        """Both copy implementations preserve every field, including fields
-        declared with init=False, and leave the step's tables to sampling."""
-        for fast_path in (False, True):
-            info = _make_info()
-            step = MagicMock()
-            info.step_penalties = step
-            with (
-                self.subTest(fast_path=fast_path),
-                patch(
-                    "sglang.srt.sampling.sampling_batch_info._fast_copy_enabled",
-                    return_value=fast_path,
-                ),
-            ):
-                copied = info.copy_for_forward()
-            step.logit_penalties.assert_not_called()
-            for name, value in info.__dict__.items():
-                self.assertIs(copied.__dict__[name], value, name)
+    def test_copy_matches_dataclasses_replace(self):
+        """The one-dict-update copy holds exactly what dataclasses.replace holds,
+        and leaves the step's penalty tables to sampling."""
+        info = _make_info()
+        step = MagicMock()
+        info.step_penalties = step
+        copied = info.copy_for_forward()
+        replaced = dataclasses.replace(info)
+        step.logit_penalties.assert_not_called()
+        self.assertIs(type(copied), SamplingBatchInfo)
+        self.assertIsNot(copied, info)
+        self.assertEqual(copied.__dict__.keys(), replaced.__dict__.keys())
+        for name, value in replaced.__dict__.items():
+            self.assertIs(copied.__dict__[name], value, name)
+        # The copy skips __init__: a __post_init__ or an init=False field would
+        # make it differ from dataclasses.replace.
+        self.assertNotIn("__post_init__", dir(SamplingBatchInfo))
+        self.assertTrue(all(f.init for f in dataclasses.fields(SamplingBatchInfo)))
 
 
 class TestStepBuilds(CustomTestCase):

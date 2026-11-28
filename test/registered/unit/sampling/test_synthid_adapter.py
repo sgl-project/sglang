@@ -219,6 +219,19 @@ class TestSynthIDEngine(CustomTestCase):
             engine.seed_payload(batch(ForwardMode.EXTEND, decoding_reqs=reqs))
         )
 
+    def test_fused_sample_is_skipped_for_a_custom_logit_processor(self):
+        engine = adapter.SynthIDEngine(_watermarks()[0], allow_fused_sample=True)
+        rows = SynthIDRows.from_candidates([True, True], "cpu")
+        info = _info(2, watermark=rows)
+        forward_batch = SimpleNamespace(
+            sampling_info=info, req_pool_indices=torch.tensor([0, 1])
+        )
+        sample = engine.bind_sample(forward_batch)
+
+        self.assertTrue(sample._can_fuse(keep_logits=False))
+        info.has_custom_logit_processor = True
+        self.assertFalse(sample._can_fuse(keep_logits=False))
+
     def test_sample_watermarks_on_rows_and_commits_their_slots(self):
         watermark, twin = _watermarks()
         engine = adapter.SynthIDEngine(watermark, allow_fused_sample=False)
