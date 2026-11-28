@@ -461,6 +461,99 @@ Formula: <code>(E2E Latency - TTFT) / (Number of output tokens - 1)</code>
   </tbody>
 </table>
 
+### 2.4 Benchmark a shared prefix under a TPOT budget
+
+Use this workflow when comparing output throughput under a TPOT limit, such as 50 ms or 20 ms,
+with a long shared prefix. Start the model on Ascend NPUs using its validated deployment recipe;
+keep the hardware, model, precision, and parallelism fixed while you sweep client concurrency.
+The command below targets an already running text-generation server, not a new deployment.
+
+#### Define the workload
+
+For a `128k input / 1k output / 90% shared prefix` workload, the following example uses decimal
+token counts (`128k = 128000`, `1k = 1000`):
+
+| Component | Target tokens |
+| --- | ---: |
+| Shared system prefix | 115200 |
+| Unique question | 12800 |
+| Total input per request | 128000 |
+| Output per request | 1000 |
+
+The 64k example values `57600 + 6400` do not describe a 128k input. These are generation targets:
+check the generated dataset's actual token statistics, since decoding random token IDs to text
+and tokenizing again can change the lengths. Confirm that the model and server context limit
+can accommodate the actual input plus output.
+
+For a single-turn, uniform `generated-shared-prefix` dataset, the request count comes from
+`--gsp-num-groups` times `--gsp-prompts-per-group`. Do not rely on `--num-prompts` to override
+that count. Check the generated request count and `Successful requests` in the output;
+20 generated requests cannot exercise a concurrency limit of 32 or 64.
+
+#### Verify cache reuse before comparing throughput
+
+A 90% shared prefix describes the input layout, not a measured cache hit rate. Check that the
+resolved server configuration enables prefix caching and supports it for the selected model,
+NPU backend, and speculative algorithm. A recipe containing `--disable-radix-cache` does not
+establish a cache-hit benchmark; verify compatibility before changing that recipe.
+
+On an idle server, reset the prefix cache before each run, then use the same warmup procedure.
+For example, send `POST /flush_cache` before starting the benchmark, and retain the benchmark's
+warmup for a warm-cache measurement. Do not add `--flush-cache` to that measurement: the
+benchmark clears the server cache **after** warmup. The `SGLANG_IS_IN_CI` environment setting
+can also trigger this post-warmup reset. With attention DP or multiple workers, one warmup
+request may not populate every worker's cache; check actual reuse rather than assuming 90% hits.
+
+```shell Command
+# Match the endpoint to your running server. Run against an idle test instance.
+BENCH_HOST=127.0.0.1
+BENCH_PORT=6688
+BENCH_CONCURRENCY=16
+
+curl --fail --silent --show-error -X POST \
+  "http://${BENCH_HOST}:${BENCH_PORT}/flush_cache"
+
+python -m sglang.benchmark.serving \
+  --backend sglang \
+  --host "${BENCH_HOST}" --port "${BENCH_PORT}" \
+  --dataset-name generated-shared-prefix \
+  --gsp-num-groups 1 \
+  --gsp-prompts-per-group 64 \
+  --gsp-system-prompt-len 115200 \
+  --gsp-question-len 12800 \
+  --gsp-output-len 1000 \
+  --num-prompts 64 \
+  --max-concurrency "${BENCH_CONCURRENCY}" \
+  --request-rate inf \
+  --warmup-requests 1 \
+  --cache-report \
+  --seed 42
+```
+
+`--cache-report` reports cached tokens and their ratio to prompt tokens for successful requests
+on supported SGLang backends. Retain that output with the server logs. If your build does not
+expose the counters, record the server's cached/new-token statistics and state the measurement
+method. Do not label a run as 90% cache hit based only on the input lengths.
+
+#### Select and report a configuration
+
+TPOT is measured, not a server setting. Choose its acceptance statistic before tuning: a
+`Mean TPOT <= 20 ms` result does not establish `P99 TPOT <= 20 ms`. TPOT excludes the first
+token, so record TTFT and end-to-end latency separately.
+
+Sweep `BENCH_CONCURRENCY`, for example over 4, 8, 16, and 32, while keeping the dataset, request
+count, seed, cache preparation, and server configuration fixed. Repeat runs to establish noise,
+then choose the highest output-token throughput among runs meeting your TPOT criterion.
+Use that configuration as the starting point for the tighter budget, and change server knobs
+one at a time using [Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
+
+For each selected configuration, retain the complete launch command and environment, benchmark
+command, version/commit, hardware and parallelism, actual input/output lengths, cache hit rate,
+request count and concurrency, output throughput, Mean/P95/P99 TPOT, TTFT, and failures. Keep
+commands and logs from the same run together. Attach [accuracy results](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation)
+with the dataset, sample count, and generation settings; a 10-question GSM8K check is a smoke
+test, not full-dataset accuracy.
+
 ## 3. Online Service: Multimodal Model
 
 Test `Qwen/Qwen2.5-VL-7B-Instruct` for vision-language tasks.
