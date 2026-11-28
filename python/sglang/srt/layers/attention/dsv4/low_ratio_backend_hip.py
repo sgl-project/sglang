@@ -62,6 +62,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     _as_int_list,
 )
+from sglang.srt.utils import is_gfx942_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
@@ -76,9 +77,9 @@ logger = logging.getLogger(__name__)
 
 @functools.lru_cache(maxsize=1)
 def _fp4_rowgroup_enabled() -> bool:
-    """SGLANG_HIP_FP4_INDEXER_ROWGROUP, off when the installed AITER has no row-group
-    kernel (ROCm/aiter#6145)."""
-    if not envs.SGLANG_HIP_FP4_INDEXER_ROWGROUP.get():
+    """SGLANG_HIP_FP4_INDEXER_ROWGROUP, off on gfx942 and when the installed AITER has no
+    row-group kernel (ROCm/aiter#6145). The row-group kernel has no gfx942 version."""
+    if not envs.SGLANG_HIP_FP4_INDEXER_ROWGROUP.get() or is_gfx942_supported():
         return False
     if not aiter_has_fp4_rowgroup():
         logger.warning(
