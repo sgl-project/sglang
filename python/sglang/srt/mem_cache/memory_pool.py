@@ -73,6 +73,23 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
+
+_NPU_CLEAR_MAMBA_SLOTS_UNSET = object()
+_npu_clear_mamba_slots_fn = _NPU_CLEAR_MAMBA_SLOTS_UNSET
+
+
+def _get_npu_clear_mamba_slots():
+    global _npu_clear_mamba_slots_fn
+    if _npu_clear_mamba_slots_fn is _NPU_CLEAR_MAMBA_SLOTS_UNSET:
+        try:
+            from sgl_kernel_npu.operators.mem_cache import clear_mamba_slots
+
+            _npu_clear_mamba_slots_fn = clear_mamba_slots
+        except ImportError:
+            _npu_clear_mamba_slots_fn = None
+    return _npu_clear_mamba_slots_fn
+
+
 from sglang.srt.mem_cache.allocator.mamba import MambaSlotAllocator
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
@@ -1201,20 +1218,20 @@ class MambaPool:
             sibling.reset_slots(indices)
         idx64 = indices.to(torch.int64)
         if _is_npu and idx64.numel() > 0:
-            from sglang.srt.mem_cache.mamba_slot_fused import npu_clear_slots_fast
-
-            for conv in self.mamba_cache.conv:
-                if conv.numel() > 0 and conv[0, 0].is_contiguous():
-                    npu_clear_slots_fast(conv, idx64)
-                else:
-                    conv.index_fill_(1, idx64, 0)
-            temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
-                if temporal[0, 0].is_contiguous():
-                    npu_clear_slots_fast(temporal, idx64)
-                else:
-                    temporal.index_fill_(1, idx64, 0)
-            return
+            clear_mamba_slots = _get_npu_clear_mamba_slots()
+            if clear_mamba_slots is not None:
+                for conv in self.mamba_cache.conv:
+                    if conv.numel() > 0 and conv[0, 0].is_contiguous():
+                        clear_mamba_slots(conv, idx64)
+                    else:
+                        conv.index_fill_(1, idx64, 0)
+                temporal = self.mamba_cache.temporal
+                if temporal.numel() > 0:
+                    if temporal[0, 0].is_contiguous():
+                        clear_mamba_slots(temporal, idx64)
+                    else:
+                        temporal.index_fill_(1, idx64, 0)
+                return
         if self._should_fuse_slot_ops():
             from sglang.srt.mem_cache.mamba_slot_fused import fused_clear_conv_slots
 
