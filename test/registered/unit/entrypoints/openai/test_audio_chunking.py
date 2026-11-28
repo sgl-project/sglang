@@ -117,6 +117,32 @@ class TestSplitAudioEnergyAware(CustomTestCase):
         self.assertEqual(sum(len(d) for d in decoded), len(wav))
         self.assertEqual(len(offsets), len(chunks))
 
+    def test_max_clip_le_search_window_makes_progress(self):
+        # When max_clip_s <= SPLIT_SEARCH_WINDOW_S (1.0 s), chunk_size <= search_size.
+        # The splitter must clamp search_start >= i + 1 so split_point strictly
+        # advances on every iteration instead of slicing negatively or looping infinitely.
+        wav = _tone_with_silences(2.5, [(0.0, 2.5)])
+        for max_clip_s in (0.5, 1.0):
+            chunks, offsets = split_audio_energy_aware(
+                _wav_bytes(wav), max_clip_s=max_clip_s
+            )
+            self.assertGreaterEqual(len(chunks), 3)
+            self.assertEqual(len(offsets), len(chunks))
+            decoded = [_decode(c) for c in chunks]
+            for d in decoded:
+                self.assertGreater(len(d), 0)
+                self.assertLessEqual(len(d), int(max_clip_s * SR))
+            self.assertEqual(sum(len(d) for d in decoded), len(wav))
+
+    def test_invalid_max_clip_or_sample_rate_raises(self):
+        wav = _tone_with_silences(1.0, [])
+        raw = _wav_bytes(wav)
+        for bad_clip in (0.0, -1.0, 1e-6):
+            with self.assertRaises(ValueError):
+                split_audio_energy_aware(raw, max_clip_s=bad_clip)
+        with self.assertRaises(ValueError):
+            split_audio_energy_aware(raw, max_clip_s=10.0, sample_rate=0)
+
 
 if __name__ == "__main__":
     unittest.main()
