@@ -52,6 +52,75 @@ class Buffer:
 
 
 class TestRegisteredNPUHostAllocation(unittest.TestCase):
+    def test_npu_host_backend_defaults_to_acl_without_setting_environment(self):
+        path = ROOT / "python/sglang/srt/mem_cache/pool_host/npu_host_memory.py"
+        names = {
+            "host_memory_backend",
+            "memfabric_host_memory_enabled",
+            "acl_host_memory_enabled",
+            "get_host_memory_backend",
+        }
+        functions = [
+            n
+            for n in ast.parse(path.read_text()).body
+            if isinstance(n, ast.FunctionDef) and n.name in names
+        ]
+        acl = type("AclHostMemoryBackend", (), {})
+        mf = type("MemfabricHostMemoryBackend", (), {})
+        namespace = dict(
+            os=os,
+            NpuHostMemoryBackend=object,
+            AclHostMemoryBackend=acl,
+            MemfabricHostMemoryBackend=mf,
+            _backend=None,
+        )
+        exec(compile(ast.Module(functions, []), str(path), "exec"), namespace)
+        env_name = "SGLANG_HICACHE_HOST_MEM_BACKEND"
+        for setting, expected in (
+            (None, acl),
+            ("", acl),
+            ("memfabric", mf),
+        ):
+            with self.subTest(setting=setting):
+                environment = {} if setting is None else {env_name: setting}
+                with patch.dict(os.environ, environment, clear=True):
+                    namespace["_backend"] = None
+                    self.assertIsInstance(
+                        namespace["get_host_memory_backend"](), expected
+                    )
+                    self.assertEqual(os.environ.get(env_name), setting)
+
+    def test_mha_draft_layout_preserves_npu_layer_order(self):
+        path = (
+            ROOT / "python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py"
+        )
+        function = next(
+            n
+            for n in ast.parse(path.read_text()).body
+            if isinstance(n, ast.FunctionDef) and n.name == "_build_mha_mla_host_pool"
+        )
+        mha_info = type("MHABufferInfo", (), {})
+        namespace = dict(
+            MHABufferInfo=mha_info,
+            is_npu=lambda: True,
+            _mha_host_inputs=lambda pool, info: (lambda info, **kw: kw, {}),
+        )
+        module = ast.Module(
+            [ast.ImportFrom("__future__", [ast.alias("annotations")], 0), function], []
+        )
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+        for source in ("page_first_kv_split", "layer_first_kv_split"):
+            result = namespace["_build_mha_mla_host_pool"](
+                pool=object(),
+                buffer_info=mha_info(),
+                host_to_device_ratio=2,
+                page_size=128,
+                layout=source,
+                allocator_type="default",
+                pool_label="draft",
+            )
+            self.assertEqual(result["layout"], "page_first_direct")
+
     def test_pin_memory_allocator_selects_configured_backend(self):
         path = ROOT / "python/sglang/srt/mem_cache/pool_host/common.py"
         tree = ast.parse(path.read_text())
@@ -148,6 +217,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.namespace = dict(
             self.ops,
             _is_npu=True,
+            is_npu=lambda: True,
             maybe_dcp_kernel_indices=self.localize,
             logger=Mock(),
             torch=SimpleNamespace(
@@ -170,8 +240,11 @@ class TestNPUSparseDispatch(unittest.TestCase):
         self.native = SimpleNamespace(
             k=Buffer((3, 8, 128, 1, 512)),
             v=Buffer((3, 8, 128, 1, 64)),
-            index_k=Buffer((2, 8, 128, 1, 128)),
-            index_scales=Buffer((2, 8, 128, 1)),
+            # BF16 index K: under a packed one-byte main KV the indexer keeps
+            # its own dtype, and the host mirror must follow it.
+            index_k=Buffer((2, 8, 128, 1, 128), SimpleNamespace(itemsize=2)),
+            # FP32 scales: the host mirror is sized from the device scale dtype.
+            index_scales=Buffer((2, 8, 128, 1), SimpleNamespace(itemsize=4)),
             index_layer_indices=(0, 2),
             index_width=128,
             k_width=512,
@@ -407,7 +480,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
         h._transfer_device = SimpleNamespace(type="npu")
         h.device, h.pin_memory, h.allocator = "cpu", True, None
         h.kv_lora_rank, h.qk_rope_head_dim = 512, 64
-        allocate = Mock(side_effect=lambda shape, **_: Buffer(shape))
+        allocate = Mock(
+            side_effect=lambda shape, dtype="bf16", **_: Buffer(shape, dtype)
+        )
         reserve = Mock()
         empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
         self.namespace.update(
@@ -437,15 +512,14 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertEqual(h.k_buffer.shape, (*kv_dims, self.native.k_width))
                     self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
                     self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
+                    self.assertIs(h.index_k_buffer.dtype, self.native.index_k.dtype)
                     self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
                     expected_blocks = [
                         8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
                     ]
                     if v_width:
                         expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
-                    expected_blocks.extend(
-                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
-                    )
+                    expected_blocks.extend([8 * 128 * 2 * 128 * 2, 8 * 128 * 2 * 4])
                     reserve.assert_called_once_with(sum(expected_blocks), 0)
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
@@ -457,7 +531,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
         h._transfer_device = SimpleNamespace(type="npu")
         h.device, h.pin_memory, h.allocator = "cpu", True, None
         h.kv_lora_rank, h.qk_rope_head_dim = 512, 64
-        allocate = Mock(side_effect=lambda shape, **_: Buffer(shape))
+        allocate = Mock(
+            side_effect=lambda shape, dtype="bf16", **_: Buffer(shape, dtype)
+        )
         reserve = Mock()
         empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
         self.namespace.update(
@@ -487,15 +563,14 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     self.assertEqual(h.k_buffer.shape, (*kv_dims, self.native.k_width))
                     self.assertEqual(h.v_buffer.shape, (*kv_dims, v_width))
                     self.assertEqual(h.index_k_buffer.shape, (*index_dims, 128))
+                    self.assertIs(h.index_k_buffer.dtype, self.native.index_k.dtype)
                     self.assertEqual(h.index_k_scale_buffer.shape, (*index_dims, 1))
                     expected_blocks = [
                         8 * 128 * 3 * self.native.k_width * h.dtype.itemsize
                     ]
                     if v_width:
                         expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
-                    expected_blocks.extend(
-                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
-                    )
+                    expected_blocks.extend([8 * 128 * 2 * 128 * 2, 8 * 128 * 2 * 4])
                     reserve.assert_called_once_with(sum(expected_blocks), 0)
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
@@ -540,7 +615,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
                         cfg=cfg,
                         args=cfg,
                         use_mla_backend=lambda _: mla,
-                        model_config_of=lambda _: SimpleNamespace(hf_config=None),
+                        model_config_of=lambda _: SimpleNamespace(
+                            hf_config=None, attention_arch="mha"
+                        ),
                         declare_resolution=lambda args, source, **kw: resolved.update(
                             kw
                         ),
@@ -551,16 +628,14 @@ class TestNPUSparseDispatch(unittest.TestCase):
                             sys.modules,
                             {
                                 "sglang.srt.configs.model_config": SimpleNamespace(
-                                    is_deepseek_v4=lambda _: dsv4
+                                    AttentionArch=SimpleNamespace(MHA="mha"),
+                                    is_deepseek_v4=lambda _: dsv4,
                                 )
                             },
                         ),
                     ):
                         exec(code, namespace)
-                        self.assertEqual(
-                            os.environ.get("SGLANG_HICACHE_HOST_MEM_BACKEND"),
-                            "acl" if dsv4 or mla else None,
-                        )
+                        self.assertNotIn("SGLANG_HICACHE_HOST_MEM_BACKEND", os.environ)
                     if dsv4:
                         expected = (
                             "layer_first" if layout == "layer_first" else "page_first"
@@ -600,7 +675,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
                             cfg=cfg,
                             args=cfg,
                             use_mla_backend=lambda _: mla,
-                            model_config_of=lambda _: SimpleNamespace(hf_config=None),
+                            model_config_of=lambda _: SimpleNamespace(
+                                hf_config=None, attention_arch="mha"
+                            ),
                             declare_resolution=Mock(),
                         )
                         environment = {} if backend is None else {env_name: backend}
@@ -610,22 +687,48 @@ class TestNPUSparseDispatch(unittest.TestCase):
                                 sys.modules,
                                 {
                                     "sglang.srt.configs.model_config": SimpleNamespace(
-                                        is_deepseek_v4=lambda _: dsv4
+                                        AttentionArch=SimpleNamespace(MHA="mha"),
+                                        is_deepseek_v4=lambda _: dsv4,
                                     ),
                                 },
                             ),
                         ):
                             exec(code, namespace)
-                            expected = backend
-                            if (
-                                backend is None
-                                and (dsv4 or mla)
-                                and trigger != "disabled"
-                            ):
-                                expected = "acl"
-                            self.assertEqual(os.environ.get(env_name), expected)
+                            self.assertEqual(os.environ.get(env_name), backend)
                             if trigger == "disabled":
                                 namespace["declare_resolution"].assert_not_called()
+
+    def test_npu_ssm_does_not_select_mha_host_backend(self):
+        code = self._npu_hicache_resolution_code()
+        cfg = SimpleNamespace(
+            enable_hierarchical_cache=True, hicache_mem_layout="layer_first"
+        )
+        resolved = {}
+        namespace = dict(
+            os=os,
+            cfg=cfg,
+            args=cfg,
+            use_mla_backend=lambda _: False,
+            model_config_of=lambda _: SimpleNamespace(
+                hf_config=None, attention_arch="ssm"
+            ),
+            declare_resolution=lambda args, source, **kw: resolved.update(kw),
+        )
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.configs.model_config": SimpleNamespace(
+                        AttentionArch=SimpleNamespace(MHA="mha"),
+                        is_deepseek_v4=lambda _: False,
+                    )
+                },
+            ),
+        ):
+            exec(code, namespace)
+            self.assertNotIn("SGLANG_HICACHE_HOST_MEM_BACKEND", os.environ)
+        self.assertEqual(resolved["hicache_mem_layout"], "page_first_direct")
 
     def test_controller_keeps_pf_and_lf_indices_on_npu(self):
         path = ROOT / "python/sglang/srt/managers/cache_controller.py"
@@ -666,15 +769,11 @@ class TestNPUSparseDispatch(unittest.TestCase):
         cpu_di = object()
         for backend in ("acl", "memfabric", None):
             layouts = (
-                (
-                    "page_first_kv_split",
-                    "layer_first_kv_split",
-                    "page_first",
-                    "layer_first",
-                    "page_first_direct",
-                )
-                if backend
-                else ("page_first_direct",)
+                "page_first_kv_split",
+                "layer_first_kv_split",
+                "page_first",
+                "layer_first",
+                "page_first_direct",
             )
             for layout in layouts:
                 with self.subTest(backend=backend, layout=layout):
@@ -703,16 +802,11 @@ class TestNPUSparseDispatch(unittest.TestCase):
                             mem_pool_host=SimpleNamespace(layout=layout),
                         )
                         move = namespace["move_indices"]
-                        if backend:
-                            self.assertEqual(move(ctl, hi, di), (hi, di))
-                            upload.assert_not_called()
-                            self.assertEqual(move(ctl, cpu_hi, di), (hi, di))
-                            upload.assert_called_once_with(cpu_hi, "npu")
-                            di.cpu.assert_not_called()
-                        else:
-                            self.assertEqual(move(ctl, cpu_hi, di), (cpu_hi, cpu_di))
-                            di.cpu.assert_called_once_with()
-                            upload.assert_not_called()
+                        self.assertEqual(move(ctl, hi, di), (hi, di))
+                        upload.assert_not_called()
+                        self.assertEqual(move(ctl, cpu_hi, di), (hi, di))
+                        upload.assert_called_once_with(cpu_hi, "npu")
+                        di.cpu.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional
@@ -570,12 +571,12 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
             self.draft_step_folds.append(forward_batch.draft_step_fold)
 
-        def run_stock():
+        def run_stock(greedy: bool):
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
             dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
 
-            ret = self.eagle_worker.draft_forward(forward_batch)
+            ret = self.eagle_worker.draft_forward(forward_batch, greedy=greedy)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -584,7 +585,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             self._run_capture_tail_hooks(ret, forward_batch, num_tokens)
             return ret
 
-        def run_once():
+        def run_once(greedy: bool):
             self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)
 
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -598,7 +599,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             return self.draft_runtime.run_draft_loop(
                 runner=self,
                 forward_batch=forward_batch,
-                stock=run_stock,
+                stock=functools.partial(run_stock, greedy=greedy),
             )
 
         with forward_context(
@@ -617,7 +618,7 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
             maybe_flashinfer_autotune_speculative_draft(
                 self,
-                run_once,
+                functools.partial(run_once, greedy=False),
                 post_warmup_hook=post_warmup_hook,
                 run_lm_head=True,
             )
@@ -627,14 +628,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
                 else (None,)
             )
             for variant in variants:
-                sampling_info.is_all_greedy = variant == _GREEDY_VARIANT
                 self.backend.capture_one(
                     self._make_graph_key(
                         num_seqs,
                         variant_label=variant,
                         attention_variant=attention_variant,
                     ),
-                    run_once,
+                    functools.partial(run_once, greedy=variant == _GREEDY_VARIANT),
                     capture_inputs=None,
                     post_warmup_hook=post_warmup_hook,
                 )

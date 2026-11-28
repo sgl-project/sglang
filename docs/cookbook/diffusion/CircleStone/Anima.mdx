@@ -96,6 +96,10 @@ with fresh state. CFG parallelism, guidance 1, layerwise offload, wrapped module
 compilation, and graph capture use the original projection path. BCG replay
 continues to use its captured graph.
 
+On CUDA, the resident unquantized eager transformer also reuses the fixed
+positive and negative text keys and values across denoising steps. The
+denoising loop releases both branches before VAE decode.
+
 ## 5. Measured tuning
 
 For repeated requests, compilation was faster than eager execution on all three
