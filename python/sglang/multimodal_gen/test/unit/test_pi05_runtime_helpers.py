@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -545,6 +546,37 @@ def test_action_parallel_info_reports_single_rank_without_process_group():
         "runtime_role": "all",
         "action_sequence_parallel": False,
     }
+
+
+def test_pi05_checkpoint_config_follows_declared_tokenizer(tmp_path):
+    ckpt = tmp_path / "ckpt"
+    tok_dir = ckpt / "tokenizer"
+    tok_dir.mkdir(parents=True)
+    (tok_dir / "tokenizer_config.json").write_text("{}")
+    (ckpt / "policy_preprocessor.json").write_text(
+        '{"steps": ["bad", {"artifacts": null}, '
+        '{"artifacts": {"tokenizer_name": "tokenizer"}}]}'
+    )
+    config = Pi05PipelineConfig()
+    Pi05PolicyModel._apply_checkpoint_config(str(ckpt), config)
+    assert config.tokenizer_name == str(tok_dir.resolve())
+    for explicit in ("google/paligemma-3b-pt-224", "custom"):
+        config = Pi05PipelineConfig(tokenizer_name=explicit)
+        Pi05PolicyModel._apply_checkpoint_config(str(ckpt), config)
+        assert config.tokenizer_name == explicit
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "tokenizer_config.json").write_text("{}")
+    (ckpt / "empty").mkdir()
+    (ckpt / "tok_link").symlink_to(outside)
+    for bad in ("empty", "../outside", str(outside), "tok_link"):
+        (ckpt / "policy_preprocessor.json").write_text(
+            json.dumps({"steps": [{"artifacts": {"tokenizer_name": bad}}]})
+        )
+        config = Pi05PipelineConfig()
+        Pi05PolicyModel._apply_checkpoint_config(str(ckpt), config)
+        assert config.tokenizer_name == "google/paligemma-3b-pt-224"
 
 
 def test_pi05_siglip_reuses_srt_model_with_layerwise_groups():

@@ -13,7 +13,10 @@ from safetensors import safe_open
 from torch import nn
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
-from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.pi05 import (
+    Pi05PipelineConfig,
+    _DefaultTokenizerName,
+)
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
     tensor_model_parallel_all_gather,
@@ -515,11 +518,58 @@ class Pi05PolicyModel(nn.Module):
             return torch.float32
         raise ValueError(f"Unsupported Pi05 dtype: {dtype_name}")
 
+    _TOKENIZER_ARTIFACT_FILES = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "tokenizer.model",
+        "spiece.model",
+        "vocab.json",
+        "sentencepiece.bpe.model",
+    )
+
     @staticmethod
     def _apply_checkpoint_config(
         model_path: str,
         config: Pi05PipelineConfig,
     ) -> None:
+        if isinstance(config.tokenizer_name, _DefaultTokenizerName):
+            processor_path = Path(model_path) / "policy_preprocessor.json"
+            try:
+                if processor_path.is_file():
+                    with processor_path.open(encoding="utf-8") as f:
+                        payload = json.load(f)
+                    steps = payload.get("steps") if isinstance(payload, dict) else None
+                    if isinstance(steps, list):
+                        model_root: Path | None = None
+                        for step in steps:
+                            if not isinstance(step, dict):
+                                continue
+                            artifacts = step.get("artifacts")
+                            if not isinstance(artifacts, dict):
+                                continue
+                            name = artifacts.get("tokenizer_name")
+                            if not isinstance(name, str) or not name or "\x00" in name:
+                                continue
+                            rel = Path(name)
+                            if rel.is_absolute():
+                                continue
+                            if model_root is None:
+                                model_root = Path(model_path).resolve()
+                            candidate = (model_root / rel).resolve()
+                            if (
+                                candidate.is_relative_to(model_root)
+                                and candidate.is_dir()
+                                and any(
+                                    (candidate / fname).is_file()
+                                    for fname in Pi05PolicyModel._TOKENIZER_ARTIFACT_FILES
+                                )
+                            ):
+                                config.tokenizer_name = str(candidate)
+                                break
+            except Exception as e:
+                logger.warning(
+                    "Ignoring LeRobot processor config %s: %s", processor_path, e
+                )
         config_path = Path(model_path) / "config.json"
         if not config_path.exists():
             return

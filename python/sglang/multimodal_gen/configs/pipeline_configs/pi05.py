@@ -6,6 +6,13 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
+class _DefaultTokenizerName(str):
+    pass
+
+
+_DEFAULT_TOKENIZER_NAME = _DefaultTokenizerName("google/paligemma-3b-pt-224")
+
+
 @dataclass
 class Pi05PipelineConfig(PipelineConfig):
     """Configuration for OpenPI / LeRobot Pi0.5 action policies."""
@@ -28,7 +35,7 @@ class Pi05PipelineConfig(PipelineConfig):
     default_num_inference_steps: int = 10
     time_embedding_min_period: float = 4e-3
     time_embedding_max_period: float = 4.0
-    tokenizer_name: str = "google/paligemma-3b-pt-224"
+    tokenizer_name: str = _DEFAULT_TOKENIZER_NAME
 
     image_keys: tuple[str, ...] = (
         "base_0_rgb",
