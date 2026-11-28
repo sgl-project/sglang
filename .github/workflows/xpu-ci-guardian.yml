@@ -1,0 +1,246 @@
+name: XPU CI Guardian
+
+# Watches PR Test (XPU) on main. When two consecutive runs fail, opens an
+# auto-disable PR against main for the failing test files (via `disabled=` on
+# their `register_xpu_ci(...)` marker) and pings the owner. Never fixes code
+# on its own; the goal is a fast unblock while a human writes the real fix.
+#
+# Design notes:
+#   * Only touches CI-registration (`register_xpu_ci(..., disabled="...")`),
+#     never test bodies or kernel code.
+#   * Requires TWO consecutive failing XPU runs on main before acting — the
+#     `enable_retry` path in run_suite.py already covers single flakes.
+#   * At most one open guardian PR at a time (dedup via label).
+#   * Companion job (`sweep-when-green`) closes any open guardian PR once
+#     XPU CI on main is green again.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Detect only; do not open a PR."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: sgl-project/sglang
+  FORK: arathi-hlab/sglang
+  WORKFLOW: "PR Test (XPU)"
+  PING_USER: arathi-hlab
+  GUARDIAN_LABEL: xpu-ci-guardian
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # 1. Detect a real (non-flake) XPU CI regression on main             #
+  # ------------------------------------------------------------------ #
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      act: ${{ steps.classify.outputs.act }}
+      run_id: ${{ steps.classify.outputs.run_id }}
+      failing_files: ${{ steps.parse.outputs.failing_files }}
+    steps:
+      - name: Fetch last two runs on main
+        id: classify
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          set -euo pipefail
+          gh run list --repo "$UPSTREAM" --workflow "$WORKFLOW" \
+            --branch main --limit 2 \
+            --json databaseId,conclusion,createdAt > runs.json
+          count=$(jq 'length' runs.json)
+          [ "$count" = "2" ] || { echo "act=false" >>"$GITHUB_OUTPUT"; exit 0; }
+          last=$(jq -r '.[0].conclusion' runs.json)
+          prev=$(jq -r '.[1].conclusion' runs.json)
+          echo "last=$last prev=$prev"
+          if [ "$last" = "failure" ] && [ "$prev" = "failure" ]; then
+            echo "act=true" >>"$GITHUB_OUTPUT"
+            echo "run_id=$(jq -r '.[0].databaseId' runs.json)" >>"$GITHUB_OUTPUT"
+          else
+            echo "act=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract failing test file paths
+        id: parse
+        if: steps.classify.outputs.act == 'true'
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          set -euo pipefail
+          gh run view "${{ steps.classify.outputs.run_id }}" --repo "$UPSTREAM" \
+            --log-failed > log.txt || true
+          # Match `test/registered/**/*.py` mentioned as a target of a Fail line
+          grep -oE 'test/registered/[A-Za-z0-9_./-]+\.py' log.txt \
+            | sort -u > failing.txt || true
+          # Filter to files whose failure looks correctness-shaped, not infra
+          if grep -qE 'UR_RESULT_ERROR_OUT_OF_RESOURCES|Server failed to start|XPU out of memory' log.txt; then
+            echo "infra-flake pattern in log; skipping"
+            : > failing.txt
+          fi
+          test -s failing.txt || { echo "no failing files to disable"; echo "failing_files=" >>"$GITHUB_OUTPUT"; exit 0; }
+          {
+            echo "failing_files<<EOF"
+            cat failing.txt
+            echo "EOF"
+          } >>"$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------ #
+  # 2. Open (or skip) an auto-disable PR against upstream main         #
+  # ------------------------------------------------------------------ #
+  open-pr:
+    needs: detect
+    if: needs.detect.outputs.act == 'true' && needs.detect.outputs.failing_files != '' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Skip if a guardian PR is already open
+        id: gate
+        env: { GH_TOKEN: "${{ secrets.BOT_PR_TOKEN }}" }
+        run: |
+          open=$(gh pr list --repo "$UPSTREAM" \
+            --label "$GUARDIAN_LABEL" --state open --json number --jq 'length')
+          echo "open_prs=$open"
+          if [ "$open" != "0" ]; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout upstream main into fork branch
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PR_TOKEN }}
+
+      - name: Add fork remote
+        if: steps.gate.outputs.skip != 'true'
+        env: { BOT_PR_TOKEN: "${{ secrets.BOT_PR_TOKEN }}" }
+        run: |
+          git remote add fork "https://x-access-token:${BOT_PR_TOKEN}@github.com/${FORK}.git"
+
+      - name: Inject `disabled=` for each failing file
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          RUN_ID: ${{ needs.detect.outputs.run_id }}
+          FAILING: ${{ needs.detect.outputs.failing_files }}
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib
+          run_id = os.environ["RUN_ID"]
+          reason = f"auto-disabled by xpu-ci-guardian: run {run_id}"
+          files = [f.strip() for f in os.environ["FAILING"].splitlines() if f.strip()]
+          touched = []
+          for f in files:
+              p = pathlib.Path(f)
+              if not p.exists():
+                  print(f"skip missing: {f}"); continue
+              src = p.read_text()
+              if not re.search(r"register_xpu_ci\(", src):
+                  print(f"skip no register_xpu_ci: {f}"); continue
+              if re.search(r"register_xpu_ci\([^)]*disabled\s*=", src):
+                  print(f"skip already disabled: {f}"); continue
+              src = re.sub(
+                  r"register_xpu_ci\(([^)]*)\)",
+                  lambda m: 'register_xpu_ci(' + m.group(1).rstrip().rstrip(",")
+                  + f',\n    disabled="{reason}",\n)',
+                  src, count=1,
+              )
+              p.write_text(src)
+              touched.append(f)
+          pathlib.Path("touched.txt").write_text("\n".join(touched) + "\n")
+          PY
+          test -s touched.txt || { echo "nothing to disable after filtering"; exit 78; }
+
+      - name: Compose commit and PR bodies
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          RUN_ID: ${{ needs.detect.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          FILES_LIST=$(sed 's|^|- |' touched.txt)
+          {
+            printf '[XPU CI] auto-disable regressing tests (run %s)\n\n' "$RUN_ID"
+            printf 'The last two `%s` runs on main failed on the tests below.\n' "$WORKFLOW"
+            printf 'Auto-disabling them via `register_xpu_ci(..., disabled=...)`\n'
+            printf 'as a temporary unblock; the underlying fix still needs to be\n'
+            printf 'raised manually.\n\n'
+            printf 'Failing run: https://github.com/%s/actions/runs/%s\n\n' "$UPSTREAM" "$RUN_ID"
+            printf 'Files touched:\n%s\n' "$FILES_LIST"
+          } > /tmp/commit_msg.txt
+
+          {
+            printf '@%s — `%s` on main failed twice in a row.\n' "$PING_USER" "$WORKFLOW"
+            printf 'I have auto-disabled the failing tests at `register_xpu_ci`\n'
+            printf 'as a temporary unblock. Please investigate the underlying\n'
+            printf 'cause and re-enable when fixed.\n\n'
+            printf 'Failing run:\nhttps://github.com/%s/actions/runs/%s\n\n' "$UPSTREAM" "$RUN_ID"
+            printf 'Files touched:\n%s\n\n' "$FILES_LIST"
+            printf 'Recent commits on these files (probable culprits):\n'
+            while read -r f; do
+              [ -z "$f" ] && continue
+              printf '\n### %s\n```\n' "$f"
+              git log --oneline -5 -- "$f" || true
+              printf '```\n'
+            done < touched.txt
+            printf '\nI am a draft PR — the guardian bot never merges itself.\n'
+            printf 'Convert to "Ready for review" only after a human confirms\n'
+            printf 'the disable is the right unblock.\n'
+          } > /tmp/pr_body.txt
+
+      - name: Commit, push, open draft PR
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PR_TOKEN }}
+          RUN_ID: ${{ needs.detect.outputs.run_id }}
+        run: |
+          set -euo pipefail
+          BR="xpu-ci-guardian/$(date -u +%Y%m%d-%H%M)-run-${RUN_ID}"
+          git config user.name "xpu-ci-guardian[bot]"
+          git config user.email "xpu-ci-guardian@users.noreply.github.com"
+          git checkout -b "$BR"
+          git add -A
+          git commit -F /tmp/commit_msg.txt
+          git push fork "$BR"
+
+          gh pr create --repo "$UPSTREAM" \
+            --draft \
+            --title "[XPU CI] auto-disable regressing tests (run ${RUN_ID})" \
+            --head "${FORK%/*}:$BR" \
+            --base main \
+            --label "$GUARDIAN_LABEL,auto-generated" \
+            --reviewer "$PING_USER" \
+            --body-file /tmp/pr_body.txt
+
+  # ------------------------------------------------------------------ #
+  # 3. When main goes green, close any lingering guardian PR           #
+  # ------------------------------------------------------------------ #
+  sweep-when-green:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Check latest run
+        id: last
+        env: { GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+        run: |
+          conc=$(gh run list --repo "$UPSTREAM" --workflow "$WORKFLOW" \
+            --branch main --limit 1 --json conclusion --jq '.[0].conclusion')
+          echo "conclusion=$conc" >>"$GITHUB_OUTPUT"
+      - name: Close open guardian PRs
+        if: steps.last.outputs.conclusion == 'success'
+        env: { GH_TOKEN: "${{ secrets.BOT_PR_TOKEN }}" }
+        run: |
+          for n in $(gh pr list --repo "$UPSTREAM" --label "$GUARDIAN_LABEL" \
+                       --state open --json number --jq '.[].number'); do
+            gh pr comment "$n" --repo "$UPSTREAM" \
+              --body "XPU CI on main is green again — auto-closing this guardian PR."
+            gh pr close "$n" --repo "$UPSTREAM"
+          done
