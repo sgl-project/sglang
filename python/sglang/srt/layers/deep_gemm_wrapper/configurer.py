@@ -17,7 +17,8 @@ _is_musa = is_musa()
 def _sm120_deep_gemm_apis_available() -> bool:
     try:
         import deep_gemm
-    except (ImportError, OSError, RuntimeError):
+    except (ImportError, OSError, RuntimeError, AssertionError):
+        # DeepGEMM asserts during import when it cannot find a CUDA toolkit.
         return False
     return all(
         callable(getattr(deep_gemm, name, None))
@@ -46,7 +47,7 @@ def _compute_enable_deep_gemm():
 
     try:
         import deep_gemm  # noqa: F401
-    except (ImportError, OSError, RuntimeError):
+    except (ImportError, OSError, RuntimeError, AssertionError):
         return False
 
     return True
