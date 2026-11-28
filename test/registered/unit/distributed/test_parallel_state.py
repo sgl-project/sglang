@@ -171,6 +171,168 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
+def _quick_all_reduce_tp4_int4(monkeypatch, first_min_bytes):
+    from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+        MB,
+        QuickAllReduce,
+        QuickReduceRegime,
+    )
+
+    # Builds without quick all-reduce, such as the CPU suite's, define no qr_supports.
+    monkeypatch.setattr(
+        "sglang.srt.distributed.device_communicators.custom_all_reduce_ops.qr_supports",
+        lambda fa, dtype: True,
+        raising=False,
+    )
+    quick_reduce = QuickAllReduce.__new__(QuickAllReduce)
+    quick_reduce.disabled = False
+    # No handle, so close() at garbage collection destroys nothing.
+    quick_reduce._ptr = 0
+    quick_reduce.world_size = 4
+    quick_reduce.qr_quant_level = QuickReduceRegime.INT4
+    quick_reduce.use_fp16_kernels = 1
+    quick_reduce.qr_max_size = 2048 * MB
+    quick_reduce.first_min_bytes = first_min_bytes
+    return quick_reduce
+
+
+def _coordinator_with_custom_allreduce(monkeypatch, qr_comm):
+    # Quick all-reduce exists on ROCm only; deterministic collectives are off.
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: True)
+    monkeypatch.delenv("SGLANG_USE_1STAGE_ALLREDUCE", raising=False)
+    monkeypatch.delenv("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", raising=False)
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.pymscclpp_comm = None
+    coordinator.pcie_ipc_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator.qr_comm = qr_comm
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    return coordinator
+
+
+@pytest.mark.parametrize(
+    "first_min_bytes,rows,method",
+    [
+        # Unset (0): the custom all-reduce keeps every size it admits.
+        (0, 192, "ca"),
+        (1 << 20, 64, "ca"),
+        # 192 x 5120 bf16 = 1.875 MiB, below INT4's 2 MiB minimum at TP4.
+        (1 << 20, 192, "qr"),
+    ],
+)
+def test_quick_allreduce_first_min_bytes_precedes_custom_allreduce(
+    monkeypatch, first_min_bytes, rows, method
+):
+    coordinator = _coordinator_with_custom_allreduce(
+        monkeypatch, _quick_all_reduce_tp4_int4(monkeypatch, first_min_bytes)
+    )
+    input_ = torch.empty(rows, 5120, dtype=torch.bfloat16)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == method
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    # A dtype the kernel does not reduce; a size that is not a multiple of 16 bytes.
+    [((192, 5120), torch.float32), ((193, 5121), torch.bfloat16)],
+)
+def test_quick_allreduce_first_min_bytes_keeps_kernel_input_rules(
+    monkeypatch, shape, dtype
+):
+    coordinator = _coordinator_with_custom_allreduce(
+        monkeypatch, _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
+    )
+    input_ = torch.empty(shape, dtype=dtype)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+
+
+@pytest.mark.parametrize(
+    "env,value",
+    [
+        ("SGLANG_ENABLE_DETERMINISTIC_INFERENCE", "1"),
+        ("SGLANG_USE_1STAGE_ALLREDUCE", "1"),
+    ],
+)
+def test_quick_allreduce_first_min_bytes_skipped_for_deterministic_collectives(
+    monkeypatch, env, value
+):
+    coordinator = _coordinator_with_custom_allreduce(
+        monkeypatch, _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
+    )
+    monkeypatch.setenv(env, value)
+    input_ = torch.empty(192, 5120, dtype=torch.bfloat16)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+
+
+def test_quick_allreduce_first_min_bytes_needs_rocm_and_enabled_quick_allreduce(
+    monkeypatch,
+):
+    quick_reduce = _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
+    coordinator = _coordinator_with_custom_allreduce(monkeypatch, quick_reduce)
+    input_ = torch.empty(192, 5120, dtype=torch.bfloat16)
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: False)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+    monkeypatch.setattr(parallel_state, "is_hip", lambda: True)
+    quick_reduce.disabled = True
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+
+
+def test_quick_allreduce_first_min_bytes_bounded_by_max_size(monkeypatch):
+    from sglang.srt.distributed.device_communicators.quick_all_reduce import MB
+
+    quick_reduce = _quick_all_reduce_tp4_int4(monkeypatch, 1 << 20)
+    quick_reduce.qr_max_size = 1 * MB
+    coordinator = _coordinator_with_custom_allreduce(monkeypatch, quick_reduce)
+    input_ = torch.empty(192, 5120, dtype=torch.bfloat16)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+
+
+@pytest.mark.parametrize(
+    "value,world_size,min_bytes",
+    [
+        ("0", 4, 0),
+        ("943718", 2, 943718),
+        ("943718", 8, 943718),
+        ("2:1048576,4:2097152,8:6291456", 4, 2097152),
+        ("2:1048576,4:2097152,8:6291456", 8, 6291456),
+        # A world size that is not listed keeps the custom all-reduce first.
+        ("4:2097152", 8, 0),
+    ],
+)
+def test_quick_allreduce_first_min_bytes_per_world_size(value, world_size, min_bytes):
+    from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+        parse_first_min_bytes,
+    )
+
+    assert parse_first_min_bytes(value=value, world_size=world_size) == min_bytes
+
+
+def test_quick_allreduce_first_min_bytes_above_max_size_warns(monkeypatch, caplog):
+    from sglang.srt.distributed.device_communicators import quick_all_reduce
+
+    monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "INT4")
+    monkeypatch.setenv("ROCM_QUICK_REDUCE_MAX_SIZE_BYTES_MB", "1")
+    monkeypatch.setenv("SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES", "4:2097152")
+    # No handle, so close() at garbage collection destroys nothing.
+    monkeypatch.setattr(
+        quick_all_reduce.ops, "init_custom_qr", lambda *args: 0, raising=False
+    )
+    monkeypatch.setattr(
+        quick_all_reduce.QuickAllReduce, "create_shared_buffer", lambda self: None
+    )
+    quick_reduce = quick_all_reduce.QuickAllReduce.__new__(
+        quick_all_reduce.QuickAllReduce
+    )
+    quick_reduce.rank = 0
+    quick_reduce.world_size = 4
+    with caplog.at_level("WARNING", logger=quick_all_reduce.logger.name):
+        quick_reduce.init_quick_all_reduce()
+    assert quick_reduce.first_min_bytes == 2097152
+    assert "has no effect" in caplog.text
+
+
 @pytest.mark.parametrize(
     "tp,cp,dp,pp,shared", [(8, 8, 1, 1, 8), (16, 8, 2, 2, 8), (8, 4, 1, 2, 4)]
 )

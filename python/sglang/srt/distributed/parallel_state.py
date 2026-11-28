@@ -1003,6 +1003,17 @@ class GroupCoordinator:
                 self.pymscclpp_comm is not None
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
+        # QuickReduce is lossy, so deterministic runs keep the custom all-reduce,
+        # whose deterministic kernel takes every size. That env check comes last:
+        # with the threshold unset it is never reached.
+        if (
+            is_hip()
+            and self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce_first(input_)
+            and not self._deterministic_collectives_enabled()
+        ):
+            return "qr"
         if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
