@@ -2226,8 +2226,8 @@ class TestCosmosDreamsJointAttentionBackendDefault(unittest.TestCase):
         ):
             return cosmos_dreams.default_joint_attention_backend()
 
-    def test_sm10x_prefers_fa_over_the_dynamic_cudnn_default(self):
-        self.assertIs(self._default(is_blackwell=True), AttentionBackendEnum.FA)
+    def test_sm10x_keeps_the_platform_default(self):
+        self.assertIsNone(self._default(is_blackwell=True))
 
     def test_sm12x_prefers_flashinfer_fa2(self):
         self.assertIs(self._default(is_sm120=True), AttentionBackendEnum.FLASHINFER_FA2)

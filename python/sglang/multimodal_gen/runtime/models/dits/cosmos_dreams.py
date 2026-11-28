@@ -366,8 +366,6 @@ def default_joint_attention_backend() -> AttentionBackendEnum | None:
         return None
     if current_platform.is_sm120():
         return AttentionBackendEnum.FLASHINFER_FA2
-    if current_platform.is_blackwell():
-        return AttentionBackendEnum.FA
     return None
 
 
