@@ -54,5 +54,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
+# Virtual time keeps request-pacing regressions deterministic and GPU-free.
+tokio = { workspace = true, features = ["test-util"] }
 # The gRPC end-to-end test hosts a tonic mock of the api.v1 service.
 tokio-stream = { workspace = true }
