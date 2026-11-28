@@ -77,7 +77,7 @@ def branching_checkpoint_depth(
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
     family = TREE_STATE
-    # Subclasses that skip this __init__ (MLX auxiliary state) keep the LRU walk.
+    # Subclasses that skip this __init__ keep the LRU walk.
     state_cost: Optional[StateCostStrategy] = None
 
     def __init__(
