@@ -72,8 +72,10 @@ dependencies = [
   "urllib3>=2.3",
   "uvicorn",
   "uvloop",
+  "watchfiles",
   "xxhash",
   "xgrammar==0.2.9",
+  "zstandard",
 ]
 
 [project.optional-dependencies]

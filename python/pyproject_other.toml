@@ -72,7 +72,9 @@ runtime_base = [
   "urllib3>=2.3",
   "uvicorn",
   "uvloop",
+  "watchfiles",
   "xxhash",
+  "zstandard",
 ]
 
 # runtime_common: backward-compatible — same install result as before the split.
