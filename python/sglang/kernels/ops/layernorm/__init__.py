@@ -87,6 +87,16 @@ register_kernel(
     )
 )
 
+# One dispatcher: the generic two-launch kernels, or the SM90 single-pass kernels
+# (hy4_ihc_single_pass) when the caller passes single_pass=True.
+register_kernel(
+    KernelSpec(
+        op="layernorm.hy4_ihc_post_pre_norm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.hy4_ihc:hy4_ihc_post_pre_norm",
+    )
+)
+
 register_kernel(
     KernelSpec(
         op="layernorm.mhc_post_combine_norm_decode",
