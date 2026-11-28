@@ -405,6 +405,7 @@ from sglang.srt.rust_server.server import (
 )
 from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.watermarking.batch_layout import num_prefill_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -5520,6 +5521,7 @@ class Scheduler(
                 batch.req_pool_indices_cpu[:num_reqs],
                 self.penalty_status_pool,
             ),
+            num_prefill_rows=num_prefill_rows(batch),
         )
 
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)

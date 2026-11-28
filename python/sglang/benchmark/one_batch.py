@@ -101,6 +101,7 @@ from sglang.srt.runtime_context import (
     spawn_world_rank,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.watermarking.batch_layout import num_prefill_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -509,14 +510,8 @@ def extend(reqs, model_runner):
         spec_algorithm=SpeculativeAlgorithm.NONE,
     )
     batch.prepare_for_extend()
-    sampling_params_pool = model_runner.sampling_params_pool
-    sampling_params_pool.write(reqs)
-    batch.sampling_info.set_step_state(
-        reqs,
-        sampling_params_pool.gather(
-            batch.req_pool_indices, batch.req_pool_indices_cpu, None
-        ),
-    )
+    model_runner.sampling_params_pool.write(reqs)
+    _set_sampling_step_state(batch, model_runner)
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
         batch.input_ids = batch.prefill_input_ids_cpu.to(
@@ -538,6 +533,7 @@ def extend(reqs, model_runner):
 def decode(input_token_ids, batch, model_runner):
     batch.input_ids = input_token_ids.to(torch.int64)
     batch.prepare_for_decode()
+    _set_sampling_step_state(batch, model_runner)
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     forward_batch = ForwardBatch.init_new(
         batch,
@@ -547,6 +543,17 @@ def decode(input_token_ids, batch, model_runner):
     logits_output = model_runner.forward(forward_batch).logits_output
     next_token_ids = model_runner.sample(logits_output, forward_batch)
     return next_token_ids, logits_output.next_token_logits
+
+
+def _set_sampling_step_state(batch: ScheduleBatch, model_runner):
+    """As the scheduler does at each launch."""
+    batch.sampling_info.set_step_state(
+        batch.reqs,
+        model_runner.sampling_params_pool.gather(
+            batch.req_pool_indices, batch.req_pool_indices_cpu, None
+        ),
+        num_prefill_rows=num_prefill_rows(batch),
+    )
 
 
 def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):

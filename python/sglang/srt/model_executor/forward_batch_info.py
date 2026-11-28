@@ -608,8 +608,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # A one-request batch's committed KV length, which can lag one verify: a host-side
     # lower bound attention graph variants select on; None for several requests
     attention_kv_len_lower_bound: Optional[int] = None
-    # Host-side state the watermark engine seeds its next sample from.
-    watermark_seed: Optional[Any] = None
 
     # === Per-forward overrides passed explicitly to init_new ===
     capture_hidden_mode: CaptureHiddenMode = None
@@ -1030,12 +1028,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if id(req) not in decoding_req_ids
             )
 
-        from sglang.srt.model_executor.model_runner import ModelRunner
-
-        # Only a real ModelRunner owns watermark state; lightweight stand-ins skip it.
-        watermark = (
-            model_runner.watermark if isinstance(model_runner, ModelRunner) else None
-        )
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -1114,9 +1106,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
             attention_kv_len_lower_bound=(
                 batch.reqs[0].kv.kv_committed_len if len(batch.reqs) == 1 else None
-            ),
-            watermark_seed=(
-                watermark.seed_payload(batch) if watermark is not None else None
             ),
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,

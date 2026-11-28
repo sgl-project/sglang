@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from sglang.srt.sampling.watermarking.interface import (
         WatermarkAdapter,
         WatermarkEngine,
+        WatermarkPrefill,
         WatermarkRows,
     )
 
@@ -73,6 +74,17 @@ def build_watermark_rows(
         return None
     return _ADAPTERS[get_exec().features.watermark_algorithm].build_rows(
         values, candidates_host.tolist()
+    )
+
+
+def build_watermark_prefill(
+    rows: WatermarkRows, reqs: Sequence[Req], num_prefill_rows: int
+) -> Optional[WatermarkPrefill]:
+    """The step's prefill rows (``WatermarkPrefill``), or None when no row seeds
+    and every row commits."""
+    features = get_exec().features
+    return _ADAPTERS[features.watermark_algorithm].build_prefill(
+        rows, reqs, num_prefill_rows, features=features
     )
 
 

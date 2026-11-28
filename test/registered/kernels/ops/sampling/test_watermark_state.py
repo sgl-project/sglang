@@ -10,7 +10,12 @@ from sglang.srt.sampling.watermarking.config import (
     normalize_watermark_request,
     parse_watermark_key,
 )
-from sglang.srt.sampling.watermarking.gumbel.adapter import GumbelEngine, GumbelRows
+from sglang.srt.sampling.watermarking.gumbel.adapter import (
+    GumbelEngine,
+    GumbelPrefill,
+    GumbelRows,
+    build_prefill,
+)
 from sglang.srt.sampling.watermarking.gumbel.detector import hash_context
 from sglang.srt.sampling.watermarking.gumbel.state import WatermarkState
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -25,6 +30,7 @@ register_amd_ci(
 
 _FEATURES = SimpleNamespace(
     watermark_key="0123456789abcdef",
+    watermark_context_window=2,
     watermark_default_enabled=True,
     watermark_enforce_all=False,
 )
@@ -65,7 +71,7 @@ def test_repeated_context_and_greedy_bypass():
         max_contexts_per_req=8,
         device=device,
     )
-    engine = GumbelEngine(state, _FEATURES)
+    engine = GumbelEngine(state)
     req_pool_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
     sampling_info = SimpleNamespace(
         temperatures=torch.ones((2, 1), device=device),
@@ -76,17 +82,21 @@ def test_repeated_context_and_greedy_bypass():
         watermark=_server_rows(2, 2),
     )
 
-    def forward_batch(watermark_seed=None):
+    def forward_batch(prefill=None):
         return SimpleNamespace(
-            sampling_info=sampling_info,
+            sampling_info=SimpleNamespace(
+                **vars(sampling_info), watermark_prefill=prefill
+            ),
             req_pool_indices=req_pool_indices,
-            watermark_seed=watermark_seed,
         )
 
     first_logits = torch.zeros((2, 64), device=device)
-    logprob_logits = engine.bind_sample(
-        forward_batch(([[10, 11], [20, 21]], None))
-    ).apply(first_logits, keep_logits=True)
+    seed = GumbelPrefill(
+        prompt_tails=[[10, 11], [20, 21]], histories=None, commit_rows=None
+    )
+    logprob_logits = engine.bind_sample(forward_batch(seed)).apply(
+        first_logits, keep_logits=True
+    )
 
     assert torch.equal(logprob_logits, torch.zeros_like(first_logits))
     assert torch.isfinite(first_logits[0]).sum().item() == 1
@@ -159,19 +169,13 @@ def test_retracted_request_restores_context_history():
             ),
             top_k=64,
         ),
+        full_untruncated_fill_ids=[10, 11, 10, 11],
+        extend_end=4,
         get_fill_ids=lambda: [10, 11, 10, 11],
     )
-    forward_mode = SimpleNamespace(
-        is_extend_without_speculative=lambda: True,
-        is_mixed=lambda: False,
-    )
-    batch = SimpleNamespace(
-        forward_mode=forward_mode,
-        reqs=[request],
-        decoding_reqs=None,
-        sampling_info=SimpleNamespace(watermark=_server_rows(1, 2)),
-    )
-    prompt_tails, history = GumbelEngine(state, _FEATURES).seed_payload(batch)
+    prefill = build_prefill(_server_rows(1, 2), [request], 1, features=_FEATURES)
+    prompt_tails, history = prefill.prompt_tails, prefill.histories
+    assert prefill.commit_rows is None
     assert history is not None
     expected_hashes = {
         hash_context([10, 11]),
@@ -193,6 +197,101 @@ def test_retracted_request_restores_context_history():
 
     assert torch.equal(logits, torch.zeros_like(logits))
     assert state.num_watermarked_contexts[1].item() == 2
+
+
+def _gumbel_state(state, slot):
+    """The slot's state, its recorded contexts cut at their count."""
+    count = state.num_watermarked_contexts[slot].item()
+    return (
+        state.token_ids[slot].tolist(),
+        state.lengths[slot].item(),
+        state.write_positions[slot].item(),
+        state.watermarked_context_hashes[slot, :count].tolist(),
+    )
+
+
+def test_chunked_prefill_state_equals_a_single_seed_from_the_prompt():
+    """A chunked prefill, with a decode row beside it, leaves the state that
+    seeding once from the whole prompt and committing the first token does."""
+    device = "cuda"
+    states = [
+        WatermarkState(
+            max_num_reqs=2, context_window=2, max_contexts_per_req=8, device=device
+        )
+        for _ in range(2)
+    ]
+    for state in states:
+        # Slot 0 holds a finished request's state; slot 1 decodes.
+        state.init_from_prompt(
+            torch.tensor([0, 1], device=device), [[30, 31], [20, 21]]
+        )
+    state, reference = states
+    engine = GumbelEngine(state)
+    rows = _server_rows(2, 2)
+    sampling_info = dict(
+        temperatures=torch.ones((2, 1), device=device),
+        top_ks=torch.tensor([64, 64], device=device, dtype=torch.int32),
+        top_ps=torch.ones(2, device=device),
+        min_ps=torch.zeros(2, device=device),
+        facts=SamplingFacts(max_top_k=64),
+        watermark=rows,
+    )
+    prefilling = SimpleNamespace(
+        retracted_stain=False, full_untruncated_fill_ids=[10, 11, 12, 13]
+    )
+    prefilling.get_fill_ids = lambda: prefilling.full_untruncated_fill_ids[
+        : prefilling.extend_end
+    ]
+    req_pool_indices = torch.tensor([0, 1], device=device, dtype=torch.int32)
+    torch.manual_seed(0)
+    logits = torch.randn((2, 2, 64), device=device)
+    token_ids = torch.tensor([[7, 8], [9, 10]], device=device, dtype=torch.int32)
+
+    def step(i, extend_end):
+        prefilling.extend_end = extend_end
+        prefill = build_prefill(
+            rows, [prefilling, SimpleNamespace()], 1, features=_FEATURES
+        )
+        sample = engine.bind_sample(
+            SimpleNamespace(
+                sampling_info=SimpleNamespace(
+                    **sampling_info, watermark_prefill=prefill
+                ),
+                req_pool_indices=req_pool_indices,
+            )
+        )
+        sample.apply(logits[i].clone(), keep_logits=False)
+        sample.commit(token_ids[i])
+
+    before = _gumbel_state(state, 0)
+    step(0, 2)  # a non-final chunk: row 0 drops its token
+    assert _gumbel_state(state, 0)[:3] == before[:3]
+    step(1, 4)
+
+    # The reference: row 1 decodes alone, then row 0 seeds once from its prompt.
+    one_row = {
+        name: value[1:] if isinstance(value, torch.Tensor) else value
+        for name, value in sampling_info.items()
+    }
+    _force(
+        reference,
+        logits[0, 1:].clone(),
+        req_pool_indices[1:],
+        SimpleNamespace(**one_row),
+        _server_rows(1, 2),
+    )
+    reference.append(req_pool_indices[1:], token_ids[0, 1:])
+    reference.init_from_prompt(req_pool_indices[:1], [[12, 13]])
+    _force(
+        reference,
+        logits[1].clone(),
+        req_pool_indices,
+        SimpleNamespace(**sampling_info),
+        rows,
+    )
+    reference.append(req_pool_indices, token_ids[1])
+    for slot in (0, 1):
+        assert _gumbel_state(state, slot) == _gumbel_state(reference, slot)
 
 
 def test_speculative_record_stops_at_context_capacity():
@@ -323,7 +422,7 @@ def test_speculative_tree_paths_match_tensor_reference():
         enabled=watermark_enabled,
         candidates_host=[True, True],
     )
-    verify = GumbelEngine(states[2], _FEATURES).bind_verify(rows, full_mask=True)
+    verify = GumbelEngine(states[2]).bind_verify(rows, full_mask=True)
     verify_logits = verify.apply(
         logits,
         sampling_info=sampling_info,
@@ -411,7 +510,7 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
         dtype=torch.int64,
         device="cuda",
     )
-    engine = GumbelEngine(state, _FEATURES)
+    engine = GumbelEngine(state)
     verify = engine.bind_verify(rows, full_mask=False)
     target_logits = verify.apply(
         logits.clone(),
@@ -494,7 +593,7 @@ def test_chain_commit_matches_explicit_accept_index():
             max_num_reqs=3, context_window=2, max_contexts_per_req=8, device="cuda"
         )
         state.init_from_prompt(req_pool_indices, [[10, 11], [20, 21]])
-        verify = GumbelEngine(state, _FEATURES).bind_verify(rows, full_mask=False)
+        verify = GumbelEngine(state).bind_verify(rows, full_mask=False)
         verify.apply(
             logits.clone(),
             sampling_info=sampling_info,

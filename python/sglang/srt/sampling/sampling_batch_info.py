@@ -16,7 +16,8 @@ from sglang.srt.sampling.custom_logit_processor import (
 )
 from sglang.srt.sampling.logit_bias import build_logit_bias
 from sglang.srt.sampling.penalties import StepPenalties
-from sglang.srt.sampling.watermarking.interface import WatermarkRows
+from sglang.srt.sampling.watermarking.interface import WatermarkPrefill, WatermarkRows
+from sglang.srt.sampling.watermarking.runtime import build_watermark_prefill
 from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
@@ -105,6 +106,9 @@ class SamplingBatchInfo:
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
     custom_logit_processor: Optional[Dict[int, ProcessorEntry]] = None
+    # The watermark rows' seeds and unfinished prefill chunks (see
+    # `WatermarkPrefill`), None when no row seeds and every row commits.
+    watermark_prefill: Optional[WatermarkPrefill] = None
     # Rows of the requests that return sampling masks, and each support-mode row's
     # index among them; None when no row has one. They limit capture to those rows.
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
@@ -120,9 +124,14 @@ class SamplingBatchInfo:
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
-    def set_step_state(self, reqs: List[Req], rows: SamplingRows) -> None:
+    def set_step_state(
+        self, reqs: List[Req], rows: SamplingRows, *, num_prefill_rows: int
+    ) -> None:
         """Set one launch's state: the gathered `rows`, the stages' inputs built from
-        `reqs`, then the facts over both."""
+        `reqs`, then the facts over both.
+
+        `num_prefill_rows`: how many leading rows prefill; 0 unless the batch extends.
+        """
         for name, value in zip(rows._fields, rows):
             setattr(self, name, value)
 
@@ -159,6 +168,12 @@ class SamplingBatchInfo:
         else:
             self.custom_params = None
             self.custom_logit_processor = None
+
+        self.watermark_prefill = (
+            build_watermark_prefill(self.watermark, reqs, num_prefill_rows)
+            if self.watermark is not None and num_prefill_rows > 0
+            else None
+        )
 
         mask_rows = [i for i, r in enumerate(reqs) if r.return_sampling_mask]
         capture_rows = [
