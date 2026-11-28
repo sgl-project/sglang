@@ -74,7 +74,11 @@ from sglang.srt.layers.layer_boundary.residual.add_norm import (
     Fp8Input,
     NormQuantReadout,
 )
-from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.layers.layernorm import (
+    Fp8InputWithBf16,
+    GemmaRMSNorm,
+    _fp8_static_input_scale,
+)
 
 # Layers - Linear
 from sglang.srt.layers.linear import (
@@ -95,6 +99,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
@@ -221,6 +226,31 @@ def _disable_shared_experts_fusion() -> bool:
     return bool(uses_cutedsl_ar_fusion() or is_shared_experts_fusion_disabled())
 
 
+def _input_quant_fusion_allowed() -> bool:
+    """Whether a producer may hand a projection its quantized input on CUDA."""
+    # LoRA needs the unquantized activation. DP/CP and sequence-parallel
+    # boundaries may gather after the norm, and those gathers take tensors.
+    return _is_cuda and not (
+        get_lora().enable_lora
+        or get_lora().lora_paths
+        or is_dp_attention_enabled()
+        or get_parallel().attn_cp_size > 1
+        or get_parallel().enable_layernorm_sp
+    )
+
+
+def _fuse_norm_input_quant(
+    norm: GemmaRMSNorm, linear: nn.Module, keep_bf16: bool = False
+) -> None:
+    """Quantize ``linear``'s input inside ``norm`` when it is static FP8 or NVFP4
+    W4A4 (static FP8 only with ``keep_bf16``, which also keeps the bf16 output)."""
+    if not _input_quant_fusion_allowed():
+        return
+    if not keep_bf16 and isinstance(linear.quant_method, ModelOptFp4LinearMethod):
+        linear._accepts_prequantized_fp4 = True
+    norm.fuse_input_quant(linear, keep_bf16=keep_bf16)
+
+
 def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool:
     return bool(
         not is_nextn
@@ -340,6 +370,9 @@ if _is_npu:
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
+    # Set by the decoder layer: the gated norm may emit out_proj's static FP8 input.
+    _fuse_out_proj_quant: bool = False
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -845,6 +878,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
     def _forward_input_proj(self, hidden_states: torch.Tensor):
+        if isinstance(hidden_states, Fp8InputWithBf16):
+            return self._forward_input_proj_fp8_with_bf16(hidden_states)
         if _use_aiter and self._fused_in_proj_weight is not None:
             # Unquantized BF16 projections consume the bf16 side of the fused
             # AR+RMSNorm tuple; one aiter GEMM replaces the two separate
@@ -940,6 +975,36 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
             projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        return projected_states_qkvz, projected_states_ba
+
+    def _out_proj_static_fp8_scale(self) -> Optional[torch.Tensor]:
+        if not self._fuse_out_proj_quant:
+            return None
+        return _fp8_static_input_scale(self.out_proj)
+
+    def _forward_input_proj_fp8_with_bf16(self, hidden_states: Fp8InputWithBf16):
+        """The fused Gemma norm hands the static FP8 ``in_proj_qkvz`` its
+        quantized input and the bf16 ``in_proj_ba`` the unquantized one."""
+        hs_qkvz, hs_bf16 = hidden_states.fp8_input, hidden_states.bf16
+        if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+            DUAL_STREAM_TOKEN_THRESHOLD = 0
+        else:
+            DUAL_STREAM_TOKEN_THRESHOLD = 1024
+        if (
+            self.alt_stream is not None
+            and get_is_capture_mode()
+            and hs_bf16.shape[0] < DUAL_STREAM_TOKEN_THRESHOLD
+            and _gdn_use_alt_stream
+        ):
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
+            with torch.cuda.stream(self.alt_stream):
+                projected_states_ba, _ = self.in_proj_ba(hs_bf16)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
+            projected_states_ba, _ = self.in_proj_ba(hs_bf16)
         return projected_states_qkvz, projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
@@ -1084,6 +1149,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
+        out_proj_scale = self._out_proj_static_fp8_scale()
+        if out_proj_scale is not None and not use_strided_prefill_z:
+            q, _, _ = _layer_norm_fwd(
+                core_attn_out,
+                self.norm.weight,
+                None,
+                self.norm.eps,
+                z=z,
+                group_size=self.norm.group_size,
+                norm_before_gate=self.norm.norm_before_gate,
+                is_rms_norm=True,
+                activation=self.norm.activation,
+                static_quant_scale=out_proj_scale,
+            )
+            q = q.view(-1, nv * q.shape[-1])
+            return self.out_proj((q, out_proj_scale, core_attn_out.dtype))[0]
         if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
             fp8, _, _ = _layer_norm_fwd(
                 core_attn_out,
@@ -1181,10 +1262,19 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                     fp8_input=Fp8Input.TUPLE_AND_BF16 if accepts_fp8_input else None
                 ),
             )
+            # in_proj_ba reads the bf16 input norm, so that norm keeps it too.
+            _fuse_norm_input_quant(
+                self.input_layernorm, self.linear_attn.in_proj_qkvz, keep_bf16=True
+            )
+            if isinstance(self.mlp, Qwen2MoeMLP):
+                _fuse_norm_input_quant(
+                    self.post_attention_layernorm, self.mlp.gate_up_proj
+                )
             self.attn_boundary, self.ffn_boundary = append_stages(
                 (attn, self.input_layernorm, {"fusions": boundary_fusions}),
                 (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
             )
+        self.linear_attn._fuse_out_proj_quant = _input_quant_fusion_allowed()
 
     def forward(
         self,
@@ -1252,6 +1342,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
     stage_facts = staticmethod(_qwen3_5_stage_facts)
+    # The output gate may emit o_proj's static FP8 input.
+    _fuse_o_proj_quant: bool = False
 
     def __init__(
         self,
@@ -1413,10 +1505,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                     fp8_input=Fp8Input.TUPLE if accepts_fp8_input else None
                 ),
             )
+            _fuse_norm_input_quant(self.input_layernorm, self.qkv_proj)
+            if isinstance(self.mlp, Qwen2MoeMLP):
+                _fuse_norm_input_quant(
+                    self.post_attention_layernorm, self.mlp.gate_up_proj
+                )
             self.attn_boundary, self.ffn_boundary = append_stages(
                 (attn, self.input_layernorm, {"fusions": boundary_fusions}),
                 (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
             )
+        self._fuse_o_proj_quant = _input_quant_fusion_allowed()
 
         self.alt_stream = alt_stream
 
@@ -1479,7 +1577,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             has_gate=self.attn_output_gate,
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
         )
-        seq_len = hidden_states.shape[0]
+        seq_len = qkv.shape[0]
         q = q_out.view(seq_len, -1)
         k = k_out.view(seq_len, -1)
         gate = gate_out.view(seq_len, -1) if gate_out is not None else None
@@ -1626,6 +1724,14 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         )
 
         attn_output = self.attn(q, k, v, forward_batch)
+
+        o_proj_scale = (
+            _fp8_static_input_scale(self.o_proj) if self._fuse_o_proj_quant else None
+        )
+        if self.attn_output_gate and o_proj_scale is not None:
+            fp8 = fused_sigmoid_mul(attn_output, gate, static_quant_scale=o_proj_scale)
+            output, _ = self.o_proj((fp8, o_proj_scale, attn_output.dtype))
+            return output
 
         if self.attn_output_gate:
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):

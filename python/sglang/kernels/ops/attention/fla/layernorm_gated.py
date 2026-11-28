@@ -137,6 +137,7 @@ def _layer_norm_fwd_1pass_kernel(
     Q=None,
     S=None,
     QUANT: tl.constexpr = False,
+    STATIC_QUANT: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -237,6 +238,13 @@ def _layer_norm_fwd_1pass_kernel(
         y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
         tl.store(Q + rows[:, None] * N + col_offsets, y_q, mask=mask)
         tl.store(S + tl.program_id(0), y_s)
+    elif STATIC_QUANT:
+        # Static per-tensor FP8 as static_quant_fp8 on the bf16 output: the
+        # codes match the unfused norm + quant chain bit for bit.
+        y = y.to(Y.dtype.element_ty).to(tl.float32)
+        y_s_inv = 1.0 / tl.load(S).to(tl.float32)
+        y_q = tl.clamp(y * y_s_inv, -448.0, 448.0).to(Q.dtype.element_ty)
+        tl.store(Q + rows[:, None] * stride_y_row + col_offsets, y_q, mask=mask)
     else:
         # Write output
         tl.store(Y_base, y, mask=mask)
@@ -279,6 +287,7 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     activation: str = "swish",
     quant_heads: int = 0,
+    static_quant_scale=None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -334,6 +343,11 @@ def _layer_norm_fwd(
         )
         s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
         quant = {"Q": q, "S": s, "QUANT": True}
+    elif static_quant_scale is not None:
+        # Same launch shape as the bf16 path, so rows reduce identically.
+        assert static_quant_scale.numel() == 1
+        q = torch.empty_like(out, dtype=torch.float8_e4m3fn)
+        quant = {"Q": q, "S": static_quant_scale, "STATIC_QUANT": True}
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
@@ -381,7 +395,11 @@ def _layer_norm_fwd(
             **pdl_kwargs,
             **quant,
         )
-    return ((q, s) if quant_heads else out), mean, rstd
+    if quant_heads:
+        return (q, s), mean, rstd
+    if static_quant_scale is not None:
+        return q, mean, rstd
+    return out, mean, rstd
 
 
 if _is_npu:

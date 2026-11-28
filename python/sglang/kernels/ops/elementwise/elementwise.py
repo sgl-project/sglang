@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -25,6 +27,7 @@ def _fused_sigmoid_mul_kernel(
     QUANT: tl.constexpr = False,
     ROUND_SIGMOID: tl.constexpr = False,
     USE_PDL: tl.constexpr = False,
+    STATIC_QUANT: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     if USE_PDL:
@@ -52,6 +55,13 @@ def _fused_sigmoid_mul_kernel(
         y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(q_ptr.dtype.element_ty)
         tl.store(q_ptr + attn_off, y_q, mask=mask)
         tl.store(s_ptr + pid_row, y_s)
+    elif STATIC_QUANT:
+        # Static per-tensor FP8 as static_quant_fp8 on the bf16 product: the
+        # codes match the unfused gate + quant chain bit for bit.
+        y = result.to(output_ptr.dtype.element_ty).to(tl.float32)
+        y_s_inv = 1.0 / tl.load(s_ptr).to(tl.float32)
+        y_q = tl.clamp(y * y_s_inv, -448.0, 448.0).to(q_ptr.dtype.element_ty)
+        tl.store(q_ptr + attn_off, y_q, mask=mask)
     else:
         tl.store(output_ptr + attn_off, result, mask=mask)
 
@@ -62,6 +72,7 @@ def fused_sigmoid_mul(
     inplace: bool = False,
     quant: bool = False,
     round_sigmoid: bool = False,
+    static_quant_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
@@ -79,6 +90,9 @@ def fused_sigmoid_mul(
 
     ``round_sigmoid`` rounds the sigmoid to the gate dtype before the multiply,
     matching the two-op torch spelling bit for bit.
+
+    ``static_quant_scale`` (a one-element FP32 tensor) returns only the static
+    per-tensor FP8 codes of the product instead of the product itself.
     """
     if gate.ndim == 3 and attn_output.ndim == 2:
         # Strided gate path: gate is 3D (num_tokens, num_heads, head_dim)
@@ -111,6 +125,11 @@ def fused_sigmoid_mul(
         q = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)
         s = torch.empty((num_tokens, 1), dtype=torch.float32, device=q.device)
         kwargs = {"q_ptr": q, "s_ptr": s, "QUANT": True}
+    elif static_quant_scale is not None:
+        assert static_quant_scale.numel() == 1
+        out = attn_output  # never written; only fixes the bf16 rounding dtype
+        q = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)
+        kwargs = {"q_ptr": q, "s_ptr": static_quant_scale, "STATIC_QUANT": True}
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
     use_pdl = is_arch_support_pdl()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
@@ -129,7 +148,11 @@ def fused_sigmoid_mul(
         **kwargs,
         **pdl_kwargs,
     )
-    return (q, s) if quant else out
+    if quant:
+        return q, s
+    if static_quant_scale is not None:
+        return q
+    return out
 
 
 @triton.jit
