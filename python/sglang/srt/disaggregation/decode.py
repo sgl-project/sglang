@@ -28,6 +28,7 @@ import time
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
+from functools import partial
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -2247,14 +2248,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
-        if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
-            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
-        ):
-            # TODO(ch-wan): this C128 ring and pending-pair reset races the row's
-            # previous forward; order it after that forward, before the transfer.
-            self.token_to_kv_pool.clear_request_scoped_state(
-                int(decode_req.req.kv.req_pool_idx)
-            )
         payloads = {
             StateType.MAMBA: _mamba_payload,
             StateType.QSA_PENDING: _qsa_pending_payload,
@@ -2333,6 +2326,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.kv_manager.kv_args, state_types, payloads, _swa_payload
             )
 
+        reset_state = None
+        if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
+            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
+        ):
+            reset_state = partial(
+                self.token_to_kv_pool.clear_request_scoped_state,
+                int(decode_req.req.kv.req_pool_idx),
+            )
         self._send_kv_metadata(
             decode_req,
             kv_indices,
@@ -2342,6 +2343,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             non_blocking=non_blocking_metadata,
             receive_rows=(total_prefix_len, fill_len),
             refresh=refresh,
+            reset_state=reset_state,
             **metadata_kwargs,
         )
 
@@ -2379,6 +2381,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         storage.end_receive_hold(decode_req.req)
         return page_indices, metadata_index, state_indices
 
+    def _send_waits_for_forward(self, *, non_blocking: bool, to_device: bool) -> bool:
+        """Whether the send waits for the forward in flight: under overlap, for a
+        device destination without a pinned readback or a deferred publish."""
+        return (
+            self.scheduler.enable_overlap
+            and not self._defer_publish
+            and to_device
+            and not non_blocking
+        )
+
+    def _reset_before_send(
+        self, reset_state: Callable[[], None], *, held: bool
+    ) -> None:
+        """Run ``reset_state`` after the row's previous owner, before the peer.
+
+        Under overlap the previous owner may still have a forward in flight, so a
+        held send resets on the forward stream, before the event it waits for.
+        Otherwise none is left: a deferred publish runs an iteration after its
+        allocation, without overlap forwards run on this stream, and under PP a
+        row is freed only after its owner's result (`d2h_event`, behind this
+        stage's forward via `launch_event`)."""
+        if not held:
+            reset_state()
+            return
+        with self.scheduler.device_module.stream(self.scheduler.forward_stream):
+            reset_state()
+
     def _send_kv_metadata(
         self,
         decode_req,
@@ -2389,16 +2418,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         non_blocking: bool = False,
         receive_rows: Optional[Tuple[int, int]] = None,
         refresh: Optional[Callable[[], Tuple[Any, Optional[List]]]] = None,
+        reset_state: Optional[Callable[[], None]] = None,
         **metadata_kwargs,
     ) -> None:
         """Send ``decode_req``'s destination, or hold it until the forward in
         flight is done; a held send's rows (``receive_rows``) are held, not
-        recorded as the peer's, and re-read at the send (``refresh``)."""
+        recorded as the peer's, and re-read at the send (``refresh``).
+        ``reset_state`` runs before the send goes out."""
         if not metadata_buffer_preassigned:
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
         assert decode_req.metadata_buffer_index is not None
+        # A pinned readback fences the forward only after the reset.
+        assert reset_state is None or not non_blocking
+        to_device = metadata_kwargs.get("destination") != KVTransferDestination.HOST
+        held = self._send_waits_for_forward(
+            non_blocking=non_blocking, to_device=to_device
+        )
+        if reset_state is not None:
+            self._reset_before_send(reset_state, held=held)
         readback_ready = None
         if non_blocking:
 
@@ -2427,13 +2466,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req, kv_indices, page_size
             )
             device_pages, device_state_indices = page_indices, state_indices
-        to_device = metadata_kwargs.get("destination") != KVTransferDestination.HOST
-        held = (
-            readback_ready is None
-            and self.scheduler.enable_overlap
-            and not self._defer_publish
-            and to_device
-        )
+            if (
+                reset_state is not None
+                and not held
+                and (kv_indices.device.type == "cpu" or kv_indices.numel() == 0)
+            ):
+                # A device readback waited for the reset; empty indices (a short
+                # HiSparse request) or host indices did not.
+                self.scheduler.device_module.current_stream().synchronize()
         ready = readback_ready
         if held:
             # A forward still in flight may write pages this request was just
