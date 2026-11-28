@@ -9,7 +9,7 @@ from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_p
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
-register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=45, stage="base-b", runner_config="4-gpu-b200")
 
 
 @pytest.fixture
@@ -631,6 +631,247 @@ def test_fused_hc_head(eps_outside_sqrt, hc):
     )
     ref = _hc_head_reference(x, fn, scale, base, norm_eps, 1e-6, eps_outside_sqrt)
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+def test_mhc_pre_radix4_launch_and_arch_contracts(monkeypatch):
+    assert mhc._mhc_pre_radix4_leaf_params(16384) == (128, 64)
+    assert mhc._mhc_pre_radix4_leaf_params(28672) == (64, 64)
+    assert mhc._mhc_pre_radix4_leaf_params(20480) == (64, 64)
+    assert mhc._mhc_pre_radix4_leaf_params(14336) == (64, 16)
+
+    for k in (16384, 28672, 20480, 14336):
+        exp_bk, exp_leaves = mhc._mhc_pre_radix4_leaf_params(k)
+        assert (k // exp_bk) % exp_leaves == 0
+        for num_sms in (1, 12, 132, 148, 160, 212):
+            fake = SimpleNamespace(
+                is_sm=lambda major, minor=None: major == 10, num_sms=num_sms
+            )
+            monkeypatch.setattr(mhc, "current_arch", lambda _f=fake: _f)
+            for m in (1, 16, 64, 65, 128, 352, 384, 416, 1024, 4096, 16384):
+                bk, nl, bm, s, lvl = mhc._mhc_pre_radix4_launch_params(m, k)
+                assert (bk, nl) == (exp_bk, exp_leaves)
+                assert bm in (64, 128)
+                assert s in (1, 4, 16, 64)
+                assert s * (4**lvl) == nl
+
+    monkeypatch.setattr(mhc, "_SUPPORT_TENSOR_DESCRIPTOR", True)
+    monkeypatch.setattr(mhc, "_use_deep_gemm_hc_prenorm", lambda: True)
+    for sm, expected in ((8, False), (9, False), (10, True), (12, False)):
+        fake = SimpleNamespace(is_sm=lambda m, minor=None, _s=sm: m == _s, num_sms=148)
+        monkeypatch.setattr(mhc, "current_arch", lambda _f=fake: _f)
+        assert mhc._use_packed_bf16x2_arch(16384) is expected
+        if expected:
+            reps = mhc.get_mhc_pre_token_count_representatives(16384, 28672)
+            assert len(reps) <= 6 and 64 in reps
+
+    torch.manual_seed(0)
+    fn = torch.randn(24, 1024, dtype=torch.float32) * 0.05
+    packed = torch.empty((64, 1024), dtype=torch.bfloat16)
+    mhc._fill_packed_bf16x2_weight(packed, fn)
+    reconstructed = packed[:24].float() + packed[32:56].float()
+    assert (reconstructed - fn).abs().max().item() / fn.abs().max().item() < 5e-5
+
+
+@pytest.mark.parametrize(
+    "hidden,real",
+    [(4096, 26), (4096, 364), (7168, 26), (3584, 26)],
+)
+@pytest.mark.parametrize("use_norm", [True, False])
+def test_mhc_pre_rows_independent_of_padded_token_count(
+    hidden, real, use_norm, single_process
+):
+    from sglang.srt.environ import envs
+
+    if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
+        pytest.skip("SM10x CUDA required for packed BF16x2 radix-4 mhc_pre")
+
+    torch.manual_seed(0)
+    hc_mult = 4
+    mix = hc_mult * (2 + hc_mult)
+    residual = torch.randn(real, hc_mult, hidden, device="cuda").bfloat16()
+    fn = (torch.randn(mix, hc_mult * hidden, device="cuda") * 0.01).contiguous()
+    hc_scale = torch.rand(3, device="cuda")
+    hc_base = torch.randn(mix, device="cuda") * 0.1
+    norm_weight = (
+        (1.0 + 0.1 * torch.randn(hidden, device="cuda")).bfloat16()
+        if use_norm
+        else None
+    )
+    norm_eps = _EPS if use_norm else None
+
+    with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
+        if not mhc._use_packed_bf16x2_mhc_pre(
+            residual.view(real, hc_mult * hidden), fn, mix, hc_mult * hidden
+        ):
+            pytest.skip("packed BF16x2 radix-4 mhc_pre path disabled")
+
+        ref = mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps=_EPS,
+            hc_pre_eps=_EPS,
+            hc_sinkhorn_eps=_EPS,
+            hc_post_mult_value=_POST_MULT,
+            sinkhorn_repeat=_SINKHORN_ITERS,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
+
+        for padded in (64, 128, 256, 352, 384, 416, 1024, 2048, 4096, 8192):
+            if padded < real:
+                continue
+            for random_tail in (False, True):
+                if random_tail:
+                    padded_residual = torch.randn(
+                        padded, hc_mult, hidden, device="cuda"
+                    ).bfloat16()
+                else:
+                    padded_residual = torch.zeros(
+                        padded, hc_mult, hidden, device="cuda", dtype=residual.dtype
+                    )
+                padded_residual[:real] = residual
+                got = mhc_pre(
+                    padded_residual,
+                    fn,
+                    hc_scale,
+                    hc_base,
+                    rms_eps=_EPS,
+                    hc_pre_eps=_EPS,
+                    hc_sinkhorn_eps=_EPS,
+                    hc_post_mult_value=_POST_MULT,
+                    sinkhorn_repeat=_SINKHORN_ITERS,
+                    norm_weight=norm_weight,
+                    norm_eps=norm_eps,
+                )
+                for name, a, b in zip(("post", "comb", "layer_input"), ref, got):
+                    assert torch.equal(a, b[:real]), (
+                        f"H={hidden} real={real} padded={padded} random_tail={random_tail}: "
+                        f"{name} differs in {int((a != b[:real]).sum())} elements"
+                    )
+
+        ref_post, ref_comb, _ = _mhc_pre_reference(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            eps_outside_sqrt=False,
+        )
+        torch.testing.assert_close(ref[0].squeeze(-1), ref_post, rtol=2e-5, atol=2e-5)
+        torch.testing.assert_close(ref[1], ref_comb, rtol=2e-5, atol=2e-5)
+
+
+def test_mhc_pre_radix4_sm_invariance_graph_replay_and_inference_mode(
+    monkeypatch, single_process
+):
+    from sglang.srt.environ import envs
+
+    if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
+        pytest.skip("SM10x CUDA required for packed BF16x2 radix-4 mhc_pre")
+
+    torch.manual_seed(1)
+    hc_mult, hidden, num_tokens = 4, 4096, 364
+    mix = hc_mult * (2 + hc_mult)
+    residual = torch.randn(num_tokens, hc_mult, hidden, device="cuda").bfloat16()
+    fn = (torch.randn(mix, hc_mult * hidden, device="cuda") * 0.01).contiguous()
+    hc_scale = torch.rand(3, device="cuda")
+    hc_base = torch.randn(mix, device="cuda") * 0.1
+    norm_weight = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
+
+    def call(res):
+        return mhc_pre(
+            res,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps=_EPS,
+            hc_pre_eps=_EPS,
+            hc_sinkhorn_eps=_EPS,
+            hc_post_mult_value=_POST_MULT,
+            sinkhorn_repeat=_SINKHORN_ITERS,
+            norm_weight=norm_weight,
+            norm_eps=_EPS,
+        )
+
+    with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
+        if not mhc._use_packed_bf16x2_mhc_pre(
+            residual.view(num_tokens, hc_mult * hidden), fn, mix, hc_mult * hidden
+        ):
+            pytest.skip("packed BF16x2 radix-4 mhc_pre path disabled")
+
+        # Populate cache under inference_mode (mirrors prewarm_mhc_pre) to ensure
+        # the cached pack is not an inference tensor and survives later refresh.
+        with torch.inference_mode():
+            ref = call(residual)
+        real_arch = mhc.current_arch()
+        seen_splits = set()
+        for num_sms in (1, 12, 132, 148, 160, 212):
+            monkeypatch.setattr(
+                mhc,
+                "current_arch",
+                lambda _n=num_sms: SimpleNamespace(is_sm=real_arch.is_sm, num_sms=_n),
+            )
+            _, _, _, s, _ = mhc._mhc_pre_radix4_launch_params(
+                num_tokens, hc_mult * hidden
+            )
+            seen_splits.add(s)
+            got = call(residual)
+            for a, b in zip(ref, got):
+                assert torch.equal(a, b)
+        assert seen_splits == {1, 4, 16, 64}
+        monkeypatch.setattr(mhc, "current_arch", lambda: real_arch)
+
+        buf = residual.clone()
+        call(buf)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            g_out = call(buf)
+        for seed in (10, 20):
+            torch.manual_seed(seed)
+            buf.copy_(torch.randn_like(buf))
+            graph.replay()
+            eager = call(buf)
+            for a, b in zip(g_out, eager):
+                assert torch.equal(a, b)
+
+        before = call(residual)
+        fn.copy_(torch.randn_like(fn) * 0.02)
+        after = call(residual)
+        fresh = mhc_pre(
+            residual,
+            fn.clone(),
+            hc_scale,
+            hc_base,
+            rms_eps=_EPS,
+            hc_pre_eps=_EPS,
+            hc_sinkhorn_eps=_EPS,
+            hc_post_mult_value=_POST_MULT,
+            sinkhorn_repeat=_SINKHORN_ITERS,
+            norm_weight=norm_weight,
+            norm_eps=_EPS,
+        )
+        assert not torch.equal(before[0], after[0])
+        for a, b in zip(after, fresh):
+            assert torch.equal(a, b)
+
+        hc_norm_w = torch.ones(hc_mult * hidden, device="cuda", dtype=torch.float32)
+        with torch.inference_mode():
+            out_inf = mhc.hc_pre(
+                residual.view(num_tokens, hc_mult * hidden),
+                fn,
+                hc_scale,
+                hc_base,
+                hc_mult=hc_mult,
+                rms_eps=_EPS,
+                hc_eps=_EPS,
+                sinkhorn_iters=_SINKHORN_ITERS,
+                hc_norm_weight=hc_norm_w,
+                out_norm_weight=norm_weight,
+                out_norm_eps=_EPS,
+            )
+        assert torch.equal(out_inf[0], after[2])
 
 
 if __name__ == "__main__":

@@ -40,6 +40,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _has_packed_mhc_weight_cache(model: torch.nn.Module) -> bool:
+    try:
+        from sglang.kernels.ops.layernorm.mhc import has_mhc_pre_packed_weight_cache
+    except ImportError:
+        return False
+    return has_mhc_pre_packed_weight_cache(model)
+
+
 def _unsupported_derived_weight_cache_error(
     model: Optional[torch.nn.Module] = None,
 ) -> Optional[str]:
@@ -52,12 +60,15 @@ def _unsupported_derived_weight_cache_error(
     including references retained by captured CUDA graphs. These constraints
     must be startup-determined and rank-uniform so all workers reject together.
     """
-    if model is not None and any(
-        getattr(module, "_hc_attn_tf32_parts", None) is not None
-        or getattr(module, "_hc_ffn_tf32_parts", None) is not None
-        or getattr(module, "_hc_attn_bf16_parts", None) is not None
-        or getattr(module, "_hc_ffn_bf16_parts", None) is not None
-        for module in model.modules()
+    if model is not None and (
+        any(
+            getattr(module, "_hc_attn_tf32_parts", None) is not None
+            or getattr(module, "_hc_ffn_tf32_parts", None) is not None
+            or getattr(module, "_hc_attn_bf16_parts", None) is not None
+            or getattr(module, "_hc_ffn_bf16_parts", None) is not None
+            for module in model.modules()
+        )
+        or _has_packed_mhc_weight_cache(model)
     ):
         return (
             "Online weight updates are not supported while compensated mHC "
