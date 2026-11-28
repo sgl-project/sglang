@@ -17,8 +17,10 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids_triton,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    finish_candidate_indexer_topk,
     finish_paged_indexer_topk,
     finish_prefill_indexer_topk,
+    fp4_index_logits_candidates,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -684,11 +686,17 @@ def test_hopper_indexer_backends_replay(ratio):
     ]
     captured_scores = []
     captured_masks = []
+    captured_cand_scores = []
 
     def record_scores(*args, **kwargs):
         result = fp4_index_logits_paged(*args, **kwargs)
         captured_scores.append(result)
         captured_masks.append(args[-1])
+        return result
+
+    def record_cand_scores(*args, **kwargs):
+        result = fp4_index_logits_candidates(*args, **kwargs)
+        captured_cand_scores.append(result)
         return result
 
     def run():
@@ -700,15 +708,19 @@ def test_hopper_indexer_backends_replay(ratio):
     for _ in range(3):
         run()
     graph = torch.cuda.CUDAGraph()
-    with patch.object(scoring, "fp4_index_logits_paged", side_effect=record_scores):
-        with torch.cuda.graph(graph):
-            published = run()
-    assert (
-        len(captured_scores) == 3
-    )  # all three runtime entrypoints took the paged path
-    mask = published.decode_mask
-    assert captured_masks[:2] == [None, None]
-    assert captured_masks[2] is mask
+    with (
+        patch.object(scoring, "fp4_index_logits_paged", side_effect=record_scores),
+        patch.object(
+            scoring, "fp4_index_logits_candidates", side_effect=record_cand_scores
+        ),
+        torch.cuda.graph(graph),
+    ):
+        published = run()
+    assert len(captured_scores) == 2
+    assert captured_masks == [None, None]
+    assert published.decode_mask is None
+    assert len(captured_cand_scores) == 1
+    assert captured_cand_scores[0].shape == (batch, 4 * 8)
     for step, visible in enumerate([193, 0, 1, 7, 8, 9, 65, 193]):
         # -1 positions exercise zero-length padded rows, also for ratio 1.
         lens.copy_((visible - torch.arange(batch, device=q.device) % 6).clamp_min(0))
@@ -717,7 +729,7 @@ def test_hopper_indexer_backends_replay(ratio):
         req_table[:, : width * ratio : ratio] = (slots[::6].roll(step, 1) * ratio).int()
         page_table.copy_(req_table[req.long(), ::ratio] // ratio)
         q.neg_()
-        for scores in captured_scores:
+        for scores in (*captured_scores, *captured_cand_scores):
             scores.fill_(torch.inf)
         for out in outputs:
             out.page_indices.fill_(12345)
@@ -745,7 +757,6 @@ def test_hopper_indexer_backends_replay(ratio):
                     maxima.topk(min(4, nblocks)).values.sort().values,
                 )
             keep = torch.isin(torch.arange(width, device=q.device) // 8, blocks)
-            torch.testing.assert_close(mask[row, :width], keep)
             consumer_scores[row].masked_fill_(~keep, -torch.inf)
             for out, scores in zip(
                 outputs, (source_scores, source_scores, consumer_scores)
@@ -800,6 +811,121 @@ def test_expand_index_page_table_matches_cpu(bs, n, bpp):
         out = expand(table)
         assert out.dtype == torch.int32
         assert torch.equal(out.cpu(), expand(table.cpu()))
+
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_fp4_index_logits_candidates_matches_reference(ratio):
+    from sglang.kernels.ops.attention.dsv4.topk import (
+        plan_topk_v2,
+        topk_transform_paged_v2,
+    )
+
+    batch, width, num_blocks, topk = 6, 257, 10, 16
+    q, weights, slots, _, table = _make_logits_case(batch, 32, width)
+    lens = torch.tensor([0, 1, 7, 8, 65, width], device=q.device, dtype=torch.int32)
+    req = torch.arange(batch, device=q.device, dtype=torch.int32)
+    req_table = torch.full(
+        (batch, (width + 64) * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots * ratio).to(torch.int32)
+
+    blocks = torch.full((batch, num_blocks), -1, device=q.device, dtype=torch.int32)
+    blocks[1, 0] = 0
+    blocks[2, :2] = torch.tensor([0, 3], device=q.device, dtype=torch.int32)
+    blocks[3, 0] = 0
+    blocks[4, :3] = torch.tensor([8, 2, 0], device=q.device, dtype=torch.int32)
+    blocks[5, :9] = torch.tensor(
+        [32, 0, 5, 11, 17, 23, 29, 31, 1], device=q.device, dtype=torch.int32
+    )
+
+    q_view = torch.empty(batch, 32, HEAD_DIM * 2, device=q.device, dtype=q.dtype)[
+        ..., ::2
+    ]
+    q_view.copy_(q)
+    scores = fp4_index_logits_candidates(
+        q_view, weights, req, req_table, lens, blocks, table, PAGE_SIZE, ratio
+    )
+    assert scores.shape == (batch, num_blocks * 8)
+
+    ref = _reference_logits(q, weights, slots, lens.long(), table)
+    for row in range(batch):
+        length = int(lens[row])
+        for bi in range(num_blocks):
+            bid = int(blocks[row, bi])
+            for sub in range(8):
+                col = bi * 8 + sub
+                pos = bid * 8 + sub
+                if bid < 0 or pos >= length:
+                    assert torch.isneginf(scores[row, col]).item()
+                else:
+                    torch.testing.assert_close(
+                        scores[row, col], ref[row, pos], atol=0, rtol=0
+                    )
+
+    cand_lens = torch.full((batch,), num_blocks * 8, dtype=torch.int32, device=q.device)
+    idx = torch.empty((batch, topk), dtype=torch.int32, device=q.device)
+    topk_transform_paged_v2(scores, cand_lens, None, idx, 1, plan_topk_v2(cand_lens))
+    out_pages = torch.full(
+        (batch + 1, topk + 4), 99, dtype=torch.int32, device=q.device
+    )
+    finish_candidate_indexer_topk(
+        idx, scores, lens, req, req_table, blocks, out_pages, ratio
+    )
+    assert (out_pages[batch] == -1).all().item()
+    for row in range(batch):
+        keep = torch.isin(
+            torch.arange(width, device=q.device) // 8,
+            blocks[row][blocks[row] >= 0].long(),
+        )
+        masked_ref = ref[row].masked_fill(~keep, -torch.inf)
+        count = min(topk, int(torch.isfinite(masked_ref).sum()))
+        pages = out_pages[row, :count]
+        assert (pages >= 0).all().item()
+        assert (out_pages[row, count:] == -1).all().item()
+        selected = (slots[row, :, None] == pages[None, :]).nonzero()[:, 0]
+        torch.testing.assert_close(
+            masked_ref[selected].sort().values,
+            masked_ref.topk(count).values.sort().values,
+        )
+
+
+@pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_fp4_paged_logits_grouped_matches_ungrouped(ratio):
+    groups, rpr, width = 2, 3, 259
+    batch = groups * rpr
+    q, weights, slots, _, table = _make_logits_case(batch, 32, width)
+    req = torch.arange(groups, device=q.device, dtype=torch.int32).repeat_interleave(
+        rpr
+    )
+    req_table = torch.full(
+        (groups, (width + 64) * ratio), -1, device=q.device, dtype=torch.int32
+    )
+    req_table[:, : width * ratio : ratio] = (slots[::rpr] * ratio).to(torch.int32)
+    lens = torch.tensor(
+        [0, 0, 0, width - 2, width - 1, width], device=q.device, dtype=torch.int32
+    )
+    ungrouped = fp4_index_logits_paged(
+        q, weights, req, req_table, lens, table, PAGE_SIZE, width + 64, ratio
+    )
+    grouped = fp4_index_logits_paged(
+        q,
+        weights,
+        req,
+        req_table,
+        lens,
+        table,
+        PAGE_SIZE,
+        width + 64,
+        ratio,
+        rows_per_request=rpr,
+    )
+    for row, length in enumerate(lens.tolist()):
+        if length:
+            torch.testing.assert_close(
+                grouped[row, :length], ungrouped[row, :length], atol=0, rtol=0
+            )
 
 
 if __name__ == "__main__":

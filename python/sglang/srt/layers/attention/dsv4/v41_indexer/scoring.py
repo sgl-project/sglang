@@ -17,9 +17,11 @@ from sglang.kernels.ops.attention.dsv4.candidate_scores import (
 )
 from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    finish_candidate_indexer_topk,
     finish_paged_indexer_topk,
     finish_prefill_indexer_topk,
     flat_selection_slots,
+    fp4_index_logits_candidates,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -596,6 +598,69 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     has_candidate_mask: bool
 
 
+def use_paged_decode_indexer() -> bool:
+    return get_platform().is_sm90 or get_platform().is_sm120
+
+
+def select_candidate_decode(
+    *,
+    inputs: DecodeInputs,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    req_to_token: torch.Tensor,
+    blocks: torch.Tensor,
+    block_size: int,
+) -> None:
+    req, pos = inputs.req_rows, inputs.positions
+    bs = req.shape[0]
+    if bs == 0 or blocks.shape[1] == 0:
+        inputs.reset_outputs()
+        return
+    ratio = inputs.compress_ratio
+    indexer = inputs.indexer
+    lens = ((pos + 1) // ratio).to(torch.int32)
+    lmax = min(
+        inputs.paged_metadata.max_compressed_seq_len, req_to_token.shape[1] // ratio
+    )
+    if lmax == 0:
+        inputs.reset_outputs()
+        return
+    q = indexer.queries(inputs.q_lora, inputs.freqs_cis[pos])
+    weights = indexer.head_weights(inputs.x)
+    table = token_to_kv_pool.get_index_k_with_scale_buffer(inputs.layer_id)
+    scores = fp4_index_logits_candidates(
+        q,
+        weights,
+        req,
+        req_to_token,
+        lens,
+        blocks,
+        table,
+        table.shape[1] // 68,
+        ratio,
+        block_size=block_size,
+    )
+    cand_width = scores.shape[1]
+    k = min(indexer.index_topk, cand_width)
+    if k == 0:
+        inputs.reset_outputs()
+        return
+    cand_lens = torch.full((bs,), cand_width, dtype=torch.int32, device=scores.device)
+    plan = plan_topk_v2(cand_lens)
+    idx = torch.empty((bs, k), dtype=torch.int32, device=scores.device)
+    topk_transform_paged_v2(scores, cand_lens, None, idx, 1, plan)
+    finish_candidate_indexer_topk(
+        idx,
+        scores,
+        lens,
+        req,
+        req_to_token,
+        blocks,
+        inputs.out_page_indices,
+        ratio,
+        block_size=block_size,
+    )
+
+
 def decode_scores(
     *,
     inputs: DecodeInputs,
@@ -609,7 +674,7 @@ def decode_scores(
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
     req, pos = inputs.req_rows, inputs.positions
-    paged = get_platform().is_sm90 or get_platform().is_sm120
+    paged = use_paged_decode_indexer()
     bs = req.shape[0]
     assert pos.shape[0] == bs, (
         f"decode expects one token per request, {pos.shape=} {bs=}"
