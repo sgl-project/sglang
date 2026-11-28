@@ -113,6 +113,18 @@ class Schedule(msgspec.Struct):
         float,
         "With --schedule-policy shortest-prefill-first, each prefill token processed while a request waits lowers its rank by this many tokens, bounding its wait to about its uncached length divided by the factor, in processed tokens. 0 disables aging.",
     ] = 0.0
+    shortest_prefill_wait_guard_seconds: A[
+        float,
+        "With shortest-prefill-first on a PD prefill worker, consider promoting a request after it has waited this many seconds. Requires attention TP=1, attention CP=1 and PP=1. 0 disables the guard.",
+    ] = 0.0
+    shortest_prefill_wait_guard_age_gap_seconds: A[
+        float,
+        "A guarded request must have arrived at least this many seconds before the SPF queue head.",
+    ] = 60.0
+    shortest_prefill_wait_guard_cooldown_seconds: A[
+        float,
+        "Minimum seconds between successful SPF wait-guard promotions on the same attention DP queue.",
+    ] = 4.0
     uniboost_gamma: A[
         float,
         "Boost decay rate gamma (1/s) for --schedule-policy uniboost. Larger values behave more like fcfs, smaller values more like shortest-job-first. With --enable-uniboost-gamma-ada this is the starting value. Must be > 0.",

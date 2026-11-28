@@ -25,6 +25,7 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
+from itertools import chain
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -344,6 +345,7 @@ from sglang.srt.managers.scheduler_components.weight_updater import (
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
+from sglang.srt.managers.shortest_prefill_wait_guard import ShortestPrefillWaitGuard
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
@@ -567,6 +569,11 @@ class Scheduler(
         self.server_args = server_args
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = get_schedule().schedule_policy
+        self.shortest_prefill_wait_guard = ShortestPrefillWaitGuard.from_config(
+            get_schedule(),
+            get_parallel(),
+            is_pd_prefill=get_disagg().disaggregation_mode == "prefill",
+        )
         self.enable_priority_scheduling = get_schedule().enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
             get_schedule().abort_on_priority_when_disabled
@@ -4895,7 +4902,32 @@ class Scheduler(
             if bounded_active
             else self.waiting_queue
         )
-        for req in candidates:
+        guard = self.shortest_prefill_wait_guard
+        promoted = None
+        promotion_admitted = False
+        if (
+            guard is not None
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and not (
+                self.enable_hicache_storage
+                or self.enable_lmcache
+                or self.enable_unified_cache_external_linker
+                or self.enable_unified_memory
+            )
+        ):
+            guard_now = time.perf_counter()
+            promoted = guard.pick(
+                self.waiting_queue,
+                now=guard_now,
+                has_active_chunk=self.chunked_req is not None,
+                priority_scheduling=self.enable_priority_scheduling,
+            )
+            if promoted is not None:
+                candidates = chain((promoted,), candidates)
+        for index, req in enumerate(candidates):
+            is_promotion = index == 0 and promoted is not None
+            if promotion_admitted and req is promoted:
+                continue
             if bounded_active and not self.policy.allows_admission(req):
                 break
             # A spent pass budget admits no one, even before the first
@@ -4937,9 +4969,13 @@ class Scheduler(
                 num_held_rows=num_held_rows,
                 admitted_reqs=adder.can_run_list,
             ):
+                if is_promotion:
+                    continue
                 running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
+                if is_promotion:
+                    continue
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
@@ -4979,6 +5015,8 @@ class Scheduler(
             if adder.should_defer(req):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
+                if is_promotion:
+                    continue
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
@@ -5003,11 +5041,16 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
-            if self.enable_lora:
+            added = bool(adder.can_run_list) and req is adder.can_run_list[-1]
+            rejected_promotion = is_promotion and not added
+            if is_promotion and added:
+                promotion_admitted = True
+                guard.record_admission(time.perf_counter())
+            if self.enable_lora and not rejected_promotion:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
-                if res == AddReqResult.NO_TOKEN:
+                if res == AddReqResult.NO_TOKEN and not rejected_promotion:
                     running_batch.batch_is_full = adder.batch_is_full_after_rejection(
                         req
                     )
@@ -5015,9 +5058,10 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
-                added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
                     self._drop_unadmitted_match(req)
+                    if rejected_promotion:
+                        continue
                     if res == AddReqResult.NO_TOKEN:
                         self.prefill_admission_no_token = True
                 if res == AddReqResult.UNSCHEDULABLE and not added:
