@@ -978,6 +978,9 @@ class Envs:
     # gfx950: override --hicache-ratio for Mamba states in ratio mode; a cached KV
     # prefix cannot be reused after its host state is evicted.
     SGLANG_HICACHE_MAMBA_HOST_RATIO = EnvFloat(None)
+    # Enqueue the host-to-device load-back on a loader thread, so the forward
+    # launches while the copies are still being submitted.
+    SGLANG_ENABLE_HICACHE_ASYNC_LOAD_ENQUEUE = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
