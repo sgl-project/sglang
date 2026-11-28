@@ -2,7 +2,7 @@
 // one JSON file per checkpoint. The export-cookbook-commands pre-commit hook runs it; never
 // edit the files by hand.
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -42,10 +42,11 @@ for (const path of walk(join(docs, "cookbook")).filter((path) => path.endsWith("
   if (name && source.includes("<Deployment")) pagesByConfig.set(name, [...(pagesByConfig.get(name) || []), path]);
 }
 const exportedConfigs = [...pagesByConfig]
-  .filter(([, paths]) => paths.some((path) => path.startsWith(`${EXPORTED_PAGES}/`)))
+  .filter(([, paths]) => paths.some((path) => path.startsWith(`${EXPORTED_PAGES}${sep}`)))
   .map(([name, paths]) => {
     if (paths.length !== 1) throw new Error(`${name}: expected one Cookbook page rendering it, found ${paths.length}`);
-    return { name, url: `https://docs.sglang.io/${relative(docs, paths[0]).replace(/\.mdx$/, "")}` };
+    const page = relative(docs, paths[0]).replaceAll(sep, "/").replace(/\.mdx$/, "");
+    return { name, url: `https://docs.sglang.io/${page}` };
   })
   .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -154,6 +155,8 @@ const files = Object.fromEntries(
     `[\n${entries.map((e) => `  ${JSON.stringify(e)}`).join(",\n")}\n]\n`,
   ]),
 );
+const fileCount = Object.keys(files).length;
+if (!fileCount) throw new Error("No Cookbook recipes were exported. Existing CLI recipes were preserved.");
 mkdirSync(outputDir, { recursive: true });
 const changed = [];
 for (const name of readdirSync(outputDir)) {
@@ -163,11 +166,11 @@ for (const name of readdirSync(outputDir)) {
 }
 for (const [name, json] of Object.entries(files)) {
   const path = join(outputDir, name);
-  if (existsSync(path) && readFileSync(path, "utf8") === json) continue;
+  if (existsSync(path) && readFileSync(path, "utf8").replaceAll("\r\n", "\n") === json) continue;
   writeFileSync(path, json);
   changed.push(`wrote ${name}`);
 }
-console.log(`${relative(root, outputDir)}: ${Object.keys(files).length} files, ${changed.length} changed`);
+console.log(`${relative(root, outputDir)}: ${fileCount} files, ${changed.length} changed`);
 // pre-commit only notices edits to tracked files, so a new file would pass unless this fails.
 if (changed.length) {
   console.log(`  ${changed.join("\n  ")}`);
