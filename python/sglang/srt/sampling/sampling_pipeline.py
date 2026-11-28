@@ -15,7 +15,7 @@ Two entries run it:
   `commit`.
 
 Each stage reads its step state from `SamplingBatchInfo`, which the scheduler
-builds at each launch (`set_step_state`). A verify differs only in what each
+builds at each launch (`set_rows`, `set_step_state`). A verify differs only in what each
 stage gets: several rows per request, the penalty along the draft tree or
 chain, and a grammar mask built over the draft tree. Penalty and watermark keep
 per-request state, so each commits the sampled tokens or the verify's
