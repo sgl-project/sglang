@@ -14,7 +14,7 @@ from http import HTTPStatus
 from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -277,6 +277,20 @@ class ServingCompletionTestCase(unittest.TestCase):
                 "meta_info": {
                     "id": "cmpl-test",
                     "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": None,
+                    "output_token_logprobs": [],
+                    "output_token_logprobs_length": 0,
+                    "output_top_logprobs": [],
+                },
+                "index": 0,
+            }
+            yield {
+                "text": "Partial text",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
                     "completion_tokens": 2,
                     "cached_tokens": 0,
                     "finish_reason": {
@@ -330,9 +344,53 @@ class ServingCompletionTestCase(unittest.TestCase):
         # The last chunk should be "data: [DONE]\n\n"
         self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
-        # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
-        self.assertGreaterEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
+        # The error chunk follows the streamed content and precedes [DONE]
+        self.assertIn("Partial ", "".join(chunks[:-2]))
+        self.assertIn("error", chunks[-2])
+
+    def _stream_aborted_before_first_chunk(self, status):
+        async def _mock_generate_abort(*args, **kwargs):
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": status,
+                        "message": "The request queue is full.",
+                    },
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate_abort
+        req = CompletionRequest(
+            model="x", prompt="Hello world", max_tokens=100, stream=True
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+        return get_or_create_event_loop().run_until_complete(
+            self.sc._handle_streaming_request(
+                adapted_request, req, self.fastapi_request
+            )
+        )
+
+    def test_streaming_abort_before_first_chunk_is_an_http_error(self):
+        """An error abort before the first chunk (e.g. a full queue) is raised
+        as a non-streaming request's is, for handle_request to answer with its
+        status, not streamed under HTTP 200."""
+        with self.assertRaises(HTTPException) as ctx:
+            self._stream_aborted_before_first_chunk(HTTPStatus.SERVICE_UNAVAILABLE)
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail, "The request queue is full.")
+
+        response = self._stream_aborted_before_first_chunk(HTTPStatus.BAD_REQUEST)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            json.loads(response.body)["message"], "The request queue is full."
+        )
 
     def test_echo_with_zero_logprobs_streaming(self):
         """logprobs=0 requests token logprobs without top-logprobs, so the
