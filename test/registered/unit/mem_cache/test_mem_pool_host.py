@@ -1729,25 +1729,25 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
     """page_first_kv_split books K, V and the indexer mirrors as own mappings."""
 
     @staticmethod
-    def _pool(packed_fp8=False, indexer=True, index_page_size=16):
+    def _pool(packed_fp8=False, indexer=True, index_page_size=16, packed_int8=False):
         layer_num = 3
+        kv_dtype = torch.int8 if packed_int8 else torch.bfloat16
+        index_dtype = torch.int8 if packed_int8 else torch.bfloat16
+        scale_dtype = torch.float16 if packed_int8 else torch.float32
+        k_width = 528 if packed_int8 else 640
         info = MLABufferInfo(
             buffers=MLASplitBuffers(
-                k=torch.empty((0, 1, 640), dtype=torch.bfloat16),
-                v=torch.empty((0, 1, 64), dtype=torch.bfloat16),
-                index_k=torch.empty(
-                    (2, 0, index_page_size, 1, 128), dtype=torch.bfloat16
-                )
+                k=torch.empty((0, 1, k_width), dtype=kv_dtype),
+                v=torch.empty((0, 1, 0 if packed_int8 else 64), dtype=kv_dtype),
+                index_k=torch.empty((2, 0, index_page_size, 1, 128), dtype=index_dtype)
                 if indexer
                 else None,
-                index_scales=torch.empty(
-                    (2, 0, index_page_size, 1), dtype=torch.float32
-                )
+                index_scales=torch.empty((2, 0, index_page_size, 1), dtype=scale_dtype)
                 if indexer
                 else None,
                 index_layer_indices=(0, 1) if indexer else (),
-                k_width=640,
-                v_width=64,
+                k_width=k_width,
+                v_width=0 if packed_int8 else 64,
                 index_width=128,
             ),
             data_ptrs=None,
@@ -1756,10 +1756,10 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
             page_size=16,
             kv_lora_rank=512,
             qk_rope_head_dim=64,
-            kv_cache_dim=576,
-            dtype=torch.bfloat16,
+            kv_cache_dim=k_width if packed_int8 else 576,
+            dtype=kv_dtype,
             device=torch.device("cpu"),
-            packed_fp8=packed_fp8,
+            packed_fp8=packed_fp8 or packed_int8,
         )
         return MLATokenToKVPoolHost(
             info,
@@ -1849,6 +1849,44 @@ class TestMLAKvSplitMappingLengths(CustomTestCase):
                     if indexer:
                         self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float32)
                         self.assertEqual(sizes[len(buffers) - 1], 2 * 16 * 4)
+
+    def test_mooncake_registers_every_int8_draft_page_buffer(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        pool = self._pool(packed_int8=True, index_page_size=4)
+        self.addCleanup(pool.destroy)
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.registered_pools = {}
+        store.store = unittest.mock.Mock()
+        store.store.register_buffer.return_value = 0
+
+        store.register_mem_host_pool_v2(pool, PoolName.DRAFT)
+        self.assertIs(store.registered_pools[PoolName.DRAFT], pool)
+        buffers = (pool.kv_buffer, pool.index_k_buffer, pool.index_k_scale_buffer)
+        registered = [(buf.data_ptr(), buf.nbytes) for buf in buffers]
+        self.assertEqual(
+            store.store.register_buffer.call_args_list,
+            [unittest.mock.call(ptr, size) for ptr, size in registered],
+        )
+        ptrs, sizes = store._build_pool_buffer_meta(
+            host_pool=pool,
+            host_indices=torch.cat([torch.arange(16, 32), torch.arange(64, 80)]),
+            key_strs=["page1_draft_k", "page4_draft_k"],
+            key_multiplier=1,
+            exist_states=None,
+        )
+        page_sizes = [16 * 3 * 528, 4 * 2 * 128, 4 * 2 * 2]
+        self.assertEqual(sizes, [page_sizes, page_sizes])
+        for page, page_ptrs in zip((1, 4), ptrs):
+            self.assertEqual(
+                page_ptrs,
+                [
+                    buf.data_ptr() + page * size
+                    for buf, size in zip(buffers, page_sizes)
+                ],
+            )
 
     def test_storage_buffer_enumeration_filters_optional_buffers(self):
         pool = self._pool()
