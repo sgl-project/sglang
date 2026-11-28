@@ -176,9 +176,13 @@ class TestXpuCallSitesNeverPassTheSentinel(CustomTestCase):
     def test_fp8_apply(self) -> None:
         topk_weights, topk_ids = self.routing(top_k=2)
         moe_method = SimpleNamespace(
-            moe_runner_config=MoeRunnerConfig(activation="silu"),
+            moe_runner_config=MoeRunnerConfig(
+                activation="silu", params_dtype=torch.bfloat16
+            ),
             is_fp4_expert=False,
             block_quant=False,
+            weight_block_size=None,
+            use_mxfp8=False,
         )
         with self.xpu_branch(fp8_module, _is_xpu=True, _is_npu=False, _is_hip=False):
             with unittest.mock.patch.object(

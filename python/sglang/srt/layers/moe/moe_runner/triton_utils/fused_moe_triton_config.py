@@ -10,10 +10,11 @@ import torch
 import triton
 
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import get_device_name, is_hip
+from sglang.srt.utils import get_device_name, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 _LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES = 128 * 1024
 
 
@@ -235,9 +236,12 @@ def get_default_config(
                     }
         else:
             # Block-wise quant: BLOCK_SIZE_K must be divisible by block_shape[1]
+            # XPU dot requires at least 16 columns, even for one-row MXFP8 groups.
             config = {
                 "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": block_shape[0],
+                "BLOCK_SIZE_N": (
+                    max(16, block_shape[0]) if _is_xpu else block_shape[0]
+                ),
                 "BLOCK_SIZE_K": block_shape[1],
                 "GROUP_SIZE_M": 32,
                 "num_warps": 4,

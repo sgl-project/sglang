@@ -8,6 +8,7 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_hip_runtime
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_utils import ue8m0_to_fp32 as _ue8m0_to_fp32
 from sglang.srt.utils import is_gfx95_supported
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
@@ -315,18 +316,6 @@ def _dequantize_k_cache_paged_kernel(
         rope_data,
         mask=tmask[:, None],
     )
-
-
-@triton.jit
-def _ue8m0_to_fp32(scale_u8):
-    # Follows torch.float8_e8m0fnu: byte 0 is the denormal 2 ** -127, byte 255
-    # is NaN, otherwise 2 ** (byte - 127).
-    normal = (scale_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
-    denormal = tl.full(scale_u8.shape, 0x00400000, tl.int32).to(
-        tl.float32, bitcast=True
-    )
-    scale = tl.where(scale_u8 == 0, denormal, normal)
-    return tl.where(scale_u8 == 255, float("nan"), scale)
 
 
 @triton.jit
