@@ -672,6 +672,7 @@ def _is_later_dp_replica() -> bool:
 
 
 def _export_static_state(model):
+    # Buffer clones are enqueued on the device. The adapter drains them before unmap.
     return dict(
         buffers=[
             (name, buffer.detach().clone()) for name, buffer in model.named_buffers()
