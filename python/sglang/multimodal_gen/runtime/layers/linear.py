@@ -4,6 +4,8 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/layers/linear.py
 
 from abc import abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
@@ -264,6 +266,7 @@ def apply_unquantized_linear(
         _USE_AITER_TGEMM
         and x.dtype in (torch.bfloat16, torch.float16)
         and weight.dtype == x.dtype
+        and weight.is_contiguous()
         and (bias is None or bias.dtype == x.dtype)
         and x.numel() < _AITER_TGEMM_MAX_NUMEL
         and x.numel() // x.shape[-1] * weight.shape[0] < _AITER_TGEMM_MAX_NUMEL
@@ -358,7 +361,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         if use_intel_amx_backend(layer):
             return apply_amx_packed_linear(x=x, weight=layer.weight, bias=bias)
-        return apply_unquantized_linear(x, layer.weight, bias)
+        return apply_unquantized_linear(x, linear_weight_out_in(layer), bias)
 
 
 class LinearBase(torch.nn.Module):
@@ -392,6 +395,8 @@ class LinearBase(torch.nn.Module):
         self.params_dtype = params_dtype
         self.quant_config = quant_config
         self.prefix = prefix
+        # Whether ``weight`` is stored as [in, out]; see transpose_linear_weights.
+        self.weight_transposed = False
         if quant_config is None:
             self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
         else:
@@ -406,6 +411,79 @@ class LinearBase(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
         raise NotImplementedError
+
+
+def linear_weight_out_in(layer: LinearBase) -> torch.Tensor:
+    """The weight of ``layer`` as [out, in], the layout ``F.linear`` takes."""
+    return layer.weight.t() if layer.weight_transposed else layer.weight
+
+
+def linear_weight_in_out(layer: LinearBase) -> torch.Tensor:
+    """The weight of ``layer`` as [in, out], the right operand of ``x @ weight``."""
+    return layer.weight if layer.weight_transposed else layer.weight.t()
+
+
+def _can_transpose_weight(layer: LinearBase) -> bool:
+    weight = layer.weight
+    return (
+        type(layer.quant_method) is UnquantizedLinearMethod
+        and not use_intel_amx_backend(layer)
+        and weight.dim() == 2
+        # A view into storage shared with other weights (packed projections) keeps its layout.
+        and weight.untyped_storage().nbytes() == weight.nbytes
+    )
+
+
+def _set_weight_transposed(layer: LinearBase, *, transposed: bool) -> None:
+    with torch.no_grad():
+        layer.weight.data = layer.weight.data.t().contiguous()
+    layer.weight_transposed = transposed
+
+
+def transpose_linear_weights(model: torch.nn.Module) -> int:
+    """Store the weight of each unquantized linear in ``model`` as [in, out].
+
+    ``F.linear`` gives the GEMM a [out, in] weight as a transposed operand. Some
+    GPUs run the same product faster with no operand transposed. The layers
+    compute the same values. Returns the number of linears changed.
+    """
+    count = 0
+    for module in model.modules():
+        if (
+            isinstance(module, LinearBase)
+            and not module.weight_transposed
+            and _can_transpose_weight(module)
+        ):
+            _set_weight_transposed(module, transposed=True)
+            count += 1
+    return count
+
+
+def restore_linear_weight_layout(layer: LinearBase) -> None:
+    """Store the weight of ``layer`` as [out, in] again."""
+    if layer.weight_transposed:
+        _set_weight_transposed(layer, transposed=False)
+
+
+@contextmanager
+def standard_linear_weight_layout(model: torch.nn.Module) -> Iterator[None]:
+    """Keep every linear weight of ``model`` as [out, in] inside the block.
+
+    Code that writes checkpoint tensors into the parameters runs inside it.
+    """
+    transposed = [
+        module
+        for module in model.modules()
+        if isinstance(module, LinearBase) and module.weight_transposed
+    ]
+    for layer in transposed:
+        restore_linear_weight_layout(layer)
+    try:
+        yield
+    finally:
+        for layer in transposed:
+            if _can_transpose_weight(layer):
+                _set_weight_transposed(layer, transposed=True)
 
 
 class ParallelLinear(LinearBase):
@@ -1427,10 +1505,11 @@ class RowParallelLinear(ParallelLinear):
         into the 2D ``out``: the mm / addmm that ``F.linear`` lowers to."""
         bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         rows = input_.reshape(-1, input_.shape[-1])
+        weight = linear_weight_in_out(self)
         if bias is None:
-            torch.mm(rows, self.weight.t(), out=out)
+            torch.mm(rows, weight, out=out)
         else:
-            torch.addmm(bias, rows, self.weight.t(), out=out)
+            torch.addmm(bias, rows, weight, out=out)
 
     def extra_repr(self) -> str:
         s = f"input_features={self.input_size_per_partition}"

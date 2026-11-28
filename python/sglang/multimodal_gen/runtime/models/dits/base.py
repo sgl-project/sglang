@@ -27,6 +27,9 @@ class BaseDiT(nn.Module, ABC):
     # shard conditions left in the root group stays sharded unless the entry
     # point is registered; loaders read this and register each name.
     _fsdp_forward_methods: tuple[str, ...] = ()
+    # ROCm architectures (gcnArchName without its feature suffix) on which this
+    # model was measured faster with its linear weights stored as [in, out].
+    _transposed_linear_weight_archs: tuple[str, ...] = ()
     param_names_mapping: dict
     reverse_param_names_mapping: dict
     lora_param_names_mapping: dict = {}

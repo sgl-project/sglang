@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
+    restore_linear_weight_layout,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
     WeightOnlyFP8Linear,
@@ -174,6 +175,9 @@ class BaseLayerWithLoRA(nn.Module):
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
+        # Merge, snapshot and restore all handle the weight as [out, in].
+        if isinstance(base_layer, LinearBase):
+            restore_linear_weight_layout(base_layer)
 
         self.merged: bool = False
         # Only a merged layer needs a restore target. Even a detached view here

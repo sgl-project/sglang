@@ -98,6 +98,7 @@ def _static_reject_reason(linear: Any) -> str | None:
     A LoRA wrapper is judged by the layer it wraps, whose weight the epilogue
     multiplies; whether its adapter adds output is a per-call check.
     """
+    from sglang.multimodal_gen.runtime.layers.linear import LinearBase
     from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 
     if isinstance(linear, BaseLayerWithLoRA):
@@ -106,6 +107,8 @@ def _static_reject_reason(linear: Any) -> str | None:
         return "torch._addmm_activation unavailable"
     if not _is_unquantized(linear):
         return "quantized linear"
+    if isinstance(linear, LinearBase) and linear.weight_transposed:
+        return "weight stored as [in, out]"
     if getattr(linear, "skip_bias_add", False):
         return "skip_bias_add (bias returned separately)"
     if getattr(linear, "gather_output", False) and getattr(linear, "tp_size", 1) > 1:
