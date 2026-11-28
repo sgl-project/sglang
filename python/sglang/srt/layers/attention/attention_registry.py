@@ -42,13 +42,25 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 ATTENTION_BACKENDS = {}
+# Registered backends that read the page-major KV layout's per-layer views by
+# their strides; `handle_page_major_kv_layout` admits them with its allow-list.
+PAGE_MAJOR_KV_LAYOUT_BACKENDS = set()
 OOT_LINEAR_ATTENTION_BACKENDS = {}
 HYBRID_GDN_SM100_BACKENDS = {"triton", "trtllm_mha", "fa4", "flashinfer"}
 
 
-def register_attention_backend(name):
+def register_attention_backend(name, *, page_major_kv_layout: bool = False):
+    """Register an attention backend factory under ``name``.
+
+    ``page_major_kv_layout``: the backend's kernels read the per-layer K/V views
+    of ``--enable-page-major-kv-layout`` (which ``--enable-unified-memory``
+    implies) by their strides, so it may run on that layout.
+    """
+
     def decorator(fn):
         ATTENTION_BACKENDS[name] = fn
+        if page_major_kv_layout:
+            PAGE_MAJOR_KV_LAYOUT_BACKENDS.add(name)
         return fn
 
     return decorator
