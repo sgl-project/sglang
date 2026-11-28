@@ -23,7 +23,13 @@ and CPU expert offload, which move the computation to the CPU.
 **Results are unchanged.** Routing is untouched (E-wide), and the paged layer produces the same
 output as the unpaged one: bit-identical for unquantized, FP8 and INT8 experts (with
 `--enable-deterministic-inference`), and within the Marlin kernel's own run-to-run noise for
-the other quantized formats. See [Correctness](#correctness).
+the other quantized formats. A runner that sums the top-k outputs inside its kernel
+(`flashinfer_cutlass`) gives the same output for every step that fits the resident experts (all
+decode steps up to `K // top_k` requests); a larger step (a prefill chunk) runs in several
+passes whose partial sums the runner returns in 16 bits, so it can differ from the unpaged layer
+by one 16-bit rounding per pass. Which passes a step needs depends on the experts resident at
+the time, so such a runner is refused with `--enable-deterministic-inference`. See
+[Correctness](#correctness).
 
 ## Usage
 
@@ -65,6 +71,7 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   | Experts | MoE runner | Notes |
   |---|---|---|
   | unquantized (bf16/fp16) | triton | |
+  | unquantized (bf16/fp16) | flashinfer_cutlass | pass `--moe-runner-backend flashinfer_cutlass`; experts without biases; see the note on prefill steps above |
   | block-quantized FP8 (e.g. `weight_block_size` `[128, 128]`) | triton | |
   | compressed-tensors FP8, per-channel or block, dynamic activations (e.g. `FP8-dynamic` checkpoints) | triton | per-tensor FP8 is not supported |
   | W8A8 FP8 (`--quantization w8a8_fp8`), W8A8 INT8 (`--quantization w8a8_int8`) | triton | |

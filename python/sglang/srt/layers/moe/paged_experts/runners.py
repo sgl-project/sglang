@@ -1,11 +1,22 @@
 """What paged experts needs from a fused-MoE runner backend, one ``RunnerContract`` per backend.
 
-The executor runs a step in waves (one wave when its experts fit the K slots). The runner
-returns every routed (token, expert) output already multiplied by its router weight
-(``no_combine``); the contract runs each wave over only the entries whose expert it holds,
-writes them into one merged buffer, and performs the top-k sum the runner would have performed
-itself. The contract follows from the runner the base method builds (``contract_for``);
-supporting a new backend means adding a contract here.
+The executor runs a step in waves (one wave when its experts fit the K slots). Two kinds of
+runner:
+
+- A runner that can return every routed (token, expert) output already multiplied by its router
+  weight (``no_combine``): the contract runs each wave over only the entries whose expert it
+  holds, writes them into one merged buffer, and performs the top-k sum the runner would have
+  performed itself, so a multi-wave step is exact.
+- A runner that sums the top-k outputs itself (``combines``, e.g. FlashInfer's CUTLASS MoE): a
+  wave is the runner's local expert range ``[0, K)``; the entries of other experts get id K and
+  are dropped before the grouped GEMM, as expert parallelism drops another rank's experts, and
+  the executor adds the waves' outputs in FP32. A step in one wave (every decode step the device
+  plans) is exact; in a multi-wave step each wave's output is rounded to the runner's output
+  dtype before the FP32 sum, so it can differ from the unpaged layer by one rounding per wave.
+
+The contract follows from the runner the base method builds (``contract_for``); supporting a
+new backend means adding a contract here, or registering one from the backend's own module
+(``register_runner_contract``).
 """
 
 from __future__ import annotations
@@ -13,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import weakref
 from dataclasses import replace
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
@@ -52,13 +64,36 @@ class RunnerContract:
     #: Whether the runner reads a layout the base method's post-load step repacks the
     #: experts into; the step then runs over the host store K experts at a time.
     repacks: bool = False
+    #: Whether the runner sums the top-k outputs itself: a wave's output is then the
+    #: ``[tokens, hidden]`` sum over the wave's entries, and the executor adds the waves.
+    combines: bool = False
+
+    def runner_config(self, moe_runner_config, num_slots: int):
+        """The config to build the base runner with for ``num_slots`` slots, when it is not
+        the shared one (``runner_config``: per-expert outputs); None keeps the shared one."""
+        return None
+
+    def check_layer(self, layer, expert_format) -> None:
+        """Raise if this runner is not known to serve the layer (its expert format, its
+        tensors) paged."""
+
+    def validate(self, config) -> None:
+        """Raise, before the checkpoint loads, on a server configuration (``get_exec()``) this
+        contract cannot serve (beyond the shared checks), e.g. CUDA graphs on a backend
+        without them."""
+
+    def resize(self, layer, num_slots: int) -> None:
+        """Rebuild what the runner keeps per local expert outside the paged tensors, for
+        ``num_slots`` slots: the layer had another K when its weights were processed."""
 
     def run_wave(
         self, base_method, layer, dispatch_output, slots, merged, num_entries=None
     ):
         """Compute the routed entries of one wave (``slots`` >= 0) into ``merged``, the step's
         ``[tokens, top_k, hidden]`` entries (None before its first wave), and return it.
-        ``num_entries``, if the host knows it, is how many routed entries the wave has."""
+        ``num_entries``, if the host knows it, is how many routed entries the wave has.
+        A combining contract returns the wave's own ``[tokens, hidden]`` output instead
+        (``merged`` is always None); the executor accumulates."""
         raise NotImplementedError
 
     def finish(self, merged, hidden_states, routed_scaling_factor: float):
@@ -91,6 +126,112 @@ class RunnerContract:
         rows = COMPACT_ROWS + _pad_rows(COMPACT_ROWS)
         call = rows * ((4 * hidden + 3 * inter) * size + hidden + inter)
         return merged + call
+
+
+class CombiningContract(RunnerContract):
+    """A runner that sums the top-k outputs itself. A wave sends its entries to their slots
+    ``[0, K)`` and every other entry to id K, outside the runner's K local experts, which the
+    runner drops before its grouped GEMM (as expert parallelism drops the experts of other
+    ranks). The routed scaling factor is the runner's, as unpaged: it is linear, so the waves'
+    sum carries it once.
+
+    The base method picks the runner backend while it builds the runner, so the contract is
+    known only afterwards and the runner is first built with the shared config. A combining
+    runner that never reads ``no_combine`` (FlashInfer's CUTLASS MoE) serves with it as built;
+    one that reads or rejects it (trtllm-gen asserts it is off) returns its config from
+    ``combining_config`` in ``runner_config``, and is built once more with it.
+
+    A runner without a local expert range (``drops_outside = False``) computes every id it is
+    given: the entries of other experts then go to slot 0 with weight 0, so they add nothing,
+    but every wave computes every entry of the step. Such a runner's tables are as wide as its
+    expert count, so its contract's ``runner_config`` builds it with ``num_experts`` = K."""
+
+    combines = True
+    #: Whether the runner drops ids outside its local experts ``[0, K)`` before its GEMMs.
+    drops_outside: bool = True
+
+    def validate(self, config) -> None:
+        """A multi-wave step sums each token's experts in groups that depend on which experts
+        the previous steps left resident, so the same request can round differently."""
+        if config.deterministic.enable_deterministic_inference:
+            raise RuntimeError(
+                "Paged experts: --enable-deterministic-inference needs a MoE runner that "
+                "returns each expert's output (e.g. --moe-runner-backend triton); this one "
+                "sums the top-k outputs itself, in an order that depends on which experts "
+                "are resident"
+            )
+
+    @staticmethod
+    def combining_config(moe_runner_config, num_slots: int):
+        """The shared config with the runner's own combine on, for ``runner_config``."""
+        return replace(
+            moe_runner_config,
+            num_local_experts=num_slots,
+            inplace=False,
+            no_combine=False,
+            no_combine_keep_router_weight=False,
+        )
+
+    def run_wave(
+        self, base_method, layer, dispatch_output, slots, merged, num_entries=None
+    ):
+        outside = layer.num_local_experts if self.drops_outside else 0
+        return run_on_slots(base_method, layer, dispatch_output, slots, outside=outside)
+
+    def finish(self, merged, hidden_states, routed_scaling_factor: float):
+        """The layer output: the summed waves (FP32 when there were several) in the input's
+        dtype, trimmed to its width."""
+        return merged[..., : hidden_states.shape[-1]].to(hidden_states.dtype)
+
+    def prefill_bytes(
+        self, hidden_size: int, intermediate_size: int, tokens: int, top_k: int, dtype
+    ) -> int:
+        """Beyond the runner's own use for the step unpaged (each wave is one call over the
+        whole step): the FP32 accumulator and the wave's output before it is added."""
+        hidden = _padded_hidden(hidden_size)
+        size = torch.empty((), dtype=dtype).element_size()
+        return tokens * hidden * (4 + size)
+
+
+class FlashInferCutlassContract(CombiningContract):
+    """FlashInfer's CUTLASS MoE: its experts per rank are the rows of the weight tables (K),
+    and ids outside ``[ep_rank * K, (ep_rank + 1) * K)`` are not computed. It always combines
+    and reads none of the shared config's per-entry fields, so it is built once. Only unquantized
+    experts without biases so far: the quantized formats' post-load steps repack for this
+    runner, which has not been checked against the host store's rows, and the unquantized
+    method does not pass expert biases to it. Its per-expert SwiGLU parameters (a clamped
+    activation) are rebuilt for the final K."""
+
+    def check_layer(self, layer, expert_format) -> None:
+        from sglang.srt.layers.moe.paged_experts.formats import UnquantizedFormat
+
+        if not isinstance(expert_format, UnquantizedFormat):
+            raise RuntimeError(
+                "Paged experts: the flashinfer_cutlass MoE runner is supported for "
+                f"unquantized experts only, the layer has {type(expert_format).__name__}"
+            )
+        biases = [
+            name
+            for name in ("w13_weight_bias", "w2_weight_bias")
+            if getattr(layer, name, None) is not None
+        ]
+        if biases:
+            raise RuntimeError(
+                "Paged experts: the flashinfer_cutlass MoE runner is supported for experts "
+                f"without biases only, the layer has {', '.join(biases)}; use "
+                "--moe-runner-backend triton"
+            )
+
+    def resize(self, layer, num_slots: int) -> None:
+        if getattr(layer, "_cutlass_swiglu_params", None) is None:
+            return
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            materialize_swiglu_params_for_cutlass,
+        )
+
+        layer._cutlass_swiglu_params = materialize_swiglu_params_for_cutlass(
+            layer.moe_runner_config, num_slots, layer.w13_weight.device
+        )
 
 
 def _padded_hidden(hidden: int) -> int:
@@ -284,6 +425,20 @@ class MarlinContract(RunnerContract):
 
 TRITON = TritonContract()
 MARLIN = MarlinContract()
+FLASHINFER_CUTLASS = FlashInferCutlassContract()
+
+# Contracts of backends whose runner lives elsewhere (e.g. a hardware backend's own module):
+# registered when that module is imported, so the shared code carries none of their imports.
+_REGISTERED: Dict[str, RunnerContract] = {}
+
+
+def register_runner_contract(backend_name: str, contract: RunnerContract) -> None:
+    """The paged-experts contract of a runner backend, by its ``MoeRunnerBackend`` value."""
+    if backend_name in _REGISTERED:
+        raise ValueError(
+            f"Paged experts: a runner contract for {backend_name!r} is already registered"
+        )
+    _REGISTERED[backend_name] = contract
 
 
 def runner_of(base_method, layer):
@@ -294,6 +449,37 @@ def runner_of(base_method, layer):
         if runner is not None:
             return runner
     return None
+
+
+def check_runs_its_runner(base_method) -> None:
+    """Raise if the base method's ``apply`` would not run its runner: on XPU some methods call
+    sgl-kernel's fused MoE instead, which sums the top-k outputs over all experts (paged
+    experts cannot split it into waves yet). The other methods always run their runner."""
+    from sglang.srt.layers.moe.paged_experts.store import accelerator_type
+
+    if accelerator_type() != "xpu":
+        return
+    from sglang.srt.layers.moe.utils import get_moe_runner_backend
+    from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+    from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
+
+    fused = (
+        "sgl-kernel's fused MoE, which sums the top-k outputs (paged experts cannot split "
+        "it into waves yet)"
+    )
+    if isinstance(base_method, Mxfp4MoEMethod):
+        raise RuntimeError(
+            f"Paged experts: on XPU, the MXFP4 MoE method always runs {fused}"
+        )
+    if (
+        isinstance(base_method, (UnquantizedFusedMoEMethod, Fp8MoEMethod))
+        and not get_moe_runner_backend().is_triton()
+    ):
+        raise RuntimeError(
+            f"Paged experts: on XPU, {type(base_method).__name__} runs {fused} unless the "
+            "triton MoE runner is selected: pass --moe-runner-backend triton"
+        )
 
 
 def contract_for(runner) -> RunnerContract:
@@ -307,8 +493,13 @@ def contract_for(runner) -> RunnerContract:
         and not backend.is_experimental_sgl_marlin()
     ):
         return MARLIN
+    if backend is not None and backend.is_flashinfer_cutlass():
+        return FLASHINFER_CUTLASS
+    contract = _REGISTERED.get(getattr(backend, "value", None))
+    if contract is not None:
+        return contract
     raise RuntimeError(
-        "Paged experts: requires the triton or Marlin MoE runner, the layer's method uses "
-        f"{getattr(backend, 'value', None)}; select one with --moe-runner-backend if its "
-        "quantization method supports it"
+        "Paged experts: requires the triton, Marlin or flashinfer_cutlass MoE runner, the "
+        f"layer's method uses {getattr(backend, 'value', None)}; select one with "
+        "--moe-runner-backend if its quantization method supports it"
     )

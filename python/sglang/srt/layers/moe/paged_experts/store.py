@@ -68,6 +68,27 @@ def _unregister(data_ptr: int) -> None:
         logger.warning("Paged experts: cudaHostUnregister failed (error %d)", rc)
 
 
+def pinned_host(shape, dtype: torch.dtype) -> torch.Tensor:
+    """Page-locked host memory for the current accelerator: exact-size registered shared
+    memory (``_pin_until_freed``) on CUDA and ROCm; elsewhere the host allocator sglang's
+    host KV pools use for that device (``ALLOC_MEMORY_FUNCS``)."""
+    device = accelerator_type()
+    if device in ("cuda", "hip"):
+        return _pin_until_freed(shape, dtype)
+    from sglang.srt.mem_cache.pool_host.common import ALLOC_MEMORY_FUNCS
+
+    return ALLOC_MEMORY_FUNCS[device](
+        dims=tuple(shape), dtype=dtype, device="cpu", pin_memory=True, allocator=None
+    )
+
+
+def accelerator_type() -> str:
+    """The current accelerator's device type (cuda, also on ROCm; npu, xpu, ...)."""
+    accelerator = getattr(torch, "accelerator", None)
+    current = accelerator.current_accelerator() if accelerator is not None else None
+    return current.type if current is not None else "cuda"
+
+
 RowsLike = Dict[str, Tuple[Tuple[int, ...], torch.dtype]]
 
 
@@ -96,7 +117,7 @@ class HostExpertStore:
     def _alloc(self, shape, dtype: torch.dtype) -> torch.Tensor:
         if math.prod(shape) == 0:
             return torch.empty(shape, dtype=dtype, device="cpu")
-        return _pin_until_freed(shape, dtype)
+        return pinned_host(shape, dtype)
 
     @contextlib.contextmanager
     def host_planned(self):

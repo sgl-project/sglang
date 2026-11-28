@@ -28,11 +28,12 @@ from sglang.srt.layers.moe.paged_experts.formats import (
 )
 from sglang.srt.layers.moe.paged_experts.residency import DeviceResidency, LRUPolicy
 from sglang.srt.layers.moe.paged_experts.runners import (
+    check_runs_its_runner,
     contract_for,
     runner_config,
     runner_of,
 )
-from sglang.srt.layers.moe.paged_experts.store import ExpertLoads
+from sglang.srt.layers.moe.paged_experts.store import ExpertLoads, accelerator_type
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -187,8 +188,20 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config  # rebuilt with the final K
+        # The base method picks the runner backend while building it, and the contract
+        # follows from the backend: built with the shared config, and once more only if the
+        # contract needs its own (e.g. a combining runner that rejects ``no_combine``).
+        self.contract = None
         self._create_runner(layer)
         self.contract = contract_for(self.runner)
+        self.contract.check_layer(layer, self.format)
+        check_runs_its_runner(self.base_method)
+        self.contract.validate(get_exec())
+        if (
+            self.contract.runner_config(moe_runner_config, self.num_resident)
+            is not None
+        ):
+            self._create_runner(layer)
         self.routed_scaling_factor = moe_runner_config.routed_scaling_factor or 1.0
         # Loads wait as views of the mapped checkpoint: the post-load step replays them K
         # experts at a time.
@@ -205,6 +218,12 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             self.num_resident,
             getattr(layer, "layer_id", None),
         )
+        if self.tiered and accelerator_type() != "cuda":
+            raise RuntimeError(
+                "Paged experts: the disk tier registers its host rows with CUDA, not "
+                f"available on {accelerator_type()}; raise --paged-experts-host-memory-gb "
+                "so that every expert fits in host memory"
+            )
         if self.tiered and not self.loads.waiting:
             _cannot_tier("the checkpoint is not loaded as mapped safetensors files")
 
@@ -292,6 +311,7 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         offset = self._place(layer, num_resident, slab, offset)
         self.num_resident = num_resident
         self._set_num_slots(layer, num_resident)
+        self.contract.resize(layer, num_resident)
         self._create_runner(layer)
         self._build(layer)
         return offset
@@ -301,10 +321,15 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         layer._num_local_routed = layer._num_global_routed = num_slots
 
     def _create_runner(self, layer) -> None:
-        self.base_method.create_moe_runner(
-            layer=layer,
-            moe_runner_config=runner_config(self.moe_runner_config, self.num_resident),
-        )
+        """The base runner for the current K, configured by the contract once it is known."""
+        config = None
+        if self.contract is not None:
+            config = self.contract.runner_config(
+                self.moe_runner_config, self.num_resident
+            )
+        if config is None:
+            config = runner_config(self.moe_runner_config, self.num_resident)
+        self.base_method.create_moe_runner(layer=layer, moe_runner_config=config)
         self.runner = runner_of(self.base_method, layer)
 
     def _place(self, layer, num_resident: int, slab, offset: int) -> int:
