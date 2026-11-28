@@ -2187,9 +2187,17 @@ class Envs:
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
     SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE = EnvBool(False)
+    # ROCm gfx950, pure TP: each rank keeps 1/tp of a prefill's tokens through the
+    # replicated per-token work; attention heads and experts stay TP-sharded.
+    SGLANG_DSV4_TOKEN_PARALLEL_PREFILL = EnvBool(False)
+    # ... only for extend batches of at least this many tokens.
+    SGLANG_DSV4_TOKEN_PARALLEL_MIN_TOKENS = EnvInt(2048)
     # Decoder SWA bounded replay: eager prefill steps with up to this many tail rows
     # run the tail layers from CUDA graphs (buckets of 128 rows); 0 keeps them eager.
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS = EnvInt(2048)
+    # ... also while DSpark captures the target's aux hidden states; the captured
+    # layers are all-gathered for the draft.
+    SGLANG_DSV4_TOKEN_PARALLEL_DSPARK = EnvBool(False)
     # Prefill-graph shapes of at least this many tokens run the tail from the tail
     # graphs in a break (measured crossover 1536-2048 tokens on GB300 TP4).
     SGLANG_DSV4_DECODER_TAIL_GRAPH_MIN_PREFILL_TOKENS = EnvInt(2048)
@@ -2289,6 +2297,11 @@ class Envs:
     # gfx950 DeepSeek-V4.1 prefill: attend with aiter's OPUS sparse kernel over a bf16
     # dequant of the chunk's SWA and compressed history, instead of the decode kernel.
     SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL = EnvBool(False)
+    # With the above: gather the chunk's rows as fp8 (unit scale, RoPE cast to fp8 for
+    # P*V) plus their bf16 RoPE for QK^T, instead of the bf16 dequant, and attend with
+    # aiter's fp8 OPUS kernel. Applies to the V4 cache layout and at most 32 local
+    # heads; other layers keep bf16.
+    SGLANG_OPT_HIP_OPUS_FP8_PREFILL = EnvBool(False)
     # DSpark draft block on the HIP radix backend: build the attention metadata inside the
     # draft CUDA graph from the raw inputs instead of eagerly before every replay.
     SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA = EnvBool(_default_hip)

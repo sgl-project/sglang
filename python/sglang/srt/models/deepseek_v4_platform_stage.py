@@ -123,6 +123,10 @@ class NonCudaDecoderMixin:
         self.next_boundary = None
 
     @cached_property
+    def _mega_closed_seam(self) -> bool:
+        return mhc.can_use_mega_closed_seam(self.attn_hc)
+
+    @cached_property
     def _can_fuse_attn_mhc(self):
         return (
             get_parallel().tp_size == self.self_attn.attn_tp_size == 4
@@ -153,6 +157,10 @@ class NonCudaDecoderMixin:
 
         def run_attn_hc(state: mhc.HcState) -> mhc.HcState:
             assert self.attn_hc is not None
+            if self._mega_closed_seam:
+                state = mhc.mega_closed_seam(
+                    hc=self.attn_hc, state=state, extend=local_boundary.extend
+                )
             residual = state.residual
             quantized = [] if self.self_attn.accepts_mxfp8_swizzled_input() else None
             mhc.fork_stats_stream(stats_stream)

@@ -327,6 +327,19 @@ class AiterRunnerCore(MoeRunnerCore):
             # aiter's A8W4 kernels take interleaved gate/up rows only
             if extra.get("gate_mode") == GateMode.INTERLEAVE.value:
                 extra.setdefault("quant_dtype_a", dtypes.fp8)
+        if getattr(runner_input, "dsv4_tp_mxfp8_input", False):
+            from aiter import dtypes as aiter_dtypes
+            from aiter.ops.flydsl.moe_common import GateMode as AiterGateMode
+
+            if not (
+                quant_info.fp8_activations
+                and is_gfx95
+                and extra.get("gate_mode") == AiterGateMode.INTERLEAVE.value
+            ):
+                raise RuntimeError(
+                    "token-parallel MXFP8 MoE input needs AITER's A8W4 interleaved-gate path"
+                )
+            extra.setdefault("quant_dtype_a", aiter_dtypes.fp8)
 
         activation = extra.pop("activation", None) if is_gfx95 else None
         if activation is None:
@@ -383,12 +396,48 @@ def pre_permute_standard_to_aiter(
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
         topk_weights = torch.ones_like(topk_weights)
 
+    dsv4_tp_input = _dsv4_token_parallel_input(
+        hidden_states, topk_ids, topk_weights, quant_info
+    )
+    if dsv4_tp_input is not None:
+        return dsv4_tp_input
+
     return AiterRunnerInput(
         hidden_states=hidden_states,
         topk_ids=topk_ids.to(torch.int32),
         topk_weights=topk_weights,
         quant_type=quant_info.quant_type,
     )
+
+
+def _dsv4_token_parallel_input(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    quant_info: AiterMoeQuantInfo,
+) -> Optional[AiterRunnerInput]:
+    """DeepSeek-V4.1 token-parallel prefill hands the experts MXFP8 rows it gathered,
+    with their ue8m0 scales staged; fused_moe's passthrough then sorts the scales and
+    skips its own input quant. None for any other input (bf16 rows return at once)."""
+    if hidden_states.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+        return None
+    from sglang.srt.models.deepseek_common.amd import (
+        deepseek_v4_token_parallel as token_parallel,
+    )
+
+    scale = token_parallel.take_staged_moe_input(hidden_states)
+    if scale is None:
+        return None
+    runner_input = AiterRunnerInput(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids.to(torch.int32),
+        topk_weights=topk_weights,
+        quant_type=quant_info.quant_type,
+        a1_scale=scale,
+        output_dtype=torch.bfloat16,
+    )
+    runner_input.dsv4_tp_mxfp8_input = True
+    return runner_input
 
 
 def _is_mori_dispatch_output(dispatch_output: Any) -> bool:
