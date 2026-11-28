@@ -267,6 +267,7 @@ def _inc_lock_ref_result_from_binding(result, ids: _CoreIds) -> IncLockRefResult
         component_host_lock_uuids={
             ids.tree(ct): uuid for ct, uuid in result.component_host_lock_uuids.items()
         },
+        cache_actions=_cache_actions_from_tagged(result.cache_actions, ids),
     )
 
 
