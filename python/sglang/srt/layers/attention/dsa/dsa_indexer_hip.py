@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -566,6 +567,37 @@ def _prefill_mqa_logits_fn():
     return fp8_mqa_logits
 
 
+@functools.cache
+def _prefill_mqa_logits_takes_out() -> bool:
+    # older AITER: FlyDSL fp8_mqa_logits has no out= yet
+    return "out" in inspect.signature(_prefill_mqa_logits_fn()).parameters
+
+
+# One prefill logits buffer per (device, stream). Each chunk of a long prefill wants
+# a wider [rows, keys] fp32 tensor; a fresh one per call leaves every narrower block
+# in the caching allocator, where nothing else fits, until HIP runs out of memory.
+_prefill_logits_buffers: Dict[Tuple[int, int], torch.Tensor] = {}
+
+
+def prefill_logits_out(
+    rows: int, cols: int, device: torch.device, stream_key: int
+) -> torch.Tensor:
+    """A [rows, cols] fp32 view with the kernel's own row pitch (cols rounded up to
+    256), carved from a buffer that only grows, and then at least 2x."""
+    pitch = -(-cols // 256) * 256
+    need = rows * pitch
+    key = (device.index, stream_key)
+    buf = _prefill_logits_buffers.get(key)
+    if buf is None or buf.numel() < need:
+        grow = need if buf is None else max(need, 2 * buf.numel())
+        # release the old block before asking for the larger one
+        _prefill_logits_buffers.pop(key, None)
+        del buf
+        buf = torch.empty(grow, dtype=torch.float32, device=device)
+        _prefill_logits_buffers[key] = buf
+    return buf[:need].view(rows, pitch)[:, :cols]
+
+
 def ragged_mqa_logits(
     indexer,
     q: torch.Tensor,
@@ -586,8 +618,19 @@ def ragged_mqa_logits(
             q, weights, indexer.softmax_scale, kv_fp8, ks, ke, plans
         )
     kv, scale = kv_fp8
+    extra = {}
+    # a captured graph keeps its own allocation
+    if (
+        q.shape[0] > 0
+        and _prefill_mqa_logits_takes_out()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        stream = torch.cuda.current_stream(q.device).cuda_stream
+        extra["out"] = prefill_logits_out(q.shape[0], kv.shape[0], q.device, stream)
     # clean_logits=False: the top-k transform masks invalid positions via ks/ke
-    return _prefill_mqa_logits_fn()(q, kv, scale, weights, ks, ke, clean_logits=False)
+    return _prefill_mqa_logits_fn()(
+        q, kv, scale, weights, ks, ke, clean_logits=False, **extra
+    )
 
 
 def tp_split_topk_rows(
