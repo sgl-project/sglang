@@ -1,3 +1,4 @@
+import math
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -30,6 +31,10 @@ def parse_diff_threshold_rules(
                 f"(e.g. 0.0085); got {raw[0]!r}. For per-regex predicates pass "
                 f"(regex predicate) pairs."
             ) from e
+        if not math.isfinite(value):
+            raise ValueError(
+                f"--diff-threshold float shorthand must be finite; got {raw[0]!r}."
+            )
         return [DiffThresholdRule(".*", f"rel <= {value}")]
     if len(raw) % 2 != 0:
         raise ValueError(
