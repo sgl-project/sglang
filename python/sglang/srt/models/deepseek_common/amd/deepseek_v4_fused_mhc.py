@@ -17,12 +17,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import (
-    get_bool_env_var,
-    is_gfx95_supported,
-    is_gfx942_supported,
-    is_hip,
-)
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported, is_hip
 from sglang.srt.utils.device import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
@@ -96,7 +91,7 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
 def _is_aiter_gfx95_mhc_available() -> bool:
     return (
         _is_hip
-        and get_bool_env_var("SGLANG_USE_AITER")
+        and envs.SGLANG_USE_AITER.get()
         and (is_gfx95_supported() or is_gfx942_supported())
     )
 

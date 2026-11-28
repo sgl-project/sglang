@@ -934,7 +934,10 @@ class EncoderPreprocessor:
         self, grid: Union[torch.Tensor, List[int]], modality: Modality
     ) -> int:
         """Compatibility helper for callers that still provide patch grids."""
-        if self.model_type == "inkling2" and modality == Modality.IMAGE:
+        if (
+            self.model_type in ("inkling2", "inkling2_loop")
+            and modality == Modality.IMAGE
+        ):
             # One Inkling2 image token per 40-pixel cell of the (1, rows, cols) grid.
             return int(grid[0] * grid[1] * grid[2])
         if self.model_type == "muse_spark":
