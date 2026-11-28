@@ -77,7 +77,6 @@ def _resolve_enabled(
     return enabled
 
 
-# The field a request keeps in `SamplingParamsPool`: whether it is a candidate.
 NUM_POOL_FIELDS = 1
 
 

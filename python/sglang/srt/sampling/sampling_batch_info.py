@@ -37,10 +37,10 @@ class ProcessorEntry:
 
 
 class SamplingFacts(msgspec.Struct, frozen=True):
-    """Facts over one launch's sampling, derived once; the fast-path gates read
-    them here. The param facts come from the host side of `SamplingParamsPool`
-    (`gather`), the stage facts from the step state (`set_step_state`). The
-    defaults describe a sampled batch with no truncation and no stage."""
+    """Facts over one launch's sampling, derived once. The param facts come from
+    the host side of `SamplingParamsPool` in `gather`, the stage facts from the
+    step state (`set_step_state`). The defaults describe a sampled batch with no
+    truncation and no stage."""
 
     # Every row is greedy (top_k 1); `SamplingRows.empty` sets it for no rows.
     all_greedy: bool = False
@@ -65,12 +65,11 @@ class SamplingFacts(msgspec.Struct, frozen=True):
 
     @property
     def truncates(self) -> bool:
-        """Whether some row truncates its distribution with top-k, top-p, or min-p."""
         return self.need_top_k or self.need_top_p or self.need_min_p
 
     @property
     def edits_logits(self) -> bool:
-        """Whether some stage edits the logits before the sampler or accept reads them."""
+        """Whether some stage edits the logits the sampler or accept reads."""
         return (
             self.grammar
             or self.watermark
@@ -122,10 +121,8 @@ class SamplingBatchInfo:
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
     def set_step_state(self, reqs: List[Req], rows: SamplingRows) -> None:
-        """Set one launch's state: the rows gathered from `SamplingParamsPool`; the
-        stages' inputs built from the step's requests (logit_bias, the grammars,
-        the custom logit processors, and the sampling-mask rows); then the facts,
-        the rows' param facts plus the stage facts."""
+        """Set one launch's state: the gathered `rows`, the stages' inputs built from
+        `reqs`, then the facts over both."""
         for name, value in zip(rows._fields, rows):
             setattr(self, name, value)
 

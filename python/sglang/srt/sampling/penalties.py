@@ -226,9 +226,7 @@ class PenaltyStatusPool:
             self._write_pending()
 
     def _write_pending(self) -> None:
-        """Write the queued params and history resets with one copy: everything
-        queued goes into one int64 host array, split on the device into a view per
-        segment."""
+        """Write the queued params and history resets with one copy."""
         tables = self.tables
         params = list(self.pending_params.values())
         histories = list(self.pending_init.values())
