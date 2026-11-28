@@ -474,6 +474,8 @@ class _InsertWalkState(msgspec.Struct):
     overlap_prefix_len: int = 0
     # Emitted actions awaiting the next barrier flush (or the final step).
     pending_actions: list[CacheAction | ComponentAction] = []
+    # The node the walk's last buffer-only backup ended on; later chains stop there.
+    backup_chain_tail: Optional[NodeId] = None
 
 
 class UnifiedTreeCore(UnifiedTreeCoreInterface):
@@ -500,9 +502,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
-        self.enable_external_cache_linker = False
+        self._enable_external_cache_linker = False
         self.write_through_threshold = 256
         self.is_write_back = False
+        self.mamba_path_cap_counts_host = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
         self.eviction_strategy = get_eviction_strategy(
@@ -628,6 +631,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """
         return self._node_arena[node_id]
 
+    @property
+    def enable_external_cache_linker(self) -> bool:
+        return self._enable_external_cache_linker
+
+    @enable_external_cache_linker.setter
+    def enable_external_cache_linker(self, value: bool) -> None:
+        # Stored marks describe the store being detached, not the next one.
+        if not value:
+            for node in self._node_arena.values():
+                node.external_cache_stored = False
+        self._enable_external_cache_linker = value
+
     def is_write_through_compatible(self) -> bool:
         for node in self._node_arena.values():
             if node is self.root_node:
@@ -647,6 +662,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_backuped(self, node_id: NodeId) -> bool:
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
+
+    def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        """Whether an auxiliary component has device data missing from host."""
+        return self._needs_incremental_component_backup(self.node_by_id(node_id))
 
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
@@ -1540,7 +1559,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Nodes this request already inserted were counted back then.
         node_end = state.total_prefix_length + prefix_len
         if node_end > state.params.inserted_len and self._inc_hit_count_and_check(node):
-            state.pending_actions.append(self._build_backup_kv_action(node))
+            state.pending_actions.append(self._insert_backup_action(state, node))
         state.node = node
         state.total_prefix_length += prefix_len
         state.key = state.key[prefix_len:]
@@ -1628,9 +1647,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         if self._should_backup_after_insert(state):
             state.pending_actions.append(
-                self._build_backup_kv_action(
-                    state.target_node, write_back=self.is_write_back
-                )
+                self._insert_backup_action(state, state.target_node)
             )
 
     def _split_node(
@@ -1773,7 +1790,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.evictable_device_leaves.discard(node)
 
         if self._is_host_leaf(node):
-            self.evictable_host_leaves.add(node)
+            if node not in self.evictable_host_leaves:
+                self.evictable_host_leaves.add(node)
+                self.components_by_type[BASE_COMPONENT_TYPE].on_host_leaf_added(node)
         else:
             self.evictable_host_leaves.discard(node)
 
@@ -2082,12 +2101,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         ), f"D-leaf {node.id} has write {node.write_through_pending_id} in flight"
         self._begin_tracking_unbacked_tokens()
         try:
+            if is_write_back and (
+                not node.backuped or self._needs_incremental_component_backup(node)
+            ):
+                result.backup_kv = self._build_backup_kv_action(node, write_back=True)
+                return result
             if not node.backuped:
-                if is_write_back:
-                    result.backup_kv = self._build_backup_kv_action(
-                        node, write_back=True
-                    )
-                    return result
                 # Write-through: node has no backup, delete entirely.
                 self._delete_unbacked_device_leaf(
                     node,
@@ -2730,6 +2749,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_host_memory_buffer_only(self) -> None:
         self.is_host_memory_buffer_only = True
 
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        self.mamba_path_cap_counts_host = enabled
+
     def insert_host(
         self,
         node_id: NodeId,
@@ -2962,16 +2984,30 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return None, None
         return node.key.extra_key, node.key.cache_salt
 
+    def _insert_backup_action(
+        self, state: _InsertWalkState, node: UnifiedTreeNode
+    ) -> BackupKV:
+        """The walk's write-through backup for a node; buffer-only chains stop where
+        the previous one ended."""
+        if not self.is_host_memory_buffer_only:
+            return self._build_backup_kv_action(node)
+        stop_at, state.backup_chain_tail = state.backup_chain_tail, node.id
+        return self._build_backup_kv_action(node, stop_at=stop_at)
+
     def _build_backup_kv_action(
-        self, node: UnifiedTreeNode, write_back: bool = False
+        self,
+        node: UnifiedTreeNode,
+        write_back: bool = False,
+        stop_at: Optional[NodeId] = None,
     ) -> BackupKV:
         """Build the backup action for a node; write-through also chains its
-        unbacked ancestors."""
+        unbacked ancestors below ``stop_at``."""
         chain = [node]
         if not write_back:
             ancestor = node.parent
             while (
                 ancestor is not None
+                and ancestor.id != stop_at
                 and ancestor is not self.root_node
                 and not ancestor.backuped
                 and not ancestor.external_cache_stored

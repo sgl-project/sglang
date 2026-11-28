@@ -4,6 +4,7 @@ import types
 import unittest
 
 import torch
+from fastapi import HTTPException
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_deserialize,
@@ -364,6 +365,71 @@ class TestBuildResponse(unittest.TestCase):
         self.assertIsNotNone(resps[0].generated_output)
 
 
+class TestRolloutGenerateEndpoint(unittest.TestCase):
+    def _generate(self, **request_fields):
+        import asyncio
+        from unittest.mock import patch
+
+        import msgspec
+
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training import (
+            rollout_api,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+            RolloutRequest,
+        )
+
+        async def forward(pipeline_request):
+            return OutputBatch(output=torch.zeros(1, 3, 1, 8, 8))
+
+        def build_sampling_params(request_id, **kwargs):
+            return SamplingParams(request_id=request_id, **kwargs)
+
+        with (
+            patch.object(rollout_api, "get_global_server_args", return_value=None),
+            patch.object(rollout_api, "build_sampling_params", build_sampling_params),
+            patch.object(rollout_api, "prepare_request", lambda **kwargs: None),
+            patch.object(
+                rollout_api,
+                "async_scheduler_client",
+                types.SimpleNamespace(forward=forward),
+            ),
+        ):
+            response = asyncio.run(
+                rollout_api.rollout_generate(
+                    RolloutRequest(
+                        prompt="x",
+                        num_inference_steps=4,
+                        rollout=False,
+                        **request_fields,
+                    )
+                )
+            )
+
+        payload = msgspec.msgpack.decode(response.body)
+        self.assertEqual(len(payload), 1)
+        return payload[0]
+
+    def test_request_without_seed_reports_the_seed_that_was_used(self):
+        """`seed` is optional on the request; a seedless rollout must return the
+        generated sample with the default seed it ran with, not fail after generation."""
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+
+        self.assertEqual(self._generate()["seed"], SamplingParams.seed)
+
+    def test_request_seed_is_reported_next_to_a_per_sample_seed_list(self):
+        """`extra_sampling_params` may carry a list of seeds, which the response's
+        integer `seed` field cannot hold; the request's own seed is reported."""
+        sample = self._generate(seed=7, extra_sampling_params={"seed": [3, 4]})
+
+        self.assertEqual(sample["seed"], 7)
+
+
 class TestBuildSamplingKwargs(unittest.TestCase):
     def _make_request(self, **overrides):
         from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
@@ -414,6 +480,93 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         req = Req(sampling_params=sp)
         self.assertEqual(req.rollout_sde_step_indices, [0, 2])
         self.assertEqual(req.rollout_return_step_indices, [1, 3])
+
+    def test_extra_sampling_params_allows_sampling_knobs(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        kwargs = _build_sampling_kwargs(
+            self._make_request(
+                extra_sampling_params={
+                    "guidance_scale_2": 2.5,
+                    "enable_teacache": True,
+                }
+            )
+        )
+        self.assertEqual(kwargs["guidance_scale_2"], 2.5)
+        self.assertTrue(kwargs["enable_teacache"])
+
+    def test_extra_sampling_params_rejects_path_and_output_control_fields(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        # Regression test for sglang#51555: an unauthenticated client could
+        # inject these through extra_sampling_params and make GPUWorker
+        # create directories / overwrite arbitrary files (perf_dump_path)
+        # or re-enable on-disk output (save_output + output_path).
+        for field, value in [
+            ("perf_dump_path", "/tmp/evil/report.json"),
+            ("output_path", "/tmp/evil"),
+            ("output_file_name", "evil.mp4"),
+            ("save_output", True),
+            ("image_path", "/etc/passwd"),
+            ("video_path", "/etc/passwd"),
+            ("prompt_path", "/etc/passwd"),
+            ("frame_interpolation_model_path", "/tmp/evil/model.pkl"),
+            ("upscaling_model_path", "/tmp/evil/model.pth"),
+            ("request_id", "spoofed"),
+            ("data_type", "IMAGE"),
+            ("task_type", "ACTION"),
+            ("no_override_protected_fields", True),
+            # not a SamplingParams field at all (incl. the nested
+            # diffusers_kwargs escape hatch): unknown keys are rejected too.
+            ("diffusers_kwargs", {"key": "value"}),
+            ("not_a_real_field", 1),
+        ]:
+            with self.subTest(field=field):
+                with self.assertRaises(HTTPException) as ctx:
+                    _build_sampling_kwargs(
+                        self._make_request(extra_sampling_params={field: value})
+                    )
+                self.assertEqual(ctx.exception.status_code, 400)
+                self.assertIn(field, ctx.exception.detail)
+
+    def test_extra_sampling_params_none_values_are_ignored(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        # None means "unset" for an allowed knob: it is dropped by the
+        # None filter below. A blocked field set to None is still rejected:
+        # stripping it would let the downstream default (e.g. save_output
+        # defaults to True in build_sampling_params) silently re-enable
+        # the behaviour this endpoint forces off.
+        kwargs = _build_sampling_kwargs(
+            self._make_request(extra_sampling_params={"guidance_scale_2": None})
+        )
+        self.assertNotIn("guidance_scale_2", kwargs)
+        with self.assertRaises(HTTPException) as ctx:
+            _build_sampling_kwargs(
+                self._make_request(extra_sampling_params={"save_output": None})
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_extra_sampling_params_model_specific_field_needs_server_args(self):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+
+        # video_cfg_scale only exists on the LTX SamplingParams subclass. With
+        # no global server args set, the allowlist falls back to the base
+        # class, so it is rejected here; with a running LTX server it is
+        # allowed (the subclass is resolved from the global server args).
+        with self.assertRaises(HTTPException) as ctx:
+            _build_sampling_kwargs(
+                self._make_request(extra_sampling_params={"video_cfg_scale": 3.0})
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
 
 
 if __name__ == "__main__":

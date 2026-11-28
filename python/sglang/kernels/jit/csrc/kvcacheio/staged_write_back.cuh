@@ -61,6 +61,18 @@ inline auto call_cuda_memcpy_batch_async(
 }
 #endif
 
+#if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
+using HipMemcpyBatchAsyncFn = decltype(&hipMemcpyBatchAsync);
+
+inline auto get_hip_memcpy_batch_async() -> HipMemcpyBatchAsyncFn {
+  static HipMemcpyBatchAsyncFn hip_memcpy_batch_async = []() {
+    void* symbol = dlsym(RTLD_DEFAULT, "hipMemcpyBatchAsync");
+    return reinterpret_cast<HipMemcpyBatchAsyncFn>(symbol);
+  }();
+  return hip_memcpy_batch_async;
+}
+#endif
+
 inline void copy_page_first_pages_fallback(
     const std::vector<tvm::ffi::TensorView>& src_ptrs,
     std::vector<tvm::ffi::TensorView> dst_ptrs,
@@ -99,7 +111,59 @@ inline bool try_copy_page_first_pages_batch(
     int64_t page_size,
     int device_id,
     cudaStream_t stream) {
-#if defined(USE_ROCM) || !defined(CUDA_VERSION) || (CUDA_VERSION < 12080)
+#if defined(USE_ROCM) && defined(HIP_VERSION) && HIP_VERSION >= 70100000
+  host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");
+  auto copy_fn = get_hip_memcpy_batch_async();
+  if (copy_fn == nullptr) {
+    return false;
+  }
+  thread_local std::vector<void*> batch_srcs;
+  thread_local std::vector<void*> batch_dsts;
+  thread_local std::vector<size_t> batch_sizes;
+
+  const size_t num_copies = static_cast<size_t>(src_ptrs.size()) * static_cast<size_t>(num_pages);
+  batch_srcs.clear();
+  batch_dsts.clear();
+  batch_sizes.clear();
+  batch_srcs.reserve(num_copies);
+  batch_dsts.reserve(num_copies);
+  batch_sizes.reserve(num_copies);
+
+  for (const auto tensor_id : host::irange(src_ptrs.size())) {
+    host::RuntimeCheck(
+        src_ptrs[tensor_id].dtype() == dst_ptrs[tensor_id].dtype(),
+        "Source and destination tensors must have the same dtype");
+    const int64_t elem_size = host::dtype_bytes(src_ptrs[tensor_id].dtype());
+    const int64_t src_stride0 = src_ptrs[tensor_id].stride(0);
+    const int64_t dst_stride0 = dst_ptrs[tensor_id].stride(0);
+    const size_t src_page_bytes = static_cast<size_t>(page_size * src_stride0 * elem_size);
+    const size_t dst_page_bytes = static_cast<size_t>(page_size * dst_stride0 * elem_size);
+    host::RuntimeCheck(src_page_bytes == dst_page_bytes, "Source and destination page spans must match");
+    for (const auto page_offset : host::irange(num_pages)) {
+      char* src_ptr = static_cast<char*>(src_ptrs[tensor_id].data_ptr()) +
+                      static_cast<size_t>(page_offset * page_size * src_stride0 * elem_size);
+      char* dst_ptr = static_cast<char*>(dst_ptrs[tensor_id].data_ptr()) +
+                      static_cast<size_t>(dst_indices_ptr[page_offset * page_size] * dst_stride0 * elem_size);
+      batch_srcs.push_back(src_ptr);
+      batch_dsts.push_back(dst_ptr);
+      batch_sizes.push_back(src_page_bytes);
+    }
+  }
+
+  hipMemcpyAttributes attrs{};
+  attrs.srcAccessOrder = hipMemcpySrcAccessOrderStream;
+  size_t attrs_idx = 0;
+  size_t fail_idx = std::numeric_limits<size_t>::max();
+  const hipError_t err = copy_fn(
+      batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), num_copies, &attrs, &attrs_idx, 1, &fail_idx, stream);
+  if (err == hipErrorNotSupported && fail_idx == std::numeric_limits<size_t>::max()) {
+    (void)hipGetLastError();
+    return false;
+  }
+  host::RuntimeCheck(
+      err == hipSuccess, "hipMemcpyBatchAsync failed. failIdx=", fail_idx, " error=", hipGetErrorString(err));
+  return true;
+#elif defined(USE_ROCM) || !defined(CUDA_VERSION) || (CUDA_VERSION < 12080)
   return false;
 #else
   host::RuntimeCheck(src_ptrs.size() == dst_ptrs.size(), "Source and destination tensors must have the same count");

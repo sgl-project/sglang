@@ -5,7 +5,7 @@
 //! pipeline handoff ([`MmSpec`]).
 //!
 //! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] / [`RequestLogConfig`] /
-//! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
+//! [`Http2Config`] / [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
 //! [`MmFamily`] / [`MmResample`] are
 //! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
 //! / `_build_mm_spec`) constructs them directly by keyword and hands them to
@@ -80,6 +80,8 @@ pub struct RuntimeConfig {
     pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
     /// A model package's admission check on every client generation.
     pub generate_validator: Option<Arc<dyn crate::GenerateValidator>>,
+    /// A model package's hook on every abort that names live requests.
+    pub abort_hook: Option<Arc<dyn crate::AbortHook>>,
     /// A model package's own scheduler `internal_state` fields, which
     /// `/server_info` reports by name after its typed ones. No other
     /// scheduler field is reported: the state also carries the launch
@@ -94,6 +96,7 @@ impl Default for RuntimeConfig {
             server_args: Arc::new(ServerArgs::default()),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         }
     }
@@ -143,6 +146,9 @@ pub struct ServerArgs {
     /// HTTP bind address (see [`Self::bind`]).
     pub host: String,
     pub port: u16,
+    /// `--enable-http2`: the HTTP listener also serves HTTP/2 over cleartext
+    /// (h2c) on the same port; `None` serves HTTP/1.1 only.
+    pub http2: Option<Http2Config>,
     /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
     /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
     pub grpc_port: Option<u16>,
@@ -182,9 +188,19 @@ pub struct ServerArgs {
     /// Start accepting health checks immediately instead of waiting for the
     /// main process's startup warmup request to finish.
     pub skip_server_warmup: bool,
+    /// The image Python's startup warmup sends a VLM, as base64 PNG data
+    /// (`_execute_server_warmup`): the warmup then generates from it and a
+    /// chat prompt instead of from text. `None` warms with text.
+    pub vlm_warmup_image_base64: Option<String>,
+    /// That warmup's prompt, rendered by the launcher for a chat template
+    /// this server cannot render; `None` renders it with the served one.
+    pub vlm_warmup_prompt: Option<String>,
     /// `--gc-threshold`: the thresholds the scheduler ranks set when they
     /// freeze their garbage collectors after startup; `None` keeps Python's.
     pub gc_threshold: Option<Vec<i64>>,
+    /// Keep health at 503 until Python reports that its `--warmups` finished
+    /// ([`crate::Server::finish_custom_warmups`]).
+    pub custom_warmups_pending: bool,
     /// Extra headers on a successful `/health_generate` response, for a router
     /// that reads deployment metadata off the deep health probe.
     pub health_generate_headers: BTreeMap<String, String>,
@@ -224,10 +240,12 @@ pub struct ServerArgs {
     /// `max_new_tokens` is clamped rather than rejected (Python
     /// `TokenizerManager._validate_one_request`).
     pub allow_auto_truncate: bool,
-    /// `return_hidden_states` is refused unless the server was launched with it:
-    /// the scheduler simply won't produce them, so the request would 200 with the
-    /// field silently missing.
+    /// The resolved `--enable-return-hidden-states`;
+    /// decides the mode only when `return_hidden_states_mode` is unset.
     pub enable_return_hidden_states: bool,
+    /// The resolved `--return-hidden-states-mode` (`None`, `"last"` or `"full"`):
+    /// the most a request's `return_hidden_states` may ask for.
+    pub return_hidden_states_mode: Option<String>,
     /// Output slots reserved per request on top of its input (eagle stores draft
     /// tokens there). Not a `server_args` field — `TokenizerManager` derives it and
     /// `RustServer._build_server_args` stamps it in, so both sides count alike.
@@ -240,6 +258,9 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// The scheduler's request length limits (`get_request_length_limits`).
+    pub max_req_len: u64,
+    pub max_req_input_len: u64,
     /// Resolved deployment metadata used by out-of-process orchestrators.
     pub deployment_info: DeploymentInfo,
     /// Python's `/server_info` fields that are fixed at launch, which
@@ -287,6 +308,7 @@ impl ServerArgs {
         hicache_write_policy,
         host,
         port,
+        http2,
         grpc_port,
         grpc_response_timeout_secs,
         api_key,
@@ -303,7 +325,10 @@ impl ServerArgs {
         detokenizer_worker_num,
         skip_tokenizer_init,
         skip_server_warmup,
+        vlm_warmup_image_base64,
+        vlm_warmup_prompt,
         gc_threshold,
+        custom_warmups_pending,
         health_generate_headers,
         default_priority_value,
         enable_request_header_overrides,
@@ -318,10 +343,13 @@ impl ServerArgs {
         limit_mm_data_per_request,
         allow_auto_truncate,
         enable_return_hidden_states,
+        return_hidden_states_mode,
         num_reserved_tokens,
         tokenizer_model_max_length,
         version,
         max_total_num_tokens,
+        max_req_len,
+        max_req_input_len,
         deployment_info,
         launch_server_info,
         launch_model_info,
@@ -351,6 +379,7 @@ impl ServerArgs {
         hicache_write_policy: Option<String>,
         host: String,
         port: u16,
+        http2: Option<Http2Config>,
         grpc_port: Option<u16>,
         grpc_response_timeout_secs: u64,
         api_key: Option<String>,
@@ -367,7 +396,10 @@ impl ServerArgs {
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
+        vlm_warmup_image_base64: Option<String>,
+        vlm_warmup_prompt: Option<String>,
         gc_threshold: Option<Vec<i64>>,
+        custom_warmups_pending: bool,
         health_generate_headers: BTreeMap<String, String>,
         default_priority_value: Option<i64>,
         enable_request_header_overrides: bool,
@@ -382,10 +414,13 @@ impl ServerArgs {
         limit_mm_data_per_request: Vec<(String, usize)>,
         allow_auto_truncate: bool,
         enable_return_hidden_states: bool,
+        return_hidden_states_mode: Option<String>,
         num_reserved_tokens: u64,
         tokenizer_model_max_length: i64,
         version: String,
         max_total_num_tokens: u64,
+        max_req_len: u64,
+        max_req_input_len: u64,
         deployment_info: DeploymentInfo,
         launch_server_info: JsonObject,
         launch_model_info: JsonObject,
@@ -413,6 +448,7 @@ impl ServerArgs {
             hicache_write_policy,
             host,
             port,
+            http2,
             grpc_port,
             grpc_response_timeout_secs,
             api_keys: ApiKeys::new(api_key, admin_api_key),
@@ -429,7 +465,10 @@ impl ServerArgs {
             detokenizer_worker_num,
             skip_tokenizer_init,
             skip_server_warmup,
+            vlm_warmup_image_base64,
+            vlm_warmup_prompt,
             gc_threshold,
+            custom_warmups_pending,
             health_generate_headers,
             default_priority_value,
             enable_request_header_overrides,
@@ -444,10 +483,13 @@ impl ServerArgs {
             limit_mm_data_per_request,
             allow_auto_truncate,
             enable_return_hidden_states,
+            return_hidden_states_mode,
             num_reserved_tokens,
             tokenizer_model_max_length,
             version,
             max_total_num_tokens,
+            max_req_len,
+            max_req_input_len,
             deployment_info,
             launch_server_info,
             launch_model_info,
@@ -469,6 +511,9 @@ impl Default for ServerArgs {
     /// complete `model_config` so the runtime boots. Real launches never use
     /// this — Python supplies every field.
     fn default() -> Self {
+        let model_config = ModelConfig::default();
+        // `get_request_length_limits` for an unbounded KV pool, no dLLM block, nothing reserved.
+        let max_req_len = model_config.context_len;
         Self {
             model_path: String::new(),
             served_model_name: String::new(),
@@ -483,6 +528,7 @@ impl Default for ServerArgs {
             hicache_write_policy: None,
             host: "127.0.0.1".into(),
             port: 30000,
+            http2: None,
             grpc_port: None,
             grpc_response_timeout_secs: DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
             api_keys: ApiKeys::default(),
@@ -498,14 +544,17 @@ impl Default for ServerArgs {
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
             skip_server_warmup: false,
+            vlm_warmup_image_base64: None,
+            vlm_warmup_prompt: None,
             gc_threshold: None,
+            custom_warmups_pending: false,
             health_generate_headers: BTreeMap::new(),
             default_priority_value: None,
             enable_request_header_overrides: false,
             enable_request_decompression: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
-            model_config: ModelConfig::default(),
+            model_config,
             preferred_sampling_params: None,
             default_max_new_tokens: Some(128),
             lora_ids: BTreeMap::new(),
@@ -513,10 +562,13 @@ impl Default for ServerArgs {
             limit_mm_data_per_request: Vec::new(),
             allow_auto_truncate: false,
             enable_return_hidden_states: false,
+            return_hidden_states_mode: None,
             num_reserved_tokens: 0,
             tokenizer_model_max_length: -1,
             version: String::new(),
             max_total_num_tokens: 0,
+            max_req_len,
+            max_req_input_len: max_req_len - 1 - 5,
             deployment_info: DeploymentInfo::default(),
             launch_server_info: JsonObject::default(),
             launch_model_info: JsonObject::default(),
@@ -579,6 +631,22 @@ pub struct DeploymentInfo {
     pub max_prefill_tokens: u64,
     pub enable_dp_attention: bool,
     pub speculative_algorithm: Option<String>,
+    /// `--speculative-ngram-external-corpus-max-tokens`; 0 when the launcher
+    /// did not pass it.
+    pub speculative_ngram_external_corpus_max_tokens: u64,
+    /// `--gc-threshold`, which `/freeze_gc` forwards to every scheduler.
+    pub gc_threshold: Option<Vec<i64>>,
+    /// `--enable-pd-role-switch`.
+    pub enable_pd_role_switch: bool,
+    /// `--elastic-ep-backend`; `None` when elastic EP is off, which is what
+    /// `/scale_elastic_ep` and `/is_scaling_elastic_ep` report.
+    pub elastic_ep_backend: Option<String>,
+    /// `--enable-streaming-session`, which `/open_session` needs for a
+    /// streaming session.
+    pub enable_streaming_session: bool,
+    /// The engine-info bootstrap server (`--engine-info-bootstrap-port`), as
+    /// the base URL Python's `ServerArgs.engine_info_bootstrap_url` builds.
+    pub engine_info_bootstrap_url: Option<String>,
     pub enable_hierarchical_cache: bool,
     pub hicache_ratio: Option<f64>,
     pub hicache_size: u64,
@@ -590,11 +658,41 @@ pub struct DeploymentInfo {
     pub node_listeners: Vec<NodeRustListener>,
 }
 
+impl DeploymentInfo {
+    /// What Python reports as `meta_info.dp_rank`: the scheduler's DP rank,
+    /// `None` without DP. `dp_rank` is the listener and KV-publisher index, so
+    /// it is 0 without DP. The two agree with more than one DP rank, whether
+    /// attention-DP groups or replicas. A rank set only by `SGLANG_DP_RANK`
+    /// with one DP rank reports `None` here, where Python reports it.
+    pub fn reported_dp_rank(&self) -> Option<u32> {
+        self.dp_rank.filter(|_| self.dp_size > 1)
+    }
+}
+
 /// One DP rank's listener, as a base URL (`http://host:port`).
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct RustServerEndpoint {
     pub dp_rank: u32,
     pub endpoint: String,
+    /// The secret this listener's control relay route requires (see
+    /// `api_server::core::peer`), drawn at launch by the rank that hosts the
+    /// listener and shared with the other ranks only through their startup
+    /// all-gather. Never serialized, so `/server_info` does not publish it.
+    #[serde(default, skip_serializing)]
+    pub peer_token: Option<String>,
+}
+
+impl std::fmt::Debug for RustServerEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustServerEndpoint")
+            .field("dp_rank", &self.dp_rank)
+            .field("endpoint", &self.endpoint)
+            .field(
+                "peer_token",
+                &self.peer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -623,6 +721,30 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
                 "deployment_info is not valid JSON: {e}"
             ))
         })
+    }
+}
+
+/// HTTP/2 settings, as Python's server (Granian) takes them with
+/// `--enable-http2`.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct Http2Config {
+    /// `--http2-max-concurrent-streams`: the streams one connection may open.
+    pub max_concurrent_streams: u32,
+    /// `--http2-initial-connection-window-size`: the connection-level receive
+    /// window, in bytes.
+    pub initial_connection_window_size: u32,
+}
+
+#[pyo3::pymethods]
+impl Http2Config {
+    #[new]
+    #[pyo3(signature = (*, max_concurrent_streams, initial_connection_window_size))]
+    fn py_new(max_concurrent_streams: u32, initial_connection_window_size: u32) -> Self {
+        Self {
+            max_concurrent_streams,
+            initial_connection_window_size,
+        }
     }
 }
 
@@ -860,7 +982,7 @@ impl<'py> pyo3::FromPyObject<'_, 'py> for JsonObject {
     module = "sglang.srt.rust_extensions._server"
 )]
 // Lowercase to match the values Python reports for the same field.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DisaggregationMode {
     /// Unified prefill + decode.
@@ -868,6 +990,26 @@ pub enum DisaggregationMode {
     Null,
     Prefill,
     Decode,
+}
+
+/// How much of the hidden states a request asks for or a server allows,
+/// ordered like Python's `CaptureHiddenMode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HiddenStatesMode {
+    Null,
+    Last,
+    Full,
+}
+
+impl DisaggregationMode {
+    /// The value Python reports for the same field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Prefill => "prefill",
+            Self::Decode => "decode",
+        }
+    }
 }
 
 /// The slice of the resolved Python `ModelConfig` the rust server reads.
@@ -1071,7 +1213,7 @@ pub enum MmFamily {
 pub enum MmResample {
     /// `Qwen2VLImageProcessor` / `…Fast` — torchvision on a uint8 tensor.
     AtenU8,
-    /// `Qwen2VLImageProcessorPil`, behind `--disable-fast-image-processor`.
+    /// `Qwen2VLImageProcessorPil`, behind `--image-processor-backend pil`.
     Pil,
 }
 
@@ -1127,6 +1269,17 @@ impl ServerArgs {
             .map_err(|e| format!("invalid preferred_sampling_params: {e}"))?;
         }
         Ok(())
+    }
+
+    /// The most a request's `return_hidden_states` may ask for
+    /// (Python `get_server_return_hidden_states_mode`).
+    pub fn hidden_states_mode(&self) -> HiddenStatesMode {
+        match self.return_hidden_states_mode.as_deref() {
+            Some("last") => HiddenStatesMode::Last,
+            Some("full") => HiddenStatesMode::Full,
+            _ if self.enable_return_hidden_states => HiddenStatesMode::Full,
+            _ => HiddenStatesMode::Null,
+        }
     }
 
     /// True on a prefill or decode node — requests need bootstrap routing.

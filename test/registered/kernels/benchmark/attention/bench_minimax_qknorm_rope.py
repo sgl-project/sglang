@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.minimax_qknorm_rope import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
+    est_time=12, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
 
 HEAD_DIM, ROTARY_DIM, BASE, EPS, MAXPOS = 128, 64, 5_000_000, 1e-6, 131072
@@ -67,7 +67,7 @@ FN_MAP = {"fused": _fused, "unfused_torch": _unfused}
 
 
 @marker.parametrize("T", [1, 16, 64, 256, 1024, 8192], [64, 1024])
-@marker.benchmark("impl", ["fused", "unfused_torch"])
+@marker.benchmark("impl", ["fused", "unfused_torch"], gate=["fused"])
 def benchmark(T: int, impl: str):
     cache = _cache()
     wq = (torch.randn(HEAD_DIM, device="cuda") * 0.1).to(torch.bfloat16)
@@ -127,7 +127,9 @@ C_FN_MAP = {"combined_one_launch": _combined_one, "two_launches": _combined_two}
 
 
 @marker.parametrize("T", [1, 16, 64, 256, 1024, 8192], [64, 1024])
-@marker.benchmark("impl", ["combined_one_launch", "two_launches"])
+@marker.benchmark(
+    "impl", ["combined_one_launch", "two_launches"], gate=["combined_one_launch"]
+)
 def benchmark_combined(T: int, impl: str):
     cache = _cache()
     ws = [
@@ -169,7 +171,7 @@ F_FN_MAP = {"fp8_epilogue": _fp8_epilogue, "cast_after": _fp8_cast_after}
 
 
 @marker.parametrize("T", [1, 16, 64, 256, 1024, 8192], [64, 1024])
-@marker.benchmark("impl", ["fp8_epilogue", "cast_after"])
+@marker.benchmark("impl", ["fp8_epilogue", "cast_after"], gate=["fp8_epilogue"])
 def benchmark_fp8_epilogue(T: int, impl: str):
     cache = _cache()
     ws = [(torch.randn(HEAD_DIM, device="cuda") * 0.1).bfloat16() for _ in range(4)]

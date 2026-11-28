@@ -302,6 +302,7 @@ struct FusedStoreCacheIndexerKernel {
         .with_device(device_)
         .verify(indices);
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) return;
     const auto params = FusedStoreCacheParam{
         .input = input.data_ptr(),
         .cache = cache.data_ptr(),

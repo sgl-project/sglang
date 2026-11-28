@@ -3,16 +3,13 @@
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     _maybe_wrap_hicache_storage_failure_injector,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +199,12 @@ class StorageBackendFactory:
             elif mem_pool_host.layout == "layer_first":
                 bytes_per_page = (
                     mem_pool_host.get_size_per_token() * mem_pool_host.page_size
+                )
+            else:
+                raise ValueError(
+                    "The hf3fs storage backend does not support "
+                    f"--hicache-mem-layout {mem_pool_host.layout!r}; supported "
+                    "layouts: page_first, page_first_direct, layer_first."
                 )
 
             dtype = mem_pool_host.dtype

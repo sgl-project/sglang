@@ -44,7 +44,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=26, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=25, suite="base-b-test-1-gpu-small-amd")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -162,7 +162,7 @@ def create_bench_cache(
             size=max_num_reqs,
             mamba_size=max(max_num_reqs * 2, 200),
             mamba_spec_state_size=max_num_reqs,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
             cache_params=mamba2_cache_params,
@@ -175,7 +175,7 @@ def create_bench_cache(
 
         req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
         )

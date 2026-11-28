@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
 import torch
 
-from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
+from sglang.srt.arg_groups.choices import (
+    DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    DRAFT_ATTENTION_BACKEND_CHOICES,
+)
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -49,7 +53,7 @@ def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) 
         draft_backend, _ = attention_backends()
     if draft_backend is None:
         return platform_fallback
-    if algo_label == "DFLASH" and draft_backend == "cutedsl_mla":
+    if algo_label == "DFLASH" and draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
         return draft_backend
     if draft_backend not in DRAFT_ATTENTION_BACKEND_CHOICES:
         fallback = platform_fallback
@@ -118,19 +122,34 @@ def build_draft_tp_worker(
     )
 
 
+@functools.lru_cache(maxsize=64)
+def _zero_width_relay_fields(
+    bs: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # Zero-width (no elements): nothing can be written into them, so one set per
+    # (bs, device) serves every step's draft input.
+    return (
+        torch.empty((bs, 0), device=device, dtype=torch.float32),
+        torch.empty((bs, 0), device=device, dtype=torch.int64),
+        torch.empty((bs, 0), device=device, dtype=torch.float16),
+    )
+
+
 def make_draft_input_v2(
     *,
     bonus_tokens: torch.Tensor,
     new_seq_lens: torch.Tensor,
 ) -> DFlashDraftInputV2:
     bs = int(new_seq_lens.numel())
-    device = bonus_tokens.device
+    topk_p, topk_index, hidden_states = _zero_width_relay_fields(
+        bs, bonus_tokens.device
+    )
     return DFlashDraftInputV2(
-        topk_p=torch.empty((bs, 0), device=device, dtype=torch.float32),
-        topk_index=torch.empty((bs, 0), device=device, dtype=torch.int64),
+        topk_p=topk_p,
+        topk_index=topk_index,
         bonus_tokens=bonus_tokens.to(dtype=torch.int64),
         new_seq_lens=new_seq_lens.to(dtype=torch.int64),
-        hidden_states=torch.empty((bs, 0), device=device, dtype=torch.float16),
+        hidden_states=hidden_states,
     )
 
 

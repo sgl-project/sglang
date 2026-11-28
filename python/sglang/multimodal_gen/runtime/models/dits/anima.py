@@ -17,6 +17,9 @@ from sglang.kernels.ops.diffusion import (
 from sglang.multimodal_gen.configs.models.dits.anima import AnimaDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.distributed import get_tp_world_size
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
+)
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     gather_seq,
     shard_like,
@@ -30,18 +33,26 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    DENOISING_LOOP_STATE,
+    get_forward_context,
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
+from sglang.multimodal_gen.runtime.models.dits.common import layernorm_modulate_bitexact
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.utils import is_device_stream_capturing
 
 logger = init_logger(__name__)
 
 
+_ANIMA_LN_MOD = BitExactFusionGate("Anima LayerNorm modulation", per_signature=True)
 _ANIMA_ROPE = BitExactFusionGate("Anima FP32 RoPE", per_signature=True)
 
 
@@ -164,29 +175,46 @@ class AnimaAdaLayerNorm(nn.Module):
             rank, (3 if gated else 2) * hidden_size, bias=False
         )
 
-    def forward(self, x, embedded_timestep, temb):
+    def project_modulation(self, embedded_timestep, temb):
         modulation = self.linear_1(torch.nn.functional.silu(embedded_timestep))[0]
         modulation = self.linear_2(modulation)[0]
         modulation = modulation + temb[..., : modulation.shape[-1]]
-        values = modulation.unsqueeze(1).chunk(3 if self.gated else 2, dim=-1)
+        return modulation.unsqueeze(1).chunk(3 if self.gated else 2, dim=-1)
+
+    def forward(self, x, embedded_timestep, temb, values=None):
+        if values is None:
+            values = self.project_modulation(embedded_timestep, temb)
+        shift, scale = values[:2]
+        if (
+            is_in_breakable_cuda_graph()
+            and not torch.compiler.is_compiling()
+            and x.is_contiguous()
+        ):
+            out = layernorm_modulate_bitexact(
+                _ANIMA_LN_MOD,
+                self.norm,
+                x,
+                scale.squeeze(1),
+                shift.squeeze(1),
+                lambda: self._modulate(x, scale, shift),
+                sig=(x.device, x.shape, scale.stride(0), self.norm.eps),
+            )
+        else:
+            out = self._modulate(x, scale, shift)
+        return (out, values[2]) if self.gated else out
+
+    def _modulate(self, x, scale, shift):
         norm_x = self.norm(x)
         if (
             norm_x.is_cuda
             and norm_x.dtype in (torch.float16, torch.bfloat16)
             and not torch.compiler.is_compiling()
         ):
-            # Batched chunk views are strided; only copy the small [B, D]
-            # modulation rows, never the [B, S, D] activation.
-            out = modulate_scale_shift(
-                norm_x,
-                values[1].squeeze(1).contiguous(),
-                values[0].squeeze(1).contiguous(),
+            # Batched chunk views are strided; only copy the small [B, D] rows.
+            return modulate_scale_shift(
+                norm_x, scale.squeeze(1).contiguous(), shift.squeeze(1).contiguous()
             )
-        else:
-            # Keep the original graph for torch.compile: the CUDA dispatch
-            # checks pointer alignment, which cannot be traced in a full graph.
-            out = norm_x * (1 + values[1]) + values[0]
-        return (out, values[2]) if self.gated else out
+        return norm_x * (1 + scale) + shift
 
 
 class AnimaAttention(nn.Module):
@@ -229,17 +257,25 @@ class AnimaAttention(nn.Module):
         self.attn = USPAttention(
             self.heads,
             self.head_dim,
+            global_num_heads=config.num_attention_heads,
             is_cross_attention=cross_attention,
             skip_sequence_parallel=cross_attention,
             prefix=prefix,
         )
 
+    def project_context_kv(self, context):
+        shape = (self.heads, self.head_dim)
+        k = self.to_k(context)[0].unflatten(-1, shape)
+        v = self.to_v(context)[0].unflatten(-1, shape)
+        return self.norm_k(k), v
+
     def forward(self, x, context=None, rope=None, attn_mask_meta=None):
-        context = x if context is None else context
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        k = self.to_k(context)[0].unflatten(-1, (self.heads, self.head_dim))
-        v = self.to_v(context)[0].unflatten(-1, (self.heads, self.head_dim))
-        q, k = self.norm_q(q), self.norm_k(k)
+        if isinstance(context, tuple):
+            k, v = context
+        else:
+            k, v = self.project_context_kv(x if context is None else context)
+        q = self.norm_q(q)
         if rope is not None:
             q, k = _anima_rope(q, k, *rope)
         out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta).flatten(2)
@@ -297,16 +333,20 @@ class AnimaTransformerBlock(nn.Module):
         temb,
         rope,
         attn_mask_meta=None,
+        modulations=None,
     ):
-        x, gate = self.norm1(hidden_states, embedded_timestep, temb)
+        kw = {} if modulations is None else {"values": modulations[0]}
+        x, gate = self.norm1(hidden_states, embedded_timestep, temb, **kw)
         hidden_states = _anima_residual_add(
             hidden_states, self.attn1(x, rope=rope, attn_mask_meta=attn_mask_meta), gate
         )
-        x, gate = self.norm2(hidden_states, embedded_timestep, temb)
+        kw = {} if modulations is None else {"values": modulations[1]}
+        x, gate = self.norm2(hidden_states, embedded_timestep, temb, **kw)
         hidden_states = _anima_residual_add(
             hidden_states, self.attn2(x, context=encoder_hidden_states), gate
         )
-        x, gate = self.norm3(hidden_states, embedded_timestep, temb)
+        kw = {} if modulations is None else {"values": modulations[2]}
+        x, gate = self.norm3(hidden_states, embedded_timestep, temb, **kw)
         return _anima_residual_add(hidden_states, self.ff(x), gate)
 
 
@@ -331,6 +371,7 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
         if arch.num_attention_heads % get_tp_world_size():
             raise ValueError("Anima attention heads must be divisible by TP size")
+        self._cache_unquantized_text_kv = quant_config is None
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.in_channels
@@ -351,8 +392,125 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
         self.__post_init__()
 
+    def _step_modulations(self, timestep, embedded_timestep, temb):
+        if (
+            torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or is_in_breakable_cuda_graph()
+            or is_device_stream_capturing(embedded_timestep.device)
+            or self.layerwise_offload_managers
+            or type(self.time_embed) is not AnimaTimeEmbedding
+            or "forward" in vars(self.time_embed)
+            or not all(
+                type(block) is AnimaTransformerBlock and "forward" not in vars(block)
+                for block in self.transformer_blocks
+            )
+        ):
+            return None
+        ctx = get_forward_context()
+        req = ctx.forward_batch
+        if (
+            req is None
+            or not req.do_classifier_free_guidance
+            or get_classifier_free_guidance_world_size() != 1
+        ):
+            return None
+        norms = [
+            norm
+            for block in self.transformer_blocks
+            for norm in (block.norm1, block.norm2, block.norm3)
+        ] + [self.norm_out]
+        if not all(
+            type(norm) is AnimaAdaLayerNorm
+            and "forward" not in vars(norm)
+            and type(norm.linear_1) is ReplicatedLinear
+            and type(norm.linear_2) is ReplicatedLinear
+            for norm in norms
+        ):
+            return None
+        cached = req.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
+            "anima_modulations", {}
+        )
+        key = (ctx.current_timestep, embedded_timestep.device, embedded_timestep.dtype)
+        entry = cached.get(id(self))
+        if entry is not None and entry[0] is timestep and entry[1] == key:
+            return entry[2]
+        # CFG branches share this tensor. Retain it to prevent id reuse, and keep
+        # only the latest step; the denoising stage drops the state before decode.
+        values = [norm.project_modulation(embedded_timestep, temb) for norm in norms]
+        cached[id(self)] = (timestep, key, values)
+        return values
+
+    def _text_kvs(self, source, context):
+        if (
+            not self._cache_unquantized_text_kv
+            or not context.is_cuda
+            or torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or is_in_breakable_cuda_graph()
+            or is_device_stream_capturing(context.device)
+            or self.layerwise_offload_managers
+        ):
+            return None
+        ctx = get_forward_context_or_none()
+        req = ctx.forward_batch if ctx is not None else None
+        if req is None or not all(
+            type(block) is AnimaTransformerBlock
+            and "forward" not in vars(block)
+            and type(block.attn2) is AnimaAttention
+            and "forward" not in vars(block.attn2)
+            and type(block.attn2.to_k) is ColumnParallelLinear
+            and type(block.attn2.to_v) is ColumnParallelLinear
+            for block in self.transformer_blocks
+        ):
+            return None
+        # Only the two fixed conditioning tensors live for the whole loop.
+        if getattr(req, "prompt_embeds", None) and source is req.prompt_embeds[0]:
+            branch = "positive"
+        elif (
+            getattr(req, "negative_prompt_embeds", None)
+            and source is req.negative_prompt_embeds[0]
+        ):
+            branch = "negative"
+        else:
+            return None
+        cache = req.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
+            "anima_kv", {}
+        )
+        key = (id(self), branch)
+        entry = cache.get(key)
+        if entry is None or entry[0] is not source or entry[1] != context.dtype:
+            tokens = math.prod(context.shape[:-1])
+            if (
+                req.do_classifier_free_guidance
+                and get_classifier_free_guidance_world_size() == 1
+            ):
+                tokens = sum(
+                    math.prod(embeds[0].shape[:-1])
+                    for embeds in (req.prompt_embeds, req.negative_prompt_embeds)
+                    if embeds
+                )
+            local_features = sum(
+                block.attn2.heads * block.attn2.head_dim
+                for block in self.transformer_blocks
+            )
+            cache_bytes = 2 * tokens * local_features * context.element_size()
+            free_bytes, _ = torch.cuda.mem_get_info(context.device)
+            # Leave at least three quarters of free memory for denoising.
+            kvs = None
+            if cache_bytes <= free_bytes // 4:
+                kvs = [
+                    block.attn2.project_context_kv(context)
+                    for block in self.transformer_blocks
+                ]
+            cache[key] = (source, context.dtype, kvs)
+            return kvs
+        return entry[2]
+
     def forward(self, hidden_states, encoder_hidden_states, timestep, **kwargs):
-        encoder_hidden_states = encoder_hidden_states.to(hidden_states.dtype)
+        source = encoder_hidden_states
+        encoder_hidden_states = source.to(hidden_states.dtype)
+        context_kvs = self._text_kvs(source, encoder_hidden_states)
         b, _, t, h, w = hidden_states.shape
         pt, ph, pw = self.config.patch_size
         if t % pt or h % ph or w % pw:
@@ -371,16 +529,24 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         temb, embedded_timestep = self.time_embed(
             timestep.to(hidden_states.dtype) / 1000, hidden_states.dtype
         )
-        for block in self.transformer_blocks:
+        modulations = self._step_modulations(timestep, embedded_timestep, temb)
+        for i, block in enumerate(self.transformer_blocks):
+            kw = (
+                {}
+                if modulations is None
+                else {"modulations": modulations[3 * i : 3 * i + 3]}
+            )
             hidden_states = block(
                 hidden_states,
-                encoder_hidden_states,
+                encoder_hidden_states if context_kvs is None else context_kvs[i],
                 embedded_timestep,
                 temb,
                 rope,
                 attn_mask_meta,
+                **kw,
             )
-        hidden_states = self.norm_out(hidden_states, embedded_timestep, temb)
+        kw = {} if modulations is None else {"values": modulations[-1]}
+        hidden_states = self.norm_out(hidden_states, embedded_timestep, temb, **kw)
         hidden_states = self.proj_out(hidden_states)[0]
         hidden_states = gather_seq(hidden_states, shard.orig_len)
         # checkpoint output ordering is (ph, pw, pt, c), unlike the input patches
