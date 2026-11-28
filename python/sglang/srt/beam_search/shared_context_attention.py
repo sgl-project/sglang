@@ -54,7 +54,6 @@ def enabled() -> bool:
 
 
 def has_shared_context(forward_batch: ForwardBatch) -> bool:
-    """Whether the batch carries shared-context metadata, so it runs this path."""
     return (
         forward_batch.beam is not None
         and forward_batch.beam.attention_metadata is not None

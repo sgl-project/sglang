@@ -32,7 +32,6 @@ from sglang.test.test_utils import (
 PROMPT = "Hello SGLang"
 MAX_NEW_TOKENS = 10
 OVERLAP_THRESHOLD = 0.8
-# The one beam width TestBeamParityDecodeGraph captures graphs for.
 GRAPH_BEAM_WIDTH = 10
 
 
@@ -82,7 +81,6 @@ def _decode_passes(base_url: str) -> dict:
 
 
 class TestBeamParity(CustomTestCase):
-    # No beam-specific server flag. A subclass turns a beam fast path on.
     server_args: tuple = ()
     server_env: dict = {}
     parity_beam_widths: tuple = (2, 10)
@@ -152,12 +150,8 @@ class TestBeamParity(CustomTestCase):
 
 
 class TestBeamParityDecodeGraph(TestBeamParity):
-    """The same acceptance with all-beam decode batches replayed as CUDA graphs:
-    shared-context attention under the dense LM head, for requests of
-    GRAPH_BEAM_WIDTH beams. Requests of another width still decode eagerly."""
-
     # At 2 beams eager shared-context attention returns none of HF's beams for
-    # this prompt, with or without the graphs, so parity covers the graph's width.
+    # this prompt, graphs or not, so parity covers the graph's width only.
     parity_beam_widths = (GRAPH_BEAM_WIDTH,)
     server_env = {
         "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": "1",
@@ -165,8 +159,7 @@ class TestBeamParityDecodeGraph(TestBeamParity):
         "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH": str(GRAPH_BEAM_WIDTH),
         "SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY": str(MAX_NEW_TOKENS),
     }
-    # Shared-context attention needs FlashInfer decode attention. Decode graph
-    # sizes are rows: one request of GRAPH_BEAM_WIDTH beams.
+    # Shared-context attention needs FlashInfer decode attention.
     server_args = (
         "--decode-attention-backend",
         "flashinfer",
@@ -176,8 +169,7 @@ class TestBeamParityDecodeGraph(TestBeamParity):
     )
 
     def test_beam_request_replays_a_beam_graph(self):
-        """Parity alone also passes when every beam batch falls back to eager
-        decode, or to the ordinary decode graph without shared-context attention."""
+        # Parity alone also passes when every beam batch decodes eagerly.
         self.assertIn(
             f"Beam decode graphs captured for [{GRAPH_BEAM_WIDTH}] rows "
             "(compact trie head off, shared-context attention on)",

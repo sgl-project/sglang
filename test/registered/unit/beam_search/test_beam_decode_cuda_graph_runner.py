@@ -11,8 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""What a beam decode graph replays: the batch loaded into its buffers, and only
-a batch that fits them."""
+"""Beam decode graph inputs: loading a batch, and which batches replay."""
 
 import itertools
 import unittest
@@ -55,7 +54,6 @@ def _inputs(max_rows, *, trie_head=True) -> BeamGraphInputs:
 
 
 def _metadata(prompt_lens, decode_lens, width=2) -> BeamAttentionMetadata:
-    """One bucket as build_metadata lays it out, with distinct slot numbers."""
     groups, steps = len(prompt_lens), max(decode_lens)
     return BeamAttentionMetadata(
         num_rows=groups * width,
@@ -81,9 +79,6 @@ def _metadata(prompt_lens, decode_lens, width=2) -> BeamAttentionMetadata:
 
 class TestBeamGraphInputs(CustomTestCase):
     def test_loading_refreshes_every_tensor_the_graph_reads(self):
-        """A graph reads its inputs by address: a batch tensor that loading
-        skips leaves the previous batch's values in the replay. Under the dense
-        LM head a batch carries no trie levels and replays all the same."""
         for trie_head in (True, False):
             with self.subTest(trie_head=trie_head):
                 inputs = _inputs(8, trie_head=trie_head)
@@ -112,8 +107,6 @@ class TestBeamGraphInputs(CustomTestCase):
                 self.assertEqual(tensors, 5)
 
     def test_only_a_batch_that_fits_the_graph_replays(self):
-        """Replaying a beam graph for a batch that does not fit its buffers
-        returns the attention of other slots; such a batch runs eagerly."""
         inputs = _inputs(8)
         levels = torch.zeros(4, dtype=torch.int64)
         at_capacity = _metadata(
@@ -158,9 +151,8 @@ class TestBeamGraphInputs(CustomTestCase):
 
 class TestFixedWidthSharedContextInput(CustomTestCase):
     def test_a_smaller_graph_captures_on_its_own_values(self):
-        """Graphs of every size share the buffers, and a graph of fewer groups
-        reads them at other offsets. What a larger graph's batch left there is
-        no valid input: a length past the capacity reads outside the buffers."""
+        """A smaller graph reads the shared buffers at other offsets; what a larger
+        graph's batch left there must not be captured."""
         shared_context_input = FixedWidthSharedContextInput(
             max_rows=8, device="cpu", config=CONFIG
         )
@@ -181,17 +173,13 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
             self.assertIn(decode_len, range(1, CONFIG.max_decode_len + 1))
 
     def test_graphs_need_a_width_and_a_token_budget(self):
-        """The graph is captured for one beam width and a fixed number of decode
-        steps. Nothing but the operator knows the width, and without a trie
-        nothing bounds the steps, so a server that sets neither captures no graph.
-        A step attends the tokens generated before it: one fewer than the budget."""
         runner = SimpleNamespace(
             lora_manager=None,
             device="cpu",
             model_config=SimpleNamespace(context_len=16),
         )
         cases = (
-            # (width, new token capacity, trie codebooks) -> max_decode_len, or None for no graph
+            # (width, new token capacity, trie codebooks) -> max_decode_len or None
             ((2, None, None), None),
             ((2, 4, None), 3),
             ((2, None, 3), 2),

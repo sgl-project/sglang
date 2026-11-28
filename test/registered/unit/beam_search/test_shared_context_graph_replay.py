@@ -54,7 +54,6 @@ def _attention(q, k, v, bucket):
 
 
 def _batch(groups, context, prompt_offsets, decode_lens, *, flip):
-    """A batch of `groups` groups whose decode slots start at KV slot 8."""
     rows = torch.arange(groups * WIDTH, dtype=torch.int32, device="cuda").view(
         groups, WIDTH
     )
@@ -77,9 +76,7 @@ def _batch(groups, context, prompt_offsets, decode_lens, *, flip):
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestSharedContextGraphReplay(CustomTestCase):
     def test_graphs_of_two_sizes_replay_the_loaded_batch(self):
-        """Graphs of every size read one set of buffers. Each replay must follow
-        the lengths, slots and row mapping of the batch loaded for it, and read
-        no slot past them, where another batch's values remain."""
+        """Each replay follows the batch loaded for it and reads no stale slot."""
         torch.manual_seed(17)
         q = torch.randn((2 * WIDTH, 4, 64), dtype=torch.bfloat16, device="cuda")
         k = torch.randn((64, 2, 64), dtype=torch.bfloat16, device="cuda")
