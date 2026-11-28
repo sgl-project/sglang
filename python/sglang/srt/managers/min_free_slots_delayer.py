@@ -26,6 +26,8 @@ class MinFreeSlotsDelayer:
     """Delay fresh prefill admissions until at least ``min_free_slots`` running-
     request slots free up, batching them into one admission instead of one at a
     time. Useful when each admission is expensive (e.g. DFlash's draft prefill).
+    Waiting requests that already fit in the free slots are admitted at once:
+    holding them cannot batch anything more.
 
     Per-rank local: running-batch slots are private to each DP rank, so a rank
     with free slots does not wait for a congested peer.
@@ -34,5 +36,11 @@ class MinFreeSlotsDelayer:
     def __init__(self, min_free_slots: int):
         self._min_free_slots = min_free_slots
 
-    def should_delay(self, *, running_bs: int, num_allocatable_reqs: int) -> bool:
-        return running_bs > 0 and num_allocatable_reqs < self._min_free_slots
+    def should_delay(
+        self, *, running_bs: int, num_allocatable_reqs: int, num_waiting_reqs: int
+    ) -> bool:
+        return (
+            running_bs > 0
+            and num_allocatable_reqs < self._min_free_slots
+            and num_allocatable_reqs < num_waiting_reqs
+        )
