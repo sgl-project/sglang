@@ -21,7 +21,8 @@ one cached state per node HERE; on a prefix-cache hit it is dequantized back int
 a fresh active slot (copy-on-write).
 
 Per cached slot it holds:
-  * the SSM temporal state in **int8** (per-(head,k-channel) symmetric), via the
+  * the SSM temporal state in **int8** (symmetric, one scale per (head, channel)
+    along the axis ``int8_scale_axis`` picks for the model's gate), via the
     embedded ``Int8CheckpointStore`` — ~2x more cached states than bf16,
     quality-safe (quantized once on store, dequantized once on a hit; never
     re-enters the recurrence as a quant->dequant loop).
@@ -30,13 +31,14 @@ Per cached slot it holds:
 
 Why int8 (not fp8): a cached checkpoint is loaded ONCE on a cache hit, then
 decoding continues at full precision, so the only error is a single rounding of
-S. The temporal state is roughly uniformly distributed, so int8-per-(head,
-k-channel) beats fp8-e4m3 at the same 1 byte (fp8 wastes bits on the exponent).
-The scale axis (reduces over d_v) matches the per-k-channel decay diag(alpha), so
-the large state entries keep ~bf16 precision and the error concentrates on small
-entries that barely affect the readout. Storing cached states int8 gives ~2x the
-cached-prefix capacity at fixed memory, and composes with host-offload
-(--enable-hierarchical-cache) which it also halves.
+S. The temporal state is roughly uniformly distributed, so int8 with one scale
+per (head, channel) beats fp8-e4m3 at the same 1 byte (fp8 wastes bits on the
+exponent). The channel axis follows the gate (see ``int8_scale_axis``): per
+k-channel for KDA, whose per-k-channel decay diag(alpha) sets the column
+magnitudes, and per v-channel for per-head scalar gates (GDN, Mamba2), where the
+row magnitudes follow the value channels instead. Storing cached states int8
+gives ~2x the cached-prefix capacity at fixed memory, and composes with
+host-offload (--enable-hierarchical-cache) which it also halves.
 
 This is strategy-agnostic: whether the active slot to be cached was produced by
 the ``no_buffer`` donate (copy_from) or the ``extra_buffer`` ping-pong track
@@ -58,17 +60,39 @@ from sglang.srt.runtime_context import get_exec
 logger = logging.getLogger(__name__)
 
 
+def int8_scale_axis(cache_params) -> str:
+    """Channel axis of S [H, d_v, d_k] that gets its own int8 scale.
+
+    The recurrence reads S only contracted over k (the readout S @ q and the
+    delta-rule erase S @ k), so the rounding error of row v reaches output
+    channel v and no other. Row v is written by value channel v (S += v k^T).
+
+    * KDA decays every k-channel on its own (diag(alpha)), which sets the
+      column magnitudes: "k", one scale per (head, k-channel).
+    * GDN / Mamba2 decay a head with one scalar. No per-column decay separates
+      the columns, while the rows still follow the magnitude of their value
+      channel. A per-k scale rounds every row with the step of the column's
+      largest row, which costs the small value channels most of their 8 bits:
+      "v", one scale per (head, v-channel), bounds the error of each output
+      channel by its own row instead.
+    """
+    return "k" if cache_params.is_kda else "v"
+
+
 class Int8CheckpointStore:
     """int8 store for cached multi-layer linear-attn states.
 
     Tensors (slot index handed out by the caller's allocator):
         qdata : [L, num_slots, H, d_v, d_k]  int8        (the quantized state)
-        scale : [L, num_slots, H, 1,   d_k]  scale_dtype  (per layer,slot,head,k-chan)
+        scale : [L, num_slots, H, 1,   d_k]  scale_dtype  (scale_axis="k")
+                [L, num_slots, H, d_v, 1  ]  scale_dtype  (scale_axis="v")
 
     A "state" spans all L mamba layers for one cached point (matching how the
-    radix caches one full state per node). The reduction axis for the scale is
-    d_v (dim=-2), so each (head, k-channel) gets its own scale — aligned with the
-    per-k-channel decay diag(alpha).
+    radix caches one full state per node). ``scale_axis`` names the channel axis
+    that gets its own scale: "k" reduces over d_v (dim=-2), one scale per
+    (head, k-channel), aligned with the per-k-channel decay diag(alpha) of KDA;
+    "v" reduces over d_k (dim=-1), one scale per (head, v-channel), for per-head
+    scalar decay (GDN, Mamba2). ``int8_scale_axis`` picks it for a model.
 
     ``scale_dtype`` should match the source state's dtype (bf16 / fp16 / fp32) so
     that quantize and dequantize use the identical scale — it is NOT required to
@@ -76,6 +100,8 @@ class Int8CheckpointStore:
     """
 
     QMAX = 127
+    # scale_axis -> the dim of [..., H, d_v, d_k] that amax reduces over
+    REDUCE_DIM = {"k": -2, "v": -1}
 
     def __init__(
         self,
@@ -87,7 +113,11 @@ class Int8CheckpointStore:
         head_k_dim: int,
         device: str,
         scale_dtype: torch.dtype = torch.bfloat16,
+        scale_axis: str = "k",
     ):
+        if scale_axis not in self.REDUCE_DIM:
+            raise ValueError(f"scale_axis must be 'k' or 'v', got {scale_axis!r}")
+        self.scale_axis = scale_axis
         self.num_layers = num_layers
         self.num_slots = num_slots
         self.H = num_heads
@@ -107,8 +137,7 @@ class Int8CheckpointStore:
             num_layers,
             num_slots,
             num_heads,
-            1,
-            head_k_dim,
+            *((1, head_k_dim) if scale_axis == "k" else (head_v_dim, 1)),
             dtype=scale_dtype,
             device=device,
         )
@@ -116,16 +145,23 @@ class Int8CheckpointStore:
     # ---- (de)quant math (also usable standalone for probes/tests) ----
 
     @classmethod
-    def quantize(cls, state: torch.Tensor):
-        """state [..., H, d_v, d_k] -> (qint8, scale[..., H, 1, d_k]).
+    def quantize(cls, state: torch.Tensor, scale_axis: str = "k"):
+        """state [..., H, d_v, d_k] -> (qint8, scale), with scale [..., H, 1, d_k]
+        for scale_axis="k" and [..., H, d_v, 1] for scale_axis="v".
 
         amax / scale / round are computed in float32 so quantizing a low-precision
         state doesn't lose precision in the intermediate (symmetric with
         ``dequantize``, which is already float32). The scale is rounded to the
         state dtype (its storage precision) BEFORE the division, so quantize and
         dequantize use the identical scale."""
+        if scale_axis not in cls.REDUCE_DIM:
+            raise ValueError(f"scale_axis must be 'k' or 'v', got {scale_axis!r}")
         state_fp32 = state.to(torch.float32)
-        amax = state_fp32.abs().amax(dim=-2, keepdim=True).clamp(min=1e-8)
+        amax = (
+            state_fp32.abs()
+            .amax(dim=cls.REDUCE_DIM[scale_axis], keepdim=True)
+            .clamp(min=1e-8)
+        )
         scale = (amax / cls.QMAX).to(state.dtype)
         q = (
             torch.round(state_fp32 / scale.to(torch.float32))
@@ -145,7 +181,7 @@ class Int8CheckpointStore:
         (or [L, H, d_v, d_k] when slots is a scalar/len-1)."""
         if state.dim() == 4:
             state = state.unsqueeze(1)
-        q, scale = self.quantize(state)
+        q, scale = self.quantize(state, self.scale_axis)
         self.qdata[:, slots] = q
         self.scale[:, slots] = scale.to(self.scale.dtype)
 
@@ -197,6 +233,7 @@ class MambaCheckpointPool:
         conv_dtype: torch.dtype,
         device: str,
         temporal_dtype: Optional[torch.dtype] = None,
+        scale_axis: str = "k",
     ):
         self.num_slots = num_slots
         self.device = device
@@ -212,6 +249,7 @@ class MambaCheckpointPool:
             scale_dtype=(
                 temporal_dtype if temporal_dtype is not None else torch.bfloat16
             ),
+            scale_axis=scale_axis,
         )
         # conv windows stay at their native dtype (small); one buffer per conv
         # tensor in the State
@@ -270,16 +308,18 @@ class MambaCheckpointPool:
         conv_shapes: List[tuple],
         conv_dtype: torch.dtype,
         temporal_dtype: torch.dtype,
+        scale_axis: str = "k",
     ) -> dict:
         """Estimate the pool's HBM footprint (bytes) WITHOUT allocating, so a
         caller can check it against free memory before construction. Mirrors the
-        real layout: int8 qdata + per-(head,k) scale + bf16 conv windows, including
-        the reserved slot 0."""
+        real layout: int8 qdata + per-(head,channel) scale + bf16 conv windows,
+        including the reserved slot 0."""
         slots = num_slots + 1  # slot 0 reserved (matches MambaSlotAllocator)
         scale_isz = torch.empty((), dtype=temporal_dtype).element_size()
         conv_isz = torch.empty((), dtype=conv_dtype).element_size()
         qdata = num_layers * slots * num_heads * head_v_dim * head_k_dim  # int8 = 1B
-        scale = num_layers * slots * num_heads * head_k_dim * scale_isz
+        scale_channels = head_k_dim if scale_axis == "k" else head_v_dim
+        scale = num_layers * slots * num_heads * scale_channels * scale_isz
         conv = 0
         for shape in conv_shapes:
             n = 1
@@ -328,6 +368,7 @@ def maybe_init_int8_mamba_checkpoint_pool(
     GB = 1 << 30
     H, d_v, d_k = cache_params.shape.temporal
     ckpt_size = mamba.int8_mamba_ckpt_size or (2 * mamba_size)
+    scale_axis = int8_scale_axis(cache_params)
     kwargs = dict(
         num_layers=len(mamba_layer_ids),
         num_slots=ckpt_size,
@@ -337,6 +378,7 @@ def maybe_init_int8_mamba_checkpoint_pool(
         conv_shapes=list(cache_params.shape.conv),
         conv_dtype=cache_params.dtype.conv,
         temporal_dtype=cache_params.dtype.temporal,
+        scale_axis=scale_axis,
     )
 
     est = MambaCheckpointPool.estimate_mem_usage_bytes(**kwargs)
@@ -347,10 +389,10 @@ def maybe_init_int8_mamba_checkpoint_pool(
         except Exception:
             free_bytes = None
     logger.info(
-        f"int8 mamba checkpoint pool: {ckpt_size} slots, "
-        f"{est['total'] / GB:.2f}GB (qdata {est['qdata'] / GB:.2f} + scale "
-        f"{est['scale'] / GB:.2f} + conv {est['conv'] / GB:.2f}); active mamba "
-        f"pool {mamba_size} slots"
+        f"int8 mamba checkpoint pool: {ckpt_size} slots, one scale per (head, "
+        f"{scale_axis}-channel), {est['total'] / GB:.2f}GB (qdata "
+        f"{est['qdata'] / GB:.2f} + scale {est['scale'] / GB:.2f} + conv "
+        f"{est['conv'] / GB:.2f}); active mamba pool {mamba_size} slots"
         + (f"; free HBM {free_bytes / GB:.2f}GB" if free_bytes is not None else "")
     )
     if free_bytes is not None and est["total"] >= free_bytes:
