@@ -34,7 +34,7 @@ only construction, per-modality feature extraction and weight loading.
 
 import logging
 import re
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -47,6 +47,7 @@ from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.gemma4_causal import Gemma4TextModel, pp_filter_load_weight
 from sglang.srt.models.gemma4_mm import Gemma4ForConditionalGeneration
@@ -229,8 +230,25 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
         self.post_init()
 
     @torch.no_grad()
-    def forward(self, *args, **kwargs):
-        out = super().forward(*args, **kwargs)
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        **kwargs: object,
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # Name the parameters instead of taking *args: the runners detect
+        # pp_proxy_tensors and input_embeds by name with inspect.signature.
+        out = super().forward(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+            **kwargs,
+        )
         if (
             self._suppress_idx.numel() > 0
             and isinstance(out, LogitsProcessorOutput)
