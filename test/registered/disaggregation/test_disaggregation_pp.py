@@ -1,3 +1,4 @@
+import re
 import time
 import unittest
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=246, stage="extra-b", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=430, stage="extra-b", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
@@ -168,6 +169,71 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
         print(f"{metrics=}")
 
         self.assertGreater(metrics["score"], 0.24)
+        # Wait a little bit so that the memory check happens.
+        time.sleep(5)
+
+
+class TestDisaggregationStagingPrefillPPDecodeLargerTP(PDDisaggregationServerBase):
+    """Prefill TP1 PP2 -> decode TP2 through the staging buffer (MHA model): each
+    prefill stage must stage its layers into the decode's slots for them."""
+
+    capture_per_side_logs = True
+    decode_tp_size = 2
+    decode_base_gpu_id = 2
+    extra_prefill_env = {"SGLANG_DISAGG_STAGING_BUFFER": "1"}
+    extra_decode_env = {"SGLANG_DISAGG_STAGING_BUFFER": "1"}
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
+        cls.launch_all()
+
+    @classmethod
+    def start_prefill(cls):
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--nccl-port",
+            cls.prefill_nccl_port,
+            "--tp-size",
+            "1",
+            "--pp-size",
+            "2",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices_for(range(2))
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+            env=dict(cls.extra_prefill_env),
+            return_stdout_stderr=(cls._prefill_stdout_buf, cls._prefill_stderr_buf),
+        )
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_sgl_eval(args)
+        print(f"{metrics=}")
+
+        self.assertGreater(metrics["score"], 0.6)
+        # mooncake/conn.py logs this once per process after a staged send; a
+        # transfer that skipped staging would go through the slice path instead.
+        log = self._prefill_stdout_buf.getvalue() + self._prefill_stderr_buf.getvalue()
+        for stage in ("PP0", "PP1"):
+            # Assumes prefill TP1: with TP > 1 the prefix is "PP<rank> TP<rank> PID".
+            pattern = rf"{stage} PID\d+\] \[Staging\] Sending KV through"
+            self.assertTrue(re.search(pattern, log), f"{stage} sent no staged KV")
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
 
