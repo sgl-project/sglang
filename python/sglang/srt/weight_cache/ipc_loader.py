@@ -27,11 +27,13 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 from .protocol import (
+    PROTOCOL_VERSION,
     CacheConfig,
     check_ipc_quant_support,
     compute_env_stamp,
     get_quant_method_name,
     get_socket_path,
+    handshake_with_daemon,
     hash_quant_config,
     recv_msg,
     send_msg,
@@ -575,6 +577,8 @@ class WeightCacheModelLoader(BaseModelLoader):
             ) from e
 
         try:
+            handshake_with_daemon(sock)
+
             # Build engine's config fingerprint
             parallel = get_parallel()
             tp_size = parallel.tp_size
@@ -630,7 +634,14 @@ class WeightCacheModelLoader(BaseModelLoader):
                 f"dtype={engine_config.dtype}"
             )
 
-            send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
+            send_msg(
+                sock,
+                {
+                    "type": "fetch_state",
+                    "protocol_version": PROTOCOL_VERSION,
+                    "config": engine_config.to_dict(),
+                },
+            )
             result = recv_msg(sock)
 
             if result.get("status") != "ok":
