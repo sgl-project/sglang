@@ -574,7 +574,9 @@ class MambaMixer2(torch.nn.Module):
                 and metadata.track_conv_indices is not None
             ):
                 x_to_track = x[:, metadata.track_conv_indices].transpose(0, 1)
-                conv_state[metadata.conv_states_mask_indices] = x_to_track
+                conv_state[metadata.conv_states_mask_indices] = x_to_track.to(
+                    conv_state.dtype
+                )
             ccfn = (
                 causal_conv1d_fn
                 if not use_triton_causal_conv
