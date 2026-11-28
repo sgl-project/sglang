@@ -1080,7 +1080,7 @@ pub(crate) fn chat_event_stream(
                         }
                     }
                 }
-                yield serialize_chat_stream_response(response.clone());
+                yield serialize_chat_stream_response(response);
             } else if let Some(error) = item.error {
                 yield error;
             }
@@ -1164,7 +1164,7 @@ fn stopped(output: &CoreOutput) -> bool {
     )
 }
 
-fn serialize_chat_stream_response(response: CreateChatCompletionStreamResponse) -> String {
+fn serialize_chat_stream_response(response: &CreateChatCompletionStreamResponse) -> String {
     let mut response = serde_json::to_value(response).expect("OpenAI response must serialize");
     if let Some(delta) = response
         .pointer_mut("/choices/0/delta")
