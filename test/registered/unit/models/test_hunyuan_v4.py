@@ -106,5 +106,52 @@ def test_hpc_attention_gate_is_bf16_only(monkeypatch):
         supported.cache_clear()
 
 
+def test_hunyuan_v4_flash_topk_matches_torch_topk():
+    """Regression test for #53683: hy_v4 `_topk` must not hard-depend on
+    flashinfer's JIT (which needs nvcc and fails on non-CUDA accelerators,
+    blocking decode CUDA-graph capture). Without flashinfer it must fall
+    back to torch.topk and return the same result."""
+    from sglang.srt.models import hunyuan_v4_flash
+
+    torch.manual_seed(0)
+    logits = torch.randn(4, 512)
+    # Padded non-candidate columns score -inf, as in _select.
+    logits[:, 300:] = float("-inf")
+    values, indices = hunyuan_v4_flash._topk(logits, 8)
+    ref_values, _ = torch.topk(logits, 8, dim=-1)
+    assert indices.dtype == torch.int64
+    torch.testing.assert_close(values, ref_values, rtol=0, atol=0)
+    torch.testing.assert_close(logits.gather(-1, indices), ref_values, rtol=0, atol=0)
+
+
+def test_hunyuan_v4_flash_topk_falls_back_when_flashinfer_jit_fails(monkeypatch):
+    """Regression test for #53683: even when the flashinfer top-k path is
+    selected but its JIT raises (no nvcc), `_topk` must fall back to
+    torch.topk instead of failing the decode graph capture."""
+    from sglang.srt.models import hunyuan_v4_flash
+
+    def _raise_jit_error(*args, **kwargs):
+        raise RuntimeError(
+            "Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist"
+        )
+
+    monkeypatch.setattr(hunyuan_v4_flash, "radix_topk", _raise_jit_error)
+    torch.manual_seed(0)
+    logits = torch.randn(4, 512)
+    values, indices = hunyuan_v4_flash._topk(logits, 8)
+    ref_values, _ = torch.topk(logits, 8, dim=-1)
+    torch.testing.assert_close(values, ref_values, rtol=0, atol=0)
+    torch.testing.assert_close(logits.gather(-1, indices), ref_values, rtol=0, atol=0)
+
+
+def test_hunyuan_v4_flash_topk_returns_all_columns_when_k_covers_width():
+    from sglang.srt.models import hunyuan_v4_flash
+
+    logits = torch.randn(2, 8)
+    values, indices = hunyuan_v4_flash._topk(logits, 8)
+    torch.testing.assert_close(values, logits)
+    torch.testing.assert_close(indices, torch.arange(8).expand(2, -1).contiguous())
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
