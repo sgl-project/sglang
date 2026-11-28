@@ -44,6 +44,10 @@ class OpenAIServingTokenize(OpenAIServingBase):
     ) -> Union[TokenizeResponse, ErrorResponse]:
         try:
             tokenizer = self.tokenizer_manager.tokenizer
+            if tokenizer is None:
+                return self.create_error_response(
+                    "Tokenization requires a tokenizer. Restart without --skip-tokenizer-init."
+                )
             max_model_len = getattr(tokenizer, "model_max_length", -1)
             # ORJSON accepts signed negative and unsigned positive 64-bit integers.
             if isinstance(max_model_len, int) and not (
