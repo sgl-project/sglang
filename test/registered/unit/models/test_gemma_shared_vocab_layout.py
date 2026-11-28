@@ -25,6 +25,7 @@ from sglang.srt.distributed.parallel_state import (
     initialize_model_parallel,
 )
 from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.gemma3_mm import Gemma3ForConditionalGeneration
@@ -313,6 +314,19 @@ class TestGemmaSharedVocabLayout(CustomTestCase):
                 embed = model.get_input_embeddings()
                 noise = embed(ids) * model.get_dflash_noise_embedding_scale()
                 torch.testing.assert_close(noise, embed.weight[ids])
+
+    def test_gemma4_dflash_noise_scale_on_the_last_pp_stage(self):
+        """Under PP the DFlash draft lives on the last stage, where Gemma-4's
+        embed_tokens is a PPMissingLayer: the scale must not read the module."""
+        for kind in ("gemma4", "gemma4_mm"):
+            with self.subTest(kind=kind):
+                model = build_source(kind)
+                # Gemma4ForConditionalGeneration aliases model to language_model.
+                text = model.model
+                scale = model.get_dflash_noise_embedding_scale()
+                self.assertEqual(scale, 1.0 / text.embed_tokens.embed_scale)
+                text.embed_tokens = PPMissingLayer()
+                self.assertEqual(model.get_dflash_noise_embedding_scale(), scale)
 
 
 if __name__ == "__main__":
