@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass, fields
 from typing import List, Optional, Tuple
 
+import msgspec
 import numpy as np
 import torch
 import torch.nn as nn
@@ -39,8 +40,7 @@ logger = logging.getLogger(__name__)
 DEFERRED_IMAGE_KEY = "minimax_deferred_image"
 
 
-@dataclass(frozen=True)
-class MiniMaxDeferredImage:
+class MiniMaxDeferredImage(msgspec.Struct, frozen=True):
     image_mean: List[float]
     image_std: List[float]
     rescale_factor: float

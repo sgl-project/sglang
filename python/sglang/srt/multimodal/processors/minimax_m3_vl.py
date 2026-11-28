@@ -7,11 +7,11 @@ import itertools
 import math
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
 from functools import cached_property, partial
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
+import msgspec
 import numpy as np
 import PIL
 import torch
@@ -130,8 +130,7 @@ _RAW_IMAGE_TYPES = (str, bytes, ImageData, Image.Image)
 _IMAGE_IDENTITY_VERSION = 1
 
 
-@dataclass(frozen=True)
-class _LoadedImage:
+class _LoadedImage(msgspec.Struct, frozen=True):
     image: Any
     content_digest: str
 
@@ -1021,40 +1020,9 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
 
         video_metadata = None
         if base_output.videos:
-            image_factor, max_size = self._video_resize_config()
-            video_items = video_data or []
-            if len(video_items) != len(base_output.videos):
-                if any(
-                    _video_fps(item) is not None
-                    or _max_long_side_pixel(item) is not None
-                    for item in video_items
-                ):
-                    raise ValueError(
-                        f"per-video options need one loaded video per video item, "
-                        f"got {len(base_output.videos)} videos for "
-                        f"{len(video_items)} items"
-                    )
-                video_items = [None] * len(base_output.videos)
-            videos_processed = []
-            for video, item in zip(base_output.videos, video_items):
-                fps = _check_video_fps(_video_fps(item))
-                videos_processed.append(
-                    await get_video_tensor(
-                        video,
-                        image_factor=image_factor,
-                        max_size=max_size,
-                        fps=self.video_fps if fps is None else fps,
-                        frame_max_size=self.video_frame_max_size,
-                        max_frames=self.video_max_frames,
-                        resize_fn=getattr(
-                            self._processor.video_processor, "resize_frames", None
-                        ),
-                        max_long_side_pixel=_check_max_long_side_pixel(
-                            _max_long_side_pixel(item), image_factor
-                        ),
-                    )
-                )
-            base_output.videos, video_metadata = map(list, zip(*videos_processed))
+            base_output.videos, video_metadata = await self._process_request_videos(
+                base_output.videos, video_data
+            )
 
         if (
             images_resized
@@ -1091,6 +1059,44 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             im_token_id=self.IM_TOKEN_ID,
             video_token_id=self.VIDEO_TOKEN_ID,
         )
+
+    async def _process_request_videos(
+        self, videos: list, video_data: Optional[list]
+    ) -> Tuple[list, list]:
+        image_factor, max_size = self._video_resize_config()
+        video_items = video_data or []
+        if len(video_items) != len(videos):
+            if any(
+                _video_fps(item) is not None or _max_long_side_pixel(item) is not None
+                for item in video_items
+            ):
+                raise ValueError(
+                    f"per-video options need one loaded video per video item, "
+                    f"got {len(videos)} videos for "
+                    f"{len(video_items)} items"
+                )
+            video_items = [None] * len(videos)
+        videos_processed = []
+        for video, item in zip(videos, video_items):
+            fps = _check_video_fps(_video_fps(item))
+            videos_processed.append(
+                await get_video_tensor(
+                    video,
+                    image_factor=image_factor,
+                    max_size=max_size,
+                    fps=self.video_fps if fps is None else fps,
+                    frame_max_size=self.video_frame_max_size,
+                    max_frames=self.video_max_frames,
+                    resize_fn=getattr(
+                        self._processor.video_processor, "resize_frames", None
+                    ),
+                    max_long_side_pixel=_check_max_long_side_pixel(
+                        _max_long_side_pixel(item), image_factor
+                    ),
+                )
+            )
+        videos, video_metadata = map(list, zip(*videos_processed))
+        return videos, video_metadata
 
     async def _process_image_sizes(
         self, image_data: list, input_text: str | list[int]
