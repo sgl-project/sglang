@@ -71,10 +71,10 @@ class CacheSizeProvider(Protocol):
 
 
 def estimate_cache_size_bytes(value: Any) -> Optional[int]:
-    """Estimate owned CPU bytes, returning None for GPU-backed artifacts."""
+    """Estimate owned CPU bytes, or None for GPU or unmeasurable buffers."""
     seen: set[int] = set()
 
-    def visit(item: Any) -> Optional[int]:
+    def visit(item: Any, *, buffer_owner: bool = False) -> Optional[int]:
         if item is None or isinstance(item, (bool, int, float)):
             return sys.getsizeof(item)
         item_id = id(item)
@@ -87,11 +87,24 @@ def estimate_cache_size_bytes(value: Any) -> Optional[int]:
                 return None
             return item.untyped_storage().nbytes()
         if isinstance(item, np.ndarray):
+            if item.base is not None:
+                return visit(item.base, buffer_owner=True)
             return int(item.nbytes)
         if isinstance(item, Image.Image):
             return len(item.tobytes())
-        if isinstance(item, (bytes, bytearray, memoryview)):
+        if isinstance(item, memoryview):
+            return visit(item.obj, buffer_owner=True)
+        if isinstance(item, (bytes, bytearray)):
             return len(item)
+        if buffer_owner:
+            # NumPy stride-trick wrappers also retain their underlying base.
+            base = getattr(item, "base", None)
+            if base is not None:
+                return visit(base, buffer_owner=True)
+            try:
+                return memoryview(item).nbytes
+            except TypeError:
+                return None
         if isinstance(item, str):
             return len(item.encode())
         if isinstance(item, CacheSizeProvider):
