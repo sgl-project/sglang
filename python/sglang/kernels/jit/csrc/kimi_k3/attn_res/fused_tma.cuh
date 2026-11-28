@@ -10,7 +10,9 @@
 
 #include <sgl_kernel/distributed/communicator.cuh>
 #include <sgl_kernel/distributed/ptx.cuh>
+#include <sgl_kernel/ptx/async.cuh>
 #include <sgl_kernel/ptx/barrier.cuh>
+#include <sgl_kernel/ptx/tcgen05.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/extra/stl.h>
@@ -21,34 +23,9 @@
 #include <cstdint>
 #include <utility>
 
-// Local PTX primitives (mbarrier / bulk TMA / tcgen05 / warp-group sync)
-
 namespace sglang {
 
 namespace device::ptx {
-
-// ---- bulk 1D TMA (PTX ISA §9.7.9.25) ---------------------------------------
-
-// global -> shared::cluster, completed by an smem mbarrier. Arm `bar` with
-// `mbar_arrive_expect_tx(bar, bytes)` before issuing; `bytes` and both
-// endpoints must be 16-byte aligned.
-SGL_DEVICE void cp_async_bulk_1d_load(void* smem_dst, const void* gmem_src, uint32_t bytes, uint64_t* bar) {
-  asm volatile(
-      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
-      " [%0], [%1], %2, [%3];" ::"r"(to_shared(smem_dst)),
-      "l"(gmem_src),
-      "r"(bytes),
-      "r"(to_shared(bar))
-      : "memory");
-}
-
-// Publish mbarrier initialization from the generic proxy before an async engine
-// uses the barrier.
-SGL_DEVICE void fence_mbarrier_init() {
-  asm volatile("fence.mbarrier_init.release.cluster;");
-}
-
-// ---- warp / warp-group sync (PTX ISA §9.7.4, §9.7.12.6, §9.7.13) -----------
 
 // Runtime warp-group register-budget reallocation: widen the epilogue's
 // per-thread budget (so it holds a larger primary array without spilling) by
@@ -77,72 +54,6 @@ SGL_DEVICE void setmaxnreg_inc() {
   static_assert(N >= 24 && N <= 256, "setmaxnreg N must be in [24, 256]");
   static_assert((N & 7) == 0, "setmaxnreg N must be a multiple of 8");
   asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(N));
-}
-
-// ---- tcgen05 (PTX ISA §9.7.16) ---------------------------------------------
-//
-// Lifecycle (mandatory order, §9.7.16.7.1): alloc (one warp, n_cols a power of
-// 2 in [32, 512], TMEM address written to smem) -> __syncthreads + read taddr
-// -> ld/st -> dealloc -> relinquish before kernel exit.
-//
-// Each warp can only touch its own 32-lane TMEM band (§9.7.16.8.1): warp 0 ->
-// lanes 0-31, warp 1 -> 32-63, and so on. Use `tcgen05_wait_st` /
-// `tcgen05_wait_ld` before consuming the other side of a store / drain.
-SGL_DEVICE void tcgen05_alloc(uint32_t smem_addr_for_taddr, uint32_t n_cols) {
-  asm volatile(
-      "tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(smem_addr_for_taddr), "r"(n_cols));
-}
-
-SGL_DEVICE void tcgen05_dealloc(uint32_t taddr, uint32_t n_cols) {
-  asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" ::"r"(taddr), "r"(n_cols));
-}
-
-SGL_DEVICE void tcgen05_relinquish() {
-  asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
-}
-
-// .32x32b.x8: 8 b32 per lane = 8 TMEM columns. Per-lane 8 FP32 -> 4 bf16x2
-// packs = one int4, the natural fit for a BF16 epilogue moving a column band
-// with 16-byte smem accesses.
-SGL_DEVICE void tcgen05_ld_32x32b_x8(
-    uint32_t taddr,
-    uint32_t& r0,
-    uint32_t& r1,
-    uint32_t& r2,
-    uint32_t& r3,
-    uint32_t& r4,
-    uint32_t& r5,
-    uint32_t& r6,
-    uint32_t& r7) {
-  asm volatile(
-      "tcgen05.ld.sync.aligned.32x32b.x8.b32 "
-      " {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3), "=r"(r4), "=r"(r5), "=r"(r6), "=r"(r7)
-      : "r"(taddr));
-}
-
-SGL_DEVICE void tcgen05_ld_32x32b_x8(uint32_t taddr, uint32_t* dst) {
-  tcgen05_ld_32x32b_x8(taddr, dst[0], dst[1], dst[2], dst[3], dst[4], dst[5], dst[6], dst[7]);
-}
-
-SGL_DEVICE void tcgen05_st_32x32b_x8(uint32_t taddr, const uint32_t* src) {
-  asm volatile(
-      "tcgen05.st.sync.aligned.32x32b.x8.b32 "
-      " [%8], {%0, %1, %2, %3, %4, %5, %6, %7};"
-      :
-      : "r"(src[0]),
-        "r"(src[1]),
-        "r"(src[2]),
-        "r"(src[3]),
-        "r"(src[4]),
-        "r"(src[5]),
-        "r"(src[6]),
-        "r"(src[7]),
-        "r"(taddr));
-}
-
-SGL_DEVICE void tcgen05_wait_st() {
-  asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
 }
 
 }  // namespace device::ptx
@@ -184,7 +95,7 @@ struct KimiK3AttnResTrait {
   // the producer behind the consumers (~10% slower), >2 gains nothing and
   // costs smem at small T.
   static constexpr uint32_t kNumStages = 2;
-  static constexpr uint32_t kNumChunks = (kNumRows + 1 + kChunkRows - 1) / kChunkRows;
+  static constexpr uint32_t kNumChunks = host::div_ceil(kNumRows + 1, kChunkRows);
   static constexpr uint32_t kNumConsumerWarps = 8;
   static constexpr uint32_t kConsumerRegs = kConsumerRegs_;
   static constexpr uint32_t kProducerRegs = 40;
@@ -203,7 +114,7 @@ struct KimiK3AttnResTrait {
   static constexpr uint32_t kGroupThreads = kNumConsumerThreads / kNumGroups;
   static constexpr uint32_t kVecElems = 16 / sizeof(bf16_t);  // smem ld/st are 16B max
   static constexpr uint32_t kNumTiles = kDim / kTile;
-  static constexpr uint32_t kSlicesPerGroup = (kNumTiles + kNumGroups - 1) / kNumGroups;
+  static constexpr uint32_t kSlicesPerGroup = host::div_ceil(kNumTiles, kNumGroups);
   static constexpr uint32_t kAccPerThread = kSlicesPerGroup * kVecElems;
 
   // TMEM: per group, kTmemColsPerGroup columns of cw then of ow.
@@ -233,27 +144,11 @@ struct KimiK3AttnResTrait {
   static SGL_DEVICE void forward(const AttnResTMAParams& params, Smem* smem);
 };
 
-SGL_DEVICE float2 fma_f32x2(float2 a, float2 b, float2 c) {
-  const uint64_t a_bits = reinterpret_cast<const uint64_t&>(a);
-  const uint64_t b_bits = reinterpret_cast<const uint64_t&>(b);
-  const uint64_t c_bits = reinterpret_cast<const uint64_t&>(c);
-  uint64_t result;
-  asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(result) : "l"(a_bits), "l"(b_bits), "l"(c_bits));
-  return reinterpret_cast<const float2&>(result);
-}
-
-SGL_DEVICE float2 mul_f32x2(float2 a, float2 b) {
-  const uint64_t a_bits = reinterpret_cast<const uint64_t&>(a);
-  const uint64_t b_bits = reinterpret_cast<const uint64_t&>(b);
-  uint64_t result;
-  asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(result) : "l"(a_bits), "l"(b_bits));
-  return reinterpret_cast<const float2&>(result);
-}
-
 template <int64_t kDim_, uint32_t kNumBankRows_, uint32_t kChunkRows_, uint32_t kConsumerRegs_>
 SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerRegs_>::forward(
     const AttnResTMAParams& params, Smem* smem) {
   using namespace device;
+  using tcgen05 = ptx::TCGen05<1>;
   using row_vec_t = AlignedVector<bf16x2_t, kVecElems / 2>;  // 16 bytes
   const auto tx = threadIdx.x;
   const auto warp_id = tx / kWarpThreads;
@@ -262,16 +157,17 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
   if (warp_id == 0 && lane_id < kNumStages) {
     ptx::mbar_init(&smem->bar_full[lane_id], 1);
     ptx::mbar_init(&smem->bar_free[lane_id], kNumConsumerWarps * kWarpThreads);
-    ptx::fence_mbarrier_init();
+    ptx::fence_barrier_init();
   } else if (warp_id == 1) {
-    ptx::tcgen05_alloc(ptx::to_shared(&smem->tmem_base), kTmemCols);
-    ptx::tcgen05_relinquish();
+    tcgen05::alloc(&smem->tmem_base, kTmemCols);
+    tcgen05::relinquish_alloc_permit();
+    tcgen05::fence_before_thread_sync();
   }
 
   __syncthreads();
   if (warp_id >= kNumConsumerWarps) {  // producer warp (group); first warp works
     if constexpr (kConsumerRegs > 0) ptx::setmaxnreg_dec<kProducerRegs>();
-    // TODO: reduce the register usage
+    // TODO(perf): reduce the register usage
     if (warp_id == kNumConsumerWarps && warp::elect_one_lane()) {
       uint32_t global_chunks = 0;
       constexpr uint32_t kRowBytes = kDim * sizeof(bf16_t);
@@ -295,7 +191,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
             const auto row = base_row + r;
             const auto src = row == kNumRows ? params.prefix_sum + token * kDim  //
                                              : params.bank + token * params.stride_bm + row * kDim;
-            ptx::cp_async_bulk_1d_load(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
+            ptx::cp_async_bulk_g2s(&smem->buf[slot][r], src, kRowBytes, &smem->bar_full[slot]);
           }
         }
       }
@@ -303,9 +199,12 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
     }
   } else {  // 2 consumer warp groups; one chunk per rendezvous
     if constexpr (kConsumerRegs > 0) ptx::setmaxnreg_inc<kConsumerRegs>();
+    tcgen05::fence_after_thread_sync();
     const auto group = warp_id / (kNumConsumerWarps / kNumGroups);
     const auto tid_in_group = tx % kGroupThreads;
-    const auto tmem_cw = smem->tmem_base + group * kTmemColsPerGroup;
+    // taddr bits 31-16 name the warp's own lane quadrant; ld/st must use it as the base lane (§9.7.18.8.1).
+    const uint32_t tmem_lane = (__shfl_sync(0xffffffffu, warp_id, 0) % 4) * 32 << 16;
+    const auto tmem_cw = smem->tmem_base + tmem_lane + group * kTmemColsPerGroup;
     const auto tmem_ow = tmem_cw + kNumGroups * kTmemColsPerGroup;
 
     // Stage this thread's cw / ow slices into TMEM (read once from gmem).
@@ -324,7 +223,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
-        ptx::tcgen05_st_32x32b_x8(tmem_cw + si * kVecElems, reinterpret_cast<const uint32_t*>(&staged[si * kVecElems]));
+        tcgen05::st_32x32b<kVecElems>(tmem_cw + si * kVecElems, &staged[si * kVecElems]);
       }
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
@@ -338,9 +237,9 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
-        ptx::tcgen05_st_32x32b_x8(tmem_ow + si * kVecElems, reinterpret_cast<const uint32_t*>(&staged[si * kVecElems]));
+        tcgen05::st_32x32b<kVecElems>(tmem_ow + si * kVecElems, &staged[si * kVecElems]);
       }
-      ptx::tcgen05_wait_st();
+      tcgen05::wait_st();
     }
 
     uint32_t global_chunks = 0;  // mirrors the producer's chunk counter
@@ -369,9 +268,8 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
           const auto tile = si * kNumGroups + group;
           if (tile >= kNumTiles) continue;
-          float q[kVecElems];
-          ptx::tcgen05_ld_32x32b_x8(tmem_cw + si * kVecElems, reinterpret_cast<uint32_t*>(q));
-          const auto* q2 = reinterpret_cast<const float2*>(q);
+          float2 q2[kVecElems / 2];
+          tcgen05::ld_32x32b<kVecElems>(tmem_cw + si * kVecElems, q2);
           const auto offset = tile * kTile + tid_in_group * kVecElems;
 #pragma unroll
           for (uint32_t r = 0; r < an; ++r) {
@@ -382,8 +280,8 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
 #pragma unroll
             for (uint32_t j = 0; j < kVecElems / 2; ++j) {
               const auto f = cast<float2>(rows[si][r][j]);
-              acc_rms2[r] = fma_f32x2(f, f, acc_rms2[r]);
-              acc_dot2[r] = fma_f32x2(f, q2[j], acc_dot2[r]);
+              acc_rms2[r] = math::fma_f32x2(f, f, acc_rms2[r]);
+              acc_dot2[r] = math::fma_f32x2(f, q2[j], acc_dot2[r]);
             }
           }
         }
@@ -395,7 +293,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         // arrive so the slot handoff is not delayed.
         if (params.prefix_dst != nullptr && base_row + an == kNumRows + 1) {
           const uint32_t pr = kNumRows - base_row;
-          auto* dst = params.prefix_dst + static_cast<int64_t>(token) * params.stride_bm;
+          const auto dst = params.prefix_dst + static_cast<int64_t>(token) * params.stride_bm;
 #pragma unroll
           for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
             const auto tile = si * kNumGroups + group;
@@ -478,13 +376,13 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           float2 a[kVecElems / 2];
 #pragma unroll
           for (uint32_t j = 0; j < kVecElems / 2; ++j) {
-            a[j] = mul_f32x2(acc[si * (kVecElems / 2) + j], correction2);
+            a[j] = math::mul_f32x2(acc[si * (kVecElems / 2) + j], correction2);
           }
 #pragma unroll
           for (uint32_t r = 0; r < an; ++r) {
 #pragma unroll
             for (uint32_t j = 0; j < kVecElems / 2; ++j) {
-              a[j] = fma_f32x2(weight2[r], cast<float2>(rows[si][r][j]), a[j]);
+              a[j] = math::fma_f32x2(weight2[r], cast<float2>(rows[si][r][j]), a[j]);
             }
           }
 #pragma unroll
@@ -499,7 +397,7 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       float2 acc_sq2 = make_float2(0.f, 0.f);
 #pragma unroll
       for (uint32_t j = 0; j < kAccPerThread / 2; ++j) {
-        acc_sq2 = fma_f32x2(acc[j], acc[j], acc_sq2);
+        acc_sq2 = math::fma_f32x2(acc[j], acc[j], acc_sq2);
       }
       float acc_sq = warp::reduce_sum(acc_sq2.x + acc_sq2.y);
       if (lane_id == 0) smem->warp_ssq[warp_id] = acc_sq;
@@ -512,19 +410,18 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       const float scale = inv_sum * rsqrtf(total_sq * inv_sum * inv_sum / static_cast<float>(kDim) + params.eps);
       const float2 scale2 = make_float2(scale, scale);
 
-      auto* out_ptr = params.out + static_cast<int64_t>(token) * kDim;
+      const auto out_ptr = params.out + static_cast<int64_t>(token) * kDim;
 #pragma unroll
       for (uint32_t si = 0; si < kSlicesPerGroup; ++si) {
         const auto tile = si * kNumGroups + group;
         if (tile >= kNumTiles) continue;
-        float q[kVecElems];
-        ptx::tcgen05_ld_32x32b_x8(tmem_ow + si * kVecElems, reinterpret_cast<uint32_t*>(q));
-        const auto* q2 = reinterpret_cast<const float2*>(q);
+        float2 q2[kVecElems / 2];
+        tcgen05::ld_32x32b<kVecElems>(tmem_ow + si * kVecElems, q2);
         row_vec_t out_vec;
 #pragma unroll
         for (uint32_t j = 0; j < kVecElems / 2; ++j) {
-          const auto scaled = mul_f32x2(acc[si * (kVecElems / 2) + j], scale2);
-          out_vec[j] = cast<bf16x2_t>(mul_f32x2(scaled, q2[j]));
+          const auto scaled = math::mul_f32x2(acc[si * (kVecElems / 2) + j], scale2);
+          out_vec[j] = cast<bf16x2_t>(math::mul_f32x2(scaled, q2[j]));
         }
         const auto row_vid = tile * (kTile / kVecElems) + tid_in_group;
         if (params.output_mc != nullptr) {
@@ -536,9 +433,12 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
         }
       }
     }
+    tcgen05::wait_ld();
+    tcgen05::fence_before_thread_sync();
     ptx::bar_sync(kConsumerBarId, kNumConsumerThreads);
     if (warp_id == 1) {
-      ptx::tcgen05_dealloc(smem->tmem_base, kTmemCols);
+      tcgen05::fence_after_thread_sync();
+      tcgen05::dealloc(smem->tmem_base, kTmemCols);
     }
   }
 }
@@ -657,53 +557,53 @@ struct AttnResFusedTmaKernel {
     using namespace host;
 
     auto T_ = SymbolicSize{"num_tokens"};
-    auto H_ = SymbolicSize{"hidden_size"};
     auto NB_ = SymbolicSize{"num_bank_slots"};
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(prefix_sum).verify(out);
-    TensorMatcher({T_, NB_, H_}).with_dtype<bf16_t>().with_device(device).verify(bank);
-    TensorMatcher({H_}).with_dtype<bf16_t>().with_device(device).verify(cw).verify(ow);
+    TensorMatcher({T_, kDim})  //
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .ensure_alignment(16)
+        .verify(prefix_sum)
+        .verify(out);
+    TensorMatcher({T_, NB_, kDim})  //
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .ensure_alignment(16)
+        .verify(bank);
+    TensorMatcher({kDim})  //
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(cw)
+        .verify(ow);
 
     const auto num_tokens = static_cast<int64_t>(T_.unwrap());
-    const auto H = static_cast<int64_t>(H_.unwrap());
     const auto NB = static_cast<int64_t>(NB_.unwrap());
 
-    RuntimeCheck(H == kDim, "attn_res_fused_tma: H must be ", kDim, ", got ", H);
-    RuntimeCheck(
-        1 <= nvb && nvb <= kMaxBankRows && nvb <= NB,
-        "attn_res_fused_tma: nvb must be in [1, ",
-        kMaxBankRows,
-        "] and <= NB, got nvb=",
-        nvb,
-        " NB=",
-        NB);
-    RuntimeCheck(
-        !write_prefix || nvb < NB,
-        "attn_res_fused_tma: write_prefix targets bank row nvb, needs nvb < NB, got nvb=",
-        nvb,
-        " NB=",
-        NB);
+    CHECK_HOST(1 <= nvb && nvb <= kMaxBankRows && nvb <= NB)
+        << "attn_res_fused_tma: nvb must be in [1, " << kMaxBankRows << "] and <= NB, got nvb=" << nvb << " NB=" << NB;
+    CHECK_HOST(!write_prefix || nvb < NB)
+        << "attn_res_fused_tma: write_prefix targets bank row nvb, needs nvb < NB, got nvb=" << nvb << " NB=" << NB;
 
     if (num_tokens == 0) return;
 
     [[maybe_unused]] static const bool attrs_set = [] {
       for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
-        RuntimeDeviceCheck(cudaFuncSetAttribute(kTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+        CHECK_CUDA(cudaFuncSetAttribute(kTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
       }
       return true;
     }();
 
     const auto num_sm = runtime::get_sm_count(device.unwrap().device_id);
-    const auto grid = std::min<int64_t>((int64_t)num_sm * kOccupancy, num_tokens);
+    const auto grid = std::min<int64_t>(static_cast<int64_t>(num_sm) * kOccupancy, num_tokens);
     const auto params = AttnResTMAParams{
         .prefix_sum = static_cast<const bf16_t*>(prefix_sum.data_ptr()),
         .bank = static_cast<const bf16_t*>(bank.data_ptr()),
         .cw = static_cast<const bf16_t*>(cw.data_ptr()),
         .ow = static_cast<const bf16_t*>(ow.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
-        .prefix_dst = write_prefix ? static_cast<bf16_t*>(bank.data_ptr()) + nvb * H : nullptr,
+        .prefix_dst = write_prefix ? static_cast<bf16_t*>(bank.data_ptr()) + nvb * kDim : nullptr,
         .input_mc = nullptr,
         .residual = nullptr,
         .prefix_out = nullptr,
@@ -712,7 +612,7 @@ struct AttnResFusedTmaKernel {
         .output_mc = nullptr,
         .world_size = 0,
         .rank = 0,
-        .stride_bm = NB * H,
+        .stride_bm = NB * kDim,
         .eps = static_cast<float>(eps),
         .num_tokens = static_cast<uint32_t>(num_tokens),
     };

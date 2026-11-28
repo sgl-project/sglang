@@ -1153,6 +1153,9 @@ class Envs:
     SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
     # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
     SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
+    # Qwen4-Exp HC sites with <= 128 rows on gfx950: fold the per-branch norm and the
+    # inject GEMV into a FlyDSL mix. Off by default: not bit-exact (~1 bf16 ulp).
+    SGLANG_ROCM_OPT_QWEN4_FUSED_HC = EnvBool(False)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
@@ -2153,11 +2156,9 @@ class Envs:
     # Native gRPC server
     # ===================================================================
     # Native gRPC server. SGLANG_GRPC_PORT is the env fallback for the
-    # --grpc-port CLI flag; setting either enables the native server alongside
-    # HTTP. The worker-threads knob stays env-only (internal tuning, no CLI
-    # surface).
+    # --grpc-port CLI flag; setting either enables the Rust server's native
+    # gRPC listener (requires SGLANG_RUST_SERVER).
     SGLANG_GRPC_PORT = EnvInt(None)
-    SGLANG_GRPC_WORKER_THREADS = EnvInt(4)
 
     # ===================================================================
     # NUMA and CPU affinity
@@ -2875,7 +2876,12 @@ class _DeprecatedEnv:
 # ad-hoc warnings. For a rename where the old name must keep working through a
 # descriptor, use EnvBoolWithAlias / EnvIntWithAlias instead. Once the
 # deprecation period ends, move the entry to REMOVED_ENVS.
-_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {}
+_DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
+    "SGLANG_GRPC_WORKER_THREADS": _DeprecatedEnv(
+        note="The Python gRPC bridge was removed; the Rust server sizes its own "
+        "thread pools."
+    ),
+}
 
 
 def _handle_deprecated_envs():
