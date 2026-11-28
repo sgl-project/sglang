@@ -518,6 +518,7 @@ Required fields for `DenoisingStage`:
 | `batch.negative_prompt_embeds` | Negative embeddings, wrapped in a list when CFG is used. |
 | `batch.num_inference_steps` | Number of denoising iterations. |
 | `batch.raw_latent_shape` | Original latent shape before packing, if decode needs it. |
+| `batch.generator` | Set by `InputValidationStage`. A pipeline that skips that stage has to create it. |
 
 ### 5. Distributed and memory integration
 

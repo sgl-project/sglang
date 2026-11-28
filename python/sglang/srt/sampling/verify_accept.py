@@ -1,15 +1,11 @@
-"""What a speculative verify accepted, and its commit to per-request sampling state."""
+"""What a speculative verify accepted."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import msgspec
 import torch
-
-if TYPE_CHECKING:
-    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-    from sglang.srt.sampling.watermarking.interface import VerifyWatermark
 
 
 class VerifyAccept(msgspec.Struct, frozen=True):
@@ -35,19 +31,3 @@ class VerifyAccept(msgspec.Struct, frozen=True):
             return self.accept_index >= 0
         positions = torch.arange(self.tokens.shape[1], device=self.tokens.device)
         return positions < self.accept_lens[:, None]
-
-
-def commit_verify_accept(
-    sampling_info: SamplingBatchInfo,
-    accept: VerifyAccept,
-    *,
-    watermark: Optional[VerifyWatermark],
-) -> None:
-    """Commit the accepted tokens to the penalty history and the watermark context."""
-    if sampling_info.step_penalties is not None:
-        # Guarded here: building the arguments launches device work.
-        sampling_info.step_penalties.commit(
-            accept.accept_tokens(), accept_mask=accept.accept_mask()
-        )
-    if watermark is not None:
-        watermark.commit(accept)
