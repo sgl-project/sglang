@@ -27,6 +27,7 @@ def _batch(**overrides):
         global_num_tokens_cpu=[3, 1],
         global_num_tokens_padded_cpu=[4, 4],
         global_num_tokens_gpu=torch.tensor([3, 1]),
+        moe_dp_valid_counts=None,
         dp_padding_mode=DpPaddingMode.MAX_LEN,
     )
     fields.update(overrides)
