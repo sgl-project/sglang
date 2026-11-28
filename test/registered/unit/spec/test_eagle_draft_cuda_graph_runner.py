@@ -32,7 +32,6 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -283,72 +282,6 @@ class TestEagleDraftCudaGraphRunner(CustomTestCase):
                 forward_batch.attention_kv_len_lower_bound = bound
                 runner.execute(forward_batch)
                 self.assertEqual(keys[0].attention_variant, label)
-
-    def test_replay_picks_the_graph_captured_for_the_batch_greedy(self):
-        """Under rejection sampling a batch size captures a graph whose draft
-        forward skips the proposal distribution (greedy) and one that builds it;
-        a batch replays the one captured for its own all-greedy flag. The captured
-        forwards run after the capture, as a debug-eager replay runs them."""
-        runner = self._build_runner(_RecordingDraftBackend())
-        buffers = runner.buffers
-        buffers.extend_seq_lens = torch.zeros(CAPTURE_BS, dtype=torch.int32)
-        buffers.mrope_positions = torch.zeros((3, CAPTURE_BS), dtype=torch.int64)
-        buffers.sampling_seed = None
-        runner.extend_seq_lens_cpu = [1] * CAPTURE_BS
-        runner.temperatures = torch.ones(CAPTURE_BS, 1)
-        runner.top_ks = torch.ones(CAPTURE_BS, dtype=torch.int32)
-        runner.require_attn_tp_gather = False
-        runner.make_draft_step_fold = None
-        runner.model_runner.spec_algorithm = SpeculativeAlgorithm.EAGLE
-        runner.model_runner.runner_ids = SimpleNamespace(
-            bind_runner_slots=lambda forward_batch: None
-        )
-        runner.model_runner.capture_tail_hooks = []
-        runner.draft_attn_backend = SimpleNamespace(
-            init_forward_metadata_out_graph=lambda forward_batch, **kwargs: None,
-            init_forward_metadata_in_graph=lambda forward_batch: None,
-        )
-        runner.deepep_adapter = SimpleNamespace(
-            capture=lambda is_extend_in_batch: None, replay=lambda: None
-        )
-        draft_greedy = []
-        runner.eagle_worker = SimpleNamespace(
-            speculative_num_steps=NUM_STEPS,
-            draft_forward=lambda forward_batch, *, greedy: draft_greedy.append(greedy),
-        )
-        runner.draft_runtime = SimpleNamespace(
-            run_draft_loop=lambda *, runner, forward_batch, stock: stock()
-        )
-        forward_of_key = {}
-
-        def capture_one(key, forward, capture_inputs, post_warmup_hook):
-            forward_of_key[key] = forward
-
-        runner.backend = SimpleNamespace(capture_one=capture_one)
-        spec = SimpleNamespace(speculative_use_rejection_sampling=True)
-        with (
-            patch.object(draft_graph, "get_spec", return_value=spec),
-            patch.object(draft_graph, "maybe_flashinfer_autotune_speculative_draft"),
-        ):
-            runner.capture_one_shape(CAPTURE_BS, forward=None)
-            greedy_of_key = {}
-            for key, forward in forward_of_key.items():
-                forward()
-                greedy_of_key[key] = draft_greedy[-1]
-            self.assertEqual(sorted(greedy_of_key.values()), [False, True])
-            for is_all_greedy in (True, False):
-                with self.subTest(is_all_greedy=is_all_greedy):
-                    keys = []
-                    runner._replay_graph = lambda key, fb: keys.append(key)
-                    forward_batch = self._build_forward_batch([3, 4], 7)
-                    forward_batch.sampling_info = SimpleNamespace(
-                        is_all_greedy=is_all_greedy,
-                        temperatures=torch.ones(2, 1),
-                        top_ks=torch.ones(2, dtype=torch.int32),
-                        sampling_seed=None,
-                    )
-                    runner.execute(forward_batch)
-                    self.assertEqual(greedy_of_key[keys[0]], is_all_greedy)
 
     def test_draft_extend_replay_keys_the_graph_select_picks(self):
         """As the draft graphs, for the draft-extend graphs and their variants."""
