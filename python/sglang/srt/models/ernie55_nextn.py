@@ -54,6 +54,7 @@ from sglang.srt.models.ernie55 import (
     logits_rows,
     scatter_rows,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator
 
@@ -201,7 +202,7 @@ class Ernie5_5_MoeForCausalLMNextN(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
+        current_platform.empty_cache()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         _Ernie5_5NextNWeightLoader(self).load_all(weights)

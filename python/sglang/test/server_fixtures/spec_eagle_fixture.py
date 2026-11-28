@@ -13,6 +13,7 @@ The primary axis is ``disable_overlap``:
 import contextlib
 import random
 import time
+from typing import Optional
 
 import requests
 
@@ -85,6 +86,10 @@ class SpecEagleServerBase(CustomTestCase):
     # MRO (base first), so never restate a base's. Derived wins on a repeated env.
     env_overrides = ()
     extra_args = ()
+    # Set to a path to tee the server's stdout and stderr there, for a test that
+    # asserts on a log line. Off by default: the server keeps inheriting this
+    # process's streams, so CI output is unchanged.
+    server_log_path: Optional[str] = None
 
     @classmethod
     def _launch_args(cls):
@@ -145,16 +150,30 @@ class SpecEagleServerBase(CustomTestCase):
             )
             for env_var, value in cls._merged_env_overrides():
                 stack.enter_context(env_var.override(value))
+            # popen_launch_server tees the server's output through a writer
+            # thread, so this handle has to outlive setUpClass; tearDownClass
+            # closes it.
+            cls._server_log = (
+                open(cls.server_log_path, "w")
+                if cls.server_log_path is not None
+                else None
+            )
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
                 timeout=cls.server_launch_timeout,
                 other_args=cls._launch_args(),
+                return_stdout_stderr=(
+                    (cls._server_log, cls._server_log) if cls._server_log else None
+                ),
             )
 
     @classmethod
     def tearDownClass(cls):
         terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+        if getattr(cls, "_server_log", None) is not None:
+            cls._server_log.close()
+            cls._server_log = None
 
     @property
     def tokenizer(self):
