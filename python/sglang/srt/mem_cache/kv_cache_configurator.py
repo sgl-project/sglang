@@ -139,6 +139,35 @@ from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 logger = logging.getLogger(__name__)
 
 
+def _decode_cuda_graph_max_bs() -> Optional[int]:
+    """Largest decode batch that replays a CUDA graph, or None when decode never does."""
+    if get_disagg().disaggregation_mode == "prefill":
+        return None
+    decode = get_exec().graph.cuda_graph_config.decode
+    if decode.backend == Backend.DISABLED:
+        return None
+    if decode.bs:
+        return max(decode.bs)
+    return decode.max_bs
+
+
+def _cap_to_decode_graph_range(max_num_reqs: int) -> int:
+    # Larger decode batches run eagerly; when launch-bound, the slower steps
+    # keep the batch above the graph range (sgl-project/sglang#53431).
+    graph_cap = _decode_cuda_graph_max_bs()
+    if graph_cap is None or max_num_reqs <= graph_cap:
+        return max_num_reqs
+    logger.info(
+        "max_running_requests defaults to %d (was %d), the largest "
+        "decode CUDA graph batch size, so decode does not fall back "
+        "to eager. Raise --cuda-graph-max-bs-decode to allow more "
+        "running requests, or set --max-running-requests.",
+        graph_cap,
+        max_num_reqs,
+    )
+    return graph_cap
+
+
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
@@ -3516,6 +3545,7 @@ class KVCacheConfigurator:
         else:
             requested_per_worker = None
             max_num_reqs = min(estimated, token_capacity // 2)
+            max_num_reqs = _cap_to_decode_graph_range(max_num_reqs)
 
         capped_by_mamba = False
         if self.mambaish_config is not None:

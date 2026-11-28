@@ -125,7 +125,12 @@ def handle_gpu_memory_settings(server_args: Any):
                 decode_cuda_graph_config.max_bs = 8
         elif gpu_mem < 35 * 1024:
             # A10, 4090, 5090
-            # (chunked_prefill_size 4k, max_bs 48 if tp < 4 else 160)
+            # (chunked_prefill_size 4k, max_bs 256 if tp < 4 else 160)
+            # Measured on RTX 4090 with Qwen2.5 1.5B and LoRA: decode above 48
+            # ran eager at ~15x the cost of a replay, and the slower steps kept
+            # the running batch above the graph range (#33483). Graphs to 256
+            # took 0.54 GB against 0.15 GB to 48 there, within the headroom
+            # left by --mem-fraction-static 0.85 (KV pool unchanged).
             # 32GB Blackwell (RTX 5090) can hold decode cuda graphs well past
             # bs=24; the previous cap forced eager decode at bs>=32 and
             # collapsed high-concurrency throughput vs vLLM.
@@ -137,7 +142,7 @@ def handle_gpu_memory_settings(server_args: Any):
                 )
             if decode_cuda_graph_config.max_bs is None:
                 if cfg.tp_size < 4:
-                    decode_cuda_graph_config.max_bs = 48
+                    decode_cuda_graph_config.max_bs = 256
                 else:
                     decode_cuda_graph_config.max_bs = 160
         elif gpu_mem < 60 * 1024:
