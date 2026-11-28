@@ -94,12 +94,12 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_loader.weight_utils import (
+    clone_if_runai_streamed_tensor,
     default_weight_loader,
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
-    _clone_if_runai_streamed_tensor,
     _load_fused_indexer_wk,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -1343,9 +1343,7 @@ class Ernie5_5WeightLoader:
             return
         # An fp8 checkpoint ships the weight and its block scale apart, in any order.
         pair = self.pending_wo_a.setdefault(name, {})
-        pair["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
-            tensor
-        )
+        pair["scale" if is_scale else "weight"] = clone_if_runai_streamed_tensor(tensor)
         if len(pair) < 2:
             return
         del self.pending_wo_a[name]

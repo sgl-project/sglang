@@ -54,7 +54,7 @@ from sglang.srt.model_loader.utils import (
     should_deepgemm_weight_requant_ue8m0,
 )
 from sglang.srt.model_loader.weight_utils import (
-    RUNAI_STREAMER_TENSOR_ATTR,
+    clone_if_runai_streamed_tensor,
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
@@ -112,12 +112,6 @@ def expert_input_scale_has_destination(
 
 # Optional quantization for DeepSeek nvfp4 checkpoint
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
-
-
-def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
-        return tensor.clone().detach()
-    return tensor
 
 
 def _get_indexer_weight_block_size(
@@ -179,7 +173,7 @@ def _load_fused_indexer_wk(
     # A bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
     is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
     if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
-        rows = _clone_if_runai_streamed_tensor(loaded_weight)
+        rows = clone_if_runai_streamed_tensor(loaded_weight)
     else:
         rows = _pair_block_fp8_half(name, loaded_weight, pending, quant_config)
         if rows is None:
