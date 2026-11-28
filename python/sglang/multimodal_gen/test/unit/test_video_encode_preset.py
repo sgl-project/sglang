@@ -21,11 +21,11 @@ import sglang.multimodal_gen.runtime.entrypoints.utils as output_utils
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    X264_PRESET,
     MaterializedOutput,
     save_materialized_output,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.postprocess import ffmpeg_video_encoder as x264
 
 FPS = 8
 FRAMES = 8
@@ -59,8 +59,8 @@ def test_local_codec_children_receive_only_execution_settings(tmp_path, monkeypa
         tool = tmp_path / name
         tool.write_text(script)
         tool.chmod(0o700)
-    monkeypatch.setattr(output_utils, "_resolve_ffmpeg_exe", lambda: "ffmpeg")
-    output_utils._save_video_ffmpeg(
+    monkeypatch.setattr(x264, "resolve_ffmpeg_exe", lambda: "ffmpeg")
+    x264.save_video_ffmpeg(
         str(tmp_path / "fixture.mp4"),
         [np.zeros((16, 16, 3), dtype=np.uint8)],
         fps=FPS,
@@ -124,11 +124,13 @@ def test_saved_video_carries_the_configured_preset(tmp_path):
 
     assert paths == [str(saved)] and saved.exists()
     got = _x264_options(saved)
-    expected = _x264_options(_reference_encode(tmp_path, frames, X264_PRESET))
+    expected = _x264_options(_reference_encode(tmp_path, frames, x264.X264_PRESET))
     for key in PRESET_DERIVED_KEYS:
-        assert got.get(key) == expected.get(key), f"{key} does not match {X264_PRESET}"
+        assert got.get(key) == expected.get(key), (
+            f"{key} does not match {x264.X264_PRESET}"
+        )
 
-    if X264_PRESET != "medium":
+    if x264.X264_PRESET != "medium":
         # ffmpeg's implicit default, i.e. what a dropped -preset would give.
         default = _x264_options(_reference_encode(tmp_path, frames, "medium"))
         assert any(got.get(k) != default.get(k) for k in PRESET_DERIVED_KEYS), (
@@ -274,7 +276,7 @@ def test_materialized_video_uses_ffmpeg(tmp_path, monkeypatch, with_audio, compr
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="needs ffmpeg")
 def test_ffmpeg_failure_is_reported(tmp_path):
     with pytest.raises(RuntimeError, match="ffmpeg video encoding failed"):
-        output_utils._save_video_ffmpeg(
+        x264.save_video_ffmpeg(
             str(tmp_path / "invalid.mp4"),
             [np.zeros((16, 16, 3), dtype=np.uint8)],
             fps=FPS,

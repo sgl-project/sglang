@@ -1493,7 +1493,7 @@ class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
                 return_value="/tmp/cosmos3_audio.mp4",
             ),
             mock.patch(
-                "sglang.multimodal_gen.runtime.utils.nvenc_video_encoder."
+                "sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder."
                 "supports_nvenc",
                 return_value=False,
             ) as supports,
@@ -1526,7 +1526,7 @@ class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
         with (
             mock.patch.dict("os.environ", {"SGLANG_USE_NVENC": "1"}),
             mock.patch(
-                "sglang.multimodal_gen.runtime.utils.nvenc_video_encoder."
+                "sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder."
                 "supports_nvenc",
                 return_value=True,
             ),
@@ -1591,7 +1591,7 @@ class TestCosmos3EncodeWhileDecoding(unittest.TestCase):
         with (
             mock.patch.dict("os.environ", {"SGLANG_USE_NVENC": "1"}),
             mock.patch(
-                "sglang.multimodal_gen.runtime.utils.nvenc_video_encoder."
+                "sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder."
                 "NvencVideoEncoder.open"
             ) as nvenc_open,
             mock.patch(

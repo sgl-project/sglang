@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NVENC MP4 saving with reusable per-configuration sessions."""
+"""NVENC MP4 output with reusable per-configuration sessions."""
 
 from __future__ import annotations
 
 import io
-import logging
 import math
 import os
 import subprocess
@@ -17,7 +16,9 @@ from typing import Any
 
 import torch
 
-logger = logging.getLogger(__name__)
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 _MAX_IDLE_SESSIONS = 4
 _idle_sessions: OrderedDict[tuple[int, int, int, int, int], _NvencSession] = (
     OrderedDict()
@@ -125,6 +126,16 @@ def _release_session(session: _NvencSession) -> None:
 
 class NvencVideoEncoder:
     """Save one complete CUDA RGB video using an idle NVENC session if available."""
+
+    @classmethod
+    def try_open(cls, save_file_path: str, **kwargs) -> NvencVideoEncoder | None:
+        """Return None when unavailable so either saving path can use x264."""
+        try:
+            return cls.open(save_file_path, **kwargs)
+        except Exception:
+            logger.warning_once("Cannot start NVENC; using CPU encoding instead.")
+            logger.debug("NVENC startup failure", exc_info=True)
+            return None
 
     @classmethod
     def open(

@@ -21,7 +21,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     _sample_to_uint8_frames,
-    _save_video_ffmpeg,
     _try_save_video_with_audio,
 )
 from sglang.multimodal_gen.runtime.models.vaes.ltx_2_vae import AutoencoderKLLTX2Video
@@ -35,6 +34,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.j
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
+)
+from sglang.multimodal_gen.runtime.postprocess.ffmpeg_video_encoder import (
+    save_video_ffmpeg,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -166,7 +168,7 @@ def test_stream_matches_cpu_postprocessing(tmp_path, dtype, audio):
             quality=5,
         )
     else:
-        _save_video_ffmpeg(str(cpu_path), frames, fps=13, quality=5)
+        save_video_ffmpeg(str(cpu_path), frames, fps=13, quality=5)
     assert cpu_path.read_bytes() == stream_path.read_bytes()
 
 

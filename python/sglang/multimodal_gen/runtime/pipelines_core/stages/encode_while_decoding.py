@@ -126,28 +126,22 @@ class EncodeWhileDecoding:
             x264_preset=self._batch.x264_preset,
         )
         if self._use_nvenc:
-            from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
+            from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
                 NvencVideoEncoder,
             )
 
-            try:
-                encoder = NvencVideoEncoder.open(
-                    self.save_file_path,
-                    audio=None,
-                    **kwargs,
-                    # These queued frames are FP32 until the worker converts them.
-                    max_queued_frames=max(
-                        1, _STREAMED_VIDEO_QUEUE_BYTES // (12 * height * width)
-                    ),
-                )
-                if encoder is not None:
-                    self._nvenc_started = True
-                    return encoder
-            except Exception:
-                logger.warning_once(
-                    "Cannot start streamed NVENC; using CPU encode overlap instead."
-                )
-                logger.debug("Streamed NVENC startup failure", exc_info=True)
+            encoder = NvencVideoEncoder.try_open(
+                self.save_file_path,
+                audio=None,
+                **kwargs,
+                # These queued frames are FP32 until the worker converts them.
+                max_queued_frames=max(
+                    1, _STREAMED_VIDEO_QUEUE_BYTES // (12 * height * width)
+                ),
+            )
+            if encoder is not None:
+                self._nvenc_started = True
+                return encoder
         return CudaVideoEncoder.open(
             self.save_file_path,
             audio=self._audio,

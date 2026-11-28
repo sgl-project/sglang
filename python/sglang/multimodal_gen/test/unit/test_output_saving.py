@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     post_process_sample,
     save_materialized_output,
 )
+from sglang.multimodal_gen.runtime.postprocess import ffmpeg_video_encoder as x264
 
 
 def _rgb_frame() -> np.ndarray:
@@ -155,7 +156,7 @@ def test_video_with_audio_uses_single_pass_encoder(tmp_path, monkeypatch):
     def fail_legacy_mux(**_kwargs):
         raise AssertionError("the two-pass mux path should not run")
 
-    monkeypatch.setattr(output_utils, "_save_video_ffmpeg", encode_spy)
+    monkeypatch.setattr(x264, "save_video_ffmpeg", encode_spy)
     monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
     monkeypatch.setattr(output_utils, "_maybe_mux_audio_into_mp4", fail_legacy_mux)
 
@@ -197,7 +198,7 @@ def test_x264_preset_reaches_every_video_save_path(tmp_path, monkeypatch):
 
     monkeypatch.setattr(output_utils, "_try_save_cuda_videos_direct", parallel_save)
     monkeypatch.setattr(output_utils, "_try_save_cuda_video_direct", direct_save)
-    monkeypatch.setattr(output_utils, "_save_video_ffmpeg", encode_spy)
+    monkeypatch.setattr(x264, "save_video_ffmpeg", encode_spy)
     monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
 
     output_utils.save_outputs(
@@ -245,7 +246,7 @@ def test_video_audio_single_pass_failure_falls_back(tmp_path, monkeypatch):
         if "audio_path" in kwargs:
             raise RuntimeError("unsupported audio input")
 
-    monkeypatch.setattr(output_utils, "_save_video_ffmpeg", encode_spy)
+    monkeypatch.setattr(x264, "save_video_ffmpeg", encode_spy)
     monkeypatch.setattr(output_utils, "scipy_wavfile", FakeWavFile)
     monkeypatch.setattr(
         output_utils,
@@ -289,7 +290,7 @@ def test_x264_auto_thread_count(monkeypatch, height, available_cpus, expected_th
         lambda _pid: set(range(available_cpus)),
     )
 
-    assert output_utils._x264_auto_thread_count(height) == expected_threads
+    assert x264.x264_auto_thread_count(height) == expected_threads
 
 
 def test_video_direct_save_short_circuits_materialization(tmp_path, monkeypatch):
@@ -322,7 +323,7 @@ def test_video_direct_save_short_circuits_materialization(tmp_path, monkeypatch)
 
 
 def test_nvenc_saves_cpu_tensor_with_audio(tmp_path, monkeypatch):
-    from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
+    from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
         supports_nvenc,
     )
 
@@ -338,8 +339,8 @@ def test_nvenc_saves_cpu_tensor_with_audio(tmp_path, monkeypatch):
     frames = torch.full((3, 4, 256, 256), 0.5)
     audio = np.zeros(3200, dtype=np.float32)
     monkeypatch.setattr(
-        output_utils,
-        "_save_video_ffmpeg",
+        x264,
+        "save_video_ffmpeg",
         lambda *_args, **_kwargs: pytest.fail("NVENC output fell back to CPU"),
     )
     monkeypatch.setenv("SGLANG_USE_NVENC", "1")
@@ -362,7 +363,7 @@ def test_nvenc_saves_cpu_tensor_with_audio(tmp_path, monkeypatch):
 def test_nvenc_unavailable_preserves_cuda_audio_encoder(tmp_path, monkeypatch):
     from unittest import mock
 
-    from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
+    from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
         NvencVideoEncoder,
     )
 
@@ -436,7 +437,5 @@ def test_multiple_videos_use_parallel_direct_save_with_serial_fallback(
 
 def test_video_output_preserves_pinned_encoder(monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _: "/system/ffmpeg")
-    monkeypatch.setattr(
-        output_utils.imageio_ffmpeg, "get_ffmpeg_exe", lambda: "/pinned/ffmpeg"
-    )
-    assert output_utils._resolve_ffmpeg_exe() == "/pinned/ffmpeg"
+    monkeypatch.setattr(x264.imageio_ffmpeg, "get_ffmpeg_exe", lambda: "/pinned/ffmpeg")
+    assert x264.resolve_ffmpeg_exe() == "/pinned/ffmpeg"

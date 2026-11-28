@@ -15,9 +15,32 @@ from sglang.test.test_utils import CustomTestCase
 
 
 class TestNvencAvailability(CustomTestCase):
+    def test_explicit_encoding_settings_do_not_probe_nvenc(self):
+        from sglang.multimodal_gen.runtime.postprocess import (
+            nvenc_video_encoder as nvenc,
+        )
+
+        with mock.patch.object(nvenc, "supports_nvenc") as probe:
+            for override in ({"x264_preset": "fast"}, {"output_compression": 100}):
+                with self.subTest(override=override):
+                    self.assertIsNone(
+                        nvenc.NvencVideoEncoder.open(
+                            "out.mp4",
+                            device=torch.device("cuda"),
+                            width=64,
+                            height=64,
+                            fps=8,
+                            num_frames=2,
+                            **override,
+                        )
+                    )
+            probe.assert_not_called()
+
     def test_h264_encoder_capability_controls_nvenc(self):
         """A GPU without an H.264 encoder must fall back even when CUDA is available."""
-        from sglang.multimodal_gen.runtime.utils import nvenc_video_encoder as nvenc
+        from sglang.multimodal_gen.runtime.postprocess import (
+            nvenc_video_encoder as nvenc,
+        )
 
         # The fake binding deliberately ignores its ordinal, like version 2.2.3.
         # A successful probe must choose the device via the child's environment.
@@ -54,7 +77,7 @@ class TestNvencAvailability(CustomTestCase):
 class TestNvencVideoEncoder(CustomTestCase):
     def setUp(self):
         super().setUp()
-        from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
+        from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
             supports_nvenc,
         )
 
@@ -64,7 +87,9 @@ class TestNvencVideoEncoder(CustomTestCase):
     def test_warmup_cache_hits_by_resolution(self):
         import av
 
-        from sglang.multimodal_gen.runtime.utils import nvenc_video_encoder as nvenc
+        from sglang.multimodal_gen.runtime.postprocess import (
+            nvenc_video_encoder as nvenc,
+        )
 
         with nvenc._cache_lock:
             nvenc._idle_sessions.clear()
@@ -118,7 +143,7 @@ class TestNvencVideoEncoder(CustomTestCase):
         """Frame submission returns before the NVENC worker finishes."""
         import av
 
-        from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
+        from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
             NvencVideoEncoder,
         )
 
@@ -183,7 +208,7 @@ class TestNvencVideoEncoder(CustomTestCase):
         import numpy as np
 
         from sglang.multimodal_gen.runtime.entrypoints import utils
-        from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
+        from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
             NvencVideoEncoder,
         )
 

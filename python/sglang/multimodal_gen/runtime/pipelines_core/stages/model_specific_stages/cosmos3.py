@@ -2670,7 +2670,7 @@ class Cosmos3DecodingStage(PipelineStage):
         if has_audio:
             if not diffusion_envs.SGLANG_USE_NVENC:
                 return None
-            from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
+            from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
                 supports_nvenc,
             )
 

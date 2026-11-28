@@ -1490,7 +1490,7 @@ class CosmosDreamsRolloutStage(PipelineStage):
             return None
         encoder = None
         if batch is not None and diffusion_envs.SGLANG_USE_NVENC:
-            from sglang.multimodal_gen.runtime.utils.nvenc_video_encoder import (
+            from sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder import (
                 supports_nvenc,
             )
 

@@ -2069,7 +2069,7 @@ class TestCosmosDreamsEncodedDecode(CustomTestCase):
                 return_value="/tmp/bimanual.mp4",
             ),
             mock.patch(
-                "sglang.multimodal_gen.runtime.utils.nvenc_video_encoder."
+                "sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder."
                 "supports_nvenc",
                 return_value=True,
             ),
@@ -2085,7 +2085,7 @@ class TestCosmosDreamsEncodedDecode(CustomTestCase):
                 return_value="/tmp/bimanual.mp4",
             ),
             mock.patch(
-                "sglang.multimodal_gen.runtime.utils.nvenc_video_encoder."
+                "sglang.multimodal_gen.runtime.postprocess.nvenc_video_encoder."
                 "supports_nvenc",
                 return_value=False,
             ),
