@@ -64,6 +64,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
+def _rows_per_item(num_tokens: Any, count: int) -> list:
+    return num_tokens if isinstance(num_tokens, list) else [num_tokens] * count
+
+
 class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
@@ -204,8 +208,8 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
 
-    def _output_rows(self, output: Any, cap: int) -> int:
-        """Leading-dim row count actually produced by the body, clamped to ``cap``.
+    def _output_rows(self, output: Any, cap: int) -> Any:
+        """Leading-dim rows of each output the body produced, clamped to ``cap``.
 
         A body that shards or prunes its output along dim 0 returns fewer than
         ``cap`` rows; everything else returns exactly ``cap``.
@@ -219,7 +223,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
         if isinstance(output, (list, tuple)) and output:
-            return min(self._output_rows(o, cap) for o in output if o is not None)
+            return [None if o is None else self._output_rows(o, cap) for o in output]
         return cap
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
@@ -241,21 +245,21 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
             return [self._alloc_full_buffer(o, size) for o in output]
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
-    def _slice_output(self, output: Any, num_tokens: int) -> Any:
+    def _slice_output(self, output: Any, num_tokens: Any) -> Any:
         if output is None:
             return None
         if torch.is_tensor(output):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
-        if isinstance(output, tuple):
-            return tuple(self._slice_output(item, num_tokens) for item in output)
-        if isinstance(output, list):
-            return [self._slice_output(item, num_tokens) for item in output]
+        if isinstance(output, (list, tuple)):
+            rows = _rows_per_item(num_tokens, len(output))
+            items = [self._slice_output(o, n) for o, n in zip(output, rows)]
+            return tuple(items) if isinstance(output, tuple) else items
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
-        self, output: Any, output_buffer: Any, num_tokens: int
+        self, output: Any, output_buffer: Any, num_tokens: Any
     ) -> None:
         if output is None or output_buffer is None:
             if output is None and output_buffer is None:
@@ -288,8 +292,9 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
                     "BCG output sequence structure changed between capture sizes: "
                     f"{len(output)} != {len(output_buffer)}"
                 )
-            for item, buffer in zip(output, output_buffer):
-                self._copy_output_to_buffer(item, buffer, num_tokens)
+            rows = _rows_per_item(num_tokens, len(output))
+            for item, buffer, item_rows in zip(output, output_buffer, rows):
+                self._copy_output_to_buffer(item, buffer, item_rows)
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "
