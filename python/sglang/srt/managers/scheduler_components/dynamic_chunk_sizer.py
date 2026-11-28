@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import math
 import time
@@ -18,6 +19,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import broadcast_pyobj
@@ -74,10 +76,20 @@ class DynamicChunkSizer:
             try:
                 samples = self._profile_prefill_latency()
             except Exception as e:
+                hint = (
+                    " The probes reach 1.25x --chunked-prefill-size; lower it or "
+                    "--mem-fraction-static to keep dynamic chunking."
+                    if isinstance(e, torch.OutOfMemoryError)
+                    else ""
+                )
                 logger.warning(
                     f"[PP Dynamic Chunk] Failed to profile prefill latency: {e!r}. "
-                    "Dynamic chunking will be disabled."
+                    f"Dynamic chunking will be disabled.{hint}"
                 )
+            # The probes' cached peak starves allocations outside PyTorch (oneCCL, Level
+            # Zero); release it outside the handler, whose traceback pins a failed probe.
+            gc.collect()
+            current_platform.empty_cache()
 
         # The samples are global, so one broadcast from global rank 0 (a PP0 rank)
         # reaches every stage and attention rank; a failure travels as None.
