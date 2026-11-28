@@ -1,0 +1,92 @@
+name: CI Command Status
+
+on:
+  workflow_run:
+    workflows:
+      - PR Test Base
+      - PR Test Extra
+      - PR Test (AMD)
+      - PR Test Extra (AMD)
+      - Lint
+      - PR Test (sgl-router)
+      - PR Test (sglang-processor)
+      - PR Test (Rust extensions)
+      - PR Test (Rust workspace)
+      - CI Model Inventory
+      - PR Test (MLU)
+      - PR Test (PPU)
+      - PR Test (Xeon)
+      - PR Test (NPU)
+      - PR Test (XPU)
+      - PR Test (MUSA)
+      - PR Test (Arm64)
+      - PR Test (MLX)
+    types: [requested, in_progress, completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR whose CI command replies should be refreshed
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  resolve:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.event == 'pull_request' ||
+      github.event.workflow_run.event == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      prs: ${{ steps.resolve.outputs.prs }}
+    steps:
+      # workflow_run is privileged: execute only trusted default-branch code.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci/utils
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install PyGithub
+      - id: resolve
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/ci/utils/update_ci_command_status.py --resolve
+
+  update:
+    needs: resolve
+    if: needs.resolve.outputs.prs != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        pr: ${{ fromJSON(needs.resolve.outputs.prs) }}
+    concurrency:
+      group: ci-command-status-${{ matrix.pr }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+          sparse-checkout: scripts/ci/utils
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install PyGithub
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ matrix.pr }}
+        run: python scripts/ci/utils/update_ci_command_status.py --pr-number "$PR_NUMBER"

@@ -47,6 +47,7 @@ from run_ci_approval import (  # noqa: E402
     skipped_at_gate,
     workflow_file,
 )
+from update_ci_command_status import status_line  # noqa: E402
 
 # install_script values from runner_configs.yml are passed verbatim into a
 # `bash ${{ inputs.install_script }}` step in rerun-test.yml. GHA expression
@@ -715,15 +716,13 @@ def _rerun_tier_workflows(
                 )
             )
         elif run.status != "completed":
-            results.append(
-                (
-                    True,
-                    f"⏳ [`{run.name}`]({run.html_url}) is already "
-                    f"{run.status} for this commit; left it alone.",
-                )
-            )
+            results.append((True, status_line(run, run.run_attempt or 1)))
         else:
-            results.append(_rerun_workflow_run(run))
+            next_attempt = (run.run_attempt or 1) + 1
+            acted, message = _rerun_workflow_run(run)
+            if acted:
+                message = status_line(run, next_attempt)
+            results.append((acted, message))
 
     if skip_missing and not results:
         return (
@@ -795,6 +794,15 @@ def handle_run_hardware_ci(gh_repo, pr, comment, user_perms, selected_tiers):
     )
     _refresh_pr_states(gh_repo, pr)
     pr.create_issue_comment(message)
+    # Events can arrive before the reply exists; explicitly reconcile after
+    # creating it. Use the same serialized writer as workflow_run events.
+    if "<!--ci-run:" in message:
+        try:
+            gh_repo.get_workflow("ci-command-status.yml").create_dispatch(
+                gh_repo.default_branch, {"pr_number": str(pr.number)}, throw=True
+            )
+        except Exception as e:
+            print(f"Could not refresh CI command status: {e}")
     comment.create_reaction("+1" if acted else "confused")
     return acted
 
