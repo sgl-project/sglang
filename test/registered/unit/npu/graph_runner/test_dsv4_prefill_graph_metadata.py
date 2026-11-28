@@ -103,6 +103,34 @@ class TestDsv4PrefillGraphMetadata(CustomTestCase):
         self.assertEqual(tuple(seed.c4_page_table.shape), (1, 32))
         self.assertEqual(tuple(seed.c128_page_table.shape), (1, 1))
 
+    def test_capture_uses_each_producers_metadata_width(self):
+        # CANN 9.2: sparse attention emits 2048 int32 while the lightning
+        # indexer emits 1024 and rejects any other size.  Capture must mirror
+        # each producer instead of sizing all buffers from the widest one.
+        seed = _seed(128)
+        seed.kernel_metadata = {
+            "c1a_metadata": torch.zeros(2048, dtype=torch.int32),
+            "c4a_metadata": torch.ones(2048, dtype=torch.int32),
+            "c128a_metadata": torch.ones(2048, dtype=torch.int32),
+            "li_quant_metadata": torch.ones(1024, dtype=torch.int32),
+        }
+
+        state = Dsv4PrefillGraphMetadata.allocate(
+            backend=_backend(), seed=seed, num_tokens=128
+        )
+
+        widths = {key: t.numel() for key, t in state.kernel_metadata.items()}
+        self.assertEqual(
+            widths,
+            {
+                "c1a_metadata": 2048,
+                "c4a_metadata": 2048,
+                "c128a_metadata": 2048,
+                "li_quant_metadata": 1024,
+            },
+        )
+        self.assertTrue((seed.kernel_metadata["c4a_metadata"] == 1).all().item())
+
     def test_replay_refreshes_in_place(self):
         seed = _seed(128)
         state = Dsv4PrefillGraphMetadata.allocate(
