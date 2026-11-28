@@ -123,6 +123,10 @@ for chunk in stream:
     print(chunk['message']['content'], end='', flush=True)
 ```
 
+## Limitations
+
+The Python server’s Ollama-compatible endpoints are text-only. Requests that include non-empty `images` (for example, a multimodal `/api/chat` or `/api/generate` request) are rejected with an HTTP 400 error instead of being silently ignored. To serve image input, use the [OpenAI-compatible API](/docs/basic_usage/openai_api_vision) with a vision-capable model.
+
 ## Smart Router
 
 For intelligent routing between local Ollama (fast) and remote SGLang (powerful) using an LLM judge, see the [Smart Router documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/ollama/README.md).
