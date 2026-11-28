@@ -25,6 +25,12 @@ class MusaPythonStackTest(unittest.TestCase):
             "0.17.0",
         )
 
+    def test_compressed_tensors_for_torch_213(self) -> None:
+        self.assertEqual(
+            musa_python_stack.compressed_tensors_version("2.13.0.post1+musa5.2.0"),
+            "0.17.0",
+        )
+
     def test_unknown_torch_line_fails_closed(self) -> None:
         with self.assertRaisesRegex(
             musa_python_stack.StackError, "unsupported MUSA Torch line 2.10"

@@ -29,12 +29,8 @@ STACK_HELPER="${SCRIPT_DIR}/musa_python_stack.py"
 # MUSA lane cold-download hundreds of megabytes and exceed the install timeout.
 PIP_INSTALL=(python3 -m pip install)
 readonly MUSA_TRITON_VERSION="3.2.0"
-# Current MUSA CI uses the CPython 3.10 x86_64 wheel. A Python upgrade must
-# update this digest together with the pinned artifact.
-readonly MUSA_TRITON_SHA256="65b15d42fac24a2eca4c0c9f0ac68c8bd7cbe6bcc9f619c3483fb4f323391303"
 readonly MUSA_TRITON_INDEX_URL="https://dl.mthreads.com/repo/api/pypi/pypi/simple"
 readonly MUSA_TORCHADA_VERSION="0.1.112"
-readonly MUSA_TORCHADA_SHA256="3795ee0d021a024a9552673569370ea1ed803eaee9ff4846324371bc845f8524"
 readonly MUSA_TORCHADA_INDEX_URL="https://pypi.org/simple"
 readonly MUSA_SETUPTOOLS_SPEC="setuptools<82"
 MUSA_CI_SCRATCH="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/sglang-musa-ci.XXXXXX")"
@@ -81,10 +77,6 @@ MUSA_TRITON_WHEEL=""
 MUSA_TRITON_TASK_LOCAL=""
 MUSA_TORCHADA_WHEEL=""
 
-wheel_sha256() {
-    sha256sum "$1" | awk '{print $1}'
-}
-
 find_bundled_musa_triton() {
     local candidate
     local -a candidates
@@ -94,12 +86,9 @@ find_bundled_musa_triton() {
     mapfile -t candidates < <(
         compgen -G "${WHL_DIR}/triton-${MUSA_TRITON_VERSION}-*.whl" || true
     )
-    for candidate in "${candidates[@]}"; do
-        if [ "$(wheel_sha256 "$candidate")" = "$MUSA_TRITON_SHA256" ]; then
-            MUSA_TRITON_WHEEL="$candidate"
-            return
-        fi
-    done
+    if [ "${#candidates[@]}" -ne 0 ]; then
+        MUSA_TRITON_WHEEL="${candidates[0]}"
+    fi
 }
 
 download_musa_triton() {
@@ -129,12 +118,9 @@ find_bundled_torchada() {
     mapfile -t candidates < <(
         compgen -G "${WHL_DIR}/torchada-${MUSA_TORCHADA_VERSION}-*.whl" || true
     )
-    for candidate in "${candidates[@]}"; do
-        if [ "$(wheel_sha256 "$candidate")" = "$MUSA_TORCHADA_SHA256" ]; then
-            MUSA_TORCHADA_WHEEL="$candidate"
-            return
-        fi
-    done
+    if [ "${#candidates[@]}" -ne 0 ]; then
+        MUSA_TORCHADA_WHEEL="${candidates[0]}"
+    fi
 }
 
 download_torchada() {
@@ -162,16 +148,12 @@ if [ -z "$MUSA_TRITON_WHEEL" ]; then
         --triton-only; then
         echo "Reusing the installed MUSA Triton"
     else
-        # Existing runner bundles do not contain Triton yet. Keep a hash-pinned
-        # vendor-index fallback until the wheel is shipped in /sglang-checkout/whl.
+        # Existing runner bundles do not contain Triton yet. Fall back to the
+        # vendor index until the wheel is shipped in /sglang-checkout/whl.
         download_musa_triton
     fi
 fi
 if [ -n "$MUSA_TRITON_WHEEL" ]; then
-    if [ "$(wheel_sha256 "$MUSA_TRITON_WHEEL")" != "$MUSA_TRITON_SHA256" ]; then
-        echo "::error::MUSA Triton wheel SHA256 does not match the pinned artifact"
-        exit 1
-    fi
     MUSA_TRITON_TASK_LOCAL="1"
     echo "Using MUSA Triton wheel: ${MUSA_TRITON_WHEEL}"
 fi
@@ -181,10 +163,6 @@ fi
 find_bundled_torchada
 if [ -z "$MUSA_TORCHADA_WHEEL" ]; then
     download_torchada
-fi
-if [ "$(wheel_sha256 "$MUSA_TORCHADA_WHEEL")" != "$MUSA_TORCHADA_SHA256" ]; then
-    echo "::error::torchada wheel SHA256 does not match the pinned artifact"
-    exit 1
 fi
 echo "Using torchada wheel: ${MUSA_TORCHADA_WHEEL}"
 

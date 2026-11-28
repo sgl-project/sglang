@@ -36,6 +36,7 @@ OPTIONAL_STACK_DISTRIBUTIONS = ("setuptools",)
 COMPRESSED_TENSORS_BY_TORCH_MINOR = {
     (2, 9): "0.15.0",
     (2, 11): "0.17.0",
+    (2, 13): "0.17.0",
 }
 
 LOGGER = logging.getLogger(__name__)

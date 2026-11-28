@@ -180,19 +180,6 @@ ext_modules = [
 ]
 
 
-def _remote_urls(repo_url):
-    """Remote URLs to try for a repository, in order.
-
-    The build nodes reach github.com slowly, so a mirror prefix taken from
-    SGLANG_MUSA_GIT_PROXY is tried first and the direct URL is the fallback.
-    `SGLANG_MUSA_GIT_PROXY=direct` disables the prefix.
-    """
-    prefix = os.environ.get("SGLANG_MUSA_GIT_PROXY", "").strip()
-    if not prefix or prefix.lower() == "direct":
-        return [repo_url]
-    return [prefix + repo_url, repo_url]
-
-
 class _CustomBuildExt(BuildExtension):
     """Custom build extension that clones third-party repositories before building."""
 
@@ -204,58 +191,48 @@ class _CustomBuildExt(BuildExtension):
         CI links, and the build needs nothing but the pin. Re-running on an
         existing checkout re-fetches the pin instead of cloning again.
         """
-        last_error = None
-        for url in _remote_urls(repo_url):
-            try:
-                if (repo_path / ".git").exists():
-                    subprocess.check_call(
-                        [
-                            "git",
-                            "-C",
-                            str(repo_path),
-                            "remote",
-                            "set-url",
-                            "origin",
-                            url,
-                        ]
-                    )
-                else:
-                    repo_path.mkdir(parents=True, exist_ok=True)
-                    subprocess.check_call(["git", "init", "-q", str(repo_path)])
-                    subprocess.check_call(
-                        ["git", "-C", str(repo_path), "remote", "add", "origin", url]
-                    )
-                subprocess.check_call(
-                    [
-                        "git",
-                        "-C",
-                        str(repo_path),
-                        "fetch",
-                        "-q",
-                        "--depth",
-                        "1",
-                        "origin",
-                        git_tag,
-                    ]
-                )
-                subprocess.check_call(
-                    [
-                        "git",
-                        "-C",
-                        str(repo_path),
-                        "checkout",
-                        "-q",
-                        "--force",
-                        "FETCH_HEAD",
-                    ]
-                )
-                return
-            except subprocess.CalledProcessError as error:
-                last_error = error
-                print(
-                    f"[sgl-kernel] fetching from {url} failed, trying the next remote"
-                )
-        raise last_error
+        if (repo_path / ".git").exists():
+            subprocess.check_call(
+                [
+                    "git",
+                    "-C",
+                    str(repo_path),
+                    "remote",
+                    "set-url",
+                    "origin",
+                    repo_url,
+                ]
+            )
+        else:
+            repo_path.mkdir(parents=True, exist_ok=True)
+            subprocess.check_call(["git", "init", "-q", str(repo_path)])
+            subprocess.check_call(
+                ["git", "-C", str(repo_path), "remote", "add", "origin", repo_url]
+            )
+        subprocess.check_call(
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "fetch",
+                "-q",
+                "--depth",
+                "1",
+                "origin",
+                git_tag,
+            ]
+        )
+        subprocess.check_call(
+            [
+                "git",
+                "-C",
+                str(repo_path),
+                "checkout",
+                "-q",
+                "--force",
+                "FETCH_HEAD",
+            ]
+        )
 
     def run(self):
         if os.environ.get("SGLANG_MUSA_SKIP_THIRD_PARTY", "0") == "1":

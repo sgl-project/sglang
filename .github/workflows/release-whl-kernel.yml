@@ -18,7 +18,7 @@ on:
           - 'cu130'
           - 'rocm720'
           - 'rocm1000'
-          - 'musa43'
+          - 'musa52'
       tag_name:
         description: "Version number, must be in the form of vX.Y.Z (e.g. v0.4.0)"
         type: string
@@ -326,15 +326,15 @@ jobs:
           git commit -m "update whl index"
           git push
 
-  build-musa43:
+  build-musa52:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'musa43')
+      (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'musa52')
     runs-on: kernel-build-node-musa
     strategy:
       matrix:
-        python-version: ["3.10"]
-        musa-version: ["43"]
+        python-version: ["3.12"]
+        musa-version: ["52"]
     steps:
       # Self-hosted build nodes retain the workspace across jobs. Prior builds
       # leave root-owned artifacts under python/sglang/kernels/aot/build/ that actions/checkout
@@ -361,24 +361,51 @@ jobs:
             -print \
             -delete 2>/dev/null || true
 
+      - name: Select Python interpreter
+        env:
+          PYTHON_VERSION: ${{ matrix.python-version }}
+        run: |
+          interpreter="$(command -v "python${PYTHON_VERSION}")" || {
+            echo "::error::Python ${PYTHON_VERSION} is not installed"
+            exit 1
+          }
+          python_bin="$(readlink -f "$interpreter")"
+          echo "PYTHON=${python_bin}" >> "$GITHUB_ENV"
+          "$python_bin" --version
+
+      - name: Verify MUSA build toolchain
+        run: |
+          "$PYTHON" - <<'PY'
+          import sys
+          import torch
+          import torch_musa
+
+          assert sys.version_info[:2] == (3, 12), sys.version
+          assert torch.__version__.startswith("2.13."), torch.__version__
+          assert "+musa5.2.0" in torch.__version__, torch.__version__
+          assert torch_musa.__version__.startswith("2.13."), torch_musa.__version__
+          assert "+musa5.2.0" in torch_musa.__version__, torch_musa.__version__
+
+          print("Python:", sys.version)
+          print("Torch:", torch.__version__)
+          print("torch_musa:", torch_musa.__version__)
+          PY
+
+          mcc --version | grep -q "mcc version 5.2.0"
+
       # The self-hosted node keeps its own torchada in ~/.local. Install the
       # pinned release into a job-local prefix so the build does not depend on
       # whatever version the node happens to carry.
       - name: Install torchada
         run: |
-          python -m pip install --no-deps --target "${RUNNER_TEMP}/torchada" "torchada==0.1.112"
+          "$PYTHON" -m pip install --no-deps --target "${RUNNER_TEMP}/torchada" "torchada==0.1.112"
           echo "PYTHONPATH=${RUNNER_TEMP}/torchada${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
 
       - name: Build wheels
-        env:
-          # The build nodes reach github.com very slowly, so the pinned
-          # third-party sources are fetched through a mirror by default.
-          # Override it with the repository variable, or set it to `direct`.
-          SGLANG_MUSA_GIT_PROXY: ${{ vars.SGLANG_MUSA_GIT_PROXY || 'https://gh-proxy.org/' }}
         run: |
           cd python/sglang/kernels/aot
           mv pyproject_musa.toml pyproject.toml
-          python setup_musa.py sdist bdist_wheel
+          "$PYTHON" setup_musa.py sdist bdist_wheel
 
       - name: Rename MUSA wheels
         run: |
@@ -390,8 +417,8 @@ jobs:
           name: wheel-python${{ matrix.python-version }}-musa${{ matrix.musa-version }}
           path: python/sglang/kernels/aot/dist/*
 
-  release-musa43:
-    needs: build-musa43
+  release-musa52:
+    needs: build-musa52
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -430,7 +457,7 @@ jobs:
           WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
 
       - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --musa 43
+        run: python3 scripts/update_kernel_whl_index.py --musa 52
 
       - name: Push wheel index
         run: |
