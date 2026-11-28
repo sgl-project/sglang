@@ -922,6 +922,7 @@ class ComposedPipelineBase(ABC):
         scheduler_key: str = "scheduler",
         vae_key: str | None = "vae",
         stage_name: str = "denoising_stage",
+        standard_stage_cls: type[DenoisingStage] = DenoisingStage,
     ) -> "ComposedPipelineBase":
 
         def create_stage() -> PipelineStage:
@@ -940,7 +941,7 @@ class ComposedPipelineBase(ABC):
                 kwargs["vae"] = self.get_module(vae_key, None)
 
             return ProgressiveDenoisingStageRouter(
-                standard_stage=DenoisingStage(**kwargs),
+                standard_stage=standard_stage_cls(**kwargs),
                 progressive_stage_factory=lambda: progressive_stage_cls(**kwargs),
             )
 

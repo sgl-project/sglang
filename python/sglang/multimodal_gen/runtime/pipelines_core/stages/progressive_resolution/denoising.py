@@ -268,6 +268,15 @@ class ProgressiveDenoisingStage(DenoisingStage):
         """
         return H_lat, W_lat
 
+    def _latent_channels(self, server_args: ServerArgs) -> int:
+        """Channels of the low-res initial noise in model-native layout.
+
+        Defaults to a quarter of the DiT input channels (the convention for
+        patch-packed latents). Models whose latents reach the DiT unpacked
+        override this.
+        """
+        return server_args.pipeline_config.dit_config.arch_config.in_channels // 4
+
     def _unpack_latent(
         self, latent: torch.Tensor, h_lat: int, w_lat: int
     ) -> torch.Tensor:
@@ -422,7 +431,7 @@ class ProgressiveDenoisingStage(DenoisingStage):
     ) -> torch.Tensor:
         """Generate low-res initial noise and return in model-native format."""
         device = get_local_torch_device()
-        C = server_args.pipeline_config.dit_config.arch_config.in_channels // 4
+        C = self._latent_channels(server_args)
         dtype = server_args.pipeline_config.get_latent_dtype(
             batch.prompt_embeds[0].dtype if batch.prompt_embeds else torch.bfloat16
         )
