@@ -345,6 +345,12 @@ fn validate(pattern: &str) -> Result<regex_syntax::ast::Ast, Error> {
              `re` rejects, or a repetition count Python cannot honour"
         )));
     }
+    if spaced_repetition_operator(&ast, pattern) {
+        return Err(Error::Validation(format!(
+            "stop_regex {pattern:?} has whitespace inside a repetition operator \
+             such as `{{1, 3}}`, which Python's `re` reads as literal text"
+        )));
+    }
     if alternation_under_repetition(&ast) {
         return Err(Error::Validation(format!(
             "stop_regex {pattern:?} alternates inside a repetition; each iteration \
@@ -425,6 +431,32 @@ fn repeats_an_assertion(ast: &regex_syntax::ast::Ast) -> bool {
         Ast::Group(g) => repeats_an_assertion(&g.ast),
         Ast::Concat(c) => c.asts.iter().any(repeats_an_assertion),
         Ast::Alternation(a) => a.asts.iter().any(repeats_an_assertion),
+        _ => false,
+    }
+}
+
+/// Whether a repetition operator's source text holds whitespace, as in `\d{1, 3}`.
+///
+/// `regex-syntax` reads that as a repeat with bound 3. CPython reads the literal
+/// text and needs 7 characters, so the match window would be too small.
+fn spaced_repetition_operator(ast: &regex_syntax::ast::Ast, pattern: &str) -> bool {
+    use regex_syntax::ast::Ast;
+    match ast {
+        Ast::Repetition(rep) => {
+            pattern[rep.op.span.start.offset..rep.op.span.end.offset]
+                .chars()
+                .any(char::is_whitespace)
+                || spaced_repetition_operator(&rep.ast, pattern)
+        }
+        Ast::Group(g) => spaced_repetition_operator(&g.ast, pattern),
+        Ast::Concat(c) => c
+            .asts
+            .iter()
+            .any(|a| spaced_repetition_operator(a, pattern)),
+        Ast::Alternation(a) => a
+            .asts
+            .iter()
+            .any(|a| spaced_repetition_operator(a, pattern)),
         _ => false,
     }
 }
@@ -657,6 +689,109 @@ mod tests {
         );
     }
 
+    /// Spacing outside a repeat operator reads the same in both dialects.
+    const SPACING_OUTSIDE_A_REPEAT: &[(&str, usize)] = &[
+        ("a{1,3}?", 3),
+        ("a {2}", 3),
+        ("[ ]{2}", 2),
+        ("(?x)a {2}", 2),
+    ];
+
+    #[test]
+    fn whitespace_outside_a_repeat_operator_is_still_admitted() {
+        for &(pattern, bound) in SPACING_OUTSIDE_A_REPEAT {
+            assert_eq!(
+                stop_regex_bound(pattern).map_err(|e| e.to_string()),
+                Ok(bound),
+                "{pattern:?}"
+            );
+        }
+    }
+
+    /// Asks CPython about each pattern: `Err` if `re.compile` raises, otherwise
+    /// the `sre_parse` max width, or `None` when it is unbounded.
+    /// Returns `None` when no Python interpreter can be started.
+    fn cpython_verdicts(patterns: &[String]) -> Option<Vec<Result<Option<u64>, String>>> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        const SCRIPT: &str = r#"
+import json, re, sys
+try:
+    import re._parser as sre_parse
+except ImportError:
+    import sre_parse
+out = []
+for p in json.load(sys.stdin):
+    try:
+        re.compile(p)
+        hi = sre_parse.parse(p).getwidth()[1]
+        out.append({"width": hi if hi < sre_parse.MAXREPEAT - 1 else None})
+    except Exception as e:
+        out.append({"error": f"{type(e).__name__}: {e}"})
+print(json.dumps(out))
+"#;
+        let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".into());
+        let mut child = match Command::new(&python)
+            .args(["-I", "-c", SCRIPT])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(e) => {
+                eprintln!("skipping the CPython check: cannot start {python:?}: {e}");
+                return None;
+            }
+        };
+        child
+            .stdin
+            .take()
+            .expect("piped")
+            .write_all(serde_json::to_string(patterns).expect("json").as_bytes())
+            .expect("write patterns");
+        let out = child.wait_with_output().expect("python exits");
+        assert!(out.status.success(), "{python} failed: {out:?}");
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).expect("json");
+        Some(
+            rows.iter()
+                .map(|r| match r.get("error") {
+                    Some(e) => Err(e.to_string()),
+                    None => Ok(r["width"].as_u64()),
+                })
+                .collect(),
+        )
+    }
+
+    /// Every pattern the tests expect Rust to admit must compile in CPython, and
+    /// its bound must be at least CPython's max width, so the stop can fire.
+    #[test]
+    fn admitted_patterns_compile_in_cpython_within_their_bound() {
+        let admitted: Vec<(String, usize)> = corpus()
+            .into_iter()
+            .map(|c| c.pattern)
+            .chain(SPACING_OUTSIDE_A_REPEAT.iter().map(|(p, _)| p.to_string()))
+            .filter_map(|p| stop_regex_bound(&p).ok().map(|bound| (p, bound)))
+            .collect();
+        let patterns: Vec<String> = admitted.iter().map(|(p, _)| p.clone()).collect();
+        let Some(verdicts) = cpython_verdicts(&patterns) else {
+            return;
+        };
+        let mut failures = Vec::new();
+        for ((pattern, bound), verdict) in admitted.iter().zip(verdicts) {
+            match verdict {
+                Err(e) => failures.push(format!("{pattern:?} does not compile in CPython: {e}")),
+                Ok(Some(width)) if *bound != STOP_REGEX_MAX_LEN && (*bound as u64) < width => {
+                    failures.push(format!(
+                        "{pattern:?} rust bound {bound} < CPython max width {width}"
+                    ))
+                }
+                Ok(_) => {}
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     #[test]
     fn admitted_pattern_carries_its_own_text_and_bound() {
         let p = RegexPattern::try_from(r"\d{6}").expect("valid");
@@ -784,6 +919,12 @@ mod tests {
             // the scheduler sizes too small a window and the stop never fires.
             case(r"\<END\>", Policy::MustReject, 3, Some(5), 0.02), // round 5
             case(r"\b{start}xyz", Policy::MustReject, 3, Some(10), 0.04), // round 4
+            // `regex-syntax` allows whitespace inside a counted repeat. CPython
+            // reads `a{2 }` as the five literal characters `a{2 }`, so a bound of
+            // 2 sizes too small a window and the stop never fires.
+            case("a{2 }", Policy::MustReject, 2, Some(5), 0.01),
+            case("a{ 2}", Policy::MustReject, 2, Some(5), 0.01),
+            case(r"\d{1, 3}", Policy::MustReject, 3, Some(7), 0.01),
             // ---- Compounding repeat cost. Both compile in CPython; both are fatal
             // there. `repetition_cost_too_large` covers these.
             case(
