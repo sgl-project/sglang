@@ -286,7 +286,12 @@ def parse_arguments(
     # Strategy 3: ast.literal_eval
     try:
         parsed_value = safe_literal_eval(json_value)
-        return parsed_value, True
+        # A bare comma makes literal_eval build a tuple ("1,000" -> (1, 0));
+        # only an array-typed argument may take it, as a list.
+        if not isinstance(parsed_value, tuple):
+            return parsed_value, True
+        if arg_type == "array":
+            return list(parsed_value), True
     except (ValueError, SyntaxError):
         pass
 
