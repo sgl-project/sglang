@@ -13,6 +13,30 @@ from typing import Optional
 import torch
 
 
+def get_npu_rope_cache_length(config) -> int:
+    """Bound table allocation without changing the model's YaRN parameters."""
+    max_position = config.max_position_embeddings
+    context_len = getattr(config, "context_len", None)
+    if context_len is None or context_len >= max_position:
+        return max_position
+
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_spec, max_speculative_num_draft_tokens
+
+    # Use the long-sequence RoPE reserve policy with adaptive draft capacity.
+    # The tables cannot grow inside an NPU graph.
+    draft = max_speculative_num_draft_tokens() or 0
+    # An adaptive draft tree can grow deeper than the initial step count.
+    steps = max(int(get_spec().speculative_num_steps or 0), draft)
+    reserve = (
+        context_len
+        + steps * draft * envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
+        + envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
+    )
+    align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+    return min(max_position, (reserve + align - 1) // align * align)
+
+
 class Dsv4NpuRoPE:
     """Interleaved cos/sin tables, layout [c0,c0,c1,c1,...] / [s0,s0,s1,s1,...]."""
 
