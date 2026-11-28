@@ -210,7 +210,11 @@ class MiniMaxSparseNvfp4AttnBackend(AttentionBackend):
             if forward_batch.forward_mode.is_target_verify()
             else 1
         )
-        max_pages = max(1, (int(max_seq_len) + self.page_size - 1) // self.page_size)
+        # The MSA-v1 indexer kernels address at most 8192 pages; the req_to_token row
+        # runs past the model context by one decode step's reach, so a 1M row exceeds it.
+        max_pages = min(
+            max(1, (int(max_seq_len) + self.page_size - 1) // self.page_size), 8192
+        )
         key = (
             forward_batch.forward_mode,
             batch_size,
