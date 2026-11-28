@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from functools import lru_cache
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
@@ -12,7 +13,6 @@ from sglang.kernels.spec import (
     CapabilityRequirement,
     KernelBackend,
     KernelSpec,
-    capabilities_satisfied,
 )
 
 if TYPE_CHECKING:
@@ -127,6 +127,96 @@ def _prefer_torch_rowwise_fp8(
     return m >= 8192 and ((k >= 4096 and n >= 6144) or (k >= 7168 and n >= 5376))
 
 
+_SM120_RT_DEPS: Optional[Tuple[object, object, object, bool]] = None
+
+
+def _get_sm120_rt_deps():
+    global _SM120_RT_DEPS
+    if _SM120_RT_DEPS is None:
+        import torch
+
+        from sglang.srt import batch_invariant_ops, runtime_context
+
+        _SM120_RT_DEPS = (
+            torch,
+            batch_invariant_ops,
+            runtime_context,
+            hasattr(torch, "_scaled_mm"),
+        )
+    return _SM120_RT_DEPS
+
+
+@lru_cache(maxsize=None)
+def _sm120_torch_fp8_max_n(device: torch.device) -> int:
+    import torch
+
+    from sglang.srt.utils.device import get_cuda_version
+
+    props = torch.cuda.get_device_properties(device)
+    if (props.major, props.minor) != (12, 0) or get_cuda_version() < (12, 8):
+        return 0
+    # Limit 128-column CUTLASS tiles to one third of the available SMs.
+    return props.multi_processor_count // 3 * 128
+
+
+def _prefer_sm120_torch_rowwise_fp8(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    scales_a: torch.Tensor,
+    scales_b: torch.Tensor,
+    out_dtype: torch.dtype,
+    bias: Optional[torch.Tensor],
+) -> bool:
+    """Whether Torch's SM120 cuBLASLt kernel wins for this small-M rowwise shape."""
+    if bias is not None or mat_a.ndim != 2 or mat_b.ndim != 2:
+        return False
+    m, k = mat_a.shape
+    n = mat_b.shape[1]
+    if m <= 0 or m > 128 or k < 4096 or n < 1536:
+        return False
+
+    dev = mat_a.device
+    if dev.type != "cuda":
+        return False
+    max_n = _sm120_torch_fp8_max_n(dev)
+    if max_n <= 0 or n > max_n:
+        return False
+
+    torch, batch_invariant_ops, runtime_context, has_scaled_mm = _get_sm120_rt_deps()
+    if (
+        not has_scaled_mm
+        or (out_dtype is not torch.bfloat16 and out_dtype is not torch.float16)
+        or mat_b.device != dev
+        or mat_a.dtype is not torch.float8_e4m3fn
+        or mat_b.dtype is not torch.float8_e4m3fn
+        or scales_a.dtype is not torch.float32
+        or scales_b.dtype is not torch.float32
+        or scales_a.device != dev
+        or scales_b.device != dev
+        or scales_a.shape != (m, 1)
+        or scales_b.numel() != n
+        or not mat_a.is_contiguous()
+        or mat_b.stride(0) != 1
+        or (n > 1 and mat_b.stride(1) != k)
+        or not scales_a.is_contiguous()
+        or not scales_b.is_contiguous()
+        or torch.compiler.is_compiling()
+        or batch_invariant_ops.is_batch_invariant_mode_enabled()
+    ):
+        return False
+
+    try:
+        deterministic = runtime_context.get_exec().deterministic
+        if (
+            deterministic.enable_deterministic_inference
+            or deterministic.rl_on_policy_target is not None
+        ):
+            return False
+    except ValueError:
+        pass
+    return True
+
+
 class Fp8ScaledMMOp(BaseFusedOp):
     """FP8 GEMM with independent per-row A and per-column B scales."""
 
@@ -144,16 +234,20 @@ class Fp8ScaledMMOp(BaseFusedOp):
         out_dtype: torch.dtype,
         bias: Optional[torch.Tensor] = None,
     ) -> bool:
-        # The torch path is a measured SM90 win for some shapes, not a
+        # The torch path is a measured SM90/SM120 win for some shapes, not a
         # capability limit; elsewhere the AOT kernel always runs.
-        if (
-            backend is KernelBackend.AOT
-            and capabilities_satisfied(_SM90, _platform())
-            and _prefer_torch_rowwise_fp8(
-                mat_a, mat_b, scales_a, scales_b, out_dtype, bias
-            )
-        ):
-            return False
+        if backend is KernelBackend.AOT:
+            plat = _platform()
+            if plat.device_type == "cuda":
+                if plat.cuda_arch_major == 12 and plat.cuda_arch_minor == 0:
+                    return not _prefer_sm120_torch_rowwise_fp8(
+                        mat_a, mat_b, scales_a, scales_b, out_dtype, bias
+                    )
+                if plat.cuda_arch_major == 9 and plat.cuda_arch_minor == 0:
+                    return not _prefer_torch_rowwise_fp8(
+                        mat_a, mat_b, scales_a, scales_b, out_dtype, bias
+                    )
+                return True
         return super().backend_eligible(
             backend, mat_a, mat_b, scales_a, scales_b, out_dtype, bias
         )
@@ -167,11 +261,24 @@ class Fp8ScaledMMOp(BaseFusedOp):
         out_dtype: torch.dtype,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        import torch
-
+        torch = _get_sm120_rt_deps()[0]
         m, n = mat_a.shape[0], mat_b.shape[1]
-        scale_a = scales_a.reshape(m, 1) if scales_a.numel() == m else scales_a
-        scale_b = scales_b.reshape(1, n) if scales_b.numel() == n else scales_b
+        scale_a = (
+            scales_a
+            if scales_a.shape == (m, 1)
+            else (scales_a.reshape(m, 1) if scales_a.numel() == m else scales_a)
+        )
+        scale_b = (
+            scales_b
+            if scales_b.shape == (1, n)
+            else (scales_b.reshape(1, n) if scales_b.numel() == n else scales_b)
+        )
+        plat = _platform()
+        use_fast_accum = not (
+            plat.device_type == "cuda"
+            and plat.cuda_arch_major == 12
+            and plat.cuda_arch_minor == 0
+        )
         return torch._scaled_mm(
             mat_a,
             mat_b,
@@ -179,7 +286,7 @@ class Fp8ScaledMMOp(BaseFusedOp):
             scale_b=scale_b,
             out_dtype=out_dtype,
             bias=bias,
-            use_fast_accum=True,
+            use_fast_accum=use_fast_accum,
         )
 
     def forward_aot(
