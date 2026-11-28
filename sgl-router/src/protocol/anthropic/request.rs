@@ -31,7 +31,9 @@ const FORWARDED: &[&str] = &[
 
 /// `count_only`: `count_tokens` shape, no `max_tokens` required.
 /// `inline_system`: the engine's chat template renders a system message after
-/// the first, so a system turn stays in place instead of joining the first.
+/// the first, so a system turn stays in place as a system message. Otherwise
+/// system turns before the first user or assistant turn join the first system
+/// message, and later ones are placed where they are (`attach_inline_system`).
 pub fn to_chat(req: Value, count_only: bool, inline_system: bool) -> Result<Converted, String> {
     let Value::Object(req) = req else {
         return Err("request body must be a JSON object".into());
@@ -63,8 +65,9 @@ pub fn to_chat(req: Value, count_only: bool, inline_system: bool) -> Result<Conv
         return Err("messages: at least one message is required".into());
     }
     let (merged, lifted) = merge_turns(turns, inline_system)?;
-    // Lifted text joins the first system message, as the engine's own Messages
-    // adapter (`AnthropicServing`) places it; keep the two in step.
+    // Lifted text joins the first system message, and later system turns are
+    // placed where they are, as the engine's own Messages adapter
+    // (`AnthropicServing`) places them; keep the two in step.
     for turn in lifted {
         if let Some(s) = system_turn_text(turn)? {
             system = Some(match system {
@@ -81,12 +84,19 @@ pub fn to_chat(req: Value, count_only: bool, inline_system: bool) -> Result<Conv
         match turn.role {
             "user" => convert_user(&turn.blocks, turn.at, &mut messages)?,
             "assistant" => convert_assistant(&turn.blocks, turn.at, &mut messages)?,
-            _ => messages
-                .extend(system_turn_text(turn)?.map(|s| json!({"role": "system", "content": s}))),
+            _ => {
+                if let Some(s) = system_turn_text(turn)? {
+                    if inline_system {
+                        messages.push(json!({"role": "system", "content": s}));
+                    } else {
+                        attach_inline_system(s, &mut messages);
+                    }
+                }
+            }
         }
     }
     // A final assistant turn is a prefill the reply continues; a system turn
-    // after it asks for a new reply even once lifted.
+    // after it asks for a new reply, even one with no text.
     let ends_with_system = turns
         .last()
         .and_then(|t| t.get("role"))
@@ -288,9 +298,10 @@ struct Turn<'a> {
     blocks: Vec<Value>,
 }
 
-/// Returns (merged turns, lifted system turns). Unless `inline_system`, a
-/// system turn is lifted out. Either way it keeps the turns either side of it
-/// apart, as the engine's own Messages adapter does.
+/// Returns (merged turns, lifted system turns). Unless `inline_system`, the
+/// system turns before the first user or assistant turn are lifted out. A
+/// system turn keeps the turns either side of it apart, as the engine's own
+/// Messages adapter does.
 fn merge_turns(
     turns: &[Value],
     inline_system: bool,
@@ -330,7 +341,7 @@ fn merge_turns(
             at: i,
             blocks,
         };
-        if role == "system" && !inline_system {
+        if role == "system" && !inline_system && out.is_empty() {
             lifted.push(turn);
             continue;
         }
@@ -340,6 +351,36 @@ fn merge_turns(
         }
     }
     Ok((out, lifted))
+}
+
+/// Places the text of a system turn the template cannot render after the
+/// first system message: at the end of the preceding user or tool message, or
+/// in a user message of its own after an assistant message. A request that
+/// extends a conversation then converts to the previous request's messages
+/// followed by new ones, so the prefix cache keeps matching the earlier turns.
+fn attach_inline_system(text: String, messages: &mut Vec<Value>) {
+    let note = format!("<system>{text}</system>");
+    if let Some(prev) = messages.last_mut() {
+        if matches!(prev["role"].as_str(), Some("user" | "tool")) {
+            match prev.get_mut("content") {
+                Some(Value::String(content)) if content.is_empty() => {
+                    *content = note;
+                    return;
+                }
+                Some(Value::String(content)) => {
+                    content.push_str("\n\n");
+                    content.push_str(&note);
+                    return;
+                }
+                Some(Value::Array(parts)) => {
+                    parts.push(json!({"type": "text", "text": note}));
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+    messages.push(json!({"role": "user", "content": note}));
 }
 
 fn convert_user(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> Result<(), String> {
@@ -963,20 +1004,106 @@ mod tests {
     }
 
     #[test]
-    fn inline_system_turns_join_the_first_otherwise() {
+    fn inline_system_turns_are_placed_where_they_are_otherwise() {
         let c = to_chat(inline_system_req(), false, false).unwrap().chat;
-        // No system message after the first; the user turns either side of a
-        // lifted one stay apart, and the final assistant turn is not a prefill.
+        // No system message after the first: a system turn's text goes at the
+        // end of the user turn before it, or in a user turn of its own after an
+        // assistant turn, and the final assistant turn is not a prefill.
         assert_eq!(
             c["messages"],
             json!([
-                {"role": "system", "content": "be brief\n<env>\n<todo>\n<tip>"},
-                {"role": "user", "content": "fix the test"},
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "fix the test\n\n<system><env></system>"},
                 {"role": "user", "content": "go"},
                 {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "<system><todo></system>\n\n<system><tip></system>"},
             ])
         );
         assert!(c.get("continue_final_message").is_none());
+    }
+
+    #[test]
+    fn inline_system_turns_before_the_first_turn_join_the_first_otherwise() {
+        let c = chat(req(json!([
+            {"role": "system", "content": "<base>"},
+            {"role": "system", "content": "<more>"},
+            {"role": "user", "content": "run"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t", "name": "f", "input": {}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "ok"}]},
+            {"role": "system", "content": "<one>"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "u", "name": "f", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "u", "content": [
+                {"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}]},
+            {"role": "system", "content": "<two>"},
+        ])));
+        let messages = c["messages"].as_array().unwrap();
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            roles,
+            ["system", "user", "assistant", "tool", "assistant", "tool"]
+        );
+        assert_eq!(messages[0]["content"], "<base>\n<more>");
+        assert_eq!(messages[3]["content"], "ok\n\n<system><one></system>");
+        assert_eq!(
+            messages[5]["content"],
+            json!([
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
+                {"type": "text", "text": "<system><two></system>"},
+            ])
+        );
+    }
+
+    /// Each request of an agent session, cut where the model replies, converts
+    /// to the previous request's messages followed by new ones, so the prefix
+    /// cache matches every earlier turn.
+    #[test]
+    fn each_request_of_a_session_extends_the_previous_ones_messages() {
+        let steps = [
+            json!([
+                {"role": "user", "content": "fix the test"},
+                {"role": "system", "content": "<env>"},
+            ]),
+            json!([
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t", "name": "run", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": "1 failed"}]},
+                {"role": "system", "content": "<budget 1>"},
+            ]),
+            json!([
+                {"role": "assistant", "content": "fixed"},
+                {"role": "system", "content": "<budget 2>"},
+            ]),
+            json!([
+                {"role": "assistant", "content": "anything else?"},
+                {"role": "user", "content": "no"},
+            ]),
+        ];
+        for inline_system in [false, true] {
+            let mut turns = Vec::new();
+            let mut prev: Vec<Value> = Vec::new();
+            for step in &steps {
+                turns.extend(step.as_array().unwrap().iter().cloned());
+                let mut r = req(Value::Array(turns.clone()));
+                r["system"] = json!("be brief");
+                let c = to_chat(r, false, inline_system).unwrap().chat;
+                let messages = c["messages"].as_array().unwrap().clone();
+                assert_eq!(
+                    messages[..prev.len()],
+                    prev[..],
+                    "inline_system={inline_system}, {} turns",
+                    turns.len()
+                );
+                prev = messages;
+            }
+        }
     }
 
     #[test]
