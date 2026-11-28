@@ -93,6 +93,8 @@ Here are 3 countries and their capitals:
 
 Set `stream=True` to receive Server-Sent Events as they are produced.
 
+If a proxy times out while a request is queued or prefilling, set `SGLANG_SSE_KEEPALIVE_S=20` in the server environment to emit an SSE comment after each 20 seconds without a frame. SSE clients ignore these comments. The default is `0` (disabled); this setting applies only to streaming `/v1/messages` responses and does not change request execution timeouts. The proxy must forward streaming data without buffering for keepalives to reach the client.
+
 ```python Example
 with client.messages.stream(
     model="zai-org/GLM-5.2-FP8",
