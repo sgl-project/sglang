@@ -366,7 +366,13 @@ from sglang.srt.mem_cache.kv.alloc.forward_steps import (
 )
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.models.unlimited_ocr_v2_support.admission import UocrPrefillAdder
@@ -441,7 +447,11 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import TypeBasedDispatcher
-from sglang.srt.utils.device import is_confidential_compute, is_npu
+from sglang.srt.utils.device import (
+    is_confidential_compute,
+    is_gfx942_supported,
+    is_npu,
+)
 from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -2362,6 +2372,31 @@ class Scheduler(
                 last_batch_is_extend = last_batch.forward_mode.is_extend()
             if last_batch_is_extend:
                 return True
+
+        # On gfx942, launching the next eager prefill can delay the first result.
+        # Limit the automatic path to complete singleton cache misses.
+        # Idle state is rank-local under MLP synchronization, so it must not
+        # select a collective scheduling boundary there.
+        if (
+            last_batch.after_idle_gap
+            and not self.require_mlp_sync
+            and last_batch.forward_mode == ForwardMode.EXTEND
+            and last_batch.batch_size() == 1
+            and last_batch.contains_last_prefill_chunk
+            and last_batch.prefix_lens == [0]
+            and last_batch.extend_num_tokens is not None
+            and 0 < last_batch.extend_num_tokens <= 4096
+            and last_batch.spec_algorithm == SpeculativeAlgorithm.NONE
+            and self.device == "cuda"
+            and is_gfx942_supported(self.tp_worker.gpu_id)
+            and check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED)
+            and self.is_generation
+            # Encoder-decoder batches have already stripped the encoder tokens.
+            and not self.model_config.is_encoder_decoder
+            and self.model_config.dtype == torch.bfloat16
+            and self.model_config.quantization is None
+        ):
+            return True
 
         # The next batch's grammar bitmask needs this result's FSM advance.
         return last_batch.grammar_needs_sync()

@@ -1337,15 +1337,12 @@ def is_gfx95_supported():
 
 
 @lru_cache(maxsize=1)
-def is_gfx942_supported():
-    """
-    Returns whether the current platform is AMD CDNA3 (gfx942 — MI300X / MI325X).
-    """
-    if is_hip():
-        gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-        return any(gfx in gcn_arch for gfx in ["gfx942"])
-    else:
+def is_gfx942_supported(device_id: int = 0) -> bool:
+    """Whether the selected device is an AMD gfx942 GPU."""
+    if not is_hip():
         return False
+    arch = torch.cuda.get_device_properties(device_id).gcnArchName
+    return arch.split(":", 1)[0] == "gfx942"
 
 
 @lru_cache(maxsize=1)
