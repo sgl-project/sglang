@@ -74,14 +74,12 @@ SGL_DEVICE u32x8 ld_w_v8(void const* ptr) {
       : "l"(ptr));
 #else
   auto const* p = static_cast<uint8_t const*>(ptr);
-  asm volatile(
-      "ld.global.nc.L1::no_allocate.L2::256B.v4.b32 {%0, %1, %2, %3}, [%4];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3])
-      : "l"(p));
-  asm volatile(
-      "ld.global.nc.L1::no_allocate.L2::256B.v4.b32 {%0, %1, %2, %3}, [%4];"
-      : "=r"(r.v[4]), "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
-      : "l"(p + 16));
+  asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3])
+               : "l"(p));
+  asm volatile("ld.global.nc.L1::no_allocate.L2::256B.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r.v[4]), "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+               : "l"(p + 16));
 #endif
 #endif
   return r;
@@ -98,14 +96,12 @@ SGL_DEVICE u32x8 ld_x_v8(void const* ptr) {
       : "l"(ptr));
 #else
   auto const* p = static_cast<uint8_t const*>(ptr);
-  asm volatile(
-      "ld.global.ca.v4.b32 {%0, %1, %2, %3}, [%4];"
-      : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3])
-      : "l"(p));
-  asm volatile(
-      "ld.global.ca.v4.b32 {%0, %1, %2, %3}, [%4];"
-      : "=r"(r.v[4]), "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
-      : "l"(p + 16));
+  asm volatile("ld.global.ca.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r.v[0]), "=r"(r.v[1]), "=r"(r.v[2]), "=r"(r.v[3])
+               : "l"(p));
+  asm volatile("ld.global.ca.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r.v[4]), "=r"(r.v[5]), "=r"(r.v[6]), "=r"(r.v[7])
+               : "l"(p + 16));
 #endif
 #endif
   return r;
@@ -1068,8 +1064,7 @@ inline void pre_attn_mix_cross_s1(
   CHECK_HOST(n_stack >= 1 && n_stack <= 3) << "pre_attn_mix_cross_s1: requires 1 <= n_stack <= 3, got " << n_stack;
 
   int64_t const tokens = T.unwrap();
-  CHECK_HOST(tokens >= 0 && tokens <= 32)
-      << "pre_attn_mix_cross_s1: requires 0 <= tokens <= 32, got " << tokens;
+  CHECK_HOST(tokens >= 0 && tokens <= 32) << "pre_attn_mix_cross_s1: requires 0 <= tokens <= 32, got " << tokens;
   if (tokens == 0) return;
 
   dim3 const grid(static_cast<uint32_t>(tokens), is_swa ? 5u : 7u, 1u);
@@ -1144,8 +1139,7 @@ inline void pre_mlp_mix_s1(
   CHECK_HOST(n_stack >= 1 && n_stack <= 3) << "pre_mlp_mix_s1: requires 1 <= n_stack <= 3, got " << n_stack;
 
   int64_t const tokens = T.unwrap();
-  CHECK_HOST(tokens >= 0 && tokens <= 32)
-      << "pre_mlp_mix_s1: requires 0 <= tokens <= 32, got " << tokens;
+  CHECK_HOST(tokens >= 0 && tokens <= 32) << "pre_mlp_mix_s1: requires 0 <= tokens <= 32, got " << tokens;
   if (tokens == 0) return;
 
   bf16_t const* add_p = addend.has_value() ? static_cast<bf16_t const*>(addend.value().data_ptr()) : nullptr;
