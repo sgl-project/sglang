@@ -35,6 +35,9 @@ class TestPriorityScheduling(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # These tests drive preemption with up to 10000-token generations,
+            # above the default SGLANG_MAX_NEW_TOKENS_LIMIT of 4096.
+            env={"SGLANG_MAX_NEW_TOKENS_LIMIT": "20000"},
             other_args=(
                 "--max-running-requests",  # Enforce max request concurrency is 1
                 "1",
@@ -218,6 +221,9 @@ class TestPrioritySchedulingMultipleRunningRequests(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            # These tests drive preemption with up to 10000-token generations,
+            # above the default SGLANG_MAX_NEW_TOKENS_LIMIT of 4096.
+            env={"SGLANG_MAX_NEW_TOKENS_LIMIT": "20000"},
             other_args=(
                 "--max-running-requests",  # Enforce max request concurrency is 2
                 "2",

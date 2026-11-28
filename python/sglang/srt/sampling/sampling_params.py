@@ -311,6 +311,17 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"min_new_tokens must be in [0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
+            max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
+            if (
+                max_new_tokens_limit is not None
+                and max_new_tokens_limit > 0
+                and self.max_new_tokens > max_new_tokens_limit
+            ):
+                raise ValueError(
+                    "max_new_tokens must be at most "
+                    f"SGLANG_MAX_NEW_TOKENS_LIMIT={max_new_tokens_limit}, "
+                    f"got {self.max_new_tokens}."
+                )
         if self.logit_bias is not None:
             for token_id, bias in self.logit_bias.items():
                 if not 0 <= int(token_id) < vocab_size:

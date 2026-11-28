@@ -135,6 +135,30 @@ class TestSamplingParamsVerify(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "n must be an integer >= 1"):
                 self._make(n=0).verify(self.VOCAB_SIZE)
 
+    def test_max_new_tokens_limit(self):
+        """max_new_tokens is bounded by SGLANG_MAX_NEW_TOKENS_LIMIT."""
+        with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):
+            self._make(max_new_tokens=16).verify(self.VOCAB_SIZE)
+            with self.assertRaisesRegex(ValueError, "SGLANG_MAX_NEW_TOKENS_LIMIT=16"):
+                self._make(max_new_tokens=17).verify(self.VOCAB_SIZE)
+            # max_new_tokens=None means "no explicit ask": the scheduler
+            # clips it to the limit instead of rejecting it.
+            self._make(max_new_tokens=None).verify(self.VOCAB_SIZE)
+
+        # A non-positive or unset limit disables the cap.
+        for limit in (0, -1, None):
+            with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(limit):
+                self._make(max_new_tokens=10**6).verify(self.VOCAB_SIZE)
+
+    def test_default_bounds(self):
+        """By default one request is bounded to 4096 new tokens and n=128."""
+        self._make(max_new_tokens=4096).verify(self.VOCAB_SIZE)
+        with self.assertRaisesRegex(ValueError, "max_new_tokens must be at most"):
+            self._make(max_new_tokens=4097).verify(self.VOCAB_SIZE)
+        self._make(n=128).verify(self.VOCAB_SIZE)
+        with self.assertRaisesRegex(ValueError, "n must be"):
+            self._make(n=129).verify(self.VOCAB_SIZE)
+
     def test_request_reasoning_end_token_ids_are_vocab_bounded_integers(self):
         self._make(
             custom_params={REQUEST_REASONING_END_TOKEN_IDS_KEY: [17, 18]}
