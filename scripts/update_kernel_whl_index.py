@@ -15,10 +15,10 @@ CUDA_LOCAL_VERSION_PATTERN = re.compile(r"\+cu(\d+)")
 
 
 def check_wheel_cuda_version(path_name, target_cuda_version):
-    # Skip non-CUDA backend wheels. ROCm/MUSA encode the backend in the
-    # local-version tag (for example +rocm720), while XPU uses a dedicated
-    # package name (sglang_kernel_xpu-*).
-    if re.search(r"\+(rocm|musa)", path_name) or path_name.startswith(
+    # Skip non-CUDA backend wheels. ROCm/MUSA/SAIL encode the backend in the
+    # local-version tag (for example +rocm720, +musa43, +sail), while XPU uses a
+    # dedicated package name (sglang_kernel_xpu-*).
+    if re.search(r"\+(rocm|musa|sail)", path_name) or path_name.startswith(
         "sglang_kernel_xpu-"
     ):
         return False
@@ -73,8 +73,10 @@ def _update_non_cuda_wheel_index(
             continue
         with open(path, "rb") as f:
             sha256 = hashlib.sha256(f.read()).hexdigest()
+        # The digits after the backend are optional: ROCm/MUSA wheels carry a
+        # versioned tag (+rocm720, +musa43) while SAIL's is version-less (+sail).
         ver = re.findall(
-            rf"{re.escape(package_name)}-([0-9.]+(?:\.post[0-9]+)?)(?:\+{backend}[0-9]+)?-",
+            rf"{re.escape(package_name)}-([0-9.]+(?:\.post[0-9]+)?)(?:\+{backend}[0-9]*)?-",
             path.name,
         )[0]
         full_url = f"{base_url}/{release_tag_prefix}{ver}/{path.name}#sha256={sha256}"
@@ -99,14 +101,26 @@ def update_wheel_index_musa(musa_version):
     _update_non_cuda_wheel_index("musa", musa_version)
 
 
+def update_wheel_index_sail():
+    # SAIL (PPU) wheels keep the upstream distribution name and are told apart
+    # by their `+sail` local version, so the index sits in its own `sail`
+    # directory under a `<version>+sail` release tag. Without the tag the SAIL
+    # wheel would be byte-for-byte the CUDA wheel's filename and would be
+    # published into the CUDA index as the default-CUDA build.
+    _update_non_cuda_wheel_index("sail", release_tag_suffix="+sail")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cuda", type=str, default=DEFAULT_CUDA_VERSION)
     parser.add_argument("--rocm", type=str, default=None)
     parser.add_argument("--musa", type=str, default=None)
     parser.add_argument("--xpu", action="store_true")
+    parser.add_argument("--sail", action="store_true")
     args = parser.parse_args()
-    if args.xpu:
+    if args.sail:
+        update_wheel_index_sail()
+    elif args.xpu:
         update_wheel_index_xpu()
     elif args.musa is not None:
         update_wheel_index_musa(args.musa)
