@@ -635,8 +635,9 @@ def decode_scores(
         # Prepare the device-side plan before scoring, away from its top-k consumer.
         plan = plan_topk_v2(lens) if compute_topk_plan else None
         if candidate_blocks is not None:
-            # Score only the published candidate blocks; the rest of each row is -inf,
-            # the same values as the dense masked path at a cost set by the candidates.
+            # Score only the published candidate blocks; the rest of each visible
+            # row is -inf, the same values as the dense masked path at a cost set by
+            # the candidates and the live lengths.
             assert candidate_mask is None
             scores = fp4_index_logits_paged_candidates(
                 q,

@@ -1028,6 +1028,25 @@ def _fp4_index_logits_paged_candidates_kernel(
     tl.store(out_ptr + b * out_stride + pos, logit, mask=valid)
 
 
+@triton.jit
+def _fill_visible_neg_inf_kernel(
+    out_ptr,
+    lens_ptr,
+    L,
+    out_stride,
+    SPLIT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Write -inf over a row's visible prefix only. The output has graph-stable
+    # capacity, so a full fill would cost the capacity on every replay even for
+    # short live contexts; each of SPLIT programs strides over the live length.
+    b = tl.program_id(0)
+    n_vis = tl.minimum(tl.load(lens_ptr + b), L)
+    for start in range(tl.program_id(1) * BLOCK, n_vis, SPLIT * BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        tl.store(out_ptr + b * out_stride + offs, float("-inf"), mask=offs < n_vis)
+
+
 def fp4_index_logits_paged_candidates(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -1046,8 +1065,11 @@ def fp4_index_logits_paged_candidates(
     ``blocks`` is ``[batch, n]`` int32, the candidate blocks of ``block_size``
     positions of each row, unordered and -1 padded (a source's published ids).
     Only the candidate positions are scored, with the same values as the dense
-    masked path; every other position of the ``[batch, max_len]`` output is -inf.
-    The work scales with ``n * block_size`` instead of the context length.
+    masked path; every other visible position (below ``lens[b]``) is -inf. As in
+    ``fp4_index_logits_paged``, positions at or past ``lens[b]`` are left
+    uninitialized, and consumers must use the current device-side lengths.
+    The scoring work scales with ``n * block_size`` and the fill with the live
+    length, instead of the capacity.
     """
     assert q.dtype == torch.bfloat16 and q.shape[-1] == INDEX_HEAD_DIM
     assert table.dtype == torch.uint8 and table.ndim == 2
@@ -1068,7 +1090,9 @@ def fp4_index_logits_paged_candidates(
     )
     if not batch or not max_len:
         return out
-    out.fill_(float("-inf"))
+    _fill_visible_neg_inf_kernel[(batch, 8)](
+        out, lens, max_len, out.stride(0), SPLIT=8, BLOCK=1024, num_warps=4
+    )
     num_candidate_cols = blocks.shape[1] * block_size
     if not num_candidate_cols:
         return out

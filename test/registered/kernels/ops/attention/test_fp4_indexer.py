@@ -815,7 +815,8 @@ if __name__ == "__main__":
 def test_fp4_paged_candidate_gather_matches_masked_replay(ratio, num_blocks):
     """Scoring only the published candidate blocks gives the bits of the dense masked
     path at every visible position (candidates scored, the rest -inf), across graph
-    replays that change lengths and block ids, including -1 padding and empty rows."""
+    replays that change lengths and block ids, including -1 padding and empty rows.
+    Positions at or past a row's length are left unwritten."""
     from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
         candidate_block_mask,
     )
@@ -868,3 +869,6 @@ def test_fp4_paged_candidate_gather_matches_masked_replay(ratio, num_blocks):
         assert torch.equal(
             actual[visible].view(torch.int32), expected[visible].view(torch.int32)
         )
+        # Like the dense path, only visible positions are written, so the fill's
+        # cost follows the live lengths rather than the graph capacity.
+        assert torch.isnan(actual[~visible]).all()
