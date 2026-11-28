@@ -26,6 +26,7 @@ import msgspec
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -62,17 +63,6 @@ class RowResets:
         if self._reset is not None:
             self._rows.update(rows)
 
-    def apply_row(self, row: int) -> None:
-        """Reset ``row`` now, on the current stream, if it is marked; the caller
-        has ordered this after the row's previous forward."""
-        if row in self._rows:
-            self._rows.discard(row)
-            self._reset([row])
-
-    def restored(self, row: int) -> None:
-        """``row``'s state was written whole (a restored backup): keep it."""
-        self._rows.discard(row)
-
     def apply(self) -> None:
         """Reset the marked rows, on the current stream."""
         if not self._rows:
@@ -103,6 +93,14 @@ class RowState(enum.IntEnum):
 _HOLDING = (RowState.ACTIVE, RowState.PARKED, RowState.HELD)
 
 
+class RowUnits(msgspec.Struct, frozen=True, kw_only=True):
+    """What binds the request sub-pools' units to request rows (device ids)
+    and frees them: False from ``bind`` when they do not fit."""
+
+    bind: Callable[[torch.Tensor], bool]
+    free: Callable[[torch.Tensor], None]
+
+
 class RequestTable:
     """The rows requests hold, and in each row the ids of the plan's sub-pools."""
 
@@ -111,7 +109,7 @@ class RequestTable:
         *,
         size: int,
         pre_alloc_size: int,
-        max_context_len: int,
+        row_width: int,
         state_sub_pool: Optional[str],
         tracking: Optional[StateTracking],
         device: str,
@@ -128,7 +126,6 @@ class RequestTable:
             reserved_rows if reserved_rows is not None else size + pre_alloc_size + 1
         )
         assert self._num_rows >= size + pre_alloc_size + 1
-        self.max_context_len = max_context_len
         self.device = device
         self.state_sub_pool = state_sub_pool
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -136,7 +133,7 @@ class RequestTable:
         )
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token = torch.zeros(
-                (self._num_rows, max_context_len), dtype=torch.int32, device=device
+                (self._num_rows, row_width), dtype=torch.int32, device=device
             )
         self._reset_rows()
         # Run by `clear`, after every row went back: what keeps per-row or
@@ -145,6 +142,9 @@ class RequestTable:
         # Bumped on every hand-out: a reader detects a reused row by comparing
         # the generation it stored.
         self.req_generation = torch.zeros(self._num_rows, dtype=torch.int64)
+        # Binds and frees the request sub-pools' units of rows, with the rows
+        # (`bind_row_units`); None without request sub-pools.
+        self._row_units: Optional[RowUnits] = None
 
         tracking = tracking or StateTracking(
             extra_buffer=False, lazy=False, track_slots=0, initial_slots=0
@@ -165,10 +165,26 @@ class RequestTable:
                     device=device,
                 )
 
+    def bind_row_units(self, units: RowUnits) -> None:
+        """Every row handed out from now on holds a unit of each request
+        sub-pool until it goes back."""
+        assert self._row_units is None, "the table binds one unit owner"
+        self._row_units = units
+
+    @property
+    def binds_row_units(self) -> bool:
+        """Whether a row handed out takes a unit of every request sub-pool."""
+        return self._row_units is not None
+
     @property
     def holds_state_slots(self) -> bool:
         """Whether a row names its request's state slot."""
         return self.state_sub_pool is not None
+
+    @property
+    def row_width(self) -> int:
+        """See ReqToTokenPool.row_width."""
+        return self.req_to_token.shape[1]
 
     # -- rows --
 
@@ -225,6 +241,10 @@ class RequestTable:
         if need_size == 0:
             return []
         rows = self.free_slots[-need_size:]
+        if self._row_units is not None and not self._row_units.bind(
+            async_h2d(rows, dtype=torch.int64, device=self.device)
+        ):
+            return None
         del self.free_slots[-need_size:]
         for row in rows:
             self._move(row, (RowState.FREE,), state)
@@ -236,6 +256,8 @@ class RequestTable:
         fails here instead of handing it out twice."""
         for row in rows:
             self._move(row, _HOLDING, RowState.FREE)
+        if self._row_units is not None and rows:
+            self._row_units.free(async_h2d(rows, dtype=torch.int64, device=self.device))
         self.free_slots.extend(rows)
 
     def free(self, req: Req) -> None:

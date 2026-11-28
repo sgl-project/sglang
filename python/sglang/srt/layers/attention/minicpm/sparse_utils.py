@@ -45,7 +45,7 @@ def compress_k_core_new(
     cu_total_compress_k_token_nums,
     kernel_size,
     kernel_stride,
-    max_context_length,
+    max_kv_len,
 ):
     head_num_k = key_cache.shape[1]
     head_dim = key_cache.shape[2]
@@ -56,8 +56,8 @@ def compress_k_core_new(
 
     # Use provided explicit parameters for buffer allocation
     # max_chunks_per_seq is already the maximum possible chunks for any sequence
-    # given max_context_length, kernel_size, and kernel_stride
-    max_chunks_per_seq = max(0, (max_context_length - kernel_size) // kernel_stride + 1)
+    # given max_kv_len, kernel_size, and kernel_stride
+    max_chunks_per_seq = max(0, (max_kv_len - kernel_size) // kernel_stride + 1)
 
     # ==============================================================================
     # Launch kernel for ALL chunks (history + new)
@@ -109,7 +109,7 @@ def get_compress_k_v2(
     metadata: MiniCPMSparseMetadata,
     full_compressed_k1,
     full_compressed_k2,
-    max_context_length,
+    max_kv_len,
     k1_kernel_size,
     k1_kernel_stride,
     k2_kernel_size,
@@ -144,7 +144,7 @@ def get_compress_k_v2(
             level.cu_total_compress_token_nums,
             kernel_size,
             kernel_stride,
-            max_context_length,
+            max_kv_len,
         )
 
 
@@ -160,7 +160,7 @@ def allocate_and_compress_keys(
     k2_kernel_stride: int,
     dtype: torch.dtype = torch.bfloat16,
     device: torch.device = None,
-    max_context_length: int = 32768,
+    max_kv_len: int = 32768,
 ):
     """Allocate compressed key tensors and run compression.
 
@@ -176,7 +176,7 @@ def allocate_and_compress_keys(
         k2_kernel_stride: K2 compression stride
         dtype: Tensor data type (default: bfloat16)
         device: Tensor device (default: layer device)
-        max_context_length: Maximum context length for the model (default: 32768)
+        max_kv_len: Longest KV length of a request, the req_to_token row width (default: 32768)
 
     Returns:
         Tuple of (full_compressed_k1, full_compressed_k2)
@@ -203,7 +203,7 @@ def allocate_and_compress_keys(
         metadata,
         full_compressed_k1,
         full_compressed_k2,
-        max_context_length=max_context_length,
+        max_kv_len=max_kv_len,
         k1_kernel_size=k1_kernel_size,
         k1_kernel_stride=k1_kernel_stride,
         k2_kernel_size=k2_kernel_size,
@@ -224,7 +224,7 @@ def compressed_attention(
     cu_seqlens_k: torch.Tensor,
     cu_seqlens_k2: torch.Tensor,
     max_seqlen_q: int,
-    max_context_len: int,
+    max_kv_len: int,
     init_blocks: int = 1,
     local_blocks: int = 2,
     cache_lens: Optional[torch.Tensor] = None,
@@ -273,7 +273,7 @@ def compressed_attention(
             cu_seqlens_k=cu_seqlens_k,
             cu_seqlens_v=cu_seqlens_k2,
             max_seqlen_q=max_seqlen_q_adjusted,
-            max_seqlen_k=max_context_len // kernel_stride,
+            max_seqlen_k=max_kv_len // kernel_stride,
             causal=is_prefilling,
         )
 
@@ -283,7 +283,7 @@ def compressed_attention(
             cu_seqlens_k,
             cache_lens,
             max_seqlen_q,
-            max_context_len,
+            max_kv_len,
             local_blocks=local_blocks,
             init_blocks=init_blocks,
             block_size=block_size,

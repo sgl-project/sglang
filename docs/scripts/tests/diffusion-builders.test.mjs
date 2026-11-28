@@ -358,6 +358,29 @@ test("H3-Image file URLs couple persistent output with a separate image download
   assert.equal(JSON.parse(curl(config).match(/-d '([\s\S]+)' \|/)[1]).response_format, "b64_json");
 });
 
+test("H3-Image FP8 attention is explicit and scoped to measured Spark workloads", () => {
+  const config = get("/MiniMax/MiniMax-H3-Image.mdx");
+  const dim = config.overlayDims.find((item) => item.id === "attention");
+  assert.equal(dim.default, "native");
+  const fp8 = dim.options.find((option) => option.id === "fp8");
+  assert.deepEqual(fp8.flags, ["--component-attention-backends.transformer fp8_fa_sm120"]);
+  const server = { hw: "dgx-spark", quantization: "mxfp8-all", attention: "fp8" };
+  for (const task of [
+    { size: "2048x2048" }, { size: "4736x3552" },
+    { mode: "edit", size: "4096x4096" },
+  ]) assert.equal(resolve(config, { ...server, ...task }).verified, true);
+  for (const task of [
+    { size: "6272x2688" }, { quality: "exact" }, { mode: "edit", size: "2048x2048" },
+    { mode: "edit", size: "4096x4096", references: "two" },
+  ]) assert.deepEqual(resolve(config, { ...server, ...task }).builder.verification,
+    { serve: "verified", request: "unverified" });
+  assert.equal(resolve(config, { ...server, quantization: "native" }).verified, false);
+  assert.equal(resolve(config, { ...server, hw: "rtxpro6000", placement: "resident" }).verified, false);
+  assert.match(resolve(config, { ...server, hw: "h200" }).builder.errors.join(" "), /SM120\/SM121/);
+  assert.match(resolve(config, { ...server, topology_mode: "manual", ring_degree: 2 }).builder.errors.join(" "), /Ring parallelism/);
+  assert.doesNotMatch(curl(config, server), /attention-backends/);
+});
+
 test("H3-Image request coverage does not change measured server coverage", () => {
   const config = get("/MiniMax/MiniMax-H3-Image.mdx");
   const server = { hw: "h200", gpus_per_node: 2, encoder: "fold" };
@@ -465,6 +488,41 @@ test("H3-Image PNG compression stays request-scoped and preserves the default pa
   for (const request of [{ size: "2048x2048" }, { quality: "exact" }, { mode: "edit", size: "4096x4096", references: "two" }, { vae: "local" }]) {
     assert.equal(resolve(config, { ...server, png: "none", ...request }).builder.verification.request, "unverified");
   }
+});
+
+test("H3-Image AMD recipes use AITER Auto placement and their measured 4K scope", () => {
+  const config = get("/MiniMax/MiniMax-H3-Image.mdx");
+  const resource = config.commandBuilder.resource;
+  for (const hw of ["mi355x", "mi350x", "mi325x", "mi300x"]) {
+    assert.ok(config.supportedHardware.includes(hw), hw);
+    assert.equal(config.hardware.find((entry) => entry.id === hw).vendor, "amd");
+    for (const [gpus_per_node, tp_size, ulysses_degree] of [[1, 1, 1], [2, 2, 1], [2, 1, 2], [4, 4, 1], [4, 1, 4], [8, 1, 8], [8, 8, 1]]) {
+      const base = { hw, gpus_per_node, topology_mode: "manual", tp_size, ulysses_degree, ring_degree: 1 };
+      for (const task of [
+        { size: "4736x3552" }, { size: "6272x2688" }, { mode: "edit", size: "4096x4096" },
+        { size: "2048x2048" }, { mode: "edit", size: "2048x2048" },
+      ]) {
+        const result = resolve(config, { ...base, ...task });
+        assert.deepEqual(result.builder.errors, []);
+        assert.equal(result.verified, true, JSON.stringify({ ...base, ...task }));
+        assert.equal(result.builder.resolvedSettings.attention, "AITER (auto)");
+        assert.equal(result.builder.resolvedSettings.adaln, "Keep weights");
+        assert.ok(!result.flags.some((flag) => flag.startsWith("--attention-backend")));
+      }
+      for (const override of [
+        { size: "5472x3072" }, { quality: "exact" }, { placement: "resident" }, { adaln: "online" },
+        { warmup: "off" }, { quantization: "fp8-all" }, { mode: "edit", size: "4096x4096", references: "two" },
+      ]) assert.equal(resolve(config, { ...base, size: "4736x3552", ...override }).verified, false);
+    }
+    for (const gpus_per_node of [1, 2, 4, 8]) {
+      const recipe = resource.recommendedRecipe(selection(config, { hw, gpus_per_node }));
+      assert.equal(recipe.ulysses_degree, gpus_per_node);
+      assert.equal(recipe.unverified, undefined);
+    }
+    const ring = resolve(config, { hw, gpus_per_node: 2, topology_mode: "manual", tp_size: 1, ulysses_degree: 1, ring_degree: 2 });
+    assert.match(ring.builder.errors.join(" "), /Ring parallelism requires FlashAttention/);
+  }
+  assert.equal(resolve(config, { hw: "h200", size: "4736x3552" }).builder.resolvedSettings.attention, undefined);
 });
 
 test("Wan preserves standard, multi-GPU, Ascend and LoRA recipes", () => {

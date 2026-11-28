@@ -407,9 +407,7 @@ class TestDecodeLockRefScenarios(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
 
-        req = MagicMock()
-        req.rid = "req-1"
-        req.owner_list = None
+        req = MagicMock(rid="req-1", owner_list=None)
         req.origin_input_ids = list(range(8))
         req.output_ids = [99]
         req.last_node = object()
@@ -602,6 +600,10 @@ class TestDecodeLockRefScenarios(CustomTestCase):
             model_config=None,
             enable_overlap=False,
             spec_algorithm=None,
+            sampling_params_pool=SimpleNamespace(write=lambda reqs: None),
+            penalty_status_pool=SimpleNamespace(
+                alloc=lambda reqs: None, reset_history=lambda reqs: None
+            ),
         )
         with patch("sglang.srt.disaggregation.decode.ScheduleBatch.init_new"):
             SchedulerDisaggregationDecodeMixin._get_new_prebuilt_batch(

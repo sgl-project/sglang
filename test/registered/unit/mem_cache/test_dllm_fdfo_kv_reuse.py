@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import leaving_retirer
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -143,7 +144,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
     def setUp(self):
         self.block_size = 4
         self.pool = ReqToTokenPool(
-            size=8, max_context_len=64, device="cpu", enable_memory_saver=False
+            size=8, row_width=64, device="cpu", enable_memory_saver=False
         )
         override = get_context().override_server_args(
             attention_backend="torch_native", dcp_size=1
@@ -232,9 +233,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             alloc_for_extend(batch)
 
     def test_dllm_abort_removes_waiting(self):
-        released = []
+        retirer = leaving_retirer()
         manager = DllmManager(
-            SimpleNamespace(max_running_requests=4), abort=released.append
+            SimpleNamespace(max_running_requests=4), abort=retirer.abort
         )
         first, second, keep = (
             Mock(rid=rid, owner_list=None) for rid in ("abort-1", "abort-2", "keep")
@@ -243,7 +244,9 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
 
         manager.waiting_queue.abort(AbortReq(rid="abort"))
 
-        self.assertEqual(released, [first, second])
+        self.assertEqual(
+            [c.args[0] for c in retirer.abort.call_args_list], [first, second]
+        )
         self.assertEqual(list(manager.waiting_queue), [keep])
 
     def test_staged_are_the_last_rounds_requests_still_waiting(self):
@@ -253,7 +256,7 @@ class TestDllmFdfoKvReuse(unittest.TestCase):
             for rid in ("first", "second", "aborted", "unrun")
         )
         move([first, second, aborted, unrun], manager.waiting_queue)
-        manager.take(lambda req: req is aborted)
+        leaving_retirer().release(aborted)
 
         # In the round's order, not the queue's.
         last_batch = SimpleNamespace(reqs=[aborted, second, first])
@@ -268,7 +271,7 @@ class TestDllmFdfoResolvedBlockKeepsRow(unittest.TestCase):
         release_kv_cache (it only runs for row holders), leaking the request's
         tree lock and any KV the tree does not own."""
         pool = ReqToTokenPool(
-            size=4, max_context_len=16, device="cpu", enable_memory_saver=False
+            size=4, row_width=16, device="cpu", enable_memory_saver=False
         )
         req = SimpleNamespace(
             dllm_incomplete_ids=array("q"),
@@ -359,7 +362,7 @@ class TestDllmCommittedTokens(unittest.TestCase):
             features=SimpleNamespace(enable_encoder_swa_bounded_replay=False),
             mamba=SimpleNamespace(enable_mamba_extra_buffer=False),
         )
-        # Allocation and sampling are collaborators; exercise the scheduler's
+        # Allocation is a collaborator; exercise the scheduler's
         # real cache accounting on two revisits of the same fixed-size block.
         with (
             patch(
@@ -368,9 +371,6 @@ class TestDllmCommittedTokens(unittest.TestCase):
             patch(
                 "sglang.srt.managers.schedule_batch.alloc_for_extend",
                 return_value=(torch.arange(4), torch.tensor([0]), torch.tensor([0])),
-            ),
-            patch(
-                "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch"
             ),
         ):
             for _ in range(2):

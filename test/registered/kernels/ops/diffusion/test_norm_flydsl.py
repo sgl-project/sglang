@@ -18,7 +18,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=60, stage="base-a-jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
 
@@ -238,12 +238,81 @@ def test_flydsl_multi_iteration_dim():
     torch.testing.assert_close(y, y_ref, atol=1.0, rtol=5e-2)
 
 
+@pytest.mark.parametrize("dim", [1024, 3072, 4096, 5120])
+def test_flydsl_norm_scale_shift_wave_count_dims(dim):
+    """Each hidden size a model actually uses picks a block and stays correct.
+
+    The tile is ``BLOCK * VEC``; ``_pick_num_waves`` takes the largest block
+    whose tile divides D, so these four dims exercise every entry of
+    ``_BLOCK_CHOICES``.  Before the per-dim selection only D=5120 (and its
+    multiples) reached the kernel at all.
+    """
+    _, nss_op = _flydsl_ops()
+    from sglang.kernels.ops.diffusion import flydsl_norm_supports
+
+    assert flydsl_norm_supports(dim), f"D={dim} should be eligible"
+
+    B, L = 1, 8
+    x = _mk((B, L, dim))
+    weight = _mk((dim,), torch.float32)
+    scale, shift = _mk((B, 1, dim)), _mk((B, 1, dim))
+
+    y = nss_op(x, weight, None, scale, shift, "rms", FLYDSL_EPS)
+    y_ref = _ref_norm_ss(x, weight, None, scale, shift, "rms", FLYDSL_EPS)
+    torch.testing.assert_close(y, y_ref, atol=1.0, rtol=5e-2)
+
+
+def test_flydsl_norm_supports_gates_dim():
+    """The dispatch predicate: the hidden sizes a tile divides, and no others.
+
+    A dim that no tile in ``_BLOCK_CHOICES`` divides must stay on the reference
+    path: a partial inner-loop iteration is not something the kernel can
+    express, so serving it would read past the row.
+    """
+    _require_rocm()
+    try:
+        from sglang.kernels.ops.diffusion import flydsl_norm_supports
+    except ImportError as exc:  # pragma: no cover - old FlyDSL runner image
+        pytest.skip(f"FlyDSL unavailable: {exc}")
+
+    for dim in (1024, 3072, 4096, 5120, 10240):
+        assert flydsl_norm_supports(dim), f"D={dim} should be eligible"
+    for dim in (1536, 2560, 512, 100):
+        assert not flydsl_norm_supports(dim), f"D={dim} should be rejected"
+
+
+@pytest.mark.parametrize("norm_type", ["rms", "layer"])
+def test_flydsl_norm_honors_eps(norm_type):
+    """A caller's eps must reach the kernel instead of a hard-coded 1e-6.
+
+    Inputs with variance ~1e-6 make eps=1e-5 dominate the normalizer, so a
+    kernel that drops eps is off by about 2x.
+    """
+    fused_op, nss_op = _flydsl_ops()
+
+    eps = 1e-5
+    B, L = 1, 16
+    residual = _mk((B, L, FLYDSL_D)) * 1e-3
+    x = _mk((B, L, FLYDSL_D)) * 1e-3
+    zeros = torch.zeros(B, 1, FLYDSL_D, device=DEVICE, dtype=torch.bfloat16)
+
+    y = nss_op(x, None, None, zeros, zeros, norm_type, eps)
+    y_ref = _ref_norm_ss(x, None, None, zeros, zeros, norm_type, eps)
+    torch.testing.assert_close(y, y_ref, atol=2e-2, rtol=2e-2)
+
+    y, _ = fused_op(residual, x, None, None, None, zeros, zeros, norm_type, eps)
+    y_ref, _ = _ref_fused_residual_norm_ss(
+        residual, x, None, None, None, zeros, zeros, norm_type, eps
+    )
+    torch.testing.assert_close(y, y_ref, atol=2e-2, rtol=2e-2)
+
+
 def test_flydsl_compile_cache_reuse_across_row_counts_and_layouts():
     """Guard for the compile-cache/shape-specialization hazard.
 
-    The cache key is (D, is_rms, has_gate, has_weight) and deliberately excludes
-    the row count and whether scale/shift are broadcast. One compiled kernel must
-    therefore stay correct when both of those change between calls.
+    The cache key is (D, is_rms, has_gate, has_weight, eps) and deliberately
+    excludes the row count and whether scale/shift are broadcast. One compiled
+    kernel must therefore stay correct when both of those change between calls.
     """
     _, nss_op = _flydsl_ops()
 
@@ -279,13 +348,13 @@ def test_flydsl_imports_without_flydsl_source_tree():
         "import importlib, sys;"
         f"m = importlib.import_module('{FLYDSL_MODULE}');"
         "assert 'kernels' not in sys.modules, 'leaked FlyDSL source-tree kernels package';"
-        "print('OK', m.FLYDSL_NORM_MIN_ALIGNED_DIM)"
+        "print('OK', m._BLOCK_CHOICES)"
     )
     r = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, env=env
     )
     assert r.returncode == 0, f"stdout={r.stdout}\nstderr={r.stderr}"
-    assert f"OK {FLYDSL_D}" in r.stdout, r.stdout
+    assert "OK (640, 512, 384, 128)" in r.stdout, r.stdout
 
 
 if __name__ == "__main__":

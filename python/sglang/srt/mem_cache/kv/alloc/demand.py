@@ -13,13 +13,15 @@ from sglang.srt.utils.common import ceil_align
 
 class KVDemand(msgspec.Struct, frozen=True):
     """What an allocation takes: tokens of the token sub-pool, tokens of each
-    window sub-pool by its name, and state slots. Admission and the take must
-    name every window (`checked`); an eviction request may name only the
-    sub-pools it is short of (`completed`)."""
+    window sub-pool by its name, state slots, and request rows to bind (a unit
+    of every request sub-pool each). Admission and the take must name every
+    window (`checked`); an eviction request may name only the sub-pools it is
+    short of (`completed`)."""
 
     full_tokens: int = 0
     window_tokens: Mapping[str, int] = msgspec.field(default_factory=dict)
     state_slots: int = 0
+    request_rows: int = 0
 
     @classmethod
     def same_tokens(cls, allocator, tokens: int, *, state_slots: int = 0) -> KVDemand:
@@ -39,7 +41,7 @@ class KVDemand(msgspec.Struct, frozen=True):
                 f"a demand must name every window pool: it names "
                 f"{sorted(self.window_tokens)}, the allocator keeps {sorted(names)}"
             )
-        if self.full_tokens < 0 or self.state_slots < 0:
+        if self.full_tokens < 0 or self.state_slots < 0 or self.request_rows < 0:
             raise ValueError(f"negative demand {self}")
         if any(t < 0 for t in self.window_tokens.values()):
             raise ValueError(f"negative window demand {self}")
@@ -62,6 +64,7 @@ class KVDemand(msgspec.Struct, frozen=True):
         return not (
             self.full_tokens > 0
             or self.state_slots > 0
+            or self.request_rows > 0
             or any(t > 0 for t in self.window_tokens.values())
         )
 
@@ -88,6 +91,7 @@ def request_demand(
     decode_retire_lag: int = 0,
     chunk_size: Optional[int] = None,
     state_slots: int = 0,
+    request_rows: int = 0,
     host_hit_lengths: Optional[Mapping[str, int]] = None,
     extra_tokens: int = 0,
     cached_tokens: int = 0,
@@ -96,8 +100,8 @@ def request_demand(
     chunks of at most ``chunk_size`` and then decode ``max_new_tokens``.
 
     The token sub-pool takes the page-ceiled prompt, the decode, the rows a
-    decode step allocates ahead (``decode_retire_lag``: the overlap scheduler's
-    next step or a speculative reserve) and one rounding page, plus
+    decode step allocates ahead (``decode_retire_lag``, the decode-ahead) and
+    one rounding page, plus
     ``extra_tokens``. Each window of ``windows`` (name to retained window) takes
     one bound over every phase: the request's own rows, capped by the retained
     window plus the larger of a prefill chunk with what retirement keeps beside
@@ -168,6 +172,7 @@ def request_demand(
         + extra_tokens,
         {name: window_bound(name, window) for name, window in windows.items()},
         state_slots,
+        request_rows,
     )
 
 
@@ -264,20 +269,17 @@ def window_retirement(*, shares_prefixes: bool) -> WindowRetirement:
     (`ScheduleBatch.maybe_evict_swa`). Without prefix sharing, the overlap
     scheduler retires a prefill's rows a chunk behind its frontier; decode
     retires once SGLANG_SWA_EVICTION_INTERVAL rows fell out of the window,
-    behind the processed length, while each step allocates ahead of it (the
-    overlap lag, or the speculative reserve `get_alloc_reserve_per_decode`)."""
+    behind the processed length, while each step allocates ahead of it by the
+    decode-ahead (`get_decode_ahead`)."""
     from sglang.srt.environ import envs
-    from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+    from sglang.srt.mem_cache.allocation_sizing import get_decode_ahead
     from sglang.srt.runtime_context import get_schedule, get_spec
 
     schedule = get_schedule()
     chunk = schedule.chunked_prefill_size or 0
     overlap = not schedule.disable_overlap_schedule
     prefill_lag = chunk if overlap and not shares_prefixes and chunk > 0 else 0
-    if get_spec().speculative_algorithm:
-        decode_lag = get_alloc_reserve_per_decode()
-    else:
-        decode_lag = 1 if overlap else 0
+    decode_lag = get_decode_ahead()
     interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
     if windows_retire_by_forward():
         # Between two retirements every forward but the retiring one commits
@@ -307,6 +309,7 @@ class DemandInputs(msgspec.Struct, frozen=True, kw_only=True):
     decode_retire_lag: int
     chunk_size: Optional[int]
     state_slots: int
+    request_rows: int
     host_hit_lengths: Mapping[str, int]
     extra_tokens: int
     cached_tokens: int
@@ -327,6 +330,7 @@ class DemandInputs(msgspec.Struct, frozen=True, kw_only=True):
             decode_retire_lag=self.decode_retire_lag,
             chunk_size=self.chunk_size,
             state_slots=self.state_slots,
+            request_rows=self.request_rows,
             host_hit_lengths=self.host_hit_lengths,
             extra_tokens=self.extra_tokens,
             cached_tokens=self.cached_tokens,
@@ -346,6 +350,7 @@ def demand_inputs(
     checkpoint_interval: int = 0,
     decode_retire_lag: int = 0,
     state_slots: int = 0,
+    request_rows: int = 0,
     cached_tokens: int = 0,
     host_hit_lengths: Optional[Mapping[str, int]] = None,
     extra_tokens: int = 0,
@@ -371,6 +376,7 @@ def demand_inputs(
         decode_retire_lag=decode_retire_lag,
         chunk_size=chunk_limit,
         state_slots=state_slots,
+        request_rows=request_rows,
         host_hit_lengths=dict(host_hit_lengths or {}),
         extra_tokens=extra_tokens,
         cached_tokens=cached_tokens,

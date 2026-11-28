@@ -69,6 +69,7 @@ def make_cache(pool, held, release):
 
     return SimpleNamespace(
         supports_mamba=lambda: True,
+        request_mamba_only=False,
         evict_for_alloc=MagicMock(side_effect=evict),
     )
 
@@ -92,7 +93,7 @@ class TestMambaCapacity(unittest.TestCase):
                         size=1,
                         mamba_size=5,
                         mamba_spec_state_size=1,
-                        max_context_len=16,
+                        row_width=16,
                         device="cpu",
                         enable_memory_saver=False,
                         cache_params=None,
@@ -136,7 +137,7 @@ class TestMambaCapacity(unittest.TestCase):
                         size=2,
                         pre_alloc_size=1,
                         mamba_size=1,
-                        max_context_len=16,
+                        row_width=16,
                         device="cpu",
                         enable_memory_saver=False,
                         cache_params=None,
@@ -170,6 +171,29 @@ class TestMambaCapacity(unittest.TestCase):
                     )
                 else:
                     cache.evict_for_alloc.assert_not_called()
+
+    def test_reclaim_covers_the_request_rows_it_binds(self):
+        """Under unified memory a row binds a request sub-pool unit before the
+        request's state slots, from the same bytes: reclaiming for the state
+        slots alone let admitted requests fail to take their slots."""
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+        pool = SimpleNamespace(holds_state_slots=True, binds_row_units=True)
+        state = SimpleNamespace(pending_request_slots=lambda table, req: 2)
+        chain = MagicMock()
+        chain.window_pool_names.return_value = ()
+        chain.ensure_capacity.side_effect = [False, True]
+        cache = MagicMock()
+        cache.supports_mamba.return_value = True
+        cache.token_to_kv_pool_allocator = chain
+        bound = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=4))
+        fresh = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=None))
+        self.assertTrue(ensure_mamba_capacity(pool, state, [bound, fresh], cache))
+        demand = KVDemand(
+            full_tokens=0, window_tokens={}, state_slots=4, request_rows=1
+        )
+        cache.evict_for_alloc.assert_called_once_with(demand)
+        self.assertEqual(chain.ensure_capacity.call_args.args[0], demand)
 
     def test_partial_eviction_defers_before_mutating_request(self):
         pool, held = make_pool(1)

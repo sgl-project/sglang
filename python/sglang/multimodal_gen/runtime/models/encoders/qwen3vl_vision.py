@@ -14,11 +14,13 @@ from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_vision import (
     PackedSequenceMetadata,
     QwenVLVisionAttention,
 )
+from sglang.srt.layers.linear import LinearParallelGroup
 from sglang.srt.models.qwen3_vl import (
     Qwen3_VisionMLP,
     Qwen3VLMoeVisionPatchMerger,
     Qwen3VLVisionPatchEmbed,
 )
+from sglang.srt.runtime_context import get_parallel
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,7 @@ class Qwen3VLVisionBlock(nn.Module):
         layer_idx: int,
         quant_config: Any = None,
         prefix: str = "visual",
+        parallel_group: LinearParallelGroup = "tp",
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=1e-6)
@@ -76,6 +79,7 @@ class Qwen3VLVisionBlock(nn.Module):
             prefix=f"{prefix}.blocks.{layer_idx}.attn",
             model_name="Qwen3-VL",
             quant_config=quant_config,
+            parallel_group=parallel_group,
         )
         self.mlp = Qwen3_VisionMLP(
             config.hidden_size,
@@ -84,7 +88,7 @@ class Qwen3VLVisionBlock(nn.Module):
             hidden_act=config.hidden_act,
             prefix=f"{prefix}.blocks.{layer_idx}.mlp",
             quant_config=quant_config,
-            parallel_group="tp",
+            parallel_group=parallel_group,
         )
 
     def forward(
@@ -205,8 +209,12 @@ class Qwen3VLVisionTransformer(nn.Module):
         config: Any,
         quant_config: Any = None,
         prefix: str = "visual",
+        replicated: bool = False,
     ) -> None:
         super().__init__()
+        parallel_group = (
+            "replicated" if replicated and get_parallel().tp_size > 1 else "tp"
+        )
         self.config = config
         self.spatial_merge_size = config.spatial_merge_size
         self.spatial_merge_unit = config.spatial_merge_size**2
@@ -219,7 +227,9 @@ class Qwen3VLVisionTransformer(nn.Module):
         head_dim = config.hidden_size // config.num_heads
         self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
         self.blocks = nn.ModuleList(
-            Qwen3VLVisionBlock(config, layer_idx, quant_config, prefix)
+            Qwen3VLVisionBlock(
+                config, layer_idx, quant_config, prefix, parallel_group=parallel_group
+            )
             for layer_idx in range(config.depth)
         )
         self.merger = Qwen3VLMoeVisionPatchMerger(
@@ -229,7 +239,7 @@ class Qwen3VLVisionTransformer(nn.Module):
             spatial_merge_size=config.spatial_merge_size,
             use_postshuffle_norm=False,
             prefix="visual.merger",
-            parallel_group="tp",
+            parallel_group=parallel_group,
         )
         self.deepstack_visual_indexes = tuple(config.deepstack_visual_indexes)
         self.deepstack_merger_list = nn.ModuleList(
@@ -240,7 +250,7 @@ class Qwen3VLVisionTransformer(nn.Module):
                 spatial_merge_size=config.spatial_merge_size,
                 use_postshuffle_norm=True,
                 prefix=f"visual.deepstack_merger_list.{merger_idx}",
-                parallel_group="tp",
+                parallel_group=parallel_group,
             )
             for merger_idx, _ in enumerate(self.deepstack_visual_indexes)
         )

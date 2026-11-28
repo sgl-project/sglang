@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -53,8 +52,6 @@ class MoeA2ABackend(Enum):
     def _missing_(cls, value):
         if value is None:
             return cls.NONE
-        if value == "flashinfer":  # Deprecated alias for FLASHINFER.
-            return cls.FLASHINFER
         for member in cls:
             if value == member.value:
                 return member
@@ -120,14 +117,15 @@ class AscendOpsConfig:
     - ``prefill``: ``allgather`` (TP AllGather -> local compute -> TP ReduceScatter)
       or ``alltoallv`` (TP AllToAllv -> compute -> TP AllToAllv).
     - ``decode``: ``low_latency`` (EP MC2 dispatch_v2 -> gmm -> activation ->
-      gmm -> combine_v2) or ``fused_op`` (single dispatch_ffn_combine).
+      gmm -> combine_v2).
+    - Either phase can select ``fused_op`` (MegaMoE dispatch, FFN and combine).
     - ``ll_dispatch_alg`` / ``ll_combine_alg``: the ``comm_alg`` handed to the
       MC2 dispatch/combine ops of the ``low_latency`` path. The defaults are the
       ones recommended by the operator owners (full-mesh dispatch, default
       combine).
     """
 
-    PREFILL_CHOICES = ("allgather", "alltoallv")
+    PREFILL_CHOICES = ("allgather", "alltoallv", "fused_op")
     DECODE_CHOICES = ("low_latency", "fused_op")
 
     prefill: str = "alltoallv"
@@ -146,11 +144,10 @@ class AscendOpsConfig:
                 f"invalid moe-ascend-ops-config decode mode {self.decode!r}; "
                 f"expected one of {self.DECODE_CHOICES}"
             )
-        if self.decode == "fused_op":
-            raise ValueError(
-                "moe-ascend-ops-config decode mode 'fused_op' is not implemented; "
-                "use 'low_latency'"
-            )
+
+    @property
+    def uses_fused_op(self) -> bool:
+        return "fused_op" in (self.prefill, self.decode)
 
     @classmethod
     def from_json_str(cls, s: Optional[str]) -> AscendOpsConfig:
@@ -1136,11 +1133,7 @@ def get_moe_padding_size(is_aiter_moe):
     if is_aiter_moe:
         return AITER_PADDING_SIZE
     else:
-        return (
-            TRITON_PADDING_SIZE
-            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
-            else 0
-        )
+        return TRITON_PADDING_SIZE if envs.SGLANG_MOE_PADDING.get() else 0
 
 
 def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):

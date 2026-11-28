@@ -15,14 +15,23 @@ import torch
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=4, suite="base-a-test-npu")
+register_npu_ci(est_time=4, suite="extra-a-test-npu")
+
+# The backend imports ragged_verify at module level, so load the REAL module
+# before the stub block below shadows its package parent.
+from sglang.srt.speculative.ragged_verify import RaggedVerifyMode  # noqa: F401
 
 for mod in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
+    "sgl_kernel_npu.operators.indexer",
+    "sgl_kernel_npu.operators.mem_cache",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.kvcacheio",
     "sgl_kernel_npu.norm",
     "sgl_kernel_npu.norm.add_rmsnorm_bias",
     "sglang.srt.speculative",
@@ -31,7 +40,17 @@ for mod in (
     "sglang.srt.speculative.eagle_info",
     "sglang.srt.speculative.base_spec_worker",
 ):
-    sys.modules.setdefault(mod, MagicMock())
+    # Keep a really-importable module (NPU hosts) untouched: replacing a real
+    # package with a MagicMock poisons sys.modules for the whole pytest
+    # process -- e.g. mha.py's later ``from sgl_kernel_npu.operators.data_move
+    # import ...`` would fail with "'...operators' is not a package". Stub only
+    # what is genuinely missing (pure-CPU hosts).
+    if mod in sys.modules:
+        continue
+    try:
+        __import__(mod)
+    except Exception:
+        sys.modules[mod] = MagicMock()
 
 # Stub deepseek_v2._is_hip to avoid importing the heavy model.
 _ds2_stub = ModuleType("sglang.srt.models.deepseek_v2")
@@ -59,7 +78,7 @@ _eagle_stub.per_step_draft_out_cache_loc = _per_step_draft_out_cache_loc
 sys.modules.setdefault("sglang.srt.speculative", ModuleType("sglang.srt.speculative"))
 sys.modules.setdefault("sglang.srt.speculative.eagle_utils", _eagle_stub)
 
-from sglang.srt.disaggregation.ascend.conn import AscendStateType
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     C4IndexerAscendBackendMixin,
     CompressorAscendBackendMixin,
@@ -78,8 +97,13 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
     NPUCompressStatePool,
 )
-from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
-    DSV4ReqToTokenTablesMixin,
+
+_BACKEND_NPU_OPS = (
+    "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.npu_attention_ops"
+)
+
+_BACKEND_INDEXER_OPS = (
+    "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.npu_indexer_ops"
 )
 
 
@@ -314,80 +338,209 @@ class TestMultiStepDraftCompressedLocs(unittest.TestCase):
 
 
 class TestC4StateTransferLayout(unittest.TestCase):
-    @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
-    def test_pre_arch35_payload_only_carries_c128_kv(self, _):
+    @staticmethod
+    def _pool(stage_layers, c4_layers, c128_layers=(), ring_size=8):
+        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+        pool.stage_layer_ids = tuple(stage_layers)
+        pool.sources_by_ratio = {4: list(c4_layers), 128: list(c128_layers)}
+        pool.swa_kv_pool = SimpleNamespace(
+            kv_buffer=[
+                torch.empty((12, 128, 1, 8), dtype=torch.bfloat16) for _ in stage_layers
+            ]
+        )
+        pool.c128_kv_pool = SimpleNamespace(
+            kv_buffer=[
+                torch.empty((12, 1, 1, 8), dtype=torch.bfloat16) for _ in c128_layers
+            ]
+        )
+        total_layers = max(stage_layers, default=-1) + 1
+        pool.compress_state_pools = [None] * total_layers
+        pool.indexer_compress_state_pools = [None] * total_layers
+        for layer_id in c4_layers:
+            for pools, width in (
+                (pool.compress_state_pools, 8),
+                (pool.indexer_compress_state_pools, 4),
+            ):
+                state = NPUCompressStatePool.__new__(NPUCompressStatePool)
+                state.ratio = 4
+                state.ring_size = ring_size
+                state.swa_page_size = 128
+                state.dummy_state_loc = 12 * state.ring_size
+                state.kv_score_buffer = SimpleNamespace(
+                    kv_score=torch.full(
+                        (12 * state.ring_size, width), -1.0, dtype=torch.float32
+                    )
+                )
+                pools[layer_id] = state
+        pool.layer_router = SimpleNamespace(sub_pool=lambda _: None)
+        pool._unified_kv = False
+        pool.get_request_state_buf_infos = lambda: ([], [], [])
+        return pool
+
+    def test_payload_only_carries_separate_c128_kv(self):
         req_pool = SimpleNamespace(
             c128_page_size=1,
-            req_to_c128_sidecar=torch.zeros((4, 1), dtype=torch.int32),
+            req_to_c128_sidecar=torch.tensor(
+                [[0, 0, 0], [0, 0, 0], [5, 7, 0]], dtype=torch.int32
+            ),
         )
-        payloads = dsv4_state_payloads(req_pool, 2, 13, page_size=1)
-        self.assertEqual({state_type.value for state_type in payloads}, {"dsv4_c128"})
+        payloads = dsv4_state_payloads(req_pool, 2, 384, page_size=128)
+        self.assertEqual(set(payloads), {StateType.DSV4_C128})
+        self.assertEqual(payloads[StateType.DSV4_C128]().tolist(), [5, 7])
 
-    @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=True)
-    def test_arch35_payload_pairs_explicit_rows_with_different_ring_sizes(self, _):
-        for ring_size, swa_pages, expected in (
-            (8, (5, 9), [44, 45, 46, 47, 72]),
-            (16, (7, 11), [124, 125, 126, 127, 176]),
-        ):
-            with self.subTest(ring_size=ring_size):
-                state_pool = NPUCompressStatePool.__new__(NPUCompressStatePool)
-                state_pool.ratio = 4
-                state_pool.ring_size = ring_size
-                state_pool.swa_page_size = 128
-                state_pool.dummy_state_loc = 0
+    def test_swa_registers_c4_rings_and_c128_remains_separate(self):
+        from sglang.srt.mem_cache.static_kv_storage import _static_state_entries
 
-                swa_locs = torch.cat(
-                    [torch.arange(page * 128, (page + 1) * 128) for page in swa_pages]
-                )
-                kv_pool = SimpleNamespace(
-                    compress_state_pools=[None, state_pool],
-                    translate_loc_from_full_to_swa=lambda locs: swa_locs[locs],
-                )
-                req_pool = DSV4ReqToTokenTablesMixin.__new__(DSV4ReqToTokenTablesMixin)
-                req_pool.req_to_token = torch.arange(256).unsqueeze(0)
-                req_pool._dsv4_allocator = MagicMock()
-                req_pool._dsv4_allocator.get_kvcache.return_value = kv_pool
-
-                payloads = dsv4_state_payloads(req_pool, 0, 129, page_size=128)
-                rows = payloads[AscendStateType.DSV4_C4_STATE]()
-                self.assertEqual(rows.tolist(), expected)
-
-    @patch(
-        "sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool.is_npu_arch35",
-        return_value=False,
-    )
-    def test_pre_arch35_swa_payload_registers_c4_state_rows(self, arch35):
-        attn_state = torch.empty((32, 5), dtype=torch.float32)
-        indexer_state = torch.empty((32, 7), dtype=torch.float32)
-        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
-        pool.swa_kv_pool = SimpleNamespace(kv_buffer=[])
-        pool.compress_state_pools = [
-            SimpleNamespace(
-                ratio=4,
-                ring_size=8,
-                kv_score_buffer=SimpleNamespace(kv_score=attn_state),
+        pool = self._pool([2, 3, 4], [2, 4], [3])
+        states = [
+            p
+            for pools in (
+                pool.compress_state_pools,
+                pool.indexer_compress_state_pools,
             )
+            for p in pools
+            if p is not None
         ]
-        pool.indexer_compress_state_pools = [
-            SimpleNamespace(
-                ratio=4,
-                ring_size=8,
-                kv_score_buffer=SimpleNamespace(kv_score=indexer_state),
+        buffers = pool.swa_kv_pool.kv_buffer + [
+            p.kv_score_buffer.kv_score for p in states
+        ]
+        expected_items = [b[0].nbytes for b in pool.swa_kv_pool.kv_buffer] + [
+            p.kv_score_buffer.kv_score[0].nbytes * p.ring_size for p in states
+        ]
+        ptrs, lens, items = pool.get_state_buf_infos()
+        self.assertEqual(ptrs, [b.data_ptr() for b in buffers])
+        self.assertEqual(lens, [b.nbytes for b in buffers])
+        self.assertEqual(items, expected_items)
+        expected_ids = [2, 3, 4, 2, 4, 2, 4]
+        self.assertEqual(pool.get_swa_state_layer_ids(), expected_ids)
+
+        with patch("sglang.srt.mem_cache.static_kv_storage.is_npu", return_value=True):
+            entries = _static_state_entries(
+                pool,
+                draft_token_to_kv_pool=None,
+                total_kv_layers=5,
+                state_pool=None,
             )
-        ]
-
-        _, data_lens, item_lens = pool.get_state_buf_infos()
-
-        self.assertEqual(data_lens, [attn_state.nbytes, indexer_state.nbytes])
         self.assertEqual(
-            item_lens,
-            [attn_state[0].nbytes * 8, indexer_state[0].nbytes * 8],
+            [entry.state_type for entry in entries.wire_entries],
+            [StateType.SWA, StateType.DSV4_C128],
         )
-        arch35.return_value = True
-        self.assertEqual(pool.get_state_buf_infos(), ([], [], []))
-        _, data_lens, item_lens = pool.get_c4_state_buf_infos()
-        self.assertEqual(data_lens, [attn_state.nbytes, indexer_state.nbytes])
-        self.assertEqual(item_lens, [attn_state[0].nbytes, indexer_state[0].nbytes])
+        self.assertEqual(entries.regions["state0"].ptrs, tuple(ptrs))
+        self.assertEqual(entries.regions["state0"].item_lens, tuple(expected_items))
+        self.assertEqual(entries.regions["state0"].layer_ids, tuple(expected_ids))
+        self.assertEqual(entries.regions["state1"].layer_ids, (3,))
+
+    def test_swa_layer_ids_pair_each_buffer_group_across_pp(self):
+        from sglang.srt.disaggregation.utils import build_transfer_entry_pairs
+
+        src = self._pool([2, 3, 4], [2, 4], [3])
+        dst = self._pool([0, 1, 2, 3, 4], [0, 2, 4], [1, 3])
+        src_ptrs = src.get_state_buf_infos()[0]
+        dst_ptrs = dst.get_state_buf_infos()[0]
+        pairs = build_transfer_entry_pairs(
+            src.get_swa_state_layer_ids(),
+            dst.get_swa_state_layer_ids(),
+            len(src_ptrs),
+            len(dst_ptrs),
+        )
+        self.assertEqual(
+            pairs, [(0, 2), (1, 3), (2, 4), (3, 6), (4, 7), (5, 9), (6, 10)]
+        )
+
+    def test_swa_only_stage_and_draft_have_no_c4_entries(self):
+        for stage, c128 in (([2, 3], [2, 3]), ([0], [])):
+            with self.subTest(stage=stage, c128=c128):
+                pool = self._pool(stage, [], c128)
+                buffers = pool.swa_kv_pool.kv_buffer
+                self.assertEqual(
+                    pool.get_state_buf_infos(),
+                    (
+                        [b.data_ptr() for b in buffers],
+                        [b.nbytes for b in buffers],
+                        [b[0].nbytes for b in buffers],
+                    ),
+                )
+                self.assertEqual(pool.get_swa_state_layer_ids(), stage)
+
+    @staticmethod
+    def _req_pool(kv_pool, swa_pages):
+        req_pool = SimpleNamespace(
+            req_to_token=torch.zeros((1, 384), dtype=torch.int64)
+        )
+        mapping = torch.zeros(24 * 128, dtype=torch.int64)
+        for logical_page, swa_page in enumerate(swa_pages):
+            full_page = 20 - 3 * logical_page
+            full_locs = full_page * 128 + torch.arange(128)
+            req_pool.req_to_token[0, logical_page * 128 : (logical_page + 1) * 128] = (
+                full_locs
+            )
+            mapping[full_locs] = swa_page * 128 + torch.arange(128)
+        kv_pool.translate_loc_from_full_to_swa = lambda locs: mapping[locs]
+        return req_pool
+
+    def test_swa_page_copy_preserves_decode_compressor_history(self):
+        from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
+            _build_explicit_state_block_table,
+        )
+
+        src_pages, dst_pages = [7, 3, 9], [2, 8, 5]
+        for ring_size in (8, 16):
+            for seq_len in (0, 1, 4, 7, 8, 9, 13, 127, 128, 129, 255, 256, 257):
+                with self.subTest(ring_size=ring_size, seq_len=seq_len):
+                    src = self._pool([0], [0], ring_size=ring_size)
+                    dst = self._pool([0], [0], ring_size=ring_size)
+                    src_req = self._req_pool(src, src_pages)
+                    dst_req = self._req_pool(dst, dst_pages)
+                    src_items = src.get_state_buf_infos()[2]
+                    dst_items = dst.get_state_buf_infos()[2]
+                    self.assertEqual(src_items, dst_items)
+                    for entry, attr in enumerate(
+                        ("compress_state_pools", "indexer_compress_state_pools"),
+                        start=1,
+                    ):
+                        src_state = getattr(src, attr)[0]
+                        dst_state = getattr(dst, attr)[0]
+                        src_data = src_state.kv_score_buffer.kv_score
+                        dst_data = dst_state.kv_score_buffer.kv_score
+                        dst_data.fill_(-2.0)
+                        positions = list(range(max(0, seq_len - 8), seq_len))
+                        for pos in positions:
+                            swa_loc = src_req.req_to_token[0, pos]
+                            swa_loc = src.translate_loc_from_full_to_swa(swa_loc)
+                            row = src_state.translate_from_swa_loc_to_state_loc(swa_loc)
+                            src_data[row] = pos + torch.arange(src_data.shape[1])
+
+                        # Use the exported item size and the shared SWA page IDs.
+                        # Source and destination physical page numbers differ.
+                        item_elements = src_items[entry] // src_data.element_size()
+                        for src_page, dst_page in zip(src_pages, dst_pages):
+                            dst_data.view(-1).narrow(
+                                0, dst_page * item_elements, item_elements
+                            ).copy_(
+                                src_data.view(-1).narrow(
+                                    0, src_page * item_elements, item_elements
+                                )
+                            )
+                        table = _build_explicit_state_block_table(
+                            compress_ratio=4,
+                            coff=2,
+                            state_pool=dst_state,
+                            token_to_kv_pool=dst,
+                            req_to_token=dst_req.req_to_token,
+                            req_pool_indices=torch.tensor([0]),
+                            start_pos=torch.tensor([seq_len]),
+                            cu_seqlens=torch.tensor([0, 1]),
+                            seqused=torch.tensor([1]),
+                            max_input_capacity=1,
+                        )
+                        history_rows = table[0, max(0, 8 - seq_len) : 8]
+                        for pos, row in zip(positions, history_rows):
+                            self.assertTrue(
+                                torch.equal(
+                                    dst_data[row],
+                                    pos + torch.arange(dst_data.shape[1]),
+                                )
+                            )
 
 
 class TestC4IndexerInitialization(unittest.TestCase):
@@ -561,33 +714,23 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"
     )
 
+    @patch(_BACKEND_NPU_OPS)
     @patch(_ARCH35_PATCH_TARGET, return_value=True)
-    def test_arch35_uses_kv_quant_ops_and_layout_kwargs(self, _):
-        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
-            metadata_op, attention_op = _sparse_attn_ops()
-            kwargs = _sparse_attn_kv_quant_kwargs()
-
-        self.assertIs(
-            metadata_op, custom_ops.npu_kv_quant_sparse_attn_sharedkv_metadata
-        )
-        self.assertIs(attention_op, custom_ops.npu_kv_quant_sparse_attn_sharedkv)
+    def test_arch35_uses_kv_quant_ops_and_layout_kwargs(self, _, ops):
+        metadata_op, attn_op = _sparse_attn_ops()
+        self.assertIs(metadata_op, ops.mixed_quant_sparse_flash_mla_metadata)
+        self.assertIs(attn_op, ops.mixed_quant_sparse_flash_mla)
         self.assertEqual(
-            kwargs,
-            {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64},
+            _sparse_attn_kv_quant_kwargs(), {"quant_mode": 1, "rope_head_dim": 64}
         )
 
+    @patch(_BACKEND_NPU_OPS)
     @patch(_ARCH35_PATCH_TARGET, return_value=False)
-    def test_pre_arch35_keeps_legacy_ops_without_quant_kwargs(self, _):
-        with (
-            patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
-            patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
-        ):
-            metadata_op, attention_op = _sparse_attn_ops()
-            kwargs = _sparse_attn_kv_quant_kwargs()
-
-        self.assertIs(metadata_op, custom_ops.npu_sparse_attn_sharedkv_metadata)
-        self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
-        self.assertEqual(kwargs, {})
+    def test_pre_arch35_uses_the_smla_pair_without_quant_kwargs(self, _, ops):
+        metadata_op, attn_op = _sparse_attn_ops()
+        self.assertIs(metadata_op, ops.sparse_flash_mla_metadata)
+        self.assertIs(attn_op, ops.sparse_flash_mla)
+        self.assertEqual(_sparse_attn_kv_quant_kwargs(), {})
 
 
 class TestSparseAttentionMetadata(unittest.TestCase):
@@ -599,20 +742,25 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
         seqused_kv = torch.tensor([8, 12], dtype=torch.int32)
 
-        for is_arch35, metadata_op_name in (
-            (False, "npu_sparse_attn_sharedkv_metadata"),
-            (True, "npu_kv_quant_sparse_attn_sharedkv_metadata"),
-        ):
+        for is_arch35 in (False, True):
             with (
                 self.subTest(is_arch35=is_arch35),
                 patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
-                patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
-                patch("torch.ops.npu", MagicMock(), create=True),
+                patch(_BACKEND_NPU_OPS) as ops,
+                # _build_li_quant_metadata calls the real lightning-indexer
+                # metadata op, which rejects this test's 16-head config
+                # (num_heads_q must be 64); stub it like npu_attention_ops.
+                patch(_BACKEND_INDEXER_OPS) as _,
             ):
                 backend = DeepseekV4AscendAttnBackend.__new__(
                     DeepseekV4AscendAttnBackend
                 )
-                backend.forward_metadata = SimpleNamespace()
+                backend.forward_metadata = SimpleNamespace(
+                    ori_sparse_indices=None,
+                    ori_mask_mode=4,
+                    ori_win_left=127,
+                    ori_win_right=0,
+                )
                 backend._is_dspark_draft_worker = False
                 backend._dsv4_sliding_window_size = 128
                 backend._dsv4_q_head_num = 64
@@ -630,32 +778,27 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                     actual_seq_lengths_kv=seqused_kv,
                 )
 
-                metadata_op = getattr(custom_ops, metadata_op_name)
+                metadata_op = (
+                    ops.mixed_quant_sparse_flash_mla_metadata
+                    if is_arch35
+                    else ops.sparse_flash_mla_metadata
+                )
                 self.assertEqual(metadata_op.call_count, 3)
                 for call in metadata_op.call_args_list:
-                    self.assertIs(call.kwargs["cu_seqlens_q"], cu_seqlens_q)
-                    self.assertIs(call.kwargs["seqused_kv"], seqused_kv)
+                    self.assertIs(call.kwargs["seqused_ori_kv"], seqused_kv)
 
-    def test_dspark_host_metadata_receives_host_sequence_lengths(self):
-        cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
+    def test_dspark_metadata_uses_the_sparse_dialect(self):
+        cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
         seqused_kv = torch.tensor([8, 12], dtype=torch.int32)
-        cu_seqlens_q_cpu = cu_seqlens_q.clone()
-        seqused_kv_cpu = seqused_kv.clone()
 
         metadata_op = MagicMock()
-        with (
-            patch("torch.ops.npu", MagicMock(), create=True),
-            patch(
-                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
-                return_value=(metadata_op, MagicMock()),
-            ),
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
+            return_value=(metadata_op, MagicMock()),
         ):
             backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-            backend.forward_metadata = SimpleNamespace(
-                actual_seq_lengths_q_pa_cpu=cu_seqlens_q_cpu,
-                seq_lens_cpu_int=seqused_kv_cpu,
-            )
-            backend._is_dspark_draft_worker = True
+            backend.forward_metadata = SimpleNamespace()
+            backend._is_dspark_draft_block = lambda _fb: True
             backend._dsv4_sliding_window_size = 128
             backend._dsv4_q_head_num = 64
             backend._dsv4_kv_head_num = 1
@@ -663,19 +806,35 @@ class TestSparseAttentionMetadata(unittest.TestCase):
             backend._dsv4_has_c4 = False
             backend._dsv4_has_c128 = False
 
-            kernel_metadata = backend._kernel_metadata_from_parts(
+            forward_batch = SimpleNamespace(
+                spec_info=SimpleNamespace(draft_token_num=2),
+                seq_lens=seqused_kv,
+                out_cache_loc=torch.zeros(4, dtype=torch.int64),
+            )
+            backend._init_dspark_sparse_metadata(forward_batch)
+            backend._kernel_metadata_from_parts(
                 bs=2,
                 actual_seq_lengths_q_pa=cu_seqlens_q,
                 actual_seq_lengths_kv=seqused_kv,
             )
 
+        fm = backend.forward_metadata
+        # Trailing window then the draft block, -1 padded; window+2 topk each.
+        torch.testing.assert_close(
+            fm.ori_sparse_indices[2, 0, :14], torch.arange(14, dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            fm.ori_topk_length.flatten(),
+            torch.tensor([10, 10, 14, 14], dtype=torch.int32),
+        )
         metadata_op.assert_called_once()
-        self.assertIs(kernel_metadata["c1a_metadata"], metadata_op.return_value)
-        self.assertIs(metadata_op.call_args.kwargs["cu_seqlens_q"], cu_seqlens_q_cpu)
-        actual_seqused_kv = metadata_op.call_args.kwargs["seqused_kv"]
-        torch.testing.assert_close(actual_seqused_kv, seqused_kv_cpu[:2])
-        self.assertEqual(actual_seqused_kv.dtype, torch.int32)
-        self.assertEqual(actual_seqused_kv.device.type, "cpu")
+        kwargs = metadata_op.call_args.kwargs
+        self.assertEqual(kwargs["ori_mask_mode"], 0)
+        self.assertEqual(kwargs["ori_topk"], 256)
+        self.assertIs(kwargs["ori_topk_length"], fm.ori_topk_length)
+        self.assertIs(kwargs["seqused_ori_kv"], seqused_kv)
+        self.assertEqual(kwargs["ori_win_left"], 129)
+        self.assertNotIn("seqused_kv", kwargs)
 
 
 class TestGetKvIndices(unittest.TestCase):
@@ -832,6 +991,14 @@ class TestStepOutCacheLoc(unittest.TestCase):
 
 
 class TestCompressorEpilogEmptyWrite(unittest.TestCase):
+    def setUp(self):
+        probe = patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
+            return_value=False,
+        )
+        probe.start()
+        self.addCleanup(probe.stop)
+
     @staticmethod
     def _backend(*, loc, graph_mode=False):
         backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
@@ -888,11 +1055,108 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
     def test_all_slots_masked_skips_fused_indexer_write(self):
         backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
         compressor = self._compressor(li_kv_dtype="float8", is_in_indexer=True)
-        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+        quant_cache = MagicMock()
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.npu_cache_ops.indexer_quant_cache",
+            quant_cache,
+        ):
             backend._compressor_epilog_npu(
                 compressor, torch.zeros(3, 512), self._verify_batch()
             )
-        custom_ops.indexer_compress_epilog.assert_not_called()
+        quant_cache.assert_not_called()
+
+
+class TestMirrorlessReplayWidthHint(unittest.TestCase):
+    """max_seq_len_host bounds the mirrorless replay-prep copy widths."""
+
+    _PAGE = 128
+    _WIDTH = 64  # captured block-table width, in pages
+
+    @staticmethod
+    def _verify_mode():
+        mode = MagicMock()
+        mode.is_target_verify.return_value = True
+        mode.is_draft_extend_v2.return_value = False
+        mode.is_idle.return_value = False
+        return mode
+
+    def _replay_backend(self):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.page_size = self._PAGE
+        backend._dsv4_has_c4 = True
+        backend._dsv4_has_c128 = False
+        backend._dsv4_graph_tokens_per_req = 8
+        backend._is_dspark_algorithm = False
+        backend._is_dspark_draft_worker = False
+        backend.graph_metadata = {
+            "block_tables": torch.zeros((2, self._WIDTH), dtype=torch.int32)
+        }
+        return backend
+
+    def _replay_batch(self, hint):
+        seq_lens = torch.tensor([300, 660], dtype=torch.int32)
+        return SimpleNamespace(
+            forward_mode=self._verify_mode(),
+            batch_size=2,
+            num_padding=0,
+            spec_info=None,
+            seq_lens=seq_lens,
+            seq_lens_cpu=None,  # mirrorless
+            req_pool_indices=torch.tensor([0, 1]),
+            out_cache_loc=torch.zeros(16, dtype=torch.int64),
+            max_seq_len_host=hint,
+        )
+
+    def test_replay_ctx_caps_compress_width_at_hint(self):
+        backend = self._replay_backend()
+        ctx = backend._build_dsv4_graph_replay_ctx(self._replay_batch(hint=300))
+        # hint 300 -> ceil(300/128)+1 = 4 pages of slack -> 512 tokens, well
+        # under the captured 64-page width.
+        self.assertTrue(ctx.mirrorless)
+        self.assertEqual(ctx.compress_seq_lens_max, 4 * self._PAGE)
+
+    def test_replay_ctx_caps_compress_width_at_captured_width(self):
+        backend = self._replay_backend()
+        ctx = backend._build_dsv4_graph_replay_ctx(self._replay_batch(hint=None))
+        self.assertEqual(ctx.compress_seq_lens_max, self._WIDTH * self._PAGE)
+
+    def test_replay_ctx_hint_above_captured_width_never_overshoots(self):
+        backend = self._replay_backend()
+        ctx = backend._build_dsv4_graph_replay_ctx(self._replay_batch(hint=10**9))
+        self.assertEqual(ctx.compress_seq_lens_max, self._WIDTH * self._PAGE)
+
+    def _swa_refresh_copied_width(self, hint):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.page_size = self._PAGE
+        backend.token_to_kv_pool = SimpleNamespace(
+            translate_loc_from_full_to_swa=lambda locs: locs
+        )
+        copied = {}
+        backend._copy_page_table_into_graph = lambda key, src: copied.setdefault(
+            "src", src
+        )
+        fm = SimpleNamespace(
+            swa_loc=torch.zeros(4, dtype=torch.int64),
+            block_tables_swa=torch.arange(16, dtype=torch.int32).reshape(2, 8),
+        )
+        ctx = SimpleNamespace(
+            fm=fm,
+            mirrorless=True,
+            bs=2,
+            forward_batch=SimpleNamespace(
+                max_seq_len_host=hint,
+                out_cache_loc=torch.zeros(4, dtype=torch.int64),
+            ),
+        )
+        backend._refresh_graph_swa_metadata_direct(ctx)
+        return copied["src"].shape[1]
+
+    def test_swa_refresh_sliced_to_hint_plus_one_page(self):
+        # hint 100 (+1 page slack) -> 2 of the 8 captured pages.
+        self.assertEqual(self._swa_refresh_copied_width(100), 2)
+
+    def test_swa_refresh_without_hint_copies_full_width(self):
+        self.assertEqual(self._swa_refresh_copied_width(None), 8)
 
 
 if __name__ == "__main__":

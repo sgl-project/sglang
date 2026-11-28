@@ -54,13 +54,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_deepep_mode,
-    get_moe_a2a_backend,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
@@ -88,7 +84,6 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import LazyValue, is_cuda, is_npu
 
-LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -419,7 +414,7 @@ def block_topk_triton(
 split_qkv_rmsnorm_rope_pos_cache_half_npu = None
 if _is_npu:
     try:
-        from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope_pos_cache_half_npu import (
+        from sgl_kernel_npu.operators.norm import (
             split_qkv_rmsnorm_rope_pos_cache_half_npu,
         )
     except (ImportError, OSError):
@@ -586,9 +581,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         )
 
         if self.use_block_routing:
-            if get_moe_a2a_backend().is_deepep():
+            if (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
+            ):
                 raise ValueError(
-                    "LLaDA2 block routing does not support --moe-a2a-backend deepep"
+                    "LLaDA2 block routing does not support --moe-a2a-backend "
+                    f"{get_moe_a2a_backend().value}"
                 )
             if self.correction_bias is None:
                 raise ValueError(
@@ -633,7 +632,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
-            # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
             scoring_func=self.score_function,
@@ -675,22 +673,11 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
-                if get_moe_a2a_backend().is_deepep()
+                if (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
+                )
                 else "tp",
-            )
-        # dispatcher
-        if get_moe_a2a_backend().is_deepep():
-            self.deepep_dispatcher = DeepEPDispatcher(
-                group=get_parallel().tp_group.device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.num_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=get_deepep_mode(),
-                async_finish=True,  # TODO
-                return_recv_hook=True,
             )
 
     def forward(
@@ -698,7 +685,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        if not get_moe_a2a_backend().is_deepep():
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_ops()
+        ):
             return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -1150,8 +1140,6 @@ class LLaDA2MoeModel(nn.Module):
         else:
             self.word_embeddings = PPMissingLayer()
 
-        self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
-
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LLaDA2MoeBlock(
@@ -1354,8 +1342,6 @@ class LLaDA2MoeModelLM(nn.Module):
                 and self.config.norm_head
                 and "lm_head.weight" in name
             ):
-                import torch.nn.functional as F
-
                 loaded_weight = F.normalize(loaded_weight, dim=0, p=2, eps=1e-7)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

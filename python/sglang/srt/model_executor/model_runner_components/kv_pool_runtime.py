@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_schedule,
+    get_spec,
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.utils.device import get_available_gpu_memory, get_device_memory_capacity
@@ -40,9 +41,11 @@ def is_post_capture_kv_active(
 ) -> bool:
     if is_draft_worker:
         # A dflash-family draft pool is indexed by the target's token ids, so it
-        # follows the target pool's post-capture backing.
+        # follows the target pool's post-capture backing. A draft KV ring is a
+        # fixed pool indexed by request slot instead.
         return (
             spec_algorithm.is_dflash_family()
+            and not get_spec().speculative_dflash_draft_kv_ring
             and token_to_kv_pool_allocator.get_kvcache().post_capture_active
         )
     return post_capture_kv_sizing_planned(server_args) and current_platform.is_cuda()
@@ -66,10 +69,11 @@ def compute_post_capture_kv_resize(
     post-capture GPU memory + the pool objects it must resize in place."""
     pool = model_runner.token_to_kv_pool
     torch.cuda.synchronize()
+    solo_join = get_exec().moe.is_ep_offset_joiner  # No WORLD peers.
     free_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=get_parallel().launch_world_size > 1,
+        distributed=not solo_join and get_parallel().launch_world_size > 1,
         cpu_group=get_parallel().world_group.cpu_group,
     )
     headroom_gb = model_runner.pre_model_load_memory * (

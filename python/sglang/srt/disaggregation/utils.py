@@ -20,6 +20,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
     overload,
 )
 
@@ -30,9 +31,10 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -49,9 +51,14 @@ if TYPE_CHECKING:
         CommonKVReceiver,
         CommonKVSender,
     )
+    from sglang.srt.managers.io_struct import (
+        GenerateReqInput,
+        TokenizedGenerateReqInput,
+    )
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 logger = logging.getLogger(__name__)
 
@@ -65,34 +72,34 @@ def pp_sync_polls(
     pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
-    sync_work_list: List,
+    send_window: PPSyncSendWindow,
+    p2p_tag: P2PTag,
 ) -> List[int]:
     """Synchronize poll states from PP0 through the PP pipeline.
 
     PP0 provides the data. Each later PP rank receives it from the previous
-    rank and asynchronously forwards it to the next rank.
+    rank and asynchronously forwards it to the next rank. The forwards stay
+    un-waited for the window's depth so this rank's rounds are not tied to the
+    next rank's.
     """
     if pp_size <= 1:
         assert polls is not None
         return polls
 
-    for p2p_work in sync_work_list:
-        p2p_work.work.wait()
-    sync_work_list.clear()
-
+    send_window.begin_round()
     data = polls
     if pp_rank > 0:
         data = pp_group.recv_object(
             src=pp_rank - 1,
-            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+            tag=p2p_tag,
         )
     if pp_rank + 1 < pp_size:
-        sync_work_list.extend(
+        send_window.add(
             pp_group.send_object(
                 data,
                 dst=pp_rank + 1,
                 async_send=True,
-                tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+                tag=p2p_tag,
             )
         )
     return data
@@ -123,15 +130,21 @@ def poll_and_all_reduce_prefill_pp(
     pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
-    pp_poll_sync_work_list: List[torch.distributed.Work],
+    pp_poll_send_window: PPSyncSendWindow,
+    p2p_tag: P2PTag,
+    release: bool = False,
 ) -> List[int]:
+    """PP0 polls every stage's status and forwards its polls to the other
+    stages. With release, a transfer concludes only once every stage has."""
     polls: List[int] = []
     if pp_rank == 0:
-        polls = _poll_with_failure_injection_pp(pollers)
+        polls = _poll_with_failure_injection_pp(pollers, release=release)
         polls = _all_reduce_polls(polls, attn_tp_cpu_group)
         polls = _all_reduce_polls(polls, attn_cp_cpu_group)
     # Propagate PP0's data to other ranks
-    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
+    polls = pp_sync_polls(
+        polls, pp_group, pp_rank, pp_size, pp_poll_send_window, p2p_tag
+    )
     return polls
 
 
@@ -304,15 +317,16 @@ def _poll_with_failure_injection(pollers) -> List[int]:
     return [int(poller.poll()) for poller in pollers]
 
 
-def _poll_with_failure_injection_pp(pollers) -> List[int]:
+def _poll_with_failure_injection_pp(pollers, release: bool = False) -> List[int]:
+    def poll(poller):
+        return poller.poll_pp_release() if release else poller.poll_pp_consensus()
+
     if (failure_prob := envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get()) > 0:
         return [
-            int(KVPoll.Failed)
-            if random.random() < failure_prob
-            else int(poller.poll_pp_consensus())
+            int(KVPoll.Failed) if random.random() < failure_prob else int(poll(poller))
             for poller in pollers
         ]
-    return [int(poller.poll_pp_consensus()) for poller in pollers]
+    return [int(poll(poller)) for poller in pollers]
 
 
 def decode_offloads_kvcache() -> bool:
@@ -328,6 +342,45 @@ def _is_fake_transfer(req: Req) -> bool:
         req.bootstrap_host is None
         and get_disagg().disaggregation_transfer_backend == "fake"
     )
+
+
+def lacks_decode_peer(
+    req: Union[Req, GenerateReqInput, TokenizedGenerateReqInput],
+    *,
+    disaggregation_mode: DisaggregationMode,
+    transfer_backend: TransferBackend,
+) -> bool:
+    """Whether a request to a prefill server names no bootstrap host, so that
+    no decode can find its KV. The caller passes its own mode and backend."""
+    return (
+        req.bootstrap_host is None
+        and disaggregation_mode == DisaggregationMode.PREFILL
+        and transfer_backend != TransferBackend.FAKE
+    )
+
+
+def answered_by_prefill(
+    req: Req,
+    *,
+    disaggregation_mode: DisaggregationMode,
+    transfer_backend: TransferBackend,
+) -> bool:
+    """Whether the prefill server answers this admitted request by itself: it
+    has no decode peer, and asks for no more than the token prefill samples.
+
+    Distinct from ``Req.is_prefill_only`` (max_new_tokens == 0, no sampling):
+    this is true for a one-token request as well."""
+    if not lacks_decode_peer(
+        req,
+        disaggregation_mode=disaggregation_mode,
+        transfer_backend=transfer_backend,
+    ):
+        return False
+    assert req.sampling_params.max_new_tokens in (0, 1), (
+        f"{req.rid=} has no decode peer but asks for "
+        f"{req.sampling_params.max_new_tokens} tokens"
+    )
+    return True
 
 
 def pre_alloc_fill_len(req: Req) -> int:
@@ -427,6 +480,21 @@ def check_state_wire(
                 "window tail than the decode server needs, as (sub-pool, prefill "
                 f"tail, decode tail): {shorter}. Both servers need the same "
                 "draft model and front rows, or a prefill keeping more."
+            )
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    ring_entries = [StateType.DRAFT_RING.value, StateType.REQUEST_ROW.value]
+    for role, wire, other in (
+        ("prefill", prefill_wire, decode_wire),
+        ("decode", decode_wire, prefill_wire),
+    ):
+        if wire[:-2] == other and [entry[0] for entry in wire[-2:]] == ring_entries:
+            raise RuntimeError(
+                f"PD state entry mismatch: only the {role} server registers a "
+                f"DFLASH draft KV ring ({wire[-2:]}). Each server resolves the "
+                f"ring on its own: unset SGLANG_ENABLE_DFLASH_DRAFT_KV_RING on the "
+                f"{role} server, or set it to 1 on both and align the flags the "
+                "ring needs."
             )
     raise RuntimeError(
         f"PD state entry mismatch: prefill server registers {prefill_wire}, but "
@@ -622,6 +690,7 @@ class CustomizedInfoError(ValueError):
 
 class MetadataBuffers:
     CUSTOMIZED_INFO_SLOTS = slice(6, 8)
+    DEFAULT_TOP_LOGPROBS_NUM = 128
 
     def __init__(
         self,
@@ -629,7 +698,7 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_sampling_mask_tokens: int,
-        max_top_logprobs_num: int = 128,
+        max_top_logprobs_num: int = DEFAULT_TOP_LOGPROBS_NUM,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
         *,
@@ -668,8 +737,6 @@ class MetadataBuffers:
             if self.custom_mem_pool
             else nullcontext()
         ):
-            # TODO: abort top_logprobs_num > 128 in PD
-
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
@@ -1122,13 +1189,19 @@ def _get_cp_rank_page_bounds(
 
 def filter_kv_indices_for_shard_rank(
     *,
-    kv_indices: np.ndarray,
+    kv_indices: np.ndarray | torch.Tensor,
     index_slice: slice,
     shard_rank: int,
     shard_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Logical page l lives on rank l % N as local page l // N; returns the owned
-    local ids and their send positions, which replace the contiguous index_slice."""
+    local ids and their send positions, which replace the contiguous index_slice.
+
+    Host tensor inputs must be ready before this synchronous filter runs.
+    """
+    # A one-element torch bool tensor is interpreted as an integer index by
+    # NumPy. Keep the page ids and their positional mask in the same array type.
+    kv_indices = np.asarray(kv_indices)
     owned = kv_indices % shard_size == shard_rank
     positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
     return kv_indices[owned] // shard_size, positions[owned]
@@ -1212,6 +1285,16 @@ def should_send_replicated_state(
         return True
     writers_per_decode = src_attn_tp_size // dst_attn_tp_size
     return local_tp_rank_in_group % writers_per_decode == 0
+
+
+def draft_kv_ring_row_pairs(
+    src_rows: Sequence[int], dst_rows: Sequence[int]
+) -> Tuple[List[int], List[int]]:
+    """The (prefill, decode) ring rows a DRAFT_RING transfer copies, from two
+    position-matched ``transfer_rows``: a position goes only where both ranks
+    own it (row 0 marks one a rank does not own under DCP)."""
+    pairs = [(a, b) for a, b in zip(src_rows, dst_rows) if a and b]
+    return [a for a, _ in pairs], [b for _, b in pairs]
 
 
 def compute_mamba_state_slice_blocks(
@@ -1777,8 +1860,7 @@ def get_kv_transfer_buf_infos(storage: KVStorage | StaticKVStorage):
 
 
 def _wire_state_type(state_type) -> Enum:
-    # A plan names a state type by its wire value; a static pool's
-    # hardware-specific component (Ascend's) arrives as its own enum member.
+    # Plans use wire strings, while static pools supply enum members.
     from sglang.srt.disaggregation.base.conn import StateType
 
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
@@ -1812,10 +1894,15 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: Optional[int] = None,
     window_tails: Optional[Dict[str, int]] = None,
+    draft_kv_ring: Optional[DFlashDraftKVRing] = None,
+    empty_draft_kv_ring: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
-    window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it."""
+    window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it.
+    A DFLASH draft KV ring's rows and floor go after the storage's entries:
+    readers that zip against the storage's wire entries skip them, and the wire
+    check and the checksum filter find them there."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1869,6 +1956,18 @@ def setup_state_kv_args(
             key_bytes,
             owner_view.index_bytes_per_token - key_bytes,
         )
+    if draft_kv_ring is not None:
+        kv_args.draft_kv_ring_paged = draft_kv_ring.paged
+        append_state_component(
+            kv_args, StateType.DRAFT_RING, *draft_kv_ring.ring_buf_infos()
+        )
+        append_state_component(
+            kv_args, StateType.REQUEST_ROW, *draft_kv_ring.floor_buf_infos()
+        )
+    elif empty_draft_kv_ring:
+        # A PP stage without the draft keeps empty slots and sends nothing for them.
+        append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
+        append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])
     kv_args.state_window_tails = [
         (window_tails or {}).get(sub_pool) if sub_pool is not None else None
         for sub_pool in kv_args.state_sub_pools
@@ -1885,6 +1984,32 @@ def setup_state_kv_args(
             if draft_token_to_kv_pool is not None
             else 0
         )
+
+
+def setup_page_row_kv_args(
+    kv_args: KVArgs,
+    *,
+    token_to_kv_pool,
+    transfer_backend: TransferBackend,
+    draft_token_to_kv_pool=None,
+    draft_window_pages: int = 0,
+) -> None:
+    """Flags peers read to admit a prefill with another attention TP size:
+    only the Mooncake sender slices NVFP4 page rows by head, so the other
+    backends keep sending whole rows. ``draft_window_pages`` bounds the draft
+    KV tail a sliding-window-only draft reads (0 sends every draft page)."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+    kv_args.main_kv_page_row = (
+        isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        and transfer_backend == TransferBackend.MOONCAKE
+    )
+    if kv_args.main_kv_page_row:
+        kv_args.main_kv_head_dim = token_to_kv_pool.head_dim
+    if isinstance(draft_token_to_kv_pool, MHATokenToKVPool):
+        kv_args.draft_kv_head_num = draft_token_to_kv_pool.head_num
+        kv_args.draft_window_pages = draft_window_pages
 
 
 def _token_kv_view(token_to_kv_pool):
