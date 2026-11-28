@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -510,6 +511,37 @@ def test_runai_direct_gpu_loader_does_not_reject_split_roles(monkeypatch):
 
     model.runtime_role = "idle"
     assert model._should_stream_weights_to_gpu(target_state, {})
+
+
+def test_pi05_checkpoint_excludes_declared_processor_state(tmp_path):
+    """Declared processor state leaves the weight list, and a config that is malformed
+    or declares a file holding model weights under any component map is ignored."""
+    from safetensors.torch import save_file
+
+    stats = {"action.mean": torch.zeros(7)}
+    model_file = tmp_path / "model.safetensors"
+    save_file({**stats, "action_in_proj.weight": torch.ones(2, 2)}, model_file)
+    for kind in ("pre", "post"):
+        state_file = f"policy_{kind}processor_step_0.safetensors"
+        save_file(stats, tmp_path / state_file)
+        (tmp_path / f"policy_{kind}processor.json").write_text(
+            json.dumps({"steps": [{"state_file": state_file}, {"config": {}}]})
+        )
+
+    restored = Pi05PipelineConfig()
+    del restored.loader_component_map["action_heads"]
+    restored.update_pipeline_config(
+        json.loads(json.dumps({"loader_component_map": restored.loader_component_map}))
+    )
+    manifest = Pi05PolicyModel._inspect_checkpoint(str(tmp_path), restored)
+    assert manifest.safetensor_files == [str(model_file)]
+
+    pre_state = tmp_path / "policy_preprocessor_step_0.safetensors"
+    steps = [{"state_file": pre_state.name}, {"state_file": model_file.name}]
+    for bad in ("{", "[]", '{"steps": 1}', json.dumps({"steps": steps})):
+        (tmp_path / "policy_preprocessor.json").write_text(bad)
+        manifest = Pi05PolicyModel._inspect_checkpoint(str(tmp_path), restored)
+        assert manifest.safetensor_files == [str(model_file), str(pre_state)]
 
 
 def test_pi05_loader_maps_unfused_prefix_weights_to_parallel_targets():
