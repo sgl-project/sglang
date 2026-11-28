@@ -36,9 +36,11 @@ _ALL_BF16_EXCLUDES = _MIXED_EXCLUDES + [  # amd/Qwen3.5-397B-A17B-MXFP4
 
 
 class _FakeQuantConfig:
-    def __init__(self, name, exclude_layers):
+    def __init__(self, name, exclude_layers=(), quant_description=None):
         self._name = name
         self.exclude_layers = list(exclude_layers)
+        if quant_description is not None:
+            self.quant_description = dict(quant_description)
 
     def get_name(self):
         return self._name
@@ -64,6 +66,40 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
 
     def test_non_quark_quant_config_is_untouched(self):
         quant_config = _FakeQuantConfig("fp8", _MIXED_EXCLUDES)
+
+        self.assertIs(_mtp_quant_config(quant_config), quant_config)
+
+    def test_modelslim_float_mtp_skips_quantization(self):
+        quant_config = _FakeQuantConfig(
+            "modelslim",
+            quant_description={
+                "model.layers.0.self_attn.q_proj.weight": "W8A8_MXFP8",
+                "mtp.fc.weight": "FLOAT",
+                "mtp.layers.0.self_attn.q_proj.weight": "FLOAT",
+            },
+        )
+
+        self.assertIsNone(_mtp_quant_config(quant_config))
+
+    def test_modelslim_omitted_mtp_skips_quantization(self):
+        quant_config = _FakeQuantConfig(
+            "modelslim",
+            quant_description={
+                "model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+            },
+        )
+
+        self.assertIsNone(_mtp_quant_config(quant_config))
+
+    def test_modelslim_quantized_mtp_keeps_quantization(self):
+        quant_config = _FakeQuantConfig(
+            "modelslim",
+            quant_description={
+                "model.layers.0.self_attn.q_proj.weight": "W8A8_MXFP8",
+                "mtp.fc.weight": "FLOAT",
+                "mtp.layers.0.mlp.gate_proj.weight": "W8A8_MXFP8",
+            },
+        )
 
         self.assertIs(_mtp_quant_config(quant_config), quant_config)
 

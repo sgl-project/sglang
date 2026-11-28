@@ -36,6 +36,11 @@ class MarkovGreedyStep:
     """
 
     @classmethod
+    def prefers_over_sample(cls, batch_size: int) -> bool:
+        """Whether the fused greedy kernel beats MarkovSampleStep at ``batch_size``."""
+        return batch_size == 1 or _is_npu
+
+    @classmethod
     def execute(
         cls,
         *,

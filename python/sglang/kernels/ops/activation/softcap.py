@@ -3,6 +3,10 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
+
 
 @triton.jit
 def softcap_inplace_logits_kernel(
@@ -88,6 +92,9 @@ def softcap_to_float32_logits(logits, final_logit_softcapping, output):
 
 def cast_to_float32_logits(logits, output):
     """Write FP32 logits to an equally shaped, row-contiguous output."""
+    if _is_npu and output.dtype == torch.float32 and output.shape == logits.shape:
+        output.copy_(logits)
+        return output
     return _softcap_logits(logits, None, output)
 
 

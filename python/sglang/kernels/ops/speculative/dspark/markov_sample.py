@@ -2,6 +2,7 @@
 argmax at temperature 0 and a Gumbel-max sample otherwise."""
 
 import functools
+import inspect
 from typing import Callable, Optional
 
 import torch
@@ -281,6 +282,14 @@ def _launch_partial(
     return partial.view(rows, parts * 2)
 
 
+@functools.lru_cache(maxsize=1)
+def _npu_markov_sample_kernel():
+    from sgl_kernel_npu.operators.sample import markov_sample_step_triton
+
+    params = inspect.signature(markov_sample_step_triton).parameters
+    return markov_sample_step_triton, frozenset(params)
+
+
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
     the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
@@ -295,9 +304,16 @@ class MarkovSampleStep:
     def execute(cls, **kwargs) -> torch.Tensor:
         if inputs_on_cuda(**kwargs):
             if _is_npu:
-                from sgl_kernel_npu.operators.sample import markov_sample_step_triton
-
-                return markov_sample_step_triton(**kwargs)
+                npu_fn, supported_params = _npu_markov_sample_kernel()
+                # Older sgl_kernel_npu builds silently ignore optional kwargs
+                # (softcap, vocab_limit, fold) via **kwargs; only delegate to NPU
+                # Triton when every active modifier is supported by the kernel.
+                if all(
+                    kwargs.get(name) is None or name in supported_params
+                    for name in ("softcap", "vocab_limit", "fold")
+                ):
+                    return npu_fn(**kwargs)
+                return cls.torch(**kwargs)
             return cls.triton(**kwargs)
         return cls.torch(**kwargs)
 

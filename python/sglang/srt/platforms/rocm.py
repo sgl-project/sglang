@@ -30,3 +30,6 @@ class RocmSRTPlatform(RocmDeviceMixin, SRTPlatform):
         hicache_device_kernels=True,
         supports_pynccl=True,
     )
+
+    def get_default_speculative_draft_attention_backend(self, algorithm: str) -> str:
+        return "triton"
