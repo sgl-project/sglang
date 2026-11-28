@@ -254,6 +254,11 @@ def _load_mha_v4():
 
 
 _MHA_V4 = _load_mha_v4()
+# SGLANG_ROCM_MHA_V4=1 is set on the serve command line by whoever wants MHA v4 for
+# BF16 head-dim-128 dense attention on ROCm (Wan2.2 A14B). It is off by default
+# because its output differs from fmha v3 at BF16 rounding, and a 40-step Wan2.2 run
+# has not matched the default path yet.
+_ROCM_MHA_V4_ENABLED = os.environ.get("SGLANG_ROCM_MHA_V4", "0") == "1"
 
 # fmha v3 and MHA v4 run one 256-row query tile per CU per wave. When the last
 # wave holds only a few tiles (Pika H3 Flex 5 s on 8 GPUs: 7 heads x 148 tiles
@@ -570,6 +575,17 @@ class AITerImpl(AttentionImpl):
         value: torch.Tensor,
         return_lse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if (
+            _ROCM_MHA_V4_ENABLED
+            and _MHA_V4 is not None
+            and not return_lse
+            and not self.causal
+            and self.dropout_p == 0.0
+            and query.dtype == torch.bfloat16
+            and query.shape[-1] == 128
+            and key.shape[2] == query.shape[2]
+        ):
+            return _flash(query, key, value, self.softmax_scale)
         output = aiter.flash_attn_func(
             query,
             key,
