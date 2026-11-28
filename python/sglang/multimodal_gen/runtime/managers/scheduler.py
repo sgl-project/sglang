@@ -1560,21 +1560,11 @@ class Scheduler(
         Handles abortion
         """
         if self.server_args.stage_role:
-            import asyncio
-
             from sglang.multimodal_gen.runtime.disaggregation.deployment.worker import (
-                DeploymentWorker,
-                broadcast_request,
-                run_partition,
+                run_stage_worker,
             )
 
-            if self.gpu_id == 0:
-                asyncio.run(DeploymentWorker(self).run())
-            else:
-                while self._broadcast_to_all_ranks(None) is not None:
-                    req = broadcast_request(self, None)
-                    run_partition(self, req)
-            return
+            return run_stage_worker(self)
 
         # Pool mode: all roles use the pool event loop
         if self._disagg_role != RoleType.MONOLITHIC:

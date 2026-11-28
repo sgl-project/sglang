@@ -193,9 +193,11 @@ def bootstrap_stage_role(server_args: ServerArgsPayload) -> None:
     load_plugins()
     apply_plugin_hooks()
 
-    from sglang.multimodal_gen.runtime import launch_server
+    from sglang.multimodal_gen.runtime.disaggregation.deployment.launch import (
+        launch_stage_deployment,
+    )
 
-    launch_server.launch_stage_deployment(server_args.materialize())
+    launch_stage_deployment(server_args.materialize())
 
 
 def bootstrap_http_server_process(

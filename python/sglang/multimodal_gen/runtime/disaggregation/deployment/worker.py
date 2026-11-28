@@ -102,6 +102,15 @@ def _field_size(value):
     )
 
 
+def run_stage_worker(scheduler):
+    """rank 0 serves the coordinator; other ranks follow its broadcasts"""
+    if scheduler.gpu_id == 0:
+        asyncio.run(DeploymentWorker(scheduler).run())
+        return
+    while scheduler._broadcast_to_all_ranks(None) is not None:
+        run_partition(scheduler, broadcast_request(scheduler, None))
+
+
 class DeploymentWorker:
     """serialize compute separately from transfers so next-stage reads cannot block on it"""
 

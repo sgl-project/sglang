@@ -15,6 +15,7 @@ import torch
 import zmq
 import zmq.asyncio
 
+import sglang.multimodal_gen.runtime.disaggregation.deployment.launch as deployment_launch
 import sglang.multimodal_gen.runtime.launch_server as launch_module
 from sglang.multimodal_gen.runtime.disaggregation.deployment import client, transport
 from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
@@ -99,7 +100,8 @@ def test_stage_launch_uses_real_server_args_capacity(monkeypatch, argv, expected
     )
     monkeypatch.setattr(Deployment, "load", lambda _: deployment)
     monkeypatch.setattr(
-        "sglang.multimodal_gen.registry.get_model_info",
+        deployment_launch,
+        "get_model_info",
         lambda *args, **kwargs: SimpleNamespace(
             pipeline_cls=SimpleNamespace(stage_specs=specs())
         ),
@@ -114,7 +116,7 @@ def test_stage_launch_uses_real_server_args_capacity(monkeypatch, argv, expected
     )
     monkeypatch.setattr(DeploymentServer, "stop", lambda server: None)
 
-    launch_module.launch_stage_deployment(args)
+    deployment_launch.launch_stage_deployment(args)
 
     assert started == [expected]
 
@@ -125,7 +127,7 @@ def test_stage_launch_rejects_nonpositive_capacity(monkeypatch, capacity):
     args = ServerArgs(model_path="unused", disagg_max_slots_per_instance=capacity)
 
     with pytest.raises(ValueError, match="timeout and capacity must be positive"):
-        launch_module.launch_stage_deployment(args)
+        deployment_launch.launch_stage_deployment(args)
 
 
 def test_contracts_compile_and_tensor_tree_round_trip():
