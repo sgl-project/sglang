@@ -86,6 +86,10 @@ def tiny_core():
     return core.cuda()
 
 
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9),
+    "Pi0.5 FP8 needs SM89+ (torch._scaled_mm)",
+)
 class TestPi05ModelOptFp8CUDA(CustomTestCase):
     @classmethod
     def setUpClass(cls):
