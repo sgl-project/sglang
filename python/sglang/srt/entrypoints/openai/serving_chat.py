@@ -2108,6 +2108,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages, request
             )
 
+            # Tool calls are not parsed under tool_choice="none", so a tool
+            # declared on a message must not reach the prompt either.
+            if request.tool_choice == "none":
+                for msg in messages:
+                    msg.pop("tools", None)
+
             request_tools = request.tools if tools else None
 
             # An empty system message hosts the request tools.
