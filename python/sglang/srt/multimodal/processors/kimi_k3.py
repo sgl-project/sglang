@@ -10,6 +10,7 @@ at load time.
 
 import asyncio
 import functools
+import logging
 import math
 import re
 from typing import Dict, List, Optional, Union
@@ -71,6 +72,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
+logger = logging.getLogger(__name__)
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
@@ -164,6 +167,107 @@ def _format_k3_timestamp(frame_index: int, fps: float) -> str:
     ms = round(frame_index * 1_000_000 / fps) // 1000
     hours, minutes, secs = ms // 3600000, ms // 60000 % 60, ms // 1000 % 60
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms % 1000:03d}"
+
+
+# Video sampling keys an operator may override through --mm-process-config's
+# "video" object; everything else belongs to the checkpoint's video contract.
+_K3_VIDEO_OVERRIDABLE_KEYS = ("sample_fps", "max_num_frames_each_video")
+# Real media_proc_cfg keys that stay pinned to the checkpoint: the temporal
+# grouping and timestamp format are trained contract, and the patch budgets
+# are not opened in this first version (the planner always keeps at least one
+# frame, so a budget below one frame's patches would not be honored as a
+# cost cap).
+_K3_VIDEO_LOCKED_KEYS = (
+    "temporal_merge_kernel_size",
+    "timestamp_mode",
+    "in_patch_limit_each_frame",
+    "in_patch_limit_video",
+)
+# Keys the video path reads unconditionally; a checkpoint without them can
+# still serve images, so their absence disables video instead of failing.
+_K3_VIDEO_REQUIRED_KEYS = (
+    "timestamp_mode",
+    "in_patch_limit_each_frame",
+    "in_patch_limit_video",
+    "sample_fps",
+    "temporal_merge_kernel_size",
+)
+
+
+def _validate_k3_sample_fps(value) -> None:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise ValueError(
+            "Kimi-K3 video config 'sample_fps' must be a finite number > 0, "
+            f"got {value!r}"
+        )
+
+
+def _validate_k3_max_num_frames(value) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(
+            "Kimi-K3 video config 'max_num_frames_each_video' must be an "
+            f"integer >= 1, got {value!r}"
+        )
+
+
+def _resolve_k3_video_media_proc_cfg(
+    checkpoint_cfg: Optional[dict], video_overrides
+) -> tuple[dict, tuple]:
+    """Merge operator video-sampling overrides into the checkpoint's config.
+
+    ``video_overrides`` is the ``video`` object of ``--mm-process-config``
+    (``None`` normalizes to no overrides).  The checkpoint dict is copied,
+    never mutated.  Returns ``(merged_cfg, missing_required_keys)``: the
+    merged config and the video keys the checkpoint (and the overrides)
+    lack; a non-empty tuple means video input is unavailable and image
+    input is unaffected.  Sampling values are validated on the merged
+    result, so an invalid checkpoint value fails startup even when the CLI
+    did not touch it.
+    """
+    merged = dict(checkpoint_cfg or {})
+    if video_overrides is None:
+        video_overrides = {}
+    if not isinstance(video_overrides, dict):
+        raise ValueError(
+            "The 'video' object of --mm-process-config must be a JSON object, "
+            f"got {type(video_overrides).__name__}"
+        )
+    for key, value in video_overrides.items():
+        if key in _K3_VIDEO_LOCKED_KEYS:
+            raise ValueError(
+                f"Kimi-K3 video config key {key!r} cannot be overridden; it "
+                "is part of the checkpoint's video contract"
+            )
+        if key not in _K3_VIDEO_OVERRIDABLE_KEYS:
+            raise ValueError(
+                f"Unknown Kimi-K3 video config key {key!r}; supported keys: "
+                + ", ".join(_K3_VIDEO_OVERRIDABLE_KEYS)
+            )
+        # A null value inherits the checkpoint value; it cannot clear a cap
+        # the checkpoint already sets.
+        if value is None:
+            continue
+        if key == "sample_fps":
+            _validate_k3_sample_fps(value)
+        else:
+            _validate_k3_max_num_frames(value)
+        merged[key] = value
+    missing = tuple(key for key in _K3_VIDEO_REQUIRED_KEYS if key not in merged)
+    # The frame cap is optional: normalize absence to "no cap" so the plan
+    # path never KeyErrors on it.
+    merged.setdefault("max_num_frames_each_video", None)
+    if not missing:
+        # Validate the effective values: a legal CLI override does not make
+        # an invalid checkpoint value valid.
+        _validate_k3_sample_fps(merged["sample_fps"])
+        if merged["max_num_frames_each_video"] is not None:
+            _validate_k3_max_num_frames(merged["max_num_frames_each_video"])
+    return merged, missing
 
 
 def _plan_k3_video(
@@ -535,7 +639,18 @@ class KimiK3ImageProcessor(
         (self.video_slot_token_id,) = _encode_k3_special_tokens(
             _processor.tokenizer, KIMI_K3_VIDEO_SLOT
         )
-        self.media_proc_cfg = _processor.media_processor.media_proc_cfg
+        self.media_proc_cfg, self._missing_video_cfg_keys = (
+            _resolve_k3_video_media_proc_cfg(
+                _processor.media_processor.media_proc_cfg, self.video_config
+            )
+        )
+        if self._missing_video_cfg_keys:
+            logger.warning(
+                "Kimi-K3 video input disabled: this checkpoint's media_proc_cfg "
+                "is missing %s. Image input is unaffected; video requests are "
+                "rejected before any media download.",
+                ", ".join(self._missing_video_cfg_keys),
+            )
 
     def _should_defer_gpu_preprocessing(self, images) -> bool:
         """
@@ -856,6 +971,12 @@ class KimiK3ImageProcessor(
         )
 
     async def _process_video_request(self, image_data, input_text, request_obj):
+        if self._missing_video_cfg_keys:
+            raise ValueError(
+                "Kimi-K3 video input requires the video keys of media_proc_cfg "
+                "in preprocessor_config.json; this checkpoint is missing: "
+                + ", ".join(self._missing_video_cfg_keys)
+            )
         if request_obj.mm_content_hashes:
             raise ValueError("Video requests do not support mm_content_hashes")
         if any(self._is_preprocessed_input(image) for image in image_data or []):

@@ -500,6 +500,22 @@ follow Moonshot's hosted K3 API and the checkpoint's `preprocessor_config.json`:
   frames over its full length, so one video costs at most about 41K image tokens.
   `max_num_frames_each_video` caps frames further when set.
 
+Operators can override the two cost-facing sampling parameters at startup; unset
+keys keep the checkpoint values:
+
+```bash Command
+python3 -m sglang.launch_server ... --mm-process-config '{"video": {"sample_fps": 4, "max_num_frames_each_video": 32}}'
+```
+
+`sample_fps` trades temporal resolution for token cost, and
+`max_num_frames_each_video` caps one video's sampled frame count. A `null` value
+inherits the checkpoint setting and cannot clear a frame cap the checkpoint
+already sets. The other sampling options — the temporal grouping, the timestamp
+format and the per-frame/total patch budgets — belong to the checkpoint's video
+contract and are rejected at startup. A checkpoint whose
+`preprocessor_config.json` carries no video keys starts with a warning and
+serves images normally; its video requests are rejected before any download.
+
 Sampling options on the `video_url` object are ignored. Video requests skip the
 preprocessing cache, reject `mm_content_hashes`, and are not yet validated with EPD
 encoder roles; their tokens are reported as `image_tokens` in usage.

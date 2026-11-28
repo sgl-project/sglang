@@ -60,6 +60,8 @@ from sglang.srt.multimodal.processors.kimi_k3 import (
     _expand_k3_image_prompt_text,
     _expand_k3_image_prompt_token_ids,
     _plan_k3_video,
+    _preprocess_k3_video,
+    _resolve_k3_video_media_proc_cfg,
 )
 from sglang.srt.multimodal.processors.kimi_k25 import (
     KimiGPUProcessorWrapper,
@@ -1619,6 +1621,7 @@ def test_kimi_k3_video_request_serves_chunks_and_images_in_prompt_order():
     processor = object.__new__(KimiK3ImageProcessor)
     processor.mm_tokens = SimpleNamespace(image_token_id=99)
     processor.video_slot_token_id = 77
+    processor._missing_video_cfg_keys = ()
     processor.media_proc_cfg = _K3_VIDEO_CFG
     processor._feature_transport = MultimodalFeatureTransport(
         "cpu", base_gpu_id=0, skip_mm_pool=True
@@ -1671,6 +1674,281 @@ def test_kimi_k3_video_request_serves_chunks_and_images_in_prompt_order():
     ] == [[[4, 2, 4]], [[4, 2, 4]], [[1, 2, 2]]]
     assert [item.feature.shape[0] for item in output.mm_items] == [32, 32, 4]
     assert all(item.pad_value is not None for item in output.mm_items)
+
+
+def test_kimi_k3_video_request_rejected_before_download_when_unsupported():
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor._missing_video_cfg_keys = ("sample_fps", "timestamp_mode")
+    processor.fast_load_mm_data = AsyncMock()
+
+    with pytest.raises(ValueError, match="missing: sample_fps, timestamp_mode"):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=[],
+                input_text=[1, 77],
+                request_obj=SimpleNamespace(
+                    video_data=["video"], mm_content_hashes=None
+                ),
+            )
+        )
+
+    processor.fast_load_mm_data.assert_not_awaited()
+
+
+def test_k3_video_media_proc_cfg_resolver_defaults_to_checkpoint():
+    merged, missing = _resolve_k3_video_media_proc_cfg(_K3_VIDEO_CFG, {})
+
+    assert merged == _K3_VIDEO_CFG
+    assert merged is not _K3_VIDEO_CFG
+    assert missing == ()
+
+
+def test_k3_video_media_proc_cfg_resolver_merges_overrides():
+    merged, missing = _resolve_k3_video_media_proc_cfg(
+        _K3_VIDEO_CFG, {"sample_fps": 2, "max_num_frames_each_video": 32}
+    )
+
+    assert (merged["sample_fps"], merged["max_num_frames_each_video"]) == (2, 32)
+    assert merged["in_patch_limit_video"] == _K3_VIDEO_CFG["in_patch_limit_video"]
+    assert missing == ()
+    # The HF processor's dict is copied, never mutated.
+    assert _K3_VIDEO_CFG["sample_fps"] == 8.0
+
+
+def test_k3_video_media_proc_cfg_resolver_null_value_inherits_checkpoint():
+    checkpoint = {**_K3_VIDEO_CFG, "max_num_frames_each_video": 32}
+
+    merged, _ = _resolve_k3_video_media_proc_cfg(
+        checkpoint, {"sample_fps": None, "max_num_frames_each_video": None}
+    )
+
+    # null inherits the checkpoint value; it cannot clear a frame cap.
+    assert merged["sample_fps"] == 8.0
+    assert merged["max_num_frames_each_video"] == 32
+
+
+def test_k3_video_media_proc_cfg_resolver_normalizes_null_container():
+    merged, missing = _resolve_k3_video_media_proc_cfg(_K3_VIDEO_CFG, None)
+
+    assert merged == _K3_VIDEO_CFG
+    assert missing == ()
+
+
+def test_k3_video_media_proc_cfg_resolver_rejects_non_object_container():
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        _resolve_k3_video_media_proc_cfg(_K3_VIDEO_CFG, [4])
+
+
+def test_k3_video_media_proc_cfg_resolver_rejects_unknown_keys():
+    with pytest.raises(ValueError, match="Unknown Kimi-K3 video config key"):
+        _resolve_k3_video_media_proc_cfg(_K3_VIDEO_CFG, {"fps": 4})
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "temporal_merge_kernel_size",
+        "timestamp_mode",
+        "in_patch_limit_each_frame",
+        "in_patch_limit_video",
+    ],
+)
+def test_k3_video_media_proc_cfg_resolver_rejects_locked_keys(key):
+    with pytest.raises(ValueError, match="cannot be overridden"):
+        _resolve_k3_video_media_proc_cfg(_K3_VIDEO_CFG, {key: 1})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, "8", 0, -1.5, float("nan"), float("inf")],
+)
+def test_k3_video_media_proc_cfg_resolver_validates_sample_fps(value):
+    with pytest.raises(ValueError, match="sample_fps"):
+        _resolve_k3_video_media_proc_cfg(_K3_VIDEO_CFG, {"sample_fps": value})
+
+
+@pytest.mark.parametrize("value", [True, 1.5, 0, "32"])
+def test_k3_video_media_proc_cfg_resolver_validates_max_num_frames(value):
+    with pytest.raises(ValueError, match="max_num_frames_each_video"):
+        _resolve_k3_video_media_proc_cfg(
+            _K3_VIDEO_CFG, {"max_num_frames_each_video": value}
+        )
+
+
+def test_k3_video_media_proc_cfg_resolver_validates_checkpoint_values():
+    # A legal CLI override does not make an invalid checkpoint value valid.
+    with pytest.raises(ValueError, match="sample_fps"):
+        _resolve_k3_video_media_proc_cfg(
+            {**_K3_VIDEO_CFG, "sample_fps": 0}, {"max_num_frames_each_video": 32}
+        )
+    with pytest.raises(ValueError, match="max_num_frames_each_video"):
+        _resolve_k3_video_media_proc_cfg(
+            {**_K3_VIDEO_CFG, "max_num_frames_each_video": 0}, {}
+        )
+
+
+def test_k3_video_media_proc_cfg_resolver_disables_video_on_missing_keys():
+    image_only_cfg = {"patch_size": 14}  # a checkpoint without video keys
+
+    merged, missing = _resolve_k3_video_media_proc_cfg(image_only_cfg, {})
+
+    assert missing == (
+        "timestamp_mode",
+        "in_patch_limit_each_frame",
+        "in_patch_limit_video",
+        "sample_fps",
+        "temporal_merge_kernel_size",
+    )
+    # The optional frame cap normalizes to "no cap" instead of staying absent.
+    assert merged["max_num_frames_each_video"] is None
+
+
+def test_k3_video_media_proc_cfg_resolver_cli_restores_missing_key():
+    # A checkpoint missing one required key is remediable: the CLI override
+    # fills it and video support is restored.
+    checkpoint = {k: v for k, v in _K3_VIDEO_CFG.items() if k != "sample_fps"}
+
+    merged, missing = _resolve_k3_video_media_proc_cfg(checkpoint, {"sample_fps": 4})
+
+    assert missing == ()
+    assert merged["sample_fps"] == 4
+
+
+def test_k3_video_media_proc_cfg_resolver_missing_optional_cap_keeps_video():
+    # Only the optional frame cap absent: video stays enabled and samples.
+    checkpoint = {
+        k: v for k, v in _K3_VIDEO_CFG.items() if k != "max_num_frames_each_video"
+    }
+
+    merged, missing = _resolve_k3_video_media_proc_cfg(checkpoint, {})
+
+    assert missing == ()
+    assert merged["max_num_frames_each_video"] is None
+    indices, _ = _plan_k3_video(
+        120,
+        30.0,
+        448,
+        448,
+        merged,
+        _k3_preprocess_config(in_patch_limit=65536),
+    )
+    assert len(indices) == 32  # round(120 * 8 / 30): the checkpoint rate
+
+
+def test_kimi_k3_video_plan_respects_overrides():
+    # 448x448 @ 30 fps: the frame budget (640) never binds, so the fps does.
+    indices, _ = _plan_k3_video(
+        120,
+        30.0,
+        448,
+        448,
+        {**_K3_VIDEO_CFG, "sample_fps": 2.0},
+        _k3_preprocess_config(in_patch_limit=65536),
+    )
+    assert len(indices) == 8  # round(120 * 2 / 30); 8 fps would sample 32
+
+    indices, _ = _plan_k3_video(
+        120,
+        30.0,
+        448,
+        448,
+        {**_K3_VIDEO_CFG, "max_num_frames_each_video": 3},
+        _k3_preprocess_config(in_patch_limit=65536),
+    )
+    assert len(indices) == 3
+    assert (indices[0], indices[-1]) == (0, 119)
+
+
+def test_kimi_k3_video_preprocess_tail_chunk():
+    # 10 frames at 10 fps capped at 3: one chunk of 3 frames (t < 4).
+    size, timestamps, chunk_tokens, chunks = _preprocess_k3_video(
+        _Video(num_frames=10, fps=10.0, height=28, width=56),
+        {**_K3_VIDEO_CFG, "max_num_frames_each_video": 3},
+        _k3_preprocess_config(),
+    )
+
+    assert size == (56, 28)
+    assert len(timestamps) == 1
+    assert chunk_tokens == 2
+    assert chunks[0][1] == (3, 2, 4)
+
+
+def _k3_video_init_fixture(media_proc_cfg, mm_process_config):
+    hf_processor = _HFProcessor()
+    hf_processor.tokenizer = _AnySizeTokenizer()
+    hf_processor.media_processor.media_proc_cfg = media_proc_cfg
+    hf_config = SimpleNamespace(
+        media_placeholder_token_id=42,
+        to_dict=lambda: {
+            "model_type": "kimi_k3",
+            "architectures": ["KimiK3ForConditionalGeneration"],
+        },
+    )
+    server_args = ServerArgs(
+        model_path="dummy",
+        mm_feature_transport="cpu",
+        mm_process_config=mm_process_config,
+        mm_io_worker_num=1,
+        mm_processor_worker_num=0,
+        tokenizer_worker_num=1,
+        mm_preprocess_cache_size_mb=1,
+    )
+    return hf_processor, hf_config, server_args
+
+
+def test_kimi_k3_init_wires_cli_video_overrides_into_media_proc_cfg():
+    hf_processor, hf_config, server_args = _k3_video_init_fixture(
+        # A checkpoint carrying both image and video keys.
+        {**_HFProcessor().media_processor.media_proc_cfg, **_K3_VIDEO_CFG},
+        {"video": {"sample_fps": 2, "max_num_frames_each_video": 32}},
+    )
+    publish(server_args, role="tokenizer")
+    try:
+        processor = KimiK3ImageProcessor(
+            hf_config=hf_config,
+            server_args=server_args,
+            _processor=hf_processor,
+            transport_mode=None,
+        )
+        try:
+            # The CLI overrides land in the effective config...
+            assert processor.media_proc_cfg["sample_fps"] == 2
+            assert processor.media_proc_cfg["max_num_frames_each_video"] == 32
+            assert processor._missing_video_cfg_keys == ()
+            # ...and the HF processor's checkpoint dict is copied, not mutated.
+            assert hf_processor.media_processor.media_proc_cfg["sample_fps"] == 8.0
+        finally:
+            processor.shutdown()
+    finally:
+        reset_context()
+
+
+def test_kimi_k3_init_disables_video_when_checkpoint_lacks_video_keys():
+    # _HFProcessor's media_proc_cfg carries image keys only.
+    hf_processor, hf_config, server_args = _k3_video_init_fixture(
+        _HFProcessor().media_processor.media_proc_cfg, {}
+    )
+    publish(server_args, role="tokenizer")
+    try:
+        processor = KimiK3ImageProcessor(
+            hf_config=hf_config,
+            server_args=server_args,
+            _processor=hf_processor,
+            transport_mode=None,
+        )
+        try:
+            assert processor._missing_video_cfg_keys == (
+                "timestamp_mode",
+                "in_patch_limit_each_frame",
+                "in_patch_limit_video",
+                "sample_fps",
+                "temporal_merge_kernel_size",
+            )
+            assert processor.media_proc_cfg["max_num_frames_each_video"] is None
+        finally:
+            processor.shutdown()
+    finally:
+        reset_context()
 
 
 if __name__ == "__main__":
