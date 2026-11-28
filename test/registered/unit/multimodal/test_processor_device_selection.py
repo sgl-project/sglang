@@ -345,10 +345,11 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
             pass
 
         class Feature:
-            def to(self, device):
-                events.append(("copy", device))
+            def __init__(self, name):
+                self.name = name
 
-        feature = Feature()
+            def to(self, device):
+                events.append(("copy", self.name, device))
 
         class Processor:
             image_processor = ImageProcessor()
@@ -356,7 +357,10 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
 
             def __call__(self, **kwargs):
                 events.append(("call", kwargs["device"]))
-                return {"pixel_values": feature}
+                return {
+                    name: Feature(name)
+                    for name in ("pixel_values", "image_position_ids")
+                }
 
         events = []
         processor = self._processor()
@@ -399,8 +403,41 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
 
         self.assertEqual(
             events,
-            ["enter", ("call", "cuda:0"), ("copy", "cpu"), "exit"],
+            [
+                "enter",
+                ("call", "cuda:0"),
+                ("copy", "pixel_values", "cpu"),
+                ("copy", "image_position_ids", "cpu"),
+                "exit",
+            ],
         )
+
+    def test_auxiliary_tensor_placement_when_feature_copy_is_deferred(self):
+        """CPU transport moves auxiliary outputs, such as Gemma 4 position IDs,
+        off the processor GPU even while the feature copy waits for hashing."""
+
+        class Tensor:
+            def __init__(self, device):
+                self.device = device
+
+            def to(self, device):
+                return Tensor(device)
+
+        for transport, expected in (("cpu", "cpu"), ("cuda_ipc", "cuda:0")):
+            with self.subTest(transport=transport):
+                processor = self._processor(transport=transport, precompute_hash=True)
+                processor.FEATURE_NAMES = ["pixel_values"]
+                feature = Tensor("cuda:0")
+                result = {
+                    "pixel_values": feature,
+                    "image_position_ids": Tensor("cuda:0"),
+                    "image_sizes": [Tensor("cuda:0")],
+                }
+                with patch(f"{BASE}.torch.Tensor", Tensor):
+                    processor._move_processor_output_to_cpu(result)
+                self.assertIs(result["pixel_values"], feature)
+                self.assertEqual(result["image_position_ids"].device, expected)
+                self.assertEqual(result["image_sizes"][0].device, expected)
 
 
 if __name__ == "__main__":
