@@ -23,8 +23,11 @@ MXFP8_BLOCK_SIZE = 32
 
 
 def _ue8m0_to_fp32(scale_u8: torch.Tensor) -> torch.Tensor:
-    """UE8M0 uint8 (biased exponent, bias 127) -> fp32 multiplier 2^(v-127)."""
-    return (scale_u8.to(torch.int32) << 23).view(torch.float32)
+    # OCP MXFP8: 0 -> 2^-127 (fp32 subnormal 0x00400000), 255 -> NaN (0x7FC00000).
+    bits = scale_u8.to(torch.int32) << 23
+    bits = torch.where(scale_u8 == 0, bits.new_full((), 0x00400000), bits)
+    bits = torch.where(scale_u8 == 255, bits.new_full((), 0x7FC00000), bits)
+    return bits.view(torch.float32)
 
 
 def dequant_mxfp8_2d_to_bf16(
