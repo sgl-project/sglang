@@ -346,8 +346,9 @@ impl CoreOutput {
         api::GenerateResponse {
             text: self.text,
             meta_info,
-            // Omitted while empty (a text-only frame).
-            output_ids: (!self.token_ids.is_empty()).then_some(api::TokenIds {
+            // Always present, as in Python's output dict: an empty list on a
+            // frame without tokens (a zero-token finish, a text-only delta).
+            output_ids: Some(api::TokenIds {
                 ids: self.token_ids,
             }),
             index,
@@ -831,6 +832,47 @@ mod tests {
             .unwrap()
             .remove("cached_tokens_details");
         assert_eq!(aborted_keys, abort["meta_info"]);
+    }
+
+    /// `output_ids` is on every frame, as Python's `/generate` output dict
+    /// always carries it: an empty list for a frame without tokens (a
+    /// zero-token finish, such as a `max_new_tokens: 0` scoring read, or a
+    /// text-only delta), so clients that require the key keep working.
+    #[test]
+    fn output_ids_stay_on_a_frame_without_tokens() {
+        let finished = CoreOutput {
+            finish_reason: serde_json::from_value(
+                serde_json::json!({"type": "length", "length": 0}),
+            )
+            .expect("finish reason must parse"),
+            prompt_tokens: 3,
+            ..Default::default()
+        };
+        let frame = finished.frame("rid", None, Some(0.25));
+        assert_eq!(frame.output_ids, Some(api::TokenIds { ids: Vec::new() }));
+        let body = json(&frame);
+        assert_eq!(body["output_ids"], serde_json::json!([]));
+        assert_eq!(
+            body.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["text", "meta_info", "output_ids"]
+        );
+
+        let text_only = CoreOutput {
+            text: "a".into(),
+            ..Default::default()
+        };
+        let body = json(&text_only.frame("rid", Some(1), None));
+        assert_eq!(body["output_ids"], serde_json::json!([]));
+        assert_eq!(body["index"], 1);
+
+        let with_tokens = CoreOutput {
+            token_ids: vec![4, 5],
+            ..Default::default()
+        };
+        assert_eq!(
+            json(&with_tokens.frame("rid", None, None))["output_ids"],
+            serde_json::json!([4, 5])
+        );
     }
 
     /// A trimmed stop token stays in the accumulated `token_ids` but out of the
