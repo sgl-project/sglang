@@ -3,8 +3,9 @@
 # https://github.com/alexsun07/sglang/blob/191624ff8a6d8e9fc31b9363d2138c16db66f124/python/sglang/srt/layers/attention/minimax_sparse_ops/atom_prefill.py
 """MiniMax-M3 sparse prefill using AITER's Gluon paged attention.
 
-The main KV pool remains NHD ``[max_slots, 1, head_dim]``. Each request's
-context is gathered into persistent SHUFFLE 5D scratch pages:
+The main KV pool remains NHD ``[max_slots, num_kv_heads, head_dim]`` or the packed NVFP4
+page rows; several KV heads per rank run one after another. Each request's context is
+gathered into persistent SHUFFLE 5D scratch pages:
 
 - key scratch:   [num_pages, 1, head_dim // x, GLUON_PAGE_SIZE, x]
 - value scratch: [num_pages, 1, GLUON_PAGE_SIZE // x, head_dim, x] (transposed)
@@ -430,25 +431,27 @@ def can_use_gluon_prefill(
     ):
         return False
     if isinstance(k_cache, Nvfp4Cache):
+        # several KV heads per rank run one at a time, as strided one-head views
         return (
             q.dim() == 3
             and q.shape[-1] == HEAD_DIM
             and q.dtype in (torch.bfloat16, torch.float16)
-            and k_cache.num_heads == 1
+            and v_cache.num_heads == k_cache.num_heads
+            and q.shape[1] % k_cache.num_heads == 0
             and _unit_or_none(q_scale)
             and _unit_or_none(k_scale)
             and _unit_or_none(v_scale)
         )
-    # The gather requires a contiguous, single-head NHD pool; an fp8 pool's
-    # per-tensor k/v scales pass through to the kernel.
+    # The gather requires an NHD pool with a unit head_dim stride, one KV head at a
+    # time; an fp8 pool's per-tensor k/v scales pass through to the kernel.
     fp8_kv = k_cache.dtype == _FP8_KV_DTYPE and v_cache.dtype == k_cache.dtype
     return (
         q.dim() == 3
         and q.shape[-1] == HEAD_DIM
         and k_cache.dim() == 3
         and v_cache.dim() == 3
-        and k_cache.shape[1] == 1
-        and v_cache.shape[1] == 1
+        and v_cache.shape[1] == k_cache.shape[1]
+        and q.shape[1] % k_cache.shape[1] == 0
         and k_cache.shape[2] == HEAD_DIM
         and v_cache.shape[2] == HEAD_DIM
         and q.dtype in (torch.bfloat16, torch.float16)
@@ -601,6 +604,130 @@ def _gluon_sparse_prefill_group(
     return out
 
 
+def _num_kv_heads(cache: Union[torch.Tensor, Nvfp4Cache]) -> int:
+    return cache.num_heads if isinstance(cache, Nvfp4Cache) else cache.shape[1]
+
+
+def _kv_head(
+    cache: Union[torch.Tensor, Nvfp4Cache], head: int
+) -> Union[torch.Tensor, Nvfp4Cache]:
+    """KV head ``head`` as a one-head cache: a strided view, the NVFP4 payload and scales
+    at the head's offset inside each page row."""
+    if isinstance(cache, Nvfp4Cache):
+        return Nvfp4Cache(
+            payload=cache.payload[:, head : head + 1],
+            scales=cache.scales[:, head : head + 1],
+        )
+    return cache[:, head : head + 1]
+
+
+def _gluon_sparse_prefill_per_kv_head(
+    q: torch.Tensor,
+    k_cache: Union[torch.Tensor, Nvfp4Cache],
+    v_cache: Union[torch.Tensor, Nvfp4Cache],
+    topk_idx: torch.Tensor,
+    out_quant: str = "",
+    **kwargs,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Several KV heads per rank (TP1, PP): KV heads pick different top-k blocks, so each
+    runs as its own single-KV-head prefill over its GQA group of q heads. With the pair
+    kernel the forward metadata is built once and every head reads its q slice and writes
+    its O (or fp8 O and scales for ``out_quant``) slice in place. NVFP4 runs head by head
+    through the full single-head path (bf16 O), which splits a batch past the scratch cap."""
+    num_kv_heads = _num_kv_heads(k_cache)
+    assert topk_idx.shape[0] == num_kv_heads, (
+        f"gluon prefill expects topk_idx [{num_kv_heads}, total_q, topk], "
+        f"got {tuple(topk_idx.shape)}"
+    )
+    # GQA groups are contiguous: KV head h serves q heads [h * group, (h + 1) * group).
+    group = q.shape[1] // num_kv_heads
+    q = q.contiguous()
+    total_q, num_q_heads, head_dim = q.shape
+    pair = (
+        None
+        if isinstance(k_cache, Nvfp4Cache)
+        else _pair_prefill_module(q[:, :group], k_cache)
+    )
+    if pair is None or total_q == 0:
+        out = torch.empty_like(q)
+        for head in range(num_kv_heads):
+            q_heads = slice(head * group, (head + 1) * group)
+            out[:, q_heads] = gluon_sparse_prefill(
+                q=q[:, q_heads],
+                k_cache=_kv_head(k_cache, head),
+                v_cache=_kv_head(v_cache, head),
+                topk_idx=topk_idx[head : head + 1],
+                **kwargs,
+            )
+        return out
+
+    cu_seqlens, seq_lens = kwargs["cu_seqlens"], kwargs["seq_lens"]
+    seq_lens_cpu = kwargs["seq_lens_cpu"]
+    sm_scale, k_scale, v_scale = (
+        kwargs.get("sm_scale"),
+        kwargs.get("k_scale"),
+        kwargs.get("v_scale"),
+    )
+    if sm_scale is None:
+        sm_scale = head_dim**-0.5
+    req_id, abs_pos, page_start, page_req, page_pos, total_pages = (
+        _build_gluon_prefill_meta(
+            cu_seqlens, kwargs["prefix_lens"], seq_lens, seq_lens_cpu, total_q
+        )
+    )
+    if total_pages > _MAX_SCRATCH_PAGES:
+        raise GluonPrefillUnavailableError(
+            f"gluon prefill context span too large for scratch: {total_pages} pages "
+            f"> cap {_MAX_SCRATCH_PAGES}"
+        )
+    out_fp8 = out_quant == "fp8"
+    if out_fp8:
+        q8 = torch.empty(
+            total_q, num_q_heads * head_dim, dtype=torch.float8_e4m3fn, device=q.device
+        )
+        # per 1 x 128 scales column-major for the o_proj's block GEMM: [heads, rows]
+        scale = torch.empty(num_q_heads, total_q, dtype=torch.float32, device=q.device)
+        out = q
+    else:
+        out = torch.empty_like(q)
+    for head in range(num_kv_heads):
+        q_heads = slice(head * group, (head + 1) * group)
+        # one scratch, reused head after head on the same stream
+        k5, v5 = _gather_context_to_shuffle(
+            k_cache[:, head : head + 1],
+            v_cache[:, head : head + 1],
+            kwargs["req_to_token"],
+            kwargs["req_pool_indices"],
+            seq_lens,
+            page_req,
+            page_pos,
+            total_pages,
+            q.dtype,
+        )
+        o_view = out[:, q_heads]
+        pair.pair_sparse_prefill_into(
+            q[:, q_heads],
+            k5,
+            v5,
+            topk_idx[head],
+            req_id,
+            abs_pos,
+            page_start,
+            sm_scale,
+            1.0 if k_scale is None else float(k_scale),
+            1.0 if v_scale is None else float(v_scale),
+            o_view,
+            q8[:, head * group * head_dim : (head + 1) * group * head_dim]
+            if out_fp8
+            else o_view,
+            scale[q_heads] if out_fp8 else o_view,
+            out_fp8,
+        )
+    if out_fp8:
+        return q8, scale.t()
+    return out
+
+
 def gluon_sparse_prefill(
     q: torch.Tensor,
     k_cache: Union[torch.Tensor, Nvfp4Cache],
@@ -626,6 +753,26 @@ def gluon_sparse_prefill(
     instead, raising only for one oversized request. ``out_quant`` may return O
     quantized for the o_proj, from a single group only.
     """
+    if _num_kv_heads(k_cache) > 1:
+        return _gluon_sparse_prefill_per_kv_head(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            topk_idx=topk_idx,
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            block_size_k=block_size_k,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            out_quant=out_quant,
+            # an NVFP4 head past the scratch cap runs in request groups
+            q_lens_cpu=q_lens_cpu,
+        )
     run_group = functools.partial(
         _gluon_sparse_prefill_group,
         k_cache=k_cache,

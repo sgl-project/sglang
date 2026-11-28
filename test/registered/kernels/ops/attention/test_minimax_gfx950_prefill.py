@@ -28,7 +28,10 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     flash_prefill_with_gqa_share_sparse,
 )
 from sglang.srt.layers.attention.minimax_sparse_ops import minimax_sparse
-from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import msa_v1_page_row_bytes
+from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
+    MiniMaxM3Nvfp4MainKVPool,
+    msa_v1_page_row_bytes,
+)
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.quant_ref_utils import nvfp4_kv_quantize
@@ -489,6 +492,156 @@ def test_pair_prefill_fp8_out_equals_o_proj_quant(monkeypatch, kv_scale):
     ref_scale = view_aiter_fused_rms_transposed_fp8_scale(ref_scale)
     assert torch.equal(q8.view(torch.uint8), ref_q8.view(torch.uint8))
     assert torch.equal(scale, ref_scale) and scale.stride() == ref_scale.stride()
+
+
+KV_HEADS = 4  # tp1, or tp4 with attention DP 4: 64 q heads over 4 KV heads per rank
+
+
+def _paged_batch(reqs: list[tuple[int, int]]) -> dict:
+    """Requests (prefix, extend) on shuffled whole pages of one pool, page 0 unused."""
+    gen = torch.Generator().manual_seed(len(reqs))
+    seq = [p + e for p, e in reqs]
+    pages = [-(-s // BLOCK) for s in seq]
+    page_ids = (torch.randperm(sum(pages), generator=gen) + 1).split(pages)
+    r2t = torch.zeros(len(reqs), max(pages) * BLOCK, dtype=torch.int32)
+    for i, ids in enumerate(page_ids):
+        r2t[i, : seq[i]] = (ids[:, None] * BLOCK + torch.arange(BLOCK)).flatten()[
+            : seq[i]
+        ]
+    q_lens = [e for _, e in reqs]
+    return dict(
+        slots=torch.cat([r2t[i, :s] for i, s in enumerate(seq)]).to(DEVICE),
+        num_slots=(sum(pages) + 1) * BLOCK,
+        pos=torch.cat([torch.arange(p, p + e) for p, e in reqs]).to(DEVICE),
+        kwargs=dict(
+            req_to_token=r2t.to(DEVICE),
+            req_pool_indices=torch.arange(len(reqs), device=DEVICE),
+            cu_seqlens=torch.tensor(
+                [0, *torch.tensor(q_lens).cumsum(0).tolist()], dtype=torch.int32
+            ).to(DEVICE),
+            seq_lens=torch.tensor(seq, dtype=torch.int32, device=DEVICE),
+            prefix_lens=torch.tensor(
+                [p for p, _ in reqs], dtype=torch.int32, device=DEVICE
+            ),
+            seq_lens_cpu=torch.tensor(seq),
+            block_size_k=BLOCK,
+            q_lens_cpu=q_lens,
+        ),
+    )
+
+
+def _per_head_topk(pos: torch.Tensor, gen: torch.Generator) -> torch.Tensor:
+    """[KV_HEADS, rows, TOPK]: each query's own block plus random causal blocks, chosen
+    independently per KV head, ascending with a -1 tail."""
+    n_blocks = pos // BLOCK + 1
+    blocks = torch.arange(int(n_blocks.max()), device=DEVICE)
+    score = torch.rand(
+        KV_HEADS, pos.numel(), blocks.numel(), generator=gen, device=DEVICE
+    )
+    score = score.masked_fill(blocks >= n_blocks[:, None], float("-inf"))
+    score = score.masked_fill(blocks == (n_blocks - 1)[:, None], float("inf"))
+    val, idx = score.topk(min(TOPK, blocks.numel()), dim=-1)
+    idx = torch.where(val == float("-inf"), 1 << 30, idx).sort(-1).values
+    idx = torch.where(idx == 1 << 30, -1, idx).to(torch.int32)
+    return torch.nn.functional.pad(idx, (0, TOPK - idx.shape[-1]), value=-1)
+
+
+def _kv_caches(kind: str, num_slots: int, slots: torch.Tensor, k, v):
+    """The k/v bf16 rows [len(slots), heads, 128] stored at ``slots`` of an fp8 NHD pool
+    or of the NVFP4 page-row pool."""
+    heads = k.shape[1]
+    if kind == "fp8":
+        caches = []
+        for x in (k, v):
+            pool = torch.zeros(num_slots, heads, 128, device=DEVICE, dtype=FP8)
+            pool[slots.long()] = x.to(FP8)
+            caches.append(pool)
+        return caches
+    pool = MiniMaxM3Nvfp4MainKVPool(
+        size=num_slots, page_size=BLOCK, dtype=torch.bfloat16, head_num=heads,
+        head_dim=128, layer_num=1, device=DEVICE, enable_memory_saver=False,
+    )  # fmt: skip
+    unit = torch.ones(1, device=DEVICE)
+    pk, sk = nvfp4_kv_quantize(k.reshape(-1, 128), unit)
+    pv, sv = nvfp4_kv_quantize(v.reshape(-1, 128), unit)
+    pool.set_quantized_kv_buffer(0, slots, pk, pv, sk, sv)
+    return (
+        Nvfp4Cache(
+            pool.get_key_buffer(0), pool.get_k_scale_buffer(0).view(torch.uint8)
+        ),
+        Nvfp4Cache(
+            pool.get_value_buffer(0), pool.get_v_scale_buffer(0).view(torch.uint8)
+        ),
+    )
+
+
+@pytest.mark.skipif(
+    gluon_prefill.pa_decode_gluon is None, reason="aiter Gluon paged attention"
+)
+@pytest.mark.parametrize(
+    "kind,pair_min_tokens,out_quant",
+    [
+        ("fp8", 1 << 30, ""),
+        ("fp8", 1, ""),
+        # only the pair kernel hands the o_proj its fp8 O; NVFP4 heads return bf16
+        ("fp8", 1, "fp8"),
+        ("nvfp4", 1 << 30, ""),
+        ("nvfp4", 1, ""),
+    ],
+    ids=["fp8-decode", "fp8-pair", "fp8-pair-fp8out", "nvfp4-decode", "nvfp4-pair"],
+)
+def test_gluon_prefill_several_kv_heads_equal_one_head_runs(
+    monkeypatch, kind, pair_min_tokens, out_quant
+):
+    """A rank with several KV heads (TP below 4, or attention DP) must take Gluon, not
+    raise on NVFP4 or fall back to Triton on fp8, and each KV head's q heads must equal
+    a one-KV-head run on that head's own pool, bit for bit."""
+    for name in ("PAIR_MIN_TOKENS_FP8", "PAIR_MIN_TOKENS_BF16"):
+        monkeypatch.setattr(gluon_prefill_pair_gfx950, name, pair_min_tokens)
+    gen = torch.Generator(device=DEVICE).manual_seed(0)
+    b = _paged_batch([(300, 2100), (0, 200), (5000, 33)])
+    rows, group = b["pos"].numel(), NUM_Q_HEADS
+    k, v = (
+        torch.randn(b["slots"].numel(), KV_HEADS, 128, generator=gen, device=DEVICE)
+        .mul(2)
+        .bfloat16()
+        for _ in range(2)
+    )
+    q = torch.randn(
+        rows, KV_HEADS * group, 128, generator=gen, device=DEVICE
+    ).bfloat16()
+    topk = _per_head_topk(b["pos"], gen)
+    k_cache, v_cache = _kv_caches(kind, b["num_slots"], b["slots"], k, v)
+    assert gluon_prefill.can_use_gluon_prefill(
+        q, k_cache, v_cache, None, BLOCK, b["kwargs"]["seq_lens_cpu"]
+    )
+
+    def run(q, k_cache, v_cache, topk):
+        out = gluon_prefill.gluon_sparse_prefill(
+            q=q, k_cache=k_cache, v_cache=v_cache, topk_idx=topk,
+            out_quant=out_quant, **b["kwargs"],
+        )  # fmt: skip
+        # O may come back as the o_proj's (fp8 [rows, H * 128], scale [rows, H])
+        if isinstance(out, tuple):
+            return out[0].view(rows, -1, 128).view(torch.uint8), out[1]
+        return out.view(torch.int16), None
+
+    out, scale = run(q, k_cache, v_cache, topk)
+    for head in range(KV_HEADS):
+        q_heads = slice(head * group, (head + 1) * group)
+        k1, v1 = _kv_caches(
+            kind,
+            b["num_slots"],
+            b["slots"],
+            k[:, head : head + 1].contiguous(),
+            v[:, head : head + 1].contiguous(),
+        )
+        ref, ref_scale = run(
+            q[:, q_heads].contiguous(), k1, v1, topk[head : head + 1].contiguous()
+        )
+        assert torch.equal(out[:, q_heads], ref.view(out.dtype)), f"KV head {head}"
+        if scale is not None or ref_scale is not None:
+            assert torch.equal(scale[:, q_heads], ref_scale), f"KV head {head}"
 
 
 def test_gluon_prefill_meta_does_not_wait_for_queued_work():
