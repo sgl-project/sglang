@@ -79,6 +79,18 @@ def _serves_block_fp8_as_mxfp8_on_flashinfer(model_runner: ModelRunner) -> bool:
     return False
 
 
+def _serves_compressed_tensors_nvfp4_linear(model_runner: ModelRunner) -> bool:
+    """compressed-tensors W4A4 NVFP4 linears also run FlashInfer's mm_fp4 (via fp4_gemm)."""
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
+        CompressedTensorsW4A4Fp4,
+    )
+
+    return any(
+        isinstance(getattr(module, "scheme", None), CompressedTensorsW4A4Fp4)
+        for module in model_runner.model.modules()
+    )
+
+
 def should_run_flashinfer_autotune(
     model_runner: ModelRunner, *, for_speculative_draft: bool = False
 ) -> bool:
@@ -144,6 +156,9 @@ def _kernels_take_flashinfer_tactics(
     model_uses_fp4 = model_quantization in (
         "modelopt_fp4",
         "modelopt_mixed",
+    ) or (
+        model_quantization == "compressed-tensors"
+        and _serves_compressed_tensors_nvfp4_linear(mr)
     )
     fp4_gemm_needs_autotune = model_uses_fp4 and (
         get_fp4_gemm_runner_backend().is_flashinfer_cutlass()
