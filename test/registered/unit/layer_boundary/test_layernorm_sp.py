@@ -736,5 +736,120 @@ class TestNpuMc2FusedPaths(CustomTestCase):
         self.assertIs(out, output)
 
 
+class TestTorchSymmMemWorkspace(CustomTestCase):
+    def setUp(self):
+        layernorm_sp.set_sp_num_tokens(0)
+
+    def tearDown(self):
+        layernorm_sp.set_sp_num_tokens(0)
+
+    @staticmethod
+    def _unquant_type():
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        return UnquantizedLinearMethod
+
+    def _linear(self, quant_method=None):
+        tp_group = SimpleNamespace(
+            world_size=2,
+            device_group=SimpleNamespace(group_name="tp"),
+            reduce_scatter_tensor=MagicMock(),
+        )
+        return SimpleNamespace(
+            weight=torch.zeros(4, 3, dtype=torch.bfloat16),
+            bias=None,
+            tp_group=tp_group,
+            quant_method=quant_method or self._unquant_type()(),
+        )
+
+    def _symm_mem(self, linear, workspace, **fused_ops):
+        stack = ExitStack()
+        stack.enter_context(patch.object(layernorm_sp, "is_npu", return_value=False))
+        stack.enter_context(
+            patch.object(layernorm_sp, "_HAS_TORCH_SYMM_MEM_FUSED", True)
+        )
+        stack.enter_context(
+            patch.object(
+                layernorm_sp,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_group=linear.tp_group),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                layernorm_sp,
+                "get_schedule",
+                return_value=SimpleNamespace(
+                    chunked_prefill_size=8, max_prefill_tokens=16
+                ),
+            )
+        )
+        stack.enter_context(patch.dict(layernorm_sp._symm_mem_reserved, clear=True))
+        stack.enter_context(
+            patch(
+                "torch.distributed._symmetric_memory.get_symm_mem_workspace",
+                workspace,
+            )
+        )
+        for name, op in fused_ops.items():
+            stack.enter_context(patch.object(torch.ops.symm_mem, name, op, create=True))
+        return stack
+
+    def test_row_passes_share_one_workspace_sized_for_the_largest(self):
+        linear = self._linear()
+        workspace, fused = MagicMock(), MagicMock(return_value="fused")
+        with self._symm_mem(linear, workspace, fused_matmul_reduce_scatter=fused):
+            for rows in (5, 2, 8):
+                x = torch.zeros(rows, 3, dtype=torch.bfloat16)
+                out = layernorm_sp.row_parallel_gbar_matmul(linear, x, None)
+                self.assertEqual(out, "fused")
+        workspace.assert_called_once_with("tp", min_size=2 * (8 // 2) * 4 * 2)
+
+    def test_row_pass_over_the_largest_runs_unfused(self):
+        quant = MagicMock(spec=self._unquant_type())
+        quant.apply.return_value = torch.ones(10, 4, dtype=torch.bfloat16)
+        linear = self._linear(quant)
+        workspace, fused = MagicMock(), MagicMock()
+        with self._symm_mem(linear, workspace, fused_matmul_reduce_scatter=fused):
+            x = torch.zeros(10, 3, dtype=torch.bfloat16)
+            out = layernorm_sp.row_parallel_gbar_matmul(linear, x, None)
+        fused.assert_not_called()
+        workspace.assert_not_called()
+        linear.tp_group.reduce_scatter_tensor.assert_called_once()
+        self.assertEqual(out.shape, (5, 4))
+
+    def test_column_pass_reserves_the_workspace_for_the_largest(self):
+        linear = self._linear()
+        workspace = MagicMock()
+        fused = MagicMock(
+            return_value=(None, [torch.zeros(8, 4, dtype=torch.bfloat16)])
+        )
+        layernorm_sp.set_sp_num_tokens(7)
+        with self._symm_mem(linear, workspace, fused_all_gather_matmul=fused):
+            x = torch.zeros(4, 3, dtype=torch.bfloat16)
+            out = layernorm_sp.column_parallel_g_matmul(linear, x, None)
+        self.assertEqual(out.shape, (7, 4))
+        workspace.assert_called_once_with("tp", min_size=8 * 3 * 2)
+
+    def test_column_pass_over_the_largest_runs_unfused(self):
+        quant = MagicMock(spec=self._unquant_type())
+        expected = torch.zeros(9, 4, dtype=torch.bfloat16)
+        quant.apply.return_value = expected
+        linear = self._linear(quant)
+        gathered = torch.zeros(9, 3, dtype=torch.bfloat16)
+        workspace, fused = MagicMock(), MagicMock()
+        layernorm_sp.set_sp_num_tokens(9)
+        with (
+            self._symm_mem(linear, workspace, fused_all_gather_matmul=fused),
+            patch.object(layernorm_sp, "sp_exit_gather", return_value=gathered),
+        ):
+            x = torch.zeros(5, 3, dtype=torch.bfloat16)
+            out = layernorm_sp.column_parallel_g_matmul(linear, x, None)
+        fused.assert_not_called()
+        workspace.assert_not_called()
+        quant.apply.assert_called_once_with(linear, gathered, None)
+        self.assertIs(out, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
