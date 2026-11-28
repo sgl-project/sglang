@@ -2,27 +2,53 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 """HF processor classes live in sglang.srt.configs.minimax_vl_processor to avoid circular imports with model classes."""
 
+import asyncio
 import itertools
 import math
-from functools import cached_property
+import os
+from contextlib import contextmanager
+from functools import cached_property, partial
+from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
+import msgspec
+import numpy as np
+import PIL
 import torch
 import torchvision
 import torchvision.transforms.v2.functional as tvF
 from PIL import Image
 from torchvision.transforms import InterpolationMode
+from transformers import MiniMaxM3VLImageProcessor
 
 from sglang.srt.arg_groups.model_override_base import model_config_of
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
-from sglang.srt.multimodal.media_io import ImageData, VideoData
+from sglang.srt.models.minimax_vl_common import (
+    DEFERRED_IMAGE_KEY,
+    MiniMaxDeferredImage,
+)
+from sglang.srt.multimodal.cache import (
+    CONTENT_HASH_PREFIX,
+    build_artifact_key,
+    build_processor_fingerprint,
+    snapshot_media,
+)
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    VideoData,
+    get_image_bytes,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_resize
+from sglang.srt.runtime_context import get_disagg, get_serving
+from sglang.srt.utils import is_cuda
 
 # Per-request media limits; requests outside them are rejected with HTTP 400.
 MAX_IMAGE_PIXELS = 12845056
@@ -35,6 +61,7 @@ MIN_LONG_SIDE_PIXEL = 112
 MAX_LONG_SIDE_PIXEL = 3584
 MAX_ASPECT_RATIO = 200
 DEFAULT_IMAGE_LONG_SIDE = 2016
+MAX_PREPROCESS_THREADS = 8
 
 
 def _compute_aligned_size(
@@ -99,6 +126,57 @@ def _max_long_side_pixel(item: Any) -> Any:
     return None
 
 
+_RAW_IMAGE_TYPES = (str, bytes, ImageData, Image.Image)
+_IMAGE_IDENTITY_VERSION = 1
+
+
+class _LoadedImage(msgspec.Struct, frozen=True):
+    image: Any
+    content_digest: str
+
+
+def _unwrap_loaded_images(images: list) -> Tuple[list, Optional[List[str]]]:
+    digests = [
+        image.content_digest for image in images if isinstance(image, _LoadedImage)
+    ]
+    unwrapped = [
+        image.image if isinstance(image, _LoadedImage) else image for image in images
+    ]
+    return unwrapped, digests if images and len(digests) == len(images) else None
+
+
+def _image_identity(
+    *,
+    content_digest: str,
+    processor_fingerprint: str,
+    resize_spec: Tuple[str, int],
+    grid_thw: List[int],
+) -> bytes:
+    key = build_artifact_key(
+        content_digest,
+        modality="image",
+        processor_fingerprint=processor_fingerprint,
+        preprocess_kwargs={
+            "identity_version": _IMAGE_IDENTITY_VERSION,
+            "resize": list(resize_spec),
+            "grid_thw": grid_thw,
+        },
+    )
+    return bytes.fromhex(key[len(CONTENT_HASH_PREFIX) :])
+
+
+def _read_image_size(source: Any) -> Tuple[int, int]:
+    if isinstance(source, Image.Image):
+        return source.size
+    if isinstance(source, ImageData):
+        source = source.url
+    try:
+        with Image.open(BytesIO(get_image_bytes(source))) as image:
+            return image.size
+    except (OSError, SyntaxError) as e:
+        raise ValueError(f"Could not decode image: {e}") from e
+
+
 def _video_fps(item: Any) -> Any:
     # The chat template path carries per-video fps in preprocess_kwargs.
     if isinstance(item, VideoData):
@@ -111,16 +189,23 @@ def _video_fps(item: Any) -> Any:
     return None
 
 
-def _resize_image_to_long_side(
-    image: Image.Image, factor: int, max_long_side_pixel: int
-) -> Image.Image:
-    width, height = image.size
+def _long_side_shape(
+    height: int, width: int, factor: int, max_long_side_pixel: int
+) -> Tuple[int, int]:
     new_h, new_w = _compute_aligned_size(height, width, factor, max_long_side_pixel)
     if new_h * new_w > MAX_IMAGE_PIXELS:
         raise ValueError(
             f"image pixels exceed {MAX_IMAGE_PIXELS}, got {new_h * new_w} "
             f"({new_w}x{new_h})"
         )
+    return new_h, new_w
+
+
+def _resize_image_to_long_side(
+    image: Image.Image, factor: int, max_long_side_pixel: int
+) -> Image.Image:
+    width, height = image.size
+    new_h, new_w = _long_side_shape(height, width, factor, max_long_side_pixel)
     if (new_w, new_h) == image.size:
         return image
     return image.resize((new_w, new_h), Image.Resampling.BICUBIC)
@@ -305,45 +390,141 @@ def video_resize_config(video_processor) -> Tuple[int, Tuple[int, int]]:
     return image_factor, max_size
 
 
-def resize_images_for_request(
-    images: list, image_data: list, *, image_processor, max_pixels: Optional[int]
-) -> list:
-    # The HF image processor takes one resize setting per call, so every image
-    # is resized here; one without the option uses DEFAULT_IMAGE_LONG_SIDE,
-    # or the HF area cap when the server sets an image max_pixels.
-    factor = image_processor.patch_size * image_processor.merge_size
+def _request_image_limits(
+    image_data: Optional[list], *, num_images: int, factor: int
+) -> List[Optional[int]]:
     limits = [
         _check_max_long_side_pixel(_max_long_side_pixel(item), factor)
         for item in image_data or []
     ]
-    if len(limits) != len(images):
+    if len(limits) != num_images:
         if any(limit is not None for limit in limits):
             raise ValueError(
                 f"max_long_side_pixel needs one loaded image per image item, "
-                f"got {len(images)} images for {len(limits)} items"
+                f"got {num_images} images for {len(limits)} items"
             )
-        limits = [None] * len(images)
-    resized = []
-    for image, limit in zip(images, limits):
-        if not isinstance(image, Image.Image):
-            raise ValueError(
-                f"max_long_side_pixel requires raw image input, got "
-                f"{type(image).__name__}"
+        limits = [None] * num_images
+    return limits
+
+
+def request_image_shape(
+    height: int,
+    width: int,
+    *,
+    limit: Optional[int],
+    factor: int,
+    max_pixels: Optional[int],
+) -> Tuple[int, int]:
+    if limit is None and max_pixels is not None:
+        return smart_resize(
+            height=height, width=width, factor=factor, max_pixels=max_pixels
+        )
+    return _long_side_shape(
+        height, width, factor, DEFAULT_IMAGE_LONG_SIDE if limit is None else limit
+    )
+
+
+def _resize_specs(
+    image_data: Optional[list],
+    *,
+    num_images: int,
+    factor: int,
+    max_pixels: Optional[int],
+) -> List[Tuple[str, int]]:
+    # The HF image processor takes one resize setting per call, so every image
+    # is resized here; one without the option uses DEFAULT_IMAGE_LONG_SIDE,
+    # or the HF area cap when the server sets an image max_pixels.
+    return [
+        (
+            ("max_pixels", max_pixels)
+            if limit is None and max_pixels is not None
+            else (
+                "max_long_side_pixel",
+                DEFAULT_IMAGE_LONG_SIDE if limit is None else limit,
             )
-        if limit is None and max_pixels is not None:
-            resized.append(_resize_image_to_max_pixels(image, factor, max_pixels))
-        else:
-            resized.append(
-                _resize_image_to_long_side(
-                    image,
-                    factor,
-                    DEFAULT_IMAGE_LONG_SIDE if limit is None else limit,
-                )
-            )
-    return resized
+        )
+        for limit in _request_image_limits(
+            image_data, num_images=num_images, factor=factor
+        )
+    ]
+
+
+def _resize_image_for_request(
+    image: Any, *, factor: int, spec: Tuple[str, int]
+) -> Image.Image:
+    if not isinstance(image, Image.Image):
+        raise ValueError(
+            f"max_long_side_pixel requires raw image input, got {type(image).__name__}"
+        )
+    kind, value = spec
+    if kind == "max_pixels":
+        return _resize_image_to_max_pixels(image, factor, value)
+    return _resize_image_to_long_side(image, factor, value)
+
+
+def resize_images_for_request(
+    images: list, image_data: list, *, image_processor, max_pixels: Optional[int]
+) -> list:
+    factor = image_processor.patch_size * image_processor.merge_size
+    specs = _resize_specs(
+        image_data, num_images=len(images), factor=factor, max_pixels=max_pixels
+    )
+    return [
+        _resize_image_for_request(image, factor=factor, spec=spec)
+        for image, spec in zip(images, specs)
+    ]
+
+
+def _preprocess_num_threads(*, tokenizer_worker_num: int, processor_worker_num: int):
+    concurrent_preprocessors = max(1, tokenizer_worker_num) * max(
+        1, processor_worker_num
+    )
+    return max(
+        1,
+        min(MAX_PREPROCESS_THREADS, (os.cpu_count() or 1) // concurrent_preprocessors),
+    )
+
+
+@contextmanager
+def _torch_num_threads_at_least(num_threads: int):
+    previous = torch.get_num_threads()
+    if previous >= num_threads:
+        yield
+        return
+    torch.set_num_threads(num_threads)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 def expand_media_tokens(
+    ids: List[int], replacements: Dict[int, List[List[int]]], *, im_start_id: int
+) -> List[int]:
+    ids_array = np.asarray(ids, dtype=np.int64)
+    if (ids_array == im_start_id).any() or not all(
+        im_start_id in chunk for chunks in replacements.values() for chunk in chunks
+    ):
+        return _expand_media_tokens_scan(ids, replacements, im_start_id=im_start_id)
+    positions = np.flatnonzero(np.isin(ids_array, list(replacements))).tolist()
+    tokens = [ids[pos] for pos in positions]
+    counts = {token: tokens.count(token) for token in replacements}
+    if any(counts[token] > len(chunks) for token, chunks in replacements.items()):
+        raise ValueError("More media placeholders than supplied media")
+    if any(counts[token] != len(chunks) for token, chunks in replacements.items()):
+        raise ValueError("Supplied media is missing a matching placeholder")
+    chunk_iters = {token: iter(chunks) for token, chunks in replacements.items()}
+    output = []
+    previous = 0
+    for pos, token in zip(positions, tokens):
+        output += ids[previous:pos]
+        output += next(chunk_iters[token])
+        previous = pos + 1
+    output += ids[previous:]
+    return output
+
+
+def _expand_media_tokens_scan(
     ids: List[int], replacements: Dict[int, List[List[int]]], *, im_start_id: int
 ) -> List[int]:
     output = []
@@ -460,15 +641,11 @@ def _preprocess_videos_for_encoder(items: list, *, processor, video_config: dict
 
 
 def _media_token_runs(input_ids: List[int], token_id: int) -> List[Tuple[int, int]]:
-    runs = []
-    start = None
-    for pos, token in enumerate(input_ids + [None]):
-        if token == token_id and start is None:
-            start = pos
-        elif token != token_id and start is not None:
-            runs.append((start, pos - 1))
-            start = None
-    return runs
+    mask = (np.asarray(input_ids, dtype=np.int64) == token_id).astype(np.int8)
+    edges = np.diff(mask, prepend=0, append=0)
+    starts = np.flatnonzero(edges == 1).tolist()
+    ends = (np.flatnonzero(edges == -1) - 1).tolist()
+    return list(zip(starts, ends))
 
 
 class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
@@ -501,13 +678,108 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
     def _video_resize_config(self):
         return video_resize_config(self._processor.video_processor)
 
-    def _resize_images_for_request(self, images: list, image_data: list) -> list:
-        return resize_images_for_request(
-            images,
+    @classmethod
+    def _load_single_item(cls, data, modality, *args, **kwargs):
+        if (
+            modality != Modality.IMAGE
+            or cls._is_preprocessed_input(data)
+            or envs.SGLANG_MM_SKIP_COMPUTE_HASH.get()
+        ):
+            return super()._load_single_item(data, modality, *args, **kwargs)
+        try:
+            snapshot = snapshot_media(data)
+        except (*CLIENT_MEDIA_EXCEPTIONS, OSError, TypeError):
+            return super()._load_single_item(data, modality, *args, **kwargs)
+        return _LoadedImage(
+            image=super()._load_single_item(snapshot.data, modality, *args, **kwargs),
+            content_digest=snapshot.content_digest,
+        )
+
+    def preprocess_fingerprint_payload(self) -> Dict[str, Any]:
+        image_processor = self._processor.image_processor
+        return {
+            **super().preprocess_fingerprint_payload(),
+            "image_processor": {
+                "class": type(image_processor).__qualname__,
+                "patch_size": image_processor.patch_size,
+                "temporal_patch_size": image_processor.temporal_patch_size,
+                "merge_size": image_processor.merge_size,
+                "image_mean": list(image_processor.image_mean),
+                "image_std": list(image_processor.image_std),
+                "rescale_factor": float(image_processor.rescale_factor),
+                "do_rescale": image_processor.do_rescale,
+                "do_normalize": image_processor.do_normalize,
+            },
+            "feature_dtype": self.feature_dtype,
+            "pillow": PIL.__version__,
+            "torchvision": torchvision.__version__,
+        }
+
+    def _identity_fingerprint(self) -> str:
+        if self.processor_fingerprint is None:
+            self.processor_fingerprint = build_processor_fingerprint(
+                self, self.hf_config
+            )
+        return self.processor_fingerprint
+
+    def _set_image_identities(
+        self,
+        mm_items: List[MultimodalDataItem],
+        *,
+        content_digests: List[str],
+        resize_specs: List[Tuple[str, int]],
+    ) -> None:
+        image_items = [item for item in mm_items if item.is_image()]
+        if len(image_items) != len(content_digests):
+            return
+        for item, content_digest, resize_spec in zip(
+            image_items, content_digests, resize_specs
+        ):
+            item.set_identity(
+                _image_identity(
+                    content_digest=content_digest,
+                    processor_fingerprint=self._identity_fingerprint(),
+                    resize_spec=resize_spec,
+                    grid_thw=torch.as_tensor(item.image_grid_thw).flatten().tolist(),
+                )
+            )
+
+    def _image_resize_specs(
+        self, image_data: Optional[list], num_images: int
+    ) -> List[Tuple[str, int]]:
+        return _resize_specs(
             image_data,
-            image_processor=self._processor.image_processor,
+            num_images=num_images,
+            factor=self._image_factor,
             max_pixels=self.image_config.get("max_pixels"),
         )
+
+    @property
+    def _image_factor(self) -> int:
+        image_processor = self._processor.image_processor
+        return image_processor.patch_size * image_processor.merge_size
+
+    async def _resize_images(self, images: list, specs: List[Tuple[str, int]]) -> list:
+        loop = asyncio.get_running_loop()
+        resized = await asyncio.gather(
+            *(
+                loop.run_in_executor(
+                    self.io_executor,
+                    partial(
+                        _resize_image_for_request,
+                        image,
+                        factor=self._image_factor,
+                        spec=spec,
+                    ),
+                )
+                for image, spec in zip(images, specs)
+            ),
+            return_exceptions=True,
+        )
+        for result in resized:
+            if isinstance(result, BaseException):
+                raise result
+        return resized
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -529,12 +801,73 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             video_token=self.VIDEO_TOKEN,
             video_token_id=self.VIDEO_TOKEN_ID,
         ).build(_processor)
+        self.decode_skips_pixels = (
+            get_disagg().disaggregation_mode == "decode"
+            and not get_disagg().disaggregation_decode_enable_radix_cache
+        )
+        self.preprocess_num_threads = _preprocess_num_threads(
+            tokenizer_worker_num=int(get_serving().tokenizer_worker_num),
+            processor_worker_num=self.mm_processor_worker_num,
+        )
 
     preserve_processor_input_ids = True
+    decode_skips_pixels = False
+    preprocess_num_threads = 1
 
     @cached_property
     def feature_dtype(self) -> torch.dtype:
         return model_config_of(self.server_args).dtype
+
+    @cached_property
+    def deferred_image(self) -> Optional[MiniMaxDeferredImage]:
+        image_processor = self._processor.image_processor
+        if (
+            self._feature_transport.mm_feature_transport != "cpu"
+            or not is_cuda()
+            or not isinstance(image_processor, MiniMaxM3VLImageProcessor)
+            or not (image_processor.do_rescale and image_processor.do_normalize)
+            or set(self.image_config) - {"max_pixels"}
+        ):
+            return None
+        return MiniMaxDeferredImage(
+            image_mean=[float(value) for value in image_processor.image_mean],
+            image_std=[float(value) for value in image_processor.image_std],
+            rescale_factor=float(image_processor.rescale_factor),
+            patch_size=image_processor.patch_size,
+            merge_size=image_processor.merge_size,
+            temporal_patch_size=image_processor.temporal_patch_size,
+            feature_dtype=str(self.feature_dtype).removeprefix("torch."),
+        )
+
+    async def _defer_image_preprocessing(
+        self, images: list, ids: List[int]
+    ) -> Tuple[List[MultimodalDataItem], List[int]]:
+        patch_size = self.deferred_image.patch_size
+        grids = [
+            (1, image.height // patch_size, image.width // patch_size)
+            for image in images
+        ]
+        input_ids, runs = self._expand_image_spans(list(ids), grids)
+        loop = asyncio.get_running_loop()
+        pixels = await asyncio.gather(
+            *(
+                loop.run_in_executor(self.io_executor, np.array, image)
+                for image in images
+            )
+        )
+        mm_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                feature=torch.from_numpy(array),
+                offsets=[run],
+                model_specific_data={
+                    "image_grid_thw": torch.tensor([grid]),
+                    DEFERRED_IMAGE_KEY: self.deferred_image,
+                },
+            )
+            for array, run, grid in zip(pixels, runs, grids)
+        ]
+        return mm_items, input_ids
 
     def _postprocess_mm_items_before_transport(
         self,
@@ -542,12 +875,13 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         *,
         images: Optional[List[Any]],
     ) -> List[MultimodalDataItem]:
-        for item in mm_items:
-            if (
-                isinstance(item.feature, torch.Tensor)
-                and item.feature.is_floating_point()
-            ):
-                item.feature = item.feature.to(self.feature_dtype)
+        with _torch_num_threads_at_least(self.preprocess_num_threads):
+            for item in mm_items:
+                if (
+                    isinstance(item.feature, torch.Tensor)
+                    and item.feature.is_floating_point()
+                ):
+                    item.feature = item.feature.to(self.feature_dtype)
         return mm_items
 
     def process_mm_data(
@@ -571,39 +905,41 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         if input_ids is None:
             if images_resized:
                 kwargs["images_kwargs"] = {"do_resize": False}
-            return super().process_mm_data(
-                input_text=input_text,
-                images=images,
-                videos=videos,
-                audios=audios,
-                processor=processor,
-                video_metadata=video_metadata,
-                **kwargs,
-            )
+            with _torch_num_threads_at_least(self.preprocess_num_threads):
+                return super().process_mm_data(
+                    input_text=input_text,
+                    images=images,
+                    videos=videos,
+                    audios=audios,
+                    processor=processor,
+                    video_metadata=video_metadata,
+                    **kwargs,
+                )
         # Tokenized prompts must retain every text token. Decoding and encoding
         # the entire prompt can change BPE boundaries and special-token IDs.
         result = {}
-        if images:
-            result.update(
-                processor.image_processor(
-                    images=images, return_tensors="pt", **image_config
+        with _torch_num_threads_at_least(self.preprocess_num_threads):
+            if images:
+                result.update(
+                    processor.image_processor(
+                        images=images, return_tensors="pt", **image_config
+                    )
                 )
-            )
-        if videos:
-            result.update(
-                processor.video_processor(
-                    videos=videos,
-                    return_tensors="pt",
-                    **{"do_resize": False, **self.video_config},
+            if videos:
+                result.update(
+                    processor.video_processor(
+                        videos=videos,
+                        return_tensors="pt",
+                        **{"do_resize": False, **self.video_config},
+                    )
                 )
-            )
-            if video_metadata is not None:
-                from types import SimpleNamespace
+                if video_metadata is not None:
+                    from types import SimpleNamespace
 
-                result["video_metadata"] = [
-                    SimpleNamespace(**m) if isinstance(m, dict) else m
-                    for m in video_metadata
-                ]
+                    result["video_metadata"] = [
+                        SimpleNamespace(**m) if isinstance(m, dict) else m
+                        for m in video_metadata
+                    ]
         ids = torch.as_tensor(input_ids, dtype=torch.long).flatten().tolist()
         image_grids = result.get("image_grid_thw")
         video_grids = result.get("video_grid_thw")
@@ -652,68 +988,68 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
         **kwargs,
     ) -> dict:
         video_data = request_obj.video_data
+        if (
+            self.decode_skips_pixels
+            and image_data
+            and not video_data
+            and not audio_data
+            and all(isinstance(item, _RAW_IMAGE_TYPES) for item in image_data)
+        ):
+            return await self._process_image_sizes(image_data, input_text)
+
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=video_data,
             multimodal_tokens=self.mm_tokens,
         )
+        base_output.images, content_digests = _unwrap_loaded_images(base_output.images)
 
         images_resized = False
+        image_specs = None
         # Precomputed inputs keep their own processing unless they ask for a resize.
         if base_output.images and (
             all(isinstance(image, Image.Image) for image in base_output.images)
             or any(_max_long_side_pixel(item) is not None for item in image_data or [])
         ):
-            base_output.images = self._resize_images_for_request(
-                base_output.images, image_data
+            image_specs = self._image_resize_specs(image_data, len(base_output.images))
+            base_output.images = await self._resize_images(
+                base_output.images, image_specs
             )
             images_resized = True
 
         video_metadata = None
         if base_output.videos:
-            image_factor, max_size = self._video_resize_config()
-            video_items = video_data or []
-            if len(video_items) != len(base_output.videos):
-                if any(
-                    _video_fps(item) is not None
-                    or _max_long_side_pixel(item) is not None
-                    for item in video_items
-                ):
-                    raise ValueError(
-                        f"per-video options need one loaded video per video item, "
-                        f"got {len(base_output.videos)} videos for "
-                        f"{len(video_items)} items"
-                    )
-                video_items = [None] * len(base_output.videos)
-            videos_processed = []
-            for video, item in zip(base_output.videos, video_items):
-                fps = _check_video_fps(_video_fps(item))
-                videos_processed.append(
-                    await get_video_tensor(
-                        video,
-                        image_factor=image_factor,
-                        max_size=max_size,
-                        fps=self.video_fps if fps is None else fps,
-                        frame_max_size=self.video_frame_max_size,
-                        max_frames=self.video_max_frames,
-                        resize_fn=getattr(
-                            self._processor.video_processor, "resize_frames", None
-                        ),
-                        max_long_side_pixel=_check_max_long_side_pixel(
-                            _max_long_side_pixel(item), image_factor
-                        ),
-                    )
-                )
-            base_output.videos, video_metadata = map(list, zip(*videos_processed))
+            base_output.videos, video_metadata = await self._process_request_videos(
+                base_output.videos, video_data
+            )
 
-        mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
-            base_output=base_output,
-            mm_tokens=self.mm_tokens,
-            video_metadata=video_metadata,
-            **({"images_resized": True} if images_resized else {}),
-            **({"input_ids": input_text} if isinstance(input_text, list) else {}),
-        )
+        if (
+            images_resized
+            and not base_output.videos
+            and all(image.mode == "RGB" for image in base_output.images)
+            and self.deferred_image is not None
+        ):
+            mm_items, input_ids = await self._defer_image_preprocessing(
+                base_output.images,
+                (
+                    input_text
+                    if isinstance(input_text, list)
+                    else self._encode_prompt(input_text)
+                ),
+            )
+        else:
+            mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
+                base_output=base_output,
+                mm_tokens=self.mm_tokens,
+                video_metadata=video_metadata,
+                **({"images_resized": True} if images_resized else {}),
+                **({"input_ids": input_text} if isinstance(input_text, list) else {}),
+            )
+        if content_digests is not None and image_specs is not None:
+            self._set_image_identities(
+                mm_items, content_digests=content_digests, resize_specs=image_specs
+            )
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist() if hasattr(input_ids, "tolist") else input_ids,
@@ -723,6 +1059,125 @@ class MiniMaxM3VLProcessor(BaseMultimodalProcessor):
             im_token_id=self.IM_TOKEN_ID,
             video_token_id=self.VIDEO_TOKEN_ID,
         )
+
+    async def _process_request_videos(
+        self, videos: list, video_data: Optional[list]
+    ) -> Tuple[list, list]:
+        image_factor, max_size = self._video_resize_config()
+        video_items = video_data or []
+        if len(video_items) != len(videos):
+            if any(
+                _video_fps(item) is not None or _max_long_side_pixel(item) is not None
+                for item in video_items
+            ):
+                raise ValueError(
+                    f"per-video options need one loaded video per video item, "
+                    f"got {len(videos)} videos for "
+                    f"{len(video_items)} items"
+                )
+            video_items = [None] * len(videos)
+        videos_processed = []
+        for video, item in zip(videos, video_items):
+            fps = _check_video_fps(_video_fps(item))
+            videos_processed.append(
+                await get_video_tensor(
+                    video,
+                    image_factor=image_factor,
+                    max_size=max_size,
+                    fps=self.video_fps if fps is None else fps,
+                    frame_max_size=self.video_frame_max_size,
+                    max_frames=self.video_max_frames,
+                    resize_fn=getattr(
+                        self._processor.video_processor, "resize_frames", None
+                    ),
+                    max_long_side_pixel=_check_max_long_side_pixel(
+                        _max_long_side_pixel(item), image_factor
+                    ),
+                )
+            )
+        videos, video_metadata = map(list, zip(*videos_processed))
+        return videos, video_metadata
+
+    async def _process_image_sizes(
+        self, image_data: list, input_text: str | list[int]
+    ) -> MultimodalProcessorOutput:
+        sizes = await asyncio.gather(
+            *(
+                asyncio.wrap_future(self.io_executor.submit(_read_image_size, item))
+                for item in image_data
+            )
+        )
+        grids = self._image_grids(image_data, sizes=sizes)
+        ids = (
+            input_text
+            if isinstance(input_text, list)
+            else self._encode_prompt(input_text)
+        )
+        input_ids, runs = self._expand_image_spans(ids, grids)
+        mm_items = []
+        for run, grid in zip(runs, grids):
+            item = MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[run],
+                model_specific_data={"image_grid_thw": torch.tensor([grid])},
+            )
+            item.set_hash(0)
+            mm_items.append(item)
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            im_token_id=self.IM_TOKEN_ID,
+            video_token_id=self.VIDEO_TOKEN_ID,
+        )
+
+    def _expand_image_spans(
+        self, ids: List[int], grids: List[Tuple[int, int, int]]
+    ) -> Tuple[List[int], List[Tuple[int, int]]]:
+        input_ids = expand_media_tokens(
+            ids,
+            {
+                self.IM_TOKEN_ID: [
+                    self._encode_media_text(self._image_placeholder_text(grid))
+                    for grid in grids
+                ],
+                self.VIDEO_TOKEN_ID: [],
+            },
+            im_start_id=self.IM_START_TOKEN_ID,
+        )
+        runs = _media_token_runs(input_ids, self.IM_TOKEN_ID)
+        if len(runs) != len(grids):
+            raise ValueError(f"Expected {len(grids)} image spans, found {len(runs)}")
+        return input_ids, runs
+
+    def _image_grids(
+        self, image_data: list, *, sizes: List[Tuple[int, int]]
+    ) -> List[Tuple[int, int, int]]:
+        image_processor = self._processor.image_processor
+        patch_size = image_processor.patch_size
+        factor = patch_size * image_processor.merge_size
+        limits = _request_image_limits(
+            image_data, num_images=len(image_data), factor=factor
+        )
+        grids = []
+        for (width, height), limit in zip(sizes, limits):
+            new_height, new_width = request_image_shape(
+                height,
+                width,
+                limit=limit,
+                factor=factor,
+                max_pixels=self.image_config.get("max_pixels"),
+            )
+            grids.append((1, new_height // patch_size, new_width // patch_size))
+        return grids
+
+    def _encode_prompt(self, text: str) -> List[int]:
+        bos = self._tokenizer.bos_token
+        add_special_tokens = not (
+            self._tokenizer_auto_adds_specials and bos and text.startswith(bos)
+        )
+        return self._tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
     def get_mm_data(self, prompt, embeddings, **kwargs):
         image_grids = kwargs.get("img_grid_thw")
