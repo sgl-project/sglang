@@ -172,6 +172,45 @@ class TestHermesDetector(CustomTestCase):
         params = json.loads(full_params)
         self.assertEqual(params["city"], "Tokyo")
 
+    def test_streaming_held_back_text_keeps_order_across_tool_call(self):
+        # "</" is held back as a possible "</tool_call>"; it must come out
+        # before "b", not after the tool call.
+        detector = HermesDetector()
+        chunks = [
+            "a</",
+            "b<tool_call>",
+            '{"name": "get_weather", "arguments": {"city": "Paris"}}',
+            "</tool_call>",
+            "done",
+        ]
+        all_normal_text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_normal_text += result.normal_text
+
+        self.assertEqual(all_normal_text, "a</bdone")
+
+    def test_streaming_end_tag_not_leaked_between_parallel_calls(self):
+        detector = HermesDetector()
+        chunks = [
+            "<tool_call>",
+            '{"name": "get_weather", "arguments": {"city": "Paris"}}',
+            "</tool_call>\n<tool_call>",
+            '{"name": "search", "arguments": {"query": "food"}}',
+            "</tool_call>",
+        ]
+        all_calls = []
+        all_normal_text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+            all_normal_text += result.normal_text
+
+        self.assertNotIn("</tool_call>", all_normal_text)
+        self.assertEqual(
+            [c.name for c in all_calls if c.name], ["get_weather", "search"]
+        )
+
 
 if __name__ == "__main__":
     import unittest
