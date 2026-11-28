@@ -696,6 +696,7 @@ class Inkling2Experts(nn.Module):
             counts,
             offsets,
             schedule,
+            max_expert_rows=x.shape[0],
         )
         accumulator, x_amax = routed_swiglu_expert_matmul(
             accumulator,
@@ -711,6 +712,7 @@ class Inkling2Experts(nn.Module):
             offsets,
             x.dtype,
             schedule,
+            max_expert_rows=x.shape[0],
         )
         return accumulator, (x_amax, self.w2_amax, self.w2_outer_scale_denominator)
 
