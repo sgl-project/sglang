@@ -944,6 +944,12 @@ class ModelSlimConfig(QuantizationConfig):
                     f"Unsupported scheme '{name}' for layer {resolved_prefix}"
                 )
                 return None
+            if cls is ModelSlimW4A8Int8MoE:
+                return cls(
+                    self,
+                    weight_group,
+                    group_size=self.quant_description.get("group_size", 0),
+                )
             return cls(self, weight_group)
 
         w13_scheme = instantiate(w13_scheme_name, weight_group="w13")
