@@ -17,6 +17,7 @@ import json
 import logging
 import math
 import os
+import string
 from enum import Enum, IntEnum, auto
 from functools import cached_property, lru_cache
 from pathlib import Path
@@ -336,8 +337,31 @@ def is_dspark_draft(config) -> bool:
     return _hf_arch(config) in ("DSparkDraftModel", "DSparkMiniMaxDraftModel")
 
 
-# The decision_config.json attention mode whose full-attention layers read the whole prompt.
+# Decision checkpoints declared by decision_config.json.
+DECISION_FORMAT_VERSION_LEGACY = 1
+DECISION_FORMAT_VERSION_JOINT = 2
+DECISION_JOINT_PROTOCOL_VERSION = 4
+DECISION_JOINT_PROTOCOL_TEMPLATE = "joint-chunked-readout-v1"
+DECISION_READOUT_MARKER = "<|fim_suffix|>"
+DECISION_CONTEXT_SEPARATOR = "<|fim_middle|>"
 NONCAUSAL_FULL_ATTENTION = "noncausal_full_attention"
+
+
+@lru_cache
+def load_decision_joint_config(
+    model_path: str, revision: Optional[str]
+) -> Optional[dict]:
+    """joint_config.json of a decision checkpoint with the chunked readout protocol."""
+    path = cached_file(
+        model_path,
+        "joint_config.json",
+        revision=revision,
+        _raise_exceptions_for_missing_entries=False,
+    )
+    if path is None:
+        return None
+    with open(path) as f:
+        return json.load(f)
 
 
 @lru_cache
@@ -353,10 +377,15 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
         return None
     with open(path) as f:
         config = json.load(f)
-    if config["format_version"] != 1:
+    format_version = config.get("format_version")
+    if format_version not in (
+        DECISION_FORMAT_VERSION_LEGACY,
+        DECISION_FORMAT_VERSION_JOINT,
+    ):
         raise ValueError(
-            f"decision_config.json format_version {config['format_version']} "
-            "is not supported, only version 1 is"
+            f"decision_config.json format_version {format_version!r} is not supported, "
+            f"only versions {DECISION_FORMAT_VERSION_LEGACY} and "
+            f"{DECISION_FORMAT_VERSION_JOINT} are"
         )
     # Serving a mode this loader does not honor would silently change the answers.
     attention_mode = config.get("attention_mode", "causal")
@@ -369,6 +398,62 @@ def load_decision_config(model_path: str, revision: Optional[str]) -> Optional[d
         raise ValueError(
             f"decision_config.json pooling {pooling!r} is not supported, only 'last' is"
         )
+    codes = config.get("codes")
+    token_ids = config.get("token_ids")
+    if (
+        not isinstance(codes, list)
+        or not isinstance(token_ids, list)
+        or not codes
+        or len(codes) != len(token_ids)
+        or any(not isinstance(code, str) for code in codes)
+        or any(type(token_id) is not int or token_id < 0 for token_id in token_ids)
+    ):
+        raise ValueError(
+            "decision_config.json needs nonempty codes and token_ids lists of equal length"
+        )
+    temperature = config.get("temperature")
+    if (
+        not isinstance(temperature, (int, float))
+        or not math.isfinite(temperature)
+        or temperature <= 0
+    ):
+        raise ValueError("decision_config.json temperature must be positive and finite")
+    if format_version == DECISION_FORMAT_VERSION_JOINT:
+        if attention_mode != NONCAUSAL_FULL_ATTENTION:
+            raise ValueError(
+                "decision_config.json format_version 2 requires "
+                f"attention_mode {NONCAUSAL_FULL_ATTENTION!r}"
+            )
+        if (
+            len(codes) != 255
+            or len(set(codes)) != 255
+            or len(set(token_ids)) != 255
+            or any(not set(code) <= set(string.ascii_uppercase) for code in codes)
+        ):
+            raise ValueError(
+                "decision_config.json format_version 2 requires 255 unique "
+                "uppercase answer codes and token ids"
+            )
+        protocol = load_decision_joint_config(model_path, revision)
+        if protocol is None:
+            raise ValueError(
+                "decision_config.json format_version 2 requires joint_config.json"
+            )
+        expected = {
+            "version": DECISION_JOINT_PROTOCOL_VERSION,
+            "template": DECISION_JOINT_PROTOCOL_TEMPLATE,
+            "marker": DECISION_READOUT_MARKER,
+            "readout_offset": 0,
+            "max_questions": None,
+            "max_length": None,
+            "usage": "nonpadding_joint_sequence_including_template_and_image_positions",
+            "separator": DECISION_CONTEXT_SEPARATOR,
+        }
+        if protocol != expected:
+            raise ValueError(
+                "joint_config.json is not the supported protocol-v4 declaration: "
+                f"{protocol!r}"
+            )
     return config
 
 

@@ -271,6 +271,9 @@ class OpenAIServingDecisions(OpenAIServingBase):
         chat_template_kwargs: Dict[str, Any],
         images: List[ChatCompletionMessageContentImageURL],
         system: Optional[str] = None,
+        add_generation_prompt: bool = True,
+        strip_at: Optional[str] = None,
+        append: str = "",
     ) -> EncodedQuestion:
         tokenizer = self.tokenizer_manager.tokenizer
         image_data = []
@@ -295,8 +298,23 @@ class OpenAIServingDecisions(OpenAIServingBase):
             )
             message_content = message["content"]
         prompt = self._apply_chat_template(
-            message_content, chat_template_kwargs, system
+            message_content,
+            chat_template_kwargs,
+            system,
+            add_generation_prompt=add_generation_prompt,
         )
+        if strip_at is not None:
+            # Protocol-v4 keeps the user turn open and replaces its trailing
+            # sentinel with the separator, question chunk, and readout marker.
+            cut = prompt.rfind(strip_at)
+            prefix = content.split(strip_at, 1)[0]
+            if cut < 0 or not prompt[:cut].endswith(prefix):
+                raise ValueError(
+                    "the chat template did not preserve the decision context end"
+                )
+            prompt = prompt[:cut] + append
+        elif append:
+            prompt += append
         if images:
             # Image marker metadata is an optional native processor capability.
             tokens = getattr(self.tokenizer_manager.mm_processor, "mm_tokens", None)
@@ -311,7 +329,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
                 raise ValueError(
                     "the chat template must preserve one complete marker per image"
                 )
-        if self.reasoning_markers is not None:
+        if add_generation_prompt and self.reasoning_markers is not None:
             # Look only after the message, whose last line is fixed text.
             closing = content.rsplit("\n", 1)[-1]
             cut = prompt.rfind(closing)
@@ -367,13 +385,14 @@ class OpenAIServingDecisions(OpenAIServingBase):
         content: str | List[Dict[str, Any]],
         chat_template_kwargs: Dict[str, Any],
         system: Optional[str] = None,
+        add_generation_prompt: bool = True,
     ) -> str:
         messages = [] if system is None else [{"role": "system", "content": system}]
         try:
             return self.tokenizer_manager.tokenizer.apply_chat_template(
                 [*messages, {"role": "user", "content": content}],
                 tokenize=False,
-                add_generation_prompt=True,
+                add_generation_prompt=add_generation_prompt,
                 **chat_template_kwargs,
             )
         except _CHAT_TEMPLATE_CLIENT_ERRORS as e:

@@ -1493,6 +1493,7 @@
                   {
                     "group": "Perplexity",
                     "pages": [
+                      "cookbook/autoregressive/Perplexity/PPLX-Decider-v1.3-27B",
                       "cookbook/autoregressive/Perplexity/PPLX-Decider-v1.1-27B",
                       "cookbook/autoregressive/Perplexity/PPLX-Decider-v1-27B"
                     ]
