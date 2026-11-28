@@ -3830,6 +3830,7 @@ dependencies = [
  "sgl-deepseek-recipe-core",
  "sgl-deepseek-recipe-encoding",
  "sglang-api-types",
+ "sha2",
  "thiserror 2.0.20",
  "tokenizers",
  "tracing",

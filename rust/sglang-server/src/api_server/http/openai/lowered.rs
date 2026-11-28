@@ -171,16 +171,19 @@ pub(super) async fn chat(
         .core
         .log_openai_request(OpenAiRequest::ChatCompletion, body, headers);
 
+    // Errors from here on take the response's wire, as Python's chat handler
+    // shapes every error it answers (Kimi-K3's under an `error` key).
+    let error = |reply: Reply| Some(reply_response(responder.error_reply(reply)));
     let stream = generate["stream"] == true;
-    if let Err(error) = copy_prompt_per_choice(&mut generate) {
-        return Some(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
+    if let Err(message) = copy_prompt_per_choice(&mut generate) {
+        return error(error_reply(StatusCode::BAD_REQUEST, &message.to_string()));
     }
     // Python's `adapted_request` takes the router's override headers.
     if state.server_args.enable_request_header_overrides
-        && let Err(error) = apply_header_overrides(&mut generate, headers)
+        && let Err(message) = apply_header_overrides(&mut generate, headers)
     {
         // `apply_header_overrides` raises `HTTPException(400)`, typed by its status.
-        return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
+        return error(typed_error_reply(StatusCode::BAD_REQUEST, "400", &message));
     }
     // Below the override header, `X-Data-Parallel-Rank` names the DP rank.
     match HintRoute::ChatCompletions
@@ -188,15 +191,15 @@ pub(super) async fn chat(
     {
         Ok(Some(rank)) => generate["routed_dp_rank"] = rank.into(),
         Ok(None) => {}
-        Err(error) => {
-            return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
+        Err(message) => {
+            return error(typed_error_reply(StatusCode::BAD_REQUEST, "400", &message));
         }
     }
     // Failures before the first frame answer unary even for a stream: Python
     // awaits the first chunk before it starts the stream.
     let (requests, is_batch) = match generate_requests(state, generate) {
         Ok(requests) => requests,
-        Err((code, message, _)) => return Some(error_response(code, &message)),
+        Err((code, message, _)) => return error(error_reply(code, &message)),
     };
     let timing = RequestTiming::new();
     let request_states: Vec<RequestState> = requests
@@ -206,7 +209,9 @@ pub(super) async fn chat(
     let received = ReceivedAs::Typed(state.core.logged_headers(headers));
     let calls: Vec<_> = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
-        Err(error) => return Some(error_response(error.http_status(), &error.to_string())),
+        Err(failure) => {
+            return error(error_reply(failure.http_status(), &failure.to_string()));
+        }
     };
 
     if !stream {
@@ -223,7 +228,7 @@ pub(super) async fn chat(
         .await;
         let items = match drained {
             Ok(items) => items,
-            Err(error) => return Some(call_error_response(&error)),
+            Err(failure) => return error(call_error_reply(&failure)),
         };
         // Every item is a frame: a failed one answered above.
         let output = items
@@ -233,15 +238,12 @@ pub(super) async fn chat(
                 serde_json::from_value::<GenerateResponse>(value)
             })
             .collect::<Result<Vec<_>, _>>();
-        return Some(
-            match output.ok().and_then(|output| responder.unary(output)) {
-                Some(reply) => reply_response(reply),
-                None => error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "unreadable /generate response",
-                ),
-            },
-        );
+        // Shaped before `unary` takes the responder.
+        let message = "unreadable /generate response";
+        let unreadable =
+            responder.error_reply(error_reply(StatusCode::INTERNAL_SERVER_ERROR, message));
+        let reply = output.ok().and_then(|output| responder.unary(output));
+        return Some(reply_response(reply.unwrap_or(unreadable)));
     }
 
     let incremental = state.server_args.incremental_streaming_output;
@@ -425,31 +427,32 @@ fn python_error_frame(error: &CoreError, index: Option<u32>) -> String {
 
 /// `OpenAIServingBase.create_error_response`: a 400 is a `BadRequestError`;
 /// any other status is an `HTTPException`, typed by its status code.
-fn error_response(status: StatusCode, message: &str) -> Response {
+fn error_reply(status: StatusCode, message: &str) -> Reply {
     let err_type = match status {
         StatusCode::BAD_REQUEST => "BadRequestError".to_owned(),
         _ => status.as_u16().to_string(),
     };
-    typed_error_response(status, &err_type, message)
+    typed_error_reply(status, &err_type, message)
 }
 
 /// `handle_request`'s answer to a call that failed before its first frame: a
 /// scheduler abort is the `HTTPException` the tokenizer manager raises, while a
 /// failure of this server's own is Python's generic exception.
-fn call_error_response(error: &CoreError) -> Response {
+fn call_error_reply(error: &CoreError) -> Reply {
     let status = error.http_status();
     match error {
-        CoreError::RuntimeRejected { .. } => error_response(status, &error.to_string()),
-        _ if status == StatusCode::INTERNAL_SERVER_ERROR => typed_error_response(
+        CoreError::RuntimeRejected { .. } => error_reply(status, &error.to_string()),
+        _ if status == StatusCode::INTERNAL_SERVER_ERROR => typed_error_reply(
             status,
             "InternalServerError",
             &format!("Internal server error: {error}"),
         ),
-        _ => error_response(status, &error.to_string()),
+        _ => error_reply(status, &error.to_string()),
     }
 }
 
-fn typed_error_response(status: StatusCode, err_type: &str, message: &str) -> Response {
+/// `ErrorResponse(...).model_dump()`, before the wire shapes it.
+fn typed_error_reply(status: StatusCode, err_type: &str, message: &str) -> Reply {
     let code = status.as_u16();
     let error = serde_json::json!({
         "object": "error",
@@ -458,7 +461,10 @@ fn typed_error_response(status: StatusCode, err_type: &str, message: &str) -> Re
         "param": null,
         "code": code,
     });
-    (status, axum::Json(error)).into_response()
+    Reply {
+        status: code,
+        body: error.to_string(),
+    }
 }
 
 fn reply_response(reply: Reply) -> Response {
@@ -678,6 +684,52 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         // `HTTPException(400)`, typed by its status.
         assert_eq!(body_json(response).await["type"], "400");
+    }
+
+    /// Kimi-K3 chat answers the errors this server raises after lowering in the
+    /// K3 wire's shape, under an `error` key, as Python's chat handler does.
+    #[tokio::test]
+    async fn kimi_k3_errors_take_its_wire() {
+        let post = |answer: fn(&str) -> ResponseItem, body: Value| {
+            let args = ServerArgs {
+                served_model_name: "model".into(),
+                reasoning_parser: Some("kimi_k3".into()),
+                ..Default::default()
+            };
+            let state = answering_app_state_with_item(
+                Arc::new(args),
+                ChatFormatter::KimiK3,
+                Some(tokenizer()),
+                answer,
+            );
+            post_json(
+                super::super::routes().with_state(state),
+                "/v1/chat/completions",
+                body,
+            )
+        };
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        let failed = |_: &str| ResponseItem::Error(Error::Internal("boom".into()));
+        let response = post(failed, json!({"model": "model", "messages": messages})).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let error = &body_json(response).await["error"];
+        assert_eq!(error["type"], "InternalServerError", "{error}");
+        assert_eq!(error["code"], 500);
+
+        // Before the call, too: `n` past the batch cap.
+        let answered = |rid: &str| chunk(rid, "ok", true);
+        let body = json!({"model": "model", "messages": messages, "n": i64::MAX});
+        let response = post(answered, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"]["type"],
+            "BadRequestError"
+        );
+
+        // The engine answering does not change.
+        let response = post(answered, json!({"model": "model", "messages": messages})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["object"], "chat.completion");
     }
 
     /// A failed choice answers at once, without waiting on an unfinished sibling.

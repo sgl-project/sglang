@@ -216,8 +216,14 @@ needs no `parser` feature. `tests/reasoning_parity.rs` and the test in
 `tool_call/models/<model>.rs` and its names in that `models/mod.rs`. A detector
 that overrides the base splitting, as Kimi-K3's does, is its own `ThinkConfig`
 variant. Tool detectors get the request's tools: Qwen3-Coder's types argument
-values by their schemas. Kimi-K3's `auto` tool-call structural tag is in `openai/kimi_k3_tag.rs`;
-`tests/fixtures/openai_parity/kimi-k3.json` checks it byte for byte.
+values by their schemas. Kimi-K3's tool-call structural tags, for `auto`, for a
+`required` or named `tool_choice` over non-strict tools, and for `none` over
+declared tools, are in `openai/kimi_k3_tag.rs`;
+`tests/fixtures/openai_parity/kimi-k3.json` checks them byte for byte. The
+lowered chat path serves a forced `tool_choice` only for the `kimi_k3` tool
+parser: for the others it is `Unsupported`. The tags assume the engine's
+default `SGLANG_TOOL_STRICT_LEVEL`: the strict levels change Python's K3
+grammars, and `/server_info` does not report that environment variable.
 
 Pass-through for parsing:
 - Other reasoning parsers go through
@@ -245,6 +251,8 @@ lower_chat(body, &headers, &settings, &chat_model, render, tokenizer) -> Result<
 responder.unary(items) / responder.stream_data(item) -> OpenAI JSON or SSE events
 // item is Result<GenerateResponse, GenerateStreamError>; unary accepts a Vec of items
 responder.stream_end() // after the transport receives [DONE]
+responder.rejected(error) / responder.malformed_output(field) -> Reply // in the response's shape
+chat_responder.error_reply(reply) -> Reply // a host's own error after lowering, in the response's shape
 ```
 
 SGLang-only: Python's OpenAI layer (`entrypoints/openai/`) over the engine's
@@ -258,6 +266,14 @@ exactly is `Unsupported`, and the host sends it to the engine's own route.
 `/generate` output of a live engine, or on hand-written (`synthetic`) output.
 Chat splits reasoning with `think/`, and serves only the parser names
 `think/models/` ports.
+
+A `kimi_k3` chat encoding answers chat in Kimi-K3's shape (`openai/kimi_k3_wire.rs`,
+after `kimi_k3_wire.py`): `chatcmpl-` ids, deltas without null fields, a
+`reasoning_content: ""` frame where reasoning ends, tool calls opened with
+empty arguments, each choice's usage on its end frame, both usage details,
+`server_interrupted` for an abort, a stream that fails mid-response ending its
+choices, and errors under an `error` key. Its usage headers are not sent, and
+a stream asking for `internal_content` is `Unsupported`.
 
 ```rust
 chat_model.deepseek_output(reasoning_parser, tool_call_parser)? // Option<&DeepSeekOutput>
