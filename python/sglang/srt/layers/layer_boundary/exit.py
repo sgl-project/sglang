@@ -84,14 +84,16 @@ def _select_dp_reduce_scatter(
     OutputContract); None when the FFN reduces the output and only a scatter
     remains. Whether the reduce-scatter is usable follows the DP group, which
     an elastic scale-up changes, so it is read for each batch."""
-    if reduce_scatterv:
-        return dp_reduce_scatterv
+    # MAX_LEN rows are equal per rank: the fixed-size reduce-scatter is one
+    # collective, where reduce_scatterv issues one grouped ncclReduce per rank.
     if (
         may_reduce_scatter
         and forward_batch.dp_padding_mode.is_max_len()
         and can_use_dp_reduce_scatter()
     ):
         return dp_reduce_scatter
+    if reduce_scatterv:
+        return dp_reduce_scatterv
     return None
 
 
