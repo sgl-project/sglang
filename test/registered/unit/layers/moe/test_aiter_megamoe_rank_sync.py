@@ -25,6 +25,7 @@ def test_mlp_sync_retains_full_vector_without_tp_gather():
         can_run_draft_cuda_graph=False,
         can_run_prefill_cuda_graph=False,
         prefill_cuda_graph_max_prefix_len=0,
+        global_decode_graph_max_seq_len=None,
         tp0_info_cpu=torch.tensor(
             [
                 [32, 0, 0, 0, 0, ForwardMode.DECODE.value, 0],
