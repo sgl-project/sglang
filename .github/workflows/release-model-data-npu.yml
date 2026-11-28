@@ -13,6 +13,8 @@ on:
     # re-triggered for a PR.
     paths:
       - ".github/workflows/release-model-data-npu.yml"
+      # The single-node template the enabled case runs through.
+      - ".github/workflows/_npu-single-node-test-stage.yml"
   workflow_dispatch:
     inputs:
       image:
