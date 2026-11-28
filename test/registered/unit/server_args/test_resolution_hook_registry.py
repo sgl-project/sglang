@@ -263,5 +263,67 @@ class TestEndToEnd(_IsolatedRegistry):
         )
 
 
+class TestLMCacheFinalCapabilityValidation(_IsolatedRegistry):
+    """Reject LMCache if model resolution disables the radix cache it needs."""
+
+    def setUp(self):
+        super().setUp()
+        self._config_dir = tempfile.mkdtemp(prefix="lmcache_capability_")
+        self.addCleanup(shutil.rmtree, self._config_dir, ignore_errors=True)
+
+    def _args(self, *, embedding, enable_lmcache, disable_radix_cache=False):
+        config = dict(_MINI_CONFIG)
+        if embedding:
+            config.update(
+                architectures=["Gemma3TextModel"],
+                model_type="gemma3_text",
+                head_dim=8,
+                use_bidirectional_attention=True,
+                sliding_window=256,
+                layer_types=["full_attention", "sliding_attention"],
+            )
+        with open(os.path.join(self._config_dir, "config.json"), "w") as handle:
+            json.dump(config, handle)
+        return ServerArgs(
+            model_path=self._config_dir,
+            device="cuda",
+            attention_backend="triton",
+            disable_cuda_graph=True,
+            enable_lmcache=enable_lmcache,
+            disable_radix_cache=disable_radix_cache,
+        )
+
+    def test_lmcache_rejects_model_forced_disabled_radix_cache(self):
+        # The first cache gate sees radix enabled; the real model-capability
+        # hook disables it later for this bidirectional encoder config.
+        args = self._args(embedding=True, enable_lmcache=True)
+        with self.assertRaisesRegex(
+            ValueError, "--enable-lmcache requires radix cache to be enabled"
+        ):
+            args.resolve_once()
+
+    def test_lmcache_still_rejects_explicitly_disabled_radix_cache(self):
+        args = self._args(
+            embedding=False, enable_lmcache=True, disable_radix_cache=True
+        )
+        with self.assertRaisesRegex(
+            ValueError, "--enable-lmcache requires radix cache to be enabled"
+        ):
+            args.resolve_once()
+
+    def test_encoder_without_lmcache_keeps_disabled_radix_cache(self):
+        args = self._args(embedding=True, enable_lmcache=False)
+        args.resolve_once()
+        self.assertTrue(resolution_result(args, "is_embedding"))
+        self.assertTrue(resolution_result(args, "disable_radix_cache"))
+        self.assertFalse(resolution_result(args, "enable_lmcache"))
+
+    def test_decoder_with_lmcache_keeps_enabled_radix_cache(self):
+        args = self._args(embedding=False, enable_lmcache=True)
+        args.resolve_once()
+        self.assertFalse(resolution_result(args, "disable_radix_cache"))
+        self.assertTrue(resolution_result(args, "enable_lmcache"))
+
+
 if __name__ == "__main__":
     unittest.main()
