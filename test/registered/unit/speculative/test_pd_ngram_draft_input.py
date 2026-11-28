@@ -158,7 +158,7 @@ class TestPdNgramPromptSeeding(CustomTestCase):
             chunked_req=None,
             future_map=None,
             ngram_embedding_manager=MagicMock(),
-            _get_new_prebuilt_batch=lambda running_batch: batch,
+            _get_new_prebuilt_batch=lambda running_batch, num_joining_reqs=0: batch,
             _nonblocking_admit_in_scope=lambda batch: False,
             _verify_kv_checksums=lambda batch: None,
         )

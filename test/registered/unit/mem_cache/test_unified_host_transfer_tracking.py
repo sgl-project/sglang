@@ -207,6 +207,7 @@ class TestRestoreRecordedWhereMovesReadIt(CustomTestCase):
         )
         scheduler = SimpleNamespace(
             waiting_queue=[req],
+            disagg_decode_prebuilt_queue=None,
             tree_cache=_restoring_cache(streams),
             forward_stream=streams.forward,
             schedule_stream=streams.schedule,

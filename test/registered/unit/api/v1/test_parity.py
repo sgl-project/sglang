@@ -51,6 +51,8 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
         "conversation_id",
+        # PD decode local prefill; the Rust server does not plumb it yet.
+        "disagg_local_prefill",
         "encoder_urls",
         "external_trace_header",
         "http_worker_ipc",
