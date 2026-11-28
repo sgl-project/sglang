@@ -51,6 +51,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_TEST_CAP_DEVICE_MEMORY_GIB: float | None = None
     SGLANG_TEST_NUM_INFERENCE_STEPS: int | None = None
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_MAX_VERTEX_INSTANCES: int = 64
+    SGLANG_DIFFUSION_VERTEX_MAX_CONCURRENCY: int = 32
     SGLANG_DIFFUSION_DISABLE_AUTO_RESIDENCY: bool = False
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS: int = 64
     SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32: bool = False
@@ -338,6 +340,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Maximum number of `instances` a single POST /vertex_generate request
+    # may carry. Each instance fans out to its own scheduler forward, which
+    # holds a ZMQ REQ socket open until the reply arrives, so an unbounded
+    # list exhausts the HTTP process's file descriptors ("Too many open
+    # files"). Oversized requests are rejected with HTTP 413.
+    "SGLANG_DIFFUSION_MAX_VERTEX_INSTANCES": _lazy_int(
+        "SGLANG_DIFFUSION_MAX_VERTEX_INSTANCES", 64
+    ),
+    # Maximum number of /vertex_generate scheduler forwards in flight at
+    # once, across all requests. Bounds the ZMQ REQ sockets the HTTP process
+    # holds open even for batches within the instance limit.
+    "SGLANG_DIFFUSION_VERTEX_MAX_CONCURRENCY": _lazy_int(
+        "SGLANG_DIFFUSION_VERTEX_MAX_CONCURRENCY", 32
+    ),
     # Kill-switch for the warmup-calibrated auto residency promotion that runs
     # under `--performance-mode auto` with server warmup. Set to disable the
     # promotion without giving up the rest of the auto performance policy.

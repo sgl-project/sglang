@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from sglang.multimodal_gen import envs as diffusion_envs
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
 from sglang.multimodal_gen.runtime.entrypoints.action import api as action_api
@@ -660,10 +661,58 @@ async def forward_to_scheduler(
 vertex_router = APIRouter()
 
 
+# Bounds for POST /vertex_generate (see #52345): every instance fans out to
+# its own scheduler forward, each holding a ZMQ REQ socket open until the
+# reply arrives. Without a cap, one request with thousands of instances
+# exhausts the HTTP process's file descriptors ("Too many open files") and
+# degrades /health and the other generation endpoints.
+_vertex_forward_semaphore: asyncio.Semaphore | None = None
+
+
+def _vertex_instance_limit() -> int:
+    # A non-positive limit would reject every request (or deadlock the
+    # semaphore); clamp to 1 so a misconfigured env var degrades to
+    # one-instance-at-a-time instead of breaking the endpoint outright.
+    return max(1, diffusion_envs.SGLANG_DIFFUSION_MAX_VERTEX_INSTANCES)
+
+
+def _vertex_concurrency_limit() -> int:
+    return max(1, diffusion_envs.SGLANG_DIFFUSION_VERTEX_MAX_CONCURRENCY)
+
+
+def _get_vertex_forward_semaphore() -> asyncio.Semaphore:
+    global _vertex_forward_semaphore
+    if _vertex_forward_semaphore is None:
+        _vertex_forward_semaphore = asyncio.Semaphore(_vertex_concurrency_limit())
+    return _vertex_forward_semaphore
+
+
+def _validate_vertex_instances(instances: list[dict]) -> None:
+    limit = _vertex_instance_limit()
+    if len(instances) > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Too many instances in /vertex_generate request: "
+                f"{len(instances)} > {limit} "
+                f"(SGLANG_DIFFUSION_MAX_VERTEX_INSTANCES={limit})."
+            ),
+        )
+
+
+async def _forward_vertex_request(
+    semaphore: asyncio.Semaphore, req_obj: "Req", sp: SamplingParams
+):
+    async with semaphore:
+        return await forward_to_scheduler(req_obj, sp)
+
+
 @vertex_router.post(VERTEX_ROUTE)
 async def vertex_generate(vertex_req: VertexGenerateReqInput):
     if not vertex_req.instances:
         return orjson_response({"predictions": []})
+
+    _validate_vertex_instances(vertex_req.instances)
 
     server_args = get_global_server_args()
     params = vertex_req.parameters or {}
@@ -690,8 +739,14 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # validate every instance before creating coroutines or dispatching work
+    # Bound in-flight forwards: each one holds a ZMQ REQ socket open, so an
+    # unbounded gather exhausts file descriptors (see _validate_vertex_instances).
+    semaphore = _get_vertex_forward_semaphore()
     results = await asyncio.gather(
-        *(forward_to_scheduler(req, req.sampling_params) for req in requests)
+        *(
+            _forward_vertex_request(semaphore, req, req.sampling_params)
+            for req in requests
+        )
     )
 
     return orjson_response({"predictions": results})

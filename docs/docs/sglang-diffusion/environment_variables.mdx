@@ -49,6 +49,16 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable per-stage timing logs</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MAX_VERTEX_INSTANCES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>64</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum number of <code>instances</code> in a single <code>POST /vertex_generate</code> request. Oversized requests are rejected with HTTP 413. Each instance fans out to its own scheduler forward, so the cap protects the HTTP process from file-descriptor exhaustion.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_VERTEX_MAX_CONCURRENCY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>32</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Maximum number of <code>/vertex_generate</code> scheduler forwards in flight at once, across all requests. Bounds the ZMQ REQ sockets the HTTP process holds open.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_TORCH_PROFILER_DIR</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>not set</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Directory for the torch profiler traces of requests that ask for profiling (<code>profile</code> / <code>--profile</code>); it does not enable profiling by itself. Falls back to <code>SGLANG_TORCH_PROFILER_DIR</code>, then <code>./logs</code></td>
