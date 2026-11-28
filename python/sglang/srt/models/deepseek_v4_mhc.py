@@ -367,8 +367,7 @@ def mix_stats_from_state(
 ) -> HcTriplet:
     """``mix_stats``, unless the combine already stashed the triplet.
 
-    The A5 NPU combine (``mhc_pre_dpskv4`` with ``cann_recipes_infer_cann920``,
-    see ``_npu_combine_premix``) predicts
+    The NPU combine (``mhc_pre_dpskv4``, see ``_npu_combine_premix``) predicts
     this sublayer's ``(pre, post, comb)`` as a by-product and parks it on
     ``state.stats``.  This consumes the fused operator's coefficients exactly
     like the target model does (``precomputed=state.stats`` through
@@ -383,10 +382,6 @@ def mix_stats_from_state(
 
 
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
-    if _is_npu and not is_npu_arch35() and hc.cfg.pre_from_prev:
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
-
-        return mix_stats_torch(hc, x)
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
         hc_mix_stats_sinkhorn,
@@ -555,18 +550,7 @@ def _npu_combine_premix(
     x: torch.Tensor,
     apply_pre: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """A5 single-pass mHC pre-mix + coefficient prediction.
-
-    ``combine`` collapses the streams and ``mix_stats`` predicts the triplet in
-    two steps elsewhere; the AscendC kernel does both in one launch -- it folds
-    the residual with the *previous* sublayer's pre-mix and returns this
-    sublayer's own ``(pre, post, comb)``. Those coefficients are stashed on
-    ``state.stats``, which ``_compute_triplet`` prefers over re-predicting, so the
-    post that follows consumes them.
-
-    Recipes: models/deepseek_v4_1/models/modules/op_impls/mhc.py L57-L71
-    (``hc_pre_ascendc``) and modeling_deepseek.py L1621-L1624 / L1638-L1640.
-    """
+    """Fold the previous pre-mix and cache the current triplet in one NPU call."""
     cfg = hc.cfg
     if x.shape[0] == 0:
         # Idle / DP-padding rank: nothing to mix, and the coefficient writers
@@ -577,12 +561,6 @@ def _npu_combine_premix(
             x.new_empty((0, cfg.mult, cfg.mult), dtype=torch.float32),
         )
         return hc.norm(x[:, 0, :])
-    if not is_npu_arch35():
-        from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import mix_stats_torch
-
-        state.stats = mix_stats_torch(hc, x)
-        mixed = x[:, 0, :] if apply_pre is None else combine_premix(x, apply_pre)
-        return hc.norm(mixed)
     if apply_pre is None:
         # The first sublayer has no previous pre-mix to fold; seed the identity
         # one-hot (stream 0 on its own).
@@ -601,7 +579,6 @@ def _npu_combine_premix(
         cfg.rms_eps,
         pre_mix=apply_pre,
         return_pre=True,
-        impl="cann_recipes_infer_cann920",
     )
     state.stats = (pre, post_mix, comb)
     return hc.norm(y)

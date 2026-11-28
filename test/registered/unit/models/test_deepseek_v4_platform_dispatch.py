@@ -277,7 +277,7 @@ class TestNpuMhcSeam(unittest.TestCase):
             rows * self.MULT * self.HIDDEN, dtype=torch.float32
         ).reshape(rows, self.MULT, self.HIDDEN)
 
-    def test_npu_combine_folds_the_previous_premix_and_stashes_the_triplet(self):
+    def test_npu_combine_uses_previous_pre_mix_and_stashes_stats(self):
         hc = self._sub_layer()
         x = self._residual()
         pre_prev = torch.full((2, self.MULT), 0.25)
@@ -298,10 +298,11 @@ class TestNpuMhcSeam(unittest.TestCase):
         stub.mhc_pre_dpskv4 = fake_pre_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.object(mhc, "is_npu_arch35", return_value=True),
+            patch.object(mhc, "is_npu_arch35", return_value=False),
             patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
             out = mhc.combine(hc, state)
+            self.assertIs(mhc.mix_stats_from_state(hc, x, state), state.stats)
 
         torch.testing.assert_close(out, x.float().mean(1))
         # The residual, the layer's weights and the flow config go in
@@ -315,17 +316,17 @@ class TestNpuMhcSeam(unittest.TestCase):
         self.assertEqual(args[5], 20)
         self.assertEqual(args[6], 1e-6)
         self.assertEqual(args[7], 1e-6)
-        # The previous pre-mix is folded in and the pre-mix is requested back.
-        self.assertIs(seen["kwargs"]["pre_mix"], pre_prev)
+        # V2 receives the previous pre-mix and returns the current triplet.
+        self.assertEqual(set(seen["kwargs"]), {"pre_mix", "return_pre"})
         self.assertIs(seen["kwargs"]["return_pre"], True)
-        self.assertEqual(seen["kwargs"]["impl"], "cann_recipes_infer_cann920")
+        self.assertIs(seen["kwargs"]["pre_mix"], pre_prev)
         # ``mix_stats`` is skipped: the post reads the stashed coefficients.
         pre, post_mix, comb = state.stats
         torch.testing.assert_close(pre, torch.full((2, self.MULT), 0.5))
         torch.testing.assert_close(post_mix, torch.ones(2, self.MULT))
         torch.testing.assert_close(comb, torch.ones(2, self.MULT, self.MULT))
 
-    def test_npu_first_sublayer_seeds_the_identity_one_hot(self):
+    def test_npu_first_sublayer_seeds_stream_zero_one_hot(self):
         hc = self._sub_layer()
         x = self._residual()
         state = mhc.HcState(x)  # no previous pre-mix
@@ -351,13 +352,15 @@ class TestNpuMhcSeam(unittest.TestCase):
             out = mhc.combine(hc, state)
 
         torch.testing.assert_close(out, x[:, 0, :])
-        # Recipes seeds the first sublayer with the identity one-hot, i.e. the
+        # V2 receives the identity one-hot, i.e. the
         # plain ``norm(x[:, 0, :])`` of the device-agnostic path.
         expected = torch.zeros(2, self.MULT)
         expected[:, 0] = 1.0
         pre_mix = seen["kwargs"]["pre_mix"]
         self.assertEqual(pre_mix.dtype, torch.float32)
         torch.testing.assert_close(pre_mix, expected)
+        self.assertEqual(set(seen["kwargs"]), {"pre_mix", "return_pre"})
+        self.assertIs(seen["kwargs"]["return_pre"], True)
 
     def test_npu_empty_batch_skips_the_kernel(self):
         hc = self._sub_layer()
