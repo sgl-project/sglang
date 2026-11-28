@@ -15,7 +15,7 @@ from sglang.benchmark.datasets.common import (
     compute_random_lens,
     first_two_sharegpt_turns,
 )
-from sglang.benchmark.utils import download_and_cache_hf_file, is_file_valid_json
+from sglang.benchmark.utils import download_and_cache_hf_file
 
 
 @dataclass
@@ -86,7 +86,7 @@ def sample_random_requests(
         # Sample token ids from ShareGPT and repeat/truncate them to satisfy the input_lens
 
         # Download sharegpt if necessary
-        if not is_file_valid_json(dataset_path):
+        if dataset_path == "":
             dataset_path = download_and_cache_hf_file(
                 repo_id=SHAREGPT_REPO_ID,
                 filename=SHAREGPT_FILENAME,
