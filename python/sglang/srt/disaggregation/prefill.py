@@ -38,7 +38,7 @@ from sglang.srt.disaggregation.checksum import (
     page_indices_for_request,
     state_indices_for_request,
 )
-from sglang.srt.disaggregation.common.conn import CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager, KVTransferError
 from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
@@ -46,12 +46,14 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.utils import (
+    ABORT_REASON_PEER,
     CustomizedInfoError,
     KVClassType,
     MetadataBuffers,
     NetworkTransferWaiter,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    TransferOutcome,
     answered_by_prefill,
     build_kv_layer_ids,
     build_staging_slot_metadata,
@@ -60,12 +62,15 @@ from sglang.srt.disaggregation.utils import (
     get_kv_transfer_buf_infos,
     get_pd_kv_layout,
     get_qsa_pending_state_indices,
+    is_abort_failure_reason,
     is_aborted,
     is_mla_backend,
     is_unadmitted_reject,
     kv_layout_signature,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
+    poll_transfer_outcomes_attn_cp_tp_group,
+    poll_transfer_outcomes_prefill_pp,
     prepare_abort,
     record_network_transfer,
     setup_page_row_kv_args,
@@ -1465,9 +1470,9 @@ class SchedulerDisaggregationPrefillMixin:
         senders = [req.disagg_kv_sender for req in transfer_queue]
         parallel = get_parallel()
         if parallel.pp_size > 1:
-            # PP0 decides from every stage's status and forwards the decision,
-            # so every stage releases the same requests the same way.
-            polls = poll_and_all_reduce_prefill_pp(
+            # PP0 decides from every stage's status; each stage applies the
+            # decision so all stages release the same requests the same way.
+            polls, outcomes = poll_transfer_outcomes_prefill_pp(
                 senders,
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
@@ -1476,7 +1481,6 @@ class SchedulerDisaggregationPrefillMixin:
                 parallel.pp_size,
                 self.pp_transfer_poll_send_window,
                 P2PTag.DISAGG_TRANSFER_PP_SYNC,
-                release=True,
             )
             if parallel.pp_rank > 0:
                 for sender, poll in zip(senders, polls):
@@ -1485,14 +1489,14 @@ class SchedulerDisaggregationPrefillMixin:
                         # end, transfer latency); PP0 made the decision.
                         sender.poll()
         else:
-            polls = poll_and_all_reduce_attn_cp_tp_group(
+            polls, outcomes = poll_transfer_outcomes_attn_cp_tp_group(
                 senders,
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
             )
 
         # Check .poll() for the reqs in disagg_prefill_transfer_queue. If Success, respond to the client and remove it from the queue
-        for req, poll in zip(transfer_queue, polls):
+        for req, poll, outcome in zip(transfer_queue, polls, outcomes):
             if req.pending_bootstrap:
                 # Parked: prefill finished before bootstrap completed.
                 if self.handle_pending_bootstrap(req, poll):
@@ -1557,7 +1561,9 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
-                self.handle_inflight_transfer_failure(req)
+                self.handle_inflight_transfer_failure(
+                    req, aborted_by_request=outcome == TransferOutcome.ABORT
+                )
                 done_reqs.append(req)
             else:
                 raise RuntimeError(
@@ -1601,30 +1607,49 @@ class SchedulerDisaggregationPrefillMixin:
 
         return done_reqs
 
-    def handle_inflight_transfer_failure(self: Scheduler, req: Req) -> None:
+    def handle_inflight_transfer_failure(
+        self: Scheduler, req: Req, aborted_by_request: bool = False
+    ) -> None:
         """Conclude an inflight request whose KV transfer failed."""
         error_message = (
             f"Prefill transfer failed for request rank={get_parallel().tp_rank} "
             f"{req.rid=} {req.bootstrap_room=}"
         )
-        exc: Optional[Exception] = None
+        # aborted_by_request is the classification agreed across ranks; this
+        # rank's own exception is only logged, since a rank that succeeded has none.
+        is_aborted_by_request = (
+            isinstance(req.finished_reason, FINISH_ABORT) or aborted_by_request
+        )
+        exc: Optional[KVTransferError] = None
         try:
             req.disagg_kv_sender.failure_exception()
-        except Exception as e:
+        except KVTransferError as e:
             exc = e
             error_message += f" with exception {e}"
-        # Mute error message for propagated exceptions to avoid duplicate logging
-        if getattr(exc, "is_from_another_rank", False):
+        except Exception as e:
+            error_message += f" with exception {e}"
+        is_propagated = exc is not None and exc.is_from_another_rank
+        # Mute propagated exceptions and requested aborts to avoid noisy logging
+        if is_propagated or is_aborted_by_request:
             logger.debug(error_message)
         else:
             logger.warning(error_message)
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_message})
         if not isinstance(req.finished_reason, FINISH_ABORT):
-            prepare_abort(
-                req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
-            )
+            if is_aborted_by_request:
+                # This rank's own reason when it recorded one; a rank that
+                # succeeded locally only knows a peer recorded an abort.
+                reason = exc.failure_reason if exc is not None else None
+                prepare_abort(
+                    req,
+                    reason if is_abort_failure_reason(reason) else ABORT_REASON_PEER,
+                )
+            else:
+                prepare_abort(
+                    req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+                )
         self.request_retirer.release(req, checkpoint=False)
-        if self.metrics_reporter.enable_metrics:
+        if self.metrics_reporter.enable_metrics and not is_aborted_by_request:
             self.metrics_collector.increment_transfer_failed_reqs()
 
     def _retire_aborted_prefill_result(self: Scheduler, req: Req) -> bool:

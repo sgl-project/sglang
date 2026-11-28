@@ -7,7 +7,7 @@ import random
 import time
 from collections import deque
 from contextlib import nullcontext
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -123,6 +123,27 @@ def poll_and_all_reduce_pp(
     ]
 
 
+# Failure reasons recorded for a transfer the client or decode asked to stop.
+ABORT_REASON_REQUEST = "Aborted by AbortReq."
+ABORT_REASON_DECODE = "Aborted by decode-side abort notification."
+# Reported by a rank that succeeded locally when the agreed outcome is an abort.
+ABORT_REASON_PEER = "Aborted by a requested abort on another rank."
+_ABORT_FAILURE_REASONS = frozenset({ABORT_REASON_REQUEST, ABORT_REASON_DECODE})
+
+
+def is_abort_failure_reason(failure_reason: Optional[str]) -> bool:
+    return failure_reason in _ABORT_FAILURE_REASONS
+
+
+class TransferOutcome(IntEnum):
+    """Terminal outcome of a prefill KV transfer, derived on every rank from
+    the agreed poll and abort flags (see _all_reduce_transfer_outcomes)."""
+
+    ERROR = 0
+    ABORT = 1
+    SUCCESS = 2
+
+
 def poll_and_all_reduce_prefill_pp(
     pollers: List[CommonKVSender],
     attn_cp_cpu_group: dist.ProcessGroup,
@@ -132,13 +153,12 @@ def poll_and_all_reduce_prefill_pp(
     pp_size: int,
     pp_poll_send_window: PPSyncSendWindow,
     p2p_tag: P2PTag,
-    release: bool = False,
 ) -> List[int]:
     """PP0 polls every stage's status and forwards its polls to the other
-    stages. With release, a transfer concludes only once every stage has."""
+    stages."""
     polls: List[int] = []
     if pp_rank == 0:
-        polls = _poll_with_failure_injection_pp(pollers, release=release)
+        polls = _poll_with_failure_injection_pp(pollers)
         polls = _all_reduce_polls(polls, attn_tp_cpu_group)
         polls = _all_reduce_polls(polls, attn_cp_cpu_group)
     # Propagate PP0's data to other ranks
@@ -146,6 +166,39 @@ def poll_and_all_reduce_prefill_pp(
         polls, pp_group, pp_rank, pp_size, pp_poll_send_window, p2p_tag
     )
     return polls
+
+
+def poll_transfer_outcomes_prefill_pp(
+    pollers: List[CommonKVSender],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    pp_group: GroupCoordinator,
+    pp_rank: int,
+    pp_size: int,
+    pp_poll_send_window: PPSyncSendWindow,
+    p2p_tag: P2PTag,
+) -> Tuple[List[int], List[Optional[TransferOutcome]]]:
+    """PP0 decides polls and outcomes for every stage; a transfer concludes
+    only once every stage has."""
+    decision = None
+    if pp_rank == 0:
+        polls = _poll_with_failure_injection_pp(pollers, release=True)
+        abort_only = [
+            int(
+                poll != KVPoll.Failed
+                or poller.is_failure_requested_abort_pp_consensus()
+            )
+            for poll, poller in zip(polls, pollers)
+        ]
+        decision = _all_reduce_transfer_outcomes(
+            polls=polls,
+            abort_only=abort_only,
+            attn_cp_cpu_group=attn_cp_cpu_group,
+            attn_tp_cpu_group=attn_tp_cpu_group,
+        )
+    return pp_sync_polls(
+        decision, pp_group, pp_rank, pp_size, pp_poll_send_window, p2p_tag
+    )
 
 
 def get_dsa_seed_metadata_dim(hf_config) -> int:
@@ -617,6 +670,49 @@ def poll_and_all_reduce_attn_cp_tp_group(
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.
     return _all_reduce_polls(polls, attn_cp_cpu_group)
+
+
+def poll_transfer_outcomes_attn_cp_tp_group(
+    pollers,
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> Tuple[List[int], List[Optional[TransferOutcome]]]:
+    """Poll senders and agree on polls and terminal outcomes across attn TP/CP."""
+    polls = _poll_with_failure_injection(pollers)
+    # A rank that succeeded locally has no failure reason and stays neutral.
+    abort_only = [
+        int(poll != KVPoll.Failed or poller.is_failure_requested_abort())
+        for poll, poller in zip(polls, pollers)
+    ]
+    return _all_reduce_transfer_outcomes(
+        polls=polls,
+        abort_only=abort_only,
+        attn_cp_cpu_group=attn_cp_cpu_group,
+        attn_tp_cpu_group=attn_tp_cpu_group,
+    )
+
+
+def _all_reduce_transfer_outcomes(
+    polls: List[int],
+    abort_only: List[int],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+) -> Tuple[List[int], List[Optional[TransferOutcome]]]:
+    # MIN over both groups: an error on any rank outranks an abort on another.
+    reduced = _all_reduce_polls(polls + abort_only, attn_tp_cpu_group)
+    reduced = _all_reduce_polls(reduced, attn_cp_cpu_group)
+    polls, abort_only = reduced[: len(polls)], reduced[len(polls) :]
+    outcomes: List[Optional[TransferOutcome]] = []
+    for poll, is_abort in zip(polls, abort_only):
+        if poll == KVPoll.Success:
+            outcomes.append(TransferOutcome.SUCCESS)
+        elif poll == KVPoll.Failed:
+            outcomes.append(
+                TransferOutcome.ABORT if is_abort else TransferOutcome.ERROR
+            )
+        else:
+            outcomes.append(None)
+    return polls, outcomes
 
 
 def poll_and_all_reduce_with_staging(
