@@ -30,6 +30,36 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.memory_pool import KVCache
 
+_MAX_STAGED_CHUNKS = 256
+
+
+def _compact_staged_pages(staged_pages: list[torch.Tensor]) -> None:
+    """Bound staged tensor count with O(1) amortized copies (size-decreasing tail merge)."""
+    if len(staged_pages) < _MAX_STAGED_CHUNKS:
+        return
+    tail_sum = 0
+    split = len(staged_pages)
+    while split > 0 and (
+        split > len(staged_pages) - 2 or staged_pages[split - 1].numel() <= tail_sum
+    ):
+        split -= 1
+        tail_sum += staged_pages[split].numel()
+    staged_pages[split:] = [torch.cat(staged_pages[split:])]
+
+
+def _concat_free_and_staged(
+    free_pages: torch.Tensor, staged_pages: list[torch.Tensor]
+) -> torch.Tensor:
+    if not staged_pages:
+        return free_pages
+    if (
+        len(free_pages) == 0
+        and len(staged_pages) == 1
+        and staged_pages[0].dtype == free_pages.dtype
+    ):
+        return staged_pages[0]
+    return torch.cat((free_pages, *staged_pages))
+
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
     # alloc_decode accepts req_to_token_write (one-launch alloc + req_to_token write).

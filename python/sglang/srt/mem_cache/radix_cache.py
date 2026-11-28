@@ -569,11 +569,11 @@ class RadixCache(BasePrefixCache):
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
+        evicted_values: List[torch.Tensor] = []
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            # Tree values are page-aligned copies of a kv row: page-exact segment.
-            self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
+            evicted_values.append(x.value)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
@@ -582,6 +582,16 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self.kv_events.record_remove(x)
+
+        if evicted_values:
+            # Tree values are page-aligned copies of a kv row, so their
+            # concatenation stays page-aligned and frees in a single call.
+            freed = (
+                evicted_values[0]
+                if len(evicted_values) == 1
+                else torch.cat(evicted_values)
+            )
+            self.token_to_kv_pool_allocator.free_segment(freed, start_pos=0)
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)

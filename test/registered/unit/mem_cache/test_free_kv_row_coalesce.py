@@ -72,11 +72,11 @@ def _make_cache_with_row(num_tokens):
 class TestFreeKvRowCoalesce(unittest.TestCase):
     def test_adjacent_ranges_split_mid_page_free_every_page_once(self):
         cache, alloc, row, kv = _make_cache_with_row(3 * PAGE_SIZE)
-        before = len(alloc.free_pages)
+        before = len(alloc.get_all_free_pages())
         # Kept prefix [0, 8); the unaligned tail [8, 9) and the deferred
         # truncation tail [9, 24) meet at 9, inside page 1.
         cache.free_kv_row(kv, [(8, 9), (9, 3 * PAGE_SIZE)])
-        freed = alloc.free_pages[: len(alloc.free_pages) - before]
+        freed = alloc.get_all_free_pages()[before:]
         reference = torch.unique(row[8:] // PAGE_SIZE)
         self.assertTrue(torch.equal(torch.sort(freed)[0], reference))
 
