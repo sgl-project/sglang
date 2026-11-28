@@ -264,6 +264,36 @@ against 8 of 18 with the current references. Leaving out one day at a time,
 to 23% above the pool's minimum; the minimum rule leaves those runs failing
 rather than widening the pool's references to cover them.
 
+### Hunyuan3D shape denoising on `computable-e`
+
+For `hunyuan3d_shape_gen`, the fastest measured 50-step shape denoising stage
+across 84 single-H100 jobs on this pool (November 3–15, 2026) was
+[1990.09 ms](https://github.com/sgl-project/sglang/actions/runs/41990846147/job/127122908135).
+The existing 25% tolerance gives this stage a 2487.61 ms limit. The average,
+median and sampled steps also guard the denoising loop. On 31 later jobs (November 16–20),
+replaying the logged performance checks increased first-attempt passes from
+3 to 16, and jobs with a passing attempt from 19 to 31.
+
+### FastHunyuan VAE decode at `quality="exact"`
+
+`fast_hunyuan_video` has a consistency golden, so its request runs at
+`quality="exact"`. Since #50806, the Hunyuan VAE decoder runs the fused
+GroupNorm+SiLU kernel only while its `VaeFastPathGate` is on, and the gate is off
+at `exact`, because the fused kernel is not bit-identical to eager
+`GroupNorm` → `SiLU`. `DecodingStage` went from about 3.5 s to about 5.3 s on
+every H100 pool, while denoising did not change (#53413).
+
+The shared E2E and `DecodingStage` references follow the calibration policy in
+the file metadata: the maximum over 9 measurements in 7 `computable-e` jobs from
+November 21–26, 2026, plus 5%. The maximum E2E was
+[11273.92 ms](https://github.com/sgl-project/sglang/actions/runs/45330088512/job/138229283688),
+giving 11837.62 ms. The maximum decode was
+[5314.89 ms](https://github.com/sgl-project/sglang/actions/runs/45788354474/job/139809952138),
+giving 5580.63 ms. Replaying the logged checks of 8 `computable-d` jobs from
+November 20–26 raises the jobs with a passing attempt from 2 to 8. All 7
+`computable-e` jobs pass under both the old and the new references. No
+`runner_overrides` entry is needed.
+
 ## Initial loading references
 
 The initial H100 loading references cover 28 cases with at least three distinct

@@ -27,6 +27,7 @@ from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.ernie55_detector import Ernie5_5Detector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
+from sglang.srt.function_call.gigachat4_detector import GigaChat4Detector
 from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
 from sglang.srt.function_call.glm4_moe_detector import (
     Glm4MoeDetector,
@@ -80,7 +81,7 @@ class FunctionCallParser:
     Parser for function/tool calls in model outputs.
 
     This class handles both streaming and non-streaming parsing of function calls using a detector.
-    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_increment
+    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_segments
     and returns the resulting normal_text and calls to the upper layer (or SSE).
     """
 
@@ -127,6 +128,7 @@ class FunctionCallParser:
         "hunyuan": HunyuanDetector,
         "gigachat3": GigaChat3Detector,
         "gigachat35": GigaChat35Detector,
+        "gigachat4": GigaChat4Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
         "inkling2": Inkling2Detector,
@@ -303,9 +305,37 @@ class FunctionCallParser:
         else:
             return full_text, []
 
+    def parse_stream_segments(
+        self, chunk_text: str
+    ) -> list[Tuple[str, list[ToolCallItem]]]:
+        """Parse a streamed chunk into (normal_text, calls) segments.
+
+        Each segment is sent text first, then calls; the segments are in
+        generation order.
+        """
+        leading_text = ""
+        if self._stream_phase is not None:
+            leading_text, chunk_text = self._advance_stream_phase(chunk_text)
+            if chunk_text is None:
+                return [(leading_text, [])]
+        if not self.tools and not self.detector.parses_without_tools():
+            return [(leading_text + chunk_text, [])]
+        segments = [
+            (result.normal_text, result.calls)
+            for result in self.detector.parse_streaming_segments(chunk_text, self.tools)
+        ]
+        if leading_text:
+            # It precedes anything the detector parsed in the chunk.
+            text, calls = segments[0]
+            segments[0] = (leading_text + text, calls)
+        return segments
+
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
         Streaming incremental parsing of chunks of text as they arrive.
+
+        parse_stream_segments merged into one pair, for callers that do not
+        depend on the order of text and calls.
 
         Args:
             chunk_text: The new chunk of text to parse
@@ -315,24 +345,11 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        leading_text = ""
-        if self._stream_phase is not None:
-            leading_text, chunk_text = self._advance_stream_phase(chunk_text)
-            if chunk_text is None:
-                return leading_text, []
-        if not self.tools and not self.detector.parses_without_tools():
-            return leading_text + chunk_text, []
-        final_normal_text = ""
-        final_calls = []
-
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
-        if sp_result.normal_text:
-            final_normal_text = sp_result.normal_text
-        if sp_result.calls:
-            final_calls.extend(sp_result.calls)
-            final_normal_text = sp_result.normal_text
-
-        return leading_text + final_normal_text, final_calls
+        normal_text, calls = "", []
+        for text, segment_calls in self.parse_stream_segments(chunk_text):
+            normal_text += text
+            calls.extend(segment_calls)
+        return normal_text, calls
 
     def _advance_stream_phase(self, chunk_text: str) -> Tuple[str, Optional[str]]:
         # Returns the text to emit as is, and the text for the detector or None.

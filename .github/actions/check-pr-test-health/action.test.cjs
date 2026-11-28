@@ -15,6 +15,8 @@ const run = new (Object.getPrototypeOf(async function () {}).constructor)(
 async function check({
   snapshot = [], live = [], lint = 'success', event = 'pull_request',
   failedJobNames = ['model-test'], jobs, independentTestJobPrefix = '',
+  lintErrors = [], jobErrors = [], quotaWait = () => assert.fail('unexpected quota wait'),
+  maxQuotaWaitMinutes = '2', pageSizes = [],
 } = {}) {
   const failures = [];
   let labelReads = 0;
@@ -22,9 +24,12 @@ async function check({
   const labels = names => names.map(name => ({ name }));
   const github = {
     rest: {
-      checks: { listForRef: async () => ({ data: { check_runs: [
-        { app: { slug: 'github-actions' }, status: 'completed', conclusion: lint },
-      ] } }) },
+      checks: { listForRef: async () => {
+        if (lintErrors.length) throw lintErrors.shift();
+        return { data: { check_runs: [
+          { app: { slug: 'github-actions' }, status: 'completed', conclusion: lint },
+        ] } };
+      } },
       pulls: { get: async args => {
         assert.equal(args.pull_number, 42);
         labelReads++;
@@ -36,8 +41,11 @@ async function check({
       } },
       actions: { listJobsForWorkflowRun: () => {} },
     },
-    paginate: async () => {
+    paginate: async (endpoint, params) => {
+      assert.equal(endpoint, github.rest.actions.listJobsForWorkflowRun);
+      pageSizes.push(params.per_page);
       jobReads++;
+      if (jobErrors.length) throw jobErrors.shift();
       return jobs || failedJobNames.map(name => ({
         name, status: 'completed', conclusion: 'failure',
         steps: [{ name: 'Run test', conclusion: 'failure' }],
@@ -50,7 +58,8 @@ async function check({
       ? { pull_request: { number: 42, head: { sha: 'head' }, labels: labels(snapshot) } }
       : {},
   }, { info: () => {}, setFailed: message => failures.push(message) },
-     { env: { GITHUB_WORKSPACE: WORKSPACE, INDEPENDENT_TEST_JOB_PREFIX: independentTestJobPrefix } }, require);
+     { env: { GITHUB_WORKSPACE: WORKSPACE, INDEPENDENT_TEST_JOB_PREFIX: independentTestJobPrefix,
+       MAX_QUOTA_WAIT_MINUTES: maxQuotaWaitMinutes } }, name => name === 'node:timers/promises' ? { setTimeout: quotaWait } : require(name));
   return { failures, labelReads, jobReads };
 }
 
@@ -190,4 +199,63 @@ test('the generic action still blocks real roots behind a coverage summary', asy
   ] });
   assert.match(result.failures[0], /base-b-diffusion-test-1-gpu-small/);
   assert.doesNotMatch(result.failures[0], /coverage-check/);
+});
+
+function quotaError(seconds = 100, remaining = '0') {
+  return Object.assign(new Error('GitHub rejected the read'), {
+    status: 403, response: { headers: {
+      'x-ratelimit-remaining': remaining,
+      'x-ratelimit-reset': String(Math.floor(Date.now() / 1000) + seconds),
+    } },
+  });
+}
+
+test('a near quota reset retries the read and preserves a failed lint gate', async () => {
+  const waits = [];
+  const result = await check({ lintErrors: [quotaError()], lint: 'failure',
+    quotaWait: ms => waits.push(ms) });
+  assert.equal(waits.length, 1);
+  assert.ok(waits[0] >= 1000 && waits[0] <= 101_000);
+  assert.deepEqual(result, { failures: ['Fail-fast: lint check failed'], labelReads: 0, jobReads: 0 });
+});
+
+test('a jobs read retries once and still blocks on a failed job', async () => {
+  const result = await check({ jobErrors: [quotaError()], quotaWait: () => {} });
+  assert.equal(result.jobReads, 2);
+  assert.deepEqual(result.failures, ['Fail-fast: skipping — root cause job(s): model-test']);
+});
+
+test('a gateway error retries the full jobs listing with smaller pages', async () => {
+  const pageSizes = [];
+  const result = await check({ jobErrors: [{ status: 502 }], pageSizes });
+  assert.deepEqual(pageSizes, [100, 30]);
+  assert.deepEqual(result.failures, ['Fail-fast: skipping — root cause job(s): model-test']);
+});
+
+test('a second gateway error fails the check', async () => {
+  const error = Object.assign(new Error('Gateway timeout'), { status: 504 });
+  const pageSizes = [];
+  await assert.rejects(check({ jobErrors: [error, error], pageSizes }), err => err === error);
+  assert.deepEqual(pageSizes, [100, 30]);
+});
+
+test('diffusion can wait for a ten-minute reset and still enforces lint', async () => {
+  const waits = [];
+  const result = await check({ lintErrors: [quotaError(603)], lint: 'failure',
+    maxQuotaWaitMinutes: '12', quotaWait: ms => waits.push(ms) });
+  assert.equal(waits.length, 1);
+  assert.ok(waits[0] >= 602_000 && waits[0] <= 604_000);
+  assert.deepEqual(result.failures, ['Fail-fast: lint check failed']);
+  const tooLate = quotaError(730);
+  await assert.rejects(check({ lintErrors: [tooLate], maxQuotaWaitMinutes: '12' }),
+    err => err === tooLate);
+});
+
+test('another quota failure, a long reset or a permission error still fails the check', async () => {
+  const repeated = quotaError();
+  await assert.rejects(check({ lintErrors: [quotaError()], jobErrors: [repeated],
+    quotaWait: () => {} }), err => err === repeated);
+  for (const error of [quotaError(600), quotaError(100, '24'), quotaError(NaN)]) {
+    await assert.rejects(check({ lintErrors: [error] }), err => err === error);
+  }
 });

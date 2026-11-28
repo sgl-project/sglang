@@ -295,6 +295,7 @@ async def init_multi_tokenizer() -> ServerArgs:
         completion_template=get_serving().completion_template,
     )
 
+    tokenizer_manager.max_req_len = scheduler_info["max_req_len"]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
@@ -981,6 +982,8 @@ async def generate_request(obj: GenerateReqInput, request: Request):
     contract_error = generate_contract_error(await request.json())
     if contract_error is not None:
         return ORJSONResponse(status_code=400, content={"error": contract_error})
+    # The streaming response holds `request` until the request finishes.
+    request.__dict__.pop("_json", None)
     return await serve_generate_request(obj, request)
 
 
@@ -993,11 +996,26 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     if obj.stream:
 
         async def stream_results() -> AsyncIterator[bytes]:
+            # A client may stop reading at a request's finishing event; a proxy
+            # that has not read [DONE] by then sees a cancelled stream. So a
+            # single request's last event, and an error event, go out in one
+            # write with [DONE]. A batch (several prompts, or n > 1) still
+            # writes [DONE] on its own. The tokenizer manager sets is_single
+            # when it normalizes obj, before the first output; one that
+            # normalizes a copy leaves it unset, which reads as a batch.
+            done_sent = False
             try:
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + dumps_json(out) + b"\n\n"
+                    event = b"data: " + dumps_json(out) + b"\n\n"
+                    if (
+                        getattr(obj, "is_single", False)
+                        and out["meta_info"]["finish_reason"] is not None
+                    ):
+                        event += b"data: [DONE]\n\n"
+                        done_sent = True
+                    yield event
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
                 # cancellation, not a server error or bad input -- log it and
@@ -1015,8 +1033,10 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                     }
                 }
                 logger.error(f"[http_server] Error: {e}")
-                yield b"data: " + dumps_json(out) + b"\n\n"
-            yield b"data: [DONE]\n\n"
+                yield b"data: " + dumps_json(out) + b"\n\ndata: [DONE]\n\n"
+                done_sent = True
+            if not done_sent:
+                yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
             stream_results(),
@@ -1225,6 +1245,18 @@ async def hicache_storage_backend_status():
             "hicache_write_policy",
         )
     }
+
+
+@app.api_route("/unified-cache/external-linker", methods=["PUT", "DELETE"])
+async def update_cache_linker(request: Request):
+    """Re-attach (PUT) or detach (DELETE) the launch-time external linker while all schedulers are idle."""
+    ret = await _global_state.tokenizer_manager.update_cache_linker(
+        attach=request.method == "PUT"
+    )
+    return ORJSONResponse(
+        msgspec_to_builtins(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 # example usage:
@@ -2345,11 +2377,60 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     return MINIMUM_PNG_PICTURE_BASE64
 
 
+def _vlm_warmup_generate_request(
+    model_info: dict, max_new_tokens: int
+) -> Dict[str, Any]:
+    """The VLM startup warmup as a ``/generate`` request: its image, and the
+    prompt the chat path renders for a user message with that image and
+    "Describe the image.". A P/D prefill server adds its fake bootstrap."""
+    image_url = f"data:image/png;base64,{_get_vlm_warmup_image_base64(model_info)}"
+    tokenizer_manager = _global_state.tokenizer_manager
+    serving_chat = tokenizer_manager.serving_chat_class(
+        tokenizer_manager, _global_state.template_manager
+    )
+    chat_request = ChatCompletionRequest(
+        model=tokenizer_manager.served_model_name,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                    {"type": "text", "text": "Describe the image."},
+                ],
+            }
+        ],
+    )
+    rendered, _ = serving_chat._convert_to_internal_request(chat_request)
+    prompt = (
+        {"text": rendered.text}
+        if rendered.text is not None
+        else {"input_ids": rendered.input_ids}
+    )
+    return {
+        **prompt,
+        "image_data": [image_url],
+        "sampling_params": {"temperature": 0, "max_new_tokens": max_new_tokens},
+    }
+
+
+def _is_vlm_warmup_model(model_info: dict) -> bool:
+    # A language-only worker may advertise VLM capability for encoder
+    # disaggregation, but its local warmup must stay on the text path.
+    return (
+        bool(model_info.get("has_image_understanding", False))
+        and not get_disagg().language_only
+        and not get_disagg().language_model_only
+        and not get_exec().features.enable_encoder_swa_bounded_replay
+        and not is_mps()
+    )
+
+
 async def _send_disaggregation_warmup_requests(
     url: str,
     headers: Dict[str, str],
     ssl_verify: Union[bool, str],
     timeout: int,
+    vlm_warmup: Optional[Dict[str, Any]] = None,
 ) -> List[int]:
     ssl_context = (
         ssl_verify
@@ -2369,6 +2450,13 @@ async def _send_disaggregation_warmup_requests(
             "input_ids": [10, 11, 12, 13],
             "routed_dp_rank": dp_rank,
         }
+        if vlm_warmup is not None:
+            json_data = {
+                **vlm_warmup,
+                "bootstrap_host": FAKE_BOOTSTRAP_HOST,
+                "bootstrap_room": dp_rank,
+                "routed_dp_rank": dp_rank,
+            }
         async with session.post(
             url + "/generate", json=json_data, ssl=ssl_context
         ) as response:
@@ -2418,23 +2506,27 @@ def _execute_server_warmup(server_args: ServerArgs):
     model_info = res.json()
 
     # Construct a warmup request (MLX: text warmup for VLM-advertising models; TODO: enable image warmup).
-    # A language-only worker may advertise VLM capability for encoder
-    # disaggregation, but its local warmup must stay on the text path.
-    is_vlm = (
-        bool(model_info.get("has_image_understanding", False))
-        and not get_disagg().language_only
-        and not get_disagg().language_model_only
-        and not get_exec().features.enable_encoder_swa_bounded_replay
-        and not is_mps()
-    )
-    if model_info["is_generation"]:
-        if is_vlm and not get_serving().skip_tokenizer_init:
-            request_name = "/v1/chat/completions"
-        else:
-            request_name = "/generate"
-    else:
-        request_name = "/encode"
+    is_vlm = _is_vlm_warmup_model(model_info)
+    request_name = "/generate" if model_info["is_generation"] else "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
+    # A P/D decode server never runs the vision encoder.
+    vlm_warmup = None
+    if (
+        is_vlm
+        and model_info["is_generation"]
+        and not get_serving().skip_tokenizer_init
+        and get_disagg().disaggregation_mode != "decode"
+    ):
+        try:
+            vlm_warmup = _vlm_warmup_generate_request(model_info, max_new_tokens)
+        except Exception:
+            # A warmup prompt the chat template cannot render fails the
+            # startup, P/D included: the server is misconfigured.
+            logger.error(
+                f"Initialization failed. warmup error: {traceback.format_exc()}"
+            )
+            kill_process_tree(os.getpid())
+            return False
     json_data = {
         "sampling_params": {
             "temperature": 0,
@@ -2448,38 +2540,8 @@ def _execute_server_warmup(server_args: ServerArgs):
         # TODO Workaround the bug that embedding errors for list of size 1
         if get_parallel().num_dp_ranks == 1:
             json_data["input_ids"] = json_data["input_ids"][0]
-    elif (
-        is_vlm
-        and get_disagg().disaggregation_mode == "null"
-        and model_info["is_generation"]
-    ):
-        served_model_name = _global_state.tokenizer_manager.served_model_name
-        # TODO: ChatCompletionRequest does not have bootstrap info required by disaggregation mode, disable image-warmup for now
-        # Only use chat completions format for generation models, not embedding models
-        json_data = {
-            "model": served_model_name,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": "data:image/png;base64,"
-                                f"{_get_vlm_warmup_image_base64(model_info)}"
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": "Describe the image.",
-                        },
-                    ],
-                }
-            ],
-            "max_tokens": max_new_tokens,
-            "stream": False,
-            "temperature": 0.0,
-        }
+    elif vlm_warmup is not None and get_disagg().disaggregation_mode == "null":
+        json_data = vlm_warmup
     else:
         json_data["text"] = [
             "The capital city of France is"
@@ -2539,6 +2601,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                     headers=headers,
                     ssl_verify=ssl_verify,
                     timeout=warmup_timeout if warmup_timeout > 0 else 1800,
+                    vlm_warmup=vlm_warmup,
                 )
             )
             failed_status_codes = [code for code in status_codes if code != 200]
@@ -2609,7 +2672,7 @@ def _wait_and_warmup(
         _wait_weights_ready()
 
     # Joiner schedulers are served through the primary after adoption.
-    skip_elastic_joiner_warmup = get_exec().moe.is_ep_scale_joiner
+    skip_elastic_joiner_warmup = get_exec().moe.is_ep_offset_joiner
     if skip_elastic_joiner_warmup:
         logger.debug(
             "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",

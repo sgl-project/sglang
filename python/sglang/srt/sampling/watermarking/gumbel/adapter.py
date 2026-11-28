@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
@@ -13,7 +13,7 @@ from ..config import (
     WatermarkRequestConfig,
     parse_watermark_key,
 )
-from ..interface import SampleStep
+from ..interface import SampleWatermarkOutput
 from .detector import hash_context
 from .state import WatermarkState
 
@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.sampling.verify_accept import VerifyAccept
 
 
 def _as_signed_int32(value: int) -> int:
@@ -38,46 +39,6 @@ class GumbelRows(msgspec.Struct, frozen=True):
 
     def __repr__(self) -> str:
         return f"GumbelRows(rows={len(self.candidates_host)!r})"
-
-    def filter(
-        self, keep_indices: list[int], keep_indices_device: torch.Tensor
-    ) -> Optional[GumbelRows]:
-        candidates_host = [self.candidates_host[index] for index in keep_indices]
-        if not any(candidates_host):
-            return None
-        return GumbelRows(
-            keys=self.keys[keep_indices_device],
-            context_windows=self.context_windows[keep_indices_device],
-            enabled=self.enabled[keep_indices_device],
-            candidates_host=candidates_host,
-        )
-
-    def concat(
-        self, other: Optional[GumbelRows], self_len: int, other_len: int
-    ) -> GumbelRows:
-        if other is None:
-            other = _off_rows(other_len, self.keys.device)
-        return GumbelRows(
-            keys=torch.cat([self.keys, other.keys]),
-            context_windows=torch.cat([self.context_windows, other.context_windows]),
-            enabled=torch.cat([self.enabled, other.enabled]),
-            candidates_host=self.candidates_host + other.candidates_host,
-        )
-
-    def prepend_off(self, num_rows: int) -> GumbelRows:
-        return _off_rows(num_rows, self.keys.device).concat(
-            self, num_rows, len(self.candidates_host)
-        )
-
-
-def _off_rows(num_rows: int, device: torch.device) -> GumbelRows:
-    # Disabled rows are never forced, so their key and window are never used.
-    return GumbelRows(
-        keys=torch.zeros(num_rows, dtype=torch.int64, device=device),
-        context_windows=torch.ones(num_rows, dtype=torch.int32, device=device),
-        enabled=torch.zeros(num_rows, dtype=torch.bool, device=device),
-        candidates_host=[False] * num_rows,
-    )
 
 
 def resolve_watermark_request(
@@ -136,37 +97,40 @@ def resolve_watermark_request(
     return resolved_key, context_window, True
 
 
-def build_rows(
-    requests: Sequence[Req],
-    *,
-    features: ExecFeatures,
-    device: torch.device | str,
-) -> Optional[GumbelRows]:
-    keys = []
-    context_windows = []
-    enabled = []
-    candidates = []
-    for request in requests:
-        config = request.sampling_params.watermark
-        key, context_window, request_enabled = resolve_watermark_request(
-            config,
-            server_enabled=True,
-            default_key=features.watermark_key,
-            default_context_window=features.watermark_context_window,
-            default_enabled=features.watermark_default_enabled,
-            enforce_all=features.watermark_enforce_all,
-        )
-        keys.append(parse_watermark_key(key) if key is not None else 0)
-        context_windows.append(context_window)
-        enabled.append(request_enabled)
-        candidates.append(request_enabled and request.sampling_params.top_k > 1)
-    if not any(candidates):
-        return None
+# The fields a request keeps in `SamplingParamsPool`: its int64 key as (low, high)
+# int32 halves, its context window, and whether it is enabled.
+NUM_POOL_FIELDS = 4
+_KEY_LO, _KEY_HI, _CONTEXT_WINDOW, _ENABLED = range(NUM_POOL_FIELDS)
+
+
+def pool_values(
+    request: Req, *, features: ExecFeatures
+) -> tuple[bool, tuple[int, int, int, int]]:
+    key, context_window, request_enabled = resolve_watermark_request(
+        request.sampling_params.watermark,
+        server_enabled=True,
+        default_key=features.watermark_key,
+        default_context_window=features.watermark_context_window,
+        default_enabled=features.watermark_default_enabled,
+        enforce_all=features.watermark_enforce_all,
+    )
+    key_value = parse_watermark_key(key) if key is not None else 0
+    candidate = request_enabled and request.sampling_params.top_k > 1
+    return candidate, (
+        _as_signed_int32(key_value & 0xFFFFFFFF),
+        key_value >> 32,
+        context_window,
+        int(request_enabled),
+    )
+
+
+def build_rows(values: torch.Tensor, candidates_host: list[bool]) -> GumbelRows:
+    keys = torch.stack((values[_KEY_LO], values[_KEY_HI]), dim=1)
     return GumbelRows(
-        keys=torch.tensor(keys, dtype=torch.int64, device=device),
-        context_windows=torch.tensor(context_windows, dtype=torch.int32, device=device),
-        enabled=torch.tensor(enabled, dtype=torch.bool, device=device),
-        candidates_host=candidates,
+        keys=keys.view(torch.int64).view(-1),
+        context_windows=values[_CONTEXT_WINDOW],
+        enabled=values[_ENABLED].bool(),
+        candidates_host=candidates_host,
     )
 
 
@@ -232,15 +196,6 @@ class GumbelEngine:
         if rows is None:
             return None
         return GumbelVerify(self.state, rows, full_mask)
-
-    def append_accept_tokens(
-        self,
-        rows: GumbelRows,
-        req_pool_indices: torch.Tensor,
-        accept_tokens: torch.Tensor,
-        accept_lens: torch.Tensor,
-    ) -> None:
-        self.state.append_speculative(req_pool_indices, accept_tokens, accept_lens)
 
     def _prompt_tails(
         self, batch: ScheduleBatch
@@ -314,7 +269,9 @@ class GumbelSample:
         self.rows = rows
         self.forward_batch = forward_batch
 
-    def apply(self, logits: torch.Tensor, *, keep_logits: bool) -> SampleStep:
+    def apply(
+        self, logits: torch.Tensor, *, keep_logits: bool
+    ) -> SampleWatermarkOutput:
         forward_batch = self.forward_batch
         logprob_logits = logits.clone() if keep_logits else None
         req_pool_indices = forward_batch.req_pool_indices[: logits.shape[0]]
@@ -328,7 +285,7 @@ class GumbelSample:
             self.rows.context_windows,
             self.rows.enabled,
         )
-        return SampleStep(
+        return SampleWatermarkOutput(
             sampling_info=forward_batch.sampling_info, logprob_logits=logprob_logits
         )
 
@@ -404,17 +361,19 @@ class GumbelVerify:
         self._forced = (req_pool_indices, context_hashes, selected)
         return logits, sampling_info
 
-    def record(
-        self, accept_index: Optional[torch.Tensor], accept_lens: torch.Tensor
-    ) -> None:
+    def commit(self, accept: VerifyAccept) -> None:
         req_pool_indices, context_hashes, selected = self._forced
+        accept_index = accept.accept_index
         if accept_index is None:
             assert self._chain_width is not None
             accept_index = torch.arange(
                 selected.numel(), dtype=torch.int32, device=selected.device
             ).view(-1, self._chain_width)
         self.record_speculative(
-            req_pool_indices, context_hashes, selected, accept_index, accept_lens
+            req_pool_indices, context_hashes, selected, accept_index, accept.accept_lens
+        )
+        self.state.append_speculative(
+            req_pool_indices, accept.accept_tokens(), accept.accept_lens
         )
 
     # Provider ABI v2 WatermarkStateView: the state's operations on these rows.

@@ -55,9 +55,7 @@ from sglang.srt.speculative.spec_utils import (
     resolve_draft_decode_window,
 )
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_device_core_count,
-    get_int_env_var,
     is_cuda,
     is_gfx95_supported,
     is_gfx942_supported,
@@ -90,12 +88,12 @@ _MLA_DECODE_MIN_BLOCK_KV = 32
 
 
 def _mla_decode_kv_splits_cap(
-    base_max_kv_splits: int, sm_count: int, max_context_len: int
+    base_max_kv_splits: int, sm_count: int, max_kv_len: int
 ) -> int:
     if sm_count <= 0:
         return base_max_kv_splits
     sm_cap = next_power_of_2(sm_count)
-    ctx_cap = next_power_of_2(triton.cdiv(max_context_len, _MLA_DECODE_MIN_BLOCK_KV))
+    ctx_cap = next_power_of_2(triton.cdiv(max_kv_len, _MLA_DECODE_MIN_BLOCK_KV))
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
@@ -150,6 +148,9 @@ class ForwardMetadata:
     qo_indptr: torch.Tensor
     custom_mask: torch.Tensor
     mask_indptr: torch.Tensor
+    # Gemma 4 image masks apply only to sliding-window layers. Generic masks
+    # (including speculative trees and DiffusionGemma) apply to every layer.
+    custom_mask_sliding_layers_only: bool = False
     # Every window rail of the forward, keyed by the sub-pool its window layers
     # read (`TritonAttnBackend.window_lengths`).
     windows: Dict[str, WindowRail] = field(default_factory=dict)
@@ -256,6 +257,7 @@ class TritonAttnBackend(AttentionBackend):
         if _is_hip:
             _hip.init_m31_draft(self, model_runner.model_config.hf_config)
         self.req_to_token_pool = model_runner.req_to_token_pool
+        self.max_kv_len = self.req_to_token_pool.row_width
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
@@ -345,7 +347,6 @@ class TritonAttnBackend(AttentionBackend):
         self.lean_v_head_dim = triton.next_power_of_2(
             max((self.v_head_dim, *self.extra_v_head_dims))
         )
-        self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
         # Lean decode persistent-grid size (depends only on head architecture).
@@ -356,15 +357,13 @@ class TritonAttnBackend(AttentionBackend):
         # BLOCK_M for Lean partial-result buffers; kept as an attribute so the
         # cuda-graph / eager buffer allocators (separate methods) can size them.
         self.lean_block_m = _LEAN_BLOCK_M
-        self.static_kv_splits = get_bool_env_var(
-            "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
-        )
+        self.static_kv_splits = envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.get()
         self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
         if self.use_mla and not _is_xpu:
             self.max_kv_splits = _mla_decode_kv_splits_cap(
                 self.max_kv_splits,
                 self.device_core_count,
-                self.max_context_len,
+                self.max_kv_len,
             )
             if _is_gfx942:
                 # gfx942's 304 CUs round up to 512 splits, doubling the persistent
@@ -394,16 +393,14 @@ class TritonAttnBackend(AttentionBackend):
 
         if self.enable_deterministic:
             # Fixed split tile size for batch invariance
-            self.split_tile_size = get_int_env_var(
-                "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256
-            )
+            self.split_tile_size = envs.SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE.get()
             self.static_kv_splits = False
         else:
             self.split_tile_size = get_exec().kernel.triton_attention_split_tile_size
 
         if self.split_tile_size is not None:
             self.max_kv_splits = (
-                self.max_context_len + self.split_tile_size - 1
+                self.max_kv_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
         assert not (
@@ -1073,7 +1070,7 @@ class TritonAttnBackend(AttentionBackend):
                     # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
                     seq_lens_sum = forward_batch.seq_lens_sum
                     if seq_lens_sum is None:
-                        seq_lens_sum = bs * self.max_context_len
+                        seq_lens_sum = bs * self.max_kv_len
                     kv_indices = torch.empty(
                         seq_lens_sum, dtype=torch.int64, device=self.device
                     )
@@ -1165,7 +1162,7 @@ class TritonAttnBackend(AttentionBackend):
             # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:
-                seq_lens_sum = bs * self.max_context_len
+                seq_lens_sum = bs * self.max_kv_len
             kv_indices = (
                 None
                 if self.verify_reads_window_kv_only
@@ -1212,7 +1209,7 @@ class TritonAttnBackend(AttentionBackend):
                 if forward_batch.extend_prefix_lens_cpu is not None:
                     kv_indices_len = sum(forward_batch.extend_prefix_lens_cpu)
                 else:
-                    kv_indices_len = bs * self.max_context_len
+                    kv_indices_len = bs * self.max_kv_len
                 kv_indices = torch.empty(
                     kv_indices_len,
                     dtype=torch.int64,
@@ -1338,7 +1335,7 @@ class TritonAttnBackend(AttentionBackend):
                 0 if self.mla_dcp_window_verify is not None else max_num_tokens
             )
             self.cuda_graph_kv_indices = torch.zeros(
-                (rail_tokens * self.max_context_len),
+                (rail_tokens * self.max_kv_len),
                 dtype=torch.int64,
                 device=self.device,
             )
@@ -1351,7 +1348,7 @@ class TritonAttnBackend(AttentionBackend):
             is_draft_runner=self.is_draft_runner,
             skip_prefill=self.skip_prefill,
             max_bs=max_bs,
-            max_context_len=self.max_context_len,
+            max_kv_len=self.max_kv_len,
             num_draft_tokens=self.num_draft_tokens,
             device=self.device,
             is_read=True,
@@ -1808,6 +1805,14 @@ class TritonAttnBackend(AttentionBackend):
         )
         return True
 
+    def _custom_mask_for_layer(self, layer):
+        metadata = self.forward_metadata
+        if metadata.custom_mask_sliding_layers_only and (
+            layer.sliding_window_size is None or layer.sliding_window_size < 0
+        ):
+            return None, None
+        return metadata.custom_mask, metadata.mask_indptr
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1953,6 +1958,8 @@ class TritonAttnBackend(AttentionBackend):
                 aux_tensors=aux_tensors,
             )
 
+        custom_mask, mask_indptr = self._custom_mask_for_layer(layer)
+
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             bidirectional_extend = (
@@ -1995,7 +2002,7 @@ class TritonAttnBackend(AttentionBackend):
             and k_descale == 1.0
             and v_descale == 1.0
             and not logits_soft_cap
-            and self.forward_metadata.custom_mask is None
+            and custom_mask is None
             and not (
                 self.use_sliding_window_kv_pool
                 and self.kv_layers.route(layer.layer_id).sub_pool
@@ -2039,9 +2046,9 @@ class TritonAttnBackend(AttentionBackend):
                 self.forward_metadata.qo_indptr,
                 kv_indptr,
                 kv_indices,
-                self.forward_metadata.custom_mask,
+                custom_mask,
                 causal,
-                self.forward_metadata.mask_indptr,
+                mask_indptr,
                 self.forward_metadata.max_extend_len,
                 k_descale,
                 v_descale,
@@ -2068,9 +2075,9 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,
-            self.forward_metadata.custom_mask,
+            custom_mask,
             causal,
-            self.forward_metadata.mask_indptr,
+            mask_indptr,
             self.forward_metadata.max_extend_len,
             k_descale,
             v_descale,
@@ -2435,6 +2442,8 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        custom_mask, mask_indptr = self._custom_mask_for_layer(layer)
+
         # Call unified kernel
         self.extend_attention_fwd_unified(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2448,8 +2457,8 @@ class TritonAttnBackend(AttentionBackend):
             unified_kv_indices,
             prefix_lens,
             self.forward_metadata.max_extend_len,
-            custom_mask=self.forward_metadata.custom_mask,
-            mask_indptr=self.forward_metadata.mask_indptr,
+            custom_mask=custom_mask,
+            mask_indptr=mask_indptr,
             sm_scale=layer.scaling,
             logit_cap=logits_soft_cap,
             is_causal=causal,
@@ -2631,6 +2640,7 @@ class TritonAttnBackend(AttentionBackend):
                 lean_Op=self.forward_metadata.lean_Op,
                 lean_locks=self.forward_metadata.lean_locks,
                 uneven_batch=self.forward_metadata.uneven_batch,
+                stop_at_request_splits=self.enable_deterministic,
             )
             local_lse = torch.logsumexp(
                 self.forward_metadata.attn_lse[
@@ -2669,6 +2679,7 @@ class TritonAttnBackend(AttentionBackend):
             lean_Op=self.forward_metadata.lean_Op,
             lean_locks=self.forward_metadata.lean_locks,
             uneven_batch=self.forward_metadata.uneven_batch,
+            stop_at_request_splits=self.enable_deterministic,
         )
         return o
 
@@ -2707,15 +2718,13 @@ class TritonMultiStepDraftBackend:
                     kv_indptr_buf=self.kv_indptr[i],
                 )
             )
-        self.max_context_len = self.attn_backends[0].max_context_len
         self.num_head = (
             model_runner.model_config.get_max_num_attention_heads()
             // get_parallel().attn_tp_size
         )
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
-        self.req_to_token_pool = model_runner.req_to_token_pool
-        self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.max_kv_len = self.attn_backends[0].max_kv_len
         self.page_size = get_schedule().page_size
         self.draft_window_size, self.draft_sink_size = resolve_draft_decode_window(
             model_runner
@@ -2757,7 +2766,7 @@ class TritonMultiStepDraftBackend:
         if seq_lens_sum is None:
             # seq_lens_sum here only slice-clamps a preallocated kv_indices buffer;
             # over-estimate is safe. Use a static UB to skip the per-iter .sum().item() D2H.
-            seq_lens_sum = num_seqs * self.max_context_len
+            seq_lens_sum = num_seqs * self.max_kv_len
 
         src = self.runner_ids.read_source(
             forward_batch.iteration_ids,
@@ -2826,7 +2835,7 @@ class TritonMultiStepDraftBackend:
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         kv_indices_width = draft_kv_indices_buffer_width(
-            forward_batch.batch_size, self.topk, self.max_context_len
+            forward_batch.batch_size, self.topk, self.max_kv_len
         )
         kv_indices = torch.empty(
             (self.speculative_num_steps, kv_indices_width),
@@ -2871,7 +2880,7 @@ class TritonMultiStepDraftBackend:
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         kv_indices_width = draft_kv_indices_buffer_width(
-            max_bs, self.topk, self.max_context_len
+            max_bs, self.topk, self.max_kv_len
         )
         self.cuda_graph_kv_indices = torch.zeros(
             (self.speculative_num_steps, kv_indices_width),

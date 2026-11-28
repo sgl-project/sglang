@@ -91,8 +91,6 @@ class TestQwen4ExpPDKVCacheSharding(GSM8KMixin, PDDisaggregationServerBase):
     prefill_tp_size = CP_SIZE
     decode_tp_size = CP_SIZE
     decode_base_gpu_id = CP_SIZE
-    # KV sharding with the radix cache on requires the Python tree core.
-    extra_prefill_env = {"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "python"}
     extra_prefill_args = PREFILL_ARGS
     extra_decode_args = DECODE_ARGS
 

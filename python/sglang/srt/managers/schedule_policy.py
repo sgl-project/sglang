@@ -9,6 +9,7 @@ from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_allocation_tokens,
 )
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.managers.shortest_prefill_load import ShortestPrefillLoadScaling
 from sglang.srt.runtime_context import (
     get_context,
     get_disagg,
@@ -78,7 +79,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
-from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.common import (
+    match_kv_cache,
+    prefill_load_tokens,
+    touch_waiting_prefix,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
@@ -93,9 +98,7 @@ if TYPE_CHECKING:
 # This can prevent the server from being too conservative.
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS = int(
-    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
-)
+CLIP_MAX_NEW_TOKENS = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
 @lru_cache(maxsize=1)
@@ -220,6 +223,7 @@ class SchedulePolicy:
         enable_uniboost_gamma_ada: bool = False,
         uniboost_rank_invariant: bool = False,
         uniboost_step_clock: Optional[Callable[[], int]] = None,
+        shortest_prefill_load_scaling: Optional[ShortestPrefillLoadScaling] = None,
     ):
         self._lpm_gate_calls = 0
         self._on_bounded_state_change = None
@@ -249,6 +253,11 @@ class SchedulePolicy:
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self.shortest_prefill_aging_factor = shortest_prefill_aging_factor
+        self.shortest_prefill_load_scaling = shortest_prefill_load_scaling
+        # Recomputed on every shortest-prefill-first pass. Without load scaling the
+        # boundary stays inf, so every request is in the shortest-first class.
+        self.shortest_prefill_backlog = 0
+        self.shortest_prefill_class_boundary = math.inf
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
 
@@ -275,6 +284,7 @@ class SchedulePolicy:
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
         bootstrap_queue: Iterable[Req] = (),
+        chunked_req: Optional[Req] = None,
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
@@ -374,6 +384,8 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                if self.shortest_prefill_load_scaling is not None:
+                    self._update_shortest_prefill_load(waiting_queue, chunked_req)
                 self._sort_by_shortest_prefill(
                     waiting_queue,
                     temporary_deprioritized,
@@ -381,11 +393,7 @@ class SchedulePolicy:
                 )
                 self._shortest_prefill_calls += 1
                 if waiting_queue and self._shortest_prefill_calls % 128 == 1:
-                    logger.info(
-                        "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d",
-                        len(waiting_queue),
-                        self._shortest_prefill_work(waiting_queue[0]),
-                    )
+                    self._log_shortest_prefill(waiting_queue)
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -564,7 +572,7 @@ class SchedulePolicy:
         """
         try:
             policy_enum = CacheAwarePolicy(policy)
-            if getattr(tree_cache, "disable", True):
+            if tree_cache.disable:
                 if policy_enum == CacheAwarePolicy.UNIBOOST:
                     # UniBoost still works without a prefix cache: every
                     # prompt token counts as uncached work.
@@ -684,12 +692,84 @@ class SchedulePolicy:
         processed_tokens: int,
     ) -> None:
         # Prioritize short uncached prefills while deferring duplicate prefixes.
-        waiting_queue.sort(
-            key=lambda r: (
+        # Requests at or above the class boundary go after the shorter ones in
+        # arrival order, so a large request is not passed indefinitely.
+        def key(r: Req):
+            arrived = r.time_stats.wait_queue_entry_time
+            by_arrival = self._shortest_prefill_by_arrival(r)
+            return (
                 r.rid in temporary_deprioritized,
-                self._prefill_rank(r, self._shortest_prefill_work(r), processed_tokens),
-                r.time_stats.wait_queue_entry_time,
+                by_arrival,
+                arrived
+                if by_arrival
+                else self._prefill_rank(
+                    r, self._shortest_prefill_work(r), processed_tokens
+                ),
+                arrived,
             )
+
+        waiting_queue.sort(key=key)
+
+    def _update_shortest_prefill_load(
+        self, waiting_queue: List[Req], chunked_req: Optional[Req]
+    ) -> None:
+        # The backlog is the load /v1/loads reports, not the sort work: it also
+        # leaves out a confirmed storage hit whose prefetch is still in flight.
+        # The sort keeps it, since the request cannot be admitted before the
+        # prefetch lands and a lower rank would only reserve chunk room it cannot
+        # use. The match and the storage spans change at rank-agreed points, so
+        # every TP rank computes the same boundary and budget.
+        backlog = sum(
+            prefill_load_tokens(
+                r.seqlen,
+                r.num_matched_prefix_tokens,
+                self.tree_cache.waiting_storage_span(r.cache_request_handle),
+            )
+            for r in waiting_queue
+        )
+        if chunked_req is not None:
+            backlog += max(
+                0, len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+            )
+        self.shortest_prefill_backlog = backlog
+        self.shortest_prefill_class_boundary = (
+            self.shortest_prefill_load_scaling.class_boundary(backlog)
+        )
+
+    def _log_shortest_prefill(self, waiting_queue: List[Req]) -> None:
+        load = ""
+        if self.shortest_prefill_load_scaling is not None:
+            load = (
+                f" class_boundary={int(self.shortest_prefill_class_boundary)}"
+                f" backlog={self.shortest_prefill_backlog}"
+            )
+        logger.info(
+            "Experimental shortest-prefill-first: queue=%d shortest_uncached=%d%s",
+            len(waiting_queue),
+            self._shortest_prefill_work(waiting_queue[0]),
+            load,
+        )
+
+    def _shortest_prefill_by_arrival(self, r: Req) -> bool:
+        return (
+            self.shortest_prefill_load_scaling is not None
+            and self._shortest_prefill_work(r) >= self.shortest_prefill_class_boundary
+        )
+
+    def can_join_continuing_chunk(self, req: Req) -> bool:
+        """Whether req may share a pass with a continuing chunked prefill: requests
+        at or above the class boundary go by arrival and never do. The queue is in
+        class order, so joining stops at the first of them."""
+        return not self._shortest_prefill_by_arrival(req)
+
+    def prefill_token_budget(
+        self, *, page_size: int, align: Optional[int]
+    ) -> Optional[int]:
+        """Prefill tokens this pass may carry, or None for no cap."""
+        if self.shortest_prefill_load_scaling is None:
+            return None
+        return self.shortest_prefill_load_scaling.token_budget(
+            self.shortest_prefill_backlog, page_size=page_size, align=align
         )
 
     def shortest_prefill_chunk_limit(
@@ -723,6 +803,7 @@ class SchedulePolicy:
             if (
                 self._prefill_rank(req, work, processed_tokens) >= chunked_rank
                 or reserved + charge > budget - page_size
+                or not self.can_join_continuing_chunk(req)
             ):
                 break
             reserved += charge
@@ -971,22 +1052,37 @@ def mamba_prefill_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> in
     #40907 donates from a prefix-relative snapshot, so rounding the cut would
     only drop up to one grid of prefill budget, except where windows retire
     behind the checkpoints (`windows_retire_behind_checkpoints`): a chunk below
-    the checkpoint grid takes none, so every cut lands on that grid. A
-    PrefillAdder built before the server config is published, as in unit
-    tests, also leaves the cut.
+    the checkpoint grid takes none, so every cut lands on that grid. Under
+    deterministic inference (`deterministic_cuts_on_grid`) every cut lands on
+    the kernel chunk grid. A PrefillAdder built before the server config is
+    published, as in unit tests, leaves the cut.
     """
     ctx = get_context()
     if not (
         ctx.is_config_namespace_published("exec")
         and ctx.is_config_namespace_published("parallel")
-        and get_exec().mamba.enable_mamba_extra_buffer
     ):
         return 1
-    if get_parallel().dcp_enabled:
+    if get_exec().mamba.enable_mamba_extra_buffer:
+        if get_parallel().dcp_enabled:
+            return mamba_cache_chunk_size()
+        if windows_retire_behind_checkpoints(tree_cache):
+            return mamba_checkpoint_grid(tree_cache.page_size)
+    if deterministic_cuts_on_grid(tree_cache):
         return mamba_cache_chunk_size()
-    if windows_retire_behind_checkpoints(tree_cache):
-        return mamba_checkpoint_grid(tree_cache.page_size)
     return 1
+
+
+def deterministic_cuts_on_grid(tree_cache: Optional[BasePrefixCache]) -> bool:
+    """Whether deterministic inference keeps prefill cuts on the mamba kernel
+    chunk grid: the kernel chunks each extend from its start, so an off-grid
+    cut changes the result."""
+    return bool(
+        tree_cache is not None
+        and get_context().is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+        and tree_cache.supports_mamba()
+    )
 
 
 def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> bool:
@@ -1029,13 +1125,15 @@ class PrefillAdder:
         kv_awaiting_transfer: bool = False,
     ):
         self.page_size = page_size
-        # DCP donates a checkpoint only on the kernel chunk grid. A cut off
-        # that grid costs the request every later donation, so keep it there.
-        # Without DCP the prefix-relative depth rule already donates, and
-        # rounding would only shorten the chunk.
         self.mamba_chunk_grid = mamba_prefill_chunk_grid(tree_cache)
+        self.windows_retire_behind_checkpoints = windows_retire_behind_checkpoints(
+            tree_cache
+        )
         # Whether every cut must land on that grid, never below it.
-        self.strict_chunk_grid = windows_retire_behind_checkpoints(tree_cache)
+        self.strict_chunk_grid = (
+            self.windows_retire_behind_checkpoints
+            or deterministic_cuts_on_grid(tree_cache)
+        )
         self.prefill_tile_block_m = prefill_tile_block_m
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -1132,7 +1230,7 @@ class PrefillAdder:
         self.waiting_queue_len = waiting_queue_len
 
     def _admitted_extend_lens(self) -> List[int]:
-        return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
+        return [req.extend_len for req in self.can_run_list]
 
     def _tile_admission_metric_key(self) -> str:
         return f"{PREFILL_TILE_BUDGET_MODE}_q_tiles_per_head"
@@ -1281,21 +1379,23 @@ class PrefillAdder:
         The chunk that finishes a request may stop anywhere, so only shorten
         when `trunc_len` really is a cut. Leave the cut alone when rounding
         would empty it: making no progress is worse than losing a donation.
+        Under `strict_chunk_grid` such a cut returns 0 and the caller waits.
         """
         if self.mamba_chunk_grid <= 1 or trunc_len >= remaining:
             return trunc_len
         floored = trunc_len // self.mamba_chunk_grid * self.mamba_chunk_grid
         if self.strict_chunk_grid:
-            # Below the grid a chunk takes no checkpoint; a continuation's
-            # limit was raised to one grid unit (`grid_continuation_limit`).
+            # A continuation still gets one unit: see `_add_chunked_req` and
+            # `grid_continuation_limit`.
             return floored
         return floored or trunc_len
 
     def grid_continuation_limit(self, limit: int, remaining: int) -> int:
-        """A continuing request's chunk limit, applied after every runtime limit
-        of the pass under `strict_chunk_grid`: floored onto the grid but at
-        least one unit (or the prompt's rest), so it never starves."""
-        if not self.strict_chunk_grid or limit >= remaining:
+        """Where windows retire behind the checkpoints, a continuing request's
+        chunk limit after the pass's runtime limits: floored onto the grid but
+        at least one unit (or the prompt's rest), so it never starves.
+        Elsewhere the limit may carry the memory bound, so it stays."""
+        if not self.windows_retire_behind_checkpoints or limit >= remaining:
             return limit
         grid = self.mamba_chunk_grid
         return max(limit // grid * grid, min(grid, remaining))
@@ -1334,6 +1434,7 @@ class PrefillAdder:
         admitted_chunk_limit: Optional[int] = None,
         cached_tokens: Optional[int] = None,
         reuses_kv: bool = False,
+        commit_unfinished: bool = False,
     ):
         """Charge one admitted request against the prefill budgets.
 
@@ -1381,6 +1482,7 @@ class PrefillAdder:
             # prefix before the chunk cached (``prefix_len`` by default).
             admitted_chunk_limit=admitted_chunk_limit,
             cached_tokens=prefix_len if cached_tokens is None else cached_tokens,
+            commit_unfinished=commit_unfinished,
         )
         self.rem_input_tokens -= compute_charge
 
@@ -1708,7 +1810,12 @@ class PrefillAdder:
 
         if self.chunked_req_limit is not None:
             assert self.chunked_req_limit > 0
-            _rem_tokens = min(_rem_tokens, self.chunked_req_limit)
+            limit = self.chunked_req_limit
+            if self.strict_chunk_grid and not self.windows_retire_behind_checkpoints:
+                # A cut below the grid waits: the room kept for shorter
+                # requests must leave the continuation one grid unit.
+                limit = max(limit, self.mamba_chunk_grid)
+            _rem_tokens = min(_rem_tokens, limit)
 
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         _rem_tokens = self.grid_continuation_limit(_rem_tokens, cand_extend_input_len)
@@ -1789,6 +1896,9 @@ class PrefillAdder:
                 else 0
             ),
             admitted_chunk_limit=_rem_tokens,
+            # Under a chunk cap, requests are admitted after a chunk cut short;
+            # holding its rest and decode keeps them off the KV later passes need.
+            commit_unfinished=truncated and self.chunked_req_limit is not None,
         )
 
         # Return if chunked prefill not finished
@@ -1965,15 +2075,19 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.floor_chunked_tokens(chunk_limit, cand_extend_input_len)
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
 
             # Reserve after the tile gate so rejected requests consume no scratch.
-            if not self._kv_shard_reserve_scratch(prefix_len=0, extend_len=trunc_len):
+            # A streaming session lends its prefix even with the radix cache disabled.
+            if not self._kv_shard_reserve_scratch(
+                prefix_len=req.prefix_len, extend_len=trunc_len
+            ):
                 return AddReqResult.OTHER
 
-            assert req.prefix_len == 0
             req.extend_end = req.prefix_len + trunc_len
             self.can_run_list.append(req)
             self.new_chunked_req = req
@@ -1993,6 +2107,7 @@ class PrefillAdder:
                     req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
                 ),
                 admitted_chunk_limit=chunk_limit,
+                cached_tokens=req.prefix_len,
             )
 
         return self.budget_state()
@@ -2033,7 +2148,7 @@ class PrefillAdder:
         if self.chunked_req_waits:
             return AddReqResult.NO_TOKEN
 
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+        if req.sampling_params.ignore_eos and self.tree_cache.disable:
             return self.add_one_req_ignore_eos(req, truncation_align_size)
 
         max_new = self._swa_new_tokens(req)

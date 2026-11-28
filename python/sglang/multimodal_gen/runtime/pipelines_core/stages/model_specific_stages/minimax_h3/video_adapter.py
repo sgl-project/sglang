@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
     canonical_minimax_h3_task,
 )
+from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
 
 try:
     # imported with the adapter so the first output check does not pay for it
@@ -369,6 +370,8 @@ def _ffprobe_output_media(path: str) -> dict[str, Any]:
         probe = subprocess.run(
             [
                 "ffprobe",
+                "-protocol_whitelist",
+                "file",
                 "-v",
                 "error",
                 "-show_entries",
@@ -377,6 +380,7 @@ def _ffprobe_output_media(path: str) -> dict[str, Any]:
                 "json",
                 str(path),
             ],
+            env=local_media_subprocess_env(),
             check=True,
             capture_output=True,
             text=True,
@@ -442,7 +446,7 @@ def _read_output_media(path: str) -> dict[str, Any]:
     if av is None:
         return _ffprobe_output_media(path)
     try:
-        with av.open(str(path)) as container:
+        with av.open(str(path), options={"protocol_whitelist": "file"}) as container:
             streams = [_pyav_stream_entries(stream) for stream in container.streams]
             format_entries: dict[str, Any] = {"format_name": container.format.name}
             if container.duration:

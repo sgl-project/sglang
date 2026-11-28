@@ -54,6 +54,7 @@ from sglang.srt.parser.chat_parsing.response_templates import (
 logger = logging.getLogger(__name__)
 
 _THINKING_FIELD = "thinking"
+_REASONING_CONTENT_FIELD = "reasoning_content"
 _CONTENT_FIELD = "content"
 _TOOL_FIELD = "tool_calls"
 _PASSTHROUGH_FIELD = "normal"
@@ -93,6 +94,14 @@ def _derive_serving_templates(template: dict) -> _ServingTemplates:
 @functools.lru_cache(maxsize=8)
 def _derive_serving_templates_from_json(template_json: str) -> _ServingTemplates:
     template = json.loads(template_json)
+    fields = template.get("fields") if isinstance(template, dict) else None
+    if isinstance(fields, dict) and _REASONING_CONTENT_FIELD in fields:
+        if _THINKING_FIELD in fields:
+            raise ValueError(
+                "response_template cannot declare both 'thinking' and "
+                "'reasoning_content' fields"
+            )
+        fields[_THINKING_FIELD] = fields.pop(_REASONING_CONTENT_FIELD)
     loaded = load_response_template(template)
     _check_serving_fields(loaded)
     content = loaded.fields.get(_CONTENT_FIELD)
@@ -142,7 +151,8 @@ def _check_serving_fields(loaded: ResponseTemplate) -> None:
         if (
             field.content != "text"
             or field.transform is not None
-            or field.join is not None
+            # The streaming adapter concatenates regions without a separator.
+            or field.join not in (None, "")
         ):
             raise ValueError(
                 f"response_template field {name!r} uses semantics that cannot "

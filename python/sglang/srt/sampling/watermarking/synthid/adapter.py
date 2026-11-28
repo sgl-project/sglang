@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
@@ -10,11 +10,11 @@ from sglang.kernels.ops.sampling.synthid import MAX_CHAIN_WIDTH
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.async_probe import sanitize_nan_logits
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import is_cuda, rows_where
 
 from ..batch_layout import num_prefill_rows
 from ..config import SYNTHID_CONFIG_FIELDS, WatermarkRequestConfig
-from ..interface import NO_WATERMARK_VIEW_FIELDS, SampleStep
+from ..interface import NO_WATERMARK_VIEW_FIELDS, SampleWatermarkOutput
 from .algorithm import SynthIDConfig
 from .watermark import FilterProbs, SynthIDWatermark
 
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.sampling.verify_accept import VerifyAccept
 
 
 class SynthIDRows(msgspec.Struct, frozen=True):
@@ -32,45 +33,12 @@ class SynthIDRows(msgspec.Struct, frozen=True):
     indices: torch.Tensor
     candidates_host: list[bool]
 
-    @classmethod
-    def from_candidates(
-        cls, candidates_host: list[bool], device: torch.device | str
-    ) -> Optional[SynthIDRows]:
-        indices = [index for index, on in enumerate(candidates_host) if on]
-        if not indices:
-            return None
-        return cls(
-            indices=torch.tensor(indices, dtype=torch.int64, device=device),
-            candidates_host=candidates_host,
-        )
-
     def __repr__(self) -> str:
         return f"SynthIDRows(rows={len(self.candidates_host)!r})"
 
     @property
     def all_on(self) -> bool:
         return self.indices.shape[0] == len(self.candidates_host)
-
-    def filter(
-        self, keep_indices: list[int], keep_indices_device: torch.Tensor
-    ) -> Optional[SynthIDRows]:
-        return SynthIDRows.from_candidates(
-            [self.candidates_host[index] for index in keep_indices],
-            self.indices.device,
-        )
-
-    def concat(
-        self, other: Optional[SynthIDRows], self_len: int, other_len: int
-    ) -> SynthIDRows:
-        other_on = other.candidates_host if other is not None else [False] * other_len
-        return SynthIDRows.from_candidates(
-            self.candidates_host + other_on, self.indices.device
-        )
-
-    def prepend_off(self, num_rows: int) -> SynthIDRows:
-        return SynthIDRows.from_candidates(
-            [False] * num_rows + self.candidates_host, self.indices.device
-        )
 
     def take(self, tensor: torch.Tensor) -> torch.Tensor:
         return tensor if self.all_on else tensor[self.indices]
@@ -110,24 +78,26 @@ def _resolve_enabled(
     return enabled
 
 
-def build_rows(
-    requests: Sequence[Req],
-    *,
-    features: ExecFeatures,
-    device: torch.device | str,
-) -> Optional[SynthIDRows]:
-    return SynthIDRows.from_candidates(
-        [
-            _resolve_enabled(
-                request.sampling_params.watermark,
-                server_enabled=True,
-                default_enabled=features.watermark_default_enabled,
-                enforce_all=features.watermark_enforce_all,
-            )
-            and request.sampling_params.top_k > 1
-            for request in requests
-        ],
-        device,
+NUM_POOL_FIELDS = 1
+
+
+def pool_values(request: Req, *, features: ExecFeatures) -> tuple[bool, tuple[int]]:
+    candidate = (
+        _resolve_enabled(
+            request.sampling_params.watermark,
+            server_enabled=True,
+            default_enabled=features.watermark_default_enabled,
+            enforce_all=features.watermark_enforce_all,
+        )
+        and request.sampling_params.top_k > 1
+    )
+    return candidate, (int(candidate),)
+
+
+def build_rows(values: torch.Tensor, candidates_host: list[bool]) -> SynthIDRows:
+    return SynthIDRows(
+        indices=rows_where(values[0] != 0, sum(candidates_host)),
+        candidates_host=candidates_host,
     )
 
 
@@ -207,19 +177,6 @@ class SynthIDEngine:
             return None
         return SynthIDVerify(self.watermark, rows)
 
-    def append_accept_tokens(
-        self,
-        rows: SynthIDRows,
-        req_pool_indices: torch.Tensor,
-        accept_tokens: torch.Tensor,
-        accept_lens: torch.Tensor,
-    ) -> None:
-        self.watermark.state.commit(
-            rows.take(req_pool_indices),
-            rows.take(accept_tokens),
-            rows.take(accept_lens),
-        )
-
 
 def _request_filter(
     sampling_info: SamplingBatchInfo, rows: SynthIDRows, *, width: int = 1
@@ -282,7 +239,9 @@ class SynthIDSample:
         self.forward_batch = forward_batch
         self.allow_fused_sample = allow_fused_sample
 
-    def apply(self, logits: torch.Tensor, *, keep_logits: bool) -> SampleStep:
+    def apply(
+        self, logits: torch.Tensor, *, keep_logits: bool
+    ) -> SampleWatermarkOutput:
         forward_batch = self.forward_batch
         sampling_info = forward_batch.sampling_info
         rows = self.rows
@@ -300,7 +259,7 @@ class SynthIDSample:
         sanitize_nan_logits(logits, "watermark: next_token_logits")
 
         if self._can_fuse(keep_logits):
-            return SampleStep(
+            return SampleWatermarkOutput(
                 sampling_info=sampling_info,
                 logprob_logits=None,
                 token_ids=self.watermark.sample(logits, temperatures, slots),
@@ -312,7 +271,7 @@ class SynthIDSample:
             rows=rows.take_index,
             filter_probs=_request_filter(sampling_info, rows),
         )
-        return SampleStep(
+        return SampleWatermarkOutput(
             sampling_info=_without_request_filters(sampling_info, rows),
             logprob_logits=logprob_logits,
         )
@@ -334,6 +293,8 @@ class SynthIDSample:
             and not sampling_info.need_min_p_sampling
             and sampling_info.sampling_seed is None
             and sampling_info.sampling_mask_batch_indices is None
+            # The fused sample skips the stages after the watermark.
+            and not sampling_info.has_custom_logit_processor
         )
 
 
@@ -344,6 +305,8 @@ class SynthIDVerify:
     def __init__(self, watermark: SynthIDWatermark, rows: SynthIDRows) -> None:
         self.watermark = watermark
         self.rows = rows
+        # Set by apply, read by commit.
+        self._req_pool_indices: Optional[torch.Tensor] = None
 
     def apply(
         self,
@@ -360,6 +323,7 @@ class SynthIDVerify:
         if keep_logits:
             logits = logits.clone()
         rows = self.rows
+        self._req_pool_indices = req_pool_indices
         self.watermark.apply_verify(
             logits,
             rows.take(sampling_info.temperatures),
@@ -370,11 +334,13 @@ class SynthIDVerify:
         )
         return logits, _without_request_filters(sampling_info, rows)
 
-    def record(
-        self, accept_index: Optional[torch.Tensor], accept_lens: torch.Tensor
-    ) -> None:
-        # The state advances only by append_accept_tokens.
-        pass
+    def commit(self, accept: VerifyAccept) -> None:
+        rows = self.rows
+        self.watermark.state.commit(
+            rows.take(self._req_pool_indices),
+            rows.take(accept.accept_tokens()),
+            rows.take(accept.accept_lens),
+        )
 
 
 def watermark_view_fields(rows: SynthIDRows) -> dict[str, Any]:

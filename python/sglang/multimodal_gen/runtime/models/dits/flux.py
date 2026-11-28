@@ -669,6 +669,7 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
 
         self.attn = USPAttention(
             num_heads=self.local_heads if self.shard_qkv else num_heads,
+            global_num_heads=self.heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -1097,7 +1098,7 @@ class FluxTransformerBlock(nn.Module):
 
         joint_attention_kwargs = joint_attention_kwargs or {}
         # Attention.
-        attention_outputs = self.attn(
+        attn_output, context_attn_output = self.attn(
             x=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
             freqs_cis=freqs_cis,
@@ -1105,11 +1106,6 @@ class FluxTransformerBlock(nn.Module):
             num_replicated_prefix=num_replicated_prefix,
             **joint_attention_kwargs,
         )
-
-        if len(attention_outputs) == 2:
-            attn_output, context_attn_output = attention_outputs
-        elif len(attention_outputs) == 3:
-            attn_output, context_attn_output, ip_attn_output = attention_outputs
 
         # Process attention outputs for the `hidden_states`.
         hidden_states = residual_gate_add(
@@ -1130,8 +1126,6 @@ class FluxTransformerBlock(nn.Module):
             hidden_states, ff_output, gate_mlp.unsqueeze(1)
         )
 
-        if len(attention_outputs) == 3:
-            hidden_states = hidden_states + ip_attn_output
         # Process attention outputs for the `encoder_hidden_states`.
         encoder_hidden_states = residual_gate_add(
             encoder_hidden_states, context_attn_output, c_gate_msa.unsqueeze(1)

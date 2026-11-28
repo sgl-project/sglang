@@ -178,7 +178,7 @@ def build_tri_pool(
         mamba2_cache_params=config,
         max_mamba_cache_size=8,
         model_context_len=256 * page_size,
-        extra_max_context_len=1,
+        req_to_token_row_width=256 * page_size + 1,
         max_num_reqs=4,
         enable_mamba_extra_buffer=False,
         enable_mamba_extra_buffer_lazy=False,
@@ -502,7 +502,7 @@ def build_swa_cache(
     )
     req_pool = ReqToTokenPool(
         size=4,
-        max_context_len=256 * page_size,
+        row_width=256 * page_size,
         device="cpu",
         enable_memory_saver=False,
     )
@@ -611,6 +611,8 @@ class UnifiedGeometry(msgspec.Struct, frozen=True, kw_only=True):
     state_slots: int = 8
     byte_budget: Optional[int] = None
     context_len: int = 256
+    # The request table's row width; unset is context_len + 1.
+    req_to_token_row_width: Optional[int] = None
     max_num_reqs: int = 4
     lazy: bool = True
     # Paged extend and decode launch device kernels; their callers need "cuda".
@@ -661,7 +663,7 @@ def build_test_unified_pools(
     total_bytes=None,
     unified_total_bytes=None,
     model_context_len=None,
-    extra_max_context_len=0,
+    req_to_token_row_width=0,
     max_num_reqs=1,
     enable_memory_saver=False,
     post_capture_active=False,
@@ -722,6 +724,7 @@ def build_test_unified_pools(
         window_tokens=swa_max_total_num_tokens,
         state_slots=max_mamba_cache_size,
         context_len=model_context_len,
+        req_to_token_row_width=req_to_token_row_width,
         floor_window=sliding_window_size,
         alignment=1,
     )
@@ -738,8 +741,6 @@ def build_test_unified_pools(
         head_num=head_num,
         head_dim=head_dim,
         max_num_reqs=max_num_reqs,
-        model_context_len=model_context_len or 0,
-        extra_max_context_len=extra_max_context_len,
         state_cache_params=mamba2_cache_params,
         enable_mamba_extra_buffer=enable_mamba_extra_buffer,
         enable_mamba_extra_buffer_lazy=enable_mamba_extra_buffer_lazy,
@@ -798,12 +799,18 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         checkpoint_interval=mamba_cache_chunk_size() if g.state_layer_ids else None,
     )
     by_tokens = g.byte_budget is None or bool(g.state_layer_ids)
+    req_to_token_row_width = (
+        g.req_to_token_row_width
+        if g.req_to_token_row_width is not None
+        else g.context_len + 1
+    )
     sizing = KVSizingInputs(
         budget_bytes=g.byte_budget,
         full_tokens=g.full_tokens if by_tokens else None,
         window_tokens=g.swa_tokens if by_tokens and g.swa_layer_ids else None,
         state_slots=g.state_slots if g.state_layer_ids else 0,
         context_len=g.context_len,
+        req_to_token_row_width=req_to_token_row_width,
         floor_window=g.window if g.swa_layer_ids else None,
         alignment=1,
     )
@@ -817,8 +824,6 @@ def build_unified_bundle(geometry: UnifiedGeometry):
         head_num=g.head_num,
         head_dim=g.head_dim,
         max_num_reqs=g.max_num_reqs,
-        model_context_len=g.context_len,
-        extra_max_context_len=1,
         state_cache_params=cache_params,
         disable_overlap_schedule=True,
     )
