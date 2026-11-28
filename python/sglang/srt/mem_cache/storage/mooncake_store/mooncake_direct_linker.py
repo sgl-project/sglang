@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
+    TransferReady,
     UnifiedCacheLinker,
 )
 from sglang.srt.runtime_context import (
@@ -81,18 +82,28 @@ def _storage_sharing(
     tp_rank: int,
     tp_size: int,
     attn_cp_rank: int,
+    attn_cp_size: int,
     pp_rank: int,
     offload_owner: bool,
     dcp_size: int,
     dcp_rank: int,
 ):
-    """Per-pool key suffixes and the pools this rank offloads. A pool replicated
-    across attention TP is written by TP rank 0 (or the first DCP block) only."""
+    """Per-pool key suffixes and writers for explicitly replicated pages.
+
+    Attention TP sharing uses TP rank 0 (or the first DCP block). A pool that
+    also guarantees full CP replication can use the CP rank 0 TP owner only.
+    Do not infer CP replication from the group's attention-TP replication.
+    """
     dcp_sharded = {name for name, pool in pools.items() if pool.dcp_sharded}
     tp_shared = {
         name
         for name, pool in pools.items()
         if not rank_replicated and tp_size > 1 and pool.tp_replicated
+    }
+    cp_shared = {
+        name
+        for name, pool in pools.items()
+        if rank_replicated and attn_cp_size > 1 and dcp_size == 1 and pool.cp_replicated
     }
     suffixes = {
         name: _shared_pool_suffix(
@@ -106,15 +117,22 @@ def _storage_sharing(
         )
         for name in tp_shared | dcp_sharded
     }
+    # A new versioned, CP-width-specific suffix deliberately misses the old
+    # rank-local keys. All CP ranks read the same object; other pools keep
+    # their existing rank/PP suffix and semantics.
+    suffixes.update(
+        dict.fromkeys(cp_shared, f"cpshared_v1_cp{attn_cp_size}_pp{pp_rank}")
+    )
     offload_pools = {
         name
         for name in pools
         if offload_owner
+        and (name not in cp_shared or attn_cp_rank == 0)
         and (
             name not in tp_shared or tp_rank < (dcp_size if name in dcp_sharded else 1)
         )
     }
-    return suffixes, offload_pools, tp_shared
+    return suffixes, offload_pools, tp_shared, cp_shared
 
 
 class MooncakeDirectLinker(UnifiedCacheLinker):
@@ -191,12 +209,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
-        self.storage.pool_suffixes, self.offload_pools, tp_shared = _storage_sharing(
+        (
+            self.storage.pool_suffixes,
+            self.offload_pools,
+            tp_shared,
+            cp_shared,
+        ) = _storage_sharing(
             self.pools,
             rank_replicated=rank_replicated,
             tp_rank=tp_rank,
             tp_size=tp_size,
             attn_cp_rank=params.attn_cp_rank,
+            attn_cp_size=params.attn_cp_size,
             pp_rank=params.pp_rank,
             offload_owner=self.offload_owner,
             dcp_size=get_parallel().attn_dcp_size,
@@ -205,13 +229,14 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         logger.info(
             "Mooncake direct linker storage topology: "
             "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
-            "tp_shared=%s, offload_pools=%s",
+            "tp_shared=%s, cp_shared=%s, offload_pools=%s",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
             sorted(tp_shared),
+            sorted(cp_shared),
             sorted(self.offload_pools),
         )
 
@@ -243,7 +268,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             | None
         ] = Queue()
         self.offload_queue: Queue[
-            tuple[list[PoolTransfer], int, list[object], str | None] | None
+            tuple[list[PoolTransfer], int, TransferReady | None, str | None] | None
         ] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
@@ -658,7 +683,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.freeze_gc_once()
         expanded = [t for t in expanded if t.name in self.offload_pools]
         if not expanded:
-            self.offload_results.put(True)
+            # A peer can have a rank-local window write in flight before a
+            # shared-only page. A synchronous no-op ACK would overtake it;
+            # the wrapper consumes offload ACKs in submission order.
+            self.offload_queue.put(([], 0, None, None))
             return True
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
@@ -673,6 +701,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if task is None:
                     return
                 expanded, tokens, ready, session_id = task
+                if not expanded:
+                    self.offload_results.put(True)
+                    continue
+                assert ready is not None
                 ready.synchronize()
                 extra_info = (
                     HiCacheStorageExtraInfo(extra_info={"session_id": session_id})

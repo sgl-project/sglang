@@ -551,6 +551,12 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             },
         )
         self.assertEqual(group.entry_map[PoolName.DEEPSEEK_V4_C1].layer_mapping, {3: 0})
+        # The full-page source KV and index buffers are replicated across CP;
+        # the packed target/draft SWA can include rank-specific unwritten rows.
+        self.assertEqual(
+            {entry.name for entry in group.entries if entry.cp_replicated},
+            set(group.entry_map) - {PoolName.SWA},
+        )
         c2 = group.entry_map[PoolName.DEEPSEEK_V4_C2]
         self.assertEqual(c2.layer_mapping, {1: 0, 5: 1})
         self.assertIsNone(c2.get_prepared_layer_range_meta([1], 2))
