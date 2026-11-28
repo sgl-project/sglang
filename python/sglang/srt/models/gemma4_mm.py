@@ -596,41 +596,39 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         all_input_features_mask = flatten_nested_list(
             [~item.input_features_mask for item in items]
         )
-
-        all_embeds = []
-        for input_features, input_features_mask in zip(
-            all_input_features, all_input_features_mask
-        ):
-            if input_features.dim() == 2:
-                input_features = input_features.unsqueeze(0)
-            if input_features_mask.dim() == 1:
-                input_features_mask = input_features_mask.unsqueeze(0)
-
-            input_features = input_features.to(
-                device=self.audio_tower.device,
-                dtype=self.language_model.dtype(),
-            )
-            input_features_mask = input_features_mask.to(device=input_features.device)
-
-            # audio_mel_mask convention: True = padding
-            audio_encodings, audio_mask = self.audio_tower(
-                input_features, input_features_mask
-            )
-
-            audio_features = self.embed_audio(inputs_embeds=audio_encodings)
-
-            for enc, mask in zip(audio_features, audio_mask):
-                all_embeds.append(enc[~mask])
-
-        if all_embeds:
-            return torch.cat(all_embeds, dim=0)
-        else:
+        if not all_input_features:
             return torch.empty(
                 0,
                 self.language_model.config.hidden_size,
                 device=next(self.parameters()).device,
                 dtype=self.language_model.dtype(),
             )
+
+        # Encode every clip of the batch in one tower pass. Clips are padded
+        # to the longest one; padded frames are masked like the processor's
+        # own padding (zeroed before each subsampling conv, causal light
+        # conv, masked attention keys), so valid frames are unaffected.
+        device = self.audio_tower.device
+        dtype = self.language_model.dtype()
+        features = [f if f.dim() == 3 else f.unsqueeze(0) for f in all_input_features]
+        masks = [m if m.dim() == 2 else m.unsqueeze(0) for m in all_input_features_mask]
+        batch = sum(f.shape[0] for f in features)
+        num_frames = max(f.shape[1] for f in features)
+        mel = features[0].new_zeros((batch, num_frames, features[0].shape[-1]))
+        # audio_mel_mask convention: True = padding
+        mel_mask = masks[0].new_ones((batch, num_frames), dtype=torch.bool)
+        row = 0
+        for f, m in zip(features, masks):
+            mel[row : row + f.shape[0], : f.shape[1]] = f
+            mel_mask[row : row + f.shape[0], : f.shape[1]] = m.to(mel_mask.device)
+            row += f.shape[0]
+        mel = mel.to(device=device, dtype=dtype, non_blocking=True)
+        mel_mask = mel_mask.to(device=device, non_blocking=True)
+
+        audio_encodings, audio_mask = self.audio_tower(mel, mel_mask)
+        audio_features = self.embed_audio(inputs_embeds=audio_encodings)
+        # Valid frames of every clip, in clip order.
+        return audio_features[~audio_mask]
 
     def get_per_layer_inputs(
         self, input_ids: torch.LongTensor
