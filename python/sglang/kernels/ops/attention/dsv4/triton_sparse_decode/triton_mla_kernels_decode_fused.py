@@ -60,6 +60,12 @@ SMALL_BATCH_TOKEN_THRESHOLD = 8
 # Topk threshold for split-K value selection within the split-K path
 SPLITK_HIGH_TOPK_THRESHOLD = 512
 
+# At or below this h_q the non-split grid has one H block per token, too few
+# programs to fill the GPU, so dual scope always splits K.
+SMALL_HQ_SPLITK_THRESHOLD = 16
+# Small-h_q split-K uses 8 splits up to this many tokens and 4 beyond.
+SMALL_HQ_SPLITK8_TOKEN_THRESHOLD = 48
+
 # ============================================================================
 # Shared split-K decision logic for dual-scope kernels
 # ============================================================================
@@ -71,6 +77,9 @@ def _decide_splitk_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> i
     Returns:
         split_k value (0 means no split-K, use non-splitk kernel).
     """
+    if h_q <= SMALL_HQ_SPLITK_THRESHOLD:
+        return 8 if total_tokens <= SMALL_HQ_SPLITK8_TOKEN_THRESHOLD else 4
+
     # Conditions under which split-K is beneficial:
     use_splitk_for_small_bs = total_tokens <= SMALL_BATCH_TOKEN_THRESHOLD and (
         h_q >= 128 or total_topk >= 1024
