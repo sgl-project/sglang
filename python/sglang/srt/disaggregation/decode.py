@@ -361,6 +361,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
         max_verify_batch_size: Optional[int] = None,
+        speculative_algorithm: Optional[str] = None,
     ):
         DecodeReqToTokenPool.__init__(
             self,
@@ -416,6 +417,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             enable_mamba_extra_buffer=self.enable_mamba_extra_buffer,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
             speculative_eagle_topk=speculative_eagle_topk,
+            speculative_algorithm=speculative_algorithm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
