@@ -395,6 +395,7 @@ class AscendAttnBackend(AttentionBackend):
         dense_mla = self.use_mla and not self.use_dsa
         self.dense_mla_dcp_target = dense_mla and self.dcp_size > 1
         self.dsa_dcp_target = self.use_dsa and self.dcp_size > 1
+        self.use_decode_indexer_request_shard = parallel.attn_tp_size > 1
         if self.use_mla:
             self.nope_padding_dtype = self.model_dtype or torch.bfloat16
             if (
@@ -1979,6 +1980,38 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
             )
+        return self._forward_unquantized_sparse(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            topk_indices=topk_indices,
+            scaling=layer.scaling,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+        )
+
+    def _forward_unquantized_sparse(
+        self,
+        *,
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        topk_indices,
+        scaling,
+        actual_seq_qlen,
+        actual_seq_lengths_kv,
+    ):
+        # Before arch35, sparse attention requires a power-of-two head group.
+        # Arch35 supports K3.1's 96 query heads without padding.
+        num_q_heads = q_nope.shape[1]
+        head_padding = (
+            0 if is_npu_arch35() else next_power_of_2(num_q_heads) - num_q_heads
+        )
+        if head_padding:
+            q_nope = torch.nn.functional.pad(q_nope, (0, 0, 0, head_padding))
+            q_pe = torch.nn.functional.pad(q_pe, (0, 0, 0, head_padding))
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=k_nope,
@@ -1986,7 +2019,7 @@ class AscendAttnBackend(AttentionBackend):
             query_rope=q_pe,
             key_rope=k_pe,
             sparse_indices=topk_indices,
-            scale_value=layer.scaling,
+            scale_value=scaling,
             actual_seq_lengths_query=actual_seq_qlen.to(
                 device=q_nope.device, dtype=torch.int32
             ),
@@ -2001,7 +2034,7 @@ class AscendAttnBackend(AttentionBackend):
             attention_mode=2,
             return_softmax_lse=False,
         )
-        return attn_out
+        return attn_out[:, :num_q_heads] if head_padding else attn_out
 
     def _forward_fp8_sparse(
         self,
@@ -2131,7 +2164,11 @@ class AscendAttnBackend(AttentionBackend):
             k_rope = k_rope.reshape(
                 k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
             )
-            if getattr(self.token_to_kv_pool, "layer_shard_enabled", False):
+            kv_view = (
+                self.token_to_kv_pool.layer_router.wrapped_view()
+                or self.token_to_kv_pool
+            )
+            if getattr(kv_view, "layer_shard_enabled", False):
                 # The split pool caches the CP-gathered full-sequence copy on
                 # non-owner ranks, skipping the get-time owner broadcast.
                 # Only safe when this write covers the whole read range: a
@@ -2236,6 +2273,11 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
             )
+            logical_rows = getattr(self.forward_metadata, "cp_query_num_tokens", None)
+            if logical_rows is not None:
+                # All-masked physical PCP rows can produce NaNs. They must
+                # not reach the output projection or subsequent reductions.
+                attn_out[logical_rows:].zero_()
         else:
             # extend_kv is set by the model only for a DCP extend that gathered the KV.
             dcp_metadata = forward_batch.attn_dcp_metadata
@@ -2281,53 +2323,16 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv,
                 )
             else:
-                # npu_sparse_flash_attention requires the GQA group size
-                # (num_q_heads / num_kv_heads) to be a power of two; Kimi K3.1
-                # has 96 q heads / 32 kv heads (group size 3), so pad the query
-                # heads to the next power of two by duplicating the last head
-                # and slice the padding off the output.
-                num_q_heads = q_nope.shape[1]
-                pad_heads = next_power_of_2(num_q_heads)
-                if pad_heads != num_q_heads:
-                    extra = pad_heads - num_q_heads
-                    q_nope = torch.cat(
-                        (
-                            q_nope,
-                            q_nope[:, -1:, :].expand(-1, extra, -1),
-                        ),
-                        dim=1,
-                    ).contiguous()
-                    q_pe = torch.cat(
-                        (
-                            q_pe,
-                            q_pe[:, -1:, :].expand(-1, extra, -1),
-                        ),
-                        dim=1,
-                    ).contiguous()
-                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
-                    query=q_nope,
-                    key=k_nope,
-                    value=k_nope,
-                    query_rope=q_pe,
-                    key_rope=k_pe,
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    return_softmax_lse=False,
+                attn_out = self._forward_unquantized_sparse(
+                    q_nope=q_nope,
+                    q_pe=q_pe,
+                    k_nope=k_nope,
+                    k_pe=k_pe,
+                    topk_indices=topk_indices,
+                    scaling=layer.scaling,
+                    actual_seq_qlen=actual_seq_qlen,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
                 )
-                if pad_heads != num_q_heads:
-                    attn_out = attn_out[:, :num_q_heads]
 
         return attn_out
 
@@ -3857,6 +3862,31 @@ class AscendAttnBackend(AttentionBackend):
                     value_quant_mode=0,
                 )
             else:
+                # DFLASH draft blocks are ENCODER_ONLY: mutually visible
+                # (non-causal) with a per-layer look-back window. sparse_mode=4
+                # bands off the tril diagonal in atten_mask and widens by
+                # pre/next tokens, so the tril mtp_mask with pre=window /
+                # next=FULL yields keys [p - window, end] per row; a maskless
+                # sparse_mode=4 is rejected by the kernel.
+                if layer.attn_type == AttentionType.ENCODER_ONLY:
+                    is_swa_verify = layer.sliding_window_size != -1
+                    verify_sparse_mode = 4 if is_swa_verify else 0
+                    verify_mask = self.mtp_mask if is_swa_verify else None
+                    verify_pre_tokens = (
+                        layer.sliding_window_size if is_swa_verify else 0
+                    )
+                    verify_next_tokens = FULL_ATTENTION_WINDOW if is_swa_verify else 0
+                else:
+                    # Causal verify chain (MTP/DSPARK): tril mask, full
+                    # look-back; a sliding layer narrows the left edge.
+                    verify_sparse_mode = 4 if layer.sliding_window_size != -1 else 3
+                    verify_mask = self.mtp_mask
+                    verify_pre_tokens = (
+                        layer.sliding_window_size
+                        if layer.sliding_window_size != -1
+                        else FULL_ATTENTION_WINDOW
+                    )
+                    verify_next_tokens = 0
                 workspace = (
                     torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                         q_nope,
@@ -3872,10 +3902,12 @@ class AscendAttnBackend(AttentionBackend):
                         antiquant_scale=None,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=verify_sparse_mode,
+                        atten_mask=verify_mask,
                         actual_seq_lengths=actual_seq_lengths,
                         actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        pre_tokens=verify_pre_tokens,
+                        next_tokens=verify_next_tokens,
                     )
                 )
                 attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
@@ -3894,10 +3926,12 @@ class AscendAttnBackend(AttentionBackend):
                     antiquant_scale=None,
                     block_table=block_table,
                     block_size=self.page_size,
-                    sparse_mode=3,
-                    atten_mask=self.mtp_mask,
+                    sparse_mode=verify_sparse_mode,
+                    atten_mask=verify_mask,
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    pre_tokens=verify_pre_tokens,
+                    next_tokens=verify_next_tokens,
                     workspace=workspace,
                     out=[attn_output, softmax_lse],
                 )

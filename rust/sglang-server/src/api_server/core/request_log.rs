@@ -984,8 +984,8 @@ impl Drop for RequestRecord {
 }
 
 /// `output`'s `/generate` frame, with its keys in the order of Python's output
-/// dict (`text`, `output_ids`, `meta_info`) and `output_ids` present even when
-/// empty as Python's is.
+/// dict (`text`, `output_ids`, `meta_info`). `frame()` always sets `output_ids`,
+/// so the empty-list fallback below is only defensive.
 fn python_out(output: CoreOutput, rid: &str, e2e_latency: f64) -> Map<String, Value> {
     let frame = output.frame(rid, None, Some(e2e_latency));
     let Value::Object(mut frame) = serde_json::to_value(&frame).expect("frames serialize") else {

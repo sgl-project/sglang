@@ -33,7 +33,6 @@ dependencies = [
   "cuda-python>=13.0",
   "datasets",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
-  "deepseek-recipe==0.2.0 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "distro",
   "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "einops",
@@ -83,6 +82,7 @@ dependencies = [
   "setproctitle",
   "sgl-deep-ep==0.1.3",
   "sgl-deep-gemm==0.2.9",
+  "sgl-deepseek-recipe==0.2.1 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or sys_platform == 'darwin'",
   "sgl-fa3==0.1.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",  # Only an x86_64 wheel is published.
   "sgl-flash-mla==1.0.5",
   "sglang-kernel==0.4.11",
@@ -99,6 +99,7 @@ dependencies = [
   "torchvision",
   "tqdm",
   "transformers==5.19.0",
+  "urllib3>=2.3",
   "uvicorn>=0.51",
   "uvloop",
   "watchfiles",
@@ -122,6 +123,8 @@ diffusion = [
   "cache-dit==1.5.1",
   "cloudpickle==3.1.2",
   "diffusers==0.37.0",
+  "httpcore>=0.17.2",
+  "httpx",
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",

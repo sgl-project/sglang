@@ -86,7 +86,8 @@ class TestSamplingParamsTruncation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         manager = TokenizerManager.__new__(TokenizerManager)
-        manager.context_len = 100
+        manager.max_req_len = 100
+        manager.max_req_input_len = 94
         manager.num_reserved_tokens = 0
         manager.allow_auto_truncate = True
         manager.validate_total_tokens = True
@@ -112,6 +113,50 @@ class TestSamplingParamsTruncation(CustomTestCase):
                         [min(20, 100 - length) for length in lengths],
                     )
                     self.assertEqual(shared, {"max_new_tokens": 20})
+
+    def test_truncated_prompt_keeps_its_reserved_tokens(self):
+        """Reserved tokens count in the total after truncation; a multimodal prompt is rejected instead."""
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.max_req_len = 100
+        manager.max_req_input_len = 91
+        manager.num_reserved_tokens = 3
+        manager._embedding_preserve_last_token_id = None
+        manager.allow_auto_truncate = True
+        manager.validate_total_tokens = True
+        manager.is_generation = True
+        manager.model_config = SimpleNamespace(
+            joint_head_config=None, pointer_head=None
+        )
+        req = GenerateReqInput(
+            input_ids=[1] * 120, sampling_params={"max_new_tokens": 20}
+        )
+        req.normalize_batch_and_arguments()
+        manager._validate_one_request(req, req.input_ids)
+
+        self.assertEqual(len(req.input_ids), 91)
+        self.assertEqual(req.sampling_params["max_new_tokens"], 100 - 91 - 3)
+
+        mm_req = GenerateReqInput(
+            input_ids=[1] * 120, sampling_params={"max_new_tokens": 20}
+        )
+        mm_req.normalize_batch_and_arguments()
+        with self.assertRaisesRegex(
+            ValueError, "Multimodal prompt is too long after expanding"
+        ):
+            manager._validate_one_request(mm_req, mm_req.input_ids, is_multimodal=True)
+        self.assertEqual(len(mm_req.input_ids), 120)
+        manager.allow_auto_truncate = False
+        long_req = GenerateReqInput(
+            input_ids=[1] * 10, sampling_params={"max_new_tokens": 200}
+        )
+        long_req.normalize_batch_and_arguments()
+        with self.assertRaisesRegex(
+            ValueError, "This model's maximum context length is 100 tokens"
+        ):
+            manager._validate_one_request(long_req, long_req.input_ids)
 
 
 _NOT_FINISHED = object()  # Sentinel: request has not finished yet
@@ -1164,6 +1209,8 @@ def _make_tm_for_generate(case, enable_lora=False) -> TokenizerManager:
     tm.tokenizer = None
     tm.is_pause = False
     tm.is_pause_cond = asyncio.Condition()
+    tm._elastic_shrink_pause_event = asyncio.Event()
+    tm._elastic_shrink_pause_event.set()
     tm.model_update_lock = Mock()
     tm.model_update_lock.reader_lock = _DummyAsyncCM()
     tm.request_metrics_exporter_manager = Mock()
