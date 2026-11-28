@@ -26,16 +26,7 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
-    if (
-        cfg.uses_mamba_radix_cache
-        and decode_state_free_radix_of(cfg)
-        and cfg.enable_unified_cache_external_linker
-    ):
-        raise ValueError(
-            "A state-free PD decode radix tree does not support "
-            "--enable-unified-cache-external-linker; set "
-            "SGLANG_DECODE_STATE_FREE_RADIX=0 to keep Mamba state in the tree."
-        )
+    _reject_linker_on_state_free_decode_tree(cfg)
     from sglang.srt.mem_cache.unified_cache.linker_config import (
         UnifiedCacheLinkerConfig,
         parse_linker_load_options,
@@ -126,6 +117,19 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+
+def _reject_linker_on_state_free_decode_tree(cfg: Any):
+    if (
+        cfg.uses_mamba_radix_cache
+        and decode_state_free_radix_of(cfg)
+        and cfg.enable_unified_cache_external_linker
+    ):
+        raise ValueError(
+            "A state-free PD decode radix tree does not support "
+            "--enable-unified-cache-external-linker; set "
+            "SGLANG_DECODE_STATE_FREE_RADIX=0 to keep Mamba state in the tree."
+        )
 
 
 def handle_hicache_ratio_default(server_args: Any):
