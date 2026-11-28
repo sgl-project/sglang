@@ -141,6 +141,8 @@ class MarlinPairProvider(PairRowDomainProvider):
             use_atomic_add=self._use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
+            # align_rows sorts live blocks by expert and writes a one-word padded count.
+            expert_ids_are_sorted=True,
         )
 
     def gateup(self, row_state: MarlinRowState, out: torch.Tensor) -> None:
@@ -192,6 +194,33 @@ class MarlinFp8PairProvider(MarlinPairProvider):
         key="marlin_fp8_contiguous", quant_info_cls=MoeLoraFp8MarlinQuantInfo
     )
     _is_fp8 = True
+
+    def __init__(self, quant_info: MoeLoraFp8MarlinQuantInfo):
+        super().__init__(quant_info)
+        device = quant_info.w13_qweight.device
+        capability = torch.cuda.get_device_capability(device)
+        layer = (
+            quant_info.group_size,
+            quant_info.hidden_size,
+            quant_info.intermediate_size,
+        )
+        # Measured on SM90: 16-row blocks beat 8-row from 6.5 pairs/expert, not 7.2.
+        self._early_block_16 = layer == (128, 2048, 512) and capability == (9, 0)
+        # Measured on SM103/152 SMs: prepare + both GEMMs run faster in 48-row blocks.
+        self._blocks_of_48 = (
+            layer == (32, 2048, 512)
+            and quant_info.num_local_experts == 256
+            and capability == (10, 3)
+            and torch.cuda.get_device_properties(device).multi_processor_count == 152
+        )
+
+    def _block_size_m(self, num_tokens: int, top_k: int, num_experts: int) -> int:
+        pairs_per_expert = num_tokens * top_k / num_experts
+        if self._early_block_16 and 6.5 <= pairs_per_expert < 7.2:
+            return 16
+        if self._blocks_of_48 and 128 <= pairs_per_expert <= 512:
+            return 48
+        return super()._block_size_m(num_tokens, top_k, num_experts)
 
 
 class MarlinMxfp4PairProvider(MarlinPairProvider):

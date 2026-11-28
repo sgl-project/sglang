@@ -121,9 +121,9 @@ def _load_mxfp8_layer(w13: torch.Tensor, w2: torch.Tensor):
             w2_weight=torch.nn.Parameter(w2, requires_grad=False),
             w13_weight_scale_inv=torch.nn.Parameter(w13_scale, requires_grad=False),
             w2_weight_scale_inv=torch.nn.Parameter(w2_scale, requires_grad=False),
-            hidden_size=_H,
-            intermediate_size_per_partition=_I,
-            num_local_experts=_E,
+            num_local_experts=w2.shape[0],
+            hidden_size=w2.shape[1],
+            intermediate_size_per_partition=w2.shape[2],
             moe_runner_config=SimpleNamespace(
                 is_gated=True, activation="silu", apply_router_weight_on_input=False
             ),
@@ -141,6 +141,7 @@ def _load_mxfp8_layer(w13: torch.Tensor, w2: torch.Tensor):
         serialized = load(q13, q2, s13, s2, serialized=True)
     for name in ("w13_qweight", "w2_qweight", "w13_scales", "w2_scales"):
         assert torch.equal(getattr(online, name), getattr(serialized, name)), name
+    assert online.group_size == 32
     return online, ref13, ref2
 
 
@@ -183,6 +184,56 @@ def _check_gemms(gateup, down, hidden, topk_ids, act_pairs, w13_eff, w2_eff):
     inputs = hidden.repeat_interleave(topk_ids.shape[1], dim=0)
     assert rel_l2(gateup.float(), reference(inputs, w13_eff)) < _MARLIN_TOL
     assert rel_l2(down.float(), reference(act_pairs, w2_eff)) < _MARLIN_TOL
+
+
+@pytest.mark.parametrize(
+    "family, tokens, block_size_m, only_on",
+    (
+        # 6.5 pairs per expert: the lower bound of the SM90 block-16 rule.
+        ("fp8", 13, 16, (9, 0)),
+        # 32 pairs per expert: the shared rule's 48-row blocks on any GPU, with
+        # 128-wide and 32-wide scale groups (the SM103 48-row rule's width).
+        ("fp8", 64, 48, None),
+        ("mxfp8", 64, 48, None),
+    ),
+)
+def test_fp8_marlin_block_sizes_replay(family, tokens, block_size_m, only_on):
+    _skip_unless_supported()
+    if only_on is not None and torch.cuda.get_device_capability() != only_on:
+        pytest.skip("the early block-16 rule is SM90-only")
+    g = torch.Generator(device="cpu").manual_seed(17)
+    hidden_size, intermediate = 2048, 512
+    quant_info, w13_eff, w2_eff = _marlin_layer(
+        family,
+        _rand(g, _E, 2 * intermediate, hidden_size),
+        _rand(g, _E, hidden_size, intermediate),
+    )
+    assert quant_info.group_size == (32 if family == "mxfp8" else 128)
+    provider = select_provider_cls("route_major", family, "marlin")(quant_info)
+    hidden, topk_ids = _rand(g, tokens, hidden_size), _route(g, tokens)
+    act_pairs = _rand(g, tokens * _TOPK, intermediate, scale=0.1)
+
+    state, gateup, down = _run_gemms(provider, hidden, topk_ids, act_pairs)
+    assert state.block_size_m == block_size_m
+    _check_gemms(gateup, down, hidden, topk_ids, act_pairs, w13_eff, w2_eff)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            _run_gemms(provider, hidden, topk_ids, act_pairs)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        state, gateup, down = _run_gemms(provider, hidden, topk_ids, act_pairs)
+    assert state.block_size_m == block_size_m
+    # Replay over new routing and inputs in the captured buffers.
+    topk_ids.copy_(_route(g, tokens))
+    hidden.copy_(_rand(g, tokens, hidden_size))
+    act_pairs.copy_(_rand(g, tokens * _TOPK, intermediate, scale=0.1))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_gemms(gateup, down, hidden, topk_ids, act_pairs, w13_eff, w2_eff)
 
 
 @pytest.mark.parametrize(
@@ -291,6 +342,7 @@ def test_fp8_marlin_channel_scales_are_applied_before_accumulation(
     w13, s13 = weight(2 * intermediate, hidden_size)
     w2, s2 = weight(hidden_size, intermediate)
     quant_info = _bind(w13, w2, s13, s2)
+    assert quant_info.group_size == group_size
     tokens = 4
     values = torch.full((tokens, 1), 2.0**-60, device="cuda", dtype=torch.bfloat16)
     if group_size == 32:
@@ -458,6 +510,7 @@ def test_compressed_tensors_marlin_keeps_separate_gate_and_up_scales():
         scheme.process_weights_after_loading(layer)
 
     info = MoeLoraFp8MarlinQuantInfo.from_layer(layer)
+    assert info.group_size == 32
     row_scale = gate_up_scale.repeat_interleave(intermediate, dim=1)
     expected = _bind(
         codes13,
