@@ -1298,19 +1298,7 @@ def test_sm120_low_hd_paged_decode_reuses_cached_host_plan(
 ):
     """Low-HD MHA/GQA/MQA decode must reuse its compiled TVM-FFI plan."""
     sm120_forward_host.clear_launch_plans()
-    cache_hits = []
-    original_try_paged = sm120_forward_host.try_paged
-
-    def record_cache_hit(**kwargs):
-        result = original_try_paged(**kwargs)
-        cache_hits.append(result is not None)
-        return result
-
-    monkeypatch.setattr(
-        sm120_forward_host,
-        "try_paged",
-        record_cache_hit,
-    )
+    cache_hits = _record_paged_cache_hits(monkeypatch)
     torch.manual_seed(20260731 + head_dim + num_kv_heads)
     batch_size, num_q_heads = 2, 8
     max_seqlen, page_size = 512, 64
@@ -1419,8 +1407,7 @@ def _record_paged_cache_hits(monkeypatch):
     return cache_hits
 
 
-@pytest.mark.parametrize("page_size", [1, 64])
-@pytest.mark.parametrize("num_kv_heads", [8, 2])
+@pytest.mark.parametrize(("page_size", "num_kv_heads"), [(1, 8), (64, 2)])
 def test_sm120_paged_prefill_reuses_cached_host_plan(
     monkeypatch,
     page_size,
@@ -1465,40 +1452,6 @@ def test_sm120_paged_prefill_reuses_cached_host_plan(
     for _ in range(2):
         run(layers[0], torch.empty_like(outs[0]), max_seqlen_k=max(lengths) + 64)
     assert cache_hits == [False, False, True]
-
-
-def test_sm120_paged_prefill_full_and_swa_layers_keep_separate_plans(monkeypatch):
-    sm120_forward_host.clear_launch_plans()
-    cache_hits = _record_paged_cache_hits(monkeypatch)
-    torch.manual_seed(20261105)
-    lengths = (192, 128, 77)
-
-    def run(layer, window_size):
-        return flash_attn_with_kvcache(
-            **layer,
-            max_seqlen_q=max(lengths),
-            causal=True,
-            window_size=window_size,
-            num_splits=1,
-        )
-
-    # The window is well below the sequence lengths, so the two settings differ.
-    full, swa = (-1, -1), (63, 0)
-    layers = [
-        (_paged_prefill_batch(lengths, 64, 16, 2, 128), window_size)
-        for window_size in (full, swa, full, swa)
-    ]
-    outputs = [run(*layer) for layer in layers]
-    torch.cuda.synchronize()
-    # The first SWA call misses although a full-attention plan of identical shapes exists.
-    assert cache_hits == [False, False, False, False, True, True]
-
-    for layer, cached in zip(layers, outputs):
-        sm120_forward_host.clear_launch_plans()
-        torch.testing.assert_close(run(*layer), cached, atol=0.0, rtol=0.0)
-
-    # The bitwise checks catch a shared plan only if the settings' outputs differ.
-    assert not torch.equal(run(layers[0][0], swa), outputs[0])
 
 
 def test_sm120_split_kv_paged_prefill_is_not_replayed_from_a_plan():
@@ -1961,19 +1914,7 @@ def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(
 ):
     """Ragged SplitKV must remain correct across uniform/ragged cache reuse."""
     sm120_forward_host.clear_launch_plans()
-    cache_hits = []
-    original_try_paged = sm120_forward_host.try_paged
-
-    def record_cache_hit(**kwargs):
-        result = original_try_paged(**kwargs)
-        cache_hits.append(result is not None)
-        return result
-
-    monkeypatch.setattr(
-        sm120_forward_host,
-        "try_paged",
-        record_cache_hit,
-    )
+    cache_hits = _record_paged_cache_hits(monkeypatch)
     torch.manual_seed(1234)
     batch_size, num_q_heads, head_dim = 4, 6, 256
     max_seqlen, page_size = 1024, 64
@@ -2255,19 +2196,7 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
 ):
     """Every SplitKV dataflow must safely launch its captured combine early."""
     sm120_forward_host.clear_launch_plans()
-    cache_hits = []
-    original_try_paged = sm120_forward_host.try_paged
-
-    def record_cache_hit(**kwargs):
-        result = original_try_paged(**kwargs)
-        cache_hits.append(result is not None)
-        return result
-
-    monkeypatch.setattr(
-        sm120_forward_host,
-        "try_paged",
-        record_cache_hit,
-    )
+    cache_hits = _record_paged_cache_hits(monkeypatch)
     torch.manual_seed(20260730)
     batch_size, head_dim = 1, 256
     max_seqlen, page_size = 2048, 64

@@ -38,25 +38,10 @@ class TestQuackSwigluGemm(CustomTestCase):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
         init_single_process_dist()
 
-    def test_kernel_reads_gate_up_layout_in_place(self):
+    def test_mlp_runs_the_fused_gemm(self):
         """The merged weight is [gate; up]. M covers both tile heights, all tile
         widths and partial M tiles."""
-        from sglang.kernels.ops.gemm.quack_swiglu_gemm import quack_swiglu_gemm
-
-        for m in (1, 256, 300, 512, 600, 768, 2049):
-            with self.subTest(m=m):
-                torch.manual_seed(m)
-                x = torch.randn(m, HIDDEN, device="cuda", dtype=torch.bfloat16)
-                w = torch.randn(2 * INTER, HIDDEN, device="cuda", dtype=torch.bfloat16)
-                w = w * 0.05
-                torch.testing.assert_close(
-                    quack_swiglu_gemm(x, w).float(),
-                    _swiglu_ref(x, w),
-                    rtol=2e-2,
-                    atol=2e-2,
-                )
-
-    def _mlp(self):
+        import sglang.kernels.ops.gemm as gemm_ops
         from sglang.srt.models.qwen2 import Qwen2MLP
 
         torch.manual_seed(0)
@@ -64,28 +49,26 @@ class TestQuackSwigluGemm(CustomTestCase):
             mlp = Qwen2MLP(HIDDEN, INTER, "silu").to("cuda", torch.bfloat16)
         for p in mlp.parameters():
             p.data.normal_(std=0.05)
-        return mlp
+        fused = gemm_ops.dual_gemm_swiglu_quack
+        activations = []
 
-    def _run(self, mlp, m):
-        import sglang.kernels.ops.gemm as gemm_ops
+        def record(x, weight):
+            activations.append(fused(x, weight))
+            return activations[-1]
 
-        x = torch.randn(m, HIDDEN, device="cuda", dtype=torch.bfloat16)
-        with mock.patch.object(
-            gemm_ops, "dual_gemm_swiglu_quack", wraps=gemm_ops.dual_gemm_swiglu_quack
-        ) as fused:
-            out = mlp(x)
-        return x, out, fused.called
-
-    def test_mlp_takes_fused_path(self):
-        mlp = self._mlp()
-        for m in (1, 2048):
+        for m in (1, 256, 300, 512, 600, 768, 2049):
             with self.subTest(m=m):
-                x, out, fused = self._run(mlp, m)
-                self.assertTrue(fused)
-                ref = _swiglu_ref(x, mlp.gate_up_proj.weight)
-                ref = ref @ mlp.down_proj.weight.float().t()
-                err = (out.float() - ref).norm() / ref.norm()
-                self.assertLess(err.item(), 1e-2)
+                activations.clear()
+                x = torch.randn(m, HIDDEN, device="cuda", dtype=torch.bfloat16)
+                with mock.patch.object(gemm_ops, "dual_gemm_swiglu_quack", record):
+                    mlp(x)
+                self.assertEqual(len(activations), 1)
+                torch.testing.assert_close(
+                    activations[0].float(),
+                    _swiglu_ref(x, mlp.gate_up_proj.weight),
+                    rtol=2e-2,
+                    atol=2e-2,
+                )
 
 
 if __name__ == "__main__":

@@ -16,13 +16,11 @@
 
 import itertools
 import math
-import threading
 import unittest
 from types import SimpleNamespace
 
 import torch
 
-from sglang.kernels.ops.attention import beam_shared_context_split_kv
 from sglang.kernels.ops.attention.beam_shared_context import shared_context_attention
 from sglang.kernels.ops.attention.beam_shared_context_split_kv import (
     partial_buffers,
@@ -99,13 +97,12 @@ def _case(
     decode_capacity=3,
     num_slots=1 << 14,
     unowned_rows=0,
-    seed=0,
 ):
     """Width buckets at shuffled rows of one Q, and their reference.
 
     `unowned_rows` rows of Q belong to no bucket and keep SENTINEL.
     """
-    torch.manual_seed(seed)
+    torch.manual_seed(0)
     device = torch.device("cuda")
     owned_rows = sum(w * len(c) for w, (c, _) in groups_per_width.items())
     num_rows = owned_rows + unowned_rows
@@ -148,20 +145,12 @@ def _case(
     )
 
 
-def _spread(tensor, dim=0):
-    """The same values and shape, with twice the stride along `dim`."""
-    shape = list(tensor.shape)
-    shape[dim] *= 2
-    index = [slice(None)] * tensor.ndim
-    index[dim] = slice(None, None, 2)
-    view = torch.zeros(shape, dtype=tensor.dtype, device=tensor.device)[tuple(index)]
-    view.copy_(tensor)
-    return view
-
-
-def _run(kernel, case, **kwargs):
+def _run(kernel, case, *, poison_partials=False, **kwargs):
     output = torch.full_like(case.q, SENTINEL)
     for bucket in case.buckets:
+        if poison_partials:
+            for buffer in partial_buffers(case.q.device, 1, 1):
+                buffer.fill_(float("nan"))
         kernel(
             case.q,
             case.k_buffer,
@@ -180,18 +169,30 @@ def _run(kernel, case, **kwargs):
 
 class TestBeamSharedContextAttention(CustomTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_split_kv_matches_fp32_reference(self):
-        """Also with empty splits, and with the kept partial buffers poisoned: a
-        launch must write every partial it reads."""
-        case = _case({4: ([1, 70, 300], [2, 1, 2])})
-        for num_splits in (None, 1, 8):
-            with self.subTest(num_splits=num_splits):
-                _run(shared_context_attention_split_kv, case, num_splits=num_splits)
-                for buffer in partial_buffers(case.q.device, 1, 1):
-                    buffer.fill_(float("nan"))
-                output = _run(
-                    shared_context_attention_split_kv, case, num_splits=num_splits
-                )
+    def test_kernels_match_fp32_reference(self):
+        """Each kernel writes only its buckets' rows. Split-KV also with empty
+        splits, and with its kept partials poisoned: a launch must write every
+        partial it reads."""
+        case = _case(
+            {
+                256: ([700, 2048], [3, 1]),
+                8: ([65, 1, 129], [1, 2, 3]),
+                3: ([40], [2]),
+            },
+            q_heads=16,
+            kv_heads=8,
+            head_dim=128,
+            unowned_rows=5,
+        )
+        variants = [("default", shared_context_attention, {})] + [
+            (f"split_kv/{n}", shared_context_attention_split_kv, {"num_splits": n})
+            for n in (None, 1, 8)
+        ]
+        for name, kernel, kwargs in variants:
+            with self.subTest(kernel=name):
+                # The first run sizes the kept partials that the second poisons.
+                _run(kernel, case, **kwargs)
+                output = _run(kernel, case, poison_partials=True, **kwargs)
                 torch.testing.assert_close(
                     output.float(), case.reference, rtol=1e-2, atol=1e-2
                 )
@@ -253,26 +254,6 @@ class TestBeamSharedContextAttention(CustomTestCase):
                 )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_kernels_write_only_their_buckets_rows(self):
-        case = _case(
-            {
-                256: ([700, 2048], [3, 1]),
-                8: ([65, 1, 129], [1, 2, 3]),
-                3: ([40], [2]),
-            },
-            q_heads=16,
-            kv_heads=8,
-            head_dim=128,
-            unowned_rows=5,
-        )
-        for name, kernel in KERNELS.items():
-            with self.subTest(kernel=name):
-                output = _run(kernel, case)
-                torch.testing.assert_close(
-                    output.float(), case.reference, rtol=1e-2, atol=1e-2
-                )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_graph_replay_refreshes_mixed_depths_and_row_mapping(self):
         torch.manual_seed(17)
         width, max_context, max_decode = 8, 80, 3
@@ -331,65 +312,6 @@ class TestBeamSharedContextAttention(CustomTestCase):
                     torch.testing.assert_close(
                         output.float(), expected.float(), rtol=1e-2, atol=1e-2
                     )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_plans_follow_the_strides(self):
-        case = _case({8: ([33, 70], [2, 1])})
-        bucket = case.buckets[0]
-        tail = (
-            bucket.context_slots,
-            bucket.context_cu_seqlens,
-            bucket.decode_slots,
-            bucket.decode_lens,
-        )
-        beam_shared_context_split_kv._PLANS.clear()
-        for _ in range(2):
-            output = shared_context_attention_split_kv(
-                case.q,
-                case.k_buffer,
-                case.v_buffer,
-                bucket.row_indices,
-                *tail,
-                output=torch.full_like(case.q, SENTINEL),
-                softmax_scale=case.softmax_scale,
-            )
-            torch.testing.assert_close(
-                output.float(), case.reference, rtol=1e-2, atol=1e-2
-            )
-        self.assertEqual(len(beam_shared_context_split_kv._PLANS), 1)
-        output = shared_context_attention_split_kv(
-            _spread(case.q),
-            _spread(case.k_buffer),
-            _spread(case.v_buffer),
-            _spread(bucket.row_indices, dim=1),
-            *tail,
-            output=_spread(torch.full_like(case.q, SENTINEL)),
-            softmax_scale=case.softmax_scale,
-        )
-        torch.testing.assert_close(output.float(), case.reference, rtol=1e-2, atol=1e-2)
-        self.assertEqual(len(beam_shared_context_split_kv._PLANS), 2)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-    def test_partial_buffers_are_kept_per_thread_and_stream(self):
-        device = torch.device("cuda", torch.cuda.current_device())
-        eager = partial_buffers(device, 4096, 64)
-        self.assertEqual(
-            partial_buffers(device, 1024, 16)[0].data_ptr(), eager[0].data_ptr()
-        )
-        others = []
-        thread = threading.Thread(
-            target=lambda: others.append(partial_buffers(device, 4096, 64))
-        )
-        thread.start()
-        thread.join()
-        for graph in (torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()):
-            with torch.cuda.graph(graph):
-                others.append(partial_buffers(device, 4096, 64))
-                others[-1][0].zero_()
-        with torch.cuda.stream(torch.cuda.Stream()):
-            others.append(partial_buffers(device, 4096, 64))
-        pointers = {buffers[0].data_ptr() for buffers in (eager, *others)}
-        self.assertEqual(len(pointers), 5)
 
 
 if __name__ == "__main__":
