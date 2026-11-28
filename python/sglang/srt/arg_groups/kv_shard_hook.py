@@ -172,11 +172,12 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "not support "
             f"--radix-cache-backend={cfg.radix_cache_backend!r}."
         )
-    if cfg.enable_unified_cache_external_linker:
+    if (
+        cfg.enable_unified_cache_external_linker
+        and cfg.unified_cache_external_linker_backend != "mooncake"
+    ):
         raise ValueError(
-            "--enable-kv-cache-sharding does not support "
-            "--enable-unified-cache-external-linker: load-back allocates "
-            "through the flat allocator API."
+            "--enable-kv-cache-sharding supports only the Mooncake external linker."
         )
     if cfg.enable_streaming_session:
         raise ValueError(

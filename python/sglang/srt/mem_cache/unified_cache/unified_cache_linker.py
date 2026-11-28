@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -46,6 +47,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
@@ -352,8 +354,13 @@ class UnifiedCacheLinkerWrapper:
         self.cache = cache
         self.cache_linker = cache_linker
         self.load_mode = cache_linker.load_mode
+        self.kv_sharded = (
+            page_interleave_shard_size(cache.token_to_kv_pool_allocator) > 1
+        )
         if self.load_mode == "prefetch" and cache.pp_size > 1:
             raise ValueError("External linker prefetch currently requires PP=1.")
+        if self.load_mode == "prefetch" and self.kv_sharded:
+            raise ValueError("External linker prefetch does not support KV sharding.")
         self._windows = tuple(cache.components[slot] for slot in windows)
         # A window whose pages the store lacks tombstones restored tails instead.
         self._skipped_windows = tuple(
@@ -736,10 +743,14 @@ class UnifiedCacheLinkerWrapper:
 
         # Build per-component linker transfers.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
+        rotation_base = None
         for component in self._components:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
+            if self.kv_sharded and component.component_type == ComponentType.FULL:
+                rotation_base, transfer = self._take_sharded_load_slots(req, hit)
+            else:
+                transfer = component.build_external_linker_transfer(
+                    LinkerTransferPhase.LOAD, None, tail_hashes
+                )
             if transfer is None:
                 self._update_load(
                     ExternalLinkerLoadPhase.ABORT,
@@ -792,11 +803,43 @@ class UnifiedCacheLinkerWrapper:
             and req.swa_branching_seqlen <= prefix_len
         ):
             req.swa_branching_seqlen = None
+        if rotation_base is not None:
+            req.kv_rotation_base = rotation_base
         self.private_load_indices[req.rid] = full_transfer.device_indices
         self.inflight_load_rids.append(req.rid)
         # The tail comes from the external store, not a host tier.
         req.host_hit_is_storage = True
         return len(full_transfer.device_indices), req.last_node
+
+    def _take_sharded_load_slots(
+        self, req: Req, hit: ExternalCacheHitMarker
+    ) -> tuple[Optional[int], Optional[PoolTransfer]]:
+        """Slots for the loaded tail that continue its chain's owner rotation,
+        and the chain's rotation base."""
+        cache = self.cache
+        allocator = cache.token_to_kv_pool_allocator
+        page = cache.page_size
+        num_tokens = len(hit.tail_hashes) * page
+        # Every rotation fits once each class has one page beyond an even split.
+        demand = num_tokens + allocator.shard_size * page
+        if allocator.available_size() < demand:
+            cache.evict_for_alloc(KVDemand(full_tokens=demand))
+        if hit.device_hit_len:
+            rotation_base = cache.rotation_base_of(req.last_node)
+            if rotation_base is None:
+                rotation_base = req.kv_rotation_base
+            assert rotation_base is not None
+            start_class = rotation_base + hit.device_hit_len // page
+        else:
+            rotation_base = start_class = allocator.least_full_class()
+        slots = allocator.alloc_cyclic(start_class=start_class, need_size=num_tokens)
+        if slots is None:
+            return None, None
+        return rotation_base, PoolTransfer(
+            name=PoolName.KV,
+            device_indices=slots.to(torch.int64),
+            keys=list(hit.tail_hashes),
+        )
 
     def _update_load(
         self,

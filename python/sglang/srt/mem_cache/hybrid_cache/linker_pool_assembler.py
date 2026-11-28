@@ -38,9 +38,19 @@ class DevicePoolEntry:
         dcp_sharded: bool = False,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
     ):
+        from sglang.srt.mem_cache.page_interleave_pool import (
+            PageInterleaveKVPoolMixin,
+        )
+
         self.name = name
         self.indices_from_pool = indices_from_pool
         self.device_pool = device_pool
+        # A page-interleaved pool holds only the pages its shard rank owns.
+        self.placement = None
+        self.shard_rank = 0
+        if isinstance(device_pool, PageInterleaveKVPoolMixin):
+            self.placement = device_pool.placement
+            self.shard_rank = device_pool.shard_rank
         self.components = [list(component) for component in components]
         self.layer_mapping = layer_mapping
         self.page_size = page_size
@@ -86,6 +96,19 @@ class DevicePoolEntry:
 
     def translate_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return self._index_mapper(indices) if self._index_mapper else indices
+
+    def owned_pages(
+        self, keys: list[str], indices: torch.Tensor
+    ) -> tuple[list[str], torch.Tensor]:
+        """Keys and pool-local indices of the pages this shard rank owns."""
+        pages = indices.reshape(-1, self.page_size)
+        if len(keys) != len(pages):
+            raise ValueError(
+                f"Pool {self.name} got {len(keys)} keys for {len(pages)} pages."
+            )
+        owned = self.placement.owner_of(pages[:, 0]) == self.shard_rank
+        owned_keys = [key for key, keep in zip(keys, owned.tolist()) if keep]
+        return owned_keys, self.placement.local_index(pages[owned].flatten())
 
     def _rows(self, indices: torch.Tensor) -> list[int]:
         slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
@@ -236,17 +259,23 @@ class DevicePoolGroup:
             source = by_name.get(source_name)
             if source is None or not source.keys:
                 continue
+            entry = self.entry_map[name]
             indices = source.device_indices
+            keys = list(source.keys)
+            if entry.placement is not None and indices is not None:
+                # May leave no keys; the transfer stays so every rank takes
+                # the same queue/ACK path.
+                keys, indices = entry.owned_pages(keys, indices)
             resolved.append(
                 replace(
                     source,
                     name=name,
                     host_indices=(
-                        self.entry_map[name].translate_indices(indices)
+                        entry.translate_indices(indices)
                         if indices is not None
                         else None
                     ),
-                    keys=list(source.keys),
+                    keys=keys,
                     hit_policy=(
                         PoolHitPolicy.ALL_PAGES
                         if source_name == PoolName.KV

@@ -5139,8 +5139,11 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         cases = (
             ({"radix_cache_backend": "custom"}, "built-in UnifiedRadixCache"),
             (
-                {"enable_unified_cache_external_linker": True},
-                "does not support --enable-unified-cache-external-linker",
+                {
+                    "enable_unified_cache_external_linker": True,
+                    "unified_cache_external_linker_backend": "mori",
+                },
+                "supports only the Mooncake external linker",
             ),
             (
                 {"enable_streaming_session": True},

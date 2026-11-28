@@ -264,11 +264,13 @@ class TestDevicePoolGroup(CustomTestCase):
                 name=PoolName.KV,
                 indices_from_pool=PoolName.KV,
                 translate_indices=lambda indices: indices,
+                placement=None,
             ),
             SimpleNamespace(
                 name=PoolName.INDEXER,
                 indices_from_pool=PoolName.KV,
                 translate_indices=lambda indices: indices + 100,
+                placement=None,
             ),
         ]
         group = DevicePoolGroup(entries, num_layers=2, page_size=2)
@@ -295,6 +297,7 @@ class TestDevicePoolGroup(CustomTestCase):
             name=PoolName.SWA,
             indices_from_pool=PoolName.SWA,
             translate_indices=lambda indices: indices + 100,
+            placement=None,
         )
         group = DevicePoolGroup([entry], num_layers=1, page_size=2)
         transfer = PoolTransfer(

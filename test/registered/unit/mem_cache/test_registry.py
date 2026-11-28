@@ -262,6 +262,7 @@ class TestCreateTreeCacheRouting(_RegistryIsolationMixin, CustomTestCase):
             ),
         )
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = ctx.params.token_to_kv_pool_allocator
         cache.tree_core = SimpleNamespace(
             enable_external_cache_linker=False, write_through_threshold=256
         )

@@ -22,6 +22,13 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
     loaded. Read completion, failure coordination and scheduling stay outside.
     """
 
+    @classmethod
+    def build(cls, device_pool, tp_group, attn_tp_group):
+        # Match the linker's load-plan group even without attention DP: CP
+        # ranks can own different pages and must not broadcast to each other.
+        group = attn_tp_group if attn_tp_group is not None else tp_group
+        return super().build(device_pool, group, attn_tp_group=None)
+
     def __init__(self, pool_group, group, src_global_rank):
         if not pool_group.rank_replicated:
             raise ValueError("Linker broadcasts require rank-replicated pools.")
@@ -52,6 +59,7 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
             group,
             src_global_rank,
         )
+        self.is_src = torch.distributed.get_rank(group) == 0
         # A physical page cannot be split into smaller rows by _bcast_layer.
         max_row_bytes = max(
             buf.shape[1]
@@ -73,13 +81,21 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
 
     def broadcast_loaded_layer(self, layer_id, prepared):
         for name, pool in self.pools.items():
-            layer = pool.layer_mapping.get(layer_id)
-            if layer is None or name not in prepared:
+            layers = pool.layer_mapping.get(layer_id)
+            if layers is None or name not in prepared:
                 continue
+            # Packed MTP transfers include both target and draft physical layers.
+            if isinstance(layers, int):
+                layers = (layers,)
             indices, _ = prepared[name]
             if indices.is_cuda:
                 indices.record_stream(device_module.current_stream())
-            for buffers in self.buffers[name]:
-                self._bcast_layer(
-                    buffers, self.kv_staging, indices, buffers[layer].shape[1], layer
-                )
+            for layer in layers:
+                for buffers in self.buffers[name]:
+                    self._bcast_layer(
+                        buffers,
+                        self.kv_staging,
+                        indices,
+                        buffers[layer].shape[1],
+                        layer,
+                    )

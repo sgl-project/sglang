@@ -1,9 +1,19 @@
 import unittest
+from collections import deque
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    _build_dsa_device_pool_group,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     _storage_sharing,
+)
+from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
+    LinkerMLADedupBroadcaster,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,6 +43,146 @@ def _sharing(dcp_size=1, **kwargs):
     return _storage_sharing(
         pools, dcp_size=dcp_size, dcp_rank=args["tp_rank"] % dcp_size, **args
     )
+
+
+class TestBroadcastGroup(CustomTestCase):
+    def test_broadcast_stays_within_the_load_plan_group(self):
+        """CP stripes need separate readers even when attention DP is disabled."""
+        tp_group = (0, 1, 2, 3)
+        pool = SimpleNamespace(
+            components=[[torch.empty((4, 2), dtype=torch.uint8)]],
+            buffer_meta=[[(0, 2, 2)]],
+            page_size=1,
+        )
+        pool_group = SimpleNamespace(
+            rank_replicated=True, entry_map={PoolName.KV: pool}, num_layers=1
+        )
+        for dp_enabled in (False, True):
+            for rank in tp_group:
+                for attn_tp_group in (
+                    tp_group[rank // 2 * 2 : rank // 2 * 2 + 2],
+                    None,
+                ):
+                    with (
+                        self.subTest(dp=dp_enabled, rank=rank, attn_tp=attn_tp_group),
+                        patch(
+                            "sglang.srt.mem_cache.mla_host_dedup.is_dp_attention_enabled",
+                            return_value=dp_enabled,
+                        ),
+                        patch(
+                            "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                            return_value=(rank % 2, 2) if dp_enabled else (rank, 4),
+                        ),
+                        patch.object(
+                            torch.distributed,
+                            "get_rank",
+                            side_effect=lambda group: group.index(rank),
+                        ),
+                        patch.object(
+                            torch.distributed,
+                            "get_process_group_ranks",
+                            side_effect=list,
+                        ),
+                        patch(
+                            "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                            side_effect=lambda *, group_ranks, backend: tuple(
+                                group_ranks
+                            ),
+                        ),
+                        patch.object(LinkerMLADedupBroadcaster, "_warmup_group"),
+                    ):
+                        broadcaster = LinkerMLADedupBroadcaster.build(
+                            pool_group, tp_group, attn_tp_group
+                        )
+                    expected = attn_tp_group if attn_tp_group is not None else tp_group
+                    self.assertEqual(broadcaster.group, expected)
+                    self.assertEqual(broadcaster.src_global_rank, expected[0])
+                    self.assertEqual(broadcaster.is_src, rank == expected[0])
+
+
+class TestPackedMTPBroadcast(CustomTestCase):
+    def test_target_and_draft_bytes_reach_rank_local_slots(self):
+        """Packed MTP loads must restore draft bytes as well as target bytes."""
+
+        def make_group():
+            def pool(layers):
+                return SimpleNamespace(
+                    page_size=2,
+                    layer_num=layers,
+                    kv_buffer=[
+                        torch.zeros((8, 3), dtype=torch.uint8) for _ in range(layers)
+                    ],
+                    index_k_with_scale_buffer=[
+                        torch.zeros((4, 5), dtype=torch.uint8) for _ in range(layers)
+                    ],
+                )
+
+            return _build_dsa_device_pool_group(pool(2), 2, (pool(1),))
+
+        for layer_id, names, loaded_layers in (
+            (0, (PoolName.KV, PoolName.INDEXER), (0, 2)),
+            (1, (PoolName.KV, PoolName.INDEXER), (1,)),
+            (9, (PoolName.KV, PoolName.INDEXER), ()),
+            (0, (PoolName.KV,), (0, 2)),
+        ):
+            with self.subTest(layer=layer_id, pools=names):
+                broadcasters = []
+                for rank in range(2):
+                    with (
+                        patch(
+                            "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                            return_value=(rank, 2),
+                        ),
+                        patch.object(torch.distributed, "get_rank", return_value=rank),
+                    ):
+                        broadcasters.append(
+                            LinkerMLADedupBroadcaster(make_group(), None, 0)
+                        )
+                source, receiver = broadcasters
+                for pool_id, components in enumerate(source.buffers.values()):
+                    for layer, buffer in enumerate(components[0]):
+                        buffer.copy_(
+                            torch.arange(buffer.numel()).reshape_as(buffer)
+                            + 30 * layer
+                            + 100 * pool_id
+                        )
+                # One row per chunk also exercises staging reuse across physical layers.
+                for broadcaster in broadcasters:
+                    broadcaster.kv_staging.resize_(5)
+                chunks = deque()
+                with patch.object(
+                    torch.distributed,
+                    "broadcast",
+                    side_effect=lambda tensor, **kwargs: chunks.append(tensor.clone()),
+                ):
+                    source.broadcast_loaded_layer(
+                        layer_id,
+                        source.prepare_broadcast(
+                            {name: torch.tensor([2, 3]) for name in names}, None
+                        ),
+                    )
+                with patch.object(
+                    torch.distributed,
+                    "broadcast",
+                    side_effect=lambda tensor, **kwargs: tensor.copy_(chunks.popleft()),
+                ):
+                    receiver.broadcast_loaded_layer(
+                        layer_id,
+                        receiver.prepare_broadcast(
+                            {name: torch.tensor([4, 5]) for name in names}, None
+                        ),
+                    )
+                self.assertFalse(chunks)
+                for name, components in receiver.buffers.items():
+                    for layer, buffer in enumerate(components[0]):
+                        expected = torch.zeros_like(buffer)
+                        if name in names and layer in loaded_layers:
+                            src_rows = [2, 3] if name == PoolName.KV else [1]
+                            dst_rows = [4, 5] if name == PoolName.KV else [2]
+                            expected[dst_rows] = source.buffers[name][0][layer][
+                                src_rows
+                            ]
+                        torch.testing.assert_close(buffer, expected)
 
 
 class TestStorageSharing(CustomTestCase):
