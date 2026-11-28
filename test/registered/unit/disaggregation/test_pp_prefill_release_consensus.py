@@ -27,6 +27,7 @@ from sglang.srt.disaggregation.common.conn import (  # noqa: E402
     _pp_held_key,
     _PPStagingOutstanding,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
 from sglang.srt.disaggregation.pp_consensus_store import (  # noqa: E402
     PPConsensusStore,
 )
@@ -37,6 +38,7 @@ from sglang.srt.disaggregation.utils import (  # noqa: E402
     ABORT_REASON_DECODE,
     ABORT_REASON_REQUEST,
     ReqToMetadataIdxAllocator,
+    TransferBackend,
     TransferOutcome,
     poll_transfer_outcomes_attn_cp_tp_group,
 )
@@ -130,6 +132,8 @@ class _Stage(SchedulerDisaggregationPrefillMixin):
         )
         self.pp_transfer_poll_send_window = PPSyncSendWindow(rounds=1)
         self.attn_cp_cpu_group = self.attn_tp_cpu_group = None
+        self.disaggregation_mode = DisaggregationMode.PREFILL
+        self.transfer_backend = TransferBackend.MOONCAKE
         self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(4)
         self.request_retirer = leaving_retirer()

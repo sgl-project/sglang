@@ -2994,6 +2994,7 @@ class TestMooncakeRegistrationDraftCount(CustomTestCase):
         manager.enable_staging = False
         manager.exchange_aux_item_lens = False
         manager.customized_info_enabled = False
+        manager.decode_enable_radix_cache = False
         manager.local_ip = "127.0.0.1"
         manager.rank_port = 1234
         manager.get_session_id = lambda: "session"
@@ -3008,7 +3009,8 @@ class TestMooncakeRegistrationDraftCount(CustomTestCase):
         self.assertEqual(info.dst_kv_ptrs, [0x1000, 0x2000])
 
     def test_registration_without_the_field_parses_none(self):
-        msg = self._manager(2).build_receiver_registration_message()[:-1]
+        # A peer predating num_draft_entries also predates the frame after it.
+        msg = self._manager(2).build_receiver_registration_message()[:-2]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
 
@@ -3584,7 +3586,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             ),
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token, row_width=req_to_token.shape[1]
+            ),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([4, 4], dtype=torch.int64),
         )
@@ -3647,7 +3651,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             ),
             req_pool_indices=torch.tensor([1, 1], dtype=torch.int64),
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token, row_width=req_to_token.shape[1]
+            ),
             seq_lens=torch.tensor([4, 3], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([4, 3], dtype=torch.int64),
         )

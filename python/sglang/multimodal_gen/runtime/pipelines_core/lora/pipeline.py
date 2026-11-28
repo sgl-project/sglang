@@ -161,6 +161,61 @@ def _store_fused_lora_groups(
             adapter[f"{base}.alpha"] = torch.tensor(float(fused_alpha), device=device)
 
 
+def map_lora_state_dict_to_dit(
+    lora_state_dict: dict[str, torch.Tensor],
+    param_names_mapping_fn,
+    lora_param_names_mapping_fn,
+    lora_alpha: float | None,
+    device: torch.device | str,
+) -> dict[str, torch.Tensor]:
+    """Rename a normalized LoRA state dict to the DiT's LoRA layer names.
+
+    Returns ``{"<layer>.lora_A": A, "<layer>.lora_B": B, ...}``; a layer gets
+    the adapter only when both of its keys are present. Shared by
+    ``load_lora_adapter`` and the Hub LoRA coverage test.
+    """
+    new_adapter: dict[str, torch.Tensor] = {}
+    to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
+    for name, weight in lora_state_dict.items():
+        name = name.replace("diffusion_model.", "")
+        name = name.removesuffix(".weight")
+        # misc-format -> HF-format
+        name, _, _ = lora_param_names_mapping_fn(name)
+        # HF-format (LoRA) -> SGLang-dit-format
+        target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
+        # for fuse B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, r, in_dim)
+        # see param mapping in HunyuanVideoArchConfig
+        if merge_index is not None:
+            to_merge_params[target_name][merge_index] = weight
+            # A/B/alpha of one fused layer are laid out together (GQA B cannot stack).
+            if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
+                continue
+            if len(to_merge_params[target_name]) == num_params_to_merge:
+                sorted_tensors = [
+                    to_merge_params[target_name][i] for i in range(num_params_to_merge)
+                ]
+                # Use stack instead of cat because it needs to be compatible with TP.
+                weight = torch.stack(sorted_tensors, dim=0)
+                del to_merge_params[target_name]
+            else:
+                continue
+
+        weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
+        if target_name in new_adapter:
+            raise ValueError(
+                f"Dit target weight name {target_name} already exists in the adapter"
+            )
+        new_adapter[target_name] = weight.to(device)
+
+    _store_fused_lora_groups(
+        new_adapter,
+        to_merge_params,
+        lora_alpha,
+        device,
+    )
+    return new_adapter
+
+
 def strip_diffusers_transformer_prefix(
     state_dict: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
@@ -247,7 +302,7 @@ class LoRAPipeline(ComposedPipelineBase):
         self.lora_path = self.server_args.lora_path
         self.lora_nickname = self.server_args.lora_nickname
         if self.lora_path is not None:
-            self.convert_to_lora_layers(snapshot_base=False)
+            self.convert_to_lora_layers()
             self.set_lora(
                 self.lora_nickname,
                 self.lora_path,
@@ -417,7 +472,6 @@ class LoRAPipeline(ComposedPipelineBase):
         module_name: str,
         target_lora_layers: dict[str, BaseLayerWithLoRA],
         check_exclude: bool = True,
-        snapshot_base: bool = True,
     ) -> int:
         """
         Convert layers in a module to LoRA layers.
@@ -452,7 +506,6 @@ class LoRAPipeline(ComposedPipelineBase):
                 layer,
                 lora_rank=self.lora_rank,
                 lora_alpha=self.lora_alpha,
-                snapshot_base=snapshot_base,
             )
             if lora_layer is not None:
                 self._bind_lora_offload_view(
@@ -460,7 +513,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     name,
                     lora_layer,
                     materialized,
-                    snapshot_base=snapshot_base,
                 )
                 target_lora_layers[name] = lora_layer
                 replace_submodule(self.modules[module_name], name, lora_layer)
@@ -476,7 +528,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     name,
                     lora_layer,
                     materialized,
-                    snapshot_base=snapshot_base,
                 )
                 packed = getattr(lora_layer.base_layer, "_packed_weight_cpu", None)
                 if packed is not None and packed.numel() > 1:
@@ -495,7 +546,6 @@ class LoRAPipeline(ComposedPipelineBase):
         name: str,
         lora_layer: BaseLayerWithLoRA,
         materialized: dict[str, torch.Tensor],
-        snapshot_base: bool = True,
     ) -> None:
         """Bind LoRA to the manager CPU view, not the (1,) GPU placeholder."""
         if not materialized:
@@ -504,8 +554,6 @@ class LoRAPipeline(ComposedPipelineBase):
         if weight is None:
             return
         data = weight.detach()
-        lora_layer.cpu_weight = data.clone() if snapshot_base else data
-        lora_layer._base_is_view = not snapshot_base
         base = lora_layer.base_layer
         base._offload_root = module
         base._offload_param_prefix = name
@@ -536,15 +584,8 @@ class LoRAPipeline(ComposedPipelineBase):
                         "unquantized checkpoint to use LoRA."
                     )
 
-    def convert_to_lora_layers(self, snapshot_base: bool = True) -> None:
-        """
-        Unified method to convert the transformer to a LoRA transformer.
-
-        snapshot_base=False keeps CPU-backed unmerge snapshots as zero-copy
-        views of the base weights instead of clones (38 GB of anonymous memory
-        on H3's DiT). Resident accelerator layers still retain owned CPU
-        snapshots because they cannot be rebound to the CPU merge cache.
-        """
+    def convert_to_lora_layers(self) -> None:
+        """Wrap target layers without copying or retaining their base weights."""
         if self.lora_initialized:
             return
         self._reject_lora_on_packed_weights()
@@ -556,7 +597,6 @@ class LoRAPipeline(ComposedPipelineBase):
             "transformer",
             self.lora_layers,
             check_exclude=True,
-            snapshot_base=snapshot_base,
         )
         logger.info("Converted %d layers to LoRA layers", converted_count)
 
@@ -569,7 +609,6 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.modules["transformer_2"],
                 "transformer_2",
                 self.lora_layers_transformer_2,
-                snapshot_base=snapshot_base,
                 check_exclude=True,
             )
             logger.info(
@@ -582,7 +621,6 @@ class LoRAPipeline(ComposedPipelineBase):
                 self.modules["fake_score_transformer"],
                 "fake_score_transformer",
                 self.lora_layers_critic,
-                snapshot_base=snapshot_base,
                 check_exclude=False,
             )
             logger.info(
@@ -1041,9 +1079,6 @@ class LoRAPipeline(ComposedPipelineBase):
         if adapter_lora_alpha is None:
             adapter_lora_alpha = get_peft_lora_alpha(adapter_config)
 
-        # Swapped in at the end so a failed load keeps the previous adapter.
-        new_adapter: dict[str, torch.Tensor] = {}
-
         config = self.server_args.pipeline_config.dit_config.arch_config
 
         param_names_mapping_fn = get_param_names_mapping(
@@ -1055,42 +1090,11 @@ class LoRAPipeline(ComposedPipelineBase):
             or self.modules["transformer"].lora_param_names_mapping
         )
 
-        to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
-        for name, weight in lora_state_dict.items():
-            name = name.replace("diffusion_model.", "")
-            name = name.removesuffix(".weight")
-            # misc-format -> HF-format
-            name, _, _ = lora_param_names_mapping_fn(name)
-            # HF-format (LoRA) -> SGLang-dit-format
-            target_name, merge_index, num_params_to_merge = param_names_mapping_fn(name)
-            # for fuse B(out_dim, r) @ A(r, in_dim) -> (N, out_dim, r) @ (N, r, in_dim)
-            # see param mapping in HunyuanVideoArchConfig
-            if merge_index is not None:
-                to_merge_params[target_name][merge_index] = weight
-                # A/B/alpha of one fused layer are laid out together (GQA B cannot stack).
-                if target_name.endswith((".lora_A", ".lora_B", ".alpha")):
-                    continue
-                if len(to_merge_params[target_name]) == num_params_to_merge:
-                    sorted_tensors = [
-                        to_merge_params[target_name][i]
-                        for i in range(num_params_to_merge)
-                    ]
-                    # Use stack instead of cat because it needs to be compatible with TP.
-                    weight = torch.stack(sorted_tensors, dim=0)
-                    del to_merge_params[target_name]
-                else:
-                    continue
-
-            weight = _swap_peft_swiglu_fc1_lora_b(name, target_name, weight)
-            if target_name in new_adapter:
-                raise ValueError(
-                    f"Dit target weight name {target_name} already exists in lora_adapters[{lora_nickname}]"
-                )
-            new_adapter[target_name] = weight.to(self.device)
-
-        _store_fused_lora_groups(
-            new_adapter,
-            to_merge_params,
+        # Swapped in at the end so a failed load keeps the previous adapter.
+        new_adapter = map_lora_state_dict_to_dit(
+            lora_state_dict,
+            param_names_mapping_fn,
+            lora_param_names_mapping_fn,
             adapter_lora_alpha,
             self.device,
         )
@@ -1198,7 +1202,7 @@ class LoRAPipeline(ComposedPipelineBase):
 
         # Layerwise keeps manager views; do not load_all.
         if not self.lora_initialized:
-            self.convert_to_lora_layers(snapshot_base=not self._has_layerwise_offload())
+            self.convert_to_lora_layers()
 
         target_to_indices = {}
         modules_by_target = {}

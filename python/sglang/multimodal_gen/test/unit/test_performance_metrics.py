@@ -470,6 +470,28 @@ def test_peak_vram_validation_uses_independent_tolerances():
             validator.validate_peak_vram(runtime_regression, 10_000.0, 10_000.0)
 
 
+@pytest.mark.parametrize("phase", ["load", "warmup", "serving"])
+def test_auto_placement_requires_device_headroom_in_each_phase(phase):
+    floors = {"load": 8192, "warmup": 6144, "serving": 4096}
+    scenario = ScenarioConfig({}, {}, 0, 0, 0, min_free_vram_mb=floors)
+    validator = PerformanceValidator(scenario, ToleranceConfig(0, 0, 0, 0, 0), ())
+    summary = PerformanceSummary(0, 0, 0, {}, [], {}, {}, 14000, 22000)
+    summary.load_peak_allocated_mb = 14000
+    summary.min_free_vram_by_gpu_mb = {
+        p: [floor, floor + 100] for p, floor in floors.items()
+    }
+    # loading above the old allocated peak is safe when every device has room
+    validator.validate_peak_vram(
+        summary, 1000, 22000, expected_load_peak_allocated_mb=900
+    )
+    summary.min_free_vram_by_gpu_mb[phase][1] = floors[phase] - 1
+    with pytest.raises(AssertionError, match=f"{phase} minimum free VRAM"):
+        validator.validate_peak_vram(summary, 1000, 22000)
+    del summary.min_free_vram_by_gpu_mb[phase]
+    with pytest.raises(AssertionError, match=f"Missing {phase} GPU headroom"):
+        validator.validate_peak_vram(summary, 1000, 22000)
+
+
 def test_peak_vram_validation_enforces_allocated_when_baselined():
     validator = PerformanceValidator(
         scenario=ScenarioConfig({}, {}, 0.0, 0.0, 0.0),
