@@ -371,6 +371,10 @@ class FusedMoE(torch.nn.Module):
             layer may expose FlashInfer's block-FP8 deferred MoE output.
     """
 
+    # Set by models that pass the prepared FFN input directly to dispatch.
+    # Without a declared layout, allow for replicated rows during autotuning.
+    dispatch_input_boundary = None
+
     # True on shared-expert FusedMoE subclasses (e.g. Inkling's sink); lets
     # backend resolution distinguish them from routed experts.
     is_shared_fused_moe = False

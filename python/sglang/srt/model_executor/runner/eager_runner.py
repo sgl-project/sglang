@@ -68,6 +68,40 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _bf16_autotune_batch_size(
+    *, model: torch.nn.Module, batch_size: int, attn_tp_size: int
+) -> int:
+    from sglang.srt.layers.layer_boundary.layout import batches_are_unpadded
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    global_limit = per_rank_limit = batch_size
+    for module in model.modules():
+        if not isinstance(module, FusedMoE):
+            continue
+        bound = module.dispatcher.get_decode_token_capacity()
+        if bound is None or batch_size <= bound:
+            continue
+        if bound <= 0:
+            raise ValueError("Decode dispatcher token capacity must be positive")
+
+        # Only aligned batches take the ordinary TP-sliced FFN path. An
+        # unpadded remainder can send the entire batch to each dispatcher.
+        boundary = module.dispatch_input_boundary
+        sharded = boundary is not None and boundary.input_on_attn_tp_slices
+        global_bound = bound * attn_tp_size if sharded else bound
+        global_limit = min(global_limit, global_bound)
+        per_rank_limit = min(per_rank_limit, bound)
+
+    if batch_size <= per_rank_limit:
+        return batch_size
+    aligned = global_limit // attn_tp_size * attn_tp_size
+    if aligned:
+        return aligned
+    if batches_are_unpadded():
+        return per_rank_limit
+    raise ValueError("Decode dispatcher cannot fit a TP-aligned batch")
+
+
 class EagerRunner(BaseRunner):
     def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
@@ -142,23 +176,46 @@ class EagerRunner(BaseRunner):
             self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
-        """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
-        flashinfer-autotune forward.
+        """Allocate decode scratch without changing the live eager registry."""
+        from sglang.srt.layers.moe.utils import is_tbo_enabled
+        from sglang.srt.model_executor.runner.flashinfer_autotune import (
+            should_run_flashinfer_autotune,
+        )
 
-        flashinfer's MoE autotuner times candidate tactics against the buffer it
-        is given, so it must match the live decode shape for the cached tactic to
-        be optimal at decode. The eager input registry spans the prefill token
-        ceiling; the dummy run only needs the decode-sized slice.
-        """
         mr = self.model_runner
+        parallel = get_parallel()
+        batch_size = self._eager_max_bs
         num_tokens_per_req = 1
         if mr.spec_algorithm.is_speculative():
             num_tokens_per_req = mr.decode_num_tokens_per_req()
+        if (
+            mr.is_generation
+            and not mr.is_draft_worker
+            and mr.spec_algorithm.is_none()
+            and DllmConfig.from_server_args(mr.server_args) is None
+            and not is_tbo_enabled()
+            and parallel.dp_size == parallel.attn_dp_size == parallel.attn_cp_size == 1
+            and parallel.moe_dp_size == parallel.pp_size == 1
+            and parallel.tp_size == parallel.attn_tp_size == parallel.moe_ep_size
+            and get_exec().moe.moe_a2a_backend == "deepep"
+            and should_run_flashinfer_autotune(mr, require_bf16_only=True)
+        ):
+            batch_size = _bf16_autotune_batch_size(
+                model=mr.model,
+                batch_size=batch_size,
+                attn_tp_size=parallel.attn_tp_size,
+            )
+            if batch_size != self._eager_max_bs:
+                logger.info(
+                    "FlashInfer BF16 autotune scratch batch %s (live eager batch %s)",
+                    batch_size,
+                    self._eager_max_bs,
+                )
         return (
             self._alloc_dummy_decode_buffers(
-                self._eager_max_bs, num_tokens_per_req=num_tokens_per_req
+                batch_size, num_tokens_per_req=num_tokens_per_req
             ),
-            self._eager_max_bs,
+            batch_size,
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:

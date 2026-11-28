@@ -976,6 +976,8 @@ class MiMoV2DecoderLayer(nn.Module):
             (attn, self.input_layernorm, {"fusions": fusions}),
             (ffn, self.post_attention_layernorm, {"fusions": fusions}),
         )
+        if self.is_layer_sparse:
+            self.mlp.experts.dispatch_input_boundary = self.ffn_boundary
 
     @classmethod
     def stage_facts(cls, config, layer_id: int):

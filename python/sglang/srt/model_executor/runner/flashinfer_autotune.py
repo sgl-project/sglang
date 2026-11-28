@@ -80,7 +80,10 @@ def _serves_block_fp8_as_mxfp8_on_flashinfer(model_runner: ModelRunner) -> bool:
 
 
 def should_run_flashinfer_autotune(
-    model_runner: ModelRunner, *, for_speculative_draft: bool = False
+    model_runner: ModelRunner,
+    *,
+    for_speculative_draft: bool = False,
+    require_bf16_only: bool = False,
 ) -> bool:
     """Check if flashinfer autotune should be run."""
     mr = model_runner
@@ -98,12 +101,17 @@ def should_run_flashinfer_autotune(
         # the batch shape.
         return False
     return _kernels_take_flashinfer_tactics(
-        mr, for_speculative_draft=for_speculative_draft
+        mr,
+        for_speculative_draft=for_speculative_draft,
+        require_bf16_only=require_bf16_only,
     )
 
 
 def _kernels_take_flashinfer_tactics(
-    model_runner: ModelRunner, *, for_speculative_draft: bool
+    model_runner: ModelRunner,
+    *,
+    for_speculative_draft: bool,
+    require_bf16_only: bool = False,
 ) -> bool:
     mr = model_runner
     if for_speculative_draft:
@@ -163,6 +171,11 @@ def _kernels_take_flashinfer_tactics(
         fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
     from sglang.srt.layers.quantization.unquant import bf16_gemm_needs_autotune
+
+    if require_bf16_only and (
+        moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune
+    ):
+        return False
 
     if not (
         moe_needs_autotune

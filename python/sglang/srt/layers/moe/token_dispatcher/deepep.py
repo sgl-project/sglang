@@ -1121,6 +1121,11 @@ class DeepEPDispatcher(BaseDispatcher):
         else:
             self._normal_dispatcher.prebuild_buffer()
 
+    def get_decode_token_capacity(self) -> Optional[int]:
+        if self.deepep_mode.resolve(False) == DeepEPMode.LOW_LATENCY:
+            return self._low_latency_dispatcher.num_max_dispatch_tokens_per_rank
+        return None
+
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
