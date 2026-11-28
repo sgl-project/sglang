@@ -113,7 +113,6 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         activation_scheme: str = "dynamic",
         weight_block_size: Optional[List[int]] = None,
         use_mxfp8: bool = False,
-        quantize_dense_linears: bool = True,
     ) -> None:
         source_ignored_layers = self._normalize_ignored_layers(exclude_modules)
         fp4_ignored_layers = (
@@ -141,7 +140,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         self.activation_scheme = activation_scheme
         self.weight_block_size = weight_block_size
         self.use_mxfp8 = use_mxfp8
-        self.set_quantize_dense_linears(quantize_dense_linears)
+        self.set_quantize_dense_linears(True)
 
     def set_quantize_dense_linears(self, quantize_dense_linears: bool) -> None:
         """Dense models convert their linears; MoE models opt in by env."""
@@ -208,12 +207,6 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 
         if isinstance(layer, LinearBase):
-            if self.converts_dense_linears():
-                # Packed [N, K/2] weights cannot take checkpoint-format [N, K]
-                # tensors again. Mark every linear, including ignored and
-                # fallback ones, so the rejection depends only on the config
-                # and every pipeline stage refuses before any of them writes.
-                layer._derived_weight_cache_error = _DENSE_LINEAR_WEIGHT_UPDATE_ERROR
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
@@ -223,7 +216,7 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
                     return Fp8LinearMethod(self)
                 return UnquantizedLinearMethod()
             if self.converts_dense_linears():
-                return NvFp4OnlineLinearMethod(self)
+                return NvFp4OnlineLinearMethod()
             if self.is_checkpoint_fp8_serialized:
                 return Fp8LinearMethod(self)
             return UnquantizedLinearMethod()
@@ -250,9 +243,7 @@ class NvFp4OnlineLinearMethod(LinearMethodBase):
     non-BF16/FP16 weight such as an FP32 router) stay in source precision.
     """
 
-    _SUPPORTED_PARAMS_DTYPES = (torch.bfloat16, torch.float16)
-
-    def __init__(self, quant_config: NvFp4OnlineConfig) -> None:
+    def __init__(self) -> None:
         backend = get_fp4_gemm_runner_backend()
         if not backend.is_flashinfer_cutedsl():
             raise ValueError(
@@ -262,12 +253,7 @@ class NvFp4OnlineLinearMethod(LinearMethodBase):
                 "For MoE models, unset SGLANG_NVFP4_ONLINE_DENSE_LINEAR to keep "
                 "dense linears in source precision."
             )
-        self.quant_config = quant_config
         self.fallback = UnquantizedLinearMethod()
-
-    @staticmethod
-    def _is_quantized(layer: torch.nn.Module) -> bool:
-        return getattr(layer, "nvfp4_online_quantized", False)
 
     def create_weights(
         self,
@@ -280,7 +266,7 @@ class NvFp4OnlineLinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ) -> None:
         layer.nvfp4_online_quantized = (
-            params_dtype in self._SUPPORTED_PARAMS_DTYPES
+            params_dtype in (torch.bfloat16, torch.float16)
             and sum(output_partition_sizes) % FP4_GEMM_ALIGNMENT == 0
             and input_size_per_partition % FP4_GEMM_ALIGNMENT == 0
         )
@@ -295,6 +281,10 @@ class NvFp4OnlineLinearMethod(LinearMethodBase):
                 **extra_weight_attrs,
             )
             return
+        # Packed [N, K/2] weights cannot take checkpoint-format [N, K] tensors
+        # again. The scheduler shares this across all ranks at startup, so
+        # pipeline stages without a packed layer refuse too.
+        layer._derived_weight_cache_error = _DENSE_LINEAR_WEIGHT_UPDATE_ERROR
         layer.register_parameter(
             "weight",
             ModelWeightParameter(
@@ -310,7 +300,7 @@ class NvFp4OnlineLinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if not self._is_quantized(layer):
+        if not layer.nvfp4_online_quantized:
             self.fallback.process_weights_after_loading(layer)
             return
 
@@ -351,7 +341,7 @@ class NvFp4OnlineLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if not self._is_quantized(layer):
+        if not layer.nvfp4_online_quantized:
             return self.fallback.apply(layer, x, bias)
 
         from flashinfer import SfLayout, nvfp4_quantize

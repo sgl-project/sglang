@@ -422,6 +422,71 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
         target.weight_updater.update_weights_from_ipc.assert_not_called()
         self.assertEqual(self.recorded, [])
 
+    def _manager_with_remote_rejections(self, remote, target, draft=None):
+        """A manager on a 2-rank world whose other rank reports ``remote``."""
+
+        def gather(outputs, obj, group):
+            outputs[0], outputs[1] = obj, remote
+
+        prefix = "sglang.srt.managers.scheduler_components.weight_updater"
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch(
+                f"{prefix}.get_world_group",
+                return_value=SimpleNamespace(world_size=2, cpu_group=None),
+            ),
+            patch("torch.distributed.all_gather_object", side_effect=gather),
+        ):
+            manager = self._manager(target, draft=draft, session=False)
+            manager.share_load_rejections()
+        return manager
+
+    def test_other_stage_draft_rejection_blocks_disk_update(self):
+        """Under PP speculation the draft lives on the last stage only; stage 0 must refuse too."""
+        target = _runner()
+        manager = self._manager_with_remote_rejections(
+            {"draft": "draft refuses"}, target
+        )
+
+        output = manager.update_weights_from_disk(_request())
+
+        self.assertFalse(output.success)
+        self.assertEqual(output.message, "draft refuses")
+        target.weight_updater.update_weights_from_disk.assert_not_called()
+        self.assertEqual(self.recorded, [])
+
+    def test_other_stage_target_rejection_blocks_ipc_update(self):
+        """A stage with no packed layer refuses with the stage that has one."""
+        target = _runner()
+        manager = self._manager_with_remote_rejections(
+            {"target": "target refuses"}, target
+        )
+
+        output = manager.update_weights_from_ipc(_request())
+
+        self.assertFalse(output.success)
+        target.weight_updater.update_weights_from_ipc.assert_not_called()
+
+    def test_shared_rejection_respects_the_selector(self):
+        """A draft-only restriction does not block a target-only session."""
+        target = _runner()
+        manager = self._manager_with_remote_rejections(
+            {"draft": "draft refuses"}, target
+        )
+
+        draft_out = manager.begin_weight_update(
+            BeginWeightUpdateReqInput(selector="all")
+        )
+        self.assertFalse(draft_out.success)
+        self.assertEqual(draft_out.message, "draft refuses")
+        target.weight_updater.begin_weight_update.assert_not_called()
+
+        target_out = manager.begin_weight_update(
+            BeginWeightUpdateReqInput(selector="target")
+        )
+        self.assertTrue(target_out.success)
+        target.weight_updater.begin_weight_update.assert_called_once_with()
+
     def test_successful_distributed_update_records_the_version(self):
         """The distributed refit is the path an RL trainer actually drives, so it must record too."""
         manager = self._manager(_runner())

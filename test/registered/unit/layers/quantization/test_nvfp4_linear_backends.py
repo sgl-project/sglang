@@ -137,6 +137,12 @@ def _cutedsl_backend():
     )
 
 
+def _dense_only_config():
+    config = NvFp4OnlineConfig()
+    config.set_quantize_dense_linears(False)
+    return config
+
+
 def _make_online_layer(n: int, k: int):
     layer = make_tp1_column_parallel_linear(NvFp4OnlineConfig(), n, k)
     w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
@@ -208,15 +214,13 @@ class TestNvFp4LinearBackends(CustomTestCase):
 
     def test_online_per_token_activation_scale(self):
         torch.manual_seed(7)
-        with mock.patch.object(
-            fp4_utils,
-            "FP4_GEMM_RUNNER_BACKEND",
-            Fp4GemmRunnerBackend("flashinfer_cutedsl"),
-        ):
+        with _cutedsl_backend():
             for m, n, k in ONLINE_SHAPES:
                 with self.subTest(shape=(m, n, k)):
                     layer = _make_online_layer(n, k)
                     layer.quant_method.process_weights_after_loading(layer)
+                    # packed weights refuse online updates
+                    self.assertIsNotNone(layer._derived_weight_cache_error)
 
                     decades = torch.logspace(-2, 2, m, device="cuda")
                     x = (torch.randn((m, k), device="cuda") / 10 * decades[:, None]).to(
@@ -238,7 +242,6 @@ class TestNvFp4LinearBackends(CustomTestCase):
             for m in (1, 2, 8):
                 with self.subTest(m=m):
                     x = torch.randn((m, 1024), device="cuda", dtype=torch.bfloat16)
-                    eager, _ = layer(x)
                     for _ in range(2):
                         layer(x)
                     torch.cuda.synchronize()
@@ -252,11 +255,11 @@ class TestNvFp4LinearBackends(CustomTestCase):
 
     def test_online_moe_model_keeps_dense_linears(self):
         with _cutedsl_backend():
-            config = NvFp4OnlineConfig(quantize_dense_linears=False)
-            layer = make_tp1_column_parallel_linear(config, 256, 512)
+            layer = make_tp1_column_parallel_linear(_dense_only_config(), 256, 512)
             self.assertIsInstance(layer.quant_method, UnquantizedLinearMethod)
+            self.assertIsNone(getattr(layer, "_derived_weight_cache_error", None))
             with envs.SGLANG_NVFP4_ONLINE_DENSE_LINEAR.override(True):
-                config = NvFp4OnlineConfig(quantize_dense_linears=False)
+                config = _dense_only_config()
             layer = make_tp1_column_parallel_linear(config, 256, 512)
             self.assertIsInstance(layer.quant_method, NvFp4OnlineLinearMethod)
 
@@ -281,8 +284,11 @@ class TestNvFp4LinearBackends(CustomTestCase):
     def test_online_unsupported_shards_stay_in_source_precision(self):
         torch.manual_seed(7)
         # N or K not a multiple of 32 (e.g. Gemma 3n AltUp K=4), or FP32 weights.
-        cases = [(48, 512, torch.bfloat16), (256, 4, torch.bfloat16)]
-        cases.append((256, 512, torch.float32))
+        cases = [
+            (48, 512, torch.bfloat16),
+            (256, 4, torch.bfloat16),
+            (256, 512, torch.float32),
+        ]
         with _cutedsl_backend():
             for n, k, dtype in cases:
                 with self.subTest(n=n, k=k, dtype=dtype):
@@ -300,28 +306,13 @@ class TestNvFp4LinearBackends(CustomTestCase):
                     layer.weight.weight_loader(layer.weight, w)
                     layer.quant_method.process_weights_after_loading(layer)
                     self.assertEqual(layer.weight.dtype, dtype)
+                    # source-precision layers still reload
+                    self.assertIsNone(
+                        getattr(layer, "_derived_weight_cache_error", None)
+                    )
                     x = torch.randn((8, k), device="cuda", dtype=dtype)
                     out, _ = layer(x)
                     assert_output_close(self, out, x.float() @ w.float().T)
-
-    def test_online_weight_update_rejection_depends_only_on_config(self):
-        # Every linear carries the marker, so a pipeline stage whose layers are
-        # all ignored or in source precision still refuses with the others.
-        prefix = "model.layers.0.mlp.up_proj"
-        with _cutedsl_backend():
-            converted = _make_online_layer(256, 512)
-            fallback = make_tp1_column_parallel_linear(NvFp4OnlineConfig(), 48, 512)
-            with envs.SGLANG_FP4_IGNORED_LAYERS.override(prefix):
-                ignored = make_tp1_column_parallel_linear(
-                    NvFp4OnlineConfig(), 256, 512, prefix=prefix
-                )
-            moe_dense = make_tp1_column_parallel_linear(
-                NvFp4OnlineConfig(quantize_dense_linears=False), 256, 512
-            )
-        self.assertIsInstance(ignored.quant_method, UnquantizedLinearMethod)
-        for layer in (converted, fallback, ignored):
-            self.assertIsNotNone(layer._derived_weight_cache_error)
-        self.assertIsNone(getattr(moe_dense, "_derived_weight_cache_error", None))
 
     def test_online_ignores_fused_layer_name(self):
         prefix = "model.layers.0.mlp.gate_up_proj"
@@ -329,6 +320,7 @@ class TestNvFp4LinearBackends(CustomTestCase):
             config = NvFp4OnlineConfig()
             layer = make_tp1_column_parallel_linear(config, 256, 512, prefix=prefix)
         self.assertIsInstance(layer.quant_method, UnquantizedLinearMethod)
+        self.assertIsNone(getattr(layer, "_derived_weight_cache_error", None))
 
     def test_flashinfer_cutedsl(self):
         self._run_backend("flashinfer_cutedsl")
