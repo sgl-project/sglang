@@ -79,6 +79,23 @@ Guidelines:
 - For MHA models with Mooncake and `page_head` layout, HiCache will split head shards based on `tp_lcm_size` to make keys reusable across heterogeneous TP deployments.
 - If all clusters use the same TP size, this option is not needed.
 
+### KV cache sharding with File storage
+
+Use File storage with KV cache sharding on NVIDIA CUDA PD prefill workers with a single KV host pool. Configure plain TP for MLA or prefill attention CP for GQA. Leave `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND` unset or set it to `python`. Replace `SHARED_HICACHE_PATH` with a directory accessible to every shard rank.
+
+```bash Command
+--enable-kv-cache-sharding \
+--enable-hierarchical-cache \
+--hicache-host-memory-mode cache \
+--hicache-storage-backend file \
+--hicache-storage-key-scheme unified \
+--hicache-storage-backend-extra-config '{"file_storage_path":"SHARED_HICACHE_PATH"}'
+```
+
+KV-sharded File storage requires the `unified` key scheme, which selects the `page_unified` host layout and kernel I/O. Leave `max_size` and `min_free_space` disabled in both the extra config and environment on every worker sharing these files.
+
+Unified keys identify layer and head chunks by their position in the model, so a page's new owner can read the same files. Sharded and unsharded workers using unified keys can share those files when their model identity, page size, KV dtype, and layer and head chunk boundaries match.
+
 ### Prefetch Policies
 
 ```bash Command

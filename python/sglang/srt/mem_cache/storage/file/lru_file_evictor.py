@@ -69,6 +69,7 @@ class LRUFileEvictor:
         *,
         owned_suffixes: Tuple[str, ...],
         tp_rank: int,
+        allow_eviction: bool = True,
         extra_config: Optional[dict] = None,
         on_evict: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -88,6 +89,11 @@ class LRUFileEvictor:
         self._load_config(extra_config or {})
 
         self._eviction_enabled = self.max_size_bytes > 0 or self.min_free_bytes > 0
+        if self._eviction_enabled and not allow_eviction:
+            # Shard ranks share files and cannot coordinate per-process limits.
+            raise ValueError(
+                "KV-sharded File storage requires disk eviction to be disabled."
+            )
         if not self._eviction_enabled:
             return
 

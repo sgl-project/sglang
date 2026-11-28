@@ -103,3 +103,12 @@ class PageInterleaveHostPool:
             self.placement.local_index(host_indices[owned]),
             self.placement.local_index(device_owned),
         )
+
+    def owned_storage_pages(
+        self, host_indices: torch.Tensor
+    ) -> tuple[list[int], torch.Tensor]:
+        """This rank's pages of a storage batch: their positions in the batch
+        and their local host rows (whole pages, in batch order)."""
+        mask = self.placement.local_mask(host_indices, self.shard_rank)
+        positions = torch.nonzero(mask[:: self.page_size]).squeeze(1).tolist()
+        return positions, self.placement.local_index(host_indices[mask])

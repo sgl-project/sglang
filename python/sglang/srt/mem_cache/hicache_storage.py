@@ -54,6 +54,10 @@ class HiCacheStorageConfig:
 
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
+    # The controller filters storage I/O to pages owned by this rank.
+    kv_sharded_store: bool = False
+    # Page-interleaved File storage elects writers according to page placement.
+    storage_writer_override: Optional[bool] = None
 
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
@@ -90,6 +94,8 @@ class HiCacheStorageConfig:
         MLA uses one writer per DCP shard in the first DCP group; with DCP
         disabled, MLA uses TP rank 0 and non-MLA uses every TP rank.
         """
+        if self.storage_writer_override is not None:
+            return self.storage_writer_override
         if self.unified_suffixes is not None and self.attn_cp_rank != 0:
             return False
         return not self.is_rank_replicated or self.tp_rank == self.dcp_rank
@@ -944,7 +950,7 @@ class HiCacheFile(HiCacheStorage):
         attn_cp_rank = storage_config.attn_cp_rank
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
-            os.makedirs(self.file_path)
+            os.makedirs(self.file_path, exist_ok=True)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
         # Metadata cache positive lookup toggle & TTL
@@ -991,6 +997,7 @@ class HiCacheFile(HiCacheStorage):
             self.file_path,
             owned_suffixes=owned_suffixes,
             tp_rank=tp_rank,
+            allow_eviction=not storage_config.kv_sharded_store,
             extra_config=storage_config.extra_config,
             on_evict=(
                 self.metadata_cache.remove if self.metadata_cache is not None else None

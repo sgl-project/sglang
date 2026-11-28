@@ -46,7 +46,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.mem_cache.storage.file.lru_file_evictor import _parse_size_to_bytes
+from sglang.srt.mem_cache.storage.file.lru_file_evictor import (
+    LRUFileEvictor,
+    _parse_size_to_bytes,
+)
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.test_utils import CustomTestCase
 
@@ -177,6 +180,19 @@ class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
         # No tracking happens.
         self.assertEqual(len(b._evictor._lru), 0)
         self.assertEqual(b._evictor._total_bytes, 0)
+
+    def test_kv_sharded_store_refuses_eviction_before_scanning_files(self):
+        config = replace(
+            _make_config(extra_config={"max_size": 1}),
+            kv_sharded_store=True,
+            unified_suffixes=["ukv1-test_L0-1_H0"],
+        )
+        with (
+            mock.patch.object(LRUFileEvictor, "_scan_existing_files") as scan,
+            self.assertRaisesRegex(ValueError, "eviction"),
+        ):
+            HiCacheFile(config, file_path=self.tmpdir)
+        scan.assert_not_called()
 
 
 class TestCapBasedEviction(HiCacheFileLRUTestBase):

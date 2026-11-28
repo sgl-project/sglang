@@ -59,6 +59,8 @@ from sglang.srt.arg_groups.kv_cache_hook import (
 )
 from sglang.srt.arg_groups.kv_shard_hook import (
     handle_kv_cache_sharding,
+    kv_shard_storage_backend_supported,
+    register_kv_shard_storage_backend,
     validate_kv_shard_attention_backend,
 )
 from sglang.srt.arg_groups.lora_hook import check_lora_server_args
@@ -5063,16 +5065,54 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
             handle_kv_cache_sharding(args)
 
-    def test_hicache_host_offload_is_accepted_but_not_storage(self):
-        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
-        args.enable_hierarchical_cache = True
-        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
-            handle_kv_cache_sharding(args, 80 * 1024)
+    def test_hicache_storage_allowlist(self):
+        self.assertTrue(kv_shard_storage_backend_supported("file"))
+        with (
+            patch(
+                "sglang.srt.arg_groups.kv_shard_hook._KV_SHARD_STORAGE_BACKENDS",
+                {"file"},
+            ),
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+        ):
+            register_kv_shard_storage_backend("dynamic")
+            for backend in (None, "file", "dynamic"):
+                with self.subTest(backend=backend):
+                    args = self._rounding_args(
+                        raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                    )
+                    args.enable_hierarchical_cache = True
+                    args.hicache_storage_backend = backend
+                    if backend == "file":
+                        args.hicache_storage_key_scheme = "unified"
+                    handle_kv_cache_sharding(args, 80 * 1024)
 
+        for backend in ("dynamic", "fast_file", "mooncake"):
+            with self.subTest(backend=backend):
+                args = self._args(
+                    enable_hierarchical_cache=True, hicache_storage_backend=backend
+                )
+                with self.assertRaisesRegex(ValueError, backend):
+                    handle_kv_cache_sharding(args)
+
+    def test_hicache_file_storage_requires_unified_keys(self):
         args = self._args(
-            enable_hierarchical_cache=True, hicache_storage_backend="file"
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="file",
+            hicache_storage_key_scheme="rank-suffix",
         )
-        with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
+        with self.assertRaisesRegex(ValueError, "requires .*key-scheme unified"):
+            handle_kv_cache_sharding(args)
+
+    def test_hicache_file_storage_rejects_dsa(self):
+        args = self._args(
+            enable_hierarchical_cache=True,
+            hicache_storage_backend="file",
+            hicache_storage_key_scheme="unified",
+        )
+        args._model_config.hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+        )
+        with self.assertRaisesRegex(ValueError, "for DSA models"):
             handle_kv_cache_sharding(args)
 
     def test_incompatible_cache_tree_modes_are_rejected(self):

@@ -3040,6 +3040,7 @@ class TestPrefetchCommitOrdering(CustomTestCase):
                 cache.host_memory_mode = "cache"
                 cache.page_size = 4
                 cache.prefetch_threshold = 4
+                cache._prefetch_rotation_base.return_value = None
                 cc = cache.cache_controller
                 cc.page_size = cache.page_size
                 cc.mem_pool_host.anchor_entry.host_pool = object()
@@ -3500,6 +3501,25 @@ class TestUnifiedRadixCacheStorageAttachBackfill(
             all(h for h in self._hashes_by_token_ids(cache).values()),
             "every node must carry a hash chain once storage is enabled",
         )
+
+    def test_prefetch_threshold_applies_page_floor_only_to_sharded_storage(self):
+        for sharded, threshold in ((False, 0), (True, 4)):
+            cache = SimpleNamespace(
+                enable_storage=True,
+                page_size=4,
+                _uses_sharded_storage=mock.Mock(return_value=sharded),
+            )
+            StorageAttachment(cache).apply_runtime_config(
+                storage_backend="file",
+                prefetch_threshold=0,
+                prefetch_timeout_base=1.0,
+                prefetch_timeout_per_ki_token=0.25,
+                hicache_storage_pass_prefix_keys=False,
+                enable_storage=True,
+                enable_storage_metrics=False,
+                extra_metric_labels=None,
+            )
+            self.assertEqual(cache.prefetch_threshold, threshold)
 
 
 class TestAnchorLockOutcomePolicy(AnchorLockOutcomePolicyFixtures, CustomTestCase):
