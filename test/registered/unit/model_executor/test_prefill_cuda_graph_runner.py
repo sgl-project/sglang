@@ -490,6 +490,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         model_runner = SimpleNamespace(
+            device="cuda",
             is_draft_worker=False,
             spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
         )
@@ -562,6 +563,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         model_runner = SimpleNamespace(
+            device="cuda",
             is_draft_worker=False,
             lora_manager=None,
             model=object(),

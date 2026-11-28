@@ -1,4 +1,4 @@
-"""Attention compute kernels (Triton): decode / extend / prefill / metadata.
+"""Attention compute kernels: decode / extend / prefill / metadata.
 
 The Triton kernels migrated here live in this package
 (``sglang.kernels.ops.attention.<module>``); import them from there. Their
@@ -15,8 +15,18 @@ from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
     CapabilityRequirement,
+    DeviceType,
     KernelBackend,
     KernelSpec,
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.mlx_radix_decode",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.attention.mlx.radix_attention:radix_decode",
+        capabilities=frozenset({CapabilityRequirement(device=DeviceType.MPS)}),
+    )
 )
 
 if TYPE_CHECKING:

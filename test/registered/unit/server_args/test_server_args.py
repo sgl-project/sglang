@@ -192,6 +192,32 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             POSITIONAL_FIELD_ORDER,
         )
 
+    def test_mps_backend_preserves_existing_positional_slots(self):
+        """Adding the MPS backend must not reinterpret pre-existing positional calls."""
+        fields = msgspec.structs.fields(ServerArgs)
+        for index, name in (
+            (563, "disable_multimodal"),
+            (567, "enable_dsa_fp4_indexer"),
+            (568, "kda_dwdp_size"),
+            (569, "weight_cache_transport"),
+            (585, "shortest_prefill_budget_doubling_chunks"),
+            (590, "mps_execution_backend"),
+        ):
+            with self.subTest(index=index):
+                self.assertEqual(fields[index].name, name)
+        defaults = ServerArgs(model_path="dummy")
+        positional = [getattr(defaults, field.name) for field in fields[:590]]
+        positional[567:570] = [True, 2, "shm"]
+        positional[585] = 4.0
+
+        args = ServerArgs(*positional)
+
+        self.assertTrue(args.enable_dsa_fp4_indexer)
+        self.assertEqual(args.kda_dwdp_size, 2)
+        self.assertEqual(args.weight_cache_transport, "shm")
+        self.assertEqual(args.shortest_prefill_budget_doubling_chunks, 4.0)
+        self.assertEqual(args.mps_execution_backend, "eager")
+
 
 class TestMuseSparkLaunchDefaults(CustomTestCase):
     """Minimal recipes must resolve before generic memory/backend defaults."""
@@ -6134,6 +6160,50 @@ class TestPagedExpertsNumResident(unittest.TestCase):
         for bad in ("0", "-1", "abc", "max", "AUTO", " 12"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 _paged_experts_num_resident(bad)
+
+
+class TestCompiledMpsGraphDefaults(CustomTestCase):
+    def test_compiled_defaults_respect_explicit_phase_off_switches(self):
+        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+        from sglang.srt.arg_groups.model_override_base import resolved_view
+
+        for backend, flags, expected in (
+            ("eager", {}, ("disabled", "disabled")),
+            ("mlx-compiled", {}, ("full", "full")),
+            (
+                "mlx-compiled",
+                {"disable_prefill_cuda_graph": True},
+                ("disabled", "full"),
+            ),
+            ("mlx-compiled", {"disable_decode_cuda_graph": True}, ("full", "disabled")),
+            (
+                "mlx-compiled",
+                {"cuda_graph_backend_decode": "disabled"},
+                ("full", "disabled"),
+            ),
+            ("mlx-compiled", {"disable_cuda_graph": True}, ("disabled", "disabled")),
+            (
+                "mlx-compiled",
+                {"cuda_graph_config": {"decode": {"backend": "disabled"}}},
+                ("full", "disabled"),
+            ),
+        ):
+            with self.subTest(backend=backend, flags=flags):
+                args = ServerArgs(
+                    model_path="dummy",
+                    device="mps",
+                    attention_backend="torch_native",
+                    mps_execution_backend=backend,
+                    disable_overlap_schedule=True,
+                    **flags,
+                )
+                args._model_config = MagicMock(is_encoder_decoder=False)
+                parse_cuda_graph_config(args)
+                handle_attention_backend_compatibility(args)
+                config = resolved_view(args).cuda_graph_config
+                self.assertEqual(
+                    (config.prefill.backend, config.decode.backend), expected
+                )
 
 
 if __name__ == "__main__":

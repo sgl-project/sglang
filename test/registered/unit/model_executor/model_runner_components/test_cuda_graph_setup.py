@@ -11,8 +11,82 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     index_attention_layers_by_global_id,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestMpsDecodeSelection(CustomTestCase):
+    def test_explicit_decode_off_does_not_enable_lookahead(self):
+        from sglang.srt.managers.tp_worker import TpModelWorker
+        from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+        from sglang.srt.runtime_context import get_context
+
+        with get_context().override_server_args(
+            device="mps",
+            mps_execution_backend="mlx-compiled",
+            disable_overlap_schedule=True,
+            cuda_graph_config=CudaGraphConfig.from_dict(
+                {"decode": {"backend": "disabled"}}
+            ),
+        ):
+            worker = TpModelWorker.__new__(TpModelWorker)
+            self.assertIsNone(worker.enable_execution_lookahead())
+
+    def test_explicit_decode_off_preserves_eager_runner_selection(self):
+        from unittest.mock import Mock, patch
+
+        from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+        from sglang.srt.runtime_context import get_context
+
+        eager, compiled = object(), object()
+        owner = SimpleNamespace(
+            device="mps",
+            is_draft_worker=False,
+            maybe_init_uocr_greedy_graph=lambda: None,
+        )
+        for backend in ("disabled", "full"):
+            with (
+                self.subTest(backend=backend),
+                get_context().override_server_args(
+                    device="mps",
+                    mps_execution_backend="mlx-compiled",
+                    disable_overlap_schedule=True,
+                    cuda_graph_config=CudaGraphConfig.from_dict(
+                        {
+                            "decode": {"backend": backend},
+                            "prefill": {"backend": "disabled"},
+                        }
+                    ),
+                ),
+                patch.object(
+                    cuda_graph_setup.GraphSharedOutput,
+                    "create_for_model_runner",
+                    return_value=None,
+                ),
+                patch.object(cuda_graph_setup, "EagerRunner", return_value=eager),
+                patch.object(
+                    cuda_graph_setup,
+                    "current_platform",
+                    SimpleNamespace(capabilities=SimpleNamespace(graph_capture=False)),
+                ),
+                patch.dict(
+                    sys.modules,
+                    {
+                        "sglang.srt.hardware_backend.mps.compiled_runner": SimpleNamespace(
+                            CompiledMlxRunner=Mock(return_value=compiled)
+                        )
+                    },
+                ),
+            ):
+                capture = cuda_graph_setup.capture_cuda_graphs(
+                    model_runner=owner,
+                    finalize=False,
+                    defer_distributed_setup=True,
+                )
+                self.assertIs(
+                    capture.decode.runner, eager if backend == "disabled" else compiled
+                )
 
 
 @pytest.mark.parametrize("width", [1, 6])

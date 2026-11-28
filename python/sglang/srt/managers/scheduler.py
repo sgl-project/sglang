@@ -2243,15 +2243,22 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        execution_fence = self.tp_worker.enable_execution_lookahead()
         while True:
+            if execution_fence is not None:
+                execution_fence()
             if self.gracefully_exit:
+                if execution_fence is not None:
+                    execution_fence(discard=True, reason="shutdown")
                 break
             self.increment_scheduler_iterations()
 
             self.tick_elastic_scale()
 
             # Receive requests
-            self.ingest_requests()
+            incoming = self.ingest_requests()
+            if incoming and execution_fence is not None:
+                execution_fence(discard=True, reason="ingress")
             if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2269,6 +2276,8 @@ class Scheduler(
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
+                if execution_fence is not None:
+                    execution_fence(discard=True, reason="idle")
                 # When the server is idle, do self-check and re-init some states.
                 self._sched_idled = True
                 self.on_idle()
