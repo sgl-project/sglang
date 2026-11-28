@@ -602,6 +602,25 @@ _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 # Grace period from ShutdownReq to SIGKILL for each scheduler.
 _SCHEDULER_EXIT_TIMEOUT_SECS = 15
 
+# How long startup waits for the scheduler side to connect to the tokenizer.
+_SCHEDULER_CONNECT_TIMEOUT_SECS = 15
+
+
+def wait_for_scheduler_connection(send_to_scheduler: zmq.Socket) -> None:
+    """Wait until the scheduler side has connected to `send_to_scheduler`.
+
+    The schedulers start connecting before the tokenizer binds this socket, and
+    ZMQ retries a failed connect every 100 ms, so their readiness, which arrives
+    over a separate pipe, can come first. Once they are connected, a ShutdownReq
+    that cannot be sent means the scheduler is gone.
+    """
+    sock = zmq.Socket.shadow(send_to_scheduler.underlying)
+    if not sock.poll(_SCHEDULER_CONNECT_TIMEOUT_SECS * 1000, zmq.POLLOUT):
+        logger.warning(
+            f"No scheduler connected within {_SCHEDULER_CONNECT_TIMEOUT_SECS}s; "
+            "requests wait until one does."
+        )
+
 
 def wait_for_schedulers_to_exit() -> None:
     deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
@@ -907,6 +926,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+        # ShutdownReq goes out once; atexit repeats an explicit Engine.shutdown().
+        self._shutdown_req_sent = False
 
     def is_healthy(self) -> bool:
         """Return whether startup completed and the server is neither unhealthy nor shutting down."""
@@ -4193,10 +4214,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self._subprocess_watchdog is not None:
             self._subprocess_watchdog.stop()
         if self._subprocess_watchdog is not None or self.tokenizer_ipc_name is None:
-            # Ask schedulers to release resources in userspace and exit (see
-            # ShutdownReq), then wait for them before hard-killing the rest.
-            self._dispatch_to_scheduler(ShutdownReq())
-            wait_for_schedulers_to_exit()
+            self.shutdown_schedulers()
         else:
             logger.info(
                 "Drained. The process that launched the schedulers shuts them down."
@@ -4214,6 +4232,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self._server_stop_hook()
             return
         sys.exit(0)
+
+    def shutdown_schedulers(self) -> None:
+        """Ask the schedulers to release resources in userspace and exit (see
+        ShutdownReq), then wait for them before the caller hard-kills the rest."""
+        if self._shutdown_req_sent:
+            return
+        self._shutdown_req_sent = True
+        req = ShutdownReq()
+        if self.tokenizer_ipc_name is not None:
+            stamp_http_worker_ipc(req, self.tokenizer_ipc_name)
+        # Engine.shutdown() can run with no current event loop (after
+        # asyncio.run(), or at exit), which the zmq.asyncio socket needs to send
+        # and a sync shadow of it does not. NOBLOCK: startup waited for the
+        # scheduler to connect, so a request it cannot take means it is gone
+        # (RayEngine kills its actors first, or the scheduler crashed).
+        try:
+            sock_send(
+                zmq.Socket.shadow(self.send_to_scheduler.underlying),
+                req,
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.ZMQError as e:
+            logger.warning(
+                f"Could not send ShutdownReq ({e}); the schedulers will be "
+                "killed without releasing in userspace."
+            )
+            return
+        wait_for_schedulers_to_exit()
 
     def force_exit_handler(self):
         """Put some custom force exit logic here."""

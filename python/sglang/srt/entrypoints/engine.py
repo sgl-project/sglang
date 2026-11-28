@@ -110,6 +110,7 @@ from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
     get_tokenizer_worker_class,
+    wait_for_scheduler_connection,
 )
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.observability import metrics_collector
@@ -1388,6 +1389,7 @@ class Engine(EngineScoreMixin, EngineBase):
         try:
             # Wait for the model to finish loading
             scheduler_init_result.wait_for_ready()
+            wait_for_scheduler_connection(tokenizer_manager.send_to_scheduler)
 
             cls._set_startup_time(
                 tokenizer_manager.set_startup_time, scheduler_init_result, startup_tic
@@ -1513,7 +1515,26 @@ class Engine(EngineScoreMixin, EngineBase):
                 and self.tokenizer_manager._subprocess_watchdog is not None
             ):
                 self.tokenizer_manager._subprocess_watchdog.stop()
+            try:
+                # Same as the server's SIGTERM path: SIGKILLing a scheduler skips
+                # its userspace release, which is how GPU memory survives.
+                # Pipeline-parallel event loops do not honor ShutdownReq yet.
+                if (
+                    isinstance(self.tokenizer_manager, TokenizerManager)
+                    and get_parallel().pp_size == 1
+                ):
+                    self.tokenizer_manager.shutdown_schedulers()
+            finally:
+                self._reap_subprocesses()
+        finally:
+            if isinstance(self.tokenizer_manager, TokenizerManager):
+                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
+                if mm_processor is not None:
+                    mm_processor.shutdown()
+                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
+    def _reap_subprocesses(self) -> None:
+        try:
             # Gracefully stop weight cache daemons *before* the blanket
             # kill_process_tree below, so their SIGTERM handlers can unlink the
             # .sock/.ready files instead of being SIGKILLed and leaving stale state.
@@ -1521,14 +1542,8 @@ class Engine(EngineScoreMixin, EngineBase):
             if daemon_procs:
                 self._terminate_weight_cache_daemons(daemon_procs)
                 self._weight_cache_daemon_procs = []
-
-            kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
         finally:
-            if isinstance(self.tokenizer_manager, TokenizerManager):
-                mm_processor = getattr(self.tokenizer_manager, "mm_processor", None)
-                if mm_processor is not None:
-                    mm_processor.shutdown()
-                self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
+            kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
 
     def __enter__(self):
         return self
