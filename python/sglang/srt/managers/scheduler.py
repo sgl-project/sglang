@@ -7595,7 +7595,10 @@ def run_scheduler_process(
                 scheduler.async_d2h_worker = None
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
-            if scheduler.gracefully_exit:
+            if scheduler.gracefully_exit and not hit_exception:
+                # Captured graphs can hold communicator state; free them while
+                # the communicators below still exist.
+                scheduler.model_worker.release_cuda_graphs()
                 scheduler.release_host_resources()
                 close_custom_all_reduce()
                 # Last: anything above may still need a working communicator.

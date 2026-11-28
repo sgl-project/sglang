@@ -5,7 +5,7 @@ import hashlib
 import logging
 import time
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 import torch
@@ -36,6 +36,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.runner import (
+    BaseCudaGraphRunner,
     EagerRunner,
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
@@ -397,6 +398,20 @@ def release_decode_cuda_graph(
     if decode_runner is not None and decode_runner is not eager_runner:
         decode_runner.backend.cleanup()
         current_platform.synchronize()
+
+
+def release_graph_runners(*, runners: Sequence[Optional[BaseRunner]]) -> None:
+    """Free the captured graphs of every graph runner in ``runners``, once each;
+    eager and CPU runners hold none."""
+    graph_runners = list(
+        {id(r): r for r in runners if isinstance(r, BaseCudaGraphRunner)}.values()
+    )
+    if not graph_runners:
+        return
+    current_platform.synchronize()
+    for runner in graph_runners:
+        runner.backend.cleanup()
+    current_platform.synchronize()
 
 
 def drop_elastic_cuda_graph_state(

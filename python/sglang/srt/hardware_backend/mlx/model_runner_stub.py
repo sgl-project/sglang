@@ -118,6 +118,12 @@ class MlxModelRunnerStub(ModelRunner):
     # that path working instead of raising AttributeError.
     prefill_aware_swa = False
 
+    # No device graphs on the MLX path either: the base ModelRunner sets these in
+    # init_cuda_graphs(), which this lightweight initialize() skips, and graceful
+    # shutdown releases them unconditionally.
+    prefill_cuda_graph_runner = None
+    decode_cuda_graph_runner = None
+
     @property
     def logical_max_total_num_tokens(self) -> int:
         """MLX pool slots already count logical tokens; no DCP expansion applies."""

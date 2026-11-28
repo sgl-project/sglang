@@ -3,12 +3,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     _align_pipeline_layers,
     capture_decode_graph,
     has_standard_gqa_for_all_local_layers,
     index_attention_layers_by_global_id,
+    release_graph_runners,
+)
+from sglang.srt.model_executor.runner import (
+    DecodeCudaGraphRunner,
+    EagerRunner,
+    PrefillCudaGraphRunner,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -249,6 +256,48 @@ def test_align_pipeline_layers_uses_absolute_indices():
         _align_pipeline_layers(
             local_layers, SimpleNamespace(start_layer=0, layers=local_layers)
         )
+
+
+def test_release_graph_runners_frees_only_graph_runners(monkeypatch):
+    """Eager and CPU runners have no graph backend, each runner is freed once,
+    and with nothing to free the device is left alone (shutdown calls this on
+    every platform)."""
+    events = []
+    monkeypatch.setattr(
+        cuda_graph_setup,
+        "current_platform",
+        SimpleNamespace(synchronize=lambda: events.append("synchronize")),
+    )
+
+    def graph_runner(runner_cls, name):
+        runner = object.__new__(runner_cls)
+        runner.backend = SimpleNamespace(
+            cleanup=lambda: events.append(f"cleanup {name}")
+        )
+        return runner
+
+    decode = graph_runner(DecodeCudaGraphRunner, "decode")
+    release_graph_runners(
+        runners=(
+            graph_runner(PrefillCudaGraphRunner, "prefill"),
+            None,
+            decode,
+            # A runner held twice (an active adaptive state) is freed once.
+            decode,
+        )
+    )
+    assert events == [
+        "synchronize",
+        "cleanup prefill",
+        "cleanup decode",
+        "synchronize",
+    ]
+
+    events.clear()
+    release_graph_runners(
+        runners=(object.__new__(EagerRunner), object.__new__(CPUGraphRunner), None)
+    )
+    assert events == []
 
 
 if __name__ == "__main__":

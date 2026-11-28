@@ -144,6 +144,10 @@ class BaseTpWorker(ABC):
         runners = self.model_runner_list or [self.model_runner]
         return sum(runner.preloaded_weights_bytes for runner in runners)
 
+    def release_cuda_graphs(self) -> None:
+        for runner in self.model_runner_list or [self.model_runner]:
+            runner.release_cuda_graphs()
+
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
