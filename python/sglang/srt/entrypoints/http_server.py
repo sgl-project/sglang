@@ -31,7 +31,6 @@ import tempfile
 import threading
 import time
 import traceback
-import uuid
 from contextlib import asynccontextmanager
 from functools import partial
 from http import HTTPStatus
@@ -76,8 +75,7 @@ from pydantic import ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
     AnthropicMessagesRequest,
@@ -89,6 +87,7 @@ from sglang.srt.entrypoints.engine import (
     init_tokenizer_manager,
     node_hosts_rust_server,
 )
+from sglang.srt.entrypoints.health_probe import run_generation_probe
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
     OllamaGenerateRequest,
@@ -141,6 +140,7 @@ from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
+from sglang.srt.managers.frontend_stall_watchdog import FrontendStallWatchdog
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -310,11 +310,36 @@ async def init_multi_tokenizer() -> ServerArgs:
     return server_args
 
 
+def _maybe_start_frontend_stall_watchdog(
+    fast_api_app: FastAPI,
+) -> Optional[FrontendStallWatchdog]:
+    timeout = envs.SGLANG_STALL_WATCHDOG_TIMEOUT.get()
+    if timeout <= 0:
+        return None
+    if not getattr(fast_api_app, "is_single_tokenizer_mode", False):
+        logger.warning(
+            "The frontend stall watchdog supports one tokenizer worker only; "
+            "SGLANG_STALL_WATCHDOG_TIMEOUT arms the scheduler watchdog alone."
+        )
+        return None
+    tokenizer_manager = _global_state.tokenizer_manager
+    watchdog = FrontendStallWatchdog(
+        tokenizer_manager=tokenizer_manager,
+        timeout=timeout,
+        probe_fn=lambda probe_timeout: run_generation_probe(
+            tokenizer_manager, timeout=probe_timeout
+        ),
+    )
+    watchdog.start()
+    return watchdog
+
+
 @asynccontextmanager
 async def lifespan(fast_api_app: FastAPI):
     grpc_handle = None
     sidecar = None
     warmup_thread = None
+    stall_watchdog = None
     if getattr(fast_api_app, "is_single_tokenizer_mode", False):
         server_args = fast_api_app.server_args
         warmup_thread_kwargs = fast_api_app.warmup_thread_kwargs
@@ -469,9 +494,13 @@ async def lifespan(fast_api_app: FastAPI):
         )
         warmup_thread.start()
 
+        stall_watchdog = _maybe_start_frontend_stall_watchdog(fast_api_app)
+
         # Start the HTTP server
         yield
     finally:
+        if stall_watchdog is not None:
+            stall_watchdog.stop()
         if sidecar is not None:
             try:
                 sidecar.stop()
@@ -802,43 +831,14 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
-    # uuid keeps rids unique across tokenizer workers (a bare time.time() can
-    # collide, and colliding rids overwrite each other's detokenize state).
-    rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
-
-    if _global_state.tokenizer_manager.is_generation:
-        gri = GenerateReqInput(
-            rid=rid,
-            input_ids=[0],
-            sampling_params=sampling_params,
-            log_metrics=False,
-        )
-        if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
-            gri.bootstrap_host = FAKE_BOOTSTRAP_HOST
-            gri.bootstrap_room = 0
-    else:
-        gri = EmbeddingReqInput(
-            rid=rid, input_ids=[0], sampling_params=sampling_params, log_metrics=False
-        )
-
-    async def gen():
-        async for _ in _global_state.tokenizer_manager.generate_request(gri, request):
-            break
-
-    task = asyncio.create_task(gen())
-
     # As long as we receive any response from the detokenizer/scheduler, we consider the server is healthy.
     tic = time.time()
-    while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-        await asyncio.sleep(1)
-        if _global_state.tokenizer_manager.last_receive_tstamp > tic:
-            task.cancel()
-            _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
-            _global_state.tokenizer_manager.server_status = ServerStatus.Up
-            return Response(status_code=200)
+    if await run_generation_probe(
+        _global_state.tokenizer_manager, timeout=HEALTH_CHECK_TIMEOUT, request=request
+    ):
+        _global_state.tokenizer_manager.server_status = ServerStatus.Up
+        return Response(status_code=200)
 
-    task.cancel()
     tic_time = time.strftime("%H:%M:%S", time.localtime(tic))
     last_receive_time = time.strftime(
         "%H:%M:%S", time.localtime(_global_state.tokenizer_manager.last_receive_tstamp)
@@ -848,7 +848,6 @@ async def health_generate(request: Request) -> Response:
         f"{HEALTH_CHECK_TIMEOUT} seconds. tic start time: {tic_time}. "
         f"last_heartbeat time: {last_receive_time}"
     )
-    _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
     _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
     return Response(status_code=503)
 

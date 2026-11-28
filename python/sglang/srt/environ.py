@@ -785,6 +785,14 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    # Seconds a server with queued or in-flight requests may go without progress
+    # before it crashes so that a supervisor restarts it; -1 disables. Arms a
+    # scheduler watchdog for requests that are queued but never scheduled, and
+    # a frontend watchdog for a blocked event loop or an unanswered probe.
+    SGLANG_STALL_WATCHDOG_TIMEOUT = EnvFloat(-1)
+    # A busy scheduler acknowledges a skipped health probe only after a forward
+    # step launched since the probe arrived, so a stuck queue fails /health.
+    SGLANG_HEALTH_CHECK_REQUIRE_PROGRESS = EnvBool(False)
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
     # Most per-request states the detokenizer keeps; past it, the oldest is

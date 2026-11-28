@@ -801,3 +801,63 @@ def create_scheduler_watchdog(
         dump_info=dump_info,
         before_crash=scheduler.dump_requests_before_crash,
     )
+
+
+def _scheduler_has_unscheduled_work(scheduler: Scheduler) -> bool:
+    """Whether the scheduler holds requests but launched nothing this iteration."""
+    if scheduler.is_initializing or scheduler.pause_state.paused:
+        return False
+    if scheduler.cur_batch_for_debug is not None:
+        # A batch in flight is the forward watchdog's to time.
+        return False
+    return (
+        len(scheduler.waiting_queue) > 0
+        or scheduler.chunked_req is not None
+        or not scheduler.running_batch.is_empty()
+    )
+
+
+def create_scheduler_stall_watchdog(
+    scheduler: Scheduler, watchdog_timeout: float
+) -> WatchdogRaw:
+    """Crash a scheduler that holds requests but launches no step for too long.
+
+    The forward watchdog is active only while a batch is in flight, so a queue
+    that never yields a batch (memory or state slots never released) would
+    stall the server silently; this one covers that window.
+    """
+
+    def is_active() -> bool:
+        # An exception here would end the watchdog thread, so fail closed.
+        try:
+            return _scheduler_has_unscheduled_work(scheduler)
+        except Exception:
+            return False
+
+    def dump_info() -> str:
+        parts = [
+            "requests held without a forward step: "
+            f"waiting={len(scheduler.waiting_queue)}, "
+            f"running={len(scheduler.running_batch.reqs)}, "
+            f"chunked={scheduler.chunked_req is not None}, "
+            f"forward_ct={scheduler.forward_ct}",
+        ]
+        try:
+            _, messages = scheduler.invariant_checker._check_all_pools(
+                scheduler.pool_stats_observer.get_pool_stats(),
+            )
+            parts += messages
+        except Exception as e:
+            parts.append(f"pool stats unavailable: {e!r}")
+        return "\n".join(parts)
+
+    return WatchdogRaw(
+        debug_name="Scheduler stall",
+        get_counter=lambda: (scheduler.forward_ct, scheduler.watchdog_heartbeats),
+        is_active=is_active,
+        watchdog_timeout=watchdog_timeout,
+        dump_info=dump_info,
+        before_crash=scheduler.dump_requests_before_crash,
+        reset_on_activate=True,
+        poll_interval=min(5.0, watchdog_timeout / 4),
+    )

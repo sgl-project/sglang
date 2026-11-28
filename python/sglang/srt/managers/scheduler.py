@@ -288,6 +288,7 @@ from sglang.srt.managers.scheduler_components.internal_state import (
 )
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
+    create_scheduler_stall_watchdog,
     create_scheduler_watchdog,
 )
 from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcChannels
@@ -750,6 +751,7 @@ class Scheduler(
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
+        self.maybe_init_stall_watchdog()
 
         # Init profiler
         self.init_profiler()
@@ -1454,6 +1456,9 @@ class Scheduler(
         self.enable_skip_finishing_decode = False
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
+        # forward_ct when each queued acknowledgement's probe arrived, aligned
+        # with return_health_check_ipcs; see SGLANG_HEALTH_CHECK_REQUIRE_PROGRESS.
+        self.return_health_check_forward_cts: Deque[int] = deque()
         self.flush_wrapper = SchedulerFlushWrapper(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
@@ -1645,6 +1650,23 @@ class Scheduler(
             self.soft_watchdog = create_scheduler_watchdog(
                 self, watchdog_timeout=x, soft=True
             )
+
+    def maybe_init_stall_watchdog(self):
+        """Arm the watchdog for requests held without a forward step."""
+        self.stall_watchdog = None
+        timeout = envs.SGLANG_STALL_WATCHDOG_TIMEOUT.get()
+        if timeout <= 0:
+            return
+        if get_disagg().disaggregation_mode != DisaggregationMode.NULL.value:
+            # PD queues legitimately hold requests across long transfers.
+            logger.warning(
+                "SGLANG_STALL_WATCHDOG_TIMEOUT is ignored under PD disaggregation."
+            )
+            return
+        self.stall_watchdog = create_scheduler_stall_watchdog(
+            self, watchdog_timeout=timeout
+        )
+        logger.info(f"Scheduler stall watchdog armed ({timeout=}s).")
 
     def init_watch_dog_memory_saver_input_blocker(self):
         # Start watchdog thread
@@ -2441,9 +2463,7 @@ class Scheduler(
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
-                self.return_health_check_ipcs.append(
-                    getattr(recv_req, "http_worker_ipc", None)
-                )
+                self._queue_health_check_ack(getattr(recv_req, "http_worker_ipc", None))
                 continue
 
             if vmm_errors is not None and any(vmm_errors):
@@ -6171,7 +6191,7 @@ class Scheduler(
             return
         is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
         for probe in probes:
-            self.return_health_check_ipcs.append(probe.http_worker_ipc)
+            self._queue_health_check_ack(probe.http_worker_ipc)
             # The acknowledgement is the probe's final output.
             record_send(probe, "health_check")
             # Released as _abort_waiting does, without an abort to the tokenizer.
@@ -6180,8 +6200,19 @@ class Scheduler(
             probe.finish_outside_step(FINISH_ABORT())
             self.request_retirer.release(probe, checkpoint=False)
 
+    def _queue_health_check_ack(self, http_worker_ipc: Optional[str]) -> None:
+        self.return_health_check_ipcs.append(http_worker_ipc)
+        self.return_health_check_forward_cts.append(self.forward_ct)
+
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:
+            if (
+                envs.SGLANG_HEALTH_CHECK_REQUIRE_PROGRESS.get()
+                and self.forward_ct <= self.return_health_check_forward_cts[0]
+            ):
+                # No step launched since the oldest probe arrived; a scheduler
+                # holding requests it never runs must fail the health check.
+                return
             # Return some signal for the health check.
             # This is used to prevent the health check signal being blocked by long context prefill.
             # However, one minor issue is that this code path does not check the status of detokenizer manager.
@@ -6190,8 +6221,10 @@ class Scheduler(
                 # probes share one heartbeat, so one acknowledgement answers
                 # every probe skipped so far.
                 self.return_health_check_ipcs.clear()
+                self.return_health_check_forward_cts.clear()
                 self.rust_server.push_health_ack()
             else:
+                self.return_health_check_forward_cts.popleft()
                 self.ipc_channels.send_to_tokenizer.send_output(
                     HealthCheckOutput(
                         http_worker_ipc=self.return_health_check_ipcs.popleft()
