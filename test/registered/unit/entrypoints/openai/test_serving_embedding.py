@@ -49,6 +49,7 @@ if "sgl_kernel" not in sys.modules:
     sys.meta_path.insert(0, _SglKernelMockFinder())
 
 from fastapi import Request
+from pydantic import ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingRequest,
@@ -89,6 +90,40 @@ class _MockTokenizerManager:
             }
 
         self.generate_request = Mock(return_value=mock_generate_embedding())
+
+
+# Writes each content part where it appears, so a test can see where media landed.
+_ORDER_TEMPLATE = (
+    "{% for m in messages %}<{{ m.role }}>"
+    "{% if m.content is string %}{{ m.content }}"
+    "{% else %}{% for p in m.content %}"
+    "{% if p.type == 'text' %}{{ p.text }}{% else %}[{{ p.type }}]{% endif %}"
+    "{% endfor %}{% endif %}{% endfor %}"
+    "{% if instruction %}<instruction:{{ instruction }}>{% endif %}"
+    "{% if add_generation_prompt %}<assistant>{% endif %}"
+)
+
+
+def _render_order_template(messages, tokenize, add_generation_prompt, **kwargs):
+    return jinja2.Template(_ORDER_TEMPLATE).render(
+        messages=messages, add_generation_prompt=add_generation_prompt, **kwargs
+    )
+
+
+def _text(text):
+    return {"type": "text", "text": text}
+
+
+def _image(url):
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _video(url):
+    return {"type": "video_url", "video_url": {"url": url}}
+
+
+def _urls(media):
+    return [item.url for item in media]
 
 
 # Mock TemplateManager for embedding tests
@@ -364,6 +399,223 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             "encoding_format must be either",
             self.serving_embedding._validate_request(invalid_request),
         )
+
+    def _use_order_template(self, *, is_multimodal=True):
+        self.tokenizer_manager.model_config.is_multimodal = is_multimodal
+        self.tokenizer_manager.tokenizer.chat_template = _ORDER_TEMPLATE
+        self.tokenizer_manager.tokenizer.apply_chat_template = Mock(
+            side_effect=_render_order_template
+        )
+
+    def _convert(self, **request_fields):
+        request = EmbeddingRequest(model="test-model", **request_fields)
+        self.assertIsNone(self.serving_embedding._validate_request(request))
+        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+            request
+        )
+        return adapted_request
+
+    def test_chat_conversation_in_input_is_rendered_not_dropped(self):
+        """A vLLM-style conversation sent in `input` must not lose its content.
+
+        It used to validate as an empty MultimodalEmbeddingInput and be embedded
+        as the literal "padding", dropping the text and the image.
+        """
+        self._use_order_template()
+
+        adapted_request = self._convert(
+            input=[{"role": "user", "content": [_text("a red car"), _image("car")]}]
+        )
+
+        self.assertEqual(adapted_request.text, "<user>a red car[image]")
+        self.assertEqual(_urls(adapted_request.image_data), ["car"])
+
+    def test_chat_messages_keep_interleaved_media_order(self):
+        """Media stays at its position in the prompt and in the media lists,
+        and no generation prompt is added by default (as in vLLM)."""
+        self._use_order_template()
+
+        adapted_request = self._convert(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        _text("before"),
+                        _image("first"),
+                        _text("between"),
+                        _video("clip"),
+                        _image("second"),
+                        _text("after"),
+                    ],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            adapted_request.text,
+            "<user>before[image]between[video][image]after",
+        )
+        self.assertEqual(_urls(adapted_request.image_data), ["first", "second"])
+        self.assertEqual(adapted_request.video_data, ["clip"])
+
+    def test_batched_chat_messages_give_one_media_entry_per_conversation(self):
+        """Media lists must line up with the batch, with None for text-only items."""
+        self._use_order_template()
+
+        adapted_request = self._convert(
+            messages=[
+                [{"role": "query", "content": [_text("cat"), _image("cat.png")]}],
+                [{"role": "document", "content": "a text-only document"}],
+            ]
+        )
+
+        self.assertEqual(
+            adapted_request.text,
+            ["<query>cat[image]", "<document>a text-only document"],
+        )
+        self.assertEqual(_urls(adapted_request.image_data[0]), ["cat.png"])
+        self.assertIsNone(adapted_request.image_data[1])
+        self.assertIsNone(adapted_request.video_data)
+        adapted_request.normalize_batch_and_arguments()
+        self.assertEqual(adapted_request.batch_size, 2)
+
+    def test_text_only_model_does_not_add_special_tokens_to_chat_prompt(self):
+        """The chat template already writes BOS; encoding must not add another."""
+        self._use_order_template(is_multimodal=False)
+        bos = 1
+        self.tokenizer_manager.tokenizer.encode = lambda text, add_special_tokens=True: (
+            ([bos] if add_special_tokens else []) + [len(text)]
+        )
+
+        adapted_request = self._convert(messages=[{"role": "user", "content": "hello"}])
+
+        self.assertEqual(adapted_request.input_ids, [len("<user>hello")])
+        self.assertIsNone(adapted_request.text)
+
+    def test_request_options_override_chat_template_kwargs(self):
+        """chat_template_kwargs reach the template, but add_generation_prompt from
+        the request wins over a kwarg of the same name, as in vLLM."""
+        self._use_order_template()
+
+        adapted_request = self._convert(
+            messages=[{"role": "user", "content": "hello"}],
+            chat_template_kwargs={
+                "instruction": "query",
+                "add_generation_prompt": True,
+            },
+        )
+
+        self.assertEqual(adapted_request.text, "<user>hello<instruction:query>")
+
+    def test_media_is_rejected_for_text_only_model(self):
+        """A text-only model would render the prompt and drop the image silently."""
+        self._use_order_template(is_multimodal=False)
+        request = EmbeddingRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": [_text("x"), _image("y")]}],
+        )
+
+        self.assertIn(
+            "only supports text input",
+            self.serving_embedding._validate_request(request),
+        )
+
+    def test_media_is_rejected_when_model_lacks_that_modality(self):
+        """A vision model given audio (or an audio model given an image) would
+        render the placeholder and drop the media silently."""
+        cases = [
+            (
+                "is_audio_understandable_model",
+                {"type": "audio_url", "audio_url": {"url": "a.wav"}},
+                "audio",
+            ),
+            ("is_image_understandable_model", _image("y"), "image"),
+            ("is_image_understandable_model", _video("v"), "video"),
+        ]
+        for flag, part, modality in cases:
+            with self.subTest(modality=modality):
+                self._use_order_template()
+                model_config = self.tokenizer_manager.model_config
+                model_config.is_audio_understandable_model = True
+                model_config.is_image_understandable_model = True
+                setattr(model_config, flag, False)
+                request = EmbeddingRequest(
+                    model="test-model",
+                    messages=[{"role": "user", "content": [_text("x"), part]}],
+                )
+
+                self.assertIn(
+                    f"does not support {modality} input",
+                    self.serving_embedding._validate_request(request),
+                )
+
+    def test_media_is_rejected_for_string_format_template(self):
+        """A "string" content-format template keeps only text parts."""
+        self._use_order_template()
+        self.template_manager.jinja_template_content_format = "string"
+        request = EmbeddingRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": [_text("x"), _image("y")]}],
+        )
+
+        with self.assertRaisesRegex(ValueError, "renders text only"):
+            self.serving_embedding._convert_to_internal_request(request)
+
+    def test_input_and_messages_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValidationError, "exactly one of"):
+            EmbeddingRequest(
+                model="test-model",
+                input="hello",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+    def test_conversation_template_renders_messages_in_order(self):
+        """Registered conversation templates (gme-qwen2-vl) render the message
+        through generate_chat_conv, keeping the image where it was sent."""
+        self.tokenizer_manager.model_config.is_multimodal = True
+        self.template_manager.chat_template_name = "gme-qwen2-vl"
+
+        adapted_request = self._convert(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [_text("a photo of"), _image("dog"), _text("outside")],
+                }
+            ]
+        )
+
+        self.assertIn(
+            "a photo of<|vision_start|><|image_pad|><|vision_end|>outside",
+            adapted_request.text,
+        )
+        self.assertEqual(_urls(adapted_request.image_data), ["dog"])
+
+    def test_conversation_template_prompt_matches_multimodal_input(self):
+        """For gme-qwen2-vl, `messages` and the existing `input` form must give the
+        same prompt, so both produce the same embedding for the same content."""
+        self.tokenizer_manager.model_config.is_multimodal = True
+        self.template_manager.chat_template_name = "gme-qwen2-vl"
+
+        from_messages = self._convert(
+            messages=[
+                {"role": "user", "content": [_image("dog"), _text("a dog outside")]}
+            ]
+        )
+        from_input = self._convert(
+            input=[MultimodalEmbeddingInput(text="a dog outside", image="dog")]
+        )
+
+        self.assertEqual(from_messages.text, from_input.text)
+
+    def test_conversation_template_rejects_roles_it_cannot_render(self):
+        self.tokenizer_manager.model_config.is_multimodal = True
+        self.template_manager.chat_template_name = "gme-qwen2-vl"
+        request = EmbeddingRequest(
+            model="test-model", messages=[{"role": "query", "content": "cat"}]
+        )
+
+        with self.assertRaisesRegex(ValueError, "role 'query' is not supported"):
+            self.serving_embedding._convert_to_internal_request(request)
 
 
 if __name__ == "__main__":
