@@ -72,6 +72,8 @@ def _blocks():
         block.layer_index = index
         block.norm1 = block.norm2 = nn.Identity()
         block.attn = _Identity()
+        block.attn.hybrid = None
+        block.attn.out_proj = SimpleNamespace(tp_size=1)
         block.mlp = _Identity()
         block.adaln_proj = None
         block.preserve_input_for_cache_dit = True

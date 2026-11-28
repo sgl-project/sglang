@@ -231,5 +231,176 @@ class TestMegakernelBindingDsa(CustomTestCase):
                 binding.assert_live()
 
 
+def hybrid_pools(verify: bool):
+    """An MLA + KDA hybrid pool pair with one layer of each; ``verify`` gives the KDA
+    layer its target-verify scratch."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MambaPool
+
+    full = SimpleNamespace(
+        kv_buffer=[torch.zeros(4 * 2, 3)],
+        kv_cache_dim=3,
+        size=6,
+        post_capture_active=False,
+        dtype=torch.bfloat16,
+        store_dtype=torch.bfloat16,
+    )
+    pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+    pool.__dict__.update(
+        full_kv_pool=full,
+        full_attention_layer_id_mapping={0: 0},
+        page_size=2,
+        use_mla=True,
+        use_dsa=False,
+    )
+    scratch = {
+        "intermediate_conv_window": [torch.zeros(1, 4, 2)],
+        "intermediate_ssm": torch.zeros(1, 4, 8, 2),
+    }
+    state = (
+        MambaPool.SpeculativeState(
+            conv=[torch.zeros(1, 4, 2)], temporal=torch.zeros(1, 4, 2), **scratch
+        )
+        if verify
+        else MambaPool.State(conv=[torch.zeros(1, 4, 2)], temporal=torch.zeros(1, 4, 2))
+    )
+    mamba_pool = SimpleNamespace(
+        size=3, mamba2_layer_cache=lambda index: state.at_layer_idx(index)
+    )
+    req_pool = SimpleNamespace(mamba_map={1: 0}, mamba_pool=mamba_pool, size=3)
+    return pool, req_pool, state
+
+
+def hybrid_backend(req_pool, *, verify_rows=None):
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
+    )
+
+    backend = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+    backend.__dict__.update(
+        token_to_kv_pool=None,
+        full_attn_backend=SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                block_kv_indices=torch.zeros(2, 4, dtype=torch.int32),
+                seq_lens_k=torch.ones(2, dtype=torch.int32),
+            )
+        ),
+        linear_attn_backend=SimpleNamespace(
+            forward_metadata=SimpleNamespace(
+                mamba_cache_indices=torch.tensor([1, 2], dtype=torch.int32)
+            ),
+            verify_intermediate_state_indices=verify_rows,
+            req_to_token_pool=req_pool,
+        ),
+    )
+    return backend
+
+
+def step_batch(*, verify: bool, aux=None):
+    mode = SimpleNamespace(is_target_verify=lambda: verify)
+    rows = 2 * (6 if verify else 1)
+    return SimpleNamespace(
+        forward_mode=mode,
+        batch_size=2,
+        out_cache_loc=torch.arange(rows),
+        input_ids=torch.zeros(rows, dtype=torch.int64),
+        req_pool_indices=torch.tensor([1, 2]),
+        spec_info=SimpleNamespace(draft_token_num=6) if verify else None,
+        aux_hidden_states_buffer=aux,
+    )
+
+
+class TestHybridStepViews(CustomTestCase):
+    """The hybrid MLA + KDA views: a target verify carries its rows per request, each
+    request's verify scratch row and the auxiliary hidden-state rows; decode does not."""
+
+    def _binding(self, *, aux_width=0):
+        binding = mb.MegakernelBinding(model=torch.nn.Module())
+        binding._aux_width, binding._aux_dtype = aux_width, torch.bfloat16
+        return binding
+
+    def test_the_pool_view_offers_the_verify_scratch_only_where_the_pool_keeps_it(self):
+        for verify in (False, True):
+            with self.subTest(verify=verify):
+                pool, req_pool, state = hybrid_pools(verify)
+                view = self._binding().pool_view(pool, req_pool).hybrid
+                kda = view.kda.state(1)
+                if verify:
+                    self.assertEqual(
+                        kda.intermediate_ssm.data_ptr(),
+                        state.intermediate_ssm[0].data_ptr(),
+                    )
+                    self.assertEqual(
+                        kda.intermediate_conv_window[0].data_ptr(),
+                        state.intermediate_conv_window[0][0].data_ptr(),
+                    )
+                else:
+                    self.assertEqual(kda.intermediate_conv_window, ())
+                    self.assertIsNone(kda.intermediate_ssm)
+
+    def test_a_replaced_verify_scratch_fails_assert_live(self):
+        pool, req_pool, state = hybrid_pools(verify=True)
+        binding = self._binding()
+        binding.pool_view(pool, req_pool)
+        backend = hybrid_backend(req_pool)
+        with patch.object(mb, "get_attn_backend", return_value=backend):
+            binding.assert_live()
+            object.__setattr__(state, "intermediate_ssm", torch.zeros(1, 4, 8, 2))
+            with self.assertRaisesRegex(RuntimeError, "hybrid buffers changed"):
+                binding.assert_live()
+
+    def test_a_decode_step_has_no_verify_fields(self):
+        _, req_pool, _ = hybrid_pools(verify=True)
+        backend = hybrid_backend(
+            req_pool, verify_rows=torch.arange(4, dtype=torch.int32)
+        )
+        with patch.object(mb, "get_attn_backend", return_value=backend):
+            hybrid = self._binding(aux_width=8).forward_view(step_batch(verify=False))
+        self.assertEqual(hybrid.hybrid.mla.tokens_per_request, 1)
+        self.assertIsNone(hybrid.hybrid.kda.verify_scratch_indices)
+        self.assertIsNone(hybrid.hybrid.aux_hidden_states)
+
+    def test_a_target_verify_offers_its_rows_scratch_and_aux_buffer(self):
+        _, req_pool, _ = hybrid_pools(verify=True)
+        rows = torch.arange(4, dtype=torch.int32)
+        backend = hybrid_backend(req_pool, verify_rows=rows)
+        aux = torch.zeros(12, 8, dtype=torch.bfloat16)
+        with patch.object(mb, "get_attn_backend", return_value=backend):
+            view = self._binding(aux_width=8).forward_view(
+                step_batch(verify=True, aux=aux)
+            )
+        self.assertEqual(view.hybrid.mla.tokens_per_request, 6)
+        self.assertTrue(torch.equal(view.hybrid.kda.verify_scratch_indices, rows[:2]))
+        self.assertIs(view.hybrid.aux_hidden_states, aux)
+
+    def test_an_eager_verify_gets_an_aux_buffer_and_a_captured_one_must_have_one(self):
+        _, req_pool, _ = hybrid_pools(verify=True)
+        backend = hybrid_backend(
+            req_pool, verify_rows=torch.arange(4, dtype=torch.int32)
+        )
+        binding = self._binding(aux_width=8)
+        with (
+            patch.object(mb, "get_attn_backend", return_value=backend),
+            patch.object(torch.cuda, "is_current_stream_capturing", lambda: False),
+        ):
+            batch = step_batch(verify=True)
+            view = binding.forward_view(batch)
+            aux = view.hybrid.aux_hidden_states
+            self.assertEqual(tuple(aux.shape), (12, 8))
+            self.assertEqual(aux.dtype, torch.bfloat16)
+            self.assertIs(batch.aux_hidden_states_buffer, aux)
+            with patch.object(torch.cuda, "is_current_stream_capturing", lambda: True):
+                with self.assertRaisesRegex(RuntimeError, "auxiliary hidden-state"):
+                    binding.forward_view(step_batch(verify=True))
+
+    def test_a_target_without_aux_taps_offers_none(self):
+        _, req_pool, _ = hybrid_pools(verify=True)
+        backend = hybrid_backend(
+            req_pool, verify_rows=torch.arange(4, dtype=torch.int32)
+        )
+        with patch.object(mb, "get_attn_backend", return_value=backend):
+            view = self._binding(aux_width=0).forward_view(step_batch(verify=True))
+        self.assertIsNone(view.hybrid.aux_hidden_states)
+
+
 if __name__ == "__main__":
     unittest.main()

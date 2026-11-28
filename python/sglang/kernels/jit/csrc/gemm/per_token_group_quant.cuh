@@ -335,15 +335,20 @@ struct QuantTrait {
         scale_inv = __uint_as_float(static_cast<uint32_t>(exp) << 23);
       }
       const float quant_scale = inv_scale_ue8m0(exp);
-      const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
+      if constexpr (std::is_same_v<T, bf16_t>) {
+        // The power-of-two multiplier and every product are exact in BF16.
+        const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
 #pragma unroll
-      for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        if constexpr (std::is_same_v<T, bf16_t>) {
+        for (uint32_t i = 0; i < kVecSize / 2; ++i) {
           out[i] = static_cast<Q2>(__hmul2(in[i], scale2));
-        } else {
-          // FP16 scaling can overflow even for finite inputs (zero * inf).
-          const auto max_clip = cast<T>(kMaxValue);
-          out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), T2{max_clip, max_clip}));
+        }
+      } else {
+        // The multiplier of a small-amax group (up to 2^42) overflows FP16, so
+        // scale in FP32; the result equals the FP16 product wherever that is finite.
+        const auto quant_scale2 = float2{quant_scale, quant_scale};
+#pragma unroll
+        for (uint32_t i = 0; i < kVecSize / 2; ++i) {
+          out[i] = WTrait::quant(math::mul_f32x2(cast<float2>(in[i]), quant_scale2));
         }
       }
     } else {

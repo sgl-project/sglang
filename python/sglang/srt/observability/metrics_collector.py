@@ -95,11 +95,15 @@ class SchedulerStats:
     #                     its layers declare); 0 without one. Kept for readers
     #                     of the single-window name.
     # mamba_usage:        Mamba SSM state pool usage (hybrid SSM models only, e.g. Jamba).
+    # total_kv_bytes_usage: share of the unified memory pool's bytes in used (non-evictable) full and swa
+    #                   pages; None (no sample) unless the pool is unified with a full band, exactly
+    #                   one swa band and no state band.
     token_usage: float = 0.0
     full_token_usage: float = 0.0
     window_token_usage: Dict[str, float] = field(default_factory=dict)
     swa_token_usage: float = 0.0
     mamba_usage: float = 0.0
+    total_kv_bytes_usage: Optional[float] = None
 
     # Absolute token counts for the full-attention KV cache pool.
     # Invariant: kv_available_tokens + kv_evictable_tokens + kv_used_tokens <= max_total_num_tokens
@@ -166,6 +170,10 @@ class SchedulerStats:
 
     # Scheduler policy
     new_token_ratio: float = 0.0
+    # Load-scaled shortest-prefill-first; None when it is off.
+    shortest_prefill_backlog_tokens: Optional[int] = None
+    shortest_prefill_class_boundary_tokens: Optional[float] = None
+    shortest_prefill_token_budget: Optional[int] = None
 
     # CUDA graph
     is_cuda_graph: int = 0
@@ -440,6 +448,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self.mamba_usage = Gauge(
             name="sglang:mamba_usage",
             documentation="The token usage for Mamba layers.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.total_kv_bytes_usage = Gauge(
+            name="sglang:total_kv_bytes_usage",
+            documentation="The share of the unified memory pool's bytes in used (non-evictable) full and SWA pages; only for unified pools of a full band and exactly one SWA band, with no state band.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -770,6 +784,27 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.shortest_prefill_backlog_tokens = Gauge(
+            name="sglang:shortest_prefill_backlog_tokens",
+            documentation="Load-scaled shortest-prefill-first backlog: uncached "
+            "tokens of the waiting requests plus the continuing chunk's remainder.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.shortest_prefill_class_boundary_tokens = Gauge(
+            name="sglang:shortest_prefill_class_boundary_tokens",
+            documentation="Uncached size from which waiting requests go in "
+            "arrival order instead of shortest first.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.shortest_prefill_token_budget = Gauge(
+            name="sglang:shortest_prefill_token_budget",
+            documentation="Prefill tokens one batch may carry under load-scaled "
+            "shortest-prefill-first; the chunk size when uncapped.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
 
         # =================================================================
         # CUDA graph
@@ -935,6 +970,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             buckets=exponential_buckets(start=0.001, width=1.62, length=30),
             labelnames=list(labels.keys()) + ["stage"],
         )
+        # Observed for every request at every stage; `labels()` rebuilds and
+        # stringifies the label tuple on each call.
+        self._per_stage_req_latency_children: Dict[str, Any] = {}
 
         # =================================================================
         # Grammar
@@ -1526,8 +1564,13 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
-        labels_with_stage = {**self.labels, "stage": stage}
-        self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
+        child = self._per_stage_req_latency_children.get(stage)
+        if child is None:
+            child = self.per_stage_req_latency_seconds.labels(
+                **{**self.labels, "stage": stage}
+            )
+            self._per_stage_req_latency_children[stage] = child
+        child.observe(latency)
 
     def observe_queue_time(self, latency: float) -> None:
         self._log_histogram(self.queue_time, latency)
@@ -1714,6 +1757,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_window_gauge(self.window_token_usage, stats.window_token_usage)
         self._log_gauge(self.swa_token_usage, stats.swa_token_usage)
         self._log_gauge(self.mamba_usage, stats.mamba_usage)
+        if stats.total_kv_bytes_usage is not None:
+            self._log_gauge(self.total_kv_bytes_usage, stats.total_kv_bytes_usage)
 
         # Absolute token counts
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
@@ -1783,6 +1828,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
         # Scheduler policy
         self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
+        if stats.shortest_prefill_backlog_tokens is not None:
+            self._log_gauge(
+                self.shortest_prefill_backlog_tokens,
+                stats.shortest_prefill_backlog_tokens,
+            )
+            self._log_gauge(
+                self.shortest_prefill_class_boundary_tokens,
+                stats.shortest_prefill_class_boundary_tokens,
+            )
+            self._log_gauge(
+                self.shortest_prefill_token_budget,
+                stats.shortest_prefill_token_budget,
+            )
 
         # CUDA graph
         self._log_gauge(self.is_cuda_graph, stats.is_cuda_graph)
@@ -2299,6 +2357,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "host allocation, transfer, or cache insertion.",
             labelnames=labels.keys(),
         )
+        # Plain copies of the storage-prefetch and backup token counters for the
+        # load report (/v1/loads), which routers difference.
+        self.total_storage_prefetch_hit_tokens = 0
+        self.total_storage_prefetch_unfulfilled_tokens: Dict[str, int] = {}
+        self.total_backuped_tokens = 0
+        self.total_backup_dropped_tokens = 0
 
         self.storage_prefetch_unfulfilled_tokens_total = Counter(
             name="sglang:storage_prefetch_unfulfilled_tokens_total",
@@ -2462,6 +2526,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backuped_tokens(self, backuped_tokens: int):
         if backuped_tokens > 0:
             self.backuped_tokens_total.labels(**self.labels).inc(backuped_tokens)
+            self.total_backuped_tokens += backuped_tokens
 
     def observe_backup_storage_duration(self, duration_seconds: float) -> None:
         self.backup_storage_duration_seconds.labels(**self.labels).observe(
@@ -2471,6 +2536,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_storage_prefetch_hit_tokens(self, num_tokens: int) -> None:
         if num_tokens > 0:
             self.storage_prefetch_hit_tokens_total.labels(**self.labels).inc(num_tokens)
+            self.total_storage_prefetch_hit_tokens += num_tokens
 
     def log_storage_prefetch_unfulfilled_tokens(
         self, num_tokens: int, reason: str
@@ -2479,6 +2545,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.storage_prefetch_unfulfilled_tokens_total.labels(
                 **self.labels, reason=reason
             ).inc(num_tokens)
+            unfulfilled = self.total_storage_prefetch_unfulfilled_tokens
+            unfulfilled[reason] = unfulfilled.get(reason, 0) + num_tokens
 
     def log_storage_prefetch_deferred_tokens(
         self, num_tokens: int, reason: str
@@ -2491,6 +2559,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
     def log_backup_dropped_tokens(self, dropped_tokens: int):
         if dropped_tokens > 0:
             self.backup_dropped_tokens_total.labels(**self.labels).inc(dropped_tokens)
+            self.total_backup_dropped_tokens += dropped_tokens
 
     def log_prefetch_aux_alloc_failed_tokens(self, num_tokens: int):
         if num_tokens > 0:
@@ -2769,6 +2838,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def init_linker_metrics(self) -> None:
         """Create the external cache linker series; only caches with a linker call this."""
+        # The cache and its collectors outlive individual linker attachments.
+        if getattr(self, "_linker_metrics_initialized", False):
+            return
         from prometheus_client import Counter as _PromCounter
         from prometheus_client import Gauge as _PromGauge
         from prometheus_client import Histogram as _PromHistogram
@@ -2859,6 +2931,7 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self._linker_metrics_initialized = True
 
     def increment_linker_lookup_tokens(
         self, lookup_tokens: int, hit_tokens: int

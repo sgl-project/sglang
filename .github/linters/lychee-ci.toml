@@ -12,6 +12,9 @@ scheme = ["http", "https"]
 exclude = [
   # Slack invite link returns 403 to CI user-agents (anti-bot); the link is valid.
   "^https://slack\\.sglang\\.io(/|$)",
+  # Social and course sites that return 403 to CI user-agents (anti-bot); the links are valid.
+  "^https://(www\\.)?(x|twitter)\\.com/",
+  "^https://www\\.deeplearning\\.ai/",
   # Local-only endpoints referenced in docs/examples.
   # These are expected to be unreachable in GitHub-hosted CI.
   "^https?://localhost(:[0-9]+)?(/|$)",

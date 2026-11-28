@@ -105,7 +105,7 @@ class _VarlenLaunchPlan:
 
 
 @dataclass(frozen=True)
-class _PagedDecodeLaunchPlan:
+class _PagedLaunchPlan:
     compiled_fn: Callable
     compile_key: tuple
     actual_num_splits: int
@@ -1027,7 +1027,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     def __init__(self) -> None:
         self._varlen_plans: OrderedDict[tuple, _VarlenLaunchPlan] = OrderedDict()
-        self._paged_plans: OrderedDict[tuple, _PagedDecodeLaunchPlan] = OrderedDict()
+        self._paged_block_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
+        self._paged_exact_plans: OrderedDict[tuple, _PagedLaunchPlan] = OrderedDict()
         self._paged_plan_tiles: OrderedDict[tuple, tuple[int, int]] = OrderedDict()
         self._paged_workspaces: OrderedDict[
             tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]
@@ -1263,7 +1264,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     def _paged_workspace(
         self,
-        plan: _PagedDecodeLaunchPlan,
+        plan: _PagedLaunchPlan,
         q: torch.Tensor,
         v: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1313,19 +1314,61 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         return result
 
     @staticmethod
-    def _supports_cached_paged_decode(
+    def _keys_on_kv_blocks(
         *,
         head_dim: int,
         head_dim_v: int,
         effective_q_rows: int,
     ) -> bool:
-        """Qualify shapes covered by the SM12x paged-decode launch cache."""
+        """Shapes whose plans key on KV blocks, not the exact max_seqlen_k.
+
+        Valid only while select_config and resolve_plan read it as KV blocks.
+        """
         head_dims = (head_dim, head_dim_v)
         return (
             head_dims in LOW_HD_DECODE_SHAPES or head_dims == (256, 256)
         ) and effective_q_rows <= 16
 
-    def try_paged_decode(
+    @staticmethod
+    def _paged_exact_key(base_key: tuple, max_seqlen_k: int) -> tuple:
+        # get_fwd_tile_size reads the exact seqlen_k, so exact-keyed plans key on it.
+        return (*base_key, max_seqlen_k)
+
+    def _paged_block_plan(
+        self,
+        base_key: tuple,
+        *,
+        max_seqlen_k: int,
+        window_size_left: Optional[int],
+        window_size_right: Optional[int],
+    ) -> Optional[_PagedLaunchPlan]:
+        tile_mn = self._paged_plan_tiles.get(base_key)
+        if tile_mn is None:
+            return None
+        self._paged_plan_tiles.move_to_end(base_key)
+        selection_key = self._paged_selection_key(
+            base_key,
+            *tile_mn,
+            max_seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        plan = self._paged_block_plans.get(selection_key)
+        if plan is None:
+            return None
+        self._paged_block_plans.move_to_end(selection_key)
+        return plan
+
+    def _paged_exact_plan(
+        self, base_key: tuple, *, max_seqlen_k: int
+    ) -> Optional[_PagedLaunchPlan]:
+        key = self._paged_exact_key(base_key, max_seqlen_k)
+        plan = self._paged_exact_plans.get(key)
+        if plan is not None:
+            self._paged_exact_plans.move_to_end(key)
+        return plan
+
+    def try_paged(
         self,
         *,
         arch: int,
@@ -1383,12 +1426,11 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         effective_q_rows = actual_max_seqlen_q * (
             qhead_per_kvhead if actual_pack_gqa else 1
         )
-        if not self._supports_cached_paged_decode(
+        keys_on_kv_blocks = self._keys_on_kv_blocks(
             head_dim=q.shape[-1],
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
-        ):
-            return None
+        )
         causal, window_size_left, window_size_right = _resolve_causal_local_window(
             causal,
             window_size_left,
@@ -1410,21 +1452,17 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             pack_gqa=actual_pack_gqa,
             requested_num_splits=requested_num_splits,
         )
-        tile_mn = self._paged_plan_tiles.get(base_key)
-        if tile_mn is None:
-            return None
-        self._paged_plan_tiles.move_to_end(base_key)
-        selection_key = self._paged_selection_key(
-            base_key,
-            *tile_mn,
-            actual_max_seqlen_k,
-            window_size_left,
-            window_size_right,
-        )
-        plan = self._paged_plans.get(selection_key)
+        if keys_on_kv_blocks:
+            plan = self._paged_block_plan(
+                base_key,
+                max_seqlen_k=actual_max_seqlen_k,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+            )
+        else:
+            plan = self._paged_exact_plan(base_key, max_seqlen_k=actual_max_seqlen_k)
         if plan is None:
             return None
-        self._paged_plans.move_to_end(selection_key)
         if out is None:
             out = torch.empty(
                 expected_out_shape,
@@ -1475,7 +1513,7 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             )
         return out, None
 
-    def register_paged_decode(
+    def register_paged(
         self,
         *,
         arch: int,
@@ -1504,11 +1542,13 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
     ) -> None:
         qhead_per_kvhead = q.shape[1] // k.shape[-2]
         effective_q_rows = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
-        if not self._supports_cached_paged_decode(
+        keys_on_kv_blocks = self._keys_on_kv_blocks(
             head_dim=q.shape[-1],
             head_dim_v=v.shape[-1],
             effective_q_rows=effective_q_rows,
-        ):
+        )
+        # Exact-keyed shapes plan only single-split launches; SplitKV keeps the generic path.
+        if not keys_on_kv_blocks and actual_num_splits != 1:
             return
         base_key = self._paged_base_key(
             arch=arch,
@@ -1526,6 +1566,18 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             pack_gqa=pack_gqa,
             requested_num_splits=requested_num_splits,
         )
+        if not keys_on_kv_blocks:
+            self._register_paged_exact_plan(
+                self._paged_exact_key(base_key, max_seqlen_k),
+                _PagedLaunchPlan(
+                    compiled_fn=compiled_fn,
+                    compile_key=compile_key,
+                    actual_num_splits=1,
+                    compiled_combine=None,
+                    partial_dtype=q.dtype,
+                ),
+            )
+            return
         selection_key = self._paged_selection_key(
             base_key,
             tile_m,
@@ -1539,20 +1591,20 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
         while len(self._paged_plan_tiles) > _LAUNCH_PLAN_CAPACITY:
             stale_base_key, _ = self._paged_plan_tiles.popitem(last=False)
             stale_selection_keys = [
-                key for key in self._paged_plans if key[:-1] == stale_base_key
+                key for key in self._paged_block_plans if key[:-1] == stale_base_key
             ]
             for key in stale_selection_keys:
-                del self._paged_plans[key]
-        self._paged_plans[selection_key] = _PagedDecodeLaunchPlan(
+                del self._paged_block_plans[key]
+        self._paged_block_plans[selection_key] = _PagedLaunchPlan(
             compiled_fn=compiled_fn,
             compile_key=compile_key,
             actual_num_splits=actual_num_splits,
             compiled_combine=compiled_combine,
             partial_dtype=(out_partial.dtype if out_partial is not None else q.dtype),
         )
-        self._paged_plans.move_to_end(selection_key)
-        while len(self._paged_plans) > _LAUNCH_PLAN_CAPACITY:
-            self._paged_plans.popitem(last=False)
+        self._paged_block_plans.move_to_end(selection_key)
+        while len(self._paged_block_plans) > _LAUNCH_PLAN_CAPACITY:
+            self._paged_block_plans.popitem(last=False)
 
         if out_partial is None or lse_partial is None:
             return
@@ -1595,6 +1647,12 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
             ),
         )
 
+    def _register_paged_exact_plan(self, key: tuple, plan: _PagedLaunchPlan) -> None:
+        self._paged_exact_plans[key] = plan
+        self._paged_exact_plans.move_to_end(key)
+        while len(self._paged_exact_plans) > _LAUNCH_PLAN_CAPACITY:
+            self._paged_exact_plans.popitem(last=False)
+
     def _cache_workspace_view(
         self,
         key: tuple,
@@ -1625,7 +1683,8 @@ class Sm120ForwardHost(Sm120ForwardPolicy):
 
     def clear_launch_plans(self) -> None:
         self._varlen_plans.clear()
-        self._paged_plans.clear()
+        self._paged_block_plans.clear()
+        self._paged_exact_plans.clear()
         self._paged_plan_tiles.clear()
         self._paged_workspaces.clear()
         self._paged_workspace_views.clear()

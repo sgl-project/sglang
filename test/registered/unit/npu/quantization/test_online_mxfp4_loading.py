@@ -19,9 +19,9 @@ from sglang.srt.layers.moe.fused_moe_triton import layer as moe_layer
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.npu_mxfp4 import Mxfp4W4A8Config
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_npu_ci(est_time=5, suite="extra-a-test-npu")
 
 
 class TestOnlineMXFP4Loading(unittest.TestCase):

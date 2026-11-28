@@ -225,8 +225,9 @@ if (
     and torch.cuda.get_device_capability()[0] >= 9
 ):
     LINE_VALS.insert(2, "tma")
+OWN_LINES = [v for v in LINE_VALS if v != "aot"]
 
-# A/A on GB300 moved host-transfer lines run to run: aot H2D by -24%, tma/jit by 4-8%.
+# A/A on GB300 moved the gated host-transfer lines (tma/jit) by 4-8% run to run.
 TOL = marker.Tolerance(rel=0.10)
 
 
@@ -241,6 +242,7 @@ TOL = marker.Tolerance(rel=0.10)
     "provider",
     LINE_VALS,
     unit="ms",
+    gate=OWN_LINES,
     tolerance=TOL,
 )
 def benchmark_one_layer_h2d(element_size: int, batch_size: int, provider: str):
@@ -323,7 +325,7 @@ def _create_ptr_tensor(tensors, device="cuda"):
 
 @marker.parametrize("element_size", ELEMENT_SIZES, CI_ELEMENT_SIZES)
 @marker.parametrize("batch_size", marker.range(14, pattern="pow2"), [16])
-@marker.benchmark("provider", LINE_VALS, unit="ms", tolerance=TOL)
+@marker.benchmark("provider", LINE_VALS, unit="ms", gate=OWN_LINES, tolerance=TOL)
 def benchmark_all_layer_d2h(element_size: int, batch_size: int, provider: str):
     """All Layer: Device (GPU) -> Host (CPU)."""
     global cache

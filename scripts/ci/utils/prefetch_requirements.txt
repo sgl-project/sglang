@@ -1,0 +1,19 @@
+# Exact pins for scripts/ci/utils/prefetch_hf_models.py, installed by
+# .github/actions/prefetch-hf-models from pypi.org only, where a released file
+# never changes. It installs with --no-deps, so this list is the whole install
+# set: bump huggingface-hub and its dependencies together.
+anyio==4.16.0
+click==8.5.1
+filelock==4.3.1
+fsspec==2026.9.0
+h11==0.16.0
+hf-xet==1.8.0
+httpcore2==2.16.2
+httpx2==2.16.2
+huggingface-hub==2.4.0
+idna==3.20
+packaging==26.4
+pyyaml==6.0.4
+tqdm==4.70.1
+truststore==0.10.5
+typing-extensions==4.16.0

@@ -505,7 +505,7 @@ def _chunk_state_varlen_kernel(
     pid_m = tl.program_id(axis=0) // num_pid_n
     pid_n = tl.program_id(axis=0) % num_pid_n
     end_idx = tl.load(cu_seqlens_ptr + pid_b + 1)
-    pid_c = (end_idx - 1) // chunk_size
+    pid_c = ((end_idx - 1) // chunk_size).to(tl.int64)
     b_ptr += (
         pid_c * chunk_size * stride_b_seqlen
         + (pid_h // nheads_ngroups_ratio) * stride_b_head
