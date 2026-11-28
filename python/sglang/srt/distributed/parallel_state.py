@@ -103,6 +103,11 @@ _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 # (128 KiB of payload at world_size 8).
 _FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
 _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
+# Set by initialize_model_parallel: under DCP the per-layer context-gather
+# prefetch runs beside the critical-path collectives, which then need the
+# HIGH-priority HCCL stream to stay ahead of it. Group options consult this
+# flag at creation.
+_DCP_PG_PRIORITY = False
 
 
 # WORLD active_ranks handle (WORLD PG has no GroupCoordinator wrapper).
@@ -122,17 +127,51 @@ def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
 
-    # Only create HCCL options for default group or MoE-related groups
-    if group_name is not None and "moe" not in group_name:
+    # HCCL options for the default group and MoE groups, plus (under DCP) the
+    # attention-TP and DCP groups. The DCP group gets a tuned buffer but keeps
+    # default priority: its context gather is the background work the other
+    # groups must stay ahead of.
+    is_dcp = group_name == "dcp"
+    is_attn_tp = group_name == "attention_tp"
+    if (
+        group_name is not None
+        and "moe" not in group_name
+        and not is_dcp
+        and not (is_attn_tp and _DCP_PG_PRIORITY)
+    ):
         return None
 
     import torch_npu
 
     options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    hccl_buffer_size = int(
-        os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
-    )
-    options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+    # The attention-TP group gets priority only: its pre-DCP traffic ran on the
+    # HCCL default buffer, and a buffer change there is unmeasured for every
+    # non-DCP attention-TP user.
+    if not is_attn_tp:
+        hccl_buffer_size = int(
+            os.environ.get("DEEPEP_HCCL_BUFFSIZE")
+            or os.environ.get("HCCL_BUFFSIZE")
+            or 200
+        )
+        options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+    # Under DCP the critical-path collectives -- the attention-TP chunk
+    # exchange that feeds every layer's indexer, and MoE dispatch/combine --
+    # get their HCCL communication on a HIGH-priority stream, so the AIV
+    # scheduler serves them ahead of the DCP context-gather prefetch. Fail-
+    # soft: a torch_npu build whose Options lack the field logs once and runs
+    # unboosted.
+    is_moe = group_name is not None and "moe" in group_name
+    if _DCP_PG_PRIORITY and not is_dcp and (is_attn_tp or is_moe):
+        try:
+            options.is_high_priority_stream = True
+        except (AttributeError, TypeError) as err:
+            logger.warning(
+                "DCP pg priority: this torch_npu build's "
+                "ProcessGroupHCCL.Options has no is_high_priority_stream "
+                "(%s); group %r runs at default priority",
+                err,
+                group_name,
+            )
     return options
 
 
@@ -2659,6 +2698,8 @@ def initialize_model_parallel(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
     parallel = get_parallel()
+    global _DCP_PG_PRIORITY
+    _DCP_PG_PRIORITY = parallel.attn_dcp_size > 1
     tensor_model_parallel_size = parallel.tp_size
     expert_model_parallel_size = parallel.moe_ep_size
     pipeline_model_parallel_size = parallel.pp_size

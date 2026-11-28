@@ -15,7 +15,7 @@
 """Decode context parallel (DCP) layout: per-rank lengths, the owner-rule
 local-index filter, and the LSE base of each MLA backend's partials."""
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -271,3 +271,168 @@ def update_local_kv_lens_for_dcp(kv_len_arr):
     if not parallel.dcp_enabled:
         return
     kv_len_arr.copy_(get_dcp_lens(kv_len_arr, parallel.dcp_size, parallel.dcp_rank))
+
+
+class DcpPackedReadPlan(NamedTuple):
+    """Where each KV position of a ONE-REQUEST extend lives in the packed buffer.
+
+    ``plan_dcp_extend_gather`` permutes the all-gather's rank-major output back
+    into position order so the sparse operator can read it. That permutation is
+    a context-sized ``index_select`` -- 784 launches x 0.275 ms = 216 ms a
+    forward -- plus the position-ordered output buffer it writes into, ~1.04 GiB
+    a rank at a 972k context. Neither is needed: the operator reads the KV
+    through ``sparse_indices``, so it does not care what order the rows are in,
+    only that the indices point at the right ones. Remapping a ``[tokens, k]``
+    index tensor is arithmetic on a few million integers; permuting the KV is a
+    gigabyte of traffic. (An open CUDA PR explores the same idea for SM120:
+    sgl-project/sglang#39215.)
+
+    The packed buffer is exactly what the collective produces, in one piece::
+
+        [ rank 0's send rows | rank 1's | ... | rank C-1's ][ this chunk's KV ]
+          <--- send_rows ---> each                            <-- extend_len -->
+
+    Under the owner rule ``pos % C == rank`` a request's position ``p`` sits in
+    rank ``p % C``'s send at local row ``p // C``, so::
+
+        p <  prefix_len   ->  (p % C) * send_rows + p // C
+        p >= prefix_len   ->  gathered_rows + (p - prefix_len)
+
+    ``send_rows`` is the padded local length, so ranks below ``prefix_len % C``
+    hold one row more than the rest and the spare rows are never addressed.
+
+    **ONE REQUEST ONLY, and the reason is the same one DSA-CP has.** With two
+    requests the all-gather still lays out rank-major over the whole send, so a
+    request's rows land in C separate blocks and the operator's cumulative
+    ``actual_seq_lengths_kv`` -- which needs each request contiguous -- cannot
+    describe them. Multi-request extends keep the permuting path. That covers
+    87% of the tokens in the AISBench run as measured on 2026-09-18.
+    """
+
+    prefix_len: int
+    extend_len: int
+    dcp_size: int
+    send_rows: int
+    gathered_rows: int
+    rows: int
+    # D2v2: the sub-all-gather count the buffer was (or will be) filled with.
+    # 1 is the monolithic rank-major layout above; above 1 the prefix part is
+    # chunk-major (chunk, then rank, then row) and the remap gains a chunk-major
+    # branch. See dcp_gather_chunks_for.
+    chunks: int = 1
+
+
+# D2v2: split the per-layer context all-gather into this many sub-all-gathers.
+# Measured on GLM-5.2/A3 (DCP16, 972k context): the monolithic gather was one
+# 9-16 ms AIV episode (93% MTE2) that starved the compute stream's own AIV work;
+# 8 sub-collectives leave the inter-collective windows for it. 1 = monolithic.
+_DCP_GATHER_CHUNKS = 8
+
+
+def plan_dcp_packed_read(
+    prefix_len: int, extend_len: int, dcp_size: int
+) -> DcpPackedReadPlan:
+    """Sizes of the packed rank-major buffer for a one-request extend."""
+    send_rows = -(-int(prefix_len) // dcp_size)
+    gathered_rows = send_rows * dcp_size
+    return DcpPackedReadPlan(
+        prefix_len=int(prefix_len),
+        extend_len=int(extend_len),
+        dcp_size=dcp_size,
+        send_rows=send_rows,
+        gathered_rows=gathered_rows,
+        rows=gathered_rows + int(extend_len),
+        chunks=dcp_gather_chunks_for(send_rows),
+    )
+
+
+def dcp_gather_chunks_for(send_rows: int) -> int:
+    """The effective D2v2 sub-all-gather count for a send this long.
+
+    The configured chunk count clamped to what the send can actually be cut
+    into: a chunk of zero rows would be a collective with nothing in it, and
+    one row per chunk (send shorter than the count) keeps the arithmetic honest
+    rather than being a special case. 1 is "off": the monolithic collective and
+    the rank-major layout, bit for bit.
+    """
+    chunks = _DCP_GATHER_CHUNKS
+    if chunks <= 1:
+        return 1
+    return min(chunks, max(1, int(send_rows)))
+
+
+def _chunk_bounds(plan: DcpPackedReadPlan):
+    """(q, rem, n): the D2v2 chunk sizes.
+
+    The first ``n - 1`` chunks hold ``q = send_rows // n`` local rows each; the
+    last holds ``q + send_rows % n``. ``n`` is 1 only for the monolithic plan,
+    where this is never called.
+    """
+    n = plan.chunks
+    q, rem = divmod(plan.send_rows, n)
+    return q, rem, n
+
+
+def packed_row_of(pos: int, plan: DcpPackedReadPlan) -> int:
+    """Reference implementation of the remap, one position at a time.
+
+    Exists to be the thing ``remap_topk_to_packed`` is checked against on CPU:
+    the tensor version has to fuse the branch into ``where`` and do floor
+    division on a signed tensor, and those are the two places this kind of
+    arithmetic goes wrong.
+    """
+    if pos < 0:
+        return pos
+    if pos < plan.prefix_len:
+        c = plan.dcp_size
+        if plan.chunks == 1:
+            return (pos % c) * plan.send_rows + pos // c
+        # Chunk-major: local row i of rank r = chunk k, in-chunk row j, and
+        # chunk k's block starts at c * (k * q) rows in (chunks before it each
+        # held q local rows x c ranks).
+        q, rem, n = _chunk_bounds(plan)
+        r = pos % c
+        i = pos // c
+        if i < (n - 1) * q:
+            k = i // q
+            j = i - k * q
+            sk = q
+        else:
+            k = n - 1
+            j = i - (n - 1) * q
+            sk = q + rem
+        return c * (k * q) + r * sk + j
+    return plan.gathered_rows + (pos - plan.prefix_len)
+
+
+def remap_topk_to_packed(
+    topk_indices: torch.Tensor, plan: DcpPackedReadPlan
+) -> torch.Tensor:
+    """Top-k positions within a request -> rows of the packed buffer.
+
+    Shape and dtype are preserved, and so are the negatives: ``_pad_topk_indices``
+    fills unused slots with -1 and the operator reads that tail as "no more
+    entries", so mapping them into a real row would silently add keys. Every
+    branch here is elementwise, which is what keeps this ~ a millisecond against
+    the 216 ms it replaces.
+    """
+    c = plan.dcp_size
+    # floor division, not trunc: torch's // on a signed tensor rounds toward
+    # zero for negatives, and the -1 sentinels must come through untouched.
+    local_row = torch.div(topk_indices, c, rounding_mode="floor")
+    if plan.chunks == 1:
+        prefix_row = (topk_indices % c) * plan.send_rows + local_row
+    else:
+        # D2v2 chunk-major: local row i of rank r sits in chunk k = i // q
+        # (the last chunk absorbs the remainder) at in-chunk row j, and chunk
+        # k's block starts c * (k * q) rows in. Same arithmetic as
+        # packed_row_of, fused into where/clamp because this runs on a
+        # [tokens, k] tensor 21 times a forward.
+        q, rem, n = _chunk_bounds(plan)
+        k = torch.div(local_row, q, rounding_mode="floor").clamp(max=n - 1)
+        j = torch.where(k == n - 1, local_row - (n - 1) * q, local_row - k * q)
+        sk = q + (k == n - 1).to(local_row.dtype) * rem
+        prefix_row = c * (k * q) + (topk_indices % c) * sk + j
+    extend_row = plan.gathered_rows + (topk_indices - plan.prefix_len)
+    packed = torch.where(topk_indices < plan.prefix_len, prefix_row, extend_row)
+    return torch.where(topk_indices < 0, topk_indices, packed)
