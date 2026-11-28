@@ -669,7 +669,9 @@ class VAELoader(WeightOverrideComponentLoader):
                 component_type=component_type,
             )
             vae = current_platform.optimize_vae(vae)
-            return vae
+            from sglang.multimodal_gen.runtime.models.vaes.tiny_vae import with_tiny_vae
+
+            return with_tiny_vae(vae, server_args, component_name)
 
         if os.path.isfile(component_weights_path):
             if not component_weights_path.endswith(".safetensors"):
@@ -744,7 +746,11 @@ class VAELoader(WeightOverrideComponentLoader):
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
                     )
             _hold_decoder_weights_in_decode_dtype(vae, server_args, component_name)
-            return current_platform.optimize_vae(vae)
+            from sglang.multimodal_gen.runtime.models.vaes.tiny_vae import with_tiny_vae
+
+            return with_tiny_vae(
+                current_platform.optimize_vae(vae), server_args, component_name
+            )
 
         loaded = {}
         for sf_path in safetensors_list:
@@ -824,4 +830,6 @@ class VAELoader(WeightOverrideComponentLoader):
             component_type=component_type,
         )
         vae = current_platform.optimize_vae(vae)
-        return vae
+        from sglang.multimodal_gen.runtime.models.vaes.tiny_vae import with_tiny_vae
+
+        return with_tiny_vae(vae, server_args, component_name)
