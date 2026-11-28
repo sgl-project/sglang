@@ -317,6 +317,20 @@ def create_prefill_budget(
     )
 
 
+def admission_capacity_grew(
+    capacity_at_refusal: Optional[tuple[int, ...]],
+    allocator,
+    tree_cache: Optional[BasePrefixCache],
+) -> bool:
+    """Whether a request refused at ``capacity_at_refusal`` may now fit."""
+    if capacity_at_refusal is None:
+        return True
+    current = create_prefill_budget(allocator, tree_cache).admission_capacity()
+    return current is None or any(
+        now > then for now, then in zip(current, capacity_at_refusal)
+    )
+
+
 @capacity_decision
 def evict_for_alloc(cache: BasePrefixCache, demand: KVDemand) -> EvictResult:
     """Evict from ``cache`` so that an allocation of ``demand`` (what it will
