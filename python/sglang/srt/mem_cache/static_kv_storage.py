@@ -1067,13 +1067,22 @@ def _static_state_entries(
                 c128_ptrs, c128_lens, c128_item_lens = (
                     token_to_kv_pool.get_request_state_buf_infos()
                 )
-                if c128_ptrs:
-                    add(
-                        StateType.DSV4_REQUEST_STATE,
-                        c128_ptrs,
-                        c128_lens,
-                        c128_item_lens,
-                    )
+                # Register unconditionally: a layer-split rank may own no
+                # c128 layers, and the bootstrap requires an identical state
+                # wire across the ranks of one pipeline stage. The empty
+                # component transfers nothing. Layer ids pair a split
+                # prefill's owned rings with the full decode peer's.
+                add(
+                    StateType.DSV4_REQUEST_STATE,
+                    c128_ptrs,
+                    c128_lens,
+                    c128_item_lens,
+                    layer_ids=(
+                        token_to_kv_pool.get_request_state_layer_ids()
+                        if hasattr(token_to_kv_pool, "get_request_state_layer_ids")
+                        else None
+                    ),
+                )
         elif router.wrapped_view() is not None:
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
@@ -1224,15 +1233,18 @@ def _static_state_entries(
                     add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
 
     if is_npu() and _is_dsv4_npu(token_to_kv_pool):
+        # Register unconditionally: under layer split a rank may own no
+        # ratio-128 layers, and the bootstrap requires every rank of one
+        # pipeline stage to publish an identical state wire. The empty
+        # component pairs with the peer's span by layer ids.
         c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
-        if c128_ptrs:
-            add(
-                StateType.DSV4_C128,
-                c128_ptrs,
-                c128_lens,
-                c128_item_lens,
-                layer_ids=token_to_kv_pool.get_c128_layer_ids(),
-            )
+        add(
+            StateType.DSV4_C128,
+            c128_ptrs,
+            c128_lens,
+            c128_item_lens,
+            layer_ids=token_to_kv_pool.get_c128_layer_ids(),
+        )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

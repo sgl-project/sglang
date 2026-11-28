@@ -379,8 +379,18 @@ class PrefillBootstrapQueue:
         )
         layer_shard_rank = getattr(self.token_to_kv_pool, "layer_shard_rank", None)
         layer_shard_size = getattr(self.token_to_kv_pool, "layer_shard_size", 1)
+        # GLM's draft rides inside the target's DSA components, so only the
+        # last shard rank needs to send it. DSV4's draft is its own wire
+        # component (its SWA ring), which every rank must register for the
+        # per-stage state wires to pair — a rank without the component would
+        # be refused by the bootstrap's wire check.
+        draft_shares_target_components = not isinstance(
+            self.draft_token_to_kv_pool, DeepSeekV4TokenToKVPool
+        )
         transfer_draft_cache = (
-            not layer_shard_enabled or layer_shard_rank == layer_shard_size - 1
+            not layer_shard_enabled
+            or not draft_shares_target_components
+            or layer_shard_rank == layer_shard_size - 1
         )
         kv_args.prefill_start_layer = (
             getattr(

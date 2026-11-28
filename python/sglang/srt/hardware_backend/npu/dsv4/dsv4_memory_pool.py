@@ -774,15 +774,39 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return list(self.sources_by_ratio.get(128, []))
 
     def get_swa_state_layer_ids(self) -> List[int]:
-        """Global layer ids in ``get_state_buf_infos`` registration order."""
+        """Global layer ids in ``get_state_buf_infos`` registration order.
+
+        A layer-split prefill registers SWA rows for its owned layers only,
+        and occurrence-order pairing against the full decode peer would
+        then cross-pair the groups. Band each kv_score group above the row
+        id space so every entry pairs by a unique id.
+        """
+        band = len(self.compression_ratios)
         ids = self.swa_layer_ids()
-        for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+        for pools, offset in (
+            (self.compress_state_pools, band),
+            (self.indexer_compress_state_pools, 2 * band),
+        ):
             ids.extend(
-                layer_id
+                layer_id + offset
                 for layer_id, pool in enumerate(pools)
                 if pool is not None and pool.ratio == 4
             )
         return ids
+
+    def get_request_state_layer_ids(self) -> List[int]:
+        """Global layer id per ``get_request_state_buf_infos`` entry, in order.
+
+        A layer-split prefill registers only its owned layers' request rings,
+        so the peer pairs the entries by id instead of by position. The
+        filter mirrors ``get_request_state_buf_infos`` exactly so ids align
+        with entries one to one.
+        """
+        return [
+            layer_id
+            for layer_id, pool in enumerate(self.compress_state_pools)
+            if pool is not None and pool.request_scoped
+        ]
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
@@ -887,12 +911,14 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_id: int,
         loc: torch.Tensor,
         cache: torch.Tensor,
+        cp_gathered_full: bool = False,
     ) -> None:
         """Write ``cache`` into the SWA pool at flat token positions ``loc``.
 
         ``cache`` shape: (num_tokens, num_kv_heads=1, dim). The buffer view is
         (num_pages, page_size, 1, dim) so we flatten the first two dims and
-        index_put.
+        index_put. ``cp_gathered_full`` only drives the layer-split override's
+        seeding; the unsplit pool writes every rank locally and ignores it.
         """
         # Index by PP-stage-local layer_id (see get_swa_buffer).
         pool = self.swa_kv_pool
@@ -1034,10 +1060,13 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         kv: torch.Tensor,
         kv_scale: Optional[torch.Tensor],
         from_indexer: bool,
+        cp_gathered_full: bool = False,
     ) -> None:
         # Routes to the indexer pool (from_indexer) or to the compressed KV pool
         # of this layer's ratio (4 / 128, plus 1 / 2 for DeepSeek-V4.1). NPU
         # bypasses CUDA fused_store_cache with direct writes into the PA_ND rows.
+        # ``cp_gathered_full`` only drives the layer-split override's seeding;
+        # the unsplit pool writes every rank locally and ignores it.
         item = self.layer_mapping[layer_id]
         ratio = item.compress_ratio
         compress_layer_id = item.compress_layer_id

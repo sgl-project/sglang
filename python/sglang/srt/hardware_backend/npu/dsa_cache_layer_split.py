@@ -11,18 +11,20 @@ that layer's buffer into a full-size per-rank remote scratch tensor.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.hardware_backend.npu.layer_split_mixin import (
+    NPULayerSplitMixin,
+    _SplitKindState,
+)
 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
     NPUDSATokenToKVPool,
     NPUMLATokenToKVPool,
 )
-from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.device import is_npu
 
 if is_npu():
@@ -30,12 +32,14 @@ if is_npu():
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.managers.cache_controller import LayerDoneCounter
 
 logger = logging.getLogger(__name__)
 
+KIND_KV = "kv"
+KIND_INDEX = "index"
 
-class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
+
+class LayerSplitNPUMLATokenToKVPool(NPULayerSplitMixin, NPUMLATokenToKVPool):
     """NPU MLA KV pool that shards layers across CP ranks with owner-broadcast reads.
 
     Layout: ``k_buffer``/``v_buffer`` (and the indexer buffers) keep their stacked
@@ -52,53 +56,14 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         layer_shard_size: int,
         **kwargs,
     ):
-        assert layer_shard_rank is not None and layer_shard_size > 1, (
-            "LayerSplitNPUMLATokenToKVPool requires layer_shard_size > 1"
-        )
-        self.layer_shard_rank = layer_shard_rank
-        self.layer_shard_size = layer_shard_size
-        self.layer_shard_enabled = True
+        self._init_layer_split(layer_shard_rank, layer_shard_size)
         super().__init__(*args, **kwargs)
         # First global layer index owned by this rank (used by PD transfer to
         # label the contiguous owned-buffer range).
         self.layer_shard_start = self.start_layer + self._owned_local_layer_range()[0]
 
-    def _owned_local_layer_range(self) -> tuple[int, int]:
-        # host_pool_config.py addresses the split-pool root through the
-        # mem_cache backend's method name, so the NPU class must expose it
-        # too when hicache is combined with split.
-        return get_layer_shard_range(
-            self.layer_shard_rank, self.layer_shard_size, self.layer_num
-        )
-
-    def _is_local_layer_owned(self, local_layer_id: int) -> bool:
-        owned_start, owned_end = self._owned_local_layer_range()
-        return owned_start <= local_layer_id < owned_end
-
-    def _is_layer_owned(self, layer_id: int) -> bool:
-        return self._is_local_layer_owned(layer_id - self.start_layer)
-
-    def _get_layer_owner_rank(self, layer_id: int) -> int:
-        return get_layer_owner(
-            layer_id - self.start_layer, self.layer_shard_size, self.layer_num
-        )
-
-    def _log_layer_shard_plan(self) -> None:
-        partitions = []
-        for rank in range(self.layer_shard_size):
-            st, ed = get_layer_shard_range(rank, self.layer_shard_size, self.layer_num)
-            partitions.append(f"r{rank}:[{st},{ed})")
-        my_start, my_end = self._owned_local_layer_range()
-        logger.info(
-            "Layer shard plan (continuous, NPU): "
-            f"pool={type(self).__name__}, layer_num={self.layer_num}, shard_size={self.layer_shard_size}, "
-            f"rank={self.layer_shard_rank}, local=[{my_start},{my_end}), "
-            f"global=[{self.start_layer + my_start},{self.start_layer + my_end}), "
-            f"partitions={'; '.join(partitions)}"
-        )
-
     def _create_buffers(self):
-        self._log_layer_shard_plan()
+        self._log_layer_shard_plan("MLA")
         if self.enable_sparsity_driven_kv_offload:
             raise ValueError(
                 "--enable-dsa-cache-layer-split is incompatible with "
@@ -191,64 +156,56 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 * self.kr_cache_dim
                 * torch.empty((), dtype=_v_dtype).element_size()
             )
-            self.remote_kv_all = torch.empty(
+            remote_kv_all = torch.empty(
                 _k_bytes + _v_bytes, dtype=torch.uint8, device=self.device
             )
             self.remote_k_buffer = (
-                self.remote_kv_all[:_k_bytes]
+                remote_kv_all[:_k_bytes]
                 .view(self.store_dtype)
                 .view(kv_pages, self.page_size, 1, self.kv_cache_dim)
             )
             # v_buffer is always materialized (bfloat16 in c8 mode), so the
             # remote v scratch mirrors that dtype instead of store_dtype.
             self.remote_v_buffer = (
-                self.remote_kv_all[_k_bytes:]
+                remote_kv_all[_k_bytes:]
                 .view(_v_dtype)
                 .view(kv_pages, self.page_size, 1, self.kr_cache_dim)
             )
             self._v_dtype = _v_dtype
             self._kv_capacity_tokens = kv_pages * self.page_size
-            self.remote_index_k_buffer = None
-            self.remote_index_k_scale_buffer = None
+            remote_index_k = None
+            remote_index_scale = None
             if self.index_head_dim is not None:
-                self.remote_index_k_buffer = torch.empty(
+                remote_index_k = torch.empty(
                     (index_pages, self.index_page_size, 1, self.index_head_dim),
                     dtype=self.store_dtype,
                     device=self.device,
                 )
                 if self.index_k_scale_buffer is not None:
-                    self.remote_index_k_scale_buffer = torch.empty(
+                    remote_index_scale = torch.empty(
                         (index_pages, self.index_page_size, 1),
                         dtype=torch.float32,
                         device=self.device,
                     )
+            self.remote_index_k_buffer = remote_index_k
+            self.remote_index_k_scale_buffer = remote_index_scale
 
-        self.remote_kv_layer_id: Optional[int] = None
-        self.remote_index_layer_id: Optional[int] = None
-        self.pending_remote_kv_layer_id: Optional[int] = None
-        self.pending_remote_kv_broadcast = False
-        self.pending_remote_index_layer_id: Optional[int] = None
-        self.pending_remote_index_broadcast = False
-        # Async kick handles (torch.distributed Work) for the in-flight
-        # prefix broadcasts.
-        self.pending_kv_works: list = []
-        self.pending_index_works: list = []
         # Row-space bound of the current kick's broadcast: rows [0, bound)
         # below the batch's patch-write region.
         self._kv_used_bound = 0
         self._idx_used_bound = 0
+        self._register_split_kind(KIND_KV, remote_kv_all)
+        self._register_split_kind(KIND_INDEX, remote_index_k)
 
     def get_kv_size_bytes(self):
         # Scratch storage is persistent and must be included in memory reports.
         size = super().get_kv_size_bytes()
-        for name in (
-            "remote_kv_all",
-            "remote_index_k_buffer",
-            "remote_index_k_scale_buffer",
-        ):
-            buffer = getattr(self, name, None)
-            if buffer is not None:
-                size += buffer.nbytes
+        for st in self._ls_states.values():
+            if st.scratch is not None:
+                size += st.scratch.nbytes
+        scale = getattr(self, "remote_index_k_scale_buffer", None)
+        if scale is not None:
+            size += scale.nbytes
         return size
 
     def _kv_local_offset(self, layer_id: int) -> int:
@@ -267,89 +224,62 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             return self._kv_capacity_tokens
         return min(used_bound, self._kv_capacity_tokens)
 
-    def _broadcast_kv_from_owner(self, layer_id: int, used_bound: Optional[int] = None):
-        """Broadcast K and V token rows [0, slice_tokens) from the owner."""
-        slice_tokens = self._kv_slice_tokens(used_bound)
-        owner_rank = self._get_layer_owner_rank(layer_id)
-        offset = self._kv_local_offset(layer_id)
-        cp_group = get_parallel().attn_cp_group
-        # torch.distributed expects the *global* rank of the source.
-        src = cp_group.ranks[owner_rank]
-        if self.layer_shard_rank == owner_rank:
-            k_buf = self.k_buffer[offset].view(-1, self.kv_cache_dim)[:slice_tokens]
-            v_buf = self.v_buffer[offset].view(-1, self.kr_cache_dim)[:slice_tokens]
+    def _split_broadcast_units(
+        self, kind: str, layer_id: int, index
+    ) -> List[Tuple[Optional[torch.Tensor], torch.Tensor]]:
+        is_owner = self._is_layer_owned(layer_id)
+        if kind == KIND_KV:
+            slice_tokens = self._kv_slice_tokens(index)
+            if is_owner:
+                offset = self._kv_local_offset(layer_id)
+                return [
+                    (
+                        self.k_buffer[offset].view(-1, self.kv_cache_dim)[
+                            :slice_tokens
+                        ],
+                        None,
+                    ),
+                    (
+                        self.v_buffer[offset].view(-1, self.kr_cache_dim)[
+                            :slice_tokens
+                        ],
+                        None,
+                    ),
+                ]
+            return [
+                (
+                    None,
+                    self.remote_k_buffer.view(-1, self.kv_cache_dim)[:slice_tokens],
+                ),
+                (
+                    None,
+                    self.remote_v_buffer.view(-1, self.kr_cache_dim)[:slice_tokens],
+                ),
+            ]
+        assert kind == KIND_INDEX, kind
+        cap_elems = self.remote_index_k_buffer.numel()
+        cap_tokens = cap_elems // self.index_head_dim
+        if index:
+            n_tok = min(index, cap_tokens)
         else:
-            k_buf = self.remote_k_buffer.view(-1, self.kv_cache_dim)[:slice_tokens]
-            v_buf = self.remote_v_buffer.view(-1, self.kr_cache_dim)[:slice_tokens]
-        return [
-            torch.distributed.broadcast(
-                k_buf, src=src, group=cp_group.device_group, async_op=True
-            ),
-            torch.distributed.broadcast(
-                v_buf, src=src, group=cp_group.device_group, async_op=True
-            ),
-        ]
-
-    def _broadcast_buffer_from_owner(
-        self,
-        buf: torch.Tensor,
-        layer_id: int,
-        src_buf: Optional[torch.Tensor] = None,
-    ):
-        """Broadcast one layer's buffer from its owner into ``buf`` (scratch)."""
-        owner_rank = self._get_layer_owner_rank(layer_id)
-        if self.layer_shard_rank == owner_rank:
-            assert src_buf is not None
-            if buf.data_ptr() != src_buf.data_ptr():
-                buf.copy_(src_buf)
-        cp_group = get_parallel().attn_cp_group
-        # Use the CP group's HCCL device group.
-        # torch.distributed expects the *global* rank of the source.
-        work = torch.distributed.broadcast(
-            buf,
-            src=cp_group.ranks[owner_rank],
-            group=cp_group.device_group,
-            async_op=True,
-        )
-        return work
+            n_tok = cap_tokens
+        n_elems = n_tok * self.index_head_dim
+        units = []
+        if is_owner:
+            slot = self.indexer_layer_id_to_slot.get(layer_id)
+            units.append((self.index_k_buffer[slot].view(-1)[:n_elems], None))
+            if self.index_k_scale_buffer is not None:
+                units.append((self.index_k_scale_buffer[slot], None))
+        else:
+            units.append((None, self.remote_index_k_buffer.view(-1)[:n_elems]))
+            if self.remote_index_k_scale_buffer is not None:
+                units.append((None, self.remote_index_k_scale_buffer))
+        return units
 
     def _maybe_view_dtype(self, buffer: torch.Tensor) -> torch.Tensor:
         if self.store_dtype != self.dtype:
             return buffer.view(self.dtype)
         return buffer
-
-    def _finalize_pending_kv_broadcast(
-        self, *, set_remote_layer_id: bool = True, wait_works: bool = True
-    ) -> None:
-        if not self.pending_remote_kv_broadcast:
-            return
-        # Wait the async kick handles before any main-stream use of the
-        # scratch (set-side scatter / get-side read) or of the owner's src
-        # buffer (the layer set overwrites the broadcast's source).
-        if wait_works:
-            for w in self.pending_kv_works:
-                if w is not None:
-                    w.wait()
-        self.pending_kv_works = []
-        self.pending_remote_kv_broadcast = False
-        if set_remote_layer_id and self.pending_remote_kv_layer_id is not None:
-            self.remote_kv_layer_id = self.pending_remote_kv_layer_id
-        self.pending_remote_kv_layer_id = None
-
-    def _finalize_pending_index_broadcast(
-        self, *, set_remote_layer_id: bool = True, wait_works: bool = True
-    ) -> None:
-        if not self.pending_remote_index_broadcast:
-            return
-        if wait_works:
-            for w in self.pending_index_works:
-                if w is not None:
-                    w.wait()
-        self.pending_index_works = []
-        self.pending_remote_index_broadcast = False
-        if set_remote_layer_id and self.pending_remote_index_layer_id is not None:
-            self.remote_index_layer_id = self.pending_remote_index_layer_id
-        self.pending_remote_index_layer_id = None
 
     def prefetch_index_k_buffer(
         self, layer_id: int, used_bound: Optional[int] = None
@@ -364,49 +294,13 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             or self.remote_index_k_scale_buffer is not None
         ):
             return
-        if self.remote_index_layer_id == layer_id:
-            return
-        if self.pending_remote_index_broadcast:
-            if self.pending_remote_index_layer_id == layer_id:
-                return
-            self._finalize_pending_index_broadcast(
-                set_remote_layer_id=False, wait_works=False
-            )
-        # Same assign-not-max as the KV bound: row-space, per-chunk correct.
         self._idx_used_bound = used_bound or 0
-        work = self._broadcast_index_from_owner(layer_id)
-        self.pending_index_works = [work]
-        self.pending_remote_index_layer_id = layer_id
-        self.pending_remote_index_broadcast = True
-
-    def _broadcast_index_from_owner(self, layer_id: int, full: bool = False):
-        """Owner-broadcast of the index-K scratch, sliced to the live rows."""
-        head_dim = self.index_head_dim
-        cap_elems = self.remote_index_k_buffer.numel()
-        cap_tokens = cap_elems // head_dim
-        if not full and self._idx_used_bound > 0:
-            n_tok = min(self._idx_used_bound, cap_tokens)
-        else:
-            n_tok = cap_tokens
-        n_elems = n_tok * head_dim
-        owner_rank = self._get_layer_owner_rank(layer_id)
-        if self.layer_shard_rank == owner_rank:
-            slot = self.indexer_layer_id_to_slot.get(layer_id)
-            buf = self.index_k_buffer[slot].view(-1)[:n_elems]
-        else:
-            buf = self.remote_index_k_buffer.view(-1)[:n_elems]
-        cp_group = get_parallel().attn_cp_group
-        return torch.distributed.broadcast(
-            buf,
-            src=cp_group.ranks[owner_rank],
-            group=cp_group.device_group,
-            async_op=True,
-        )
+        self._prefetch_kind(KIND_INDEX, layer_id, self._idx_used_bound)
 
     def prefetch_kv_buffer(
         self,
         layer_id: int,
-        layer_transfer_counter: Optional[LayerDoneCounter] = None,
+        layer_transfer_counter=None,
         layer_transfer_idx: Optional[int] = None,
         used_bound: Optional[int] = None,
     ) -> None:
@@ -421,64 +315,19 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         copy is discarded and the get falls back to the synchronous
         broadcast.
         """
-        if self.remote_kv_layer_id == layer_id:
-            return
-        if self.pending_remote_kv_broadcast:
-            if self.pending_remote_kv_layer_id == layer_id:
-                return
-            self._finalize_pending_kv_broadcast(
-                set_remote_layer_id=False, wait_works=False
-            )
-
-        if layer_transfer_counter is not None and layer_transfer_idx is not None:
-            layer_transfer_counter.wait_until(layer_transfer_idx)
         self._kv_used_bound = used_bound or 0
-        works = self._broadcast_kv_from_owner(layer_id, self._kv_used_bound)
-        self.pending_kv_works = works
-        self.pending_remote_kv_layer_id = layer_id
-        self.pending_remote_kv_broadcast = True
-
-    def _ensure_remote_layer(self, layer_id: int) -> None:
-        """Synchronously materialize ``layer_id`` in the remote scratch if remote."""
-        if self.pending_remote_kv_broadcast:
-            self._finalize_pending_kv_broadcast(
-                set_remote_layer_id=self.pending_remote_kv_layer_id == layer_id
-            )
-        if self.remote_kv_layer_id == layer_id:
-            return
-        # Fallback materialization: wait immediately, the caller reads the
-        # scratch right after this returns.
-        for _w in self._broadcast_kv_from_owner(layer_id, None):
-            _w.wait()
-        self.remote_kv_layer_id = layer_id
-
-    def _ensure_remote_index_layer(self, layer_id: int) -> None:
-        """Materialize ``layer_id``'s indexer rows on every rank (paired broadcast)."""
-        if self.pending_remote_index_broadcast:
-            self._finalize_pending_index_broadcast(
-                set_remote_layer_id=False, wait_works=False
-            )
-        if self.remote_index_layer_id == layer_id:
-            return
-        if self.remote_index_k_buffer is None:
-            return
-        scale_src = None
-        if self._is_layer_owned(layer_id):
-            slot = self.indexer_layer_id_to_slot.get(layer_id)
-            if slot is not None and self.index_k_scale_buffer is not None:
-                scale_src = self.index_k_scale_buffer[slot]
-        self._broadcast_index_from_owner(layer_id, full=True).wait()
-        if self.remote_index_k_scale_buffer is not None:
-            self._broadcast_buffer_from_owner(
-                self.remote_index_k_scale_buffer, layer_id, scale_src
-            ).wait()
-        self.remote_index_layer_id = layer_id
+        self._prefetch_kind(
+            KIND_KV,
+            layer_id,
+            self._kv_used_bound,
+            layer_transfer_counter=layer_transfer_counter,
+            layer_transfer_idx=layer_transfer_idx,
+        )
 
     def get_kv_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        self._raise_if_native_kv_cache_disabled()
-        self._ensure_remote_layer(layer_id)
+        self._ensure_remote_kind(
+            KIND_KV, layer_id, layer_transfer_counter=self.layer_transfer_counter
+        )
         if self._is_layer_owned(layer_id):
             return super().get_kv_buffer(layer_id)
         return (
@@ -487,22 +336,40 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         )
 
     def get_key_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        self._raise_if_native_kv_cache_disabled()
-        self._ensure_remote_layer(layer_id)
+        self._ensure_remote_kind(
+            KIND_KV, layer_id, layer_transfer_counter=self.layer_transfer_counter
+        )
         if self._is_layer_owned(layer_id):
             return super().get_key_buffer(layer_id)
         return self._maybe_view_dtype(self.remote_k_buffer)
 
     def get_value_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        self._raise_if_native_kv_cache_disabled()
-        self._ensure_remote_layer(layer_id)
+        self._ensure_remote_kind(
+            KIND_KV, layer_id, layer_transfer_counter=self.layer_transfer_counter
+        )
         if self._is_layer_owned(layer_id):
             return super().get_value_buffer(layer_id)
         return self._maybe_view_dtype(self.remote_v_buffer)
+
+    def get_index_k_buffer(self, layer_id: int):
+        if self.index_k_buffer is None:
+            raise RuntimeError("NPU MLA index KV cache is not allocated.")
+        # Every rank (owner included) goes through the broadcastable path so the
+        # HCCL broadcast is paired across the CP group.
+        self._ensure_remote_kind(
+            KIND_INDEX, layer_id, layer_transfer_counter=self.layer_transfer_counter
+        )
+        if self._is_layer_owned(layer_id):
+            return super().get_index_k_buffer(layer_id)
+        return self._maybe_view_dtype(self.remote_index_k_buffer)
+
+    def get_index_k_scale_buffer(self, layer_id: int):
+        self._ensure_remote_kind(
+            KIND_INDEX, layer_id, layer_transfer_counter=self.layer_transfer_counter
+        )
+        if self._is_layer_owned(layer_id):
+            return super().get_index_k_scale_buffer(layer_id)
+        return self.remote_index_k_scale_buffer
 
     def set_kv_buffer(
         self,
@@ -514,26 +381,25 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         cp_gathered_chunk: bool = False,
     ):
         layer_id = layer.layer_id
+        st: _SplitKindState = self._split_state(KIND_KV)
         prefix_broadcast_pending = (
-            self.pending_remote_kv_broadcast
-            and self.pending_remote_kv_layer_id == layer_id
+            st.pending_remote_broadcast and st.pending_remote_layer_id == layer_id
         )
-        had_remote_copy = self.remote_kv_layer_id == layer_id
+        had_remote_copy = st.remote_layer_id == layer_id
         # Consume/invalidate the pending remote copy on EVERY rank
         # (before the owned-only early return), so the follow-up get-time
         # broadcast decision stays paired across the CP group. A write
         # this layer must re-broadcast on both ranks.
-        if self.pending_remote_kv_layer_id == layer_id:
-            self._finalize_pending_kv_broadcast(set_remote_layer_id=False)
-        if self.remote_kv_layer_id == layer_id:
-            self.remote_kv_layer_id = None
+        if st.pending_remote_layer_id == layer_id:
+            self._finalize_pending_kind(KIND_KV, set_remote_layer_id=False)
+        self._invalidate_kind_cache(KIND_KV, layer_id)
         if (
             cp_gathered_full
             or (cp_gathered_chunk and (prefix_broadcast_pending or had_remote_copy))
         ) and self._remote_store_supported():
             if self._is_layer_owned(layer_id):
                 super().set_kv_buffer(layer, loc_info, cache_k, cache_v)
-                self.remote_kv_layer_id = layer_id
+                st.remote_layer_id = layer_id
             else:
                 self._store_remote_copy(layer, loc_info, cache_k, cache_v)
             return
@@ -597,7 +463,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 loc.view(-1, 1),
                 cache_v.view(-1, 1, self.qk_rope_head_dim),
             )
-        self.remote_kv_layer_id = layer.layer_id
+        self._split_state(KIND_KV).remote_layer_id = layer.layer_id
 
     def set_index_k_buffer(
         self,
@@ -607,23 +473,23 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         cp_gathered_full: bool = False,
         cp_gathered_chunk: bool = False,
     ):
+        st: _SplitKindState = self._split_state(KIND_INDEX)
         prefix_broadcast_pending = (
-            self.pending_remote_index_broadcast
-            and self.pending_remote_index_layer_id == layer_id
+            st.pending_remote_broadcast and st.pending_remote_layer_id == layer_id
         )
-        had_remote_copy = self.remote_index_layer_id == layer_id
-        if self.pending_remote_index_layer_id == layer_id:
-            self._finalize_pending_index_broadcast(set_remote_layer_id=False)
+        had_remote_copy = st.remote_layer_id == layer_id
+        if st.pending_remote_layer_id == layer_id:
+            self._finalize_pending_kind(KIND_INDEX, set_remote_layer_id=False)
         # A write invalidates any cached remote copy before the owned-only
         # early return, so the next read re-broadcasts on every rank.
-        self.invalidate_index_layer(layer_id)
+        self._invalidate_kind_cache(KIND_INDEX, layer_id)
         if (
             cp_gathered_full
             or (cp_gathered_chunk and (prefix_broadcast_pending or had_remote_copy))
         ) and self._remote_index_store_supported():
             if self._is_layer_owned(layer_id):
                 super().set_index_k_buffer(layer_id, loc, index_k)
-                self.remote_index_layer_id = layer_id
+                st.remote_layer_id = layer_id
             else:
                 self._store_remote_index_copy(layer_id, loc, index_k)
             return
@@ -645,9 +511,8 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         index_k: torch.Tensor,
     ) -> None:
         """Cache a CP-gathered full-sequence index row copy into the remote
-        scratch, so the follow-up get_index_k_buffer read hits
-        ``remote_index_layer_id`` instead of issuing a synchronous owner
-        broadcast."""
+        scratch, so the follow-up get_index_k_buffer read hits the cached
+        layer instead of issuing a synchronous owner broadcast."""
         if index_k.dtype != self.dtype:
             index_k = index_k.to(self.dtype)
         if self.store_dtype != self.dtype:
@@ -657,37 +522,16 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             loc.view(-1, 1),
             index_k.view(-1, 1, self.index_head_dim),
         )
-        self.remote_index_layer_id = layer_id
+        self._split_state(KIND_INDEX).remote_layer_id = layer_id
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
-        self.invalidate_index_layer(layer_id)
+        self._invalidate_kind_cache(KIND_INDEX, layer_id)
         if not self._is_layer_owned(layer_id):
             return
         super().set_index_k_scale_buffer(layer_id, loc, scale)
 
-    def get_index_k_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        if self.index_k_buffer is None:
-            raise RuntimeError("NPU MLA index KV cache is not allocated.")
-        # Every rank (owner included) goes through the broadcastable path so the
-        # HCCL broadcast is paired across the CP group.
-        self._ensure_remote_index_layer(layer_id)
-        if self._is_layer_owned(layer_id):
-            return super().get_index_k_buffer(layer_id)
-        return self._maybe_view_dtype(self.remote_index_k_buffer)
-
-    def get_index_k_scale_buffer(self, layer_id: int):
-        if self.layer_transfer_counter is not None:
-            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        self._ensure_remote_index_layer(layer_id)
-        if self._is_layer_owned(layer_id):
-            return super().get_index_k_scale_buffer(layer_id)
-        return self.remote_index_k_scale_buffer
-
     def invalidate_index_layer(self, layer_id: int) -> None:
-        if self.remote_index_layer_id == layer_id:
-            self.remote_index_layer_id = None
+        self._invalidate_kind_cache(KIND_INDEX, layer_id)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if tgt_loc.numel() == 0:

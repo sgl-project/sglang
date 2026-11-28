@@ -47,7 +47,7 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.utils.common import parse_connector_type
-from sglang.srt.utils.device import is_mps
+from sglang.srt.utils.device import is_mps, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +144,7 @@ def handle_model_specific_adjustments(server_args: Any):
         NONCAUSAL_FULL_ATTENTION,
         get_mimo_v2_fused_qkv_expected_tp_size,
         is_deepseek_dsa,
+        is_deepseek_v4,
         is_kimi_k3,
     )
 
@@ -190,11 +191,20 @@ def handle_model_specific_adjustments(server_args: Any):
                 "Intern-S2-Mobius does not support: " + "; ".join(unsupported) + "."
             )
 
-    if cfg.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
-        raise ValueError(
-            "--enable-dsa-cache-layer-split is only supported for DSA "
-            "(DeepSeek Sparse Attention) models."
-        )
+    if cfg.enable_dsa_cache_layer_split:
+        if not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)):
+            raise ValueError(
+                "--enable-dsa-cache-layer-split is only supported for DSA "
+                "(DeepSeek Sparse Attention) models and the DeepSeek-V4 "
+                "compressed-KV family."
+            )
+        # DSA models run layer split on GPU and NPU alike; the DeepSeek-V4
+        # compressed-KV split pool is currently only supported on NPU.
+        if is_deepseek_v4(hf_config) and not is_npu():
+            raise ValueError(
+                "--enable-dsa-cache-layer-split for the DeepSeek-V4 "
+                "compressed-KV family is only implemented on NPU."
+            )
 
     if cfg.enable_cp_decode_attn_tp:
         from sglang.srt.layers.cp.cp_decode_attn_tp import (

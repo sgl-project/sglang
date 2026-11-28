@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.hardware_backend.npu import dsa_cache_layer_split as npu_split
+from sglang.srt.hardware_backend.npu import layer_split_mixin
 from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
     LayerSplitNPUDSATokenToKVPool,
 )
@@ -213,7 +214,7 @@ class TestKimiLayerSplitPool(CustomTestCase):
                 return_value=SimpleNamespace(disable_radix_cache=True),
             ),
             patch.object(
-                npu_split,
+                layer_split_mixin,
                 "get_parallel",
                 return_value=SimpleNamespace(
                     attn_cp_group=SimpleNamespace(
