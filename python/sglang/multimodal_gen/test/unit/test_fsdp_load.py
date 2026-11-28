@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,14 +9,19 @@ from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
 from safetensors.torch import safe_open, save_file
 from torch import nn
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import DTensor, Shard, distribute_tensor
 
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
     UnquantizedLinearMethod,
+    pack_rows_into_one_buffer,
+    rows_of_one_buffer,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
     BitsAndBytesConfig,
@@ -606,3 +612,47 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
                         torch.testing.assert_close(
                             model.proj.bias, bias, rtol=0, atol=0
                         )
+
+
+class TestFusedRowsSkipShardedParams(unittest.TestCase):
+    """FSDP-sharded (DTensor) q/k/v weights stay unfused instead of failing at load."""
+
+    @classmethod
+    def setUpClass(cls):
+        # the conftest single_process_model_parallel fixture may already hold an
+        # NCCL default group; build the CPU mesh on a gloo group either way
+        cls._owns_default_group = not dist.is_initialized()
+        if cls._owns_default_group:
+            fd, cls._store_path = tempfile.mkstemp()
+            os.close(fd)
+            dist.init_process_group(
+                "gloo", store=dist.FileStore(cls._store_path, 1), rank=0, world_size=1
+            )
+            cls._group = None
+            cls.mesh = init_device_mesh("cpu", (1,))
+        else:
+            cls._group = dist.new_group(backend="gloo")
+            cls.mesh = DeviceMesh.from_group(cls._group, "cpu")
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._owns_default_group:
+            dist.destroy_process_group()
+            Path(cls._store_path).unlink(missing_ok=True)
+        else:
+            dist.destroy_process_group(cls._group)
+
+    def test_sharded_params_are_left_alone(self):
+        params = [
+            nn.Parameter(distribute_tensor(torch.randn(4, 2), self.mesh, [Shard(0)]))
+            for _ in range(3)
+        ]
+        before = [param.to_local().clone() for param in params]
+
+        pack_rows_into_one_buffer(params)
+
+        for param, local in zip(params, before):
+            self.assertIsInstance(param.data, DTensor)
+            self.assertTrue(torch.equal(param.to_local(), local))
+        self.assertIsNone(rows_of_one_buffer(params))
+        self.assertIsNone(rows_of_one_buffer([param.data for param in params]))
