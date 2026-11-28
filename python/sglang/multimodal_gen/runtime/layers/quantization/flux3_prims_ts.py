@@ -470,10 +470,10 @@ class Flux3ModelOptFp4Config(Flux3PrimsTsConfigMixin, ModelOptFp4Config):
                 )
                 if planned is role:
                     continue
-                if role is not Flux3PrimsTsRole.QKV_QKNORM_ROPE or planned is None:
-                    missing.append(prefix)
                 if role is Flux3PrimsTsRole.QKV_QKNORM_ROPE:
                     missing.append(f"{prefix} (QKV/QKNorm/RoPE epilogue)")
+                else:
+                    missing.append(prefix)
         if missing:
             raise RuntimeError(
                 "FLUX.3 NVFP4 requires PrimsTS FP4 GEMM for every image/joint "

@@ -82,6 +82,8 @@ def _apply_weight_only_fp8_linear(
         bias = bias.to(weight.dtype) if bias is not None else None
         return F.linear(x.to(weight.dtype), weight, bias)
     x = x.to(compute_dtype)
+    if not x.is_contiguous():
+        x = x.contiguous()
     bias = bias.to(compute_dtype) if bias is not None else None
     if enable_fused_w8a8 and _can_apply_fused_w8a8_fp8_linear(
         x, weight, weight_scale, compute_dtype

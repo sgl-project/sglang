@@ -22,11 +22,30 @@ if _is_npu:
     import torch_npu
 
 from sglang.multimodal_gen.runtime.models.parameter import (
-    BasevLLMParameter,
     GroupQuantScaleParameter,
     ModelWeightParameter,
+    RowvLLMParameter,
 )
 from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearScheme
+
+
+class _MulScaleParameter(RowvLLMParameter):
+    """Smooth-quant activation scale, indexed by the layer's input dim.
+
+    Row-parallel layers shard the input dim, so each rank takes its slice
+    (inherited ``load_row_parallel_weight``, input_dim=0). Column-parallel,
+    merged and QKV layers keep the full input dim on every rank, so the whole
+    vector is copied.
+    """
+
+    def _load_replicated(self, loaded_weight: torch.Tensor, **kwargs) -> None:
+        assert self.data.shape == loaded_weight.shape
+        self.data.copy_(loaded_weight)
+
+    load_column_parallel_weight = _load_replicated
+    load_merged_column_weight = _load_replicated
+    load_qkv_weight = _load_replicated
+
 
 MXFP4_BLOCK_SIZE = 32
 # L1 (dual) scale groups this many L0 blocks together.
@@ -52,7 +71,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
         self.legacy_mul_scale_key = prefix + ".div.mul_scale"
         self.has_mul_scale = (
             self.legacy_mul_scale_key in quant_config
-            and self.mul_scale_key in quant_config
+            or self.mul_scale_key in quant_config
         )
         self.single_level_kernel = None
         if not self.is_dual_scale:
@@ -62,7 +81,7 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
 
             self.single_level_kernel = NPUSingleLevelMXFP4OfflineLinearMethod()
         else:
-            if self.is_dual_scale_key not in self.quant_config:
+            if self.dual_scale_key not in self.quant_config:
                 raise ValueError(
                     f"Dual-level MXFP4 quantization requires missing '{self.dual_scale_key}' in quant_config."
                     "Check that the model was exported with dual-level quantization."
@@ -132,11 +151,12 @@ class ModelSlimMXFP4Scheme(ModelSlimLinearScheme):
             # After repack, it becomes `<prefix>.mul_scale`.
             # This is CRITICAL: the offline-quantized weights were calibrated with
             # x * mul_scale applied to the activation. Omitting it causes mosaic output.
-            mul_scale = BasevLLMParameter(
+            mul_scale = _MulScaleParameter(
                 data=torch.empty(
                     (input_size_per_partition,),
                     dtype=torch.float32,
                 ),
+                input_dim=0,
                 weight_loader=weight_loader,
             )
             mul_scale.missing_param_init = "error"
