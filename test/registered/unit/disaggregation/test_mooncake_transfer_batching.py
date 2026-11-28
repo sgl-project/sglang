@@ -27,6 +27,82 @@ FOREGROUND = TransferIntent.FOREGROUND
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
+class TestMooncakeTransferQueueSharding(CustomTestCase):
+    @staticmethod
+    def _make_manager(rooms, queue_count=4):
+        queued_rooms = [[] for _ in range(queue_count)]
+        queues = [
+            SimpleNamespace(
+                put=lambda chunk, queue_index=queue_index: queued_rooms[
+                    queue_index
+                ].append(chunk.room)
+            )
+            for queue_index in range(queue_count)
+        ]
+        sessions = {
+            f"decode-host:{port}": object() for port in (15001, 15002, 15003, 15004)
+        }
+        manager = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.PREFILL,
+            request_status={room: KVPoll.WaitingForInput for room in rooms},
+            transfer_infos={room: sessions for room in rooms},
+            transfer_queues=queues,
+            send_record=MagicMock(),
+            note_send_enqueued=MagicMock(),
+        )
+        manager.check_status = lambda room: manager.request_status[room]
+        return manager, queued_rooms
+
+    @staticmethod
+    def _enqueue(manager, room):
+        MooncakeKVManager.add_transfer_request(
+            manager,
+            bootstrap_room=room,
+            kv_indices=np.array([room], dtype=np.int32),
+            index_slice=slice(None),
+            is_last_chunk=False,
+        )
+
+    def test_congruent_rooms_distribute_across_queues(self):
+        room_count = 32
+        queue_count = 4
+        # These rooms model one DP shard: their low queue bits are identical.
+        rooms = range(100, 100 + room_count * queue_count, queue_count)
+        manager, queued_rooms = self._make_manager(rooms, queue_count)
+
+        for room in rooms:
+            self._enqueue(manager, room)
+
+        used_queues = [items for items in queued_rooms if items]
+        self.assertEqual(len(used_queues), min(room_count, queue_count))
+
+    def test_chunks_from_same_room_stay_on_one_queue(self):
+        room = 100
+        manager, queued_rooms = self._make_manager([room])
+
+        self._enqueue(manager, room)
+        self._enqueue(manager, room)
+
+        used_queues = [items for items in queued_rooms if items]
+        self.assertEqual(len(used_queues), 1)
+        self.assertEqual(used_queues[0], [room, room])
+
+    def test_failed_session_skips_chunk_from_another_queue(self):
+        """A session failed by one worker must be skipped by every other worker."""
+        rooms = (101, 202)
+        manager, first_queue = TestMooncakeEarlySend._worker(None, rooms)
+        manager.send_kvcache.side_effect = [17, 0]
+        second_queue = SimpleQueue()
+        second_queue.put(TransferKVChunk(rooms[1], [0], slice(0, 1), False, None, None))
+        second_queue.put(None)
+
+        MooncakeKVManager.transfer_worker(manager, first_queue, MagicMock())
+        self.assertIn("peer", manager.failed_sessions)
+        MooncakeKVManager.transfer_worker(manager, second_queue, MagicMock())
+
+        manager.send_kvcache.assert_called_once()
+
+
 class TestMooncakeTransferBatching(unittest.TestCase):
     @staticmethod
     def _make_manager(
@@ -813,15 +889,18 @@ class TestMooncakeEarlySend(CustomTestCase):
         ready.synchronize.assert_not_called()
         indices_ready.synchronize.assert_not_called()
 
-    def _worker(self, event):
+    @staticmethod
+    def _worker(event, rooms=(1,)):
         chunk = TransferKVChunk(
-            1, [0], slice(0, 1), False, None, None, wait_event=event
+            rooms[0], [0], slice(0, 1), False, None, None, wait_event=event
         )
         queue = SimpleQueue()
         queue.put(chunk)
         queue.put(None)
         peer = SimpleNamespace(
             is_dummy=False,
+            endpoint="127.0.0.1",
+            dst_port=80,
             mooncake_session_id="peer",
             dst_device_kv_indices=None,
             dst_kv_indices=[10],
@@ -841,14 +920,18 @@ class TestMooncakeEarlySend(CustomTestCase):
             enable_staging=False,
             enable_deferred_decode_kv_release=True,
             _staging_outstanding=defaultdict(int),
-            request_status={1: KVPoll.WaitingForInput},
-            transfer_infos={1: {"peer": peer}},
+            request_status={room: KVPoll.WaitingForInput for room in rooms},
+            transfer_infos={room: {"peer": peer} for room in rooms},
             _prefill_unique_rank=lambda: 0,
             session_lock=Lock(),
             failed_sessions=set(),
             # Read under session_lock alongside failed_sessions on every
             # non-dummy req, and invoked by the worker's except path.
             state_layout_rejections={},
+            failed_session_probes={},
+            session_failures=defaultdict(int),
+            conclude_failure=MagicMock(),
+            _poison_unsettled_send=MagicMock(),
             poison_deferred_ack_room=MagicMock(),
             decode_kv_args_table={"peer": registration},
             _get_dsa_cache_transfer_skip_flags=lambda reg: (False, False),
