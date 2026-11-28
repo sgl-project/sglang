@@ -465,13 +465,9 @@ class _SegmentEncoder:
                 if ids is not None:
                     self.cache.move_to_end(key)
                     known[text] = ids
-                elif (ids := self.probation.pop(key, None)) is not None:
-                    packed = array("I", ids)
-                    self.cached_bytes += _entry_bytes(key, packed) - _entry_bytes(
-                        key, ids
-                    )
-                    self.cache[key] = packed
+                elif (ids := self.probation.get(key)) is not None:
                     known[text] = ids
+                    self._promote(key, ids)
                 elif key in self.in_flight:
                     waits[text] = self.in_flight[key]
                 else:
@@ -504,30 +500,56 @@ class _SegmentEncoder:
             start += count
         return encoded
 
+    def _promote(self, key, ids):
+        """Move a reused text from `probation` to `cache`, packed. Caching is
+        best effort: if packing fails, the text stays in `probation`."""
+        try:
+            packed = array("I", ids)
+        except Exception:
+            self.probation.move_to_end(key)
+            return
+        del self.probation[key]
+        self.cached_bytes += _entry_bytes(key, packed) - _entry_bytes(key, ids)
+        self.cache[key] = packed
+
     def _publish(self, texts, encoded, cache_salt):
         """Cache the ids of the claimed `texts` and release their claims, in one
         step under the lock, so a text is always cached, in flight or unclaimed.
-        If the encode raised, `encoded` is empty and the waiters get no ids."""
+        If the encode raised, `encoded` is empty and the waiters get no ids.
+        Caching is best effort: the claims are released and the waiters woken
+        even if caching fails."""
         with self.lock:
-            for text in texts:
-                key = (cache_salt, text)
-                ids = encoded.get(text)
-                if ids is not None:
-                    size = _entry_bytes(key, ids)
-                    lru = self.probation
-                    if size > _SEGMENT_CACHE_MAX_ENTRY_BYTES:
-                        # Too big as a list: keep it packed, if that fits.
-                        ids, lru = array("I", ids), self.cache
-                        size = _entry_bytes(key, ids)
-                    if size <= _SEGMENT_CACHE_MAX_ENTRY_BYTES:
-                        lru[key] = ids
-                        self.cached_bytes += size
-                claim = self.in_flight.pop(key)
-            claim.ids = encoded
-            claim.done.set()
-            while self.cached_bytes > _SEGMENT_CACHE_MAX_BYTES:
-                lru = self.probation if self.probation else self.cache
-                self.cached_bytes -= _entry_bytes(*lru.popitem(last=False))
+            claim = self.in_flight[(cache_salt, texts[0])]
+            try:
+                for text in texts:
+                    self._cache_new(text, encoded.get(text), cache_salt)
+                while self.cached_bytes > _SEGMENT_CACHE_MAX_BYTES:
+                    lru = self.probation if self.probation else self.cache
+                    self.cached_bytes -= _entry_bytes(*lru.popitem(last=False))
+            finally:
+                for text in texts:
+                    self.in_flight.pop((cache_salt, text), None)
+                claim.ids = encoded
+                claim.done.set()
+
+    def _cache_new(self, text, ids, cache_salt):
+        if ids is None:
+            return
+        key = (cache_salt, text)
+        if key in self.cache or key in self.probation:
+            return
+        size = _entry_bytes(key, ids)
+        lru = self.probation
+        if size > _SEGMENT_CACHE_MAX_ENTRY_BYTES:
+            # Too big as a list: keep it packed, if that fits.
+            try:
+                ids = array("I", ids)
+            except Exception:
+                return
+            lru, size = self.cache, _entry_bytes(key, ids)
+        if size <= _SEGMENT_CACHE_MAX_ENTRY_BYTES:
+            lru[key] = ids
+            self.cached_bytes += size
 
 
 class _InFlightEncode:

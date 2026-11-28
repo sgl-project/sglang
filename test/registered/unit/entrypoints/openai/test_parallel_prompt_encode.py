@@ -1037,6 +1037,34 @@ class TestPromptSegments(_EncodeCase):
         self.assertEqual(list(encoder.probation), [])
         self._assert_within_byte_budget(encoder, ppe._SEGMENT_CACHE_MAX_BYTES)
 
+    def test_a_failed_pack_still_releases_the_claim(self):
+        """Caching is best effort: if packing ids raises (e.g. MemoryError), the
+        call still returns its ids and leaves no claim behind, or the next
+        request for that text would wait for it forever."""
+        big, other = "hello world " * 40, "the quick brown fox " * 5
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        failing = unittest.mock.patch.object(ppe, "array", side_effect=MemoryError)
+        # Publish: a new text over the entry limit as a list is packed.
+        with (
+            failing,
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_BYTES", 2048),
+        ):
+            ids = ppe.encode_prompt_segments(self.tokenizer, ["<|user|>", big])
+        self.assertEqual(ids, self.tokenizer.encode(f"<|user|>{big}"))
+        self.assertEqual(encoder.in_flight, {})
+        # Claim: a reused text is packed while other texts are being claimed.
+        ppe.encode_prompt_segments(self.tokenizer, ["<|user|>", other])
+        with failing:
+            ids = ppe.encode_prompt_segments(
+                self.tokenizer, ["<|user|>", other, "<|assistant|>", "new text"]
+            )
+        self.assertEqual(
+            ids, self.tokenizer.encode(f"<|user|>{other}<|assistant|>new text")
+        )
+        self.assertEqual(encoder.in_flight, {})
+        self.assertIn((None, other), encoder.probation)
+        self._assert_within_byte_budget(encoder, ppe._SEGMENT_CACHE_MAX_BYTES)
+
     def test_new_text_is_evicted_before_text_that_recurred(self):
         reused, budget = "hello world " * 20, 6000
         with unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_BYTES", budget):
