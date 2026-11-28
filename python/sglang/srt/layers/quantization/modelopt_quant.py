@@ -2380,8 +2380,6 @@ def _compute_gemm1_alphas(
         gate_scale = w13_weight_scale_2.reshape(w13_weight_scale_2.shape[0])
         up_scale = gate_scale
     g1_alphas = (w13_input_scale * gate_scale).to(torch.float32)
-    if up_scale is gate_scale:
-        return g1_alphas, g1_alphas
     g1_alphas_up = (w13_input_scale * up_scale).to(torch.float32)
     return g1_alphas, g1_alphas_up
 
@@ -2851,7 +2849,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale,
             layer.moe_runner_config.is_gated,
         )
-        layer._g1_alphas_shared = g1_alphas is g1_alphas_up
         copy_or_rebind_param(layer, "g1_alphas", g1_alphas)
         copy_or_rebind_param(layer, "g1_alphas_up", g1_alphas_up)
         copy_or_rebind_param(

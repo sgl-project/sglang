@@ -993,23 +993,5 @@ def test_adapter_skips_ue8m0_patch_for_cutedsl_and_reuses_output_buffer(monkeypa
     assert dgm.pack_ue8m0_to_int is original_pack
 
 
-def test_validate_nvfp4_fc1_alpha_skips_allclose_when_shared(monkeypatch):
-    module = _load_megamoe_module(monkeypatch)
-    alpha = torch.ones(4, dtype=torch.float32)
-    layer = types.SimpleNamespace(
-        moe_runner_config=types.SimpleNamespace(is_gated=True),
-        num_local_experts=4,
-        g1_alphas=alpha,
-        g1_alphas_up=alpha.clone(),
-        _g1_alphas_shared=True,
-    )
-    monkeypatch.setattr(
-        torch,
-        "allclose",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("unexpected allclose")),
-    )
-    module._validate_nvfp4_fc1_alpha(layer)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

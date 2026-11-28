@@ -238,18 +238,8 @@ def _validate_nvfp4_fc1_alpha(layer: FusedMoE) -> None:
     expert, so the gate and up FC1 alphas must agree."""
     if not layer.moe_runner_config.is_gated:
         return
-    if layer.g1_alphas is layer.g1_alphas_up or getattr(
-        layer, "_g1_alphas_shared", False
-    ):
-        return
     gate_alpha = _local_expert_vector(layer.g1_alphas, layer.num_local_experts)
     up_alpha = _local_expert_vector(layer.g1_alphas_up, layer.num_local_experts)
-    if (
-        gate_alpha.data_ptr() == up_alpha.data_ptr()
-        and gate_alpha.shape == up_alpha.shape
-        and gate_alpha.stride() == up_alpha.stride()
-    ):
-        return
     if not torch.allclose(gate_alpha, up_alpha):
         raise ValueError(
             "FlashInfer NVFP4 MegaMOE requires matching gate/up FC1 alpha "
