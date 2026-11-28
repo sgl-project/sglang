@@ -558,6 +558,11 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
+        if get_parallel().nnodes == 1 and get_exec().moe.elastic_ep_backend is None:
+            # No remote workers or future joiners need a handshake listener.
+            assert worker_ports is not None
+            return worker_ports
+
         is_joiner = get_exec().moe.is_ep_offset_joiner
         if get_parallel().dist_init_addr is None or is_joiner:
             na = NetworkAddress(
@@ -784,7 +789,7 @@ class DataParallelController:
                         get_parallel().attn_cp_size,
                     )
                     # compute zmq ports for this dp rank
-                    rank_port_args = PortArgs.init_new(
+                    rank_port_args = port_args.for_dp_worker(
                         server_args, dp_rank, worker_ports
                     )
                     if get_exec().moe.is_ep_offset_joiner:
@@ -798,10 +803,6 @@ class DataParallelController:
                         rank_port_args.detokenizer_ipc_name = NetworkAddress(
                             primary_addr.host, primary_port_base + 1
                         ).to_tcp()
-                    # Data parallelism reuses the tensor parallelism group,
-                    # so all dp ranks should use the same nccl port.
-                    rank_port_args.nccl_port = port_args.nccl_port
-                    rank_port_args.instance_id = port_args.instance_id
 
                 gpu_id = (
                     get_device().base_gpu_id
