@@ -306,8 +306,8 @@ class _VideoSparseAttentionH3BackendResolver(_CudaAttentionBackendResolver):
 class _HybridWindowAttentionH3BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3
 
-    # the window rides FlashAttention varlen: FA4 on SM100 / SM103 / SM120, FA3 on
-    # SM90; SM80 / SM86 / SM89 run FA3's Sm80 mainloop (FA2-class throughput)
+    # the window rides FlashAttention varlen: FA4 on SM100 / SM103 / SM120 / SM121,
+    # FA3 on SM90; SM80 / SM86 / SM89 run FA3's Sm80 mainloop (FA2-class throughput)
     supported_capabilities = {
         (8, 0),
         (8, 6),
@@ -316,6 +316,7 @@ class _HybridWindowAttentionH3BackendResolver(_CudaAttentionBackendResolver):
         (10, 0),
         (10, 3),
         (12, 0),
+        (12, 1),
     }
 
     @classmethod
@@ -329,8 +330,8 @@ class _HybridWindowAttentionH3BackendResolver(_CudaAttentionBackendResolver):
             raise ValueError(
                 "hybrid_window_attn_h3 (VDN-H3) needs compute capability 8.0 / "
                 "8.6 / 8.9 (Ampere, Ada), 9.0 (Hopper), 10.0 (B200 / GB200), "
-                "10.3 (B300 / GB300) or 12.0 (RTX PRO 6000 Blackwell); this "
-                f"device reports {found}."
+                "10.3 (B300 / GB300), 12.0 (RTX PRO 6000 Blackwell) or 12.1 "
+                f"(DGX Spark / GB10); this device reports {found}."
             )
         if not platform._prepare_flash_attention_for_blackwell():
             raise RuntimeError(
