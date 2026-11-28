@@ -93,8 +93,6 @@ class Gemma4Renoise(DllmAlgorithm):
             raise ValueError("DiffusionGemma does not support pipeline parallelism")
         if cfg.dcp_size > 1 or cfg.attn_cp_size > 1:
             raise ValueError("DiffusionGemma does not support context parallelism")
-        if model_config.quantization is not None:
-            raise ValueError("DiffusionGemma does not support quantized loading")
         if not (
             getattr(hf_config, "tie_word_embeddings", False)
             and getattr(hf_config.text_config, "tie_word_embeddings", False)
