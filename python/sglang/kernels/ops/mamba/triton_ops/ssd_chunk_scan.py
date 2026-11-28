@@ -428,6 +428,14 @@ def _chunk_scan_fwd_kernel(
             )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
             acc = tl.dot(C, prev_states) * scale_m[:, None]
+            if HAS_SEQ_IDX:
+                if not HAS_INITSTATES:
+                    # prev_states belongs to seq_idx_prev. scale_m is 0 for the rows
+                    # of any other sequence, but 0 * nan is nan, so a non-finite
+                    # carried state would reach those rows through tl.dot. Select the
+                    # rows that own it instead: their own nan stays visible, and
+                    # other sequences' rows get an exact 0.
+                    acc = tl.where((seq_idx_m == seq_idx_prev)[:, None], acc, 0.0)
         else:
             for k in range(0, dstate, BLOCK_SIZE_K):
                 C = tl.load(
@@ -448,6 +456,20 @@ def _chunk_scan_fwd_kernel(
                 C_ptrs += BLOCK_SIZE_K
                 prev_states_ptrs += BLOCK_SIZE_K
             acc *= scale_m[:, None]
+            if HAS_SEQ_IDX:
+                if not HAS_INITSTATES:
+                    # See the comment on the other `prev_states` select above.
+                    acc = tl.where((seq_idx_m == seq_idx_prev)[:, None], acc, 0.0)
+
+    if HAS_SEQ_IDX:
+        # seq_idx is non-decreasing within [c_off, chunk_size_limit) (this pseudo-
+        # chunk's own range; c_off is 0 unless HAS_INITSTATES splits a physical
+        # chunk), so that whole range belongs to one sequence iff its first and
+        # last positions agree. Most chunks are like this; only one straddling a
+        # sequence boundary needs the x sanitize below, so skip it otherwise.
+        chunk_has_boundary = tl.load(
+            seq_idx_ptr + c_off * stride_seq_idx_seqlen
+        ) != tl.load(seq_idx_ptr + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
 
     offs_k = tl.arange(0, BLOCK_SIZE_K) + c_off
     cb_ptrs = cb_ptr + (
@@ -458,6 +480,8 @@ def _chunk_scan_fwd_kernel(
     )
     dt_ptrs = dt_ptr + offs_k * stride_dt_csize
     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
+    if HAS_SEQ_IDX:
+        seq_idx_scan_ptrs = seq_idx_ptr + offs_k * stride_seq_idx_seqlen
     K_MAX = (
         chunk_size_limit
         if not IS_CAUSAL
@@ -476,21 +500,108 @@ def _chunk_scan_fwd_kernel(
         # So we don't need masking wrt seq_idx here.
         cb *= tl.exp(dA_cs_m[:, None] - dA_cs_k[None, :])
         dt_k = tl.load(dt_ptrs, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
-        cb *= dt_k
-        if IS_CAUSAL:
-            mask = offs_m[:, None] >= k + offs_k[None, :]
-            cb = tl.where(mask, cb, 0.0)
-        cb = cb.to(x_ptr.dtype.element_ty)
         x = tl.load(
             x_ptrs,
             mask=(offs_k[:, None] < chunk_size_limit - k) & (offs_n[None, :] < hdim),
             other=0.0,
         )
-        acc += tl.dot(cb, x)
+        if HAS_SEQ_IDX and not HAS_INITSTATES:
+            # Isolating one request's non-finite x/dt from another costs two extra
+            # dots, so run it only for a tile that crosses a request boundary AND
+            # actually holds a non-finite x or dt; finite input takes the plain
+            # path. (v - v) is 0 for finite v and nan for +-inf/nan.
+            has_nonfinite = (
+                tl.max(((x - x) != 0.0).to(tl.int32))
+                + tl.max(((dt_k - dt_k) != 0.0).to(tl.int32))
+            ) > 0
+            isolate = chunk_has_boundary & has_nonfinite
+            if isolate:
+                # cb == 0 does not mean token k belongs to another request (a
+                # same-sequence cb can underflow to exact 0), so mask dt_k by
+                # sequence ownership: cb is exactly 0 for seq_idx[m] != seq_idx[k].
+                seq_idx_k = tl.load(
+                    seq_idx_scan_ptrs,
+                    mask=offs_k < chunk_size_limit - k,
+                    other=-1,
+                )
+                same_seq_mk = seq_idx_m[:, None] == seq_idx_k[None, :]
+                cb = tl.where(same_seq_mk, cb * dt_k, cb)
+            else:
+                cb *= dt_k
+        else:
+            cb *= dt_k
+        if IS_CAUSAL:
+            mask = offs_m[:, None] >= k + offs_k[None, :]
+            cb = tl.where(mask, cb, 0.0)
+        cb = cb.to(x_ptr.dtype.element_ty)
+        if HAS_SEQ_IDX and not HAS_INITSTATES:
+            if isolate:
+                # cb[m, k] is already exactly 0 for seq_idx[m] != seq_idx[k] (comment
+                # above), but tl.dot sums every k into one running value per row, so a
+                # non-finite x at a column another request owns turns 0 * x[k] into
+                # nan for every row that doesn't own k. That nan then adds into the
+                # row's otherwise-correct sum before any select could discard it, so
+                # sanitizing x itself (replacing it wholesale) would also hide the
+                # owning request's own non-finite x.
+                #
+                # Compute both a raw and a sanitized dot and select per (row, channel)
+                # instead: dot_safe never touches a non-finite value, so it is exact
+                # for every (row, channel) whose own columns are finite there. dot_raw
+                # keeps a row's own non-finite propagation, and is exact wherever the
+                # row's own sequence holds the non-finite value in that channel, since
+                # every column it does not own is exactly 0 * (that other request's
+                # value) there. The select must be per-channel, not just per-row: two
+                # requests in the same tile can each carry a non-finite value in a
+                # different channel of the same head, and a row-only select (one flag
+                # per m, broadcast over every n) would pick dot_raw for a channel the
+                # row's own sequence never touched, letting 0 * (other request's nan)
+                # leak through. This still does not reconstruct the exact reference
+                # when two different requests in the same tile are non-finite in the
+                # exact same channel (an unsupported compound case; see the PR's
+                # known-limitations note). On finite input, x_safe == x bit-for-bit, so
+                # dot_raw == dot_safe == tl.dot(cb, x) and this is a no-op past the
+                # extra select.
+                #
+                # Not applied with HAS_INITSTATES: there each program's whole tile
+                # already covers exactly one sequence (seq_idx_m is only built as a
+                # per-row vector in the not-HAS_INITSTATES path above), so there is
+                # no cross-request column to isolate and the plain dot below is exact.
+                seq_idx_k = tl.load(
+                    seq_idx_scan_ptrs,
+                    mask=offs_k < chunk_size_limit - k,
+                    other=-1,
+                )
+                same_seq_mk = seq_idx_m[:, None] == seq_idx_k[None, :]
+                x_safe = tl.where((x - x) == 0.0, x, 0.0)
+                # Per (k, n): is column k's value non-finite at exactly this channel?
+                nonfinite_x = tl.where(x == x_safe, 0.0, 1.0)
+                # Per (m, n): does row m's own sequence own a non-finite value in this
+                # exact channel? same_seq_mk already zeroes out every other sequence's
+                # column, so this is one more matmul-shaped reduction of the same
+                # (BLOCK_M, BLOCK_K) x (BLOCK_K, BLOCK_N) shape as dot_raw/dot_safe
+                # below, not a dot per sequence segment.
+                #
+                # Only count columns row m can actually read: with IS_CAUSAL, a column
+                # k > m is already zeroed in cb (cb is where-masked below), so a non-
+                # finite x there, even in the row's own sequence, is a future token
+                # and must not select dot_raw (where 0 * nan would reach row m).
+                own_k = same_seq_mk
+                if IS_CAUSAL:
+                    own_k = own_k & (offs_m[:, None] >= k + offs_k[None, :])
+                own_has_nonfinite = tl.dot(own_k.to(tl.float32), nonfinite_x) > 0.0
+                dot_raw = tl.dot(cb, x)
+                dot_safe = tl.dot(cb, x_safe)
+                acc += tl.where(own_has_nonfinite, dot_raw, dot_safe)
+            else:
+                acc += tl.dot(cb, x)
+        else:
+            acc += tl.dot(cb, x)
         cb_ptrs += BLOCK_SIZE_K * stride_cb_csize_k
         x_ptrs += BLOCK_SIZE_K * stride_x_seqlen
         dt_ptrs += BLOCK_SIZE_K * stride_dt_csize
         dA_cumsum_ptrs += BLOCK_SIZE_K * stride_dA_cs_csize
+        if HAS_SEQ_IDX:
+            seq_idx_scan_ptrs += BLOCK_SIZE_K * stride_seq_idx_seqlen
 
     offs_out_m = pid_m * BLOCK_SIZE_M + c_off + tl.arange(0, BLOCK_SIZE_M)
     offs_out_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)

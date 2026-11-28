@@ -780,6 +780,624 @@ def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
         )
 
 
+@pytest.mark.parametrize("len_a", [5, 16], ids=["same_chunk", "chunk_boundary"])
+@pytest.mark.parametrize("target", ["x", "B"])
+@pytest.mark.parametrize("nonfinite_value", [torch.inf, torch.nan], ids=["inf", "nan"])
+def test_mamba_chunk_scan_isolates_nonfinite_request(len_a, target, nonfinite_value):
+    """Regression test for https://github.com/sgl-project/sglang/issues/51108.
+
+    One request's non-finite input (x or B, inf or nan) must not corrupt another
+    request's output or final state in the same packed prefill.
+
+    `len_a=5` ("same_chunk") puts both requests in chunk 0, exercising the
+    chunk-local masking in `_chunk_state_fwd_kernel` / `_chunk_scan_fwd_kernel`.
+    `len_a=16` ("chunk_boundary") makes request A exactly fill chunk 0 (chunk_size
+    is 16), so request B starts in chunk 1 and the only remaining contamination
+    path is the cross-chunk state carry in `_state_passing_fwd_kernel`, which
+    masks the same way (`scale = where(mask, exp(dA_cs), 0.0); states = scale *
+    states + new_states`) and is just as vulnerable to `0 * inf = nan`.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    torch.manual_seed(0)
+    n_heads, d_head, d_state = 2, 4, 8
+    len_b = 30
+    seqlen = len_a + len_b
+
+    x = torch.ones(1, seqlen, n_heads, d_head, device=device)
+    B = torch.ones(1, seqlen, 1, d_state, device=device)
+    if target == "x":
+        x[0, 2, 0, 1] = nonfinite_value  # only request A (the first len_a tokens)
+    else:
+        B[0, 2, 0, 1] = nonfinite_value
+    dt = torch.ones(1, seqlen, n_heads, device=device)
+    A = torch.zeros(n_heads, device=device)
+    C = torch.ones(1, seqlen, 1, d_state, device=device)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.int32, device=device),
+        torch.tensor([len_a, len_b], device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor([0, len_a, seqlen], dtype=torch.int32, device=device)
+
+    out = torch.empty_like(x)
+    states = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        16,  # chunk_size
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=out,
+        return_varlen_states=True,
+    )
+
+    victim_out = out[:, len_a:]
+    expected = (
+        d_state * torch.arange(1, len_b + 1, device=device, dtype=torch.float32)
+    )[None, :, None, None].expand(1, len_b, n_heads, d_head)
+
+    assert states[1].isfinite().all(), "request B's final state must stay finite"
+    assert victim_out.isfinite().all(), "request B's output must stay finite"
+    torch.testing.assert_close(victim_out, expected)
+    torch.testing.assert_close(states[1], torch.full_like(states[1], float(len_b)))
+
+
+@pytest.mark.parametrize("target", ["x", "B"])
+def test_mamba_chunk_scan_lone_request_nonfinite_input_stays_nonfinite(target):
+    """A single, unbatched request's own non-finite input must still surface as
+    non-finite output, not be silently sanitized into a finite-but-wrong value.
+
+    The sanitization added for #51108 only guards the masked-select paths that
+    exist when `seq_idx` is given (HAS_SEQ_IDX); without it there is one
+    sequence per batch row and no `0 * inf` path to guard against, so the fix
+    must not apply there.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    torch.manual_seed(0)
+    n_heads, d_head, d_state = 2, 4, 8
+    seqlen = 30
+
+    x = torch.ones(1, seqlen, n_heads, d_head, device=device)
+    B = torch.ones(1, seqlen, 1, d_state, device=device)
+    if target == "x":
+        x[0, 2, 0, 1] = torch.inf
+    else:
+        B[0, 2, 0, 1] = torch.inf
+    dt = torch.ones(1, seqlen, n_heads, device=device)
+    A = torch.zeros(n_heads, device=device)
+    C = torch.ones(1, seqlen, 1, d_state, device=device)
+
+    out = torch.empty_like(x)
+    mamba_chunk_scan_combined(x, dt, A, B, C, 16, out=out)
+
+    assert not out.isfinite().all(), (
+        "a lone request's own non-finite input must not be silently sanitized "
+        "into finite-but-wrong output"
+    )
+
+
+@pytest.mark.parametrize("target", ["x", "dt"])
+def test_mamba_chunk_scan_single_seq_with_seq_idx_nonfinite_input_stays_nonfinite(
+    target,
+):
+    """BBuf review (PR 51342): `chunk_has_boundary` (set when a chunk's first and
+    last seq_idx differ) skips both the dt_k ownership mask and the extra
+    per-channel `tl.dot` ownership reduction for any chunk that does not mix
+    sequences, falling back to the plain `cb *= dt_k` / `tl.dot(cb, x)` path. A
+    single packed request -- `seq_idx` given (HAS_SEQ_IDX=True), but only one
+    sequence, so every chunk has chunk_has_boundary=False -- must take that cheap
+    path through every one of its multiple chunks and still land on the same
+    finite/non-finite split as the unpacked (no seq_idx) reference (nan vs inf can
+    differ with fp associativity), exercising the cheap path's correctness
+    independently from the lone-request-no-seq_idx case above (which never enters
+    HAS_SEQ_IDX code at all).
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    chunk_size, lens = 16, [40]
+    offender = (0, 2, target, torch.inf)
+    results = _packed_vs_independent(lens, chunk_size, offender)
+    packed_out, packed_state, alone_out, alone_state = results[0]
+
+    assert not packed_out.isfinite().all(), (
+        "the request's own non-finite input must surface as non-finite even on "
+        "the cheap (no-boundary) path"
+    )
+    assert not packed_state.isfinite().all()
+    torch.testing.assert_close(
+        packed_out.isfinite(),
+        alone_out.isfinite(),
+        msg="finite/non-finite split on the cheap path must match the unpacked reference",
+    )
+
+
+@pytest.mark.parametrize("target", ["x", "B"])
+@pytest.mark.parametrize(
+    "chunk_size,lens",
+    [(16, [40, 30]), (16, [16, 20, 20]), (128, [200, 100, 60])],
+    ids=["two_seqs_carry", "three_seqs_chain", "chunk128_three_seqs"],
+)
+def test_mamba_chunk_scan_nonfinite_stays_with_its_request_across_chunks(
+    chunk_size, lens, target
+):
+    """The first request carries a non-finite x or B at token 2 and spans several
+    chunks. Every later request in the packed prefill must stay exact (output and
+    final state), through chunk boundaries and through a chain of three requests.
+    The offender's own last token must stay non-finite: its carried state must not
+    be zeroed in later chunks, only kept out of the other requests' rows.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, d_state = 2, 16, 16
+    seqlen = sum(lens)
+
+    x = torch.ones(1, seqlen, n_heads, d_head, device=device)
+    B = torch.ones(1, seqlen, 1, d_state, device=device)
+    if target == "x":
+        x[0, 2, 0, 1] = torch.inf
+    else:
+        B[0, 2, 0, 1] = torch.inf
+    dt = torch.ones(1, seqlen, n_heads, device=device)
+    A = torch.zeros(n_heads, device=device)
+    C = torch.ones(1, seqlen, 1, d_state, device=device)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(len(lens), dtype=torch.int32, device=device),
+        torch.tensor(lens, device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32, device=device
+    )
+
+    out = torch.empty_like(x)
+    states = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=out,
+        return_varlen_states=True,
+    )
+
+    assert not out[:, lens[0] - 1].isfinite().all(), (
+        "the offending request's own carried state must stay visible in its last "
+        "token, not be zeroed"
+    )
+    start = lens[0]
+    for i, n in enumerate(lens[1:], start=1):
+        expected = (
+            d_state * torch.arange(1, n + 1, device=device, dtype=torch.float32)
+        )[None, :, None, None].expand(1, n, n_heads, d_head)
+        torch.testing.assert_close(out[:, start : start + n], expected)
+        torch.testing.assert_close(states[i], torch.full_like(states[i], float(n)))
+        start += n
+
+
+def _packed_vs_independent(lens, chunk_size, offender, itype_softplus=False):
+    """Run `lens` packed (seq_idx + cu_seqlens) and each request on its own.
+
+    offender is None (all inputs finite) or (request, token, field, value): that one
+    input element is set to `value`. Returns, per request, (packed output, packed
+    final state, independent output, independent final state).
+    """
+    device = get_device()
+    n_heads, d_head, d_state = 4, 16, 16
+    gen = torch.Generator(device=device).manual_seed(0)
+    total = sum(lens)
+    rnd = lambda *shape: torch.randn(*shape, device=device, generator=gen)
+    x = rnd(1, total, n_heads, d_head)
+    dt = torch.rand(1, total, n_heads, device=device, generator=gen) * 0.1 + 0.01
+    A = -(torch.rand(n_heads, device=device, generator=gen) + 0.5)
+    B = rnd(1, total, 1, d_state) * 0.5
+    C = rnd(1, total, 1, d_state) * 0.5
+    starts = [0]
+    for n in lens:
+        starts.append(starts[-1] + n)
+    if offender is not None:
+        request, token, field, value = offender
+        {"x": x, "dt": dt, "B": B, "C": C}[field][0, starts[request] + token, 0] = value
+
+    seq_idx = torch.repeat_interleave(
+        torch.arange(len(lens), dtype=torch.int32, device=device),
+        torch.tensor(lens, device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor(starts, dtype=torch.int32, device=device)
+    packed_out = torch.empty_like(x)
+    packed_states = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=packed_out,
+        dt_softplus=itype_softplus,
+        return_varlen_states=True,
+    )
+    results = []
+    for i, n in enumerate(lens):
+        sl = slice(starts[i], starts[i] + n)
+        alone_out = torch.empty_like(x[:, sl])
+        alone_state = mamba_chunk_scan_combined(
+            x[:, sl],
+            dt[:, sl],
+            A,
+            B[:, sl],
+            C[:, sl],
+            chunk_size,
+            out=alone_out,
+            dt_softplus=itype_softplus,
+            return_final_states=True,
+        )[0]
+        results.append((packed_out[:, sl], packed_states[i], alone_out, alone_state))
+    return results
+
+
+# (request lengths, chunk size, offending request, offending token). In each layout a
+# healthy request starts in the chunk where the offending request has its token, or
+# in the next chunk: the cases where state or decay leaks across a request boundary.
+_PACKED_NONFINITE_LAYOUTS = [
+    ([5, 30], 16, 0, 2),
+    ([40, 30], 16, 0, 39),
+    ([7, 9, 20, 11], 16, 2, 19),
+    ([100, 60, 90], 64, 1, 30),
+    ([33, 70, 5], 32, 1, 69),
+]
+
+
+@pytest.mark.parametrize(
+    "lens,chunk_size,bad_request,bad_token", _PACKED_NONFINITE_LAYOUTS
+)
+@pytest.mark.parametrize(
+    "field,value,softplus",
+    [
+        ("none", 0.0, False),
+        ("dt", torch.inf, False),
+        ("dt", torch.inf, True),
+        ("dt", torch.nan, False),
+        ("dt", -torch.inf, False),
+        ("C", torch.nan, False),
+        ("x", torch.inf, False),
+        ("B", torch.nan, False),
+    ],
+    ids=[
+        "all_finite",
+        "dt_inf",
+        "dt_inf_softplus",
+        "dt_nan",
+        "dt_neginf",
+        "C_nan",
+        "x_inf",
+        "B_nan",
+    ],
+)
+def test_mamba_chunk_scan_nonfinite_input_does_not_reach_other_requests(
+    lens, chunk_size, bad_request, bad_token, field, value, softplus
+):
+    """Every request other than the offending one must be finite and match its own
+    independent run (fp32 inputs, 1e-3), however another request's input is broken.
+
+    dt = nan and -inf are neutralised by the dt >= 0 clamp before the cumsum, so they
+    pass without any special handling. dt = +inf survives the clamp and used to turn
+    the cumsum of dt * A, and so the decay of every later token in its chunk,
+    non-finite for the requests packed after it.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    offender = None if field == "none" else (bad_request, bad_token, field, value)
+    results = _packed_vs_independent(lens, chunk_size, offender, softplus)
+    for i, (packed_out, packed_state, alone_out, alone_state) in enumerate(results):
+        if offender is not None and i == bad_request:
+            continue
+        assert packed_out.isfinite().all(), f"request {i} output is not finite"
+        assert packed_state.isfinite().all(), f"request {i} state is not finite"
+        torch.testing.assert_close(packed_out, alone_out, rtol=1e-3, atol=1e-3)
+        torch.testing.assert_close(packed_state, alone_state, rtol=1e-3, atol=1e-3)
+
+
+def test_mamba_chunk_scan_offender_x_matches_its_own_standalone_run():
+    """BBuf review (pullrequestreview-6005666966, line 524): with lengths [5, 30]
+    and an infinite x at token 2 of request 0, the old blanket x sanitize
+    (`x = tl.where((x - x) == 0.0, x, 0.0)`) replaced every non-finite x in a
+    boundary chunk, including request 0's own, so request 0's token 4 came out
+    finite even though its own carried state is non-finite. The classification
+    (nan / +inf / -inf / finite) of a packed request's own output must match
+    its unpacked reference, not just stay isolated from other requests.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    lens, chunk_size = [5, 30], 16
+    offender = (0, 2, "x", torch.inf)
+    results = _packed_vs_independent(lens, chunk_size, offender)
+    packed_out, _packed_state, alone_out, _alone_state = results[0]
+
+    def classify(t):
+        return torch.isnan(t), torch.isposinf(t), torch.isneginf(t)
+
+    # Compare from the offending token on. Tokens before it are causally
+    # independent of it, but the unpacked kernel itself turns them non-finite
+    # when they share a chunk with the offender (0 * inf through tl.dot with the
+    # causal-masked cb), and that depends on where chunk boundaries fall, which
+    # differs between packed and standalone runs. The packed run keeps them
+    # finite; see test_mamba_chunk_scan_future_nonfinite_does_not_reach_earlier_token.
+    first = offender[1]
+    for packed_flag, alone_flag in zip(
+        classify(packed_out[:, first:]), classify(alone_out[:, first:])
+    ):
+        assert torch.equal(packed_flag, alone_flag), (
+            "request 0's own non-finite classification diverged from its standalone run"
+        )
+    # The healthy request must still be finite and match its own reference.
+    healthy_out, healthy_state, healthy_alone_out, healthy_alone_state = results[1]
+    assert healthy_out.isfinite().all()
+    assert healthy_state.isfinite().all()
+    torch.testing.assert_close(healthy_out, healthy_alone_out, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(healthy_state, healthy_alone_state, rtol=1e-3, atol=1e-3)
+
+
+def test_mamba_chunk_scan_offender_dt_underflowed_cb_matches_standalone():
+    """BBuf review (pullrequestreview-6005666966, line 505): with A = -1, an
+    infinite first dt, and 128 subsequent unit-step decays in one chunk, cb
+    underflows to exact 0 by the end of the run (exp(-128) rounds to 0 in
+    fp32). The old `cb = tl.where(cb != 0.0, cb * dt_k, cb)` treated that
+    underflowed-but-same-sequence 0 the same as a cross-sequence 0 and skipped
+    the multiply, so the offending request's own infinite dt got silently
+    dropped and its last token came out finite instead of nan. A healthy
+    request packed right after it must stay exact.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, d_state = 1, 8, 8
+    chunk_size = 256
+    offender_len, healthy_len = 129, 20
+    lens = [offender_len, healthy_len]
+    total = sum(lens)
+
+    gen = torch.Generator(device=device).manual_seed(1)
+    x = torch.randn(1, total, n_heads, d_head, device=device, generator=gen)
+    dt = torch.ones(1, total, n_heads, device=device)
+    dt[0, 0, 0] = torch.inf
+    A = torch.full((n_heads,), -1.0, device=device)
+    B = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+    C = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+
+    assert float(torch.exp(torch.tensor(-128.0, dtype=torch.float32))) == 0.0, (
+        "this reproduction depends on exp(-128) underflowing to exact 0 in fp32"
+    )
+
+    seq_idx = torch.repeat_interleave(
+        torch.arange(len(lens), dtype=torch.int32, device=device),
+        torch.tensor(lens, device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor(
+        [0, offender_len, offender_len + healthy_len], dtype=torch.int32, device=device
+    )
+    packed_out = torch.empty_like(x)
+    packed_states = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=packed_out,
+        return_varlen_states=True,
+    )
+
+    def run_alone(start, n):
+        xs, dts, Bs, Cs = (
+            x[:, start : start + n],
+            dt[:, start : start + n],
+            B[:, start : start + n],
+            C[:, start : start + n],
+        )
+        out = torch.empty_like(xs)
+        state = mamba_chunk_scan_combined(
+            xs, dts, A, Bs, Cs, chunk_size, out=out, return_final_states=True
+        )[0]
+        return out, state
+
+    alone_off_out, _alone_off_state = run_alone(0, offender_len)
+    alone_healthy_out, alone_healthy_state = run_alone(offender_len, healthy_len)
+
+    packed_off_last = packed_out[0, offender_len - 1]
+    assert torch.isnan(packed_off_last).all(), "offender's last token should be nan"
+    assert torch.equal(
+        torch.isnan(packed_off_last), torch.isnan(alone_off_out[0, -1])
+    ), "offender's own non-finite classification diverged from its standalone run"
+
+    healthy_out = packed_out[:, offender_len:]
+    assert healthy_out.isfinite().all()
+    assert packed_states[1].isfinite().all()
+    torch.testing.assert_close(healthy_out, alone_healthy_out, rtol=1e-3, atol=1e-3)
+    torch.testing.assert_close(
+        packed_states[1], alone_healthy_state, rtol=1e-3, atol=1e-3
+    )
+
+
+def test_mamba_chunk_scan_isolates_nonfinite_channel_from_other_request():
+    """BBuf review (PR 51342): two fresh requests (no carried/init state) packed
+    into one chunk can each carry a non-finite value in a DIFFERENT channel of
+    the same head. The old select (`own_has_nonfinite[:, None]`) was a per-row
+    flag broadcast across every channel, so once a row's own sequence owned a
+    non-finite value in ANY channel, `dot_raw` was picked for ALL of that row's
+    channels -- including ones where the row's own data was finite but another
+    packed request's `0 * nan` leaked in. Each request's output must match its
+    standalone run exactly in every channel it does not itself corrupt, and its
+    own non-finite channel must still surface as non-finite, matching standalone.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, d_state = 1, 8, 8
+    len_a, len_b, chunk_size = 4, 4, 16  # both fresh requests share one tile
+    total = len_a + len_b
+
+    gen = torch.Generator(device=device).manual_seed(7)
+    x = torch.randn(1, total, n_heads, d_head, device=device, generator=gen)
+    dt = torch.rand(1, total, n_heads, device=device, generator=gen) * 0.1 + 0.01
+    A = -(torch.rand(n_heads, device=device, generator=gen) + 0.5)
+    B = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+    C = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+
+    chan_a, chan_b = 1, 5  # different channels of the same (only) head
+    x[0, 1, 0, chan_a] = torch.nan  # request A's own non-finite channel
+    x[0, len_a + 1, 0, chan_b] = torch.inf  # request B's own non-finite channel
+
+    seq_idx = torch.repeat_interleave(
+        torch.arange(2, dtype=torch.int32, device=device),
+        torch.tensor([len_a, len_b], device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor([0, len_a, total], dtype=torch.int32, device=device)
+
+    packed_out = torch.empty_like(x)
+    mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=packed_out,
+        return_varlen_states=True,
+    )
+
+    def run_alone(start, n):
+        sl = slice(start, start + n)
+        alone_out = torch.empty_like(x[:, sl])
+        mamba_chunk_scan_combined(
+            x[:, sl], dt[:, sl], A, B[:, sl], C[:, sl], chunk_size, out=alone_out
+        )
+        return alone_out
+
+    alone_a = run_alone(0, len_a)
+    alone_b = run_alone(len_a, len_b)
+
+    other_chans_a = [c for c in range(d_head) if c != chan_a]
+    torch.testing.assert_close(
+        packed_out[:, :len_a, :, other_chans_a],
+        alone_a[:, :, :, other_chans_a],
+        rtol=1e-3,
+        atol=1e-3,
+        msg="request A's channels untouched by its own nan must match its standalone run",
+    )
+    assert not packed_out[:, :len_a, :, chan_a].isfinite().all(), (
+        "request A's own non-finite channel must still surface as non-finite"
+    )
+
+    other_chans_b = [c for c in range(d_head) if c != chan_b]
+    torch.testing.assert_close(
+        packed_out[:, len_a:, :, other_chans_b],
+        alone_b[:, :, :, other_chans_b],
+        rtol=1e-3,
+        atol=1e-3,
+        msg="request B's channels untouched by its own inf must match its standalone run",
+    )
+    assert not packed_out[:, len_a:, :, chan_b].isfinite().all(), (
+        "request B's own non-finite channel must still surface as non-finite"
+    )
+
+
+def test_mamba_chunk_scan_future_nonfinite_does_not_reach_earlier_token():
+    """BBuf review (PR 51342): lengths [1, 257, 1] with chunk_size 256 put the
+    middle request's tokens 255 and 256 in the same physical chunk (global
+    positions 256 and 257) alongside a sequence boundary. A non-finite x at
+    token 256 is a FUTURE token for token 255: it is already zeroed in cb by the
+    causal mask, but a non-causal ownership flag still counted it and picked
+    `dot_raw` for token 255, where 0 * nan made a token that is finite when run
+    alone non-finite only when packed. Token 255 must match its standalone run;
+    token 256 itself must still surface as non-finite.
+    """
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    n_heads, d_head, d_state, chunk_size = 1, 8, 8, 256
+    lens = [1, 257, 1]
+    total = sum(lens)
+    mid_start = lens[0]
+
+    gen = torch.Generator(device=device).manual_seed(11)
+    x = torch.randn(1, total, n_heads, d_head, device=device, generator=gen)
+    dt = torch.rand(1, total, n_heads, device=device, generator=gen) * 0.1 + 0.01
+    A = -(torch.rand(n_heads, device=device, generator=gen) + 0.5)
+    B = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+    C = torch.randn(1, total, 1, d_state, device=device, generator=gen) * 0.5
+    x[0, mid_start + 256, 0, 3] = torch.nan  # middle request's token 256
+
+    seq_idx = torch.repeat_interleave(
+        torch.arange(len(lens), dtype=torch.int32, device=device),
+        torch.tensor(lens, device=device),
+    ).unsqueeze(0)
+    cu_seqlens = torch.tensor(
+        [0, lens[0], lens[0] + lens[1], total], dtype=torch.int32, device=device
+    )
+
+    packed_out = torch.empty_like(x)
+    mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        seq_idx=seq_idx,
+        cu_seqlens=cu_seqlens,
+        out=packed_out,
+        return_varlen_states=True,
+    )
+
+    sl = slice(mid_start, mid_start + lens[1])
+    alone_out = torch.empty_like(x[:, sl])
+    mamba_chunk_scan_combined(
+        x[:, sl], dt[:, sl], A, B[:, sl], C[:, sl], chunk_size, out=alone_out
+    )
+
+    assert alone_out[0, 255].isfinite().all(), "premise: token 255 finite alone"
+    assert packed_out[0, mid_start + 255].isfinite().all(), (
+        "future nan at token 256 leaked into token 255 only when packed"
+    )
+    torch.testing.assert_close(
+        packed_out[0, mid_start + 255],
+        alone_out[0, 255],
+        rtol=1e-3,
+        atol=1e-3,
+    )
+    assert not packed_out[0, mid_start + 256].isfinite().all(), (
+        "the offending token itself must still surface as non-finite"
+    )
+    assert packed_out[0, mid_start + lens[1]].isfinite().all(), (
+        "the third request must stay finite"
+    )
+
+
 if __name__ == "__main__":
     import sys
 
