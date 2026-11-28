@@ -597,6 +597,7 @@ def register_fake_ops(tp_size: int):
         "fused_add_layernorm_cpu",
         "l2norm_cpu",
         "fused_rmsnorm_gated_cpu",
+        "mamba_gated_rmsnorm_cpu",
         "shared_expert_cpu",
         "causal_conv1d_update_cpu",
         "causal_conv1d_fwd_cpu",

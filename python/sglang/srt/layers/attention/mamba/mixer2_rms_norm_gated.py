@@ -117,6 +117,30 @@ class Mixer2RMSNormGated(BaseFusedOp):
 
         return self.weight * x.to(input_dtype)
 
+    def forward_cpu(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+    ):
+        # Fused sgl-kernel path for the collective-free cases: either a single
+        # group on one rank, or each rank owning whole groups.
+        local_group_ok = self.n_groups % self.tp_size == 0 and (
+            self.n_groups > 1 or self.tp_size == 1
+        )
+        if (
+            not self.use_rms_norm
+            or not local_group_ok
+            or x.dim() != 2
+            or x.dtype not in (torch.bfloat16, torch.float16)
+            or gate.dtype != x.dtype
+            or x.stride(-1) != 1
+            or gate.stride(-1) != 1
+        ):
+            return self.forward_native(x, gate)
+        return torch.ops.sgl_kernel.mamba_gated_rmsnorm_cpu(
+            x, gate, self.weight, self.group_size, self.variance_epsilon
+        )
+
     def forward_cuda(
         self,
         x: torch.Tensor,

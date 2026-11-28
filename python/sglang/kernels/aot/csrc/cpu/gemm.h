@@ -71,6 +71,7 @@ enum class CPUActMethod : int {
   silu_and_mul = 0,
   swiglu = 1,
   gelu_and_mul = 2,
+  relu2 = 3,
 };
 
 // swiglu is selected by its (alpha, limit) parameters rather than by name and
@@ -90,7 +91,10 @@ inline CPUActMethod act_method_from_string(const std::optional<std::string>& act
   if (activation.value() == "gelu") {
     return CPUActMethod::gelu_and_mul;
   }
-  TORCH_CHECK(false, "Unsupported activation: ", activation.value(), ". Supported: silu, gelu");
+  if (activation.value() == "relu2") {
+    return CPUActMethod::relu2;
+  }
+  TORCH_CHECK(false, "Unsupported activation: ", activation.value(), ". Supported: silu, gelu, relu2");
 }
 
 enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4 };

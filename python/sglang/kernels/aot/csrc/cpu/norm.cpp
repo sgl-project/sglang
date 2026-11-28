@@ -1,3 +1,5 @@
+#include <ATen/record_function.h>
+
 #include "common.h"
 #include "vec.h"
 
@@ -839,6 +841,95 @@ at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Te
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_rmsnorm_gated_kernel", [&] {
     norm4d_kernel_impl<NormMode::RMSNormGated, scalar_t>(
         output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), p, gate.data_ptr<scalar_t>());
+  });
+  return output;
+}
+
+// Mamba2 gated RMSNorm (norm after gate), grouped:
+//   y = weight * rmsnorm_group(x * SiLU(gate))
+// input : {num_tokens, hidden_size}, last dim contiguous
+// gate  : {num_tokens, hidden_size}, last dim contiguous (may be a strided split view)
+// weight: {hidden_size}
+// group_size must divide hidden_size
+at::Tensor mamba_gated_rmsnorm_cpu(
+    const at::Tensor& input, const at::Tensor& gate, const at::Tensor& weight, int64_t group_size, double eps) {
+  RECORD_FUNCTION("sgl-kernel::mamba_gated_rmsnorm_cpu", std::vector<c10::IValue>({input, gate}));
+  CHECK_DIM(2, input);
+  CHECK_DIM(2, gate);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(gate);
+  const auto st = input.scalar_type();
+  const int64_t M = input.size(0);
+  const int64_t hidden = input.size(1);
+  CHECK_EQ(gate.size(0), M);
+  CHECK_EQ(gate.size(1), hidden);
+  CHECK_EQ(gate.scalar_type(), st);
+  CHECK_EQ(weight.numel(), hidden);
+  TORCH_CHECK(group_size > 0 && hidden % group_size == 0, "group_size must divide hidden_size");
+  auto w = weight.to(st).contiguous();
+  at::Tensor output = at::empty({M, hidden}, input.options());
+  const int64_t ngroups = hidden / group_size;
+  const int64_t in_stride = input.stride(0);
+  const int64_t g_stride = gate.stride(0);
+  const float feps = static_cast<float>(eps);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "mamba_gated_rmsnorm_kernel", [&] {
+    using bVec = at::vec::Vectorized<scalar_t>;
+    using fVec = at::vec::Vectorized<float>;
+    constexpr int64_t kVecSize = bVec::size();
+    const scalar_t* in_ptr = input.data_ptr<scalar_t>();
+    const scalar_t* g_ptr = gate.data_ptr<scalar_t>();
+    const scalar_t* w_ptr = w.data_ptr<scalar_t>();
+    scalar_t* out_ptr = output.data_ptr<scalar_t>();
+    const fVec one(1.f);
+
+    at::parallel_for(0, M * ngroups, 0, [&](int64_t begin, int64_t end) {
+      std::vector<float> buf(group_size);
+      for (int64_t i = begin; i < end; ++i) {
+        const int64_t m = i / ngroups;
+        const int64_t off = (i % ngroups) * group_size;
+        const scalar_t* x = in_ptr + m * in_stride + off;
+        const scalar_t* g = g_ptr + m * g_stride + off;
+        const scalar_t* wp = w_ptr + off;
+        scalar_t* y = out_ptr + m * hidden + off;
+
+        // pass 1: v = x * silu(g), accumulate v^2
+        fVec acc(0.f);
+        float acc_s = 0.f;
+        int64_t d = 0;
+        for (; d <= group_size - kVecSize; d += kVecSize) {
+          auto [x0, x1] = at::vec::convert_to_float<scalar_t>(bVec::loadu(x + d));
+          auto [g0, g1] = at::vec::convert_to_float<scalar_t>(bVec::loadu(g + d));
+          x0 = x0 * (g0 / (one + g0.neg().exp_u20()));
+          x1 = x1 * (g1 / (one + g1.neg().exp_u20()));
+          x0.store(buf.data() + d);
+          x1.store(buf.data() + d + fVec::size());
+          acc = at::vec::fmadd(x0, x0, acc);
+          acc = at::vec::fmadd(x1, x1, acc);
+        }
+        for (; d < group_size; ++d) {
+          const float gv = static_cast<float>(g[d]);
+          const float v = static_cast<float>(x[d]) * (gv / (1.f + std::exp(-gv)));
+          buf[d] = v;
+          acc_s += v * v;
+        }
+        const float var = (acc_s + vec_reduce_sum(acc)) / static_cast<float>(group_size);
+        const float rs = 1.f / std::sqrt(var + feps);
+        const fVec vrs(rs);
+
+        // pass 2: y = v * rs * w
+        d = 0;
+        for (; d <= group_size - kVecSize; d += kVecSize) {
+          auto [w0, w1] = at::vec::convert_to_float<scalar_t>(bVec::loadu(wp + d));
+          fVec v0 = fVec::loadu(buf.data() + d) * vrs * w0;
+          fVec v1 = fVec::loadu(buf.data() + d + fVec::size()) * vrs * w1;
+          convert_from_float_ext<scalar_t>(v0, v1).store(y + d);
+        }
+        for (; d < group_size; ++d) {
+          y[d] = static_cast<scalar_t>(buf[d] * rs * static_cast<float>(wp[d]));
+        }
+      }
+    });
   });
   return output;
 }

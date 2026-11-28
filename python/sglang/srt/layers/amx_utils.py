@@ -148,6 +148,9 @@ def _amx_process_weight_after_loading(
 
     is_conv_weight = False
     if qweight_packed_method is None:
+        # Pre-validate all target weights first so packing is atomic per module:
+        # if any weight is unsupported, skip packing all of them.
+        prepared_weights = []
         for i, weight_name in enumerate(weight_names):
             weight_tensor = getattr(module, weight_name)
 
@@ -166,6 +169,9 @@ def _amx_process_weight_after_loading(
                 module.use_intel_amx_backend = False
                 return
 
+            prepared_weights.append((weight_name, weight_tensor, is_conv_weight))
+
+        for weight_name, weight_tensor, is_conv_weight in prepared_weights:
             packed_weight = torch.nn.Parameter(
                 amx_process_weight_after_loading(weight_tensor, is_conv_weight),
                 requires_grad=False,

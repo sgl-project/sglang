@@ -72,6 +72,10 @@ std::tuple<at::Tensor, at::Tensor> fused_scale_residual_norm_scale_shift_cpu(
 // qwen3_next_rmsnorm_gated
 at::Tensor fused_rmsnorm_gated_cpu(at::Tensor& input, at::Tensor& weight, at::Tensor& gate, double eps);
 
+// mamba2 gated rmsnorm (gate applied before grouped norm)
+at::Tensor mamba_gated_rmsnorm_cpu(
+    const at::Tensor& input, const at::Tensor& gate, const at::Tensor& weight, int64_t group_size, double eps);
+
 // fused_add_rmsnorm
 void fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps);
@@ -327,6 +331,59 @@ at::Tensor chunk_gated_delta_rule_cpu(
     bool use_qk_l2norm_in_kernel,
     const at::Tensor& initial_state_indices,
     double eps = 1e-6);
+
+at::Tensor selective_state_update_cpu(
+    at::Tensor& state,
+    const at::Tensor& x,
+    const at::Tensor& dt,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    const std::optional<at::Tensor>& D,
+    const std::optional<at::Tensor>& z,
+    const std::optional<at::Tensor>& dt_bias,
+    bool dt_softplus,
+    const std::optional<at::Tensor>& state_batch_indices,
+    int64_t pad_slot_id,
+    bool disable_state_update,
+    const std::optional<at::Tensor>& out);
+
+std::tuple<at::Tensor, at::Tensor> mamba_chunk_scan_combined_cpu(
+    const at::Tensor& x,
+    const at::Tensor& dt,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    int64_t chunk_size,
+    const std::optional<at::Tensor>& D,
+    const std::optional<at::Tensor>& z,
+    const std::optional<at::Tensor>& dt_bias,
+    const std::optional<at::Tensor>& initial_states,
+    bool dt_softplus,
+    double dt_min,
+    double dt_max,
+    const std::optional<at::ScalarType>& state_dtype,
+    const std::optional<at::Tensor>& out);
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> mamba_chunk_scan_combined_varlen_cpu(
+    const at::Tensor& x,
+    const at::Tensor& dt,
+    const at::Tensor& A,
+    const at::Tensor& B,
+    const at::Tensor& C,
+    int64_t chunk_size,
+    const std::optional<at::Tensor>& D,
+    const std::optional<at::Tensor>& z,
+    const std::optional<at::Tensor>& dt_bias,
+    const std::optional<at::Tensor>& initial_states,
+    const at::Tensor& cu_seqlens,
+    const std::optional<at::Tensor>& state_seq_idx,
+    const std::optional<at::Tensor>& state_pos,
+    bool dt_softplus,
+    double dt_min,
+    double dt_max,
+    const std::optional<at::ScalarType>& state_dtype,
+    const std::optional<at::Tensor>& out);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -677,6 +734,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("l2norm_cpu", torch::kCPU, &l2norm_cpu);
   m.def("fused_rmsnorm_gated_cpu(Tensor input, Tensor weight, Tensor gate, float eps) -> Tensor");
   m.impl("fused_rmsnorm_gated_cpu", torch::kCPU, &fused_rmsnorm_gated_cpu);
+  m.def("mamba_gated_rmsnorm_cpu(Tensor input, Tensor gate, Tensor weight, int group_size, float eps) -> Tensor");
+  m.impl("mamba_gated_rmsnorm_cpu", torch::kCPU, &mamba_gated_rmsnorm_cpu);
   m.def("fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
   m.impl("fused_add_rmsnorm_cpu", torch::kCPU, &fused_add_rmsnorm_cpu);
   m.def("gemma_fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor(a!) residual, Tensor weight, float eps) -> ()");
@@ -858,6 +917,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor(a!) initial_state, bool output_final_state, Tensor cu_seqlens, bool head_first, "
       "bool use_qk_l2norm_in_kernel, Tensor initial_state_indices, float eps=1e-6) -> Tensor");
   m.impl("chunk_gated_delta_rule_cpu", torch::kCPU, &chunk_gated_delta_rule_cpu);
+
+  m.def(
+      "selective_state_update_cpu(Tensor(a!) state, Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C, "
+      "Tensor? D, Tensor? z, Tensor? dt_bias, bool dt_softplus, Tensor? state_batch_indices, "
+      "int pad_slot_id, bool disable_state_update, Tensor? out) -> Tensor");
+  m.impl("selective_state_update_cpu", torch::kCPU, &selective_state_update_cpu);
+
+  m.def(
+      "mamba_chunk_scan_combined_cpu(Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C, int chunk_size, "
+      "Tensor? D, Tensor? z, Tensor? dt_bias, Tensor? initial_states, bool dt_softplus, float dt_min, "
+      "float dt_max, ScalarType? state_dtype, Tensor? out) -> (Tensor, Tensor)");
+  m.impl("mamba_chunk_scan_combined_cpu", torch::kCPU, &mamba_chunk_scan_combined_cpu);
+
+  m.def(
+      "mamba_chunk_scan_combined_varlen_cpu(Tensor x, Tensor dt, Tensor A, Tensor B, Tensor C, int chunk_size, "
+      "Tensor? D, Tensor? z, Tensor? dt_bias, Tensor? initial_states, Tensor cu_seqlens, Tensor? state_seq_idx, "
+      "Tensor? state_pos, bool dt_softplus, float dt_min, float dt_max, ScalarType? state_dtype, Tensor? out) "
+      "-> (Tensor, Tensor, Tensor)");
+  m.impl("mamba_chunk_scan_combined_varlen_cpu", torch::kCPU, &mamba_chunk_scan_combined_varlen_cpu);
 
   // weight prepack
   m.def("convert_weight_packed(Tensor weight) -> Tensor");
