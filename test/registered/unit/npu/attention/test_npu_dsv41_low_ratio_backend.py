@@ -75,6 +75,10 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendAttnBackend,
     LowRatioCompressAscendBackendMixin,
 )
+from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
+    Dsv4PrefillGraphMetadata,
+    Dsv41PrefillGraphMetadata,
+)
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
@@ -146,6 +150,7 @@ def _low_ratio_backend(*, ratios=(1, 2), window=128):
     backend._dsv4_has_low_ratio = any(
         r in (1, 2) for r in backend._dsv4_compress_ratios
     )
+    backend._dsv4_is_v41_model = backend._dsv4_has_low_ratio
     backend._dsv4_sliding_window_size = window
     backend._dsv4_q_head_num = 64
     backend._dsv4_head_dim = 512
@@ -2462,6 +2467,423 @@ class TestDs41OperatorResolver(unittest.TestCase):
                 self.assertEqual(vars(resolved_entries), expected_entries)
             finally:
                 _real_ds41_ops.cache_clear()
+
+
+def _v41_prefill_backend():
+    backend = _low_ratio_backend()
+    backend.device = "cpu"
+    # Full request-pool rows, matching the eager extend block-table width.
+    backend.req_to_token_pool = SimpleNamespace(row_width=512)
+    backend.token_to_kv_pool.translate_loc_from_full_to_swa = lambda loc: loc
+    return backend
+
+
+def _v41_kernel_metadata():
+    return {
+        "win_metadata": torch.zeros(48, dtype=torch.int32),
+        "c1a_metadata": torch.zeros(48, dtype=torch.int32),
+        "c2a_metadata": torch.zeros(48, dtype=torch.int32),
+        "c1a_qli_metadata": torch.zeros(1024, dtype=torch.int32),
+        "c2a_qli_metadata": torch.zeros(1024, dtype=torch.int32),
+    }
+
+
+def _v41_prefill_seed(
+    *,
+    num_tokens,
+    extent,
+    prefix,
+    block_tables,
+    swa_page_table=None,
+    cycle=0,
+):
+    c2_capacity = min(num_tokens, num_tokens // 2 + 1)
+    return SimpleNamespace(
+        actual_seq_lengths_q=torch.tensor([extent], dtype=torch.int32),
+        actual_seq_lengths_q_pa=torch.tensor([0, extent], dtype=torch.int32),
+        actual_seq_lengths_kv=torch.tensor([prefix + extent], dtype=torch.int32),
+        seqused=torch.tensor([extent], dtype=torch.int32),
+        start_pos=torch.tensor([prefix], dtype=torch.int32),
+        positions_cmp_padding_c1=torch.zeros(num_tokens, dtype=torch.int64),
+        positions_cmp_padding_c2=torch.zeros(c2_capacity, dtype=torch.int64),
+        c1_loc=torch.full((num_tokens,), -1, dtype=torch.int32),
+        c2_loc=torch.full((c2_capacity,), -1, dtype=torch.int32),
+        block_tables=block_tables,
+        swa_page_table=(block_tables if swa_page_table is None else swa_page_table),
+        kernel_metadata=_v41_kernel_metadata(),
+        dsv4_cycle_state_block_table=torch.tensor([cycle], dtype=torch.int32),
+    )
+
+
+def _v41_prefill_batch(*, positions, out_cache_loc, req_index=2):
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+        global_num_token_non_padded_cpu=len(positions),
+        positions=torch.tensor(positions, dtype=torch.int64),
+        out_cache_loc=torch.tensor(out_cache_loc, dtype=torch.int64),
+        batch_size=1,
+        req_pool_indices=torch.tensor([req_index], dtype=torch.int32),
+    )
+
+
+class TestV41PrefillGraphMetadata(unittest.TestCase):
+    """The V4.1 contract owns capacity buffers and refreshes them in place."""
+
+    def _allocate(self, *, num_tokens=8, separate_swa=False):
+        backend = _v41_prefill_backend()
+        full = torch.tensor(
+            [[1, 2, 3, 4]] if separate_swa else [[0, 0, 0, 0]],
+            dtype=torch.int32,
+        )
+        swa = torch.tensor([[9, 9, 9, 9]], dtype=torch.int32) if separate_swa else full
+        seed = _v41_prefill_seed(
+            num_tokens=num_tokens,
+            extent=num_tokens,
+            prefix=0,
+            block_tables=full,
+            swa_page_table=swa,
+        )
+        state = Dsv41PrefillGraphMetadata.allocate(
+            backend=backend, seed=seed, num_tokens=num_tokens
+        )
+        return backend, seed, state, full, swa
+
+    def test_allocate_binds_generation_fields_and_shared_page_table(self):
+        _, seed, state, full, _ = self._allocate()
+        self.assertIsInstance(state, Dsv41PrefillGraphMetadata)
+        self.assertEqual(state.win_sparse_indices.shape, (8, 1, 128))
+        self.assertEqual(state.win_topk_length.shape, (8, 1))
+        self.assertEqual(state.cmp_topk_length[1].shape, (8, 1))
+        self.assertEqual(state.positions[2].shape, (5,))
+        self.assertEqual(state.locs[2].shape, (5,))
+        # The eager block tables are full request-pool width, not live width.
+        self.assertEqual(state.full_block_table.shape, (1, 4))
+        self.assertEqual(state.index_page_tables[1].shape, (1, 8))
+        self.assertEqual(state.index_page_tables[2].shape, (1, 4))
+        self.assertIs(seed.block_tables, state.full_block_table)
+        self.assertIs(seed.swa_page_table, state.swa_page_table)
+        self.assertIs(state.swa_page_table, state.full_block_table)
+        self.assertIs(seed.c1_page_table, state.full_block_table)
+        self.assertIs(seed.c2_page_table, state.full_block_table)
+        self.assertIs(seed.c1_index_page_table, state.index_page_tables[1])
+        self.assertIs(seed.c2_index_page_table, state.index_page_tables[2])
+        self.assertIs(seed.dsv41_win_sparse_indices, state.win_sparse_indices)
+        self.assertIs(seed.dsv4_prefill_graph_state, state)
+        self.assertIs(seed.kernel_metadata, state.kernel_metadata)
+        self.assertEqual(set(state.kernel_metadata), set(_v41_kernel_metadata()))
+        self.assertTrue(all(t.numel() >= 1024 for t in state.kernel_metadata.values()))
+        self.assertIsNone(seed.c1_topk_indices)
+        self.assertIsNone(seed.dsv41_candidate_blocks)
+        # The generation contracts are exclusive: no V4 c4/c128 fields or
+        # explicit per-token state tables leak into a V4.1 capture.
+        self.assertFalse(hasattr(seed, "positions_cmp_padding_c4"))
+        self.assertFalse(hasattr(seed, "c4_page_table"))
+        self.assertFalse(hasattr(seed, "c4_loc"))
+        self.assertEqual(seed.dsv4_explicit_state_block_tables, {})
+        self.assertFalse(hasattr(state, "state_tables"))
+        self.assertFalse(hasattr(state, "c4_page_table"))
+
+    def test_refresh_updates_in_place_and_neutralizes_dead_rows(self):
+        backend, seed, state, _, _ = self._allocate()
+        pointers = {
+            name: getattr(state, name).data_ptr()
+            for name in (
+                "full_block_table",
+                "swa_page_table",
+                "win_sparse_indices",
+                "win_topk_length",
+                "live_mask",
+                "positions_token",
+            )
+        }
+        live = _v41_prefill_seed(
+            num_tokens=8,
+            extent=5,
+            prefix=3,
+            block_tables=torch.tensor([[3, 4, 5, 6]], dtype=torch.int32),
+            cycle=2,
+        )
+        state.refresh(
+            backend=backend,
+            live=live,
+            forward_batch=_v41_prefill_batch(
+                positions=[3, 4, 5, 6, 7, 0, 0, 0],
+                out_cache_loc=[200, 201, 202, 203, 204],
+                req_index=2,
+            ),
+        )
+        for name, pointer in pointers.items():
+            self.assertEqual(getattr(state, name).data_ptr(), pointer)
+        self.assertEqual(state.positions_token.tolist(), [3, 4, 5, 6, 7, 0, 0, 0])
+        self.assertEqual(
+            state.live_mask.tolist(),
+            [True, True, True, True, True, False, False, False],
+        )
+        self.assertEqual(state.positions[1].tolist(), [3, 4, 5, 6, 7, 0, 0, 0])
+        self.assertEqual(state.locs[1].tolist(), [200, 201, 202, 203, 204, -1, -1, -1])
+        # ratio 2 keeps only group closers, compacted, with a skip tail.
+        self.assertEqual(state.positions[2].tolist(), [2, 4, 6, 0, 0])
+        self.assertEqual(state.locs[2].tolist(), [100, 101, 102, -1, -1])
+        self.assertEqual(state.win_topk_length[:, 0].tolist(), [4, 5, 6, 7, 8, 0, 0, 0])
+        self.assertEqual(
+            state.cmp_topk_length[1][:, 0].tolist(), [4, 5, 6, 7, 8, 0, 0, 0]
+        )
+        self.assertEqual(
+            state.cmp_topk_length[2][:, 0].tolist(), [2, 2, 3, 3, 4, 0, 0, 0]
+        )
+        self.assertEqual(state.full_block_table.tolist(), [[3, 4, 5, 6]])
+        self.assertEqual(state.cycle_state_block_table.tolist(), [2])
+        self.assertIs(seed.actual_seq_lengths_q_pa, state.actual_q_pa)
+        self.assertIs(seed.dsv41_live_mask_buf, state.live_mask)
+        self.assertEqual(
+            state.index_page_tables[1].tolist(), [[6, 7, 8, 9, 10, 11, 12, 13]]
+        )
+
+    def test_separate_swa_table_stays_distinct_from_the_full_table(self):
+        backend, seed, state, _, _ = self._allocate(separate_swa=True)
+        self.assertFalse(state.swa_shared_with_full)
+        self.assertIsNot(state.full_block_table, state.swa_page_table)
+        live = _v41_prefill_seed(
+            num_tokens=8,
+            extent=5,
+            prefix=3,
+            block_tables=torch.tensor([[1, 2, 3, 4]], dtype=torch.int32),
+            swa_page_table=torch.tensor([[5, 6, 7, 8]], dtype=torch.int32),
+        )
+        state.refresh(
+            backend=backend,
+            live=live,
+            forward_batch=_v41_prefill_batch(
+                positions=[3, 4, 5, 6, 7, 0, 0, 0],
+                out_cache_loc=[200, 201, 202, 203, 204],
+            ),
+        )
+        self.assertEqual(state.full_block_table.tolist(), [[1, 2, 3, 4]])
+        self.assertEqual(state.swa_page_table.tolist(), [[5, 6, 7, 8]])
+        self.assertIs(seed.c1_page_table, state.full_block_table)
+
+    def test_token_overflow_raises_instead_of_truncating(self):
+        backend, _, state, _, _ = self._allocate(num_tokens=8)
+        live = _v41_prefill_seed(
+            num_tokens=8,
+            extent=5,
+            prefix=3,
+            block_tables=torch.tensor([[3, 4, 5, 6]], dtype=torch.int32),
+        )
+        with self.assertRaisesRegex(RuntimeError, "token overflow"):
+            state.refresh(
+                backend=backend,
+                live=live,
+                forward_batch=_v41_prefill_batch(
+                    positions=[0, 1, 2, 3, 4, 5, 6, 7, 8],
+                    out_cache_loc=[200, 201, 202, 203, 204],
+                ),
+            )
+
+    def test_idle_replay_neutralizes_all_state(self):
+        backend, _, state, _, _ = self._allocate(num_tokens=4)
+        idle = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: True),
+            global_num_token_non_padded_cpu=0,
+        )
+        state.refresh(backend=backend, live=SimpleNamespace(), forward_batch=idle)
+        self.assertEqual(state.live_mask.tolist(), [False, False, False, False])
+        self.assertEqual(state.locs[1].tolist(), [-1, -1, -1, -1])
+        self.assertEqual(state.win_topk_length.tolist(), [[0], [0], [0], [0]])
+        self.assertEqual(state.win_sparse_indices[:, 0, 0].tolist(), [0, 0, 0, 0])
+        self.assertEqual(state.cycle_state_block_table.tolist(), [0])
+        self.assertEqual(state.actual_q_pa.tolist(), [0, 1])
+
+    def test_topk_outputs_are_kept_per_layer(self):
+        _, _, state, _, _ = self._allocate()
+        first = torch.zeros((8, 4), dtype=torch.int32)
+        second = torch.ones((8, 4), dtype=torch.int32)
+        self.assertIs(state.stage_topk(3, first), first)
+        self.assertIs(state.stage_topk(4, second), second)
+        self.assertIs(state.topk_by_layer[3], first)
+        self.assertIs(state.topk_by_layer[4], second)
+
+
+class TestV41TopkSourceResolution(unittest.TestCase):
+    """Consumer layers read the last same-ratio index source's top-k."""
+
+    def _backend(self):
+        backend = _low_ratio_backend()
+        backend._dsv4_compress_ratios = [0, 1, 1, 2, 2, 1, 1, 2, 2]
+        backend._dsv41_index_source_layers = (1, 3, 5, 7)
+        return backend
+
+    def test_consumers_resolve_to_the_preceding_same_ratio_source(self):
+        backend = self._backend()
+        self.assertEqual(backend._dsv41_topk_source_for(2, 1), 1)
+        self.assertEqual(backend._dsv41_topk_source_for(4, 2), 3)
+        self.assertEqual(backend._dsv41_topk_source_for(6, 1), 5)
+        self.assertEqual(backend._dsv41_topk_source_for(8, 2), 7)
+        # A source layer resolves to itself; before any source there is none.
+        self.assertEqual(backend._dsv41_topk_source_for(3, 2), 3)
+        self.assertIsNone(backend._dsv41_topk_source_for(0, 1))
+        self.assertIsNone(backend._dsv41_topk_source_for(2, 2))
+
+    def test_consumer_reads_the_sources_staged_output(self):
+        backend = self._backend()
+        staged = torch.ones(3, dtype=torch.int32)
+        shared = torch.zeros(3, dtype=torch.int32)
+        fm = SimpleNamespace(
+            dsv4_prefill_graph_state=SimpleNamespace(topk_by_layer={3: staged}),
+            c2_topk_indices=shared,
+        )
+        self.assertIs(backend._dsv41_topk_for_layer(fm, 4, 2), staged)
+        self.assertIs(backend._dsv41_topk_for_layer(fm, 3, 2), staged)
+        # Eager metadata has no graph state: the shared attribute is the
+        # current source's output.
+        eager = SimpleNamespace(c2_topk_indices=shared)
+        self.assertIs(backend._dsv41_topk_for_layer(eager, 4, 2), shared)
+
+
+class TestV41DispatchMetadata(unittest.TestCase):
+    """Capacity buffers must produce the same dispatch key set as eager."""
+
+    def test_attention_keys_and_dead_rows(self):
+        backend = _low_ratio_backend(window=4)
+        win = torch.zeros((6, 1), dtype=torch.int32)
+        cmp_1 = torch.zeros((6, 1), dtype=torch.int32)
+        cmp_2 = torch.zeros((6, 1), dtype=torch.int32)
+        out = backend._dsv41_attention_dispatch_metadata(
+            cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32),
+            win_lengths=win,
+            cmp_lengths_by_ratio={1: cmp_1, 2: cmp_2},
+        )
+        self.assertEqual(set(out), {"win_metadata", "c1a_metadata", "c2a_metadata"})
+
+    def test_index_candidate_keys_follow_the_configured_source(self):
+        backend = _low_ratio_backend()
+        backend._dsv41_candidate_source_layer = 1
+        backend._dsv41_candidate_topk_blocks = 64
+        backend._dsv41_candidate_block_size = 8
+        backend._dsv41_index_source_layers = (1, 2)
+        out = backend._dsv41_index_dispatch_metadata(
+            cu_seqlens_q=torch.tensor([0, 4], dtype=torch.int32),
+            kv_lens=torch.tensor([4], dtype=torch.int32),
+            positions=torch.arange(4, dtype=torch.int64),
+            batch_size=1,
+        )
+        self.assertEqual(
+            set(out),
+            {
+                "c1a_qli_metadata",
+                "c2a_qli_metadata",
+                "c1a_qli_candidate_metadata",
+                "c1a_qsli_metadata",
+            },
+        )
+
+    def test_window_capacity_tail_has_negative_one_and_zero_length(self):
+        backend = _low_ratio_backend(window=4)
+        positions = torch.tensor([0, 1, 0, 0], dtype=torch.int64)
+        live = torch.tensor([True, True, False, False])
+        indices = torch.zeros((4, 1, 4), dtype=torch.int32)
+        lengths = torch.zeros((4, 1), dtype=torch.int32)
+        backend._dsv41_fill_window_buffers(
+            positions=positions, live_mask=live, indices=indices, lengths=lengths
+        )
+        self.assertEqual(lengths[:, 0].tolist(), [1, 2, 0, 0])
+        self.assertEqual(
+            indices[:, 0, :].tolist(),
+            [[0, -1, -1, -1], [0, 1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1]],
+        )
+
+
+class TestV41PrefillCapability(unittest.TestCase):
+    """The contract gate is one switch for metadata, source and attention."""
+
+    def _backend(self, *, low_ratio=True):
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend._dsv4_has_low_ratio = low_ratio
+        backend._dsv4_is_v41_model = low_ratio
+        backend.is_draft_worker = False
+        backend._dsv41_candidate_source_layer = -1
+        return backend
+
+    def _patch(self, *, breakable=True, arch35=True, cp=1, dcp=1, pp=1):
+        return patch.multiple(
+            dsv4_backend,
+            check_cuda_graph_backend=MagicMock(return_value=breakable),
+            get_parallel=MagicMock(
+                return_value=SimpleNamespace(
+                    attn_cp_size=cp, attn_dcp_size=dcp, pp_size=pp
+                )
+            ),
+            is_npu_arch35=MagicMock(return_value=arch35),
+        )
+
+    def test_prefill_graph_off_keeps_v41_on_the_eager_break_path(self):
+        with self._patch(breakable=False):
+            self.assertFalse(self._backend()._supports_dsv4_prefill_graph_capture())
+
+    def test_supported_v41_config_is_accepted(self):
+        with self._patch():
+            self.assertTrue(self._backend()._supports_dsv4_prefill_graph_capture())
+
+    def test_v4_path_is_unchanged(self):
+        with self._patch():
+            self.assertTrue(
+                self._backend(low_ratio=False)._supports_dsv4_prefill_graph_capture()
+            )
+
+    def test_metadata_protocol_is_selected_by_generation(self):
+        self.assertIs(
+            self._backend()._prefill_graph_metadata_cls(),
+            Dsv41PrefillGraphMetadata,
+        )
+        self.assertIs(
+            self._backend(low_ratio=False)._prefill_graph_metadata_cls(),
+            Dsv4PrefillGraphMetadata,
+        )
+
+    def test_unsupported_parallel_is_rejected_and_a3_stays_eager(self):
+        with self._patch(cp=2):
+            with self.assertRaisesRegex(ValueError, "without CP/DCP"):
+                self._backend()._supports_dsv4_prefill_graph_capture()
+        with self._patch(pp=2):
+            with self.assertRaisesRegex(ValueError, "requires PP=1"):
+                self._backend()._supports_dsv4_prefill_graph_capture()
+        with self._patch(arch35=False):
+            # A3 has no C1/C2 index or candidate buffers; the capability gate
+            # falls back to eager instead of raising.
+            self.assertFalse(self._backend()._supports_dsv4_prefill_graph_capture())
+
+
+class TestV41PrefillAdmission(unittest.TestCase):
+    def test_mixed_and_over_context_batches_are_rejected(self):
+        backend = _low_ratio_backend()
+        backend.max_context_len = 10
+        mixed = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_mixed=lambda: True, is_idle=lambda: False),
+            _original_forward_mode=None,
+            seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+        )
+        self.assertFalse(backend.can_run_prefill_cuda_graph(mixed))
+        self.assertFalse(backend.vote_prefill_cuda_graph(mixed))
+        long = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_mixed=lambda: False, is_idle=lambda: False),
+            _original_forward_mode=None,
+            seq_lens_cpu=torch.tensor([11], dtype=torch.int32),
+        )
+        self.assertFalse(backend.can_run_prefill_cuda_graph(long))
+        self.assertFalse(backend.vote_prefill_cuda_graph(long))
+        converted = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_mixed=lambda: False, is_idle=lambda: False),
+            _original_forward_mode=SimpleNamespace(is_decode=lambda: True),
+            seq_lens_cpu=torch.tensor([1], dtype=torch.int32),
+        )
+        self.assertFalse(backend.can_run_prefill_cuda_graph(converted))
+        ok = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_mixed=lambda: False, is_idle=lambda: False),
+            _original_forward_mode=None,
+            seq_lens_cpu=torch.tensor([9], dtype=torch.int32),
+        )
+        self.assertTrue(backend.can_run_prefill_cuda_graph(ok))
+        self.assertTrue(backend.vote_prefill_cuda_graph(ok))
 
 
 if __name__ == "__main__":

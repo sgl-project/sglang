@@ -22,6 +22,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
 from sglang.srt.hardware_backend.npu.attention.dsv4_prefill_graph import (
     MAX_PREFILL_GRAPH_REQS,
     Dsv4PrefillGraphMetadata,
+    Dsv41PrefillGraphMetadata,
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos_sin
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
@@ -1289,14 +1290,17 @@ class LowRatioCompressAscendBackendMixin:
     Mirrors ``DeepseekV4AttnBackend.forward_low_ratio_sources`` but keeps its own
     orchestration: ``deepseek_v4_backend`` imports Triton kernels at module scope,
     and the two generations differ in kernels and cache row formats. The
-    context-parallel and prefill-graph branches are CUDA-only.
+    context-parallel branches are CUDA-only.  The prefill-graph contract is
+    enabled on NPU by the concrete backend once the V4.1 fixed metadata is
+    complete; when enabled, sources and attention are captured as one flow.
 
     Unlike CUDA, the compress step hands its pre-RoPE ``latent`` to the index
     step, because ``indexer_prologue_k`` projects the index K from that latent.
     """
 
-    # The prefill-graph contract is CUDA-only; ``_low_ratio_sources_break``
-    # short-circuits on ``is_in_breakable_cuda_graph()`` before this attr is read.
+    # Instance value when the V4.1 prefill-graph contract is active; this class
+    # default keeps sources at an eager break.  ``_low_ratio_sources_break``
+    # reads it only inside a breakable graph scope.
     low_ratio_prefill_graph = False
     # Read by ``_low_ratio_compress`` below; still unset on NPU because the
     # replay-tail path that writes it is CUDA-only, so it stays None.
@@ -1443,6 +1447,12 @@ class LowRatioCompressAscendBackendMixin:
             topk = self._dsv41_index_qsli_topk(layer, x, q_lora, pos, forward_batch)
         else:
             topk, _ = self._dsv41_index_full_topk(layer, x, q_lora, pos, forward_batch)
+        graph_state = getattr(fm, "dsv4_prefill_graph_state", None)
+        if graph_state is not None:
+            # One output per layer; the shared attribute only remembers the
+            # last capture-time assignment.  Attention reads this map back by
+            # layer id when its body runs at replay (or at an eager break).
+            topk = graph_state.stage_topk(layer.layer_id, topk)
         setattr(fm, f"c{ratio}_topk_indices", topk)
         # No indexer-topk capture: the capturer is sized from ratio-4 layers,
         # which V4.1 has none of, and compress_layer_id collides across ratios.
@@ -1843,94 +1853,110 @@ class LowRatioCompressAscendBackendMixin:
             # arch22 LI V2/V3 and SLI do not consume a metadata tensor.
             return {}
         fm = self.forward_metadata
-        kv_lens = self._dsv41_qli_kv_lens(forward_batch)
         cu_seqlens_q = fm.actual_seq_lengths_q_pa
         if cu_seqlens_q is None:
             return {}
-        ds41 = _ds41_ops()
-        out: dict = {}
-
-        def keep(key: str, metadata: torch.Tensor) -> None:
+        out = self._dsv41_index_dispatch_metadata(
+            cu_seqlens_q=cu_seqlens_q,
+            kv_lens=self._dsv41_qli_kv_lens(forward_batch),
+            positions=forward_batch.positions.reshape(-1),
+            batch_size=int(forward_batch.batch_size),
+        )
+        kept: dict = {}
+        for key, value in out.items():
             # aclgraph binds the address at capture: refresh in place.
             buf = fm.kernel_metadata.get(key)
-            if buf is not None and buf.shape == metadata.shape:
-                buf.copy_(metadata)
-                metadata = buf
-            out[key] = metadata
+            if buf is not None and buf.shape == value.shape:
+                buf.copy_(value)
+                value = buf
+            kept[key] = value
+        return kept
 
-        batch_size = int(forward_batch.batch_size)
+    def _dsv41_index_dispatch_metadata(
+        self,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        kv_lens: torch.Tensor,
+        positions: torch.Tensor,
+        batch_size: int,
+    ) -> dict:
+        """Build the QLI/QSLI/candidate dispatch tables from explicit tensors.
+
+        ``positions`` and ``kv_lens`` may be live-sized (eager) or the
+        capacity-sized buffers of a captured bucket (prefill replay); the
+        caller decides.  Keeping this pure lets both paths share one formula
+        instead of relying on ``ForwardMetadata`` side effects.
+        """
+        ds41 = _ds41_ops()
+        out: dict = {}
         for ratio in self._dsv41_low_ratios():
             cmp_lens = (kv_lens // ratio).to(torch.int32)
-            keep(
-                f"c{ratio}a_qli_metadata",
-                ds41.quant_lightning_indexer_metadata_dsl(
-                    cu_seqlens_q=cu_seqlens_q,
-                    seqused_q=None,
-                    seqused_k=cmp_lens,
-                    # mask_mode=3 + cmp_ratio != 1 requires the residual (README).
-                    cmp_residual_k=(
-                        None if ratio == 1 else (kv_lens % ratio).to(torch.int32)
-                    ),
-                    batch_size=batch_size,
-                    num_heads_q=self._dsv4_index_n_heads,
-                    num_heads_k=1,
-                    head_dim=self._dsv4_index_head_dim,
-                    topk=self._dsv4_index_topk,
-                    mask_mode=3,
-                    cmp_ratio=ratio,
-                    layout_q="TND",
-                    layout_k="PA_BBND",
+            out[f"c{ratio}a_qli_metadata"] = ds41.quant_lightning_indexer_metadata_dsl(
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_q=None,
+                seqused_k=cmp_lens,
+                # mask_mode=3 + cmp_ratio != 1 requires the residual (README).
+                cmp_residual_k=(
+                    None if ratio == 1 else (kv_lens % ratio).to(torch.int32)
                 ),
+                batch_size=batch_size,
+                num_heads_q=self._dsv4_index_n_heads,
+                num_heads_k=1,
+                head_dim=self._dsv4_index_head_dim,
+                topk=self._dsv4_index_topk,
+                mask_mode=3,
+                cmp_ratio=ratio,
+                layout_q="TND",
+                layout_k="PA_BBND",
             )
         candidate_ratio = self._dsv41_candidate_ratio()
-        if candidate_ratio is not None:
-            block = self._dsv41_candidate_block_size
-            if block <= 0 or self._dsv41_candidate_topk_blocks <= 0:
-                raise RuntimeError(
-                    "DeepSeek-V4.1 has a candidate source layer but no "
-                    f"candidate_topk_blocks/candidate_block_size "
-                    f"({self._dsv41_candidate_topk_blocks}/{block})."
-                )
-            cmp_lens = (kv_lens // candidate_ratio).to(torch.int32)
-            # Level one publishes blocks, so its dispatch table is a separate
-            # instance from the plain per-ratio one.
-            keep(
-                f"c{candidate_ratio}a_qli_candidate_metadata",
-                ds41.quant_lightning_indexer_metadata_dsl(
-                    cu_seqlens_q=cu_seqlens_q,
-                    seqused_q=None,
-                    seqused_k=cmp_lens,
-                    cmp_residual_k=(
-                        None
-                        if candidate_ratio == 1
-                        else (kv_lens % candidate_ratio).to(torch.int32)
-                    ),
-                    batch_size=batch_size,
-                    num_heads_q=self._dsv4_index_n_heads,
-                    num_heads_k=1,
-                    head_dim=self._dsv4_index_head_dim,
-                    topk=self._dsv4_index_topk,
-                    mask_mode=3,
-                    cmp_ratio=candidate_ratio,
-                    layout_q="TND",
-                    layout_k="PA_BBND",
-                    candidate_topk_blocks=self._dsv41_candidate_topk_blocks,
-                    candidate_block_size=block,
-                ),
+        if candidate_ratio is None:
+            return out
+        block = int(self._dsv41_candidate_block_size)
+        if block <= 0 or self._dsv41_candidate_topk_blocks <= 0:
+            raise RuntimeError(
+                "DeepSeek-V4.1 has a candidate source layer but no "
+                f"candidate_topk_blocks/candidate_block_size "
+                f"({self._dsv41_candidate_topk_blocks}/{block})."
             )
-        if candidate_ratio is not None and self._dsv41_has_candidate_consumers():
+        cmp_lens = (kv_lens // candidate_ratio).to(torch.int32)
+        # Level one publishes blocks, so its dispatch table is a separate
+        # instance from the plain per-ratio one.
+        out[f"c{candidate_ratio}a_qli_candidate_metadata"] = (
+            ds41.quant_lightning_indexer_metadata_dsl(
+                cu_seqlens_q=cu_seqlens_q,
+                seqused_q=None,
+                seqused_k=cmp_lens,
+                cmp_residual_k=(
+                    None
+                    if candidate_ratio == 1
+                    else (kv_lens % candidate_ratio).to(torch.int32)
+                ),
+                batch_size=batch_size,
+                num_heads_q=self._dsv4_index_n_heads,
+                num_heads_k=1,
+                head_dim=self._dsv4_index_head_dim,
+                topk=self._dsv4_index_topk,
+                mask_mode=3,
+                cmp_ratio=candidate_ratio,
+                layout_q="TND",
+                layout_k="PA_BBND",
+                candidate_topk_blocks=self._dsv41_candidate_topk_blocks,
+                candidate_block_size=block,
+            )
+        )
+        if self._dsv41_has_candidate_consumers():
             # QSLI only needs a scheduling bound: the visible block count per row.
             visible_blocks = (
                 torch.div(
-                    forward_batch.positions.reshape(-1) + candidate_ratio * block,
+                    positions.reshape(-1) + candidate_ratio * block,
                     candidate_ratio * block,
                     rounding_mode="floor",
                 )
                 .clamp_min(1)
                 .clamp_max(self._dsv41_candidate_topk_blocks)
             )
-            keep(
-                f"c{candidate_ratio}a_qsli_metadata",
+            out[f"c{candidate_ratio}a_qsli_metadata"] = (
                 ds41.quant_sparse_lightning_indexer_metadata_dsl(
                     candidate_block_length=visible_blocks.to(torch.int32).view(-1, 1),
                     cu_seqlens_q=cu_seqlens_q,
@@ -1948,7 +1974,7 @@ class LowRatioCompressAscendBackendMixin:
                     cmp_ratio=candidate_ratio,
                     layout_q="TND",
                     layout_k="PA_BBND",
-                ),
+                )
             )
         return out
 
@@ -2031,20 +2057,50 @@ class LowRatioCompressAscendBackendMixin:
             lengths = torch.empty((t, 1), dtype=torch.int32, device=positions.device)
             setattr(fm, "dsv41_win_sparse_indices", indices)
             setattr(fm, "dsv41_win_topk_length", lengths)
-        offsets = torch.arange(topk, dtype=positions.dtype, device=positions.device)
-        valid_len = torch.clamp(positions + 1, max=topk)
         # Dead rows (batch padding / idle slots): see _dsv41_live_row_mask; the
         # final-length mirror tells an idle dummy verify window from a live one.
         live_rows = self._dsv41_live_rows_for(fm, forward_batch, t)
-        if live_rows is not None:
-            valid_len = torch.where(live_rows, valid_len, torch.zeros_like(valid_len))
+        self._dsv41_fill_window_buffers(
+            positions=positions,
+            live_mask=live_rows,
+            indices=indices,
+            lengths=lengths,
+        )
+        return indices, lengths
+
+    @staticmethod
+    def _dsv41_fill_window_buffers(
+        *,
+        positions: torch.Tensor,
+        live_mask: Optional[torch.Tensor],
+        indices: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> None:
+        """Fill capacity-sized window buffers from positions and a live mask.
+
+        ``positions`` covers the whole captured bucket; rows past the live
+        prefix get a zero length and an all -1 index row, which the attention
+        operator skips.  Shared by the eager build and the prefill-graph
+        refresh so both see one formula.
+        """
+        t = int(positions.numel())
+        if indices.shape[0] != t or lengths.shape[0] != t:
+            raise RuntimeError(
+                "DSV4.1 window buffer capacity mismatch: "
+                f"indices={tuple(indices.shape)} lengths={tuple(lengths.shape)} "
+                f"positions={t}"
+            )
+        topk = int(indices.shape[-1])
+        offsets = torch.arange(topk, dtype=positions.dtype, device=positions.device)
+        valid_len = torch.clamp(positions + 1, max=topk)
+        if live_mask is not None:
+            valid_len = torch.where(live_mask, valid_len, torch.zeros_like(valid_len))
         window_start = positions - valid_len + 1
         ids = window_start.unsqueeze(1) + offsets.unsqueeze(0)
         valid = offsets.unsqueeze(0) < valid_len.unsqueeze(1)
         ids = torch.where(valid, ids, ids.new_full((), -1))
         indices.copy_(ids.unsqueeze(1).to(torch.int32))
         lengths.copy_(valid_len.to(torch.int32).unsqueeze(1))
-        return indices, lengths
 
     def _dsv41_cmp_topk_length(self, forward_batch: ForwardBatch, ratio: int):
         """Per-query valid compressed top-k length, ``min((p+1)//ratio, index_topk)``."""
@@ -2055,14 +2111,35 @@ class LowRatioCompressAscendBackendMixin:
         if buf is None or buf.shape[0] != t:
             buf = torch.empty((t, 1), dtype=torch.int32, device=positions.device)
             setattr(fm, f"dsv41_cmp_topk_length_c{ratio}", buf)
-        lens = ((positions + 1) // ratio).clamp_max(int(self._dsv4_index_topk))
         # Same dead-row rule as _dsv41_window_indices: a row with no live KV
         # has length 0, not (0 + 1)//ratio.
         live_rows = self._dsv41_live_rows_for(fm, forward_batch, t)
-        if live_rows is not None:
-            lens = torch.where(live_rows, lens, torch.zeros_like(lens))
-        buf.copy_(lens.to(torch.int32).view(-1, 1))
+        self._dsv41_fill_cmp_lengths(
+            positions=positions,
+            live_mask=live_rows,
+            dst=buf,
+            ratio=ratio,
+        )
         return buf
+
+    def _dsv41_fill_cmp_lengths(
+        self,
+        *,
+        positions: torch.Tensor,
+        live_mask: Optional[torch.Tensor],
+        dst: torch.Tensor,
+        ratio: int,
+    ) -> None:
+        """Fill one capacity-sized compressed top-k length buffer."""
+        if dst.shape[0] != positions.numel():
+            raise RuntimeError(
+                "DSV4.1 compressed length capacity mismatch: "
+                f"dst={tuple(dst.shape)} positions={positions.numel()}"
+            )
+        lens = ((positions + 1) // ratio).clamp_max(int(self._dsv4_index_topk))
+        if live_mask is not None:
+            lens = torch.where(live_mask, lens, torch.zeros_like(lens))
+        dst.copy_(lens.to(torch.int32).view(-1, 1))
 
     def _dsv41_attention_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         """MQSMLA dispatch tables: ``win`` (ratio 0) plus ``c{r}a`` (ratio 1/2)."""
@@ -2088,8 +2165,40 @@ class LowRatioCompressAscendBackendMixin:
                 out[key] = metadata
             return out
         _, win_lengths = self._dsv41_window_indices(forward_batch)
+        cmp_lengths_by_ratio = {
+            ratio: self._dsv41_cmp_topk_length(forward_batch, ratio)
+            for ratio in self._dsv41_low_ratios()
+        }
+        out = self._dsv41_attention_dispatch_metadata(
+            cu_seqlens_q=fm.actual_seq_lengths_q_pa,
+            win_lengths=win_lengths,
+            cmp_lengths_by_ratio=cmp_lengths_by_ratio,
+        )
+        kept: dict = {}
+        for key, metadata in out.items():
+            # aclgraph binds the address at capture: refresh in place.
+            buf = fm.kernel_metadata.get(key)
+            if buf is not None and buf.shape == metadata.shape:
+                buf.copy_(metadata)
+                metadata = buf
+            kept[key] = metadata
+        return kept
+
+    def _dsv41_attention_dispatch_metadata(
+        self,
+        *,
+        cu_seqlens_q: torch.Tensor,
+        win_lengths: torch.Tensor,
+        cmp_lengths_by_ratio: dict,
+    ) -> dict:
+        """Build the MQSMLA dispatch tables from explicit capacity buffers.
+
+        ``win_lengths`` and each ``cmp_lengths_by_ratio`` entry cover the full
+        captured bucket; rows past the live prefix carry length 0.  The eager
+        path and the prefill replay refresh both call this, so the captured
+        kernels read one schedule shape (`[1024]` int32) for every live T.
+        """
         ds41 = _ds41_ops()
-        cu_seqlens_q = fm.actual_seq_lengths_q_pa
         head_num = int(self._dsv4_q_head_num)
         # The DSV4 pool exposes qk_nope/qk_rope head dims but no ``head_dim``
         # attribute (an AttributeError); take the width from the backend config.
@@ -2100,9 +2209,9 @@ class LowRatioCompressAscendBackendMixin:
             if ratio == 0:
                 cmp_lengths = torch.zeros_like(win_lengths)
             else:
-                cmp_lengths = self._dsv41_cmp_topk_length(forward_batch, ratio)
+                cmp_lengths = cmp_lengths_by_ratio[ratio]
             key = f"{attention_type}_metadata"
-            metadata = ds41.mixed_quant_sparse_flash_mla_metadata_dsl(
+            out[key] = ds41.mixed_quant_sparse_flash_mla_metadata_dsl(
                 ori_topk_length=win_lengths,
                 cmp_topk_length=cmp_lengths,
                 cu_seqlens_q=cu_seqlens_q,
@@ -2115,12 +2224,6 @@ class LowRatioCompressAscendBackendMixin:
                 has_ori_kv=True,
                 has_cmp_kv=ratio > 0,
             )
-            # aclgraph binds the address at capture: refresh in place.
-            buf = fm.kernel_metadata.get(key)
-            if buf is not None and buf.shape == metadata.shape:
-                buf.copy_(metadata)
-                metadata = buf
-            out[key] = metadata
         return out
 
     def _dsv41_a3_query_tokens(self, forward_batch) -> int | None:
@@ -2257,7 +2360,9 @@ class LowRatioCompressAscendBackendMixin:
             return_softmax_lse=False,
         )
         if compress_ratio > 0:
-            topk = getattr(fm, f"c{compress_ratio}_topk_indices", None)
+            # Only index_source_layer_ids layers own an indexer; consumers in
+            # between reuse the most recent same-ratio source's output.
+            topk = self._dsv41_topk_for_layer(fm, layer.layer_id, compress_ratio)
             if topk is None:
                 raise RuntimeError(
                     f"DeepSeek-V4.1 ratio-{compress_ratio} attention has no "
@@ -2303,6 +2408,38 @@ class LowRatioCompressAscendBackendMixin:
 
     def _dsv41_low_ratios(self) -> list:
         return [r for r in self._dsv4_unique_compress_ratios if r in (1, 2)]
+
+    def _dsv41_topk_source_for(self, layer_id: int, ratio: int) -> Optional[int]:
+        """The last same-ratio index-source layer at or before ``layer_id``.
+
+        Only ``index_source_layer_ids`` layers carry an indexer.  Consumer
+        layers in between read the shared top-k published by that source, so
+        a per-layer lookup must resolve to the owning source rather than the
+        consumer's own id.
+        """
+        source = None
+        for candidate in self._dsv41_index_source_layers:
+            if candidate > layer_id:
+                continue
+            if not (0 <= candidate < len(self._dsv4_compress_ratios)):
+                continue
+            if self._dsv4_compress_ratios[candidate] != ratio:
+                continue
+            if source is None or candidate > source:
+                source = candidate
+        return source
+
+    def _dsv41_topk_for_layer(self, fm, layer_id: int, ratio: int):
+        """This layer's top-k: the owning source's staged buffer, else shared."""
+        graph_state = getattr(fm, "dsv4_prefill_graph_state", None)
+        topk = None
+        if graph_state is not None:
+            source_id = self._dsv41_topk_source_for(layer_id, ratio)
+            if source_id is not None:
+                topk = graph_state.topk_by_layer.get(source_id)
+        if topk is None:
+            topk = getattr(fm, f"c{ratio}_topk_indices", None)
+        return topk
 
     def _dsv41_candidate_ratio(self) -> Optional[int]:
         """The compression ratio of the layer that publishes candidate blocks."""
@@ -2364,6 +2501,67 @@ class LowRatioCompressAscendBackendMixin:
         if ratio == 1:
             return keep, positions, out_loc
         return keep, (positions // ratio) * ratio, out_loc // ratio
+
+    def _dsv41_fill_ratio_rows(
+        self,
+        *,
+        ratio: int,
+        positions: torch.Tensor,
+        out_loc: torch.Tensor,
+        live_mask: Optional[torch.Tensor],
+        pos_dst: torch.Tensor,
+        loc_dst: torch.Tensor,
+    ) -> None:
+        """Fill capacity-sized ratio-1/2 rows from one live token layout.
+
+        Ratio 1 keeps token order (mask in place); ratio 2 stable-compacts
+        completed groups.  The destination is the captured bucket buffer, so
+        every caller (eager builder, prefill refresh) produces identical row
+        layouts over the whole capacity, with dead rows carrying the skip
+        sentinel.
+        """
+        if positions.numel() != out_loc.numel():
+            raise RuntimeError(
+                "DSV4.1 ratio rows need one position and one slot per token: "
+                f"positions={positions.numel()} out_loc={out_loc.numel()}"
+            )
+        if pos_dst.shape[0] != loc_dst.shape[0]:
+            raise RuntimeError(
+                "DSV4.1 ratio row buffers disagree: "
+                f"pos_dst={tuple(pos_dst.shape)} loc_dst={tuple(loc_dst.shape)}"
+            )
+        if ratio == 1 and pos_dst.shape[0] != positions.numel():
+            # Ratio 1 is token-indexed: one row per token, no compaction.
+            raise RuntimeError(
+                "DSV4.1 ratio-1 rows need one row per token: "
+                f"positions={positions.numel()} dst={pos_dst.shape[0]}"
+            )
+        if pos_dst.shape[0] == 0 or pos_dst.shape[0] > positions.numel():
+            raise RuntimeError(
+                "DSV4.1 ratio row capacity out of range: "
+                f"positions={positions.numel()} dst={pos_dst.shape[0]}"
+            )
+        keep, pos_values, slot_values = self._dsv41_ratio_row_values(
+            positions,
+            out_loc,
+            ratio,
+            int(self.page_size),
+            row_live=live_mask,
+        )
+        if ratio == 1:
+            # Ratio 1 has no fused compressor: row i is token i, so mask in
+            # place instead of compacting to keep the row order.
+            pos_dst.copy_(torch.where(keep, pos_values, torch.zeros_like(pos_values)))
+            loc_dst.copy_(
+                torch.where(
+                    keep,
+                    slot_values,
+                    torch.full_like(slot_values, self._DSV41_SLOT_SKIP),
+                ).to(loc_dst.dtype)
+            )
+            return
+        self._stable_compact_1d(pos_dst, pos_values, keep, fill=0)
+        self._stable_compact_1d(loc_dst, slot_values, keep, fill=self._DSV41_SLOT_SKIP)
 
     def _build_dsv41_ratio_metadata(
         self, forward_batch: ForwardBatch, ratio: int
@@ -2889,6 +3087,12 @@ class DeepseekV4AscendAttnBackend(
         self._dsv4_has_low_ratio = any(
             ratio in (1, 2) for ratio in self._dsv4_compress_ratios
         )
+        if self._dsv4_is_v41_model and (self._dsv4_has_c4 or self._dsv4_has_c128):
+            raise ValueError(
+                "DeepSeek-V4 generation mixes ratio 1/2 with ratio 4/128; the "
+                "prefill-graph metadata contracts are generation-exclusive: "
+                f"compress_ratios={list(self._dsv4_compress_ratios)}."
+            )
         if self._dsv4_has_low_ratio:
             if is_npu_arch35():
                 # MQSMLA fixes N1 = 64 and does not shard query heads over TP.
@@ -2950,12 +3154,30 @@ class DeepseekV4AscendAttnBackend(
         self.use_captured_forward_metadata_for_breakable_cuda_graph = (
             self._supports_dsv4_prefill_graph_capture()
         )
+        # The source break and the attention call must switch together: a
+        # captured attention reading a bridge written by an eager source (or
+        # the reverse) is not a supported contract.  See dsv4_prefill_graph.py.
+        self.low_ratio_prefill_graph = (
+            self._dsv4_is_v41_model
+            and self.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
         if self.use_captured_forward_metadata_for_breakable_cuda_graph:
             self.prefill_cuda_graph_max_batch_size = MAX_PREFILL_GRAPH_REQS
             logger.info(
-                "DSV4 NPU breakable prefill graph: compressor/indexer captured, "
+                "DSV4%s NPU breakable prefill graph: %s captured, "
                 "max %d request(s) per replay.",
+                ".1" if self._dsv4_is_v41_model else "",
+                (
+                    "low-ratio sources + attention"
+                    if self._dsv4_is_v41_model
+                    else "compressor/indexer"
+                ),
                 MAX_PREFILL_GRAPH_REQS,
+            )
+        elif self._dsv4_is_v41_model:
+            logger.info(
+                "DeepSeek-V4.1 NPU prefill graph not enabled: low-ratio sources "
+                "and attention stay at eager breaks."
             )
 
     def _supports_dsv4_prefill_graph_capture(self) -> bool:
@@ -2975,9 +3197,88 @@ class DeepseekV4AscendAttnBackend(
                 "indexer and requires a model without CP/DCP. Disable "
                 "--cuda-graph-backend-prefill=breakable for this model."
             )
+        if self._dsv4_is_v41_model:
+            return self._supports_dsv41_prefill_graph_capture()
         # Ascend 950 shares the explicit cache_mode=2 compressor state table
         # and npu.compressor with A3; its arch-specific KV / indexer fused
         # epilogs write through the same fixed loc buffers inside the segment.
+        return True
+
+    def _prefill_graph_metadata_cls(self):
+        """The fixed-metadata protocol owned by this model generation."""
+        if self._dsv4_is_v41_model:
+            return Dsv41PrefillGraphMetadata
+        return Dsv4PrefillGraphMetadata
+
+    def _supports_dsv41_prefill_graph_capture(self) -> bool:
+        """V4.1: capture the low-ratio source and attention as one dataflow."""
+        if not is_npu_arch35():
+            raise ValueError(
+                "DeepSeek-V4.1 prefill graph needs arch35 (the fused ratio-2 "
+                "compressor and the V4.1 KV epilogs); disable "
+                "--cuda-graph-backend-prefill=breakable on this device."
+            )
+        parallel = get_parallel()
+        if parallel.pp_size != 1:
+            raise ValueError(
+                "DeepSeek-V4.1 prefill graph requires PP=1 (the mHC "
+                "pre-mix hand-off across pipeline stages is not wired)."
+            )
+        self._validate_v41_candidate_spec()
+        return True
+
+    def _validate_v41_candidate_spec(self) -> None:
+        ratio = self._dsv41_candidate_ratio()
+        if ratio is None:
+            return
+        block = int(self._dsv41_candidate_block_size)
+        topk_blocks = int(self._dsv41_candidate_topk_blocks)
+        if block <= 0 or topk_blocks <= 0:
+            raise ValueError(
+                "DeepSeek-V4.1 candidate source layer is configured without "
+                f"candidate_block_size/candidate_topk_blocks ({block}/{topk_blocks})."
+            )
+        needed = -(-int(self._dsv4_index_topk) // block)
+        if needed > topk_blocks:
+            logger.warning(
+                "DeepSeek-V4.1 candidate blocks cover %d of the %d top-k "
+                "slots (block=%d, blocks=%d); the candidate chain is a "
+                "configuration-level approximation.",
+                needed * block,
+                self._dsv4_index_topk,
+                block,
+                topk_blocks,
+            )
+
+    def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        if not self._dsv4_has_low_ratio:
+            return True
+        # A MIXED batch replays the EXTEND graph with decode rows; V4.1's
+        # extend/decode source and attention metadata are not interchangeable.
+        if forward_batch.forward_mode.is_mixed():
+            return False
+        original = forward_batch._original_forward_mode
+        if original is not None and original.is_decode():
+            # A decode batch converted into a 1-token EXTEND is not the
+            # verified V4.1 prefill topology; keep it eager.
+            return False
+        if forward_batch.forward_mode.is_idle():
+            return True
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is not None and seq_lens_cpu.numel():
+            if int(seq_lens_cpu.max()) > int(self.max_context_len):
+                return False
+        return True
+
+    def vote_prefill_cuda_graph(self, batch) -> bool:
+        if not self._dsv4_has_low_ratio:
+            return True
+        if batch.forward_mode.is_mixed():
+            return False
+        seq_lens_cpu = batch.seq_lens_cpu
+        if seq_lens_cpu is not None and seq_lens_cpu.numel():
+            if int(seq_lens_cpu.max()) > int(self.max_context_len):
+                return False
         return True
 
     def _validate_spec_support(self, spec_algorithm) -> None:
@@ -4462,11 +4763,15 @@ class DeepseekV4AscendAttnBackend(
         self.init_forward_metadata(forward_batch)
         # allocate() refreshes the eager metadata in place, so this object is
         # also the one the capture forward reads.
-        return Dsv4PrefillGraphMetadata.allocate(
-            backend=self,
-            seed=self.forward_metadata,
-            num_tokens=int(forward_batch.positions.shape[0]),
-        ).metadata
+        return (
+            self._prefill_graph_metadata_cls()
+            .allocate(
+                backend=self,
+                seed=self.forward_metadata,
+                num_tokens=int(forward_batch.positions.shape[0]),
+            )
+            .metadata
+        )
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
         self,
