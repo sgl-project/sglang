@@ -1,0 +1,37 @@
+diff --git a/python/sglang/srt/mem_cache/pool_host/mamba.py b/python/sglang/srt/mem_cache/pool_host/mamba.py
+index 0418a3cdf9..d14e704c15 100644
+--- a/python/sglang/srt/mem_cache/pool_host/mamba.py
++++ b/python/sglang/srt/mem_cache/pool_host/mamba.py
+@@ -695,13 +695,25 @@ class MambaPoolHost(HostKVCache):
+                 # NPU: mirror the load path — the dedicated kernel transfers all
+                 # layers at once via a single 2D strided copy
+                 # (device layer-first -> host page-first).
+-                transfer_mamba_state(
+-                    device_buf=src_layers,
+-                    host_buf=dst,
+-                    device_indices=src_indices,
+-                    host_indices=dst_indices,
+-                    direction=TransferDirection.D2H,
+-                )
++                try:
++                    transfer_mamba_state(
++                        device_buf=src_layers,
++                        host_buf=dst,
++                        device_indices=src_indices,
++                        host_indices=dst_indices,
++                        direction=TransferDirection.D2H,
++                    )
++                except RuntimeError as exc:
++                    if "host buffer must use pinned memory" in str(exc):
++                        try:
++                            from sglang.srt.mem_cache.pool_host.npu_pin_diagnostics import (
++                                dump_mamba_pin_failure,
++                            )
++
++                            dump_mamba_pin_failure(dst, src_layers, exc)
++                        except Exception:
++                            logger.exception("Mamba pinned-memory diagnostics failed")
++                    raise
+             else:
+                 # Per-layer fallback when the dedicated kernel is unavailable.
+                 device_indices = src_indices.to(
