@@ -347,8 +347,8 @@ and [rerank](REFERENCE.md#rerank).
 ### Native gRPC
 
 `--grpc-port` serves `sglang.api.v1.SglangService/Generate` for a single text
-prompt or token sequence. Requests reach the same RPC on a native Rust engine,
-which must run with `--grpc-port` too. See
+prompt or token sequence. Requests reach the same RPC on an engine running the
+native Rust server (`SGLANG_RUST_SERVER=1`) with `--grpc-port`. See
 [native gRPC](REFERENCE.md#native-grpc).
 
 ### Bucket file

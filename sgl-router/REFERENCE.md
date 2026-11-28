@@ -793,12 +793,13 @@ is re-registered; its circuit breaker will open in the meantime.
 `--grpc-port` serves `sglang.api.v1.SglangService/Generate`
 (`proto/sglang/api/v1/service.proto`). A single text prompt or token sequence is
 routed like HTTP `/generate` and forwarded to the selected engine's native
-`api.v1` gRPC server. Engines must run with `--grpc-port`; the router reads that
-port from each worker's `/server_info`. HTTP requests still reach engines over
+`api.v1` gRPC server. Engines must run the native Rust server
+(`SGLANG_RUST_SERVER=1`) with `--grpc-port`, which is the only engine that
+serves `api.v1`; the router reads that port from each worker's `/server_info`. HTTP requests still reach engines over
 HTTP.
 
-This replaces the legacy runtime service. Clients and workers must use `api.v1`;
-there is no legacy fallback. OpenAI, embedding, classify, and rerank gRPC methods
+This replaces the legacy `runtime.v1` service, which engines no longer serve.
+Clients and workers must use `api.v1`; there is no legacy fallback. OpenAI, embedding, classify, and rerank gRPC methods
 are no longer served. Their HTTP endpoints remain available. The other `api.v1`
 RPCs, including health, metadata, detokenization, and administrative calls, answer
 `UNIMPLEMENTED` at the router.

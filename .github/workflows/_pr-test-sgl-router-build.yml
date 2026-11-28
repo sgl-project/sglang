@@ -60,7 +60,7 @@ jobs:
         with:
           path: sgl-router-bin/sgl-router
           # The arch is the compile runner's, as download-sgl-router reads it.
-          key: sgl-router-${{ contains(inputs.runs_on, '-arm') && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/Cargo.toml', 'rust/sglang-api-types/**', 'rust/sglang-processor/**', 'rust/sglang-runtime-v1-types/**', '.github/workflows/_pr-test-sgl-router-build.yml') }}
+          key: sgl-router-${{ contains(inputs.runs_on, '-arm') && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/Cargo.toml', 'rust/sglang-api-types/**', 'rust/sglang-processor/**', '.github/workflows/_pr-test-sgl-router-build.yml') }}
 
       - name: Upload binary
         if: steps.cache.outputs.cache-hit == 'true'
