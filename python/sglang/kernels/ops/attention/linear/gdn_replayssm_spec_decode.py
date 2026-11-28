@@ -1482,6 +1482,7 @@ def commit_gdn_replayssm_after_verify(
     mamba_steps_to_track: torch.Tensor | None = None,
     src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
+    stats: torch.Tensor | None = None,
 ) -> None:
     """Commit one verify step of the compact GDN ring.
 
@@ -1507,6 +1508,19 @@ def commit_gdn_replayssm_after_verify(
         fold_every_commit=fold_every_commit,
         null_block_id=null_block_id,
     )
+    if stats is not None:
+        from sglang.srt.mem_cache.gdn_replayssm_commit import record_gdn_commit
+
+        record_gdn_commit(
+            stats,
+            write_pos,
+            is_flush,
+            replay_indices,
+            state_batch_indices,
+            accept_lens,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
     # Capacity rows fold all layers in one launch; track rows snapshot the
     # exact crossing state without disturbing the active circular history.
     commit_gdn_replayssm_circular(
