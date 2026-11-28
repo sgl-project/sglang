@@ -7,8 +7,10 @@ time; it only reads it.
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -38,6 +40,11 @@ class SchedulerInternalStateController:
     def __init__(self, scheduler: Scheduler, record_step_time: bool) -> None:
         self.scheduler = scheduler
         self.record_step_time = record_step_time
+        # Activation/communication buffers are sized at startup. A runtime
+        # budget may throttle admission, never enlarge that allocation.
+        self._startup_max_prefill_tokens = getattr(
+            scheduler, "max_prefill_tokens", None
+        )
 
     # ---------------------------------------------------------------- readback
 
@@ -156,6 +163,17 @@ class SchedulerInternalStateController:
                 handler = handlers.get(key)
                 if handler is None:
                     raise UpdateRejected(f"Updating {key} is not supported.")
+                if key != "dspark_clear_info_records":
+                    if value is None and key == "dspark_force_budget_frac":
+                        pass
+                    elif (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or (isinstance(value, float) and not math.isfinite(value))
+                    ):
+                        raise UpdateRejected(
+                            f"{key} must be a finite number, not bool."
+                        )
                 handler.validate(key, value)
         except UpdateRejected as rejection:
             logger.warning(str(rejection))
@@ -172,6 +190,12 @@ class SchedulerInternalStateController:
 
     def _update_handlers(self) -> Dict[str, _UpdateHandler]:
         return {
+            "max_queued_requests": _UpdateHandler(
+                self._validate_max_queued_requests, self._apply_scheduler_limit
+            ),
+            "max_prefill_tokens": _UpdateHandler(
+                self._validate_max_prefill_tokens, self._apply_scheduler_limit
+            ),
             "pp_max_micro_batch_size": _UpdateHandler(
                 self._validate_pp_micro_batch_size, _override
             ),
@@ -188,6 +212,33 @@ class SchedulerInternalStateController:
                 self._validate_dspark_clear_records, self._apply_dspark_clear_records
             ),
         }
+
+    def _validate_max_queued_requests(self, key: str, value: Any) -> None:
+        if type(value) is not int or value < 0:
+            raise UpdateRejected(f"{key} must be a non-negative integer.")
+        if self.scheduler.disaggregation_mode != DisaggregationMode.NULL:
+            raise UpdateRejected(f"{key} is not used in disaggregation mode.")
+        # Until the empty priority-eviction path is fixed upstream, zero would
+        # make max(waiting_queue) raise on the next arrival. Do not duplicate
+        # that admission change here.
+        if value == 0 and self.scheduler.enable_priority_scheduling:
+            raise UpdateRejected(f"{key}=0 is not supported with priority scheduling.")
+
+    def _validate_max_prefill_tokens(self, key: str, value: Any) -> None:
+        upper = self._startup_max_prefill_tokens
+        if type(value) is not int or upper is None or not 1 <= value <= upper:
+            raise UpdateRejected(
+                f"{key} must be an integer in [1, {upper}] (startup budget)."
+            )
+        if self.scheduler.dynamic_chunk_sizer is not None:
+            raise UpdateRejected(f"{key} cannot change with dynamic chunking enabled.")
+
+    def _apply_scheduler_limit(self, key: str, value: Any) -> Dict[str, Any]:
+        # Do not trim existing queues or alter in-flight batches. Admission on
+        # the next pass uses the new limit; priority replacement keeps the
+        # existing queue length until those requests drain normally.
+        setattr(self.scheduler, key, value)
+        return {key: value}
 
     def _validate_pp_micro_batch_size(self, key: str, value: Any) -> None:
         upper = self.scheduler.max_running_requests // get_parallel().pp_size
