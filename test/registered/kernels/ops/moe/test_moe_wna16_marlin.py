@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+from sglang.srt.utils.common import round_up
 from sglang.srt.utils.device import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
@@ -1232,7 +1233,9 @@ def test_moe_wna16_marlin_inactive_output_ownership(has_inactive_prefix_count):
 @pytest.mark.parametrize("use_expert_map", [False, True])
 @pytest.mark.parametrize("weight_first", [False, True])
 @pytest.mark.parametrize("fused_norm", [False, True])
-@pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128)])
+@pytest.mark.parametrize(
+    "hidden,intermediate", [(256, 256), (512, 128), (256, 96), (256, 160)]
+)
 def test_muse_marlin_inactive_routes(
     fused_norm, hidden, intermediate, weight_first, use_expert_map
 ):
@@ -1330,8 +1333,10 @@ def test_muse_marlin_inactive_routes(
         projection_buffers[::2], projection_buffers[1::2]
     ):
         assert gate_up_buffer.data_ptr() == down_buffer.data_ptr()
+        # Marlin prep pads each gated half to a multiple of 64.
+        padded = round_up(intermediate, 64)
         assert down_buffer.untyped_storage().nbytes() == (
-            rows * topk * max(2 * intermediate, hidden) * x.element_size()
+            rows * topk * max(2 * padded, hidden) * x.element_size()
         )
     torch.testing.assert_close(mapped, local_ids, rtol=0, atol=0)
     expected_experts = torch.zeros((rows, topk, hidden), device="cuda", dtype=dtype)

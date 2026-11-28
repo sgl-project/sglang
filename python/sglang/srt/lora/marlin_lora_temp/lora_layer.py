@@ -22,6 +22,7 @@ def init_experimental_sgl_marlin_lora(layer, base_layer) -> None:
     from sglang.srt.layers.quantization.modelopt_quant import (
         ModelOptNvFp4FusedMoEMethod,
     )
+    from sglang.srt.lora.lora_moe_runner_marlin import check_lora_fits_marlin_width
 
     assert isinstance(
         base_layer.quant_method,
@@ -32,6 +33,11 @@ def init_experimental_sgl_marlin_lora(layer, base_layer) -> None:
     )
 
     quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
+    check_lora_fits_marlin_width(
+        quant_info,
+        intermediate_size=base_layer.intermediate_size_per_partition,
+        is_gated=base_layer.moe_runner_config.is_gated,
+    )
     weight_device = quant_info.w13_qweight.device
     device_capability = (
         torch.cuda.get_device_capability(weight_device)

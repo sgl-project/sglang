@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
@@ -416,6 +417,21 @@ def _permute_moe_fp4_scales_for_marlin(
     return torch.stack(tensor_list)
 
 
+def _pad_w13_shards(
+    x: torch.Tensor, *, num_shards: int, padded_size: int
+) -> torch.Tensor:
+    """Zero-pad each of the ``num_shards`` row blocks of an MoE w13 tensor
+    ``[experts, num_shards * size, ...]`` (gate and up, or the one non-gated
+    block) to ``padded_size`` rows, since a gated activation splits the GEMM
+    output in half."""
+    num_experts, rows = x.shape[:2]
+    size = rows // num_shards
+    x = x.reshape(num_experts, num_shards, size, *x.shape[2:])
+    pad = (0, 0) * (x.dim() - 3) + (0, padded_size - size)
+    x = torch.nn.functional.pad(x, pad)
+    return x.reshape(num_experts, num_shards * padded_size, *x.shape[3:])
+
+
 def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     group_size = 32
     w13 = layer.w13_weight.data
@@ -465,11 +481,9 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     def _pad_w13(x: torch.Tensor) -> torch.Tensor:
         if padded_intermediate_size == intermediate_size:
             return x
-        x = x.view(num_experts, num_shards, intermediate_size, x.shape[-1])
-        x = torch.nn.functional.pad(
-            x, (0, 0, 0, padded_intermediate_size - intermediate_size)
+        return _pad_w13_shards(
+            x, num_shards=num_shards, padded_size=padded_intermediate_size
         )
-        return x.reshape(num_experts, num_shards * padded_intermediate_size, -1)
 
     def _pad_w2(x: torch.Tensor, packing: int) -> torch.Tensor:
         if padded_intermediate_size == intermediate_size:
@@ -567,31 +581,39 @@ def prepare_moe_nvfp4_layer_for_marlin(
 
     num_experts = w13.shape[0]
     num_shards = 2 if layer.moe_runner_config.is_gated else 1
-    intermediate_size = layer.intermediate_size_per_partition
+    intermediate_size = w13.shape[1] // num_shards
     hidden_size = w13.shape[2] * 2
     param_dtype = layer.params_dtype
     if param_dtype not in (torch.float16, torch.bfloat16):
         raise RuntimeError("NVFP4 Marlin MoE requires FP16 or BF16 activations.")
+    # moe_wna16_marlin.cuh's thread configs tile N by 128 or 256 and K by 64 or
+    # 128, so both GEMMs' N (num_shards * intermediate size, hidden_size) need
+    # a multiple of 128 and GEMM2's K (intermediate size) one of 64.
+    if hidden_size % 128 != 0:
+        raise ValueError(
+            f"NVFP4 Marlin MoE needs hidden_size divisible by 128, got {hidden_size}."
+        )
 
     device = w13.device
     layer.workspace = marlin_make_workspace(device, 4)
     perm = torch.empty(0, dtype=torch.int, device=device)
 
-    if not layer.moe_runner_config.is_gated:
-        padded_intermediate_size = ((intermediate_size + 127) // 128) * 128
-        intermediate_size_pad = padded_intermediate_size - intermediate_size
-        if intermediate_size_pad:
-            w13 = torch.nn.functional.pad(w13, (0, 0, 0, intermediate_size_pad))
-            w13_scale = torch.nn.functional.pad(
-                w13_scale, (0, 0, 0, intermediate_size_pad)
+    padded_intermediate_size = round_up(intermediate_size, 128 // num_shards)
+    intermediate_size_pad = padded_intermediate_size - intermediate_size
+    if intermediate_size_pad:
+        w13 = _pad_w13_shards(
+            w13, num_shards=num_shards, padded_size=padded_intermediate_size
+        )
+        w13_scale = _pad_w13_shards(
+            w13_scale, num_shards=num_shards, padded_size=padded_intermediate_size
+        )
+        w2 = torch.nn.functional.pad(w2, (0, intermediate_size_pad // 2))
+        w2_scale = torch.nn.functional.pad(w2_scale, (0, intermediate_size_pad // 16))
+        if w13_bias is not None:
+            w13_bias = _pad_w13_shards(
+                w13_bias, num_shards=num_shards, padded_size=padded_intermediate_size
             )
-            w2 = torch.nn.functional.pad(w2, (0, intermediate_size_pad // 2, 0, 0))
-            w2_scale = torch.nn.functional.pad(
-                w2_scale, (0, intermediate_size_pad // 16)
-            )
-            if w13_bias is not None:
-                w13_bias = torch.nn.functional.pad(w13_bias, (0, intermediate_size_pad))
-            intermediate_size = padded_intermediate_size
+        intermediate_size = padded_intermediate_size
 
     w13_size_n, w13_size_k = intermediate_size * num_shards, hidden_size
     w2_size_n, w2_size_k = hidden_size, intermediate_size

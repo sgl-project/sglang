@@ -38,6 +38,20 @@ if _is_cuda:
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
 
+def check_lora_fits_marlin_width(
+    quant_info: MarlinMoeQuantInfo, *, intermediate_size: int, is_gated: bool
+) -> None:
+    """Refuse a gated layer whose Marlin prep padded each half: the Marlin LoRA
+    runners add the up delta at the unpadded offset, inside gate's padding."""
+    padded_size = quant_info.w2_qweight.shape[1] * 16
+    if is_gated and padded_size != intermediate_size:
+        raise ValueError(
+            "MoE LoRA on Marlin experts padded from an intermediate size of "
+            f"{intermediate_size} to {padded_size} needs --lora-backend triton_v2 "
+            "with --moe-runner-backend lora_marlin, which unpads each half."
+        )
+
+
 class MarlinLoraRunnerCore(DispatchMoeRunnerCore):
     """
     MoE runner using Marlin kernels for base projections, with hooks for LoRA.
