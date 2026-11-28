@@ -62,6 +62,12 @@ class Inkling2ExpertsWithLoRA(BaseLayerWithLoRA):
                 "Inkling2 expert LoRA serves one adapter slot per batch; "
                 "set --max-loras-per-batch 1"
             )
+        rank = gate_up_lora_b_weights.shape[-1]
+        # tl.dot in the routed LoRA kernels needs every dimension >= 16.
+        if rank < 16 or rank & (rank - 1):
+            raise ValueError(
+                f"Inkling2 expert LoRA needs --max-lora-rank a power of two >= 16, got {rank}"
+            )
         self.set_lora = True
         self.gate_up_lora_a_weights = gate_up_lora_a_weights
         self.gate_up_lora_b_weights = gate_up_lora_b_weights

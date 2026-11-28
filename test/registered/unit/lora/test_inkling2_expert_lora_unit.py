@@ -24,7 +24,7 @@ from sglang.test.kernels import inkling2_lora_reference as ref
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
-_D, _F, _E, _R, _TOP_K, _ALPHA = 32, 16, 4, 4, 2, 8  # scaling alpha / r = 2
+_D, _F, _E, _R, _TOP_K, _ALPHA = 32, 16, 4, 16, 2, 32  # scaling alpha / r = 2
 _CAPS = (4.0, 25.0)
 _EXPERTS = "model.llm.layers.0.mlp.experts"
 
@@ -326,3 +326,17 @@ def test_unhooked_expert_kernels_reject_lora():
     x, ids, weights = _batch()
     with pytest.raises(NotImplementedError, match="no LoRA hook"):
         experts.forward(x, weights, ids, lora=object())
+
+
+def test_rank_below_16_is_rejected():
+    """The routed LoRA kernels' tl.dot needs rank >= 16; a smaller rank must fail at
+    setup, not at the first adapter batch's kernel compile."""
+    wrapper = Inkling2ExpertsWithLoRA.__new__(Inkling2ExpertsWithLoRA)
+    rank = 8
+    with pytest.raises(ValueError, match="power of two >= 16"):
+        wrapper.set_lora_info(
+            torch.zeros(1, 1, 2 * rank, _D),
+            torch.zeros(1, _E, 2 * _F, rank),
+            torch.zeros(1, _E, rank, _F),
+            torch.zeros(1, 1, _D, rank),
+        )

@@ -61,7 +61,9 @@ def _gate_up_expand(
         gate = tl.dot(tl.load(h, row_mask[:, None], other=0), b_gate)
         up = tl.dot(tl.load(h + R, row_mask[:, None], other=0), b_up)
         if SCALED:
-            scale = _nvfp4_row_scale(XAmax, WAmax, WDenominator, expert, rows)
+            # Rows past the expert's end would read past x_amax; they are masked on store.
+            safe_rows = tl.where(row_mask, rows, start)
+            scale = _nvfp4_row_scale(XAmax, WAmax, WDenominator, expert, safe_rows)
             # A zero row has a zero delta; keep 0 / 0 out of the accumulator.
             inverse = tl.where(scale > 0, 1.0 / scale, 0.0)[:, None]
             gate *= inverse
