@@ -49,6 +49,21 @@ impl ByteBudget {
         self.claim(n as u64).map_err(|()| over_budget(what))
     }
 
+    /// Charge before loading a payload and refund if the loader declines it.
+    pub fn charge_if_loaded<T>(
+        &self,
+        n: usize,
+        what: &str,
+        load: impl FnOnce() -> Option<T>,
+    ) -> Result<Option<T>, String> {
+        self.charge_existing(n, what)?;
+        let loaded = load();
+        if loaded.is_none() {
+            self.release(n as u64);
+        }
+        Ok(loaded)
+    }
+
     /// Give back bytes claimed for a chunk but not filled by the read.
     fn release(&self, n: u64) {
         self.0.fetch_add(n, std::sync::atomic::Ordering::AcqRel);
@@ -73,6 +88,15 @@ pub fn fetch_bytes(src: &str) -> Result<Vec<u8>, String> {
 pub fn fetch_local_file_budgeted(src: &str, budget: &ByteBudget) -> Result<Vec<u8>, String> {
     let path = src.strip_prefix("file://").unwrap_or(src);
     let file = std::fs::File::open(path).map_err(|e| format!("media fetch: {path}: {e}"))?;
+    read_local_file_budgeted(file, path, budget)
+}
+
+/// Read an already opened local file using the same validation and size limits.
+pub fn read_local_file_budgeted(
+    file: std::fs::File,
+    path: &str,
+    budget: &ByteBudget,
+) -> Result<Vec<u8>, String> {
     let metadata = file
         .metadata()
         .map_err(|e| format!("media fetch: stat {path}: {e}"))?;
