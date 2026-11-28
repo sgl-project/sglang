@@ -298,6 +298,48 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
+    if (
+        cfg.speculative_draft_kv_layout != "shared"
+        and cfg.speculative_dflash_draft_kv_ring
+    ):
+        raise ValueError(
+            "Independent DFlash KV and the native draft KV ring are mutually exclusive"
+        )
+
+    if cfg.speculative_draft_kv_layout != "shared":
+        if cfg.max_running_requests is None:
+            raise ValueError(
+                "Independent DFLASH storage requires --max-running-requests."
+            )
+        if (cfg.disaggregation_mode != "null") or not cfg.disable_radix_cache:
+            raise ValueError(
+                "Independent DFLASH cache requires cold aggregated serving"
+            )
+        if (
+            not cfg.disable_overlap_schedule
+            or cfg.attn_cp_size != 1
+            or cfg.pp_size != 1
+        ):
+            raise ValueError(
+                "Independent DFLASH cache currently requires eager scheduling, CP1 and PP1."
+            )
+        if cfg.speculative_draft_window_size is not None:
+            raise ValueError(
+                "Native hybrid DFLASH cache cannot be combined with a whole-draft compact window."
+            )
+        if cfg.speculative_draft_attention_backend != "flashinfer":
+            raise ValueError(
+                "Independent DFLASH cache currently requires --speculative-draft-attention-backend flashinfer."
+            )
+        if (
+            cfg.enable_hierarchical_cache
+            or cfg.enable_unified_memory
+            or cfg.enable_session_radix_cache
+        ):
+            raise ValueError(
+                "Independent DFLASH cache does not yet support HiCache, unified memory or Session cache."
+            )
+
     algorithm = "DFLASH"
     if current_platform.is_out_of_tree():
         is_supported = current_platform.supports_speculative_algorithm(algorithm)
