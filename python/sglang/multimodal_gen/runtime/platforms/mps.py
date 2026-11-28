@@ -53,8 +53,10 @@ class MpsPlatform(Platform):
     @classmethod
     @lru_cache(maxsize=1)
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-
-        return psutil.virtual_memory().total
+        limit = torch.mps.recommended_max_memory()
+        if limit <= 0:
+            raise RuntimeError("Metal reported a non-positive working-set limit")
+        return limit
 
     @classmethod
     def get_current_memory_usage(
@@ -74,8 +76,10 @@ class MpsPlatform(Platform):
         if empty_cache:
             torch.mps.empty_cache()
 
-        # For MPS, available memory is essentially the system available memory
-        free_memory = psutil.virtual_memory().available
+        headroom = (
+            torch.mps.recommended_max_memory() - torch.mps.driver_allocated_memory()
+        )
+        free_memory = min(psutil.virtual_memory().available, max(headroom, 0))
 
         if distributed:
             import torch.distributed as dist
