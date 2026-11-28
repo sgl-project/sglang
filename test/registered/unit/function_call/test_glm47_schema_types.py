@@ -2,6 +2,7 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -157,6 +158,47 @@ class TestGlm47SchemaTypes(CustomTestCase):
             },
             {"kind": "count", "value": 7},
         )
+
+    def test_repeated_parameter_keeps_first_value(self):
+        """A later tag must not emit a second key or change a sibling's type."""
+        text = (
+            "<tool_call>inspect"
+            "<arg_key>command</arg_key><arg_value>7</arg_value>"
+            "<arg_key> command </arg_key><arg_value>true</arg_value>"
+            "<arg_key>kind</arg_key><arg_value>text</arg_value>"
+            "<arg_key>kind</arg_key><arg_value>count</arg_value>"
+            "</tool_call>"
+        )
+        text_branch = {
+            "properties": {"kind": {"const": "text"}, "command": {"type": "string"}}
+        }
+        count_branch = {
+            "properties": {"kind": {"const": "count"}, "command": {"type": "integer"}}
+        }
+        expected = [("command", "7"), ("kind", "text")]
+        for schema in (text_branch, {"oneOf": [text_branch, count_branch]}):
+            tools = [
+                Tool(
+                    type="function",
+                    function=Function(name="inspect", parameters=schema),
+                )
+            ]
+            for size in (0, 1, 7, len(text)):
+                with self.subTest(schema=schema, chunk_size=size):
+                    parser = FunctionCallParser(tools, "glm47")
+                    if size == 0:
+                        _, calls = parser.parse_non_stream(text)
+                    else:
+                        calls = []
+                        for start in range(0, len(text), size):
+                            _, delta = parser.parse_stream_chunk(
+                                text[start : start + size]
+                            )
+                            calls.extend(delta)
+                        _, final = parser.parse_stream_end()
+                        calls.extend(final)
+                    raw = "".join(call.parameters for call in calls)
+                    self.assertEqual(json.loads(raw, object_pairs_hook=list), expected)
 
     def test_plain_strings_still_stream_before_value_completes(self):
         tools = [

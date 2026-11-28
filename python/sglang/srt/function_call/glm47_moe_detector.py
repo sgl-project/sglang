@@ -44,6 +44,7 @@ class StreamState(str, Enum):
     IN_KEY = "IN_KEY"
     WAITING_VALUE = "WAITING_VALUE"
     IN_VALUE = "IN_VALUE"
+    SKIP_DUPLICATE_VALUE = "SKIP_DUPLICATE_VALUE"
 
 
 _UNSET = object()
@@ -343,7 +344,7 @@ class Glm47MoeDetector(BaseFormatDetector):
         self._current_key = ""
         self._current_value = ""
         self._xml_tag_buffer = ""
-        self._is_first_param = True
+        self._streamed_keys: set[str] = set()
         self._value_started = False
         self._cached_value_type: Optional[str] = (
             None  # Cache the value type for consistency
@@ -447,16 +448,22 @@ class Glm47MoeDetector(BaseFormatDetector):
 
             if self._stream_state in [StreamState.INIT, StreamState.BETWEEN]:
                 if self._xml_tag_buffer.endswith("<arg_key>"):
+                    if self._stream_state == StreamState.INIT:
+                        json_output += "{"
                     self._stream_state = StreamState.IN_KEY
                     self._current_key = ""
                     self._xml_tag_buffer = ""
-                    json_output += "{" if self._is_first_param else ", "
-                    self._is_first_param = False
 
             elif self._stream_state == StreamState.IN_KEY:
                 if self._xml_tag_buffer.endswith("</arg_key>"):
                     self._current_key = self._xml_tag_buffer[:-10].strip()
                     self._xml_tag_buffer = ""
+                    if self._current_key in self._streamed_keys:
+                        self._stream_state = StreamState.SKIP_DUPLICATE_VALUE
+                        continue
+                    if self._streamed_keys:
+                        json_output += ", "
+                    self._streamed_keys.add(self._current_key)
                     self._stream_state = StreamState.WAITING_VALUE
                     json_output += (
                         json.dumps(self._current_key, ensure_ascii=False) + ": "
@@ -535,6 +542,14 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 json_output += content
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
+
+            elif self._stream_state == StreamState.SKIP_DUPLICATE_VALUE:
+                end_tag = "</arg_value>"
+                # Keep just enough text to recognize a closer split across chunks.
+                self._xml_tag_buffer = self._xml_tag_buffer[-len(end_tag) :]
+                if self._xml_tag_buffer == end_tag:
+                    self._xml_tag_buffer = ""
+                    self._stream_state = StreamState.BETWEEN
 
         return json_output
 
@@ -702,28 +717,17 @@ class Glm47MoeDetector(BaseFormatDetector):
             self.streamed_args_for_tool[self.current_tool_id] += serialized
             self._sent_empty_object = True
 
-        # Handle no-arg function or need to close braces
-        if self._is_first_param and not self._sent_empty_object:
+        if not self._sent_empty_object:
+            # The first <arg_key> opens the outer object, which closes here.
+            suffix = "{}" if self._stream_state == StreamState.INIT else "}"
             calls.append(
                 ToolCallItem(
                     tool_index=self.current_tool_id,
                     name=None,
-                    parameters="{}",
+                    parameters=suffix,
                 )
             )
-            self.streamed_args_for_tool[self.current_tool_id] += "{}"
-            self._sent_empty_object = True
-        elif not self._is_first_param and not self._sent_empty_object:
-            # The streamed outer `{` is only closed here; a trailing "}" in
-            # the streamed arguments may belong to a nested object value.
-            calls.append(
-                ToolCallItem(
-                    tool_index=self.current_tool_id,
-                    name=None,
-                    parameters="}",
-                )
-            )
-            self.streamed_args_for_tool[self.current_tool_id] += "}"
+            self.streamed_args_for_tool[self.current_tool_id] += suffix
             self._sent_empty_object = True
 
         if func_args_raw:
@@ -868,17 +872,21 @@ class Glm47MoeDetector(BaseFormatDetector):
         Returns:
             Dictionary of parsed arguments
         """
+        # A streamed value cannot be retracted. Keep its first occurrence in
+        # both modes, including when resolving types from sibling arguments.
+        raw_arguments = {}
+        for key, raw in pairs:
+            raw_arguments.setdefault(key.strip(), raw)
         arguments = {}
         known_arguments = {}
         # Values with a certain type are resolved first so completed sibling
         # discriminators (e.g. kind=const) can steer root-union branch selection.
-        if len(pairs) > 1 and any(
+        if len(raw_arguments) > 1 and any(
             tool.function.name == func_name
             and _needs_argument_context(tool.function.parameters)
             for tool in tools
         ):
-            for key, raw in pairs:
-                key = key.strip()
+            for key, raw in raw_arguments.items():
                 parsed = self._parse_argument_pairs([(key, raw)], func_name, tools)[key]
                 native_types = _get_argument_types(func_name, key, tools, value=raw)
                 if (
@@ -887,8 +895,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                     or "string" not in native_types
                 ):
                     known_arguments[key] = parsed
-        for arg_key, arg_value in pairs:
-            arg_key = arg_key.strip()
+        for arg_key, arg_value in raw_arguments.items():
             arg_type = get_argument_type(func_name, arg_key, tools, known_arguments)
             parsed_value, is_good_json = parse_arguments(
                 arg_value, arg_type or "string"
