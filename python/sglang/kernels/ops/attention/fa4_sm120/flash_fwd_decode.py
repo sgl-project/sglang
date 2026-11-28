@@ -220,6 +220,8 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             smem_thr_copy_Q,
             B_in_regs=self.query_in_regs,
         )
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
         pipeline_k.consumer_release(consumer_state)
 
         acc_S_qk = layout_utils.reshape_acc_to_mn(acc_S, transpose=True)
@@ -381,6 +383,8 @@ class FlashAttentionForwardSm120DecodeTranspose(FlashAttentionForwardSm120):
             smem_thr_copy_V,
             smem_thr_copy_P,
         )
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
         pipeline_v.consumer_release(consumer_state)
 
         cute.arch.barrier(

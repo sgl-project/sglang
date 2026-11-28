@@ -2857,6 +2857,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 smem_thr_copy_q,
                 smem_thr_copy_k,
             )
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
         pipeline_k.consumer_release(k_state)
         k_state.advance()
 
@@ -3041,6 +3043,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             sV[None, None, v_state.index],
             smem_thr_copy_v,
         )
+        cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
         pipeline_v.consumer_release(v_state)
         v_state.advance()
         return v_state, p_state
