@@ -299,6 +299,18 @@ for _mod, _fn, _backend, _device in [
         )
     )
 del _mod, _fn, _backend, _device
+# A ROCm GQA DSPARK draft's sliding-window kv_indices from its per-request KV ring.
+register_kernel(
+    KernelSpec(
+        op="attention.fill_dspark_ring_window_buffer_hip",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.attention.dspark_ring_window_hip:"
+            "fill_dspark_ring_window_buffer_hip"
+        ),
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 # Called through ops.attention.kda_fused_decode_gfx950, which checks for gfx950.
 register_kernel(
     KernelSpec(

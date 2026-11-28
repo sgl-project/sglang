@@ -29,7 +29,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -56,6 +56,12 @@ from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     make_next_draft_input,
+)
+from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
+    bind_worker_draft_kv_ring_to_backend,
+    build_worker_draft_kv_ring,
+    record_worker_draft_kv_ring_floors,
+    worker_hicache_draft_plan,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
@@ -453,6 +459,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_moe_sync=self._draft_is_moe and get_parallel().attn_dp_enabled,
             acceptance_estimator=self._acceptance_estimator,
         )
+        self.draft_kv_ring = None
         self._verify_epilogue = None
         self._deferred_draft_kv: Optional[DeferredDraftKVStore] = None
         self._sampling_accept_graph: Optional[DsparkSamplingAcceptGraph] = None
@@ -689,6 +696,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
+        build_worker_draft_kv_ring(self)
         if self._static_epilogue_needs_draft_fold and not draft_folds_static_commit(
             draft_model=self.draft_model, kv_injector=self._kv_injector
         ):
@@ -697,11 +705,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "but its FULL KV slots are not the target's unremapped slots"
             )
 
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        return worker_hicache_draft_plan(self) or super()._build_hicache_draft_plan()
+
     def init_attention_backends(self):
         if not self._hosts_draft:
             return
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
+        bind_worker_draft_kv_ring_to_backend(self)
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
             target_model=self.target_worker.model_runner.model,
             draft_model=self.draft_model,
@@ -940,6 +952,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 draft_pool.set_swa_valid_from(
                     batch.req_pool_indices.index_select(0, placed_rows), valid_from
                 )
+        record_worker_draft_kv_ring_floors(self, batch)
         # Inject under the draft's TP placement, like the draft and decode paths.
         with self._draft_context():
             self._kv_injector.inject_prefill(

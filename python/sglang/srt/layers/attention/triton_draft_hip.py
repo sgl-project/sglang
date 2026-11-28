@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
@@ -13,7 +13,10 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from sglang.srt.layers.attention.triton_backend import (
+        TritonAttnBackend,
+        WindowRail,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -29,9 +32,9 @@ def init_draft_backend(backend: TritonAttnBackend, model_runner: ModelRunner) ->
     # --speculative-draft-kv-cache-dtype says otherwise; keep q and the attention
     # math in BF16 over it instead of casting q and the probabilities to FP8.
     backend.draft_bf16_dot = algorithm.is_dflash_family()
-    # A DFLASH draft never runs forward_decode, so its graphs skip the split-KV
-    # decode partials (all heads under DCP: ~14.5 GiB a rank for K3.1's MLA5 draft).
-    backend.runs_decode = not algorithm.is_dflash()
+    # A DFLASH or DSPARK draft never runs forward_decode, so its graphs skip the
+    # split-KV decode partials (all heads under DCP: ~14.5 GiB a rank for K3.1's MLA5 draft).
+    backend.runs_decode = not algorithm.is_dflash_family()
     # The monokernel's DFLASH MLA draft verifies on its own tuning of the
     # grouped-head kernel (a sliding window, two heads a tile); nothing else does.
     if (
@@ -165,3 +168,62 @@ class MlaDcpWindowVerify:
         # The kernel's LSE is natural log and the merge of Triton partials is base 2
         # (is_mla_dcp_lse_base_on_e); -inf rows (no owned key) stay -inf.
         return out.squeeze(0).flatten(1), lse * math.log2(math.e)
+
+
+def set_gqa_draft_kv_ring(backend: TritonAttnBackend, ring) -> None:
+    """Bind a per-request KV ring for non-MLA GQA DSpark drafts on ROCm."""
+    backend.gqa_draft_kv_ring_hip = ring
+    backend.verify_reads_window_kv_only = True
+
+
+def ring_window_rails(
+    backend: TritonAttnBackend,
+    req_pool_indices: torch.Tensor,
+    lens: torch.Tensor,
+    bs: int,
+    *,
+    with_offsets: bool,
+    graph: bool,
+    aligned: bool,
+) -> Optional[Dict[str, WindowRail]]:
+    """Every window rail filled from the per-request ring on non-MLA drafts, or None."""
+    ring = getattr(backend, "gqa_draft_kv_ring_hip", None)
+    if ring is None or backend.use_mla:
+        return None
+    from sglang.kernels.ops.attention.dspark_ring_window_hip import (
+        fill_dspark_ring_window_buffer_hip,
+    )
+
+    from sglang.srt.layers.attention.triton_backend import WindowRail
+
+    rails = {}
+    for name, window in backend.window_lengths.items():
+        kv_indptr, kv_indices, kv_lens, kv_offsets = fill_dspark_ring_window_buffer_hip(
+            min_pos=ring.min_pos,
+            rows_per_req=ring.rows_per_req,
+            dcp_size=ring.dcp_size,
+            window_kv_indptr=backend.window_kv_indptr[name],
+            req_pool_indices=req_pool_indices,
+            seq_lens=lens,
+            bs=bs,
+            sliding_window_size=window,
+            window_kv_indices=(
+                backend.cuda_graph_window_kv_indices[name] if graph else None
+            ),
+        )
+        if not with_offsets:
+            kv_offsets = None
+        elif graph:
+            backend.cuda_graph_window_kv_offsets[name][:bs] = kv_offsets
+            kv_offsets = backend.cuda_graph_window_kv_offsets[name]
+        rail = WindowRail(
+            kv_indptr=kv_indptr, kv_indices=kv_indices, kv_offsets=kv_offsets
+        )
+        if aligned:
+            rail.aligned_kv_indptr, rail.aligned_kv_indices = (
+                backend.align_window_kv_to_tiles(
+                    kv_indptr, kv_indices, lens[:bs] - kv_lens, bs
+                )
+            )
+        rails[name] = rail
+    return rails

@@ -74,6 +74,7 @@ if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
 if _is_hip:
     from sglang.srt.layers.attention import triton_backend_hip as _hip
+    from sglang.srt.layers.attention import triton_draft_hip as _draft_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.triton_draft_hip import MlaDcpWindowVerify
@@ -677,6 +678,21 @@ class TritonAttnBackend(AttentionBackend):
     ) -> Dict[str, WindowRail]:
         """Every window rail over the last ``lens`` tokens of each request, in the
         CUDA-graph buffers when ``graph``; ``aligned`` adds the tile-aligned rail."""
+        ring_rails = (
+            _draft_hip.ring_window_rails(
+                self,
+                req_pool_indices,
+                lens,
+                bs,
+                with_offsets=with_offsets,
+                graph=graph,
+                aligned=aligned,
+            )
+            if _is_hip
+            else None
+        )
+        if ring_rails is not None:
+            return ring_rails
         rails = {}
         for name, window in self.window_lengths.items():
             kv_indptr, kv_indices, kv_lens, kv_offsets = update_sliding_window_buffer(
@@ -1037,6 +1053,9 @@ class TritonAttnBackend(AttentionBackend):
     def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
         """Read a DFLASH MLA draft's window keys from its per-request KV ring; only
         ROCm's DCP window verify admits the ring on this backend."""
+        if _is_hip and not self.use_mla:
+            _draft_hip.set_gqa_draft_kv_ring(self, ring)
+            return
         assert self.mla_dcp_window_verify is not None, "no reader for the draft KV ring"
         self.mla_dcp_window_verify.draft_kv_ring = ring
 

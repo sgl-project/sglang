@@ -685,6 +685,8 @@ class KVCacheConfigurator:
     def loc_space_scale(self) -> int:
         if not self.is_draft_worker:
             return 1
+        if get_spec().speculative_dflash_draft_kv_ring and not self.use_mla_backend:
+            return 1
         return draft_loc_space_scale(
             hf_config=self.model_config.hf_config,
             use_mla_backend=self.use_mla_backend,
@@ -3031,7 +3033,14 @@ class KVCacheConfigurator:
         )
 
         max_num_reqs = max(1, get_schedule().max_running_requests // self.attn_dp_size)
-        page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
+        draft_is_mla = (
+            self.spec_aux_config.draft_model_config.attention_arch == AttentionArch.MLA
+        )
+        page_size = (
+            get_schedule().page_size * self.dflash_draft_loc_space_scale
+            if draft_is_mla
+            else get_schedule().page_size
+        )
         rows = draft_kv_ring_pool_rows_from_config(
             self.spec_aux_config.draft_model_config.hf_config,
             # Request rows, PD pre-alloc rows and the padding row.

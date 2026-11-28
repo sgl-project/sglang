@@ -1946,6 +1946,9 @@ class Envs:
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
     SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(False)
+    # The same ring for a GQA DSpark draft on ROCm's Triton draft backend
+    # (dspark_components/dspark_draft_ring_hip.py); startup fails where it does not fit.
+    SGLANG_ENABLE_DSPARK_DRAFT_KV_RING = EnvBool(False)
     # Disable the compact-slot SWA window lookup for compact MLA drafts.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
     # Gather DFLASH candidate top-k in one multicast all-gather.

@@ -54,6 +54,9 @@ from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
     DeferredDraftKVStore,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
+from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
+    verify_inject_cache_loc,
+)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -415,7 +418,13 @@ class TargetVerifyExecutor:
             state_slot = (
                 batch.req_pool_indices[:bs].view(-1, 1).expand(bs, vlen).reshape(-1)
             )
-        cache_loc = self.kv_injector.ids_for(verify_window.iteration_ids)
+        cache_loc, inject_iteration_ids = verify_inject_cache_loc(
+            self.kv_injector,
+            batch=batch,
+            verify_window=verify_window,
+            bs=bs,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+        )
         self.kv_injector.inject_target_hidden(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
@@ -423,7 +432,7 @@ class TargetVerifyExecutor:
             positions=verify_window.positions_2d.reshape(-1),
             commit_lens=commit_lens,
             state_slot=state_slot,
-            iteration_ids=verify_window.iteration_ids,
+            iteration_ids=inject_iteration_ids,
         )
 
     def _run_ragged(

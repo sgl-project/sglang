@@ -874,6 +874,12 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
+    from sglang.srt.speculative.dspark_components.dspark_draft_ring_hip import (
+        resolve_rocm_dspark_draft_kv_ring,
+    )
+
+    resolve_rocm_dspark_draft_kv_ring(server_args, _load_draft_hf_config)
+
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
         read_ragged_verify_mode,
