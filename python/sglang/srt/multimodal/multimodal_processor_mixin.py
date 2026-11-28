@@ -5,6 +5,7 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.multimodal.media_errors import media_load_error
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     configure_worker_media_policy,
@@ -232,15 +233,12 @@ class MultimodalProcessorMixin:
                 return load_audio(data, audio_sample_rate)
 
         except CLIENT_MEDIA_EXCEPTIONS as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise ValueError(f"Error while loading data {data_str}: {e}") from e
+            error, cause = media_load_error(ValueError, modality, data, e)
         except Exception as e:
-            data_str = str(data)
-            if len(data_str) > 100:
-                data_str = data_str[:100] + "..."
-            raise RuntimeError(f"Error while loading data {data_str}: {e}") from e
+            error, cause = media_load_error(RuntimeError, modality, data, e)
+        else:
+            return None
+        raise error from cause
 
     @staticmethod
     def _get_preprocessed_input_format(data):

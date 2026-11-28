@@ -26,6 +26,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
 )
+from sglang.srt.multimodal.media_errors import media_load_error
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     load_audio,
@@ -366,13 +367,12 @@ class EncoderPreprocessor:
         except MMError:
             raise
         except CLIENT_MEDIA_EXCEPTIONS as e:
-            # Not ValueError: the DP envelope classifies by `.code`, which only
-            # MMError carries.
-            raise BadRequestError(
-                f"Error while loading data {str(data)[:128]}: {e}"
-            ) from e
+            error, cause = media_load_error(BadRequestError, modality, data, e)
         except Exception as e:
-            raise RuntimeError(f"Error while loading data {str(data)[:128]}: {e}")
+            error, cause = media_load_error(RuntimeError, modality, data, e)
+        else:
+            return None
+        raise error from cause
 
     def _submit_data_loading_tasks(self, items, modalities):
         futures = []
