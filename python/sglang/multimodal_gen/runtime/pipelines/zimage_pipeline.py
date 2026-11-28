@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     calculate_linear_shift,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.zimage_denoising import (
+    ZImageDenoisingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.zimage import (
     ZImageProgressiveDenoisingStage,
 )
@@ -46,6 +49,7 @@ class ZImagePipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_standard_t2i_stages(
             prepare_extra_timestep_kwargs=[prepare_mu],
             progressive_denoising_stage_cls=ZImageProgressiveDenoisingStage,
+            standard_denoising_stage_cls=ZImageDenoisingStage,
         )
 
 
