@@ -34,13 +34,16 @@ class Qwen3ASRProcessor(ProcessorMixin):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         trust_remote_code = kwargs.pop("trust_remote_code", True)
+        load_kwargs = {"trust_remote_code": trust_remote_code}
+        if "revision" in kwargs:
+            load_kwargs["revision"] = kwargs["revision"]
         feature_extractor = AutoFeatureExtractor.from_pretrained(
             pretrained_model_name_or_path,
-            trust_remote_code=trust_remote_code,
+            **load_kwargs,
         )
         tokenizer = AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path,
-            trust_remote_code=trust_remote_code,
+            **load_kwargs,
         )
         return cls(feature_extractor=feature_extractor, tokenizer=tokenizer)
 
@@ -150,18 +153,83 @@ class Qwen3ASRConfig(PretrainedConfig):
         "thinker_config": Qwen3ASRThinkerConfig,
     }
 
-    def __init__(self, thinker_config=None, **kwargs):
+    def __init__(
+        self,
+        thinker_config=None,
+        audio_config=None,
+        text_config=None,
+        audio_token_id=None,
+        audio_start_token_id=None,
+        audio_end_token_id=None,
+        **kwargs,
+    ):
         if thinker_config is None:
-            thinker_config = {}
-            logger.info(
-                "thinker_config is None. "
-                "Initializing Qwen3-ASR thinker with default values"
-            )
+            if audio_config is not None or text_config is not None:
+                # Native Hugging Face Transformers checkpoints (e.g. Qwen3-ASR-*-hf,
+                # oruk/oruk-fourier-2b) place audio_config and text_config at the
+                # top level without a thinker_config wrapper.
+                thinker_kwargs = {}
+                if audio_config is not None:
+                    thinker_kwargs["audio_config"] = audio_config
+                if text_config is not None:
+                    if isinstance(text_config, dict):
+                        text_config = dict(text_config)
+                        for attr in (
+                            "tie_word_embeddings",
+                            "eos_token_id",
+                            "pad_token_id",
+                        ):
+                            if (
+                                text_config.get(attr) is None
+                                and kwargs.get(attr) is not None
+                            ):
+                                text_config[attr] = kwargs[attr]
+                    thinker_kwargs["text_config"] = text_config
+                if audio_token_id is not None:
+                    thinker_kwargs["audio_token_id"] = audio_token_id
+                if audio_start_token_id is not None:
+                    thinker_kwargs["audio_start_token_id"] = audio_start_token_id
+                if audio_end_token_id is not None:
+                    thinker_kwargs["audio_end_token_id"] = audio_end_token_id
+                for attr in ("dtype", "torch_dtype", "initializer_range"):
+                    if attr in kwargs:
+                        thinker_kwargs[attr] = kwargs[attr]
+                thinker_config = thinker_kwargs
+            else:
+                thinker_config = {}
+                logger.info(
+                    "thinker_config is None. "
+                    "Initializing Qwen3-ASR thinker with default values"
+                )
         if isinstance(thinker_config, dict):
             self.thinker_config = Qwen3ASRThinkerConfig(**thinker_config)
         else:
             self.thinker_config = thinker_config
         super().__init__(**kwargs)
+
+    @property
+    def audio_config(self) -> PretrainedConfig:
+        return self.thinker_config.audio_config
+
+    @audio_config.setter
+    def audio_config(self, value: PretrainedConfig) -> None:
+        self.thinker_config.audio_config = value
+
+    @property
+    def text_config(self) -> PretrainedConfig:
+        return self.thinker_config.text_config
+
+    @text_config.setter
+    def text_config(self, value: PretrainedConfig) -> None:
+        self.thinker_config.text_config = value
+
+    @property
+    def audio_token_id(self) -> int:
+        return self.thinker_config.audio_token_id
+
+    @audio_token_id.setter
+    def audio_token_id(self, value: int) -> None:
+        self.thinker_config.audio_token_id = value
 
     def get_text_config(self, decoder=False) -> PretrainedConfig:
         return self.thinker_config.text_config
