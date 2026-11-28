@@ -12,6 +12,7 @@ Key MoE characteristics:
 - Post-hoc normalization of top-k weights
 """
 
+import re
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -57,7 +58,12 @@ from sglang.srt.models.lfm2 import (
     register_shortconv_verify_buffers,
     shortconv_target_verify,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
+
+# The checkpoint names the dense MLP's down projection w2.
+_CKPT_DENSE_DOWN_PROJ = "feed_forward.w2"
+_DENSE_DOWN_PROJ = "feed_forward.down_proj"
 
 
 class Lfm2MoeMLP(nn.Module):
@@ -595,6 +601,20 @@ class Lfm2MoeForCausalLM(nn.Module):
 
     fall_back_to_pt_during_load = False
 
+    # Checkpoint shard names of the fused layers, so ignore lists resolve (the
+    # dense MLP is w1/w3/w2). Split q/k/v keeps a partial qkv regex an error.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["w1", "w3"],
+    }
+    # The second entry renames the escaped form inside `re:` ignore patterns.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_substr={
+            _CKPT_DENSE_DOWN_PROJ: _DENSE_DOWN_PROJ,
+            re.escape(_CKPT_DENSE_DOWN_PROJ): re.escape(_DENSE_DOWN_PROJ),
+        }
+    )
+
     def __init__(
         self,
         config: Lfm2MoeConfig,
@@ -705,8 +725,8 @@ class Lfm2MoeForCausalLM(nn.Module):
                 name = name.replace(".conv.conv.bias", ".conv.conv_bias")
 
             # Handle dense MLP w2 -> down_proj
-            if "feed_forward.w2" in name and "experts" not in name:
-                name = name.replace("feed_forward.w2", "feed_forward.down_proj")
+            if _CKPT_DENSE_DOWN_PROJ in name and "experts" not in name:
+                name = name.replace(_CKPT_DENSE_DOWN_PROJ, _DENSE_DOWN_PROJ)
 
             # Transformers >= v5.0 packs MoE expert weights into a single 3D tensor
             # per projection (experts.gate_up_proj / experts.down_proj) instead of

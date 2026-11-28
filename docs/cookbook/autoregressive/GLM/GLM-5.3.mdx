@@ -50,12 +50,12 @@ Use a Linux host with the Ascend driver and a compatible CANN / TorchNPU environ
 <Tab title="A3">
 
 ```bash Command
-docker pull quay.io/ascend/sglang:cann9.1.0-a3-B080
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B051
 ```
 
-This CANN 9.1.0 image requires a compatible SGLang build, TorchNPU, ATB, and custom operators before serving. Set `SGLANG_ROOT` to that source checkout.
+This CANN 9.2.0 image requires a compatible SGLang build, TorchNPU, ATB, and custom operators before serving. Set `SGLANG_ROOT` to that source checkout.
 
-Run the following setup before copying the generated command (CANN 9.1.0). CPU tuning requires host privileges.
+Run the following setup before copying the generated command (CANN 9.2.0). CPU tuning requires host privileges.
 
 ```bash Command
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY ASCEND_LAUNCH_BLOCKING
@@ -65,7 +65,7 @@ sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/cann-9.1.0/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/cann-9.2.0/opp/vendors/customize/bin/set_env.bash
 SGLANG_ROOT=/path/to/sglang
 export PYTHONPATH="${SGLANG_ROOT}/python:${PYTHONPATH:-}"
 export LD_LIBRARY_PATH="/usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/op_api/lib:${LD_LIBRARY_PATH:-}"
@@ -248,6 +248,75 @@ sglang serve \
   --chunked-prefill-size 32768 \
   --max-running-requests {max-running-requests} \
   --cuda-graph-max-bs-decode {max-running-requests} \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --watchdog-timeout 1800
+```
+
+### MI355X FP8 high-concurrency deployment with DCP4
+
+Official FP8 checkpoint `zai-org/GLM-5.3` at concurrency 16 and 24 on one 8×MI355X node, measured with the InferenceX AgentX harness ([InferenceX #5168](https://github.com/SemiAnalysisAI/InferenceX/pull/5168), [sweep run](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/45896778660)) on `lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261119`. Below concurrency 16, keep the [monokernel recipe above](#mi355x-fp8-deployment-with-the-amd-monokernel).
+
+- **Decode context parallelism.** At TP8 every rank holds a full copy of the KV cache, so the pool stays near 3.3M tokens. From concurrency 16, the agentic working set no longer fits: cached prefixes are evicted, the prefix-cache hit rate drops to 93%, and recomputed prefill stalls decode. `--dcp-size 4` shards the KV cache over four ranks, which raises the pool to about 10.5M tokens and the hit rate to 97%. At concurrency 8 and 10 the cache already fits, and DCP4 measured lower than DCP1 because of its extra per-step cost.
+- **KV cache.** The GPU pool holds the working set at DCP4, so these commands run without HiCache. Adding `--enable-hierarchical-cache --hicache-ratio 1.0` changed throughput by less than 1% in a local one-hour run.
+- **Prefill.** Pass `--cuda-graph-backend-prefill disabled`: breakable prefill CUDA graphs fail with DCP larger than 1 on this image. The prefill delayer batches up to two long prefills instead of interleaving them one at a time with decode. Keep `--chunked-prefill-size 32768`. With 16384-token chunks, the DSA indexer ran out of GPU memory during a cold long-context prefill.
+- **MTP.** EAGLE runs 3 steps with 4 draft tokens. 5 steps with 6 draft tokens slowed each decode step enough to cancel the higher acceptance length.
+
+The braced value `{max-running-requests}` is twice the concurrency and sets both `--max-running-requests` and `--cuda-graph-max-bs-decode`. Throughput counts input and output tokens per second per GPU. Interactivity is the output tokens per second each session sees at the P90 inter-token latency. The sweep used synthetic MTP acceptance at the GLM-5.3 golden acceptance length (2.94 for 3 steps).
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700, width: "40%"}}>Concurrency</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>16</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>24</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}>max-running-requests</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>32</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>48</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>Throughput (tok/s/GPU)</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>9,415</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>13,478</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px"}}>P90 interactivity (tok/s/user)</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>62.5</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>40.6</td>
+    </tr>
+  </tbody>
+</table>
+
+```bash TP8·DCP4 (concurrency 16–24)
+SGLANG_OPT_USE_TOPK_V2=false \
+sglang serve \
+  --model-path zai-org/GLM-5.3 \
+  --trust-remote-code \
+  --tp 8 \
+  --ep-size 1 \
+  --dcp-size 4 \
+  --dsa-prefill-backend triton \
+  --dsa-decode-backend triton \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 32768 \
+  --max-prefill-tokens 16384 \
+  --cuda-graph-backend-prefill disabled \
+  --max-running-requests {max-running-requests} \
+  --cuda-graph-max-bs-decode {max-running-requests} \
+  --enable-prefill-delayer \
+  --prefill-delayer-max-delay-ms 800 \
+  --prefill-delayer-max-delay-passes 32 \
+  --prefill-delayer-queue-min-ratio 0.5 \
+  --prefill-max-requests 2 \
   --reasoning-parser auto \
   --tool-call-parser auto \
   --watchdog-timeout 1800

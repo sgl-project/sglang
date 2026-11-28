@@ -129,9 +129,9 @@ def _backend(runner_ids, req_to_token, page_size):
     b = FlashAttentionBackend.__new__(FlashAttentionBackend)
     b.runner_ids = runner_ids
     b.req_to_token = req_to_token
-    b.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+    b.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, row_width=_MAX_CTX)
+    b.max_kv_len = _MAX_CTX
     b.page_size = page_size
-    b.max_context_len = _MAX_CTX
     b.max_num_pages = -(-_MAX_CTX // page_size)
     b.topk = 1
     b.speculative_num_draft_tokens = _NUM_DRAFT

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from enum import Enum
 from typing import Any, Dict, Iterable, Mapping, Optional
@@ -10,6 +11,9 @@ from diffusers.loaders import lora_conversion_utils as lcu
 
 from sglang.multimodal_gen.runtime.pipelines_core.lora.peft_adapter import (
     apply_peft_config,
+    compile_peft_alpha_patterns,
+    get_peft_lora_alpha,
+    match_peft_alpha_pattern,
     normalize_peft_keys,
 )
 
@@ -25,6 +29,9 @@ class LoRAFormat(str, Enum):
     XLABS_FLUX = "xlabs-ai"
     KOHYA_FLUX = "kohya-flux"
     KOHYA_MINIMAX_H3 = "kohya-minimax-h3"
+    KOHYA_QWEN_IMAGE = "kohya-qwen-image"
+    KOHYA_Z_IMAGE = "kohya-z-image"
+    MUSUBI_WAN = "musubi-wan"
     WAN = "wan"
     AI_TOOLKIT_FLUX = "ai-toolkit-flux"
 
@@ -126,6 +133,34 @@ def _convert_kohya_minimax_h3(
     return out
 
 
+_MUSUBI_WAN_KEY = re.compile(
+    r"^lora_unet_blocks_(\d+)_"
+    r"(self_attn_(?:q|k|v|o)|cross_attn_(?:q|k|v|o|k_img|v_img)|ffn_(?:0|2))"
+    r"\.(lora_down\.weight|lora_up\.weight|alpha)$"
+)
+
+
+def _looks_like_musubi_wan(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """musubi-tuner Wan LoRA (its default save format): lora_unet_blocks_N_*."""
+    keys = list(state_dict.keys())
+    return bool(keys) and all(_MUSUBI_WAN_KEY.match(k) for k in keys)
+
+
+def _convert_musubi_wan(
+    state_dict: Mapping[str, torch.Tensor],
+    log: logging.Logger,
+) -> Dict[str, torch.Tensor]:
+    """lora_unet_blocks_N_self_attn_q.* -> diffusion_model.blocks.N.self_attn.q.*,
+    the official Wan layout the WAN path already converts (with alpha)."""
+    renamed: Dict[str, torch.Tensor] = {}
+    for key, tensor in state_dict.items():
+        block, module, suffix = _MUSUBI_WAN_KEY.match(key).groups()
+        module = re.sub(r"^(self_attn|cross_attn|ffn)_", r"\1.", module)
+        renamed[f"diffusion_model.blocks.{block}.{module}.{suffix}"] = tensor
+    log.info("[LoRAFormatAdapter] renamed %d musubi Wan keys", len(renamed))
+    return convert_lora_state_dict_by_format(renamed, LoRAFormat.WAN, log)
+
+
 def _looks_like_kohya_flux(state_dict: Mapping[str, torch.Tensor]) -> bool:
     """Kohya FLUX LoRA (flux_lora.py) under lora_unet_double/single_blocks_ prefixes."""
     if not state_dict:
@@ -135,6 +170,34 @@ def _looks_like_kohya_flux(state_dict: Mapping[str, torch.Tensor]) -> bool:
         k.startswith("lora_unet_double_blocks_")
         or k.startswith("lora_unet_single_blocks_")
         for k in keys
+    )
+
+
+def _looks_like_kohya_qwen_image(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """Kohya/musubi Qwen-Image LoRA: lora_unet_transformer_blocks_N_{img,txt}_{mlp,mod}_*.
+
+    The img/txt mlp and mod names separate it from Kohya exports of other
+    MMDiTs that also use diffusers `transformer_blocks` naming.
+    """
+    return any(
+        k.startswith("lora_unet_transformer_blocks_")
+        and any(m in k for m in ("_img_mlp_", "_txt_mlp_", "_img_mod_", "_txt_mod_"))
+        for k in state_dict
+    )
+
+
+def _looks_like_kohya_z_image(state_dict: Mapping[str, torch.Tensor]) -> bool:
+    """Kohya/musubi Z-Image LoRA: lora_unet_{layers,noise_refiner,context_refiner}_N_*."""
+    return any(
+        k.startswith(
+            (
+                "lora_unet_layers_",
+                "lora_unet_noise_refiner_",
+                "lora_unet_context_refiner_",
+            )
+        )
+        and ("_attention_" in k or "_feed_forward_" in k)
+        for k in state_dict
     )
 
 
@@ -200,10 +263,30 @@ def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> 
     return (has_double_blocks or has_single_blocks) and has_lora_ab
 
 
+def _is_qwen_image_dit(dit_class_name: str | None) -> bool:
+    # endswith also matches wrapper classes such as FSDPQwenImageTransformer2DModel;
+    # Qwen-Image 2.1 (QwenImage21Transformer2DModel) uses a different layout.
+    return bool(dit_class_name) and dit_class_name.endswith(
+        "QwenImageTransformer2DModel"
+    )
+
+
+def _is_qwen_image21_dit(dit_class_name: str | None) -> bool:
+    return bool(dit_class_name) and dit_class_name.endswith(
+        "QwenImage21Transformer2DModel"
+    )
+
+
+def _is_z_image_dit(dit_class_name: str | None) -> bool:
+    return bool(dit_class_name) and dit_class_name.endswith("ZImageTransformer2DModel")
+
+
 def detect_lora_format_from_state_dict(
     state_dict: Mapping[str, torch.Tensor],
+    dit_class_name: str | None = None,
 ) -> LoRAFormat:
-    """Classify LoRA format by key patterns only."""
+    """Classify LoRA format by key patterns, using the loaded DiT class where
+    the keys alone are ambiguous."""
     keys = list(state_dict.keys())
     if not keys:
         return LoRAFormat.STANDARD
@@ -220,6 +303,25 @@ def detect_lora_format_from_state_dict(
         return LoRAFormat.KOHYA_MINIMAX_H3
     if _looks_like_kohya_flux(state_dict):
         return LoRAFormat.KOHYA_FLUX
+    if _looks_like_kohya_qwen_image(state_dict) and (
+        dit_class_name is None or _is_qwen_image_dit(dit_class_name)
+    ):
+        return LoRAFormat.KOHYA_QWEN_IMAGE
+    # An attention-only Qwen-Image LoRA has no img/txt mlp or mod names, and its
+    # `transformer_blocks_N_attn_*` keys are shared with other MMDiTs.
+    if _is_qwen_image_dit(dit_class_name) and (
+        _has_prefix_key(keys, "lora_unet_transformer_blocks_")
+        or any(k.split(".", 1)[0] in _QWEN_IMAGE_KOHYA_TOP_LEVEL_MODULES for k in keys)
+    ):
+        return LoRAFormat.KOHYA_QWEN_IMAGE
+    if _looks_like_kohya_z_image(state_dict):
+        return LoRAFormat.KOHYA_Z_IMAGE
+    # A Z-Image LoRA trained only on e.g. adaLN_modulation has no attention or
+    # feed-forward names to recognize it by.
+    if _is_z_image_dit(dit_class_name) and _has_prefix_key(keys, "lora_unet_"):
+        return LoRAFormat.KOHYA_Z_IMAGE
+    if _looks_like_musubi_wan(state_dict):
+        return LoRAFormat.MUSUBI_WAN
 
     if _looks_like_wan_lora(state_dict):
         return LoRAFormat.WAN
@@ -401,6 +503,292 @@ def _convert_kohya_flux_via_diffusers(
     )
 
 
+# diffusers' Z-Image converter splits every "_" of a Kohya name; releases before
+# these fixups (e.g. the pinned 0.37) leave the names below over-split.
+_Z_IMAGE_MODULE_NAME_FIXUPS = {
+    "context.refiner.": "context_refiner.",
+    "noise.refiner.": "noise_refiner.",
+    "adaLN.modulation.": "adaLN_modulation.",
+    "all.final.layer.": "all_final_layer.",
+    "all.x.embedder.": "all_x_embedder.",
+    "cap.embedder.": "cap_embedder.",
+    "t.embedder.": "t_embedder.",
+}
+
+
+_KOHYA_DOWN_SUFFIXES = (".lora_down.weight", ".lora.down.weight")
+
+
+def _strip_default_slot(key: str) -> str:
+    if key.endswith(".default.weight"):
+        return key.removesuffix(".default.weight") + ".weight"
+    return key
+
+
+def _kohya_alpha_key(module: str) -> str:
+    # Dot-format "to.q" modules look their alpha up as "to_q".
+    return re.sub(r"to\.([qkv])$", r"to_\1", module) + ".alpha"
+
+
+def _run_kohya_dit_converter(
+    state_dict: Mapping[str, torch.Tensor],
+    converter_name: str,
+    model_name: str,
+    log: logging.Logger,
+    module_name_fixups: Mapping[str, str] | None,
+) -> Dict[str, torch.Tensor]:
+    converted = _convert_via_diffusers_candidates(
+        state_dict,
+        (converter_name,),
+        log=log,
+        no_converter_warning=(
+            f"[LoRAFormatAdapter] No Kohya {model_name} converter found in diffusers."
+        ),
+        success_info=(
+            f"[LoRAFormatAdapter] Converted Kohya {model_name} LoRA using {{name}}"
+        ),
+        all_failed_warning=(
+            f"[LoRAFormatAdapter] Kohya {model_name} conversion failed; "
+            "last error: {last_err}"
+        ),
+    )
+    # A failed conversion returns the input; releases without the fused-qkv
+    # split (e.g. 0.37) drop a qkv-only file entirely.
+    if not any(k.endswith(".lora_A.weight") for k in converted) or any(
+        k.startswith("lora_unet_") for k in converted
+    ):
+        raise ValueError(
+            f"Could not convert this Kohya {model_name} LoRA with the installed "
+            "diffusers; it would otherwise load as a no-op"
+        )
+    out = {}
+    for key, tensor in converted.items():
+        key = key.removeprefix("transformer.")
+        for dotted, underscored in (module_name_fixups or {}).items():
+            key = key.replace(dotted, underscored)
+        out[key] = tensor
+    return out
+
+
+def _kohya_converted_names(
+    downs: Mapping[str, str], run_converter
+) -> Dict[str, list[str]]:
+    """Map each Kohya module to the converted module names it produces.
+
+    The converter only renames (or splits fused qkv) modules, so a unit-scale
+    probe whose A weight holds the module index recovers the Kohya ->
+    converted name mapping. A module the converter drops has no entry.
+    """
+    probe: Dict[str, torch.Tensor] = {}
+    modules = list(downs)
+    for index, module in enumerate(modules, start=1):
+        down_key = downs[module]
+        up_key = down_key.replace("down.weight", "up.weight")
+        probe[down_key] = torch.full((1, 1), float(index))
+        # Three rows so a fused qkv up weight splits into q, k and v.
+        probe[up_key] = torch.ones(3, 1)
+        probe[_kohya_alpha_key(module)] = torch.tensor(1.0)
+    names: Dict[str, list[str]] = {}
+    for key, tensor in run_converter(probe).items():
+        if key.endswith(".lora_A.weight"):
+            module = modules[int(tensor.flatten()[0].item()) - 1]
+            names.setdefault(module, []).append(key.removesuffix(".lora_A.weight"))
+    return names
+
+
+def _resolve_kohya_alpha(
+    module: str,
+    own_alpha: torch.Tensor | None,
+    rank: int,
+    fill_alpha: int | None,
+    pattern_alphas: Mapping[str, int | None],
+) -> float:
+    """The alpha one Kohya module applies with, checked against its patterns.
+
+    One Kohya alpha covers every module converted from it (q/k/v of a fused
+    qkv), so their pattern values and its own alpha must agree.
+    """
+    if own_alpha is not None:
+        default = float(own_alpha.item())
+        # Diffusers' converters loop on the alpha / rank scale and never return
+        # for a negative one.
+        if not math.isfinite(default) or default < 0:
+            raise ValueError(
+                f"Kohya LoRA alpha of {module!r} must be a non-negative number, "
+                f"got {default:g}"
+            )
+    elif fill_alpha is not None:
+        default = float(fill_alpha)
+    else:
+        default = float(rank)
+    resolved = {
+        name: default if alpha is None else float(alpha)
+        for name, alpha in pattern_alphas.items()
+    }
+    values = set(resolved.values())
+    if own_alpha is not None:
+        values.add(default)
+    if len(values) > 1:
+        own = f"its alpha {default:g}" if own_alpha is not None else "each other"
+        raise ValueError(
+            f"PEFT alpha_pattern alphas {resolved} for Kohya module "
+            f"{module!r} conflict with {own}"
+        )
+    return values.pop() if values else default
+
+
+def _split_qkv_converted(module: str, converted_names: Mapping[str, Any]) -> bool:
+    """A fused `..._qkv` module that diffusers skips because the same file also
+    has its split q/k/v, all of which converted."""
+    if not module.endswith("qkv"):
+        return False
+    base = module[: -len("qkv")]
+    return all(
+        f"{base}to_{x}" in converted_names or f"{base}to.{x}" in converted_names
+        for x in "qkv"
+    )
+
+
+# Qwen-Image modules outside the transformer blocks, which diffusers' Kohya
+# converter does not rename.
+_QWEN_IMAGE_KOHYA_TOP_LEVEL_MODULES = {
+    "lora_unet_img_in": "img_in",
+    "lora_unet_txt_in": "txt_in",
+    "lora_unet_proj_out": "proj_out",
+    "lora_unet_norm_out_linear": "norm_out.linear",
+    "lora_unet_time_text_embed_timestep_embedder_linear_1": (
+        "time_text_embed.timestep_embedder.linear_1"
+    ),
+    "lora_unet_time_text_embed_timestep_embedder_linear_2": (
+        "time_text_embed.timestep_embedder.linear_2"
+    ),
+}
+
+
+def _convert_kohya_dit_via_diffusers(
+    state_dict: Mapping[str, torch.Tensor],
+    converter_name: str,
+    model_name: str,
+    log: logging.Logger,
+    fill_alpha: int | None = None,
+    module_name_fixups: Mapping[str, str] | None = None,
+    alpha_patterns: list[tuple[re.Pattern[str], int]] | None = None,
+    top_level_modules: Mapping[str, str] | None = None,
+) -> Dict[str, torch.Tensor]:
+    """Convert a Kohya/musubi DiT LoRA with the matching diffusers helper.
+
+    The helper folds alpha / rank into A/B and returns `transformer.`-prefixed
+    diffusers names; the prefix is dropped to match the native DiT names.
+    A module without its own `.alpha` gets its PEFT `alpha_pattern` value, else
+    `fill_alpha`, else its rank, since older diffusers releases require one.
+    A pattern that disagrees with a module's own `.alpha` is rejected. Each
+    converted module then records `alpha = rank`, so no alpha is applied twice.
+    `top_level_modules` names modules the helper does not handle; they are
+    renamed here and keep their alpha. A module the helper drops (e.g. a fused
+    qkv on a release that cannot split it) fails the load instead of silently
+    leaving part of the LoRA out.
+    """
+
+    def run_converter(sd: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return _run_kohya_dit_converter(
+            sd, converter_name, model_name, log, module_name_fixups
+        )
+
+    # PEFT-saved files can name the adapter slot (`.lora_down.default.weight`).
+    # Diffusers drops it before converting; drop it here so alphas resolve per
+    # module as well.
+    state_dict = {
+        _strip_default_slot(key): tensor for key, tensor in state_dict.items()
+    }
+    downs = {
+        key[: -len(suffix)]: key
+        for key in state_dict
+        for suffix in _KOHYA_DOWN_SUFFIXES
+        if key.endswith(suffix)
+    }
+    top_level = {
+        module: name
+        for module, name in (top_level_modules or {}).items()
+        if module in downs
+    }
+    block_downs = {m: k for m, k in downs.items() if m not in top_level}
+    top_level_keys = {
+        key
+        for module in top_level
+        for key in (
+            downs[module],
+            downs[module].replace("down.weight", "up.weight"),
+            _kohya_alpha_key(module),
+        )
+    }
+    # Anything besides the top-level modules (block LoRA pairs, or e.g. LoKr
+    # tensors) goes through the converter, so an adapter it cannot read fails
+    # instead of loading only in part.
+    run_blocks = any(key not in top_level_keys for key in state_dict)
+    converted_names = (
+        _kohya_converted_names(block_downs, run_converter) if block_downs else {}
+    )
+    dropped = sorted(
+        module
+        for module in set(block_downs) - set(converted_names)
+        if not _split_qkv_converted(module, converted_names)
+    )
+    if dropped:
+        raise ValueError(
+            f"The installed diffusers drops {len(dropped)} module(s) of this Kohya "
+            f"{model_name} LoRA (e.g. {dropped[:3]}); loading the rest would "
+            "silently apply only part of it"
+        )
+    alphas = {}
+    for module, down_key in downs.items():
+        alpha_key = _kohya_alpha_key(module)
+        own_alpha = state_dict.get(alpha_key)
+        names = (
+            [top_level[module]]
+            if module in top_level
+            else converted_names.get(module, [])
+        )
+        pattern_alphas = {
+            name: match_peft_alpha_pattern(name, alpha_patterns or []) for name in names
+        }
+        if own_alpha is not None and own_alpha.numel() != 1:
+            if module in top_level:
+                raise ValueError(
+                    f"Kohya LoRA alpha of {module!r} must be a single number, "
+                    f"got shape {tuple(own_alpha.shape)}"
+                )
+            if any(alpha is not None for alpha in pattern_alphas.values()):
+                raise ValueError(f"PEFT alpha_pattern conflicts with {alpha_key!r}")
+            continue
+        alphas[module] = _resolve_kohya_alpha(
+            module,
+            own_alpha,
+            state_dict[down_key].shape[0],
+            fill_alpha,
+            pattern_alphas,
+        )
+        if own_alpha is None:
+            state_dict[alpha_key] = torch.tensor(alphas[module])
+
+    out = (
+        run_converter({k: v for k, v in state_dict.items() if k not in top_level_keys})
+        if run_blocks
+        else {}
+    )
+    for key in [k for k in out if k.endswith(".lora_A.weight")]:
+        out[key.removesuffix(".lora_A.weight") + ".alpha"] = torch.tensor(
+            float(out[key].shape[0])
+        )
+    for module, name in top_level.items():
+        down_key = downs[module]
+        out[f"{name}.lora_A.weight"] = state_dict[down_key]
+        out[f"{name}.lora_B.weight"] = state_dict[
+            down_key.replace("down.weight", "up.weight")
+        ]
+        out[f"{name}.alpha"] = torch.tensor(alphas[module])
+    return out
+
+
 def _convert_ai_toolkit_flux_lora(
     state_dict: Mapping[str, torch.Tensor],
     log: logging.Logger,
@@ -576,6 +964,8 @@ def convert_lora_state_dict_by_format(
     state_dict: Mapping[str, torch.Tensor],
     fmt: LoRAFormat,
     log: logging.Logger,
+    fill_alpha: int | None = None,
+    alpha_patterns: list[tuple[re.Pattern[str], int]] | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Normalize a raw LoRA state_dict into A/B + .weight naming."""
     if fmt == LoRAFormat.QWEN_IMAGE_STANDARD:
@@ -594,6 +984,31 @@ def convert_lora_state_dict_by_format(
     if fmt == LoRAFormat.KOHYA_FLUX:
         converted = _convert_kohya_flux_via_diffusers(state_dict, log)
         return _convert_non_diffusers_sd_simple(converted, log)
+
+    if fmt == LoRAFormat.KOHYA_QWEN_IMAGE:
+        return _convert_kohya_dit_via_diffusers(
+            state_dict,
+            "_convert_non_diffusers_qwen_lora_to_diffusers",
+            "Qwen-Image",
+            log,
+            fill_alpha,
+            alpha_patterns=alpha_patterns,
+            top_level_modules=_QWEN_IMAGE_KOHYA_TOP_LEVEL_MODULES,
+        )
+
+    if fmt == LoRAFormat.KOHYA_Z_IMAGE:
+        return _convert_kohya_dit_via_diffusers(
+            state_dict,
+            "_convert_non_diffusers_z_image_lora_to_diffusers",
+            "Z-Image",
+            log,
+            fill_alpha,
+            _Z_IMAGE_MODULE_NAME_FIXUPS,
+            alpha_patterns,
+        )
+
+    if fmt == LoRAFormat.MUSUBI_WAN:
+        return _convert_musubi_wan(state_dict, log)
 
     if fmt == LoRAFormat.WAN:
         maybe = _convert_with_diffusers_utils_if_available(state_dict, log)
@@ -629,8 +1044,13 @@ def normalize_lora_state_dict(
     logger: Optional[logging.Logger] = None,
     *,
     adapter_config: Mapping[str, Any] | None = None,
+    dit_class_name: str | None = None,
+    lora_alpha: int | None = None,
 ) -> Dict[str, torch.Tensor]:
-    """Normalize any supported LoRA format into a single canonical layout."""
+    """Normalize any supported LoRA format into a single canonical layout.
+
+    `lora_alpha` is the caller's override for modules that carry no alpha.
+    """
     log = logger or globals()["logger"]
 
     state_dict = normalize_peft_keys(state_dict)
@@ -645,11 +1065,32 @@ def normalize_lora_state_dict(
             ", ".join(_sample_keys(keys, 20)),
         )
 
-    fmt = detect_lora_format_from_state_dict(state_dict)
+    if _is_qwen_image21_dit(dit_class_name) and _has_prefix_key(keys, "lora_unet_"):
+        # Kohya names are not mapped to Qwen-Image 2.1 modules yet, and the
+        # generic fallback would load the adapter as a no-op.
+        raise ValueError(
+            "Kohya `lora_unet_*` LoRAs are not supported for Qwen-Image 2.1 yet; "
+            "use a diffusers/PEFT-format LoRA"
+        )
+    fmt = detect_lora_format_from_state_dict(state_dict, dit_class_name)
     log.info("[LoRAFormatAdapter] detected format: %s", fmt)
 
-    normalized = convert_lora_state_dict_by_format(state_dict, fmt, log)
-    normalized = apply_peft_config(normalized, adapter_config or {})
+    fill_alpha = (
+        lora_alpha
+        if lora_alpha is not None
+        else get_peft_lora_alpha(adapter_config or {})
+    )
+    peft_config = dict(adapter_config or {})
+    alpha_patterns = None
+    if fmt in (LoRAFormat.KOHYA_QWEN_IMAGE, LoRAFormat.KOHYA_Z_IMAGE):
+        # Conversion folds alpha into A/B, so resolve the patterns against the
+        # original alphas there instead of the converted `alpha = rank`.
+        alpha_patterns = compile_peft_alpha_patterns(peft_config)
+        peft_config.pop("alpha_pattern", None)
+    normalized = convert_lora_state_dict_by_format(
+        state_dict, fmt, log, fill_alpha, alpha_patterns
+    )
+    normalized = apply_peft_config(normalized, peft_config)
 
     norm_keys = list(normalized.keys())
     if norm_keys:

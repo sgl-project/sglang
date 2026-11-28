@@ -84,6 +84,7 @@ from sglang.srt.speculative.eagle_disaggregation import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
+from sglang.test.nixl_utils import attach_nixl_transport
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=23, suite="base-a-test-cpu")
@@ -1480,10 +1481,17 @@ class TestPPSyncPolls(CustomTestCase):
         window = PPSyncSendWindow(rounds=3)
         rounds = [[KVPoll.Bootstrapping], [KVPoll.WaitingForInput], [KVPoll.Success]]
         for polls in rounds:
-            self.assertEqual(pp_sync_polls(polls, pp_group, 0, 2, window), polls)
+            self.assertEqual(
+                pp_sync_polls(
+                    polls, pp_group, 0, 2, window, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC
+                ),
+                polls,
+            )
         self.assertEqual([w.waited for w in pp_group.sent_works], [False] * 3)
 
-        pp_sync_polls([KVPoll.Success], pp_group, 0, 2, window)
+        pp_sync_polls(
+            [KVPoll.Success], pp_group, 0, 2, window, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC
+        )
         self.assertEqual(
             [w.waited for w in pp_group.sent_works], [True, False, False, False]
         )
@@ -1496,20 +1504,20 @@ class TestPPSyncPolls(CustomTestCase):
         """A middle rank adopts the polls received from the previous rank and
         forwards them on the same tag; the last rank only receives."""
         pp0_polls = [KVPoll.Success, KVPoll.Failed]
+        tag = P2PTag.DISAGG_TRANSFER_PP_SYNC
         middle = _FakePPGroup(recv_data=pp0_polls)
         self.assertEqual(
-            pp_sync_polls([], middle, 1, 3, PPSyncSendWindow(rounds=3)), pp0_polls
+            pp_sync_polls([], middle, 1, 3, PPSyncSendWindow(rounds=3), tag),
+            pp0_polls,
         )
-        self.assertEqual(middle.recv_calls, [(0, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)])
-        self.assertEqual(
-            middle.send_calls, [(pp0_polls, 2, True, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)]
-        )
+        self.assertEqual(middle.recv_calls, [(0, tag)])
+        self.assertEqual(middle.send_calls, [(pp0_polls, 2, True, tag)])
 
         last = _FakePPGroup(recv_data=pp0_polls)
         self.assertEqual(
-            pp_sync_polls([], last, 2, 3, PPSyncSendWindow(rounds=3)), pp0_polls
+            pp_sync_polls([], last, 2, 3, PPSyncSendWindow(rounds=3), tag), pp0_polls
         )
-        self.assertEqual(last.recv_calls, [(1, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)])
+        self.assertEqual(last.recv_calls, [(1, tag)])
         self.assertEqual(last.send_calls, [])
 
 
@@ -2320,6 +2328,12 @@ class _MemcpyNixlAgent:
     def __init__(self, memory: np.ndarray):
         self.memory = memory
 
+    def register_memory(self, addrs, mem_type):
+        return addrs
+
+    def add_remote_agent(self, metadata):
+        return metadata.decode("ascii")
+
     def get_xfer_descs(self, reqs, mem_type):
         return reqs
 
@@ -2404,7 +2418,13 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
         self.assertEqual(rc, 0)
 
     def _send_nixl(self, memory, prefill, dst_rank, decode_tp, dst_ptrs, item_len):
-        prefill.agent = _MemcpyNixlAgent(memory)
+        attach_nixl_transport(
+            prefill,
+            _MemcpyNixlAgent(memory),
+            state=prefill.kv_args.state_data_ptrs,
+            peers=("decode",),
+            peer_state=[dst_ptrs],
+        )
         prefill.enable_kv_packing = False
         prefill._prepared_state_plans = {}
         prefill._state_layout_rejections = {}
@@ -2414,7 +2434,6 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
                 [np.array(self.SRC_PAGES, dtype=np.int32)],
                 [dst_ptrs],
                 [self.DST_PAGES],
-                0,
                 decode_tp,
                 decode_tp_rank=dst_rank,
                 dst_state_item_lens=[[item_len] * len(dst_ptrs)],
@@ -2987,6 +3006,7 @@ class TestMooncakeRegistrationDraftCount(CustomTestCase):
         manager.enable_staging = False
         manager.exchange_aux_item_lens = False
         manager.customized_info_enabled = False
+        manager.decode_enable_radix_cache = False
         manager.local_ip = "127.0.0.1"
         manager.rank_port = 1234
         manager.get_session_id = lambda: "session"
@@ -3001,7 +3021,8 @@ class TestMooncakeRegistrationDraftCount(CustomTestCase):
         self.assertEqual(info.dst_kv_ptrs, [0x1000, 0x2000])
 
     def test_registration_without_the_field_parses_none(self):
-        msg = self._manager(2).build_receiver_registration_message()[:-1]
+        # A peer predating num_draft_entries also predates the frame after it.
+        msg = self._manager(2).build_receiver_registration_message()[:-2]
 
         info = KVArgsRegisterInfo.from_zmq(msg)
 
@@ -3577,7 +3598,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             ),
             req_pool_indices=torch.tensor([3, 1], dtype=torch.int64),
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token, row_width=req_to_token.shape[1]
+            ),
             seq_lens=torch.tensor([4, 4], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([4, 4], dtype=torch.int64),
         )
@@ -3640,7 +3663,9 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 )
             ),
             req_pool_indices=torch.tensor([1, 1], dtype=torch.int64),
-            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=req_to_token, row_width=req_to_token.shape[1]
+            ),
             seq_lens=torch.tensor([4, 3], dtype=torch.int32),
             seq_lens_cpu=torch.tensor([4, 3], dtype=torch.int64),
         )
@@ -3907,6 +3932,51 @@ class TestDSV4DraftStateRegistration(unittest.TestCase):
         ptrs, _, items = draft.get_unified_swa_ring_buf_infos()
         self.assertEqual(len(ptrs), 1)
         self.assertEqual(items, [16])
+
+
+class TestAscendHybridLayerSplitMetadata(CustomTestCase):
+    def test_owned_entries_keep_model_layer_ids(self):
+        """A compact CP shard must address the same model layers as decode."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        pool = object.__new__(HybridLinearKVPool)
+        pool.use_mla = True
+        pool.full_attention_layer_id_mapping = {3: 0, 7: 1, 11: 2, 15: 3, 19: 4}
+        # Three buffer groups, one owned layer, fewer entries than model layers.
+        pool.full_kv_pool = SimpleNamespace(
+            get_kv_layer_ids=lambda: [2, 2, 2],
+            get_contiguous_buf_infos=lambda: ([10, 20, 30], [4096] * 3, [256] * 3),
+        )
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+            self.assertEqual(pool.get_kv_layer_ids(), [11, 11, 11])
+        pool.full_kv_pool = SimpleNamespace(
+            get_kv_layer_ids=lambda: [], get_contiguous_buf_infos=lambda: ([], [], [])
+        )
+        with patch("sglang.srt.mem_cache.memory_pool._is_npu", True):
+            self.assertEqual(pool.get_kv_layer_ids(), [])
+
+    def test_ascend_index_entries_are_not_registered_twice(self):
+        """NPU index pages travel with KV; Mamba remains a separate state."""
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+        from sglang.srt.mem_cache.static_kv_storage import _static_state_entries
+
+        child = object.__new__(NPUMLATokenToKVPool)
+        child.get_state_buf_infos = lambda: ([20], [4096], [256])
+        child.get_compress_tail_buf_infos = lambda: ([], [], [])
+        root = SimpleNamespace(
+            use_dsa=True,
+            full_kv_pool=child,
+            layer_router=SimpleNamespace(
+                sub_pool=lambda _: None, wrapped_view=lambda: child
+            ),
+            get_state_buf_infos=lambda: ([10], [1024], [128]),
+            get_state_layer_ids=lambda: [0],
+        )
+        result = _static_state_entries(
+            root, draft_token_to_kv_pool=None, total_kv_layers=20, state_pool=None
+        )
+        self.assertEqual(len(result.wire_entries), 1)
+        self.assertNotIn(StateType.DSA, result.regions)
 
 
 if __name__ == "__main__":

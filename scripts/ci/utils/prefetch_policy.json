@@ -1,0 +1,10 @@
+{
+  "_comment": "Read by prefetch_hf_models.py from the workflow's own commit, never from a PR. It downloads every loadable file of a repo at main unless the repo's entry here names `revisions` (instead of main), `patterns` (the only files to fetch), or `skip` (why it is never prefetched).",
+  "repos": {
+    "Qwen/Qwen2-1.5B-Instruct-GGUF": {"patterns": ["qwen2-1_5b-instruct-q4_k_m.gguf"]},
+    "baidu/Unlimited-OCR": {"revisions": ["07dea832e22aefee32ad281d4b80551282e1c168"]},
+    "baidu/Unlimited-OCR-2": {"revisions": ["5632329a32e103d5f1add270681e0f5c1233c6e4"]},
+    "meta-models/Muse-Spark-Open-816B-A42B-NVFP4": {"skip": "its stage downloads it with HF_MUSE_SPARK_TOKEN, never on PR runs"},
+    "thinkingmachines/Inkling": {"revisions": ["test"]}
+  }
+}

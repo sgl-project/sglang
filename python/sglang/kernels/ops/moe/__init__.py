@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     import torch
 
 _HIP = frozenset({CapabilityRequirement.HIP})
+_SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 
 register_kernel(
     KernelSpec(
@@ -341,12 +342,12 @@ register_kernel(
 )
 
 
-# Vendored tlx.ops.moe (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
+# gfx950 TLX kernels; see "TLX kernel backend" in kernels/README.md.
 register_kernel(
     KernelSpec(
         op="moe.tlx_moe",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.tlx_ops.kernels.moe.gfx950:moe",
+        backend=KernelBackend.TLX,
+        target="sglang.kernels.ops.moe.tlx_moe:moe",
         capabilities=_HIP,
     )
 )
@@ -418,3 +419,32 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _fn in (
+    "nvfp4_routed_quantize",
+    "nvfp4_routed_swiglu_quantize",
+    "mxfp8_routed_quantize",
+    "mxfp8_routed_swiglu_quantize",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"moe.inkling2_{_fn}_sm120",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.moe.inkling2_experts_sm120:{_fn}",
+            capabilities=_SM12X,
+        )
+    )
+for _fn in (
+    "route_topk_meta_lowm",
+    "route_metadata_lowm",
+    "nvfp4_quant_dedup_lowm",
+    "moe_combine_bf16",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"moe.inkling2_{_fn}_sm120",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.moe.inkling2_moe_lowm_sm120:{_fn}",
+            capabilities=_SM12X,
+        )
+    )
+del _fn
