@@ -593,3 +593,120 @@ def test_loader_folds_distinct_section_alphas(prefix, fused, sections, rows):
         dim=-1,
     )
     torch.testing.assert_close(delta * scale, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_kohya_lora_on_part_of_fused_qkv_keeps_other_sections(tmp_path):
+    # Z-Image fuses q/k/v; a Kohya LoRA trained only on to_q must leave K and V at
+    # their base weights, and the metadata alpha must not rescale the alpha that
+    # the Kohya conversion already folded into A/B.
+    from sglang.multimodal_gen.configs.models.dits.zimage import ZImageArchConfig
+
+    layer = _make_layer()
+    base_weight = layer.base_layer.weight.detach().clone()
+    transformer = torch.nn.Module()
+    transformer.layers = torch.nn.ModuleList([torch.nn.Module()])
+    transformer.layers[0].attention = torch.nn.Module()
+    transformer.layers[0].attention.to_qkv = layer
+    transformer.lora_param_names_mapping = {}
+
+    pipeline = _make_loader_pipeline()
+    pipeline.modules = {"transformer": transformer}
+    pipeline.server_args.pipeline_config.dit_config.arch_config = ZImageArchConfig()
+
+    rank, alpha = 2, 8
+    torch.manual_seed(7)
+    down = torch.randn(rank, IN_DIM)
+    up = torch.randn(OUTPUT_SIZES[0], rank)
+    adapter_file = str(tmp_path / "kohya_zimage.safetensors")
+    save_file(
+        {
+            "lora_unet_layers_0_attention_to_q.lora_down.weight": down,
+            "lora_unet_layers_0_attention_to_q.lora_up.weight": up,
+            "lora_unet_layers_0_attention_to_q.alpha": torch.tensor(float(alpha)),
+        },
+        adapter_file,
+        metadata={"alpha": str(alpha)},
+    )
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    with (
+        patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        patch(f"{loader_mod}.dist.get_rank", return_value=0),
+    ):
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0)
+        applied = pipeline._apply_lora_to_layers(
+            {"layers.0.attention.to_qkv": layer},
+            ["adapter"],
+            [adapter_file],
+            rank=0,
+            strengths=[1.0],
+            merge_weights=False,
+        )
+
+    assert applied == 1
+    x = torch.randn(3, IN_DIM)
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer.forward(x)
+    q_delta = (alpha / rank) * (x @ down.T @ up.T)
+    expected = x @ base_weight.T + torch.cat(
+        [q_delta, torch.zeros(3, sum(OUTPUT_SIZES[1:]))], dim=-1
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_section_alpha_of_partial_fused_qkv_is_applied(tmp_path):
+    # A V-only Z-Image PEFT LoRA whose `to_v.alpha` (8) differs from the file's
+    # global alpha (4): the V update must use its own alpha, 8 / rank.
+    from sglang.multimodal_gen.configs.models.dits.zimage import ZImageArchConfig
+
+    layer = _make_layer()
+    base_weight = layer.base_layer.weight.detach().clone()
+    transformer = torch.nn.Module()
+    transformer.layers = torch.nn.ModuleList([torch.nn.Module()])
+    transformer.layers[0].attention = torch.nn.Module()
+    transformer.layers[0].attention.to_qkv = layer
+    transformer.lora_param_names_mapping = {}
+
+    pipeline = _make_loader_pipeline()
+    pipeline.modules = {"transformer": transformer}
+    pipeline.server_args.pipeline_config.dit_config.arch_config = ZImageArchConfig()
+
+    rank = 4
+    torch.manual_seed(11)
+    lora_a = torch.randn(rank, IN_DIM)
+    lora_b = torch.randn(OUTPUT_SIZES[2], rank)
+    adapter_file = str(tmp_path / "zimage_v_only.safetensors")
+    save_file(
+        {
+            "layers.0.attention.to_v.lora_A.weight": lora_a,
+            "layers.0.attention.to_v.lora_B.weight": lora_b,
+            "layers.0.attention.to_v.alpha": torch.tensor(8.0),
+        },
+        adapter_file,
+        metadata={"alpha": "4"},
+    )
+    loader_mod = "sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline"
+    with (
+        patch(f"{loader_mod}.maybe_download_lora", return_value=adapter_file),
+        patch(f"{loader_mod}.dist.is_initialized", return_value=False),
+        patch(f"{loader_mod}.dist.get_rank", return_value=0),
+    ):
+        pipeline.load_lora_adapter(adapter_file, "adapter", rank=0)
+        applied = pipeline._apply_lora_to_layers(
+            {"layers.0.attention.to_qkv": layer},
+            ["adapter"],
+            [adapter_file],
+            rank=0,
+            strengths=[1.0],
+            merge_weights=False,
+        )
+
+    assert applied == 1
+    x = torch.randn(3, IN_DIM)
+    with patch(_TP_RANK_PATCH, return_value=0):
+        out, _ = layer.forward(x)
+    v_delta = (8 / rank) * (x @ lora_a.T @ lora_b.T)
+    expected = x @ base_weight.T + torch.cat(
+        [torch.zeros(3, sum(OUTPUT_SIZES[:2])), v_delta], dim=-1
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)

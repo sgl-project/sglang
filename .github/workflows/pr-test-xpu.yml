@@ -6,7 +6,10 @@ on:
     - cron: '0 4,10,16,22 * * *'
   push:
     branches: [ main ]
-  pull_request:
+  # The workflow file comes from the base branch, so a PR cannot edit the gate (pr-gate.yml,
+  # approval-mode commit). No `labeled` type: the approving slash command reruns the gated run.
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [ main ]
   workflow_dispatch:
   workflow_call:
@@ -24,8 +27,17 @@ on:
 
 concurrency:
   # Scheduled runs get a group of their own so pushes to main never cancel them.
-  group: pr-test-xpu-${{ github.event_name == 'schedule' && format('schedule-{0}', github.run_id) || inputs.ref || github.ref }}
+  # A PR keys on its number: under pull_request_target github.ref is the base branch.
+  group: pr-test-xpu-${{ github.event_name == 'schedule' && format('schedule-{0}', github.run_id) || github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || inputs.ref || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_call' && github.event_name != 'schedule' }}
+
+# Read-only for every job that runs PR code.
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+  statuses: read
 
 jobs:
   # ==================== Check Changes ==================== #
@@ -36,10 +48,13 @@ jobs:
       main_package: ${{ steps.filter.outputs.main_package == 'true' || steps.xpu-tests.outputs.changed == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen == 'true' || steps.run-mode.outputs.run_all_tests == 'true' }}
     steps:
+      # Trusted code only: under pull_request_target github.sha is the base branch. On a PR
+      # event dorny/paths-filter lists the changed files through the API.
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Determine run mode
         id: run-mode
@@ -116,11 +131,23 @@ jobs:
               - "docker/xpu.Dockerfile"
               - "scripts/ci/xpu/**"
 
+      # The base-branch script only parses (ast) the PR's test files; it never imports or runs them.
+      - name: Checkout PR test files
+        if: steps.filter.outputs.registered_tests == 'true' && github.event_name == 'pull_request_target'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          sparse-checkout: test/registered
+          allow-unsafe-pr-checkout: true
+
       - name: Detect changed per-commit XPU tests
         id: xpu-tests
         if: steps.filter.outputs.registered_tests == 'true'
         env:
           CHANGED_FILES: ${{ steps.filter.outputs.registered_tests_files }}
+          XPU_TESTS_ROOT: ${{ github.event_name == 'pull_request_target' && format('{0}/pr-head', github.workspace) || '' }}
         run: echo "changed=$(python3 scripts/ci/xpu/detect_xpu_test_changes.py)" >> "$GITHUB_OUTPUT"
 
   # ==================== PR Gate ==================== #
@@ -130,6 +157,7 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-label: run-ci-xpu-extra
+      approval-mode: commit
     secrets: inherit
 
   # Runs the entire per-commit XPU test suite in one job (single install, single queue).
@@ -141,8 +169,11 @@ jobs:
     env:
       # Per-job name so parallel runners on one host never touch each other's container.
       CONTAINER_NAME: ci_sglang_xpu_${{ github.run_id }}_${{ github.run_attempt }}_${{ github.job }}
-      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
-      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+      # pull_request_target hands secrets to the job, and the job runs PR code: keep them out.
+      DOCKERHUB_INTEL_USERNAME: ${{ github.event_name != 'pull_request_target' && secrets.DOCKERHUB_INTEL_USERNAME || '' }}
+      DOCKERHUB_INTEL_TOKEN: ${{ github.event_name != 'pull_request_target' && secrets.DOCKERHUB_INTEL_TOKEN || '' }}
+      # PR code runs in this job: no host token, no bind-mounted workspace (see xpu_ci_start_container.sh).
+      XPU_CI_UNTRUSTED: ${{ github.event_name == 'pull_request_target' && '1' || '0' }}
     steps:
       - name: Reset workspace ownership
         run: |
@@ -157,12 +188,30 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
+
+      # Host-side setup runs from the trusted ref (the base branch under pull_request_target).
+      - name: Checkout trusted CI scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          path: trusted-ci
+          sparse-checkout: scripts/ci/xpu
+          persist-credentials: false
 
       - name: Start CI container
         run: |
-          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh --container-name "${CONTAINER_NAME}"
+          # Move the trusted scripts out of the workspace before any PR code can run.
+          TRUSTED_CI="${RUNNER_TEMP}/trusted-ci"
+          rm -rf "${TRUSTED_CI}" && mv trusted-ci "${TRUSTED_CI}"
+          if [[ "${XPU_CI_UNTRUSTED}" != "1" ]]; then
+            export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          fi
+          bash "${TRUSTED_CI}/scripts/ci/xpu/xpu_ci_start_container.sh" --container-name "${CONTAINER_NAME}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -185,7 +234,6 @@ jobs:
           docker exec -w /sglang-checkout "${CONTAINER_NAME}" git fetch origin '+refs/tags/*:refs/tags/*' --force
           docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache .
           docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
-          docker exec "${CONTAINER_NAME}" /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Install checkpoint-engine extra (optional; tests skip if unavailable)
         continue-on-error: true
@@ -256,8 +304,11 @@ jobs:
     env:
       # Per-job name so parallel runners on one host never touch each other's container.
       CONTAINER_NAME: ci_sglang_xpu_${{ github.run_id }}_${{ github.run_attempt }}_${{ github.job }}
-      DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
-      DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+      # pull_request_target hands secrets to the job, and the job runs PR code: keep them out.
+      DOCKERHUB_INTEL_USERNAME: ${{ github.event_name != 'pull_request_target' && secrets.DOCKERHUB_INTEL_USERNAME || '' }}
+      DOCKERHUB_INTEL_TOKEN: ${{ github.event_name != 'pull_request_target' && secrets.DOCKERHUB_INTEL_TOKEN || '' }}
+      # PR code runs in this job: no host token, no bind-mounted workspace (see xpu_ci_start_container.sh).
+      XPU_CI_UNTRUSTED: ${{ github.event_name == 'pull_request_target' && '1' || '0' }}
     steps:
       - name: Reset workspace ownership
         run: |
@@ -268,12 +319,30 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          # Fork PR code under pull_request_target: safe because pr-gate.yml approved this exact
+          # commit first and the checkout keeps no credentials (persist-credentials: false).
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
+
+      # Host-side setup runs from the trusted ref (the base branch under pull_request_target).
+      - name: Checkout trusted CI scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          path: trusted-ci
+          sparse-checkout: scripts/ci/xpu
+          persist-credentials: false
 
       - name: Start CI container
         run: |
-          export HF_TOKEN="$(cat ~/huggingface_token.txt)"
-          bash scripts/ci/xpu/xpu_ci_start_container.sh --container-name "${CONTAINER_NAME}"
+          # Move the trusted scripts out of the workspace before any PR code can run.
+          TRUSTED_CI="${RUNNER_TEMP}/trusted-ci"
+          rm -rf "${TRUSTED_CI}" && mv trusted-ci "${TRUSTED_CI}"
+          if [[ "${XPU_CI_UNTRUSTED}" != "1" ]]; then
+            export HF_TOKEN="$(cat ~/huggingface_token.txt)"
+          fi
+          bash "${TRUSTED_CI}/scripts/ci/xpu/xpu_ci_start_container.sh" --container-name "${CONTAINER_NAME}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -296,7 +365,6 @@ jobs:
           docker exec -w /sglang-checkout "${CONTAINER_NAME}" git fetch origin '+refs/tags/*:refs/tags/*' --force
           docker exec -w /sglang-checkout/python "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache .
           docker exec "${CONTAINER_NAME}" uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
-          docker exec "${CONTAINER_NAME}" /bin/bash -c '/opt/venv/bin/hf auth login --token ${HF_TOKEN}'
 
       - name: Run diffusion server tests (1-GPU)
         timeout-minutes: 60

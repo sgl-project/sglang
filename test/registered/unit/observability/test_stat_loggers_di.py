@@ -226,6 +226,34 @@ class TestHiCacheMetrics(unittest.TestCase):
             [({**labels, "reason": "device_capacity"}, 7)],
         )
 
+    def test_load_report_token_counters_have_plain_copies(self):
+        collector = _RecordingStorageMetricsCollector(labels={"model_name": "test"})
+        self.assertEqual(collector.total_storage_prefetch_hit_tokens, 0)
+        self.assertEqual(collector.total_storage_prefetch_unfulfilled_tokens, {})
+        self.assertEqual(collector.total_backuped_tokens, 0)
+        self.assertEqual(collector.total_backup_dropped_tokens, 0)
+
+        collector.log_storage_prefetch_hit_tokens(21)
+        collector.log_storage_prefetch_hit_tokens(0)
+        collector.log_storage_prefetch_hit_tokens(9)
+        collector.log_storage_prefetch_unfulfilled_tokens(4, "storage_transfer")
+        collector.log_storage_prefetch_unfulfilled_tokens(0, "deadline")
+        collector.log_storage_prefetch_unfulfilled_tokens(2, "storage_transfer")
+        collector.log_storage_prefetch_unfulfilled_tokens(3, "device_covered")
+        collector.log_backuped_tokens(128)
+        collector.log_backuped_tokens(0)
+        collector.log_backuped_tokens(256)
+        collector.log_backup_dropped_tokens(64)
+        collector.log_backup_dropped_tokens(0)
+
+        self.assertEqual(collector.total_storage_prefetch_hit_tokens, 30)
+        self.assertEqual(
+            collector.total_storage_prefetch_unfulfilled_tokens,
+            {"storage_transfer": 6, "device_covered": 3},
+        )
+        self.assertEqual(collector.total_backuped_tokens, 384)
+        self.assertEqual(collector.total_backup_dropped_tokens, 64)
+
     def test_backup_storage_duration_metrics(self):
         # _drain_backup reads operation.enqueue_time on every L2->L3 ack; a
         # StorageOperation without the field (renamed or dropped) would crash
@@ -294,6 +322,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue.queue = []
         queue._deferred_releases = [object(), object(), object()]
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler_status_logger = None
         reporter.scheduler = SimpleNamespace(
             enable_hierarchical_cache=False,
             disaggregation_mode=DisaggregationMode.DECODE,
@@ -522,6 +551,7 @@ class TestHiCacheHostMambaStats(CustomTestCase):
 
     def _reporter(self, entry_map):
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
+        reporter.scheduler_status_logger = None
         tree_cache = MagicMock(spec=UnifiedRadixCache)
         tree_cache.full_kv_pool_host = SimpleNamespace(
             logical_size=1000, available_size=lambda: 400

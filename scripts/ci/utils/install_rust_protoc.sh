@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install protoc and a Rust toolchain (rustup/cargo). Required by setuptools-rust
-# to build the bundled native gRPC extension (rust/sglang-grpc) when installing
+# to build the bundled Rust extensions (rust/sglang-mm, rust/sglang-server) when installing
 # the main `sglang` wheel from source. Idempotent — both helpers no-op if
 # already installed.
 #
@@ -12,13 +12,16 @@ set -euxo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ "$(id -u)" = "0" ]; then
-    SUDO=""
-elif command -v sudo >/dev/null 2>&1; then
-    SUDO="sudo"
-else
-    SUDO=""
+# Check before sudo: a non-root job user with no sudo rights (docker/ci.Dockerfile)
+# would fail at the password prompt even though protoc is already installed.
+if ! { command -v protoc >/dev/null 2>&1 && protoc --version >/dev/null 2>&1; }; then
+    if [ "$(id -u)" = "0" ]; then
+        SUDO=""
+    elif command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+    else
+        SUDO=""
+    fi
+    ${SUDO} bash "${SCRIPT_DIR}/install_protoc.sh"
 fi
-
-${SUDO} bash "${SCRIPT_DIR}/install_protoc.sh"
 bash "${SCRIPT_DIR}/install_rustup.sh"

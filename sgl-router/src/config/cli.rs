@@ -131,7 +131,7 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = default_port())]
     pub port: u16,
 
-    /// Port for the native gRPC server (`sglang.runtime.v1.SglangService`, which
+    /// Port for the native gRPC server (`sglang.api.v1.SglangService`, which
     /// engines serve with `--grpc-port`); requests reach engines over their gRPC port.
     #[arg(long)]
     pub grpc_port: Option<u16>,
@@ -181,6 +181,13 @@ pub struct ServerArgs {
     /// PD: return decode's stream only once prefill completes.
     #[arg(long)]
     pub pd_stream_after_prefill: bool,
+
+    /// PD: answer a chat, completions or generate request for at most one
+    /// token (one sample, one prompt) on the prefill engine alone, with no
+    /// decode and no KV transfer. A prefill whose /server_info does not report
+    /// `prefill_answers_alone` keeps the normal prefill and decode path.
+    #[arg(long)]
+    pub pd_one_token_on_prefill_only: bool,
 
     /// PD: at most N requests per prefill DP rank go to decode before their
     /// first token; the rest wait and get their decode DP rank when sent.
@@ -734,6 +741,7 @@ impl Cli {
                 max_backoff_ms: self.server.retry_max_backoff_ms,
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
+                one_token_on_prefill_only: self.server.pd_one_token_on_prefill_only,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
