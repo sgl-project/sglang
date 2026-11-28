@@ -286,8 +286,11 @@ def parse_arguments(
     # Strategy 3: ast.literal_eval
     try:
         parsed_value = safe_literal_eval(json_value)
+        # Reject Python-only values (sets, bytes, complex): the arguments are
+        # serialized with json.dumps later.
+        json.dumps(parsed_value)
         return parsed_value, True
-    except (ValueError, SyntaxError):
+    except (ValueError, SyntaxError, TypeError):
         pass
 
     # Strategy 4: Treat as string
