@@ -40,15 +40,25 @@ def unwrap_kimi_images(images):
     ]
 
 
-def kimi_image_identity(content_config_digest: str, grid_thw: Sequence[int]) -> bytes:
-    """Bind a full source/config digest to the image's token grid."""
+def kimi_image_identity(
+    content_config_digest: str,
+    grid_thw: Sequence[int],
+    pixel_route: Optional[Sequence[str]] = None,
+) -> bytes:
+    """Bind a full source/config digest to the image's token grid.
+
+    ``pixel_route`` names the decoder and preprocessing backend that produced the
+    pixels, for processors where these vary per image for the same source.
+    """
     digest = parse_content_hash(content_config_digest)
     if digest is None:
         raise ValueError("Kimi image identity requires a content digest")
+    grid = tuple(int(dim) for dim in grid_thw)
     return media_identity(
         bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :]),
         modality="image",
-        metadata=tuple(int(dim) for dim in grid_thw),
+        # A route-free identity must stay byte-identical to the grid-only form.
+        metadata=grid if pixel_route is None else (grid, tuple(pixel_route)),
     )
 
 
@@ -128,6 +138,12 @@ class KimiGridMMDataMixin:
             processor_fingerprint=self._kimi_config_fingerprint(),
         )
 
+    def _kimi_pixel_route(
+        self, item: MultimodalDataItem, image: Any
+    ) -> Optional[tuple[str, str]]:
+        """The (decoder, preprocessing) route of a source image; None leaves it out."""
+        return None
+
     def assign_kimi_image_identities(
         self, mm_items: List[MultimodalDataItem], images: Optional[List[Any]]
     ) -> None:
@@ -158,7 +174,9 @@ class KimiGridMMDataMixin:
                 continue
             item.set_identity(
                 kimi_image_identity(
-                    self.kimi_content_config_digest(images[index]), grid
+                    self.kimi_content_config_digest(images[index]),
+                    grid,
+                    pixel_route=self._kimi_pixel_route(item, images[index]),
                 )
             )
 

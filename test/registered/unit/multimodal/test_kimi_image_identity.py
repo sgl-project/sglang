@@ -302,6 +302,41 @@ class TestKimiImageIdentity(CustomTestCase):
         self.assertEqual(items[0].identity, items[1].identity)
         self.assertEqual(items[0].pad_values, items[1].pad_values)
 
+    def test_route_free_identity_is_byte_stable(self):
+        """Route-free Kimi identities (K2.5) key caches that outlive the process,
+        such as HiCache storage, so their bytes must not change."""
+        self.assertEqual(
+            kimi_image_identity("sha256:" + "ab" * 32, [1, 4, 4]).hex(),
+            "ed07531e7d1d9ddf144a8082935684a26138b16f14d125073c09cd8581373346",
+        )
+        processor = _IdentityOnly({"in_patch_limit": 16384})
+        image = _image(0)
+        item = _image_item([1, 4, 4])
+        processor.assign_kimi_image_identities([item], [image])
+        self.assertEqual(
+            item.identity,
+            kimi_image_identity(processor.kimi_content_config_digest(image), [1, 4, 4]),
+        )
+
+    def test_pixel_route_separates_identities(self):
+        digest = "sha256:" + "ab" * 32
+        routes = [
+            None,
+            ("nvimgcodec", "eager-gpu"),
+            ("host", "eager-gpu"),
+            ("nvimgcodec", "eager-cpu"),
+            ("nvimgcodec", "deferred-gpu"),
+        ]
+        identities = [
+            kimi_image_identity(digest, [1, 4, 4], pixel_route=route)
+            for route in routes
+        ]
+        self.assertEqual(len(set(identities)), len(routes))
+        self.assertEqual(
+            kimi_image_identity(digest, [1, 4, 4], pixel_route=routes[1]),
+            identities[1],
+        )
+
     def test_identity_keeps_full_digest(self):
         item = _image_item([1, 4, 4])
         _IdentityOnly({}).assign_kimi_image_identities([item], [_image(0)])
