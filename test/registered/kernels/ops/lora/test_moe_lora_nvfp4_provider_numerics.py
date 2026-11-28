@@ -74,13 +74,17 @@ def _quant_nvfp4(weight: torch.Tensor):
 def _fake_layer(w13, w2, gated=True):
     w13_q, w13_bs, w13_gs, w13_eff = _quant_nvfp4(w13)
     w2_q, w2_bs, w2_gs, w2_eff = _quant_nvfp4(w2)
+
+    def param(data):
+        return torch.nn.Parameter(data, requires_grad=False)
+
     layer = SimpleNamespace(
-        w13_weight=SimpleNamespace(data=w13_q),
-        w2_weight=SimpleNamespace(data=w2_q),
-        w13_weight_scale=SimpleNamespace(data=w13_bs),
-        w2_weight_scale=SimpleNamespace(data=w2_bs),
-        w13_weight_scale_2=SimpleNamespace(data=w13_gs),
-        w2_weight_scale_2=SimpleNamespace(data=w2_gs),
+        w13_weight=param(w13_q),
+        w2_weight=param(w2_q),
+        w13_weight_scale=param(w13_bs),
+        w2_weight_scale=param(w2_bs),
+        w13_weight_scale_2=param(w13_gs),
+        w2_weight_scale_2=param(w2_gs),
         quant_config=SimpleNamespace(group_size=16),
         moe_runner_config=SimpleNamespace(is_gated=gated),
         num_local_experts=w2.shape[0],
