@@ -41,12 +41,17 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
         kv_heads=None,
         is_sm100: bool = True,
         *,
+        is_sm120: bool = False,
         graph: bool = False,
         replay: bool = False,
         quality: str = "lossless",
     ) -> bool:
         impl = SimpleNamespace(
-            causal=False, _cudnn_failed=False, _is_sm100=is_sm100, _is_sm103=False
+            causal=False,
+            _cudnn_failed=False,
+            _is_sm100=is_sm100 and not is_sm120,
+            _is_sm103=False,
+            _is_sm120=is_sm120,
         )
         with (
             set_forward_context(0, None, quality=quality),
@@ -97,10 +102,52 @@ class TestDynamicCudnnSDPARouting(unittest.TestCase):
 
     def test_missing_context_keeps_reference_route(self):
         impl = SimpleNamespace(
-            causal=False, _cudnn_failed=False, _is_sm100=True, _is_sm103=False
+            causal=False,
+            _cudnn_failed=False,
+            _is_sm100=True,
+            _is_sm103=False,
+            _is_sm120=False,
         )
         self.assertFalse(DynamicCudnnSDPAImpl._use_cudnn_sdpa(impl, *_qkv(126, 1536)))
         self.assertTrue(self._uses_cudnn(126, 1536, quality="high"))
+
+    def test_sm120_sends_dense_attention_to_cudnn(self):
+        # MiniMax-H3 self-attention and text cross-attention, Z-Image, MOSS-Image
+        for q_len, kv_len in ((40320, 40320), (40320, 512), (4096, 4096), (126, 1536)):
+            self.assertTrue(
+                self._uses_cudnn(q_len, kv_len, is_sm120=True), (q_len, kv_len)
+            )
+            self.assertTrue(
+                self._uses_cudnn(q_len, kv_len, is_sm120=True, graph=True),
+                (q_len, kv_len),
+            )
+
+    def test_sm120_route_ignores_quality_and_context(self):
+        # MiniMax-H3 denoises under a context without a quality ("exact")
+        self.assertTrue(self._uses_cudnn(40320, 40320, is_sm120=True, quality="exact"))
+        impl = SimpleNamespace(
+            causal=False,
+            _cudnn_failed=False,
+            _is_sm100=False,
+            _is_sm103=False,
+            _is_sm120=True,
+        )
+        self.assertTrue(DynamicCudnnSDPAImpl._use_cudnn_sdpa(impl, *_qkv(4096, 512)))
+
+    def test_sm120_keeps_gqa_causal_and_failed_layers_on_sdpa(self):
+        self.assertFalse(self._uses_cudnn(4096, 4096, kv_heads=8, is_sm120=True))
+        for field in ("causal", "_cudnn_failed"):
+            impl = SimpleNamespace(
+                causal=False,
+                _cudnn_failed=False,
+                _is_sm100=False,
+                _is_sm103=False,
+                _is_sm120=True,
+            )
+            setattr(impl, field, True)
+            self.assertFalse(
+                DynamicCudnnSDPAImpl._use_cudnn_sdpa(impl, *_qkv(4096, 4096)), field
+            )
 
     def test_quality_context_is_explicit_and_restores(self):
         batch = SimpleNamespace(extra={})
@@ -145,6 +192,22 @@ class TestDynamicCudnnSelection(unittest.TestCase):
     def test_sm100_keeps_cudnn(self):
         impl = _impl((10, 0))
         self.assertTrue(impl._use_cudnn_sdpa(*_qkv(75600, 75600, 2, 128)))
+
+
+class TestDynamicCudnnFallback(unittest.TestCase):
+    def test_sm120_falls_back_to_torch_sdpa(self):
+        with (
+            patch("torch.cuda.is_available", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(12, 0)),
+            patch(
+                "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.set_fa_ver"
+            ),
+        ):
+            impl = DynamicCudnnSDPAImpl(
+                num_heads=2, head_size=128, causal=False, softmax_scale=0.125
+            )
+        self.assertIs(type(impl.fa_impl), SDPAImpl)
+        self.assertTrue(impl._is_sm120)
 
 
 class _IntoOnLongSegments(SDPAImpl):
