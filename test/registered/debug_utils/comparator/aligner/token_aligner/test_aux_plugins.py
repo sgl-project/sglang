@@ -213,6 +213,18 @@ class TestInferPositions:
         )
         assert torch.equal(result, torch.tensor([0, 1, 0, 1, 2]))
 
+    def test_thd_empty_and_zero_length_sequences(self):
+        """Empty or zero-length sequences do not crash and preserve non-empty positions."""
+        empty_result = _infer_positions(seq_lens=torch.tensor([], dtype=torch.long))
+        assert empty_result.shape == (0,)
+        assert empty_result.dtype == torch.long
+
+        all_zero = _infer_positions(seq_lens=torch.tensor([0, 0]))
+        assert all_zero.shape == (0,)
+
+        with_zero = _infer_positions(seq_lens=torch.tensor([2, 0, 3, 0]))
+        assert torch.equal(with_zero, torch.tensor([0, 1, 0, 1, 2]))
+
 
 class TestInferCpShardedDims:
     """Tests for infer_cp_sharded_dims on each plugin."""
