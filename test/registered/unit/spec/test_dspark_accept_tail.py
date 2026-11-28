@@ -4,10 +4,14 @@ from types import SimpleNamespace
 import msgspec
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
+)
+from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+    folds_static_accept,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSyncSite
 from sglang.test.ci.ci_register import (
@@ -46,6 +50,45 @@ def _greedy_inputs():
     return candidates, logits, prefix_lens
 
 
+def _eager_greedy_accept(tp_sync, *, simulated_correct_len=None, layout=None):
+    candidates, logits, prefix_lens = _greedy_inputs()
+    draft_tokens = candidates[:, 1:].contiguous()
+    executor = TargetVerifyExecutor(
+        target_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(model_type="test")
+                )
+            ),
+            random_seed=0,
+        ),
+        gamma=STRIDE - 1,
+        verify_num_draft_tokens=STRIDE,
+        model_runner=None,
+        kv_injector=None,
+        tp_sync=tp_sync,
+        simulated_correct_len=simulated_correct_len,
+    )
+    return executor.accept_and_finalize(
+        folded_accept=False,
+        bs=BS,
+        verify_ids_2d=candidates,
+        target_logits=logits,
+        draft_block=DraftBlockResult(
+            draft_tokens=draft_tokens,
+            corrected_logits=None,
+            greedy_mask=torch.ones(BS, dtype=torch.bool),
+            temperatures=torch.ones(BS),
+            greedy_draft=True,
+        ),
+        sampling_info=None,
+        draft_input=None,
+        layout=layout,
+        prefix_lens=prefix_lens,
+        draft_tokens=draft_tokens,
+    )
+
+
 class TestAcceptTailParity(CustomTestCase):
     def _run(self, simulated_correct_len, verify_lens):
         candidates, logits, prefix_lens = _greedy_inputs()
@@ -69,42 +112,12 @@ class TestAcceptTailParity(CustomTestCase):
         graph = epilogue.read_accept(BS)
 
         eager_sync = _RecordingTpSync()
-        target_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(
-                model_config=SimpleNamespace(
-                    hf_text_config=SimpleNamespace(model_type="test")
-                )
-            ),
-            random_seed=0,
-        )
-        executor = TargetVerifyExecutor(
-            target_worker=target_worker,
-            gamma=STRIDE - 1,
-            verify_num_draft_tokens=STRIDE,
-            model_runner=None,
-            kv_injector=None,
-            tp_sync=eager_sync,
+        eager = _eager_greedy_accept(
+            eager_sync,
             simulated_correct_len=simulated_correct_len,
-        )
-        eager = executor.accept_and_finalize(
-            folded_accept=False,
-            bs=BS,
-            verify_ids_2d=candidates,
-            target_logits=logits,
-            draft_block=DraftBlockResult(
-                draft_tokens=draft_tokens,
-                corrected_logits=None,
-                greedy_mask=torch.ones(BS, dtype=torch.bool),
-                temperatures=torch.ones(BS),
-                greedy_draft=True,
-            ),
-            sampling_info=None,
-            draft_input=None,
             layout=None
             if verify_lens is None
             else SimpleNamespace(verify_lens=verify_lens),
-            prefix_lens=prefix_lens,
-            draft_tokens=draft_tokens,
         )
 
         got, want = msgspec.structs.asdict(graph), msgspec.structs.asdict(eager)
@@ -226,6 +239,82 @@ class TestFusedStaticAcceptTail(CustomTestCase):
         )
         self.assertTrue(epilogue.simulate_fold)
         self.assertFalse(epilogue._serves_accept_tail(BS))
+
+
+class TestStaticAcceptFold(CustomTestCase):
+    def test_fold_by_draft_and_platform(self):
+        cases = {
+            # DeepSeek-V4.1 on every platform
+            "dsv41": (True, True, False, False, True),
+            # a draft storing its commit at the target's slots
+            "draft_commit": (True, False, True, False, True),
+            # a private draft (Kimi K3) on NPU
+            "private_draft_npu": (True, False, False, True, True),
+            # the same draft elsewhere, or without a static verify graph
+            "private_draft_cuda": (True, False, False, False, False),
+            "npu_compact": (False, False, False, True, False),
+        }
+        for name, (static_mode, dsv41_static, draft_fold, npu, folds) in cases.items():
+            with self.subTest(name):
+                self.assertIs(
+                    folds_static_accept(
+                        static_mode=static_mode,
+                        dsv41_static=dsv41_static,
+                        draft_fold=draft_fold,
+                        npu=npu,
+                    ),
+                    folds,
+                )
+
+    def test_private_draft_graph_stores_no_kv(self):
+        """A draft with its own KV pool (Kimi K3 on NPU) takes the greedy accept
+        from the verify graph, which never stores KV: it holds the target's cache
+        locations, not the draft pool's."""
+
+        def runner(space):
+            return SimpleNamespace(runner_ids=SimpleNamespace(space=lambda kind: space))
+
+        stores = []
+        injector = SimpleNamespace(
+            model_runner=runner(SimpleNamespace(key="full", write=None)),
+            draft_model_runner=runner(SimpleNamespace(key="draft", write=None)),
+            inject_target_hidden=lambda **kwargs: stores.append(kwargs),
+        )
+        candidates, logits, prefix_lens = _greedy_inputs()
+        forward_batch = _verify_batch(candidates, prefix_lens)
+        forward_batch.forward_mode = SimpleNamespace(is_target_verify=lambda: True)
+        out = LogitsProcessorOutput(
+            next_token_logits=logits, hidden_states=logits.new_zeros(BS * STRIDE, 4)
+        )
+        epilogue = DsparkVerifyEpilogue(
+            max_bs=BS + 1,
+            verify_num_draft_tokens=STRIDE,
+            device="cpu",
+            tp_sync=_NoSiteTpSync(),
+            commit_ctx=SimpleNamespace(
+                # It opted in; only its own FULL space keeps the store out of the graph.
+                draft_model=SimpleNamespace(folds_static_verify_commit=True),
+                resolve_engram_hasher=None,
+                resolve_pool=lambda: SimpleNamespace(),
+                kv_injector=injector,
+            ),
+        )
+        epilogue.begin_static_step(BS, armed=True)
+        epilogue.capture_hook(
+            SimpleNamespace(
+                model_runner=SimpleNamespace(is_draft_worker=False),
+                ragged_verify_mode=False,
+            ),
+            out,
+            forward_batch,
+            num_tokens=BS * STRIDE,
+        )
+
+        self.assertEqual(stores, [])
+        got = msgspec.structs.asdict(epilogue.read_accept(BS))
+        want = msgspec.structs.asdict(_eager_greedy_accept(_NoSiteTpSync()))
+        for field, value in want.items():
+            self.assertTrue(torch.equal(got[field].long(), value.long()), field)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs CUDA")
