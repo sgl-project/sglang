@@ -1,5 +1,8 @@
 import contextlib
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,6 +14,7 @@ from sglang.srt.disaggregation.utils import draft_kv_ring_row_pairs
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
@@ -493,6 +497,204 @@ class TestPagedDraftKVRingPDTransfer(CustomTestCase):
                 rel = keys - floor
                 read = table[0, rel // page].to(torch.int64) * page + rel % page
                 self.assertTrue(torch.equal(dst_pool[read], keys))
+
+
+class TestSpeculatorsDSparkConfig(CustomTestCase):
+    def test_aux_stream_config_honors_launch_json_overrides(self):
+        """The capture stream must match the draft configuration's launch overrides."""
+        from sglang.srt.models import kimi_k3
+
+        owner = SimpleNamespace(model=SimpleNamespace(carries_bank_slices=False))
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen3",
+                        "dflash_config": {"aux_hidden_stream": "attn_res"},
+                    }
+                )
+            )
+            with get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_draft_model_path=directory,
+                trust_remote_code=False,
+                json_model_override_args=json.dumps(
+                    {"dflash_config": {"aux_hidden_stream": "prefix"}}
+                ),
+            ):
+                kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture(owner, [3])
+        self.assertEqual(owner.model.dspark_aux_hidden_stream, "prefix")
+        self.assertEqual(owner.model.dspark_layers_to_capture, [3])
+
+    def test_aux_stream_config_never_executes_untrusted_remote_code(self):
+        """An untrusted draft config must fail without executing checkpoint code."""
+        from sglang.srt.models import kimi_k3
+
+        owner = SimpleNamespace(model=SimpleNamespace(carries_bank_slices=False))
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "config.json").write_text(
+                json.dumps(
+                    {
+                        "model_type": "untrusted_draft",
+                        "auto_map": {
+                            "AutoConfig": "configuration_untrusted.UntrustedConfig"
+                        },
+                    }
+                )
+            )
+            Path(directory, "configuration_untrusted.py").write_text(
+                'raise AssertionError("Untrusted draft code executed")\n'
+            )
+            with (
+                get_context().override_server_args(
+                    speculative_algorithm="DSPARK",
+                    speculative_draft_model_path=directory,
+                    trust_remote_code=False,
+                ),
+                self.assertRaises(ValueError),
+            ):
+                kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture(owner, [3])
+
+    def test_speculators_dspark_config_flattens_layer_ids_and_aux_stream(self):
+        from sglang.srt.configs.speculators_dspark import (
+            try_load_speculators_dspark_config,
+        )
+        from sglang.srt.speculative.dflash_utils import (
+            get_dflash_aux_hidden_stream,
+        )
+
+        raw = {
+            "architectures": ["DSparkDraftModel"],
+            "speculators_model_type": "dspark",
+            "aux_hidden_state_layer_ids": [76, 80, 84, 88, 92],
+            "block_size": 7,
+            "markov_rank": 512,
+            "markov_head_type": "vanilla",
+            "mask_token_id": 163839,
+            "sample_from_anchor": True,
+            "sliding_window_non_causal": False,
+            "transformer_layer_config": {
+                "model_type": "qwen3",
+                "hidden_size": 7168,
+                "intermediate_size": 14336,
+                "num_hidden_layers": 5,
+                "num_attention_heads": 96,
+                "num_key_value_heads": 16,
+                "head_dim": 64,
+                "layer_types": ["sliding_attention"] * 5,
+                "sliding_window": 2048,
+                "vocab_size": 163840,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "config.json").write_text(json.dumps(raw))
+            cfg = try_load_speculators_dspark_config(tmp, revision=None)
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg.architectures, ["DSparkDraftModel"])
+        self.assertEqual(cfg.sliding_window, 2048)
+        self.assertTrue(cfg.is_causal)
+        self.assertEqual(cfg.dflash_config["target_layer_ids"], [75, 79, 83, 87, 91])
+        self.assertEqual(get_dflash_aux_hidden_stream(cfg), "prefix")
+
+    def _load(self, layer_config, **top):
+        from sglang.srt.configs.speculators_dspark import (
+            try_load_speculators_dspark_config,
+        )
+
+        raw = {
+            "speculators_model_type": "dspark",
+            "aux_hidden_state_layer_ids": [2, 4],
+            "mask_token_id": 7,
+            "transformer_layer_config": layer_config,
+            **top,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "config.json").write_text(json.dumps(raw))
+            return try_load_speculators_dspark_config(tmp, revision=None)
+
+    def test_speculators_dspark_causality_follows_the_layer_types(self):
+        """One is_causal must describe every draft layer; disagreeing layer types
+        are refused instead of being forced causal."""
+        llama = {
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+        }
+        full = {**llama, "layer_types": ["full_attention"] * 2}
+        mixed = {**llama, "layer_types": ["sliding_attention", "full_attention"]}
+        self.assertFalse(self._load(full).is_causal)
+        self.assertTrue(self._load(full, full_attention_causal=True).is_causal)
+        self.assertTrue(self._load(mixed, full_attention_causal=True).is_causal)
+        self.assertFalse(self._load(mixed, sliding_window_non_causal=True).is_causal)
+        with self.assertRaisesRegex(ValueError, "mixes causal and non-causal"):
+            self._load(mixed)
+
+    def test_speculators_dspark_embedding_tap_is_rejected(self):
+        """aux_hidden_state_layer_ids count from 1; 0 (the embeddings) has no layer."""
+        llama = {"model_type": "llama", "hidden_size": 64, "num_attention_heads": 4}
+        with self.assertRaisesRegex(ValueError, "count layers from 1"):
+            self._load(llama, aux_hidden_state_layer_ids=[0, 4])
+
+    def test_parser_hands_the_prefix_stream_to_the_kimi_capture(self):
+        """A speculators DSpark checkpoint parsed by SGLang must make Kimi-K3 capture
+        the prefix stream, end to end from the config parser to the capture setter."""
+        from sglang.srt.hf_transformers.config import HfModelConfigParser
+        from sglang.srt.models import kimi_k3
+
+        raw = {
+            "speculators_model_type": "dspark",
+            "aux_hidden_state_layer_ids": [2, 4],
+            "mask_token_id": 7,
+            "transformer_layer_config": {
+                "model_type": "llama",
+                "hidden_size": 64,
+                "num_attention_heads": 4,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "config.json").write_text(json.dumps(raw))
+            cfg = HfModelConfigParser().parse(tmp, trust_remote_code=False)
+            self.assertEqual(cfg.dflash_config["aux_hidden_stream"], "prefix")
+            causal_lm = SimpleNamespace(
+                model=SimpleNamespace(carries_bank_slices=False)
+            )
+            with get_context().override_server_args(
+                speculative_algorithm="DSPARK",
+                speculative_draft_model_path=tmp,
+                trust_remote_code=False,
+            ):
+                kimi_k3.KimiK3LinearForCausalLM.set_dspark_layers_to_capture(
+                    causal_lm, [1, 3]
+                )
+        self.assertEqual(causal_lm.model.dspark_aux_hidden_stream, "prefix")
+        self.assertEqual(causal_lm.model.dspark_layers_to_capture, [1, 3])
+
+    def test_speculators_dspark_config_follows_the_layer_backbone(self):
+        """The flattened config is the backbone's HF config class, not a fixed one."""
+        cfg = self._load(
+            {"model_type": "llama", "hidden_size": 64, "num_attention_heads": 4}
+        )
+        self.assertEqual(cfg.model_type, "llama")
+        self.assertEqual(cfg.dflash_config["target_layer_ids"], [1, 3])
+
+    def test_speculators_dspark_config_without_layer_model_type_is_rejected(self):
+        for layer_config in (
+            {"hidden_size": 64},
+            {"model_type": "", "hidden_size": 64},
+        ):
+            with self.subTest(layer_config=layer_config):
+                with self.assertRaisesRegex(
+                    ValueError, "transformer_layer_config.model_type"
+                ):
+                    self._load(layer_config)
+
+    def test_unknown_aux_hidden_stream_is_rejected(self):
+        from sglang.srt.speculative.dflash_utils import get_dflash_aux_hidden_stream
+
+        cfg = SimpleNamespace(dflash_config={"aux_hidden_stream": "prefixx"})
+        with self.assertRaisesRegex(ValueError, "aux_hidden_stream"):
+            get_dflash_aux_hidden_stream(cfg)
 
 
 if __name__ == "__main__":

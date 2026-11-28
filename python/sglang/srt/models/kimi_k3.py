@@ -6,6 +6,7 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import json
 import logging
 import re
 from array import array
@@ -184,6 +185,7 @@ _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _is_gfx95:
     from sglang.srt.models.kimi_k3_amd.kimi_k3_hip import (
         aggregate_stream_hip,
+        gather_stream_rows_hip,
         k3_bf16_gemm_hip,
         kda_f_b_gemm_hip,
         mono_output_gate_hip,
@@ -3486,6 +3488,7 @@ class KimiK3LinearModel(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        self.dspark_aux_hidden_stream: str = "attn_res"
         self._dp_attention = is_dp_attention_enabled()
         # Whether K3's SP collective is enabled on this rank, which the layers'
         # stage declarations depend on: settled once, before any is built.
@@ -3758,11 +3761,16 @@ class KimiK3LinearModel(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        """Stream value after `layer_idx` on the bank path: the pre-norm
-        mixture its next consumer would compute (next layer's attention side;
-        output side for the last layer). The standard path captures at the
-        next input instead."""
+        """Stream value after `layer_idx` on the bank path. With the draft's
+        ``prefix`` stream, the stream rows themselves (every row); with
+        ``attn_res``, the pre-norm mixture its next consumer would compute (next
+        layer's attention side; output side for the last layer). The standard
+        path captures at the next input instead."""
         hidden_states = residual_batch.snapshot(hidden_states, forward_batch)
+        if self.dspark_aux_hidden_stream == "prefix":
+            if _is_gfx95:  # the draft reads every row of a row-sharded stream
+                return gather_stream_rows_hip(self.attn_bank.require(), hidden_states)
+            return hidden_states
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
@@ -3902,6 +3910,24 @@ class KimiK3LinearForCausalLM(nn.Module):
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
+        self.model.dspark_aux_hidden_stream = "attn_res"
+        spec_cfg = get_spec()
+        if spec_cfg.speculative_draft_model_path is not None:
+            from sglang.srt.hf_transformers import get_config
+            from sglang.srt.speculative.dflash_utils import (
+                get_dflash_aux_hidden_stream,
+            )
+
+            draft_cfg = get_config(
+                spec_cfg.speculative_draft_model_path,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=spec_cfg.speculative_draft_model_revision,
+                model_override_args=json.loads(get_model().json_model_override_args),
+                model_config_parser=get_model().model_config_parser,
+            )
+            self.model.dspark_aux_hidden_stream = get_dflash_aux_hidden_stream(
+                draft_cfg
+            )
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
         # DFLASH target_layer_ids name layer outputs, which is what the DSPARK
