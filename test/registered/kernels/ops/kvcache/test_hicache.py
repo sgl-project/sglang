@@ -15,7 +15,11 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
 )
-from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.mha import (
+    MHATokenToKVPoolHost,
+    mha_bytes_per_token,
+    write_back_staging_page_chunk,
+)
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.runtime_context import publish, reset_context
@@ -43,6 +47,25 @@ MHA_ELEMENT_DIMS = [128, 256, 512, 1024]
 MLA_ELEMENT_DIMS = [576]
 LAYOUTS = ["layer_first", "page_first"]
 STAGED_WRITE_BACK_PAGE_COUNTS = [1, 63, 64, 65, 67, 128, 129]
+
+
+def _mha_chunk(page_size: int, element_dim: int = MHA_ELEMENT_DIMS[0]) -> int:
+    """Pages per staging round of a bf16 test pool (K and V of element_dim)."""
+    return write_back_staging_page_chunk(page_size, 2 * element_dim * NUM_LAYERS * 2)
+
+
+_MHA_CHUNK = _mha_chunk(PAGE_SIZE)
+MHA_STAGED_WRITE_BACK_PAGE_COUNTS = sorted(
+    {
+        1,
+        _MHA_CHUNK - 1,
+        _MHA_CHUNK,
+        _MHA_CHUNK + 1,
+        _MHA_CHUNK + 3,
+        2 * _MHA_CHUNK,
+        2 * _MHA_CHUNK + 1,
+    }
+)
 
 
 @pytest.mark.parametrize("direction", ["d2h", "h2d"])
@@ -146,7 +169,7 @@ def _token_indices_for_pages(
     return torch.cat(parts, dim=0)
 
 
-def _pinned_host_pool(host_pool_cls, **kwargs):
+def _pinned_host_pool(host_pool_cls, page_size: int = PAGE_SIZE, **kwargs):
     if "device_pool" in kwargs:
         pool = kwargs.pop("device_pool")
         kwargs.update(
@@ -164,7 +187,7 @@ def _pinned_host_pool(host_pool_cls, **kwargs):
         return host_pool_cls(
             host_to_device_ratio=2.0,
             host_size=0,
-            page_size=PAGE_SIZE,
+            page_size=page_size,
             pin_memory=True,
             device="cpu",
             **kwargs,
@@ -180,8 +203,10 @@ def _copy_tensor_with_offset(tensor: torch.Tensor, offset: int) -> None:
     tensor.copy_(data + offset)
 
 
-def _assert_page_filled(tensor: torch.Tensor, page: int, value: float) -> None:
-    page_slice = tensor[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+def _assert_page_filled(
+    tensor: torch.Tensor, page: int, value: float, page_size: int = PAGE_SIZE
+) -> None:
+    page_slice = tensor[page * page_size : (page + 1) * page_size]
     expected = torch.full_like(page_slice, value)
     assert torch.equal(page_slice.cpu(), expected.cpu())
 
@@ -363,16 +388,20 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
 
 
 def _run_page_first_staged_write_back_mha(
-    layout: str, element_dim: int, page_count: int
+    layout: str,
+    element_dim: int,
+    page_count: int,
+    host_order: str = "descending",
+    page_size: int = PAGE_SIZE,
 ) -> None:
-    pool_size = PAGE_SIZE * (page_count + 8)
+    pool_size = page_size * (page_count + 8)
     head_num = (
         element_dim // 128 if element_dim >= 128 and element_dim % 128 == 0 else 1
     )
     head_dim = element_dim // head_num
     device_pool = MHATokenToKVPool(
         size=pool_size,
-        page_size=PAGE_SIZE,
+        page_size=page_size,
         head_num=head_num,
         head_dim=head_dim,
         dtype=torch.bfloat16,
@@ -382,6 +411,7 @@ def _run_page_first_staged_write_back_mha(
     )
     host_pool = _pinned_host_pool(
         MHATokenToKVPoolHost,
+        page_size=page_size,
         buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
         device_capacity_tokens=device_pool.size
         if device_pool.host_capacity_tokens is None
@@ -398,8 +428,14 @@ def _run_page_first_staged_write_back_mha(
     # gfx950's direct copy tiles every 16-byte multiple (hicache._default_unroll)
     if element_dim * host_pool.dtype.itemsize % 128 != 0 and not is_gfx95_supported():
         assert not host_pool.can_use_jit
+    chunk = write_back_staging_page_chunk(
+        page_size,
+        mha_bytes_per_token(
+            device_pool.get_device_pool_infos()[0].buffer_info, NUM_LAYERS
+        ),
+    )
     assert host_pool.staging_page_capacity > 0
-    if page_count > 64:
+    if page_count > chunk:
         assert host_pool.staging_page_capacity < page_count
 
     for layer_id in range(NUM_LAYERS):
@@ -414,15 +450,18 @@ def _run_page_first_staged_write_back_mha(
         device=DEVICE,
         dtype=torch.int64,
     )
-    host_pages = torch.arange(
-        page_count,
-        0,
-        -1,
-        dtype=torch.int64,
-    )
+    if host_order == "descending":  # every page its own run
+        host_pages = torch.arange(page_count, 0, -1, dtype=torch.int64)
+    elif host_order == "ascending":  # one contiguous run per staging round
+        host_pages = torch.arange(1, 1 + page_count, dtype=torch.int64)
+    else:  # "gapped": two runs, split in the middle
+        host_pages = torch.arange(1, 1 + page_count, dtype=torch.int64)
+        host_pages[page_count // 2 :] += 1
     src_index_dtype = torch.int32 if page_count == 64 else torch.int64
-    device_indices = _token_indices_for_pages(device_pages, dtype=src_index_dtype)
-    host_indices = _token_indices_for_pages(host_pages, device="cpu")
+    device_indices = _token_indices_for_pages(
+        device_pages, page_size, dtype=src_index_dtype
+    )
+    host_indices = _token_indices_for_pages(host_pages, page_size, device="cpu")
     assert not host_indices.is_cuda
     expected_k = [
         device_pool.k_buffer[layer_id][device_indices.to(dtype=torch.int64)].cpu()
@@ -440,35 +479,43 @@ def _run_page_first_staged_write_back_mha(
 
     for layer_id in range(NUM_LAYERS):
         for host_page, device_page in zip(host_pages.tolist(), device_pages.tolist()):
-            host_start = host_page * PAGE_SIZE
-            device_start = device_page * PAGE_SIZE
+            host_start = host_page * page_size
+            device_start = device_page * page_size
             assert torch.equal(
                 host_pool.k_data_refs[layer_id][
-                    host_start : host_start + PAGE_SIZE
+                    host_start : host_start + page_size
                 ].cpu(),
                 device_pool.k_buffer[layer_id][
-                    device_start : device_start + PAGE_SIZE
+                    device_start : device_start + page_size
                 ].cpu(),
             )
             assert torch.equal(
                 host_pool.v_data_refs[layer_id][
-                    host_start : host_start + PAGE_SIZE
+                    host_start : host_start + page_size
                 ].cpu(),
                 device_pool.v_buffer[layer_id][
-                    device_start : device_start + PAGE_SIZE
+                    device_start : device_start + page_size
                 ].cpu(),
             )
 
+    # Every host page up to one past the last written page that is not a target,
+    # including the gap between runs, must keep its fill value.
+    written = set(host_pages.tolist())
+    untouched_pages = [p for p in range(max(written) + 2) if p not in written]
     for layer_id in range(NUM_LAYERS):
-        for untouched_page in [0, page_count + 1]:
-            _assert_page_filled(host_pool.k_data_refs[layer_id], untouched_page, -7)
-            _assert_page_filled(host_pool.v_data_refs[layer_id], untouched_page, -11)
+        for untouched_page in untouched_pages:
+            _assert_page_filled(
+                host_pool.k_data_refs[layer_id], untouched_page, -7, page_size
+            )
+            _assert_page_filled(
+                host_pool.v_data_refs[layer_id], untouched_page, -11, page_size
+            )
 
     for layer_id in range(NUM_LAYERS):
         device_pool.k_buffer[layer_id].zero_()
         device_pool.v_buffer[layer_id].zero_()
     load_indices = device_indices.to(dtype=torch.int64)
-    host_indices_load = _token_indices_for_pages(host_pages)
+    host_indices_load = _token_indices_for_pages(host_pages, page_size)
     for layer_id in range(NUM_LAYERS):
         host_pool.load_to_device_per_layer(
             device_pool, host_indices_load, load_indices, layer_id, "kernel"
@@ -591,11 +638,37 @@ def test_hicache_transfer_mla(layout: str, element_dim: int) -> None:
 
 @pytest.mark.parametrize("layout", ["page_first"])
 @pytest.mark.parametrize("element_dim", MHA_ELEMENT_DIMS)
-@pytest.mark.parametrize("page_count", STAGED_WRITE_BACK_PAGE_COUNTS)
+@pytest.mark.parametrize("page_count", MHA_STAGED_WRITE_BACK_PAGE_COUNTS)
 def test_hicache_page_first_staged_write_back_mha(
     layout: str, element_dim: int, page_count: int
 ) -> None:
     _run_page_first_staged_write_back_mha(layout, element_dim, page_count)
+
+
+@pytest.mark.parametrize("host_order", ["ascending", "gapped"])
+@pytest.mark.parametrize("page_count", [3, _MHA_CHUNK + 3])
+def test_hicache_page_first_staged_write_back_mha_coalesced_runs(
+    host_order: str, page_count: int
+) -> None:
+    """Contiguous host pages are merged into one copy per run; same bytes as per page."""
+    _run_page_first_staged_write_back_mha(
+        "page_first", MHA_ELEMENT_DIMS[0], page_count, host_order
+    )
+
+
+_PAGE1_CHUNK = _mha_chunk(1)
+
+
+@pytest.mark.parametrize("host_order", ["descending", "ascending", "gapped"])
+@pytest.mark.parametrize("page_count", [3, _PAGE1_CHUNK + 3])
+def test_hicache_page_first_staged_write_back_mha_page_size_1(
+    host_order: str, page_count: int
+) -> None:
+    """Page size 1 (the default): one token per page, so runs of contiguous host
+    slots are what coalescing merges; a round stages up to 4096 tokens."""
+    _run_page_first_staged_write_back_mha(
+        "page_first", MHA_ELEMENT_DIMS[0], page_count, host_order, page_size=1
+    )
 
 
 @pytest.mark.parametrize("layout", ["page_first"])

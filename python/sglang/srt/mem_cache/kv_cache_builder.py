@@ -47,10 +47,13 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.pool_host.base import (
-    _WRITE_BACK_STAGING_PAGE_CHUNK,
+    fixed_host_token_capacity,
     prepare_page_unified_write_back_staging,
 )
-from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
+from sglang.srt.mem_cache.pool_host.mha import (
+    mha_bytes_per_token,
+    prepare_mha_write_back_staging,
+)
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -104,10 +107,13 @@ def prepare_hicache_staging(
                 is_mla and memory.hicache_mem_layout != "page_unified"
             ):
                 return
-            # Ratio-based host pools can only shrink with post-capture KV sizing.
+            # Bound the scratch by the host pool's pages, an upper bound here:
+            # ratio-based host pools can only shrink with post-capture KV
+            # sizing, and a --hicache-size share is at most the whole size.
             # Sidecars instead inherit their target host pool's capacity.
-            page_capacity = _WRITE_BACK_STAGING_PAGE_CHUNK
-            if memory.hicache_size <= 0 and not sidecar:
+            info = pool.get_device_pool_infos()[0].buffer_info
+            page_capacity = None
+            if not sidecar and memory.hicache_size <= 0:
                 capacity_tokens = (
                     pool.size
                     if pool.host_capacity_tokens is None
@@ -116,7 +122,17 @@ def prepare_hicache_staging(
                 page_capacity = (
                     int(capacity_tokens * memory.hicache_ratio) // page_size + 1
                 )
-            info = pool.get_device_pool_infos()[0].buffer_info
+            elif not sidecar and not is_mla:
+                # MHA host pools store at least these bytes per token (scale
+                # buffers add to them), so they hold at most this many pages.
+                size_per_token = mha_bytes_per_token(
+                    info, pool.layer_num + len(packed_drafts)
+                )
+                page_capacity = (
+                    fixed_host_token_capacity(memory.hicache_size, size_per_token)
+                    // page_size
+                    + 1
+                )
             if memory.hicache_mem_layout == "page_unified":
                 geometry = resolve_kv_host_geometry(
                     pool,

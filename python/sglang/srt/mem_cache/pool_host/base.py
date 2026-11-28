@@ -44,15 +44,24 @@ HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 _WRITE_BACK_STAGING_PAGE_CHUNK = 64
 
 
+def fixed_host_token_capacity(host_size: float, size_per_token: int) -> int:
+    """Tokens a --hicache-size host pool holds, before the padding page."""
+    return int(host_size * 1e9 // size_per_token)
+
+
 def prepare_page_unified_write_back_staging(
     geometry: PageUnifiedLayout,
     *,
     dtype: torch.dtype,
     device: torch.device,
-    page_capacity: int = _WRITE_BACK_STAGING_PAGE_CHUNK,
+    page_capacity: int | None = None,
     staging: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Prepare scratch before KV sizing, or reuse it when the host pool is built."""
+    """Prepare scratch before KV sizing, or reuse it when the host pool is built.
+
+    ``page_capacity`` bounds the scratch by the host pool's pages; None leaves
+    only the per-round chunk.
+    """
     if not (
         (_is_cuda or _is_hip)
         and can_use_page_unified_write_back_jit_kernel(
@@ -66,7 +75,10 @@ def prepare_page_unified_write_back_staging(
             "and load-back JIT kernels, which could not be built for a "
             f"{geometry.group_bytes}-byte {row_kind} row."
         )
-    shape = geometry.page_dims(min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK))
+    page_num = _WRITE_BACK_STAGING_PAGE_CHUNK
+    if page_capacity is not None:
+        page_num = min(page_capacity, page_num)
+    shape = geometry.page_dims(page_num)
     if staging is None:
         return torch.empty(shape, dtype=dtype, device=device)
     if (
@@ -471,7 +483,8 @@ class HostKVCache(abc.ABC):
         else:
             if host_size > 0:
                 self.size = sync_fixed_hicache_size(
-                    int(host_size * 1e9 // self.size_per_token), host_size
+                    fixed_host_token_capacity(host_size, self.size_per_token),
+                    host_size,
                 )
             else:
                 self.size = int(device_capacity_tokens * host_to_device_ratio)

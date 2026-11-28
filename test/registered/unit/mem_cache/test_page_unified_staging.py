@@ -1,10 +1,11 @@
-"""Page-unified transfer scratch must survive final KV sizing and host assembly."""
+"""HiCache write-back scratch must survive final KV sizing and host assembly."""
 
 import unittest
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
+import msgspec
 import torch
 
 from sglang.srt import runtime_context
@@ -402,6 +403,120 @@ class TestPageUnifiedStaging(CustomTestCase):
                             page_capacity=4,
                             staging=staging,
                         )
+
+
+@contextmanager
+def _mha_page_first_environment(**memory_overrides):
+    """The staged MHA write-back path, with its JIT kernels stubbed out."""
+    with ExitStack() as stack:
+        memory = stack.enter_context(
+            _cpu_staging_environment(
+                hicache_mem_layout="page_first", **memory_overrides
+            )
+        )
+        stack.enter_context(mock.patch.object(mha, "_is_cuda", True))
+        stack.enter_context(
+            mock.patch.object(mha, "can_use_write_back_jit_kernel", return_value=True)
+        )
+        stack.enter_context(
+            mock.patch.object(mha, "can_use_hicache_jit_kernel", return_value=False)
+        )
+        yield memory
+
+
+class TestMHAPageFirstStaging(CustomTestCase):
+    def test_staging_bytes_are_capped_for_small_pages(self):
+        """Page size 1 stages up to 4096 tokens per round, but a wide model
+        (32 layers x 32 KV heads x 128, BF16: 512 KiB per token) must not
+        reserve 2 GiB of GPU scratch for it; 64 pages stay the floor."""
+        real_empty = torch.empty
+
+        def meta_empty(shape, *, dtype, device):
+            return real_empty(shape, dtype=dtype, device="meta")
+
+        # 32 layers x head_num x (128 + 128) x 2 B = head_num x 16 KiB per token.
+        for head_num, page_size, tokens in (
+            (32, 1, 128),
+            (1, 1, 4096),
+            (32, 64, 64 * 64),
+        ):
+            with (
+                self.subTest(head_num=head_num, page_size=page_size),
+                _mha_page_first_environment(),
+                mock.patch.object(
+                    kv_cache_builder,
+                    "get_schedule",
+                    return_value=SimpleNamespace(page_size=page_size),
+                ),
+            ):
+                pool = MHATokenToKVPool(
+                    size=page_size * 2,
+                    page_size=page_size,
+                    head_num=head_num,
+                    head_dim=128,
+                    dtype=torch.bfloat16,
+                    layer_num=32,
+                    device="cpu",
+                    enable_memory_saver=False,
+                    enable_alt_stream=False,
+                )
+                # A large host pool, so only the per-round chunk bounds it.
+                pool.host_capacity_tokens = 1 << 16
+                with mock.patch.object(torch, "empty", side_effect=meta_empty):
+                    kv_cache_builder.prepare_hicache_staging(tp_worker=_worker(pool))
+                self.assertEqual(
+                    [buf.shape[0] for buf in pool.hicache_write_back_staging],
+                    [tokens] * 2,
+                )
+
+    def test_fixed_host_size_bounds_prepared_staging(self):
+        """With --hicache-size the host pool can hold fewer pages than one
+        staging round; scratch prepared before KV sizing must not exceed it."""
+        # 4 layers x 4 heads x (16 + 16) x 2 B = 1 KiB per token: 976 tokens.
+        with _mha_page_first_environment(hicache_size=1e-3):
+            pool = _device_pool(is_mla=False)
+            kv_cache_builder.prepare_hicache_staging(tp_worker=_worker(pool))
+            prepared = pool.hicache_write_back_staging
+            host_pages = 976 // PAGE_SIZE + 1
+            self.assertEqual(
+                [buf.shape[0] for buf in prepared], [host_pages * PAGE_SIZE] * 2
+            )
+            with mock.patch.object(
+                torch, "empty", side_effect=AssertionError("late staging allocation")
+            ):
+                host = hybrid_pool_assembler.build_kv_host_pool(
+                    kv_pool=pool, page_size=PAGE_SIZE
+                )
+            self.assertEqual(host.page_num, host_pages)
+            self.assertEqual(host.staging_page_capacity, host_pages)
+            self.assertEqual(host.staging_k_buffer.data_ptr(), prepared[0].data_ptr())
+
+    def test_strided_device_rows_do_not_reserve_staging(self):
+        """Strided device rows (unified-pool views) bypass the staged kernel,
+        so no scratch may be reserved for them."""
+        with _mha_page_first_environment():
+            info = _device_pool(is_mla=False).get_device_pool_infos()[0].buffer_info
+            self.assertIsNotNone(
+                mha.prepare_mha_write_back_staging(
+                    info, layer_num=4, page_size=PAGE_SIZE
+                )
+            )
+            rows = torch.zeros(
+                PAGE_SIZE * 8, 2 * info.head_num, info.head_dim, dtype=info.dtype
+            )
+            strided = tuple(rows[:, : info.head_num] for _ in info.buffers.k)
+            info = msgspec.structs.replace(
+                info,
+                buffers=msgspec.structs.replace(info.buffers, k=strided, v=strided),
+            )
+            with mock.patch.object(
+                torch, "empty", side_effect=AssertionError("staging allocation")
+            ):
+                self.assertIsNone(
+                    mha.prepare_mha_write_back_staging(
+                        info, layer_num=4, page_size=PAGE_SIZE
+                    )
+                )
 
 
 if __name__ == "__main__":

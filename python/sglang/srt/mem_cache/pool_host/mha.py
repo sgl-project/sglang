@@ -100,15 +100,54 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+# Small pages stage up to this many tokens per write-back round, within
+# _WRITE_BACK_STAGING_MAX_BYTES of K+V scratch. The scratch is GPU memory that
+# sits outside the KV budget unless post-capture KV sizing is on.
+_WRITE_BACK_STAGING_TOKENS = 4096
+_WRITE_BACK_STAGING_MAX_BYTES = 64 << 20
+
+
+def mha_bytes_per_token(buffer_info: MHABufferInfo, layer_num: int) -> int:
+    """K+V bytes of one token over ``layer_num`` layers: the staging row, and
+    the payload part of the host pool's size per token."""
+    return (
+        (buffer_info.head_dim + buffer_info.v_head_dim)
+        * buffer_info.head_num
+        * layer_num
+        * buffer_info.dtype.itemsize
+    )
+
+
+def write_back_staging_page_chunk(page_size: int, bytes_per_token: int) -> int:
+    """Pages per write-back staging round: 64 pages, or more for small pages
+    up to the token and byte caps, so page size 1 does not stage 64 tokens."""
+    tokens = min(
+        _WRITE_BACK_STAGING_TOKENS, _WRITE_BACK_STAGING_MAX_BYTES // bytes_per_token
+    )
+    return max(_WRITE_BACK_STAGING_PAGE_CHUNK, tokens // page_size)
+
+
 def prepare_mha_write_back_staging(
     buffer_info: MHABufferInfo,
     *,
     layer_num: int,
     page_size: int,
-    page_capacity: int = _WRITE_BACK_STAGING_PAGE_CHUNK,
+    page_capacity: int | None = None,
     staging: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """K/V scratch of the staged write-back, or None when it will not run.
+
+    ``page_capacity`` bounds it by the host pool's pages; None leaves only the
+    per-round chunk.
+    """
     if not (_is_cuda or _is_hip) or layer_num == 0:
+        return None
+    # The staged kernel reads whole packed device pages; strided rows (unified
+    # pool views) take the stride-aware copy and never touch this scratch.
+    if not all(
+        buffer.is_contiguous()
+        for buffer in (*buffer_info.buffers.k, *buffer_info.buffers.v)
+    ):
         return None
     head_num = buffer_info.head_num
     if not all(
@@ -118,7 +157,12 @@ def prepare_mha_write_back_staging(
         for dim in (buffer_info.head_dim, buffer_info.v_head_dim)
     ):
         return None
-    token_capacity = min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK) * page_size
+    page_num = write_back_staging_page_chunk(
+        page_size, mha_bytes_per_token(buffer_info, layer_num)
+    )
+    if page_capacity is not None:
+        page_num = min(page_capacity, page_num)
+    token_capacity = page_num * page_size
     shapes = tuple(
         (token_capacity, layer_num, head_num, dim)
         for dim in (buffer_info.head_dim, buffer_info.v_head_dim)
@@ -388,19 +432,21 @@ class MHATokenToKVPoolHost(HostKVCache):
         # The staged kernel reads whole device pages, so it needs packed rows.
         if self.layout != "page_first" or not self.device_rows_packed:
             return
-        page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
         staging = prepare_mha_write_back_staging(
             buffer_info,
             layer_num=self.layer_num,
             page_size=self.page_size,
-            page_capacity=page_capacity,
+            page_capacity=self.page_num,
             staging=write_back_staging,
         )
         if staging is None:
             return
         self.can_use_write_back_jit = True
-        self.staging_page_capacity = page_capacity
-        self.staging_token_capacity = page_capacity * self.page_size
+        # Scratch prepared before KV sizing may cover more pages than remain.
+        self.staging_page_capacity = min(
+            self.page_num, staging[0].shape[0] // self.page_size
+        )
+        self.staging_token_capacity = self.staging_page_capacity * self.page_size
         self.staging_k_buffer, self.staging_v_buffer = (
             buffer[: self.staging_token_capacity] for buffer in staging
         )
