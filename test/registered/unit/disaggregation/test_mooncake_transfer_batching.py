@@ -13,11 +13,14 @@ import torch
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mooncake.buffers import BufferKeys
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
+from sglang.srt.disaggregation.mooncake.transport import MooncakeTransport
 from sglang.srt.disaggregation.transport.base import Copy, Result, Status
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
     TransferIntent,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
@@ -25,6 +28,51 @@ from sglang.test.test_utils import CustomTestCase
 FOREGROUND = TransferIntent.FOREGROUND
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+class TestMooncakeAuxRegistration(unittest.TestCase):
+    def _check_regions(self, *, aux_tcp, pool_type, expected):
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.enable_custom_mem_pool = pool_type is not None
+        manager.custom_mem_pool_type = pool_type
+        args = manager.kv_args = SimpleNamespace(
+            kv_data_ptrs=[1000],
+            kv_data_lens=[64],
+            aux_data_ptrs=[2000],
+            aux_data_lens=[16],
+            state_data_ptrs=[[3000]],
+            state_data_lens=[[32]],
+            gpu_id=0,
+        )
+        manager._local_keys = BufferKeys.for_buffers(
+            args.kv_data_ptrs, args.aux_data_ptrs, args.state_data_ptrs
+        )
+        engine = MagicMock()
+        manager.transport = MooncakeTransport(engine=engine)
+        with envs.SGLANG_MOONCAKE_SEND_AUX_TCP.override(aux_tcp):
+            manager.register_buffer_to_engine()
+            manager.deregister_buffer_to_engine()
+
+        engine.batch_register.assert_called_once()
+        self.assertCountEqual(zip(*engine.batch_register.call_args.args), expected)
+        engine.batch_deregister.assert_called_once()
+        self.assertCountEqual(
+            engine.batch_deregister.call_args.args[0], [ptr for ptr, _ in expected]
+        )
+
+    def test_tcp_aux_skips_registration(self):
+        for aux_tcp, pool_type in [(True, None), (False, "NVLINK")]:
+            with self.subTest(aux_tcp=aux_tcp, pool_type=pool_type):
+                self._check_regions(
+                    aux_tcp=aux_tcp,
+                    pool_type=pool_type,
+                    expected=[(1000, 64), (3000, 32)],
+                )
+
+    def test_mooncake_aux_keeps_registration(self):
+        self._check_regions(
+            aux_tcp=False, pool_type=None, expected=[(1000, 64), (2000, 16), (3000, 32)]
+        )
 
 
 class TestMooncakeTransferBatching(unittest.TestCase):
