@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import socket
+from datetime import timedelta
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
@@ -227,6 +228,15 @@ def _build_server_args(
         # when several modalities are over their limit.
         limit_mm_data_per_request=list(
             (get_mm().limit_mm_data_per_request or {}).items()
+        ),
+        allowed_media_domains=list(get_mm().allowed_media_domains or []),
+        allow_private_media_hosts=get_mm().allow_private_media_hosts,
+        allow_local_media_files=get_mm().allow_local_media_files,
+        media_max_file_bytes=get_mm().media_url_max_file_size_mb << 20,
+        media_url_timeout=(
+            timedelta(seconds=get_mm().media_url_timeout)
+            if get_mm().media_url_timeout is not None
+            else None
         ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,

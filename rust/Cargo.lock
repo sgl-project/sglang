@@ -2025,6 +2025,9 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is-macro"
@@ -4089,12 +4092,15 @@ dependencies = [
  "blake3",
  "half",
  "image",
+ "ipnet",
+ "libc",
  "numpy",
  "pyo3",
  "rayon",
  "serde",
  "serde_json",
  "ureq",
+ "url",
 ]
 
 [[package]]

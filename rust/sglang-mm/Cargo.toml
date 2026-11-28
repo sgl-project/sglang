@@ -48,6 +48,9 @@ pyo3 = { workspace = true, optional = true }
 numpy = { version = "0.29", optional = true }
 
 base64 = "0.22"
+ipnet = {version = "2", features = ["serde"]}
+url = "2"
+libc = "0.2"
 blake3 = "1"
 half = "2.4"
 # The formats the Python (PIL) path commonly accepts; all pure-Rust decoders.
