@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
@@ -14,13 +15,27 @@ register_npu_ci(
     nightly=True,
 )
 
-# Transfer through Ascend's native backend even when mooncake is installed.
-# With mooncake, its PD registration rejects this DSPARK + prefill(pp=2)
-# deployment ("PD KV layout mismatch ... prefill=4096 decode=32768"), so every
-# chat request fails with 500 before any KV moves.
+# Transfer through Ascend's native backend even when mooncake is installed:
+# mooncake's PD registration rejected this DSPARK deployment's KV layout in
+# earlier runs ("PD KV layout mismatch ... prefill=4096 decode=32768"), while
+# Ascend transfers served every request. This is the only deviation from the
+# 128k1k performance deployment below.
 DISAGGREGATION_TRANSFER_BACKEND = "ascend"
 
+# Expert layout shared with the 128k1k performance case (single copy lives
+# there); the accuracy tree does not carry its own.
+DEEPSEEK_V4_FLASH_EXPERT_LAYOUT = str(
+    Path(__file__).resolve().parents[2]
+    / "performance"
+    / "deepseek_v4_flash"
+    / "expert-layout-ais-replicas16.json"
+)
+
+# Environment variables / launch args mirror
+# test/registered/npu/performance/deepseek_v4_flash/
+# test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
+    "PYTHONUNBUFFERED": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "INF_NAN_MODE_FORCE_DISABLE": "1",
@@ -28,7 +43,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
-    # skip gpu branch
     "SGLANG_OPT_FP8_WO_A_GEMM": "0",
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
     "FORCE_DRAFT_MODEL_NON_QUANT": "1",
@@ -39,7 +53,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-    # mtp
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
@@ -51,35 +64,37 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
+    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
 # Prefill node environment variables for DSV4-Flash-0731 PD-Sep deployment.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS = {
     **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS,
+    # deepep
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "DEEPEP_HCCL_BUFFSIZE": "2600",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "8192",
-    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
+    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "1",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
     "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "0",
+    # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
     "SGLANG_PROFILE_WITH_STACK": "False",
-    # send cached prefix to decode early for radix-cache hits
-    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
 # Decode node environment variables for DSV4-Flash-0731 PD-Sep deployment.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS,
-    "HCCL_BUFFSIZE": "1200",
+    # deepep
+    "HCCL_BUFFSIZE": "200",
+    "DEEPEP_HCCL_BUFFSIZE": "1200",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
     "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
-    "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
 # DSPARK speculative decoding arguments shared by the prefill and decode nodes:
@@ -96,6 +111,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPECULATIVE_ARGS = [
     "ascend",
     "--speculative-num-draft-tokens",
     6,
+    "--speculative-dspark-block-size",
+    5,
 ]
 
 # Prefill node launch arguments.
@@ -103,9 +120,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
     128,
     "--tp-size",
-    8,
-    "--pp-size",
-    2,
+    16,
     "--trust-remote-code",
     "--device",
     "npu",
@@ -117,18 +132,16 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "prefill",
     "--disaggregation-transfer-backend",
     DISAGGREGATION_TRANSFER_BACKEND,
+    # --disaggregation-bootstrap-port is injected by the multi-node harness
+    # (BOOTSTRAP_INIT_PORT + pod index), so it is not repeated here.
     "--mem-fraction-static",
-    0.62,
+    0.68,
     "--prefill-max-requests",
     256,
     "--max-prefill-tokens",
     70000,
     "--max-running-requests",
     256,
-    "--chunked-prefill-size",
-    131072,
-    "--attn-dp-size",
-    8,
     "--tokenizer-worker-num",
     16,
     "--moe-a2a-backend",
@@ -144,22 +157,32 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disable-prefill-cuda-graph",
     "--load-balance-method",
     "round_robin",
+    "--enable-metrics",
+    "--enable-cache-report",
+    "--chunked-prefill-size",
+    32768,
+    "--init-expert-location",
+    DEEPSEEK_V4_FLASH_EXPERT_LAYOUT,
+    "--ep-dispatch-algorithm",
+    "dynamic",
+    "--ep-num-redundant-experts",
+    16,
+    "--attn-dp-size",
+    4,
     "--enable-prefill-cp",
     "--cp-strategy",
-    "interleave",
-    "--enable-hierarchical-cache",
-    "--hicache-io-backend",
-    "kernel_ascend",
-    "--hicache-ratio",
-    1.5,
-    "--hicache-write-policy",
-    "write_through",
-    "--enable-cache-report",
-    "--max-total-tokens",
-    140000,
+    "zigzag",
+    "--optimistic-prefill-attempts",
+    1,
+    "--json-model-override-args",
+    '{"use_index_cache":true,"index_topk_freq":2}',
+    "--expert-distribution-recorder-mode",
+    "stat",
+    "--expert-distribution-recorder-buffer-size",
+    512,
     # The DeepSWE agent (mini-swe-agent) drives the model through OpenAI
     # tool calls; without these parsers the engines return plain text and the
-    # agent gives up after three format errors.
+    # agent gives up after three format errors. The perf case does not need them.
     "--tool-call-parser",
     "deepseekv4",
     "--reasoning-parser",
@@ -201,13 +224,23 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "bfloat16",
     "--load-balance-method",
     "round_robin",
+    "--enable-metrics",
+    "--enable-cache-report",
+    "--swa-full-tokens-ratio",
+    0.05,
     "--cuda-graph-bs-decode",
     1,
     2,
     3,
     4,
-    5,
     6,
+    7,
+    8,
+    10,
+    "--json-model-override-args",
+    '{"use_index_cache":true,"index_topk_freq":2}',
+    "--tokenizer-worker-num",
+    16,
     "--tool-call-parser",
     "deepseekv4",
     "--reasoning-parser",
