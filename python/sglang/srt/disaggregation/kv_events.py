@@ -432,6 +432,7 @@ class ZmqEventPublisher(EventPublisher):
         max_queue_size: int = 100_000,
         topic: str = "",
         bind: Optional[bool] = None,
+        include_token_ids: bool = True,
     ) -> None:
         # Storage
         self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
@@ -454,6 +455,7 @@ class ZmqEventPublisher(EventPublisher):
         self._socket_setup()
 
         # Payload
+        self._include_token_ids = include_token_ids
         self._seq_gen = count()
         self._topic_bytes = topic.encode("utf-8")
 
@@ -471,6 +473,16 @@ class ZmqEventPublisher(EventPublisher):
     def publish(self, events: EventBatch) -> None:
         if not self._running:
             raise RuntimeError("Publisher is closed")
+        if not self._include_token_ids:
+            stores = [event for event in events.events if isinstance(event, BlockStored)]
+            for event in stores:
+                if event.lora_name:
+                    raise ValueError(
+                        "include_token_ids=false does not support named LoRA "
+                        "BlockStored events"
+                    )
+            for event in stores:
+                event.token_ids = []
         if events.attn_dp_rank is None:
             events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
@@ -757,6 +769,10 @@ class KVEventsConfig(BaseModel):
     """Bind (true) or connect (false) the PUB socket. When unset, infer from
     the endpoint as before. Use true to bind a concrete address such as loopback.
     """
+
+    include_token_ids: bool = True
+    """Emit BlockStored.token_ids. False supports base-model events only and
+    replaces their IDs with [] before live encoding and replay retention."""
 
     replay_endpoint: Optional[str] = None
     """The zmq endpoint to use for replaying kv events.
