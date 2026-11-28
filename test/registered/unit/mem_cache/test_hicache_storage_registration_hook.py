@@ -53,9 +53,11 @@ class RecordingBackend:
         order: List[str],
         fail_on_complete: bool = False,
         consumes_kv_hints: bool = False,
+        fail_on_register: bool = False,
     ):
         self.order = order
         self.fail_on_complete = fail_on_complete
+        self.fail_on_register = fail_on_register
         self.closed = False
         self._consumes_kv_hints = consumes_kv_hints
 
@@ -64,6 +66,8 @@ class RecordingBackend:
 
     def register_mem_host_pool_v2(self, host_pool: Any, host_pool_name: Any) -> None:
         self.order.append(f"v2:{host_pool_name}")
+        if self.fail_on_register:
+            raise RuntimeError("registration failed in a pool")
 
     def on_host_pools_registered(self) -> None:
         self.order.append("complete")
@@ -110,7 +114,7 @@ def _group() -> HostPoolGroup:
 
 
 def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
-    """Only the attributes ``attach_storage_backend`` reads."""
+    """Only the attributes used by attach and subsequent rollback."""
     controller = object.__new__(cls)
     controller.enable_storage = False
     controller.storage_stop_event = threading.Event()
@@ -130,6 +134,9 @@ def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     if cls is HybridCacheController:
         controller.pp_prefetch_command_thread = None
         controller.pp_prefetch_command_group = None
+        controller.pp_prefetch_state_lock = threading.Lock()
+        controller.pp_prefetch_states = {}
+        controller.pp_prefetch_decisions = {}
         controller.extra_host_mem_release_queues = {}
     return controller
 
@@ -253,11 +260,60 @@ class TestRegistrationBurstOrder(CustomTestCase):
         self.assertFalse(controller.enable_storage)
         self.assertIsNone(controller.storage_backend)
 
-    def test_hybrid_hook_failure_propagates(self):
-        # On the hybrid path the burst continues after super() has completed;
-        # a backend failure there propagates out of attach_storage_backend,
-        # failing the attach (the post-super section has no rollback of its
-        # own, exactly as for the v2 calls themselves).
+    def test_hybrid_hook_failure_rolls_back_and_can_retry(self):
+        # The burst continues after super() has completed. Failures in either
+        # the per-pool registration or its completion hook must roll back that
+        # completed base attach while preserving the backend error.
+        cases = [
+            (
+                "complete",
+                "registration failed in the backend",
+                ["v1", "threads", "v2:kv", "v2:mamba", "complete"],
+                {"fail_on_complete": True},
+            ),
+            (
+                "registration",
+                "registration failed in a pool",
+                ["v1", "threads", "v2:kv"],
+                {"fail_on_register": True},
+            ),
+        ]
+        for stage, expected_error, expected_order, failure_config in cases:
+            with self.subTest(stage=stage):
+                order: List[str] = []
+                group = _group()
+                controller = _controller(
+                    HybridCacheController, group.anchor_entry.host_pool, group
+                )
+                backend = RecordingBackend(order, **failure_config)
+
+                with (
+                    mock.patch.object(
+                        controller,
+                        "_stop_storage_threads",
+                        wraps=controller._stop_storage_threads,
+                    ) as stop_storage_threads,
+                    self.assertRaisesRegex(RuntimeError, expected_error),
+                ):
+                    _attach(controller, backend, order, host_pools=group.entries)
+
+                self.assertEqual(order, expected_order)
+                self.assertTrue(backend.closed)
+                self.assertFalse(controller.enable_storage)
+                self.assertIsNone(controller.storage_backend)
+                self.assertIsNone(controller.storage_backend_type)
+                self.assertGreaterEqual(stop_storage_threads.call_count, 2)
+
+                # The fixture factory returns the same recorder for its next
+                # product. Reset its state to model a fresh successful retry.
+                backend.fail_on_complete = False
+                backend.fail_on_register = False
+                backend.closed = False
+                _attach(controller, backend, order, host_pools=group.entries)
+                self.assertTrue(controller.enable_storage)
+                self.assertIs(controller.storage_backend, backend)
+
+    def test_hybrid_rollback_failure_preserves_registration_error(self):
         order: List[str] = []
         group = _group()
         controller = _controller(
@@ -265,10 +321,43 @@ class TestRegistrationBurstOrder(CustomTestCase):
         )
         backend = RecordingBackend(order, fail_on_complete=True)
 
-        with self.assertRaisesRegex(RuntimeError, "registration failed in the backend"):
-            _attach(controller, backend, order, host_pools=group.entries)
+        # The first stop is the defensive pre-attach stop. The next models a
+        # rollback that cannot stop a worker, followed by a successful explicit
+        # detach and a later attach attempt.
+        with mock.patch.object(
+            controller,
+            "_stop_storage_threads",
+            side_effect=[None, RuntimeError("worker did not stop"), None, None],
+        ) as stop_storage_threads:
+            with self.assertRaises(RuntimeError) as raised:
+                _attach(controller, backend, order, host_pools=group.entries)
 
-        self.assertEqual(order, ["v1", "threads", "v2:kv", "v2:mamba", "complete"])
+            message = str(raised.exception)
+            self.assertIn("registration failed in the backend", message)
+            self.assertIn("rollback also failed", message)
+            self.assertEqual(
+                str(raised.exception.__cause__), "registration failed in the backend"
+            )
+            self.assertEqual(
+                str(raised.exception.__context__.__cause__), "worker did not stop"
+            )
+            self.assertTrue(controller.enable_storage)
+            self.assertFalse(backend.closed)
+
+            with self.assertRaisesRegex(RuntimeError, "already attached"):
+                _attach(controller, backend, order, host_pools=group.entries)
+
+            controller.detach_storage_backend()
+            self.assertFalse(controller.enable_storage)
+            self.assertIsNone(controller.storage_backend)
+            self.assertTrue(backend.closed)
+
+            backend.fail_on_complete = False
+            backend.closed = False
+            _attach(controller, backend, order, host_pools=group.entries)
+            self.assertTrue(controller.enable_storage)
+            self.assertIs(controller.storage_backend, backend)
+            self.assertEqual(stop_storage_threads.call_count, 4)
 
     def test_dynamic_sidecar_does_not_re_fire_the_hook(self):
         order: List[str] = []

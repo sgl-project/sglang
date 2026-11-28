@@ -538,9 +538,23 @@ class HybridCacheController(BaseHiCacheController):
                 storage_backend,
             )
 
-        for entry in host_pools or []:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
-        self.storage_backend.on_host_pools_registered()
+        try:
+            for entry in host_pools or []:
+                self.storage_backend.register_mem_host_pool_v2(
+                    entry.host_pool, entry.name
+                )
+            self.storage_backend.on_host_pools_registered()
+        except Exception as registration_error:
+            # The base attach has already completed; do not leave the controller
+            # enabled with a partially registered backend after either call fails.
+            try:
+                self.detach_storage_backend()
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "Storage attach failed during host-pool registration "
+                    f"({registration_error}); rollback also failed ({rollback_error})"
+                ) from registration_error
+            raise
 
     def detach_storage_backend(self):
         super().detach_storage_backend()
