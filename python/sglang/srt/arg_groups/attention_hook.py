@@ -31,6 +31,7 @@ from sglang.srt.arg_groups.overrides import (
     _mla_backend_page_constraints,
     _mla_kv_cache_dtype_checks,
     declare_resolution,
+    max_speculative_num_draft_tokens,
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.platform_hook import (
@@ -467,7 +468,9 @@ def handle_linear_attn_backend(server_args: Any):
     # window (MambaPool checks it); KDA (kda_backend) keeps a window of the
     # same length and folds via its own fused verify ring-write +
     # commit_kda_replayssm_after_verify.
-    if cfg.enable_linear_replayssm_spec:
+    if cfg.enable_linear_replayssm_spec and _is_mamba2_ssd_model(server_args):
+        _validate_mamba2_replayssm_spec(cfg, server_args)
+    elif cfg.enable_linear_replayssm_spec:
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
                 "--enable-linear-replayssm-spec requires a linear draft chain "
@@ -547,6 +550,78 @@ def handle_linear_attn_backend(server_args: Any):
                 "verify window; validate long-sequence accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
             )
+
+
+def _is_mamba2_ssd_model(server_args: Any) -> bool:
+    from sglang.srt.configs.hybrid_arch import mamba2_config
+    from sglang.srt.configs.nemotron_h import NemotronHConfig
+
+    return isinstance(mamba2_config(model_config_of(server_args)), NemotronHConfig)
+
+
+def _validate_mamba2_replayssm_spec(cfg: Any, server_args: Any) -> None:
+    from sglang.kernels.ops.mamba.mamba2_replayssm_spec import (
+        MAX_DRAFT_TOKENS as MAMBA2_REPLAYSSM_MAX_DRAFT_TOKENS,
+    )
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    if cfg.speculative_algorithm is None:
+        raise ValueError(
+            "--enable-linear-replayssm-spec requires --speculative-algorithm."
+        )
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError(
+            "--enable-linear-replayssm-spec requires a linear draft chain "
+            "(--speculative-eagle-topk in {None, 1}), got "
+            f"{cfg.speculative_eagle_topk!r}."
+        )
+    if not get_platform().is_cuda:
+        raise ValueError("--enable-linear-replayssm-spec for Mamba2 requires CUDA.")
+    if pp_spec_stable_rows_enabled():
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 does not support "
+            "SGLANG_ENABLE_PP_SPEC yet."
+        )
+    if cfg.mamba_backend != "flashinfer":
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 runs FlashInfer's "
+            "checkpointing SSU; pass --mamba-backend flashinfer, got "
+            f"{cfg.mamba_backend!r}."
+        )
+    if cfg.enable_mamba_cache_stochastic_rounding:
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 does not support "
+            "--enable-mamba-cache-stochastic-rounding yet."
+        )
+    max_draft_tokens = max_speculative_num_draft_tokens(server_args)
+    if (max_draft_tokens or 0) > MAMBA2_REPLAYSSM_MAX_DRAFT_TOKENS:
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 supports at most "
+            f"{MAMBA2_REPLAYSSM_MAX_DRAFT_TOKENS} draft tokens, got "
+            f"{max_draft_tokens}."
+        )
+    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 requires "
+            "SGLANG_RAGGED_VERIFY_MODE=static."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 does not support "
+            "--enable-unified-memory yet."
+        )
+    if cfg.disaggregation_mode == "prefill":
+        raise ValueError(
+            "--enable-linear-replayssm-spec is not supported on a PD prefill server."
+        )
+    if cfg.enable_linear_replayssm:
+        raise ValueError(
+            "--enable-linear-replayssm-spec and --enable-linear-replayssm are "
+            "mutually exclusive."
+        )
 
 
 def handle_multi_item_scoring(server_args: Any):
