@@ -383,6 +383,7 @@ POSITIONAL_FIELD_ORDER = (
     "mm_feature_transport",
     "enable_lora",
     "enable_lora_overlap_loading",
+    "enable_lora_cpu_preparation",
     "max_lora_rank",
     "lora_target_modules",
     "lora_paths",
