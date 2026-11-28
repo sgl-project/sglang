@@ -2,7 +2,7 @@
 
 import os
 
-# Spawned interpreters inherit this marker before usercustomize runs.
+# Spawned interpreters inherit this marker before processing startup .pth files.
 os.environ["SGLANG_SIMULATOR_BOOTSTRAP"] = "1"
 
 import sglang_simulator.hook as sglang_simulator_hook
