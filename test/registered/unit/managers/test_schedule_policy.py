@@ -2,6 +2,7 @@ import unittest
 from array import array
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     CacheAgnosticPolicy,
@@ -29,6 +30,45 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
         sampling_params,
         **kwargs,
     )
+
+
+class TestInBatchPrefixMatching(CustomTestCase):
+    def test_only_full_prefixes_defer_within_the_same_namespace(self):
+        policy = SchedulePolicy(
+            "lpm", RadixCache.create_simulated(), False, False, False
+        )
+        reqs = [
+            _make_req("short", "", [1, 2]),
+            _make_req("leader", "", [1, 2, 3, 5]),
+            _make_req("other", "", [1, 2, 4]),
+            _make_req("salted", "", [1, 2, 3], cache_salt="salt"),
+            _make_req("adapter", "", [1, 2, 3], extra_key="adapter"),
+            _make_req("follower", "", [1, 2]),
+        ]
+        reqs[-1].output_ids.append(3)
+        threshold = (
+            "sglang.srt.managers.schedule_policy."
+            "IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD"
+        )
+        with patch(threshold, 3):
+            self.assertEqual(
+                policy._compute_prefix_matches(reqs, CacheAwarePolicy.LPM), {"follower"}
+            )
+            self.assertEqual(
+                policy._compute_prefix_matches(
+                    reqs[1:], CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+                ),
+                {"leader"},
+            )
+            with envs.SGLANG_RADIX_FORCE_MISS.override(True):
+                self.assertEqual(
+                    policy._compute_prefix_matches(reqs, CacheAwarePolicy.LPM), set()
+                )
+        with patch(threshold, 0):
+            self.assertEqual(
+                policy._compute_prefix_matches(reqs, CacheAwarePolicy.LPM),
+                {r.rid for r in reqs},
+            )
 
 
 class TestSchedulePolicyHRRN(CustomTestCase):
