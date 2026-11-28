@@ -27,7 +27,6 @@ from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
     adjacent_runs,
     check_drv,
-    exchange_posix_fds,
     export_shareable_handles,
     get_allocation_granularity,
     get_device_allocation_handle_type,
@@ -37,6 +36,7 @@ from sglang.srt.utils.cuda_vmm_utils import (
     map_chunk_into_span,
     release_mappings,
 )
+from sglang.srt.utils.vmm_common import exchange_posix_fds
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 

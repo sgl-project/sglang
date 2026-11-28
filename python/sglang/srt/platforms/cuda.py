@@ -90,6 +90,12 @@ class CudaDeviceMixin(DeviceMixin):
         else:
             del os.environ["CUDA_VISIBLE_DEVICES"]
 
+    def get_vmm_backend_class(self) -> type:
+        # lazy: vmm_backend imports sglang.srt.platforms
+        from sglang.srt.utils.vmm_backend import CudaVmmBackend
+
+        return CudaVmmBackend
+
     def get_torch_distributed_backend_str(self) -> str:
         return "nccl"
 

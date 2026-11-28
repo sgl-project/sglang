@@ -9,11 +9,11 @@ import torch
 from sglang.srt.utils.cuda_vmm_utils import (
     BumpArenaStub,
     VmmReservation,
-    align_up,
     allocation_handle_type_name,
     get_device_granularity,
     make_device_allocation_prop,
 )
+from sglang.srt.utils.vmm_common import align_up
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KvBufferDesc
