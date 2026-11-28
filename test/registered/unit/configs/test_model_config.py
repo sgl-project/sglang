@@ -1,5 +1,6 @@
 """Unit tests for model configuration."""
 
+import inspect
 import json
 import os
 import unittest
@@ -7,6 +8,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest import mock
 
+from torch import nn
 from transformers import (
     Cohere2Config,
     Gemma2Config,
@@ -19,6 +21,7 @@ from transformers import (
 from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.configs.model_config import (
     ModelConfig,
+    _score_and_pool_archs,
     get_hybrid_layer_ids,
     is_embedding_gemma,
     is_embedding_nemotron3,
@@ -40,7 +43,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 class TestHybridLayerIds(CustomTestCase):
@@ -513,6 +516,28 @@ class TestDefaultContextLength(CustomTestCase):
 
         self.assertEqual(derived(), 7 * MAX_PAGE_PROMPT_TOKENS + 6 * 8000 + 1024)
         self.assertEqual(derived(uocr_doc_split=False), 131072)
+
+
+class TestScoreAndPoolArchs(CustomTestCase):
+    def test_listed_archs_are_the_entry_classes_that_call_score_and_pool(self):
+        """Exactly the models that read token_indices_to_pool are listed."""
+        from sglang.srt.models.registry import ModelRegistry
+
+        callers = []
+        for arch in sorted(ModelRegistry.get_supported_archs()):
+            model_cls = ModelRegistry.resolve_model_cls(arch)[0]
+            # MiniCPMV is a plain class that wraps a version-specific module.
+            if not issubclass(model_cls, nn.Module):
+                continue
+            forward = inspect.unwrap(model_cls.forward)
+            if "score_and_pool" in forward.__code__.co_names:
+                callers.append(arch)
+        self.assertEqual(
+            sorted(_score_and_pool_archs),
+            callers,
+            "_score_and_pool_archs must list exactly the entry classes whose "
+            "forward calls score_and_pool",
+        )
 
 
 if __name__ == "__main__":

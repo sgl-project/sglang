@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context
@@ -95,6 +95,29 @@ class TestSamplingMaskValidation(CustomTestCase):
                     self.manager._validate_one_request(req, req.input_ids)
                 else:
                     with self.assertRaisesRegex(ValueError, "token_indices_to_pool"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
+    def test_token_indices_to_pool_requires_a_model_that_pools_per_position(self):
+        """Positions must not reach a model that pools one vector per request."""
+        self.manager.is_generation = False
+        for architecture, indices, accepted in (
+            ("Qwen3ForSequenceClassification", [0, 2], True),
+            ("BertModel", [0, 2], False),
+            ("BertModel", None, True),
+        ):
+            with self.subTest(architecture=architecture, indices=indices):
+                self.manager.model_config.hf_config = SimpleNamespace(
+                    architectures=[architecture]
+                )
+                req = EmbeddingReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params={"max_new_tokens": 0},
+                    token_indices_to_pool=indices,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "pools per position"):
                         self.manager._validate_one_request(req, req.input_ids)
 
     def test_logprob_start_len_must_be_at_least_minus_one(self):

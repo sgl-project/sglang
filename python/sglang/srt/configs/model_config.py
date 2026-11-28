@@ -2925,12 +2925,13 @@ def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
     return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
 
 
-# SequenceClassification models whose forward routes the head through
-# score_and_pool (per-position pooling); only these support setwise readout
-# (token_indices_to_pool). Keep in sync with callers of layers.pooler.score_and_pool.
+# Models whose forward routes the head through score_and_pool (per-position pooling);
+# only these support setwise readout (token_indices_to_pool).
+# Keep in sync with callers of layers.pooler.score_and_pool.
 _score_and_pool_archs = [
-    "LlamaForSequenceClassification",
+    "LlamaForClassification",
     "Qwen2ForSequenceClassification",
+    "Qwen3ForRewardModel",
     "Qwen3ForSequenceClassification",
 ]
 
