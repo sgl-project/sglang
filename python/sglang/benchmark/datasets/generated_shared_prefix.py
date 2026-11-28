@@ -289,6 +289,7 @@ def sample_generated_shared_prefix_requests(
     input_requests = []
     total_input_tokens = 0
     total_output_tokens = 0
+    prefix_only_turns: dict[int, tuple[str, int]] = {}
     for slot_idx, sampled_g in enumerate(
         tqdm(assignment, desc="Generating shared-prefix prompts")
     ):
@@ -304,19 +305,21 @@ def sample_generated_shared_prefix_requests(
             else None
         )
         turn_questions = questions[src_g][src_p]
+        first_question = turn_questions[0]
         if input_ids:
-            turn_prompts = [system_prompt + turn_questions[0]]
+            first_turn = system_prompt + first_question
+            prompt_len = len(first_turn)
+        elif not first_question and sampled_g in prefix_only_turns:
+            first_turn, prompt_len = prefix_only_turns[sampled_g]
         else:
-            turn_prompts = [f"{system_prompt}\n\n{turn_questions[0]}"] + turn_questions[
-                1:
-            ]
-        full_prompt = turn_prompts[0] if num_turns == 1 else turn_prompts
-        if input_ids:
-            prompt_len = len(turn_prompts[0])
-        elif fast_prepare:
-            prompt_len = 1
-        else:
-            prompt_len = len(tokenizer.encode(turn_prompts[0]))
+            first_turn = f"{system_prompt}\n\n{first_question}"
+            prompt_len = 1 if fast_prepare else len(tokenizer.encode(first_turn))
+            if not first_question:
+                prefix_only_turns[sampled_g] = (first_turn, prompt_len)
+
+        full_prompt = (
+            first_turn if num_turns == 1 else [first_turn, *turn_questions[1:]]
+        )
         output_len_val = int(output_lens[src_g, src_p])
 
         input_requests.append(

@@ -1180,6 +1180,31 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows_a), 3 * 4)
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
+    def test_gsp_prefix_only_text_encodes_once_per_sampled_group(self):
+        with patch.object(
+            self.tokenizer, "encode", wraps=self.tokenizer.encode
+        ) as encode:
+            rows = self._run_gsp(
+                mode="zipf",
+                alpha=1.0,
+                question_len=0,
+                num_turns=2,
+                fast_prepare=False,
+            )
+
+        first_turns = [row.prompt[0] for row in rows]
+        expected = set(first_turns)
+        self.assertGreater(len(expected), 1)
+        self.assertLess(len(expected), len(rows))
+        self.assertTrue(all(turn.endswith("\n\n") for turn in expected))
+        encoded = [call.args[0] for call in encode.call_args_list]
+        self.assertCountEqual((text for text in encoded if text in expected), expected)
+        self.assertEqual(len({id(turn) for turn in first_turns}), len(expected))
+        self.assertEqual(len({id(row.prompt) for row in rows}), len(rows))
+        for row in rows:
+            self.assertEqual(row.prompt[1], "")
+            self.assertEqual(row.prompt_len, len(self.tokenizer.encode(row.prompt[0])))
+
     def test_gsp_default_ignores_legacy_fast_cache(self):
         common = dict(num_groups=3, prompts_per_group=4, seed=7)
         fast_rows = self._run_gsp(ordered=False, fast_prepare=True, **common)
