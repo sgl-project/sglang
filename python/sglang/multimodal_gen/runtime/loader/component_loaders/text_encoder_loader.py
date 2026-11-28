@@ -9,6 +9,9 @@ from transformers import AutoConfig, PretrainedConfig
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig
+from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
+    MiniMaxH3Qwen3VLConfig,
+)
 from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImageEditPipelineConfig,
@@ -729,9 +732,22 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             model_config.honor_cache_free_padding_mask = isinstance(
                 server_args.pipeline_config, LongCatImagePipelineConfig
             )
-            model = initialize_model(
-                model_cls, {"config": model_config}, param_dtype, model_device
+            keep_mapping = component_starts_on_cpu and (
+                current_platform.is_mps()
+                or keep_checkpoint_mapped(
+                    weight_bytes=checkpoint_bytes(model_path), component=component_name
+                )
             )
+            init_params = {"config": model_config}
+            if (
+                isinstance(model_config, MiniMaxH3Qwen3VLConfig)
+                and keep_mapping
+                and quant_config is None
+                and encoder_tp_group.world_size == 1
+                and current_platform.is_cuda()
+            ):
+                init_params["map_text_layers"] = True
+            model = initialize_model(model_cls, init_params, param_dtype, model_device)
             if component_starts_on_cpu and isinstance(model_config, Qwen3TextConfig):
                 _build_rope_caches_on(model, local_torch_device)
 
@@ -751,12 +767,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
                     model, component_name, quant_config=quant_config
                 )
 
-            if component_starts_on_cpu and (
-                current_platform.is_mps()
-                or keep_checkpoint_mapped(
-                    weight_bytes=checkpoint_bytes(model_path), component=component_name
-                )
-            ):
+            if keep_mapping:
                 model._keep_checkpoint_mapping = True
 
             weights_to_load = {name for name, _ in model.named_parameters()}

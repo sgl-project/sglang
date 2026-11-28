@@ -511,12 +511,25 @@ def srt_text_param_name(params: dict, name: str) -> tuple[str, object]:
     return f"{module}.{projection}.{leaf}", None
 
 
-def load_srt_text_weight(params: dict, name: str, loaded_weight: torch.Tensor) -> str:
+def load_srt_text_weight(
+    params: dict, name: str, loaded_weight: torch.Tensor, *, keep_mapping: bool = False
+) -> str:
     """Load a checkpoint tensor of the language model into srt's fused
     projections (or the diffusion layers inside a quantized one); return the
     name of the parameter it filled."""
     target, shard_id = srt_text_param_name(params, name)
     param = params[target]
+    # The host-constrained single-rank H3 path keeps one dense parameter per
+    # checkpoint projection so every streamed layer can retain its file views.
+    if (
+        keep_mapping
+        and shard_id is None
+        and param.device.type == loaded_weight.device.type == "cpu"
+        and param.shape == loaded_weight.shape
+        and param.dtype == loaded_weight.dtype
+    ):
+        param.data = loaded_weight
+        return target
     weight_loader = getattr(param, "weight_loader", default_weight_loader)
     loaded_weight = loaded_weight.to(param.dtype)
     if shard_id is None:

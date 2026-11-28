@@ -272,7 +272,9 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             and not _is_unconsumed_checkpoint_weight(name, self.selected_lm_layer)
         )
 
-    def __init__(self, config: MiniMaxH3Qwen3VLConfig) -> None:
+    def __init__(
+        self, config: MiniMaxH3Qwen3VLConfig, *, map_text_layers: bool = False
+    ) -> None:
         super().__init__(config)
         arch = config.arch_config
         selected_layer = int(arch.text_config.num_hidden_layers)
@@ -281,8 +283,12 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 "MiniMax H3 Qwen3-VL language-layer configuration is "
                 f"inconsistent: {selected_layer} vs {int(arch.num_hidden_layers)}"
             )
+        self.map_text_layers = map_text_layers
         self.model = Qwen3VLModel(
-            arch, quant_config=config.quant_config, prefix="model"
+            arch,
+            quant_config=config.quant_config,
+            prefix="model",
+            separate_text_projections=map_text_layers,
         )
         # H3 and ClipProj consume an unnormalized intermediate residual stream.
         self.model.language_model.drop_final_norm()
@@ -433,7 +439,15 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             if not self.should_materialize_checkpoint_weight(name):
                 continue
             if name.startswith("model.language_model."):
-                loaded.add(load_srt_text_weight(params, name, loaded_weight))
+                loaded.add(
+                    load_srt_text_weight(
+                        params,
+                        name,
+                        loaded_weight,
+                        keep_mapping=self.map_text_layers
+                        and name.startswith("model.language_model.layers."),
+                    )
+                )
                 continue
             param_name = name
             param = params.get(param_name)

@@ -52,6 +52,7 @@ class Qwen3VLModel(QwenVLModelBase):
         *,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        separate_text_projections: bool = False,
     ):
         super().__init__()
         vision_quant_config = (
@@ -69,6 +70,7 @@ class Qwen3VLModel(QwenVLModelBase):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
             deepstack_visual_indexes=config.vision_config.deepstack_visual_indexes,
+            replicate_projections=separate_text_projections,
         )
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config

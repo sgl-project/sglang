@@ -584,12 +584,19 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
         )
 
     def test_comfy_language_checkpoint_name_maps_to_native_namespace(self):
+        self._check_language_checkpoint(map_text_layers=False)
+
+    def test_host_constrained_dense_language_weight_keeps_checkpoint_storage(self):
+        self._check_language_checkpoint(map_text_layers=True)
+
+    def _check_language_checkpoint(self, *, map_text_layers):
         encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
         torch.nn.Module.__init__(encoder)
         encoder.selected_lm_layer = 50
         encoder.model = torch.nn.Module()
         encoder.model.language_model = torch.nn.Module()
-        # srt's fused q/k/v projection, holding a quantized checkpoint's
+        encoder.map_text_layers = map_text_layers
+        # srt's fused q/k/v projection, holding the checkpoint's
         # q_proj as a layer of its own
         layer = torch.nn.Module()
         layer.self_attn = torch.nn.Module()
@@ -605,6 +612,10 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
         target_name = "model.language_model.layers.0.self_attn.qkv_proj.q_proj.weight"
         self.assertEqual(loaded, {target_name})
         torch.testing.assert_close(layer.self_attn.qkv_proj.q_proj.weight, source)
+        self.assertEqual(
+            layer.self_attn.qkv_proj.q_proj.weight.data_ptr() == source.data_ptr(),
+            map_text_layers,
+        )
 
 
 class TestMiniMaxH3ConditioningProjection(unittest.TestCase):

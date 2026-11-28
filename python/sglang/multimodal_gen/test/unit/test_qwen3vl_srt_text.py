@@ -240,6 +240,12 @@ def test_projection_layouts_match_reference(case):
 
 @single_rank
 @pytest.mark.usefixtures("srt_runtime")
+def test_dense_checkpoint_projections_match_reference():
+    _check(replicate_projections=True)
+
+
+@single_rank
+@pytest.mark.usefixtures("srt_runtime")
 def test_fp32_matches_reference():
     _check(tolerance=1e-4, dtype=torch.float32)
 
