@@ -226,8 +226,9 @@ class GenerationBatchResult:
 
     @property
     def has_sampled_token_ids(self) -> bool:
-        """True when this iter sampled token ids; False when none were produced
-        this rank/split (a non-last PP rank or a non-final prefill split)."""
+        """True when this iter produced next tokens (sampled, or a beam placeholder);
+        False when none were produced this rank/split (a non-last PP rank or a
+        non-final prefill split)."""
         return isinstance(self.next_token_ids, torch.Tensor)
 
     def get_num_generated_tokens(self, batch_size: int) -> int:

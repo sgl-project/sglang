@@ -81,6 +81,7 @@ except ImportError:
     initialize_mamba_selective_state_update_backend = None
 import traceback
 
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -5917,6 +5918,12 @@ class Scheduler(
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
                 self.future_map.stash(future_indices, payload)
+            return
+        if is_beam_only_batch(batch):
+            # Nothing was sampled; the coordinator relays every row.
+            self.beam_coordinator.maybe_select_and_relay(
+                batch, batch_result, chunked_req=self.chunked_req
+            )
             return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
