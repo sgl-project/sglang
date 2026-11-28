@@ -79,7 +79,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
-from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.common import (
+    match_kv_cache,
+    prefill_load_tokens,
+    touch_waiting_prefix,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
@@ -709,9 +713,20 @@ class SchedulePolicy:
     def _update_shortest_prefill_load(
         self, waiting_queue: List[Req], chunked_req: Optional[Req]
     ) -> None:
-        # The backlog uses the work the sort uses, so every TP rank computes the
-        # same boundary and budget.
-        backlog = sum(self._shortest_prefill_work(r) for r in waiting_queue)
+        # The backlog is the load /v1/loads reports, not the sort work: it also
+        # leaves out a confirmed storage hit whose prefetch is still in flight.
+        # The sort keeps it, since the request cannot be admitted before the
+        # prefetch lands and a lower rank would only reserve chunk room it cannot
+        # use. The match and the storage spans change at rank-agreed points, so
+        # every TP rank computes the same boundary and budget.
+        backlog = sum(
+            prefill_load_tokens(
+                r.seqlen,
+                r.num_matched_prefix_tokens,
+                self.tree_cache.waiting_storage_span(r.cache_request_handle),
+            )
+            for r in waiting_queue
+        )
         if chunked_req is not None:
             backlog += max(
                 0, len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
