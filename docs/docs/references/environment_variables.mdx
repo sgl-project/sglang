@@ -694,8 +694,8 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
 <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Configure the custom memory pool type for Mooncake. Supports <code>NVLINK</code>, <code>BAREX</code>, <code>INTRA_NODE_NVLINK</code>. If set to <code>true</code>, it defaults to <code>NVLINK</code>.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_CUSTOM_MEM_POOL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Allocate the KV cache from a custom memory pool for PD disaggregation, with either the Mooncake or the NIXL transfer backend. Supports <code>NVLINK</code> (cuMemCreate fabric memory for MNNVL), <code>BAREX</code> and <code>INTRA_NODE_NVLINK</code> (Mooncake only). If set to <code>true</code>, it defaults to <code>NVLINK</code>. <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code> is a deprecated alias.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
     </tr>
 </tbody>
@@ -988,7 +988,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, allocate the prefix gather scratch of single-node shard groups with PyTorch symmetric memory and run the all-gather on copy engines (zero SMs) through its CUDA multicast mapping, in chunks that a foreground NVLink transfer pause can stop. GPUs without multicast, <code>--enable-memory-saver</code>, and <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code> keep the NCCL all-gather. Set to <code>false</code> to keep the NCCL all-gather.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, allocate the prefix gather scratch of single-node shard groups with PyTorch symmetric memory and run the all-gather on copy engines (zero SMs) through its CUDA multicast mapping, in chunks that a foreground NVLink transfer pause can stop. GPUs without multicast, <code>--enable-memory-saver</code>, and <code>SGLANG_CUSTOM_MEM_POOL</code> keep the NCCL all-gather. Set to <code>false</code> to keep the NCCL all-gather.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
   </tbody>
