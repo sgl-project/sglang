@@ -46,3 +46,23 @@ def maybe_publish_prefill_shared_read_done(
     read_done = device_module.Event()
     read_done.record()
     model_runner.shared_read_done_event = read_done
+
+
+def refresh_shared_read_done_event(model_runner, device_module=None) -> None:
+    """Re-record ``shared_read_done_event`` after post-replay shared-pool reads."""
+    if getattr(model_runner, "shared_read_done_event", None) is None:
+        return
+    if device_module is None:
+        device_module = getattr(model_runner, "device_module", None)
+    if device_module is None:
+        device_module = getattr(
+            getattr(model_runner, "decode_cuda_graph_runner", None),
+            "device_module",
+            None,
+        )
+    if device_module is None:
+        device_module = torch.get_device_module(model_runner.device)
+    read_done = device_module.Event()
+    read_done.record()
+    model_runner.shared_read_done_event = read_done
+
