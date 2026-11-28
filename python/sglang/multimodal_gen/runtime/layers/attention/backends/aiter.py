@@ -445,6 +445,8 @@ class AITerImpl(AttentionImpl):
     Implementation of attention using AITemplate.
     """
 
+    accepts_strided_qkv = True
+
     def __init__(
         self,
         num_heads: int,
