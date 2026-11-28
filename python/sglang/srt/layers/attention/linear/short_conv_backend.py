@@ -75,6 +75,8 @@ class ShortConvMetadata(NamedTuple):
     slot_ids_cpu: Optional[List[int]] = None
     # Host mirror of has_initial_state for extend host loops. None on decode.
     has_prefix_cpu: Optional[List[bool]] = None
+    # Stable request-pool rows for speculative scratch, not persistent slots.
+    req_pool_indices: Optional[torch.Tensor] = None
 
 
 class ShortConvAttnBackend(MambaAttnBackendBase):
@@ -196,8 +198,8 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
 
         The per-step fields are already resolved on ``self.forward_metadata`` /
         ``self._*`` (in ``init_forward_metadata`` / ``_out_graph``);
-        ``forward_batch`` is accepted for interface parity with the unit-test
-        mock and is not otherwise required here.
+        ``forward_batch`` supplies the request-pool rows for speculative scratch;
+        these are independent of the persistent state slots.
         """
         layer_cache = self.state_layer_cache(layer_id)
         md = self.forward_metadata
@@ -213,6 +215,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             has_initial_state=self._has_initial_state,
             slot_ids_cpu=self._slot_ids_cpu,
             has_prefix_cpu=self._has_prefix_cpu,
+            req_pool_indices=forward_batch.req_pool_indices,
         )
 
     # The short-conv layers are invoked via conv_state_metadata + the model's own
