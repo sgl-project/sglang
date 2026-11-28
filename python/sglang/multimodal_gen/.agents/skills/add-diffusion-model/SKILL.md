@@ -176,18 +176,16 @@ supply, use server mode.
 Do this only after eager output matches the reference. A forward that captures
 once is not enough.
 
-`--enable-breakable-cuda-graph` runs on any model. The lists below record the
-validated checkpoints; a model outside them stays enabled and logs
-`[Diffusion BCG] not validated`. Marking a model validated has three parts:
+`--enable-breakable-cuda-graph` runs on any model. The table below records the
+validated checkpoints; a model outside it stays enabled and logs
+`[Diffusion BCG] not validated`. Marking a model validated has two parts:
 
-1. the resolved pipeline config class in
-   `BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS`
-   (`runtime/server_args/server_args.py`)
-2. the model IDs and safe basename aliases in
-   `BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS` (same file); a config selected
-   only by `--pipeline-class-name` goes in
-   `BREAKABLE_CUDA_GRAPH_MODEL_ID_EXEMPT_PIPELINE_CONFIGS` instead
-3. a prompt padder under `runtime/breakable_cuda_graph/model_padders/`, added
+1. an entry in `BCG_VALIDATED_CHECKPOINTS`
+   (`runtime/server_args/server_args.py`): the resolved pipeline config class
+   mapped to the lowercase repo names of its checkpoints, without the
+   organization; a config selected only by `--pipeline-class-name` maps to
+   `None`
+2. a prompt padder under `runtime/breakable_cuda_graph/model_padders/`, added
    to the imports in `_ensure_model_padders_registered`
    (`runtime/breakable_cuda_graph/prompt_padding.py`); a padder module that is
    not imported there never registers

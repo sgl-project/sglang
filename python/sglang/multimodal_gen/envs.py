@@ -61,6 +61,8 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     SGLANG_DIFFUSION_WAN_TEXT_PADDING: str = "max"
+    SGLANG_DIFFUSION_BCG_MAX_ENTRIES: int = 32
+    SGLANG_DIFFUSION_BCG_MAX_SEGMENTS: int = 512
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
     # the resolver below -- that is the value the runtime reads.
@@ -274,6 +276,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # For image generation task depends on image quality and the model config
     "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE": _lazy_int(
         "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4
+    ),
+    # Breakable CUDA graph limits per runner; 0 lifts the limit. Past the entry
+    # limit the oldest captured graph is evicted.
+    "SGLANG_DIFFUSION_BCG_MAX_ENTRIES": _lazy_int(
+        "SGLANG_DIFFUSION_BCG_MAX_ENTRIES", 32
+    ),
+    # A capture with more segments disables its runner. LTX-2 captures ~289:
+    # 48 dual-tower blocks with 6 attention break points each.
+    "SGLANG_DIFFUSION_BCG_MAX_SEGMENTS": _lazy_int(
+        "SGLANG_DIFFUSION_BCG_MAX_SEGMENTS", 512
     ),
     # Drop the SP tail-pad attention mask and run dense (unmasked) attention on
     # the padded layout, instead of the packed-varlen path. Applies only when

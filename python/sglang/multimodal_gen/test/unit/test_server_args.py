@@ -1286,16 +1286,23 @@ class TestWarmupModeNormalization(unittest.TestCase):
                 self.assertIn("not validated", warning.call_args[0][0])
 
     def test_bcg_does_not_warn_for_a_validated_model(self):
-        sa = ServerArgs.__new__(ServerArgs)
-        sa.model_path = "black-forest-labs/FLUX.1-dev"
-        sa.model_id = None
-        sa.pipeline_config = FluxPipelineConfig()
-        sa.enable_breakable_cuda_graph = True
-        sa.warmup_resolutions = ["1024x1024"]
-        with patch.object(server_args_module.logger, "warning") as warning:
-            sa._adjust_breakable_cuda_graph_support()
-        self.assertTrue(sa.enable_breakable_cuda_graph)
-        warning.assert_not_called()
+        # LTX-2.5 resolves its own config, and a local copy keeps only the repo name.
+        for model_path, config in (
+            ("black-forest-labs/FLUX.1-dev", FluxPipelineConfig()),
+            ("Lightricks/LTX-2.5-Diffusers", LTX25PipelineConfig()),
+            ("/models/LongCat-Image", LongCatImagePipelineConfig()),
+        ):
+            with self.subTest(model_path=model_path):
+                sa = ServerArgs.__new__(ServerArgs)
+                sa.model_path = model_path
+                sa.model_id = None
+                sa.pipeline_config = config
+                sa.enable_breakable_cuda_graph = True
+                sa.warmup_resolutions = ["1024x1024"]
+                with patch.object(server_args_module.logger, "warning") as warning:
+                    sa._adjust_breakable_cuda_graph_support()
+                self.assertTrue(sa.enable_breakable_cuda_graph)
+                warning.assert_not_called()
 
     def test_disagg_role_disables_server_warmup(self):
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType

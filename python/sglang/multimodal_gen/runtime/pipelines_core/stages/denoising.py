@@ -54,6 +54,9 @@ from sglang.multimodal_gen.configs.task_type import ModelTaskType, get_request_t
 from sglang.multimodal_gen.runtime.breakable_cuda_graph import (
     prompt_padding as bcg_utils,
 )
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+    in_warmup_forward,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     cache_dit_overrides_key,
@@ -2670,19 +2673,6 @@ class DenoisingStage(PipelineStage):
             model_output = current_model(**call_kwargs)
         return _ensure_tensor_model_output(model_output)
 
-    @staticmethod
-    def _bcg_is_warmup() -> bool:
-        """True when the current forward is a warmup request."""
-        from sglang.multimodal_gen.runtime.managers.forward_context import (
-            get_forward_context,
-        )
-
-        try:
-            forward_batch = get_forward_context().forward_batch
-        except Exception:
-            return False
-        return bool(getattr(forward_batch, "is_warmup", False))
-
     def _bcg_run(self, runner, call_kwargs: dict, current_model):
         """Run the DiT through the BCG runner.
 
@@ -2692,7 +2682,7 @@ class DenoisingStage(PipelineStage):
         captured. Serving just replays (or runs eager for an uncaptured
         signature, never capturing).
         """
-        if self._bcg_is_warmup():
+        if in_warmup_forward():
             for bucket in self._bcg_text_buckets():
                 runner.capture(
                     **self._bcg_pad_prompt_kwargs(

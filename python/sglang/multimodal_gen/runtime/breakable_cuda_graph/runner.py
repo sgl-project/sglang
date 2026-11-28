@@ -30,13 +30,13 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     replay_token_scope,
 )
@@ -53,15 +53,16 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 logger = logging.getLogger(__name__)
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
+def in_warmup_forward() -> bool:
     try:
-        return int(raw)
-    except ValueError:
-        logger.warning("[BCG] ignoring invalid integer %s=%r", name, raw)
-        return default
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        forward_batch = get_forward_context().forward_batch
+    except Exception:
+        return False
+    return bool(getattr(forward_batch, "is_warmup", False))
 
 
 def _map_tensors(obj, fn):
@@ -191,26 +192,6 @@ def _signature_summary(key: tuple) -> tuple:
     )
 
 
-def _clone_output(out: Any) -> Any:
-    if torch.is_tensor(out):
-        return out.clone()
-    if isinstance(out, tuple):
-        return tuple(_clone_output(o) for o in out)
-    if isinstance(out, list):
-        return [_clone_output(o) for o in out]
-    if isinstance(out, dict):
-        return {k: _clone_output(v) for k, v in out.items()}
-    if is_dataclass(out) and not isinstance(out, type):
-        return replace(
-            out,
-            **{
-                field.name: _clone_output(getattr(out, field.name))
-                for field in fields(out)
-            },
-        )
-    return out
-
-
 @dataclass
 class _CaptureEntry:
     graph: BreakableCUDAGraph
@@ -249,6 +230,7 @@ class BaseBreakableCudaGraphRunner:
 
     # Graphs captured in this process across all runners; read after warmup.
     num_captures: ClassVar[int] = 0
+    _miss_logged = False
 
     def __init__(
         self,
@@ -269,11 +251,8 @@ class BaseBreakableCudaGraphRunner:
         # Signatures we have given up capturing (capture raised); run eager.
         self._blocked: set[tuple] = set()
         self._disabled_reason: str | None = None
-        self.max_entries = max(0, _env_int("SGLANG_DIFFUSION_BCG_MAX_ENTRIES", 32))
-        # LTX-2 dual-tower blocks carry 6 attention break points each
-        # (video/audio self, video/audio prompt-cross, a2v, v2a), so 48 blocks
-        # capture ~289 segments; keep headroom above that.
-        self.max_segments = max(0, _env_int("SGLANG_DIFFUSION_BCG_MAX_SEGMENTS", 512))
+        self.max_entries = max(0, envs.SGLANG_DIFFUSION_BCG_MAX_ENTRIES)
+        self.max_segments = max(0, envs.SGLANG_DIFFUSION_BCG_MAX_SEGMENTS)
 
     def __getattr__(self, name: str) -> Any:
         # Only reached for attributes the runner itself does not define; proxy
@@ -352,7 +331,7 @@ class BaseBreakableCudaGraphRunner:
 
     def _log_signature_miss(self, key: tuple) -> None:
         """One-shot diagnostic: serving signature missed every captured graph."""
-        if getattr(self, "_miss_logged", False) or not self.entries:
+        if self._miss_logged or not self.entries:
             return
         self._miss_logged = True
         key_d = dict(key)
@@ -450,7 +429,7 @@ class BaseBreakableCudaGraphRunner:
         # Clone so the caller can hold the result across the next replay / the
         # other CFG branch (which shares this static output buffer when shapes
         # match). The clone is one cheap DtoD copy relative to the full DiT.
-        return _clone_output(entry.output)
+        return _map_tensors(entry.output, torch.Tensor.clone)
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -620,12 +599,4 @@ class DiffusionBreakableCudaGraphRunner(BaseBreakableCudaGraphRunner):
     """
 
     def _should_capture_on_call(self, key) -> bool:
-        try:
-            from sglang.multimodal_gen.runtime.managers.forward_context import (
-                get_forward_context,
-            )
-
-            forward_batch = get_forward_context().forward_batch
-        except Exception:
-            return False
-        return bool(getattr(forward_batch, "is_warmup", False))
+        return in_warmup_forward()
