@@ -14,6 +14,17 @@ SGLang uses the MUSA runtime through
 runtime Python stack from the Moore Threads package index, with public PyPI as
 the fallback for common Python dependencies.
 
+## Model coverage
+
+For MTT S5000, Moore Threads lists the supported model variants, precisions,
+and any model-specific version requirements in its
+[SGLang-MUSA compatibility matrix (in Chinese)](https://docs.mthreads.com/sglang-musa/sglang-musa-doc-online/compatibility/).
+For example, it lists Qwen3-8B in BF16 and FP8. To select a container image
+for your model and host CPU, see the [SGLang-MUSA release notes (in Chinese)](https://docs.mthreads.com/sglang-musa/sglang-musa-doc-online/releasenotes/).
+
+Upstream SGLang uses `deepseek-ai/DeepSeek-V2-Lite-Chat` by default in its
+[single-GPU MUSA serving smoke test](https://github.com/sgl-project/sglang/blob/main/test/registered/musa/test_llm_server_smoke_musa.py).
+
 ## Prerequisites
 
 Install the Moore Threads driver and MUSA toolkit before installing SGLang. For
