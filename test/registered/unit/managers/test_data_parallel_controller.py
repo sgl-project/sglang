@@ -4,7 +4,7 @@ The e2e counterpart, over the real scheduler load-report path, is
 test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
 Fragility: scheduler tests bypass `DataParallelController.__init__` via `__new__` and
-inject only the attrs the schedulers read (`workers`, `_active_workers`,
+inject only the attrs the schedulers read (`workers`, `_active_workers`, `_draining_slots`,
 `round_robin_counter`, `dp_budget`). `status` / `dp_active` / `max_dp_size` are for
 `update_active_ranks`. Update `_make_controller` if a scheduler starts reading another
 attr. `maybe_external_dp_rank_routing` is exercised as the real method, no mock. The
@@ -13,11 +13,12 @@ those. The abort-route test also sets `control_message_step` and builds the real
 dispatch table with `init_dispatcher`.
 """
 
+import importlib
 import threading
 import time
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
@@ -31,6 +32,7 @@ from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
+    DPRoutingUnavailable,
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
@@ -87,6 +89,7 @@ def _make_controller(
     ctl.status = list(ctl.dp_active)
     ctl._active_workers = list(range(num_dp_ranks))
     ctl._active_count_cache = num_dp_ranks
+    ctl._draining_slots = set()
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
@@ -121,7 +124,9 @@ class TestJoinerWorkerPortAdmission(CustomTestCase):
         controller = DataParallelController.__new__(DataParallelController)
         controller._receive_ports_as_client = MagicMock(return_value=handshake)
         controller.launch_tensor_parallel_group = launch
-        execution = SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=True))
+        execution = SimpleNamespace(
+            moe=SimpleNamespace(is_ep_scale_joiner=True, is_ep_offset_joiner=True)
+        )
 
         with (
             patch(
@@ -204,6 +209,7 @@ class TestLocalKvEventSources(CustomTestCase):
         component = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.max_total_num_tokens = 64
+        scheduler.max_req_len = 38
         scheduler.max_req_input_len = 32
         scheduler.startup_time = {}
         scheduler.page_size = 64
@@ -244,6 +250,7 @@ class TestLocalKvEventSources(CustomTestCase):
                 recv=MagicMock(
                     return_value={
                         "max_total_num_tokens": 64,
+                        "max_req_len": 38,
                         "max_req_input_len": 32,
                         "kv_event_sources": sources,
                     }
@@ -281,6 +288,93 @@ class TestLocalKvEventSources(CustomTestCase):
         )
 
 
+class TestRayAttentionDpPortArgs(CustomTestCase):
+    def test_scheduler_actors_share_the_launcher_instance_id(self):
+        """Under DP attention every scheduler actor derives its own PortArgs but must
+        keep the launcher's instance_id, which names the load-snapshot SHM file and
+        the drain notification; this holds for both placement-group branches."""
+        ray = ModuleType("ray")
+        ray.remote = lambda cls: cls
+        ray.get = lambda refs: []
+        placement = ModuleType("ray.util.placement_group")
+        placement.PlacementGroup = object
+        strategies = ModuleType("ray.util.scheduling_strategies")
+        strategies.PlacementGroupSchedulingStrategy = object
+        stubs = {
+            "ray": ray,
+            "ray.util": ModuleType("ray.util"),
+            "ray.util.placement_group": placement,
+            "ray.util.scheduling_strategies": strategies,
+        }
+        parallel = SimpleNamespace(
+            nnodes=1,
+            attn_dp_enabled=True,
+            tp_size=2,
+            pp_size=1,
+            attn_dp_size=2,
+            attn_cp_size=1,
+        )
+        launcher_port_args = SimpleNamespace(
+            nccl_port=1234,
+            instance_id="launcher",
+            detokenizer_ipc_name="detokenizer",
+            tokenizer_ipc_name="tokenizer",
+        )
+        srt_package = importlib.import_module("sglang.srt")
+        with patch.dict("sys.modules", stubs), patch.dict(vars(srt_package)):
+            ray_dp = importlib.import_module("sglang.srt.ray.data_parallel_controller")
+            for is_custom_pg in (False, True):
+                with self.subTest(is_custom_pg=is_custom_pg):
+                    controller = ray_dp.RayDataParallelController.__new__(
+                        ray_dp.RayDataParallelController
+                    )
+                    controller.scheduler_actors = []
+                    controller.event_loop_refs = []
+                    controller.is_custom_pg = is_custom_pg
+                    controller.bundle_for_node = [0]
+                    controller.rank0_node_ip = "127.0.0.1"
+                    controller.pg = object()
+                    # Like the real init_new, each call mints a new instance_id.
+                    rank_port_args = [
+                        SimpleNamespace(instance_id=f"rank-{i}") for i in range(2)
+                    ]
+                    actor_port_args = []
+
+                    def create_actor(**kwargs):
+                        actor_port_args.append(kwargs["port_args"])
+                        remote = SimpleNamespace(remote=lambda: None)
+                        return SimpleNamespace(get_info=remote, run_event_loop=remote)
+
+                    with (
+                        patch.object(ray_dp, "get_parallel", return_value=parallel),
+                        patch.object(
+                            ray_dp,
+                            "_calculate_rank_ranges",
+                            return_value=(range(1), range(2), 1, 2),
+                        ),
+                        patch.object(ray_dp, "_compute_world_size", return_value=2),
+                        patch.object(
+                            ray_dp, "_resolve_bundle_indices", return_value=[0, 1]
+                        ),
+                        patch.object(
+                            ray_dp.PortArgs, "init_new", side_effect=rank_port_args
+                        ),
+                        patch.object(
+                            ray_dp, "_create_scheduler_actor", side_effect=create_actor
+                        ),
+                    ):
+                        controller._launch_ray_tp_group(
+                            SimpleNamespace(),
+                            launcher_port_args,
+                            dp_rank=None,
+                            worker_ports=[7000, 7001],
+                        )
+                    self.assertEqual(
+                        [args.instance_id for args in actor_port_args],
+                        ["launcher", "launcher"],
+                    )
+
+
 class TestInitInfoReply(CustomTestCase):
     @staticmethod
     def _reply(*scheduler_infos):
@@ -292,7 +386,7 @@ class TestInitInfoReply(CustomTestCase):
 
     def test_router_l3_layout_is_forwarded_only_when_a_scheduler_reports_it(self):
         """The reply holds only the keys the controller names, so it must name this one."""
-        info = {"max_total_num_tokens": 64, "max_req_input_len": 32}
+        info = {"max_total_num_tokens": 64, "max_req_len": 38, "max_req_input_len": 32}
         reporting = {**info, "router_l3_layout": "layout-a"}
         self.assertEqual(
             self._reply(reporting, reporting)["router_l3_layout"], "layout-a"
@@ -443,6 +537,23 @@ class TestDispatchingWithTrace(CustomTestCase):
                     [call(req, refresh_load_budget=False) for req in reqs],
                 )
 
+    def test_batch_aborts_only_the_unroutable_item(self):
+        """The batch itself has no rid, so aborting it would leave every item hanging."""
+        for dispatch in ("dispatch_batch_generate", "dispatch_batch_embedding"):
+            with self.subTest(dispatch=dispatch):
+                ctl = self._make_traced_controller()
+                reqs = [_req(rid=rid) for rid in ("a", "b", "c")]
+                ctl.dispatching_with_trace = MagicMock(
+                    side_effect=[None, DPRoutingUnavailable("retired"), None]
+                )
+                ctl._abort_undispatchable = MagicMock()
+                getattr(ctl, dispatch)(reqs)
+                self.assertEqual(ctl.dispatching_with_trace.call_count, 3)
+                self.assertEqual(
+                    ctl._abort_undispatchable.call_args_list,
+                    [call(reqs[1], "retired")],
+                )
+
 
 class TestHealthCheckScheduler(CustomTestCase):
     def test_health_and_user_round_robin_state_are_independent(self):
@@ -499,10 +610,14 @@ class TestFollowBootstrapRoomScheduler(CustomTestCase):
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=room))
             ctl.workers[expected_rank].send_pyobj.assert_called()
 
-    def test_requires_bootstrap_room(self):
+    def test_room_less_request_is_placed_round_robin(self):
+        """A room-less request (Rust frontend, sent straight to a PD server) is
+        placed for the scheduler to answer or reject, not asserted on."""
         ctl = _make_controller(num_dp_ranks=4)
-        with self.assertRaises(AssertionError):
+        for _ in range(4):
             ctl.follow_bootstrap_room_scheduler(_req(bootstrap_room=None))
+        for worker in ctl.workers:
+            worker.send_pyobj.assert_called_once()
 
     def test_routed_dp_rank_bypasses_bootstrap_room(self):
         ctl = _make_controller(num_dp_ranks=4)
@@ -695,7 +810,6 @@ def _receive_round(*, pulled_by_rank: list, local_control: bool) -> list:
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
         request_retirer=None,

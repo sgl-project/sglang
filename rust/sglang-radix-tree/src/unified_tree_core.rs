@@ -8,7 +8,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use tch::{Device, Kind, Tensor};
+use tch::{Kind, Tensor};
 
 use crate::components::{
     self, ComponentSet, FullComponent, MambaComponent, SwaComponent, TreeComponent,
@@ -546,8 +546,8 @@ pub struct CacheInitParams {
     pub enable_hicache: bool,
     /// Hit count at which a node earns a host write-through backup.
     pub write_through_threshold: i64,
-    /// Device the KV indices live on.
-    pub device: Device,
+    /// Empty int64 index tensor supplied on the cache's device.
+    pub empty_device_indices: Tensor,
     /// SWA sliding window size in tokens; None when SWA is disabled.
     pub swa_sliding_window_size: Option<usize>,
     /// Whether SWA lives in a per-request ring rather than cached paged slots.
@@ -582,7 +582,7 @@ impl Default for CacheInitParams {
             is_write_back: false,
             enable_hicache: false,
             write_through_threshold: 256,
-            device: Device::Cpu,
+            empty_device_indices: Tensor::empty([0], (Kind::Int64, tch::Device::Cpu)),
             swa_sliding_window_size: None,
             swa_req_ring: false,
             has_swa_host_pool: false,
@@ -679,11 +679,12 @@ pub struct UnifiedTreeCore<K: ChildKeyType> {
     pub(crate) namespaced_event_hashes: HashMap<NodeId, Vec<HashDigest>>,
     /// Hit count at which a node earns a host write-through backup.
     pub(crate) write_through_threshold: i64,
+    /// The per-path Mamba cap also counts host copies and frees the host
+    /// copies of the states it caps (decided at HiCache init).
+    pub(crate) mamba_path_cap_counts_host: bool,
 
     /// Per-component monotonic sources for lock-segment UUIDs.
     pub(crate) component_uuid_counters: [i64; NUM_COMPONENT_TYPES],
-    /// Device the KV indices live on.
-    pub(crate) device: Device,
     /// Shared empty device-index tensor (an empty match's indices).
     pub(crate) empty_device_indices: Tensor,
     /// The single in-flight resumable insert, if suspended at a barrier.
@@ -1067,9 +1068,9 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             kv_event_queue: Vec::new(),
             namespaced_event_hashes: HashMap::new(),
             write_through_threshold: params.write_through_threshold,
+            mamba_path_cap_counts_host: false,
             component_uuid_counters: COMPONENT_UUID_INITIAL_VALUES,
-            device: params.device,
-            empty_device_indices: Tensor::empty([0], (Kind::Int64, params.device)),
+            empty_device_indices: params.empty_device_indices,
             ongoing_insert_walk_state: None,
             joint_lru: params.joint_lru.then(JointLRU::default),
             joint_walk: None,
@@ -3913,6 +3914,11 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         self.write_through_threshold = value;
     }
 
+    /// Make the per-path Mamba cap count and free host copies; decided at HiCache init.
+    pub fn set_mamba_path_cap_counts_host(&mut self, enabled: bool) {
+        self.mamba_path_cap_counts_host = enabled;
+    }
+
     pub fn enable_storage(&self) -> bool {
         self.enable_storage
     }
@@ -3945,6 +3951,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         value: bool,
     ) -> Result<(), TreeCoreRuntimeError> {
+        // Stored marks describe the store being detached, not the next one.
+        if !value {
+            for node_id in self.collect_all_nodes_() {
+                self.arena.node_mut(node_id).external_cache_stored = false;
+            }
+        }
         self.enable_external_cache_linker = value;
         Ok(())
     }
@@ -4769,6 +4781,22 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.arena.node(node_id).rotation_base)
     }
 
+    /// The rotation base plus the node's first position-page: the shard owner
+    /// of its first page, which host backups draw their slots from.
+    pub fn rotation_phase_of(&self, node_id: NodeId) -> Result<Option<i64>, NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        let mut node = self.arena.node(node_idx);
+        let Some(rotation_base) = node.rotation_base else {
+            return Ok(None);
+        };
+        let mut prefix_len = 0;
+        while !node.is_root() {
+            node = self.arena.node(node.parent());
+            prefix_len += node.key.atom_len();
+        }
+        Ok(Some(rotation_base + (prefix_len / self.page_size) as i64))
+    }
+
     /// Return input indices in depth-first, subtree-weight order.
     pub fn dfs_weight_order(&self, node_ids: &[NodeId]) -> Result<Vec<usize>, NodeAccessError> {
         let mut node_to_indices: HashMap<NodeIdx_, Vec<usize>> = HashMap::new();
@@ -5313,6 +5341,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 
     /// Publish loaded SWA slots into an existing tombstoned span.
     /// Validate the entire operation before splitting or publishing any values.
+    /// The caller must supply values on the tree's device; Python bindings check this.
     pub fn attach_swa_window(
         &mut self,
         key: &K,
@@ -5323,11 +5352,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     ) -> Result<CacheActions, String> {
         self.validate_swa_span_(key, window_start, window_end)?;
         let window = self.family_slot_(Family::Window);
-        if swa_values.kind() != Kind::Int64 || swa_values.device() != self.device {
-            return Err(format!(
-                "attach_swa_window requires int64 values on {:?}",
-                self.device
-            ));
+        if swa_values.kind() != Kind::Int64 {
+            return Err("attach_swa_window requires int64 values".to_owned());
         }
         if swa_values.size() != [((window_end - window_start) as i64)] {
             return Err(format!(
@@ -6573,7 +6599,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let node_slots: Vec<i64> = node
                 .try_device_value(FULL)
                 .map(|value| {
-                    Vec::<i64>::try_from(&value.to(Device::Cpu))
+                    Vec::<i64>::try_from(&value.to(tch::Device::Cpu))
                         .expect("device values are 1-D int64 tensors")
                 })
                 .unwrap_or_default();

@@ -9,6 +9,7 @@ import msgspec
 import pytest
 import torch
 
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.speculative.dspark_components import dspark_sampling_accept_graph as sag
 from sglang.srt.speculative.dspark_components import (
     dspark_verify,
@@ -16,10 +17,15 @@ from sglang.srt.speculative.dspark_components import (
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync
-from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 STRIDE = 6
 GAMMA = STRIDE - 1
@@ -56,7 +62,11 @@ def _worker(enabled=True, mode="static"):
 
 def _eligible(worker, info, *, folded=True, grammar=False, sim_bonus=None):
     return worker._sampling_graph_eligible(
-        batch=SimpleNamespace(has_grammar=grammar),
+        route=VerifyRoute.derive(
+            info,
+            has_grammar=grammar,
+            has_watermark=info is not None and info.watermark is not None,
+        ),
         proposal_folded=folded,
         sampling_info=info,
         simulate_bonus_sampling_info=sim_bonus,
@@ -136,6 +146,7 @@ def _eager_reference(io, sampler, bs, rejection_noise=None):
         target_logits=io.logits[: bs * STRIDE],
         draft_block=block,
         sampling_info=info,
+        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
         draft_input=None,
         gamma=GAMMA,
         verify_num_draft_tokens=STRIDE,

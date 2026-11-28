@@ -15,7 +15,7 @@ notes.
 
 Action-generation models are listed under **World and action**. Their linked
 recipes cover robot observations, action outputs, and policy-specific APIs;
-the [VLA cookbook](/cookbook/vla/intro) groups dedicated action-policy recipes.
+the [Action Models cookbook](/cookbook/vla/intro) groups dedicated action-policy recipes.
 
 <Tabs>
   <Tab title="Image and 3D">

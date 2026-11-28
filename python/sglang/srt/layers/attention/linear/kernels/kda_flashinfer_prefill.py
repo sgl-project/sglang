@@ -79,8 +79,8 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
     supports_safe_gate = True
 
     def __init__(self):
-        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-            raise ValueError("FlashInfer KDA prefill requires SM100 or SM103")
+        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+            raise ValueError("FlashInfer KDA prefill requires SM100, SM103 or SM107")
         from flashinfer import kda
 
         self._recurrent_kda = kda.recurrent_kda

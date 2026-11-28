@@ -50,6 +50,7 @@ ScheduleBatch -> ForwardBatch
 import copy
 import dataclasses
 import logging
+import operator
 import re
 import sys
 import weakref
@@ -117,7 +118,7 @@ from sglang.srt.mem_cache.allocation import (
     alloc_tracking_slots,
     retire_window,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
+from sglang.srt.mem_cache.allocation_sizing import decode_alloc_targets
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -716,8 +717,6 @@ class Req(ReqDllmMixin):
             top_logprobs_num=top_logprobs_num,
             token_ids_logprob=token_ids_logprob,
         )
-        self.temp_scaled_logprobs = False
-        self.top_p_normalized_logprobs = False
         self.return_sampling_mask = return_sampling_mask
         self.sampling_logprobs_mode = sampling_logprobs_mode
         self.return_flat_raw_top_logprobs = return_flat_raw_top_logprobs
@@ -2993,24 +2992,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else [self.reqs[i] for i in selected_indices]
         )
 
-        if self.spec_algorithm.is_none():
-            new_pages = sum(
-                1 for r in requests if r.kv.kv_committed_len % page_size == 0
-            )
-            return new_pages * page_size + num_beam_member_rows(requests)
-
-        return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
-
-    def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
-        """Tight estimate matching eagle_utils.eagle_prepare_for_decode allocation."""
-        reserve = get_alloc_reserve_per_decode()
-        total = 0
-        for r in requests:
-            x = max(0, r.kv.kv_committed_len + reserve - r.kv.kv_allocated_len)
-            cur = r.kv.kv_allocated_len
-            nxt = cur + x
-            total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
-        return total
+        allocated_lens, target_lens, _ = decode_alloc_targets(
+            requests, page_size=page_size
+        )
+        return sum(
+            ceil_align(target, page_size) - ceil_align(allocated, page_size)
+            for allocated, target in zip(allocated_lens, target_lens)
+        ) + num_beam_member_rows(requests)
 
     @capacity_decision
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
@@ -3208,7 +3196,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         # Workers launch some idle batches themselves, without the scheduler's builds.
         self.sampling_info.set_sampler_params(SamplerParams.empty(self.device))
-        self.sampling_info.set_seeds_and_mask_rows([])
+        self.sampling_info.set_step_state([])
 
     def _alloc_tracking_slots(self, candidates: List[Tuple[Req, int]]) -> List[bool]:
         return alloc_tracking_slots(
@@ -3312,10 +3300,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
-
-        # Clear context parallel metadata - CP is only for prefill, not decode
-        if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
-            self.attn_cp_metadata = None
 
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
@@ -3690,6 +3674,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                             self._evict_swa(req, pre_len)
                     else:
                         self._evict_swa(req, pre_len)
+                elif (
+                    self.forward_mode.is_extend()
+                    and req.kv.holds_kv
+                    and req.session is not None
+                    and req.session.streaming
+                ):
+                    # A streaming session chunk extends the session's own row on a
+                    # prefix-sharing cache; it retires SWA behind the window as decode
+                    # does, otherwise a long session holds every SWA row it wrote and
+                    # concurrent sessions exhaust the SWA pool. Later chunks of a plain
+                    # chunked prefill also hold their row but keep their SWA until
+                    # decode. Under overlap the previous extend of this row may still
+                    # be in flight.
+                    pre_len = self.prefix_lens[idx]
+                    chunk = get_schedule().chunked_prefill_size
+                    if self.enable_overlap and chunk > 0:
+                        pre_len -= chunk
+                    self._evict_swa(req, pre_len)
             self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int, *, eviction_interval: int = 1):
@@ -3703,6 +3705,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
+
+
+@lru_cache(maxsize=None)
+def schedule_batch_field_names(cls: type) -> Tuple[str, ...]:
+    """The dataclass field names of a ScheduleBatch class, computed once."""
+    return tuple(f.name for f in dataclasses.fields(cls))
+
+
+@lru_cache(maxsize=None)
+def _schedule_batch_field_getter(cls: type):
+    return operator.itemgetter(*schedule_batch_field_names(cls))
+
+
+def schedule_batch_field_values(batch: ScheduleBatch) -> tuple:
+    """Every field value of ``batch``, in field order (the per-step snapshot of the
+    overlap scheduler), read in one C-level call."""
+    try:
+        return _schedule_batch_field_getter(type(batch))(batch.__dict__)
+    except KeyError:
+        # A field never assigned on this instance reads as None.
+        fields = batch.__dict__
+        names = schedule_batch_field_names(type(batch))
+        return tuple(fields.get(name) for name in names)
 
 
 class NextBatchPlan(msgspec.Struct):

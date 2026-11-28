@@ -912,8 +912,9 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
+        # Elastic EP offset joiners always use the DPC; the primary owns the tokenizer.
         use_dp_controller = (
-            get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().num_dp_ranks > 1 or get_exec().moe.is_ep_offset_joiner
         )
         prelaunch_dp_schedulers = (
             use_dp_controller
@@ -941,10 +942,13 @@ class Engine(EngineScoreMixin, EngineBase):
             for pp_rank in pp_rank_range:
                 for tp_rank in tp_rank_range:
                     reader, writer = mp.Pipe(duplex=prelaunch_dp_schedulers)
-                    gpu_id = (
-                        get_device().base_gpu_id
-                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * get_device().gpu_id_step
+                    gpu_id = compute_local_gpu_id(
+                        pp_rank,
+                        tp_rank,
+                        pp_size_per_node,
+                        tp_size_per_node,
+                        base_gpu_id=get_device().base_gpu_id,
+                        gpu_id_step=get_device().gpu_id_step,
                     )
 
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
@@ -1423,9 +1427,9 @@ class Engine(EngineScoreMixin, EngineBase):
             )
 
             # Get back some info from scheduler to tokenizer_manager
-            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
-                0
-            ]["max_req_input_len"]
+            scheduler_info = scheduler_init_result.scheduler_infos[0]
+            tokenizer_manager.max_req_len = scheduler_info["max_req_len"]
+            tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
             # Set up subprocess liveness watchdog to detect crashes
             # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
@@ -1467,6 +1471,7 @@ class Engine(EngineScoreMixin, EngineBase):
             port_args,
             TokenizerManagerClass=get_tokenizer_worker_class(server_args),
         )
+        tokenizer_manager.max_req_len = scheduler_info["max_req_len"]
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
         tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
         return tokenizer_manager, template_manager

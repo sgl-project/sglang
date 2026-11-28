@@ -12,7 +12,7 @@ export const config = {
 
   supportedHardware: [
     "h100", "h200", "b200", "b300", "gb200", "gb300",
-    "rtx6000", "rtx5090",
+    "rtxpro6000", "rtx5090",
     // NVIDIA DGX Spark (GB10, SM121) — Flash Official FP4 only, as a 2-node
     // TP=2 pair over ConnectX-7 RoCE; the shared HARDWARE_CATALOG carries the
     // entry and its multi-node Docker flags.
@@ -29,7 +29,7 @@ export const config = {
   // RTX PRO 6000 and RTX 5090 (SM120 / Blackwell Desktop) are workstation and
   // consumer cards, not datacenter GPUs.
   hardware: [
-    { id: "rtx6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
+    { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "blackwell" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "blackwell" },
   ],
 
@@ -362,7 +362,7 @@ sgl-eval run mmmu_pro \\
     mi300x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi30x-20261028",
     mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261028",
     // TODO(NPU): `a3:` / `a5:` images (kimi-k3: quay.io/ascend/sglang:
-    // main-cann9.1.0-a3 and the swr.cn-southwest-2 950PR/DT tag).
+    // main-cann9.2.0-a3 and the swr.cn-southwest-2 950PR/DT tag).
   },
 
   // Pre-selects the issue template's `model` dropdown on "Submit verified cell".
@@ -458,7 +458,7 @@ sgl-eval run mmmu_pro \\
             env: ["MORI_EP_LAUNCH_CONFIG_MODE=AUTO"],
             envWhen: { hw: ["mi355x"], variant: ["pro", "pro-official"], quant: ["fp4"] },
             hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300",
-                         "rtx6000", "rtx5090", "dgx-spark"] } },
+                         "rtxpro6000", "rtx5090", "dgx-spark"] } },
           // No strategy gate — the Playground allows MegaMoE on any strategy for
           // experimentation (docs recommend it on high-throughput).
           //
@@ -558,7 +558,7 @@ sgl-eval run mmmu_pro \\
           flags: ["--speculative-algorithm DSPARK"],
           hide: { variant: ["flash", "pro"] },
           disable: [
-            { when: { dpAttnOn: [true], hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000", "rtx5090", "dgx-spark"] },
+            { when: { dpAttnOn: [true], hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtxpro6000", "rtx5090", "dgx-spark"] },
               reason: "DSpark is not compatible with DP Attention on the current release. For a DP + DSpark agentic recipe, see the cookbook §3.6 (B200) / §3.7 (MI355X) notes." },
             { when: { dpAttnOn: [true], hw: ["mi355x"], variant: ["flash", "flash-official", "flash-vision"] },
               reason: "DSpark is not compatible with DP Attention on the current release. For a DP + DSpark agentic recipe, see the cookbook §3.6 (B200) / §3.7 (MI355X) notes." },
@@ -623,7 +623,7 @@ sgl-eval run mmmu_pro \\
         // MORI-IO transport is AMD-only — hidden on every non-ROCm platform.
         { id: "mori",     label: "MORI",
           hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300",
-                       "rtx6000", "rtx5090", "dgx-spark"] },
+                       "rtxpro6000", "rtx5090", "dgx-spark"] },
           defaultWhen: { hw: ["mi300x", "mi355x"] },
           // MORI-IO transport tuning only — this card moves KV between the two
           // workers. The per-rank dispatch budget is sized per role (see
@@ -666,7 +666,7 @@ sgl-eval run mmmu_pro \\
           // PD deployment recipes inherit Auto; the NIC list is an explicit
           // Playground override. Legacy single-node bases retain their preset.
           defaultWhen: { hw: ["mi355x"], nodes: ["single"] },
-          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtx6000", "rtx5090", "dgx-spark"] } },
+          hide: { hw: ["h100", "h200", "b200", "b300", "gb200", "gb300", "rtxpro6000", "rtx5090", "dgx-spark"] } },
       ],
       // Router fronting the prefill + decode roles; substitute <prefill-host>/<decode-host>.
       router: {
@@ -957,7 +957,7 @@ sgl-eval run mmmu_pro \\
 
     // ----- Card 6: "Hierarchical KV Cache" -----
     hicache: {
-      excludesHw: ["rtx6000"],
+      excludesHw: ["rtxpro6000"],
       // AMD ROCm (MI300X/MI325X/MI350X/MI355X): page_first_direct + direct io.
       amdIo: { memLayout: "page_first_direct", ioBackend: "direct", ratio: 4 },
       roleOverrides: [
@@ -2988,7 +2988,7 @@ sgl-eval run mmmu_pro \\
     // RTX PRO 6000 (SM120 / Blackwell Desktop) — Flash + low-latency only
     // ====================================================================
     {
-      match: { hw: "rtx6000", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "flash-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
       env: [],
       flags: [
@@ -3003,7 +3003,7 @@ sgl-eval run mmmu_pro \\
       ],
     },
     {
-      match: { hw: "rtx6000", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
+      match: { hw: "rtxpro6000", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: true,
       env: [],
       flags: [

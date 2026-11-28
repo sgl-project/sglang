@@ -488,10 +488,23 @@ class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
         )
 
 
+@dataclass
+class PiH3PipelineConfig(MiniMaxH3PipelineConfig):
+    """pi-H3: pi-Flow adapters of the AdaLN-pruned MiniMax-H3."""
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'quality="high" is audited only for the base MiniMax-H3 50-step '
+            "4xH200 deployment; pi-H3 has no audited high-quality deployment. "
+            'Use quality="exact", or the default "lossless".'
+        )
+
+
 __all__ = [
     "FastH3OmniPipelineConfig",
     "FastH3PipelineConfig",
     "MiniMaxH3PipelineConfig",
+    "PiH3PipelineConfig",
     "PikaH3FlexPipelineConfig",
 ]
 
@@ -501,6 +514,7 @@ def register():
         FastH3OmniSamplingParams,
         FastH3SamplingParams,
         MiniMaxH3SamplingParams,
+        PiH3SamplingParams,
         PikaH3FlexSamplingParams,
     )
     from sglang.multimodal_gen.registry import register_configs
@@ -555,6 +569,18 @@ def register():
         model_detectors=[
             lambda model_id: (
                 "pikah3flex" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=PiH3SamplingParams,
+        pipeline_config_cls=PiH3PipelineConfig,
+        hf_model_paths=[
+            "Lakonik/pi-H3",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "pih3" in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
     )

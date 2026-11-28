@@ -167,6 +167,10 @@ Omitting `--chat-routing` keeps the legacy routing path (default
 `--policy round_robin`). This README and [ARCHITECTURE.md](ARCHITECTURE.md)
 describe `--chat-routing reorg`.
 
+An sgl-model-gateway flag that sgl-router does not define, such as
+`--pd-disaggregation` or `--json-log`, fails at startup with an error that
+names what to use instead or says that the feature is not supported.
+
 ## Routing policies
 
 Each engine group runs one policy, chosen by `--policy` (default `power_of_two`
@@ -342,9 +346,9 @@ and [rerank](REFERENCE.md#rerank).
 
 ### Native gRPC
 
-`--grpc-port` serves the engine's `sglang.runtime.v1.SglangService`. Each RPC is
-routed like its HTTP route and forwarded to the same RPC on the engine's own
-native gRPC port, so engines must run with `--grpc-port` too. See
+`--grpc-port` serves `sglang.api.v1.SglangService/Generate` for a single text
+prompt or token sequence. Requests reach the same RPC on a native Rust engine,
+which must run with `--grpc-port` too. See
 [native gRPC](REFERENCE.md#native-grpc).
 
 ### Bucket file

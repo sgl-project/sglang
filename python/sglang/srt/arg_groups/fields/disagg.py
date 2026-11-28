@@ -62,6 +62,24 @@ class Disagg(msgspec.Struct):
         "prefill_complete retains KV on prefill until prefill finishes, then "
         "admits it on decode. Set the same policy on both roles. Default: early.",
     ] = "early"
+    disaggregation_decode_first_token_stream: A[
+        Optional[str],
+        Arg(
+            help=(
+                "When a PD decode server streams a request's first output token, "
+                "which prefill sampled: 'admission' sends it as soon as decode "
+                "admits the request; 'first_decode' holds it to go out with the "
+                "request's first decode output. No token arrives earlier in either "
+                "mode. The choice only moves when the first token is sent, so TTFT "
+                "trades against TPOT measured as (e2e latency - TTFT) / (output "
+                "tokens - 1): 'admission' has the lower TTFT, by about one decode "
+                "step; 'first_decode' counts the wait for the second token in TTFT "
+                "instead of that TPOT. A request that finishes at admission is "
+                "sent at once either way. Default: first_decode."
+            ),
+            choices=["admission", "first_decode"],
+        ),
+    ] = None
     disaggregation_transfer_backend: A[
         str,
         Arg(

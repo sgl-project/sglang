@@ -17,14 +17,11 @@ def _make_layer(
     base_weight: torch.Tensor,
     rank: int = 2,
     alpha: int = 2,
-    snapshot_base: bool = True,
 ):
     base = nn.Linear(base_weight.shape[1], base_weight.shape[0], bias=False)
     with torch.no_grad():
         base.weight.copy_(base_weight)
-    return LinearWithLoRA(
-        base, lora_rank=rank, lora_alpha=alpha, snapshot_base=snapshot_base
-    )
+    return LinearWithLoRA(base, lora_rank=rank, lora_alpha=alpha)
 
 
 def _offload(layer: LinearWithLoRA) -> torch.Tensor:
@@ -56,7 +53,7 @@ def test_commit_merged_as_base_promotes_weights_and_resets_state():
     merged_w = base_w + s1 * (B @ A)
     # Merged weights become the permanent base + restore target.
     assert torch.allclose(layer.base_layer.weight, merged_w, atol=1e-5)
-    assert torch.allclose(layer.cpu_weight, merged_w, atol=1e-5)
+    assert layer.cpu_weight is None
     # Bookkeeping reset so a later dynamic set_lora adds a delta on top, and
     # deactivate (which only unmerges when merged=True) leaves the base intact.
     assert layer.merged is False
@@ -135,14 +132,13 @@ def test_negative_merge_after_commit_restores_original_base():
     layer.commit_merged_as_base()
 
     assert torch.allclose(layer.base_layer.weight, base_w, atol=1e-5)
-    assert torch.allclose(layer.cpu_weight, base_w, atol=1e-5)
+    assert layer.cpu_weight is None
     assert layer.merged is False
 
 
-@pytest.mark.parametrize("snapshot_base", [True, False])
 @pytest.mark.parametrize("offloaded", [False, True])
-def test_commit_snapshots_materialized_weight(offloaded, snapshot_base):
-    """The committed snapshot is the real weight, not the layerwise placeholder.
+def test_next_merge_snapshots_committed_weight(offloaded):
+    """The next merge backs up the committed weight, not the layerwise placeholder.
 
     Replays LTX-2 original mode when a request overrides the stage-1 distilled
     strength: commit s1 into the base, subtract it again, merge the request's
@@ -155,7 +151,7 @@ def test_commit_snapshots_materialized_weight(offloaded, snapshot_base):
     B = torch.randn(out_f, rank)
     s1, s1_request, s2 = 0.25, 0.5, 0.75
 
-    layer = _make_layer(base_w, rank=rank, alpha=rank, snapshot_base=snapshot_base)
+    layer = _make_layer(base_w, rank=rank, alpha=rank)
     stored = _offload(layer) if offloaded else None
 
     def weight():
@@ -172,12 +168,12 @@ def test_commit_snapshots_materialized_weight(offloaded, snapshot_base):
 
     merge(s1)
     layer.commit_merged_as_base()
-    torch.testing.assert_close(layer.cpu_weight, base_w + s1 * (B @ A))
-    assert not layer._base_is_view
+    torch.testing.assert_close(weight(), base_w + s1 * (B @ A))
+    assert layer.cpu_weight is None
 
     merge(-s1)
     layer.commit_merged_as_base()
-    torch.testing.assert_close(layer.cpu_weight, base_w, atol=1e-5, rtol=0)
+    torch.testing.assert_close(weight(), base_w, atol=1e-5, rtol=0)
 
     merge(s1_request)
     merge(s2)

@@ -134,6 +134,8 @@ def handle_pd_role_switch(
         )
 
     scheduler._pd_role_switch_in_progress = True
+    # Whichever role the scheduler ends in continues from this published busy time.
+    busy_us = scheduler._get_total_prefill_busy_us()
     try:
         # Teardown + role flip + rebuild are one logical atomic step. If any of
         # them raises, the instance is left half-torn-down (old role released,
@@ -178,6 +180,7 @@ def handle_pd_role_switch(
         return _fail(f"role switch raised: {e}")
     finally:
         scheduler._pd_role_switch_in_progress = False
+        scheduler._carry_prefill_busy_us(busy_us)
 
 
 def _reject_reason(scheduler: Scheduler, new_role: str) -> Optional[Tuple[str, bool]]:

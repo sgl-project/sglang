@@ -15,7 +15,7 @@ from ..config import (
     WatermarkRequestConfig,
     parse_watermark_key,
 )
-from ..interface import SampleStep
+from ..interface import SampleWatermarkOutput
 from .detector import hash_context
 from .state import WatermarkState
 
@@ -268,7 +268,9 @@ class GumbelSample:
         self.rows = rows
         self.forward_batch = forward_batch
 
-    def apply(self, logits: torch.Tensor, *, keep_logits: bool) -> SampleStep:
+    def apply(
+        self, logits: torch.Tensor, *, keep_logits: bool
+    ) -> SampleWatermarkOutput:
         forward_batch = self.forward_batch
         logprob_logits = logits.clone() if keep_logits else None
         req_pool_indices = forward_batch.req_pool_indices[: logits.shape[0]]
@@ -282,7 +284,7 @@ class GumbelSample:
             self.rows.context_windows,
             self.rows.enabled,
         )
-        return SampleStep(
+        return SampleWatermarkOutput(
             sampling_info=forward_batch.sampling_info, logprob_logits=logprob_logits
         )
 

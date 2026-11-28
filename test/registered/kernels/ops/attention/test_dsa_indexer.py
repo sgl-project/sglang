@@ -240,6 +240,7 @@ class MockModelRunner:
                     dtype=torch.int32,
                     device=self.device,
                 ),
+                "row_width": max_context_len,
             },
         )()
 
@@ -1593,6 +1594,7 @@ class TestDSAIndexer(CustomTestCase):
                 backend.req_to_token = torch.empty(
                     2, 4096, dtype=torch.int32, device=self.device
                 )
+                backend.max_kv_len = 4096
 
                 with (
                     envs.SGLANG_OPT_USE_TOPK_V2.override(True),
