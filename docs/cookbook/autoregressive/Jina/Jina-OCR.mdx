@@ -1,0 +1,114 @@
+---
+title: Jina-OCR
+description: "Serve jinaai/jina-ocr-v1 with SGLang for document-to-Markdown OCR through the OpenAI-compatible API."
+---
+
+## Overview
+
+[jinaai/jina-ocr-v1](https://huggingface.co/jinaai/jina-ocr-v1) converts document images into Markdown. SGLang serves it with the native DeepSeek-OCR backend, including Jina's image preprocessing and up to nine local image crops.
+
+This recipe uses autoregressive decoding. FastMTP draft heads are not used. You do not need `--trust-remote-code`.
+
+## Prerequisites
+
+- Linux with an NVIDIA CUDA GPU and a working SGLang installation. Follow the [installation guide](/docs/get-started/install) and use a source revision that includes Jina OCR support; older releases may not include it.
+- This configuration was validated on a single RTX 4080 SUPER instance exposing 32 GB of GPU memory, using BF16, Python 3.12, PyTorch 2.13 / CUDA 13.0, Transformers 5.12.1, and `sglang-kernel` 0.4.7. This is a tested environment, not a minimum memory or version requirement.
+- Install the request client's dependency with `python -m pip install openai`.
+
+The public checkpoint does not require a Hugging Face token. See the [model card](https://huggingface.co/jinaai/jina-ocr-v1) for model licensing and usage terms.
+
+## Start the server
+
+Set `MODEL_PATH` to the Hugging Face model ID or a local checkpoint directory, then run:
+
+```bash
+export MODEL_PATH=jinaai/jina-ocr-v1
+# For an existing download instead:
+# export MODEL_PATH=/path/to/jina-ocr-v1
+
+sglang serve \
+  --model-path "$MODEL_PATH" \
+  --served-model-name jina-ocr \
+  --dtype bfloat16 \
+  --context-length 4096 \
+  --mem-fraction-static 0.7 \
+  --cuda-graph-max-bs-decode 4 \
+  --host 127.0.0.1 \
+  --port 30000
+```
+
+This uses one GPU with the default tensor and data parallel sizes of one. You can also replace `sglang serve` with `python -m sglang.launch_server` using the same arguments. `--served-model-name` keeps the client model name stable when you switch between a Hugging Face ID and a local directory. SGLang selects the built-in `jina-ocr` chat template automatically (`<|User|>:\n<image>\n{text}\n<|Assistant|>:\n`, matching the checkpoint's reference processor), so no `--chat-template` is needed.
+
+Wait for the server to become ready, then check it from another terminal:
+
+```bash
+curl --fail http://127.0.0.1:30000/health
+```
+
+## Transcribe a document image
+
+Save a document page as `document.png`, then run this client example. It sends image bytes through the OpenAI-compatible API, so the server does not need access to your local image path.
+
+```python
+import base64
+from pathlib import Path
+
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:30000/v1", api_key="EMPTY")
+encoded = base64.b64encode(Path("document.png").read_bytes()).decode("ascii")
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{encoded}"},
+            },
+            {
+                "type": "text",
+                "text": (
+                    "Transcribe the provided document image into a clean "
+                    "Markdown format, preserving the natural reading order."
+                ),
+            },
+        ],
+    }
+]
+response = client.chat.completions.create(
+    model="jina-ocr",
+    messages=messages,
+    temperature=0,
+    max_tokens=2048,
+)
+print(response.choices[0].message.content)
+```
+
+The template inserts the image token; do not add an extra `<image>` marker to the text. For JPEG input, change the file path and use `data:image/jpeg;base64,` instead. Render PDF pages to images before submitting them, with one page per request.
+
+### Stream the output
+
+Reuse `client` and `messages` from the example above:
+
+```python
+stream = client.chat.completions.create(
+    model="jina-ocr",
+    messages=messages,
+    temperature=0,
+    max_tokens=2048,
+    stream=True,
+)
+for chunk in stream:
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
+print()
+```
+
+## Configuration and validation
+
+- **Output length:** The 4096-token context includes the prompt, image tokens, and generated text. If the response ends with `finish_reason="length"`, adjust `max_tokens` within the available context budget. Longer documents may need a larger `--context-length` and more GPU memory.
+- **Image processing:** The native processor applies Jina's crop policy automatically, including the nine-crop path. Submit the original page image rather than manually assembling tiles.
+- **Caching and CUDA graphs:** Keep the default prefix cache enabled to reuse repeated image-and-prompt inputs. Decode CUDA graphs were validated at batch sizes 1, 2, and 4. This does not imply support for multimodal prefill CUDA graphs.
+- **Validation scope:** Single-GPU BF16 smoke tests covered concurrent requests at three image sizes, invoice extraction, streaming, and repeated prompts. Generated token sequences matched the reference model on the three synthetic comparison images. This is not an OCR dataset accuracy or throughput benchmark; quantization, multi-GPU execution, and FastMTP were not validated.
+
+For other request formats, see [sending requests](/docs/basic_usage/send_request).
