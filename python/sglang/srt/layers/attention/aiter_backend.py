@@ -333,6 +333,10 @@ def _muse_verify_attention(
         return False
     # Splits were tuned at 2 KV heads per rank (TP8); more KV heads (TP4: 4) divide them to keep the CTA count.
     kv_scale = max(1, num_kv_heads // 2)
+    # Attention DP holds all 16 KV heads on the rank ("fly_dp" is enabled under DP only): the FlyDSL kernels take
+    # them as four groups of 4, the launch shape of a TP4 rank with four times the requests.
+    fly_hpg = 4 if num_kv_heads == 16 and "fly_dp" in kernels else None
+    fly_groups = num_kv_heads // fly_hpg if fly_hpg else 1
     if num_kv_heads == 2 and _is_gfx1250_device():
         # gfx1250 (wave32): Triton configs tuned at the TP8 verify shapes (8K context) for 4 / 16 / 64 requests.
         # Above 16 requests (random pages) the KV-head-pair kernel with FP8 QK/PV runs the sliding layers, and full
@@ -393,14 +397,15 @@ def _muse_verify_attention(
         if (
             "swa_fly" in kernels
             and gqa_verify_flydsl is not None
-            and num_kv_heads in (2, 4)
+            and (num_kv_heads in (2, 4) or fly_hpg is not None)
             and k.stride() == v.stride()
-            and use_flydsl_sliding(num_seqs, num_kv_heads)
+            and use_flydsl_sliding(num_seqs, num_kv_heads, fly_groups)
         ):
             _defer_or_merged(
                 swa_verify_flydsl(
                     q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
                     window=sliding_window, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                    heads_per_group=fly_hpg,
                 ),
                 v_descale,
             )  # fmt: skip
@@ -433,11 +438,11 @@ def _muse_verify_attention(
     if (
         "full_fly" in kernels
         and gqa_verify_flydsl is not None
-        and num_kv_heads in (2, 4)
+        and (num_kv_heads in (2, 4) or fly_hpg is not None)
         and k.stride() == v.stride()
     ):
         balanced = "full_fly_bal" in kernels and use_balanced_full(
-            num_seqs, num_kv_heads
+            num_seqs, num_kv_heads, fly_groups
         )
         if ("fly", num_seqs) not in _muse_verify_v2_logged:
             _muse_verify_v2_logged.add(("fly", num_seqs))
@@ -449,7 +454,7 @@ def _muse_verify_attention(
         _defer_or_merged(
             (gqa_verify_flydsl_balanced if balanced else gqa_verify_flydsl)(
                 q, k, v, out, seqused_k, block_table, softmax_scale, k_descale, v_descale,
-                defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested, heads_per_group=fly_hpg,
             ),
             v_descale,
         )  # fmt: skip
@@ -1125,6 +1130,9 @@ class AiterAttnBackend(AttentionBackend):
             )
             if self.use_muse_attention_paths and self._use_unified_verify and env.get()
         )
+        if self.muse_verify_kernels and get_parallel().attn_dp_enabled:
+            # all 16 KV heads on the rank: the FlyDSL verify kernels take them in groups (_muse_verify_attention)
+            self.muse_verify_kernels |= {"fly_dp"}
         if self.use_muse_attention_paths:
             logger.info(
                 "Muse Spark attention paths: reuse_extend_metadata=%s "

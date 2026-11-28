@@ -75,6 +75,18 @@ ROW_MAJOR = {
     (14336, 8192, 16): (64, 256, 1, 4, 3),
     (14336, 8192, 32): (64, 256, 1, 8, 3),
 }
+# The attention-DP rank's unsharded O projection [8192, 8192] (BF16); merged into ROW_MAJOR / ROW_MAJOR_ROT by the
+# model only under SGLANG_ROCM_MUSE_DP_O_ROWMAJOR.
+DP_TP1_ROW_MAJOR = {
+    (8192, 8192, 32): (32, 256, 1, 4, 3),
+    (8192, 8192, 64): (32, 256, 1, 4, 3),
+    (8192, 8192, 128): (64, 128, 2, 4, 3),
+}
+DP_TP1_ROW_MAJOR_ROT = {
+    (8192, 8192, 32): 5,
+    (8192, 8192, 64): 5,
+    (8192, 8192, 128): 5,
+}
 # (N, K, BM) -> per-N-block K-start rotation stride (coprime to the per-split K-tile count, 16 or 32 here) of the
 # long-K launches, so concurrent workgroups stream different K tiles; 0 or absent: the canonical in-order K loop.
 # Measured per bucket over its M range: KT_PER <= 8 launches and every [8192, 7168] bucket lose with rotation.
