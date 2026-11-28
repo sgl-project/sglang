@@ -3659,6 +3659,12 @@ class Scheduler(
                 self._reject_bad_request(req, error_msg)
                 return
 
+        if use_mlx() and req.return_logprob and not get_device().mlx_enable_sampling:
+            self._reject_bad_request(
+                req, "Output logprobs on the MLX backend require --mlx-enable-sampling."
+            )
+            return
+
         if (
             isinstance(self.spec_algorithm, SpeculativeAlgorithm)
             and self.spec_algorithm.is_some()
