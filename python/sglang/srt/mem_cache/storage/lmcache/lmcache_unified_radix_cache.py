@@ -1011,7 +1011,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.prefix_published = True
 
     def _submit_store(
-        self, req: Req, token_ids: list[int], *,
+        self,
+        req: Req,
+        token_ids: list[int],
+        *,
         writeback_range: tuple[int, int] | None = None,
     ) -> None:
         key = RadixKey(
@@ -1028,10 +1031,21 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         key = key[:aligned_len]
         if len(key) == 0:
             return
-        matched = super().match_prefix(MatchPrefixParams(key=key))
+        if writeback_range is not None:
+            # This range contains only failed attention KV. A reusable hybrid
+            # prefix also needs a recurrent checkpoint, which may stop before
+            # this block even though its FULL device values are resident.
+            key = key[: writeback_range[1]]
+            resident_tokens, store_node, _ = self.tree_core.match_full_device_prefix(
+                key
+            )
+        else:
+            matched = super().match_prefix(MatchPrefixParams(key=key))
+            resident_tokens = matched.device_prefix_len
+            store_node = matched.last_device_node
         # Store the currently resident SWA prefix; later callbacks may extend it.
         resident_len = torch.tensor(
-            [min(matched.device_prefix_len, len(key))],
+            [min(resident_tokens, len(key))],
             dtype=torch.int64,
             device="cpu",
         )
@@ -1044,7 +1058,8 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             * self.lmcache_connector.chunk_size
         )
         store_start = (
-            writeback_range[0] if writeback_range is not None
+            writeback_range[0]
+            if writeback_range is not None
             else self.lmcache_connector.get_store_start(req.rid, len(key))
         )
         if resident_len <= store_start:
@@ -1066,14 +1081,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 len(key),
             )
             key = key[:resident_len]
-            # Re-match so the lock and Mamba state use the shortened boundary.
-            matched = super().match_prefix(MatchPrefixParams(key=key))
+            if writeback_range is None:
+                # Re-match so the lock and Mamba state use the shortened boundary.
+                matched = super().match_prefix(MatchPrefixParams(key=key))
+                store_node = matched.last_device_node
         store_end = writeback_range[1] if writeback_range is not None else len(key)
         if resident_len < store_end:
             return
-        store_indices = self.path_device_indices(matched.last_device_node)[
-            store_start:store_end
-        ]
+        store_indices = self.path_device_indices(store_node)[store_start:store_end]
         if len(store_indices) != store_end - store_start:
             logger.debug(
                 "LMCache store skipped for %s: store indices length: %d, "
@@ -1084,7 +1099,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 len(key),
             )
             return
-        lock_params = self.inc_lock_ref(matched.last_device_node).to_dec_params()
+        skip_lock_components = (
+            (self._mamba_component.component_type,)
+            if writeback_range is not None and self._mamba_component is not None
+            else ()
+        )
+        lock_params = self.inc_lock_ref(
+            store_node, skip_lock_components=skip_lock_components
+        ).to_dec_params()
         mamba_value = (
             self.tree_core.get_component_device_value(
                 matched.best_match_node, ComponentType.MAMBA
@@ -1107,7 +1129,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             mamba_is_resident, torch.distributed.ReduceOp.MIN
         )
         if not mamba_is_resident.item():
-            self.dec_lock_ref(matched.last_device_node, lock_params)
+            self.dec_lock_ref(store_node, lock_params)
             logger.debug(
                 "LMCache store skipped for %s: no Mamba checkpoint at token %d",
                 req.rid,
@@ -1129,14 +1151,14 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 ),
             )
         except Exception:
-            self.dec_lock_ref(matched.last_device_node, lock_params)
+            self.dec_lock_ref(store_node, lock_params)
             logger.exception("LMCache store submission failed for %s", req.rid)
             return
         if operation is None:
-            self.dec_lock_ref(matched.last_device_node, lock_params)
+            self.dec_lock_ref(store_node, lock_params)
             return
         self._pending_stores.append(
-            LMCachePendingStore(operation, matched.last_device_node, lock_params)
+            LMCachePendingStore(operation, store_node, lock_params)
         )
         self._pending_store_counts[req.rid] = (
             self._pending_store_counts.get(req.rid, 0) + 1

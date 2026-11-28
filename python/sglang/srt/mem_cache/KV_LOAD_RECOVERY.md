@@ -87,3 +87,12 @@ Replay can change prefill chunk and batch shapes. Ownership and checkpoint
 preservation do not guarantee bitwise regenerated BF16 KV or identical greedy
 outputs across different execution shapes. Numerical/model-quality qualification
 is separate; ordinary prefix-cache reuse can also change greedy outputs.
+
+Failed-range attention write-back matches the FULL-device path independently
+of the joint attention/recurrent reuse boundary. Under mixed traffic, a tree
+node may hold the regenerated attention block without a recurrent checkpoint
+at the externally aligned key length. The adapter pins that FULL path with
+the existing transfer lock, skips the recurrent component lock, and submits
+only the failed range through the normal LMCache-MP STORE path. Ordinary prefix
+stores still require the joint checkpoint; no recurrent object, healthy suffix,
+forced PUT or new retry policy is introduced.

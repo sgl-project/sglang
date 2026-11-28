@@ -205,3 +205,109 @@ def test_lmcache_load_fences_actual_execution_stream(
     ):
         consumer = cache._load_stream(torch.device("cuda"))
     assert consumer is (current if current_is_consumer else cache._forward_stream)
+
+
+@pytest.mark.parametrize("resident_len", [6, 8])
+def test_attention_writeback_uses_full_kv_beyond_recurrent_checkpoint(
+    cache_class, resident_len
+):
+    """A joint match may stop before a dirty block whose attention KV is resident."""
+    cache = cache_class.__new__(cache_class)
+    cache._mamba_component = SimpleNamespace(component_type=ComponentType.MAMBA)
+    cache.tree_core = mock.Mock(is_eagle=False, page_size=1)
+    # The key ends inside a longer node. Pin its path, but copy only the hole.
+    cache.tree_core.match_full_device_prefix.return_value = (resident_len, 42, 12)
+    cache.lmcache_connector = mock.Mock(chunk_size=4)
+    operation = object()
+    cache.lmcache_connector.submit_store.return_value = operation
+    cache._pending_stores = []
+    cache._pending_store_counts = {}
+    cache.inc_lock_ref = mock.Mock(return_value=IncLockRefResult(node_id=42))
+    cache.dec_lock_ref = mock.Mock()
+    cache.path_device_indices = mock.Mock(return_value=torch.arange(12))
+    req = SimpleNamespace(rid="suffix", extra_key=None, cache_salt="salt")
+    joint = MatchResult(4, 41, 41, 41, full_kv_hit_length=8)
+    with mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=joint):
+        cache._submit_store(req, list(range(12)), writeback_range=(4, 8))
+
+    if resident_len < 8:
+        cache.lmcache_connector.submit_store.assert_not_called()
+        cache.inc_lock_ref.assert_not_called()
+        assert not cache._pending_stores
+        return
+    cache.lmcache_connector.submit_store.assert_called_once()
+    args, kwargs = cache.lmcache_connector.submit_store.call_args
+    assert args[:2] == ("suffix", list(range(8)))
+    assert kwargs["writeback_range"] == (4, 8)
+    assert kwargs["device_indices_start"] == 4
+    indices = cache.lmcache_connector.device_indices_by_group.call_args
+    assert torch.equal(indices.args[0], torch.arange(4, 8))
+    assert indices.kwargs["mamba_value"] is None
+    cache.inc_lock_ref.assert_called_once_with(
+        42, skip_lock_components=(ComponentType.MAMBA,)
+    )
+    cache.dec_lock_ref.assert_not_called()
+    assert len(cache._pending_stores) == 1
+    assert cache._pending_store_counts == {"suffix": 1}
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_attention_writeback_failed_admission_releases_transfer_lock(
+    cache_class, raises
+):
+    cache = cache_class.__new__(cache_class)
+    cache._mamba_component = SimpleNamespace(component_type=ComponentType.MAMBA)
+    cache.tree_core = mock.Mock(is_eagle=False, page_size=1)
+    cache.tree_core.match_full_device_prefix.return_value = (8, 42, 8)
+    cache.lmcache_connector = mock.Mock(chunk_size=4)
+    cache.lmcache_connector.submit_store.return_value = None
+    if raises:
+        cache.lmcache_connector.submit_store.side_effect = RuntimeError("admission")
+    cache._pending_stores = []
+    cache._pending_store_counts = {}
+    cache.inc_lock_ref = mock.Mock(return_value=IncLockRefResult(node_id=42))
+    cache.dec_lock_ref = mock.Mock()
+    cache.path_device_indices = mock.Mock(return_value=torch.arange(8))
+    req = SimpleNamespace(rid="suffix", extra_key=None, cache_salt="salt")
+    joint = MatchResult(4, 41, 41, 41, full_kv_hit_length=8)
+    with mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=joint):
+        cache._submit_store(req, list(range(8)), writeback_range=(4, 8))
+    cache.lmcache_connector.submit_store.assert_called_once()
+    cache.dec_lock_ref.assert_called_once()
+    assert cache.dec_lock_ref.call_args.args[0] == 42
+    assert not cache._pending_stores
+    assert not cache._pending_store_counts
+
+
+@pytest.mark.parametrize("stored_prefix", [0, 4])
+def test_ordinary_store_still_requires_joint_recurrent_checkpoint(
+    cache_class, stored_prefix
+):
+    cache = cache_class.__new__(cache_class)
+    cache._mamba_component = SimpleNamespace(component_type=ComponentType.MAMBA)
+    cache.tree_core = mock.Mock(is_eagle=False, page_size=1)
+    state = torch.tensor([7])
+    cache.tree_core.get_component_device_value.return_value = state
+    cache.lmcache_connector = mock.Mock(chunk_size=4)
+    cache.lmcache_connector.get_store_start.return_value = stored_prefix
+    cache.lmcache_connector.submit_store.return_value = object()
+    cache._pending_stores = []
+    cache._pending_store_counts = {}
+    cache.inc_lock_ref = mock.Mock(return_value=IncLockRefResult(node_id=41))
+    cache.path_device_indices = mock.Mock(return_value=torch.arange(8))
+    req = SimpleNamespace(rid="ordinary", extra_key=None, cache_salt="salt")
+    joint = MatchResult(4, 41, 41, 41, full_kv_hit_length=8)
+    with mock.patch.object(UnifiedRadixCache, "match_prefix", return_value=joint):
+        cache._submit_store(req, list(range(8)))
+    cache.tree_core.match_full_device_prefix.assert_not_called()
+    if stored_prefix:
+        cache.lmcache_connector.submit_store.assert_not_called()
+        cache.inc_lock_ref.assert_not_called()
+        return
+    args, kwargs = cache.lmcache_connector.submit_store.call_args
+    assert args[:2] == ("ordinary", list(range(4)))
+    assert kwargs["writeback_range"] is None
+    indices = cache.lmcache_connector.device_indices_by_group.call_args
+    assert torch.equal(indices.args[0], torch.arange(4))
+    assert indices.kwargs["mamba_value"] is state
+    cache.inc_lock_ref.assert_called_once_with(41, skip_lock_components=())
