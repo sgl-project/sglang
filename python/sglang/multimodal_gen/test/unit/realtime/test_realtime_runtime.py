@@ -768,6 +768,66 @@ def test_uninitialized_connections_do_not_reserve_realtime_slot(
     assert released == [session_id]
 
 
+def test_generate_closes_with_an_error_code_when_generation_fails(monkeypatch):
+    """after a generation error the client gets a close frame, not a dropped connection"""
+
+    class _Adapter(realtime_adapter.BaseRealtimeModelAdapter):
+        def create_state(self):
+            return None
+
+        async def on_init(self, session, request):
+            pass
+
+    async def failing_generate_loop(ws, session):
+        await realtime_video_api.write_error_msg(
+            "error during generate loop: scheduler failed", ws
+        )
+
+    async def release(req):
+        pass
+
+    monkeypatch.setattr(realtime_video_api, "_ACTIVE_SESSION_IDS", set())
+    monkeypatch.setattr(realtime_video_api, "get_global_server_args", lambda: None)
+    monkeypatch.setattr(
+        realtime_video_api, "get_realtime_model_adapter", lambda _: _Adapter()
+    )
+    monkeypatch.setattr(realtime_video_api, "_generate_loop", failing_generate_loop)
+    monkeypatch.setattr(realtime_video_api.async_scheduler_client, "forward", release)
+
+    async def run():
+        incoming = asyncio.Queue()
+        incoming.put_nowait({"type": "websocket.connect"})
+        incoming.put_nowait(
+            {
+                "type": "websocket.receive",
+                "bytes": msgspec.msgpack.encode(
+                    {"type": "init", "prompt": "A quiet village"}
+                ),
+            }
+        )
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        ws = WebSocket({"type": "websocket", "app": FastAPI()}, incoming.get, send)
+        await realtime_video_api.generate(ws)
+        return sent
+
+    sent = asyncio.run(asyncio.wait_for(run(), timeout=5))
+
+    assert [message["type"] for message in sent] == [
+        "websocket.accept",
+        "websocket.send",
+        "websocket.close",
+    ]
+    assert msgspec.msgpack.decode(sent[1]["bytes"]) == {
+        "type": "error",
+        "content": "error during generate loop: scheduler failed",
+    }
+    assert (sent[2]["code"], sent[2]["reason"]) == (1011, "generation failed")
+
+
 def test_cleanup_realtime_session_keeps_active_slot_during_scheduler_release(
     monkeypatch,
 ):
