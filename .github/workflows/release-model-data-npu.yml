@@ -145,7 +145,7 @@ jobs:
     needs: [metadata]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-amd64-a5-8
+      runner: linux-aarch64-a5-8
       test_type: accuracy
       # test_suite names the persisted output/metrics directory; the case file
       # itself is handed over through test_case.
