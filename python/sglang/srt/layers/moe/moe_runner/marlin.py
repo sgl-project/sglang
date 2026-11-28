@@ -180,6 +180,7 @@ def fused_experts_none_to_marlin(
         is_gated=runner_config.is_gated,
         no_combine=runner_config.no_combine,
         no_combine_keep_router_weight=runner_config.no_combine_keep_router_weight,
+        apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

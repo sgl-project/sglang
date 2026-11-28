@@ -1376,20 +1376,12 @@ def _mxfp8_moe_weights(e: int, n: int, k: int):
     return quantized.reshape(e, n, k), (exponent + 127).to(torch.uint8), reference
 
 
-@pytest.mark.parametrize("m", [1, 33, 73, 137, 222])
-# keep_router_weight None leaves the argument at its default.
-@pytest.mark.parametrize(
-    "no_combine, keep_router_weight",
-    [(False, None), (True, None), (True, True), (True, False)],
-)
-def test_fused_marlin_moe_mxfp8(m, no_combine, keep_router_weight):
-    """Catches missing E8M0 dispatch, FP8 exponent bias and weighted-route regressions."""
+def _mxfp8_marlin_experts(e: int, k: int, n: int):
+    """Gated MXFP8 experts prepared for Marlin, with float32 w13 and w2 references."""
     from sglang.srt.layers.quantization.marlin_utils_fp8 import (
         prepare_moe_mxfp8_layer_for_marlin,
     )
 
-    torch.manual_seed(0)
-    e, topk, k, n = 8, 2, 256, 128
     w13, s13, ref13 = _mxfp8_moe_weights(e, 2 * n, k)
     w2, s2, ref2 = _mxfp8_moe_weights(e, k, n)
     layer = torch.nn.Module()
@@ -1398,6 +1390,20 @@ def test_fused_marlin_moe_mxfp8(m, no_combine, keep_router_weight):
     layer.w13_weight_scale_inv = torch.nn.Parameter(s13, requires_grad=False)
     layer.w2_weight_scale_inv = torch.nn.Parameter(s2, requires_grad=False)
     prepare_moe_mxfp8_layer_for_marlin(layer)
+    return layer, ref13, ref2
+
+
+@pytest.mark.parametrize("m", [1, 33, 73, 137, 222])
+# keep_router_weight None leaves the argument at its default.
+@pytest.mark.parametrize(
+    "no_combine, keep_router_weight",
+    [(False, None), (True, None), (True, True), (True, False)],
+)
+def test_fused_marlin_moe_mxfp8(m, no_combine, keep_router_weight):
+    """Catches missing E8M0 dispatch, FP8 exponent bias and weighted-route regressions."""
+    torch.manual_seed(0)
+    e, topk, k, n = 8, 2, 256, 128
+    layer, ref13, ref2 = _mxfp8_marlin_experts(e, k, n)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     logits = torch.randn(m, e, device="cuda", dtype=torch.bfloat16)
     weights, ids = torch.topk(logits.float().softmax(-1), topk)
@@ -1427,6 +1433,59 @@ def test_fused_marlin_moe_mxfp8(m, no_combine, keep_router_weight):
         expected = weighted_routes.sum(1)
     else:
         expected = routes if keep_router_weight is False else weighted_routes
+    assert output.shape == expected.shape
+    relative_error = (output.float() - expected).norm() / expected.norm()
+    assert relative_error < 0.01
+    route_error = (output.float() - expected).norm(dim=-1) / expected.norm(dim=-1)
+    assert route_error.max() < 0.02
+
+
+@pytest.mark.parametrize("m", [1, 73])
+@pytest.mark.parametrize("topk", [1, 2])
+@pytest.mark.parametrize("no_combine", [False, True])
+@pytest.mark.parametrize("apply_router_weight_on_input", [False, True])
+@pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
+def test_fused_marlin_moe_mxfp8_router_weight_placement(
+    m, topk, no_combine, apply_router_weight_on_input, weights_dtype
+):
+    """A router weight on the input weights each route's expert input, not its
+    output, also in no_combine rows; BF16 router weights are read as BF16."""
+    torch.manual_seed(0)
+    e, k, n = 8, 256, 128
+    layer, ref13, ref2 = _mxfp8_marlin_experts(e, k, n)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    logits = torch.randn(m, e, device="cuda", dtype=torch.bfloat16)
+    weights, ids = torch.topk(logits.float().softmax(-1), topk)
+    weights = weights.to(weights_dtype)
+    output = fused_marlin_moe(
+        hidden_states=x,
+        w1=layer.w13_weight,
+        w2=layer.w2_weight,
+        w1_scale=layer.w13_weight_scale,
+        w2_scale=layer.w2_weight_scale,
+        gating_output=logits,
+        topk_weights=weights,
+        topk_ids=ids.to(torch.int32),
+        num_bits=8,
+        no_combine=no_combine,
+        # Omitted for output weights, so those cases also run on code without it.
+        **(
+            {"apply_router_weight_on_input": True}
+            if apply_router_weight_on_input
+            else {}
+        ),
+    )
+    route_weights = weights.float()[..., None]
+    expert_inputs = x.float()[:, None].expand(m, topk, k)
+    if apply_router_weight_on_input:
+        expert_inputs = expert_inputs * route_weights
+    gate_up = torch.einsum("mrk,mrnk->mrn", expert_inputs, ref13[ids])
+    gate, up = gate_up.bfloat16().float().chunk(2, dim=-1)
+    act = (torch.nn.functional.silu(gate) * up).bfloat16().float()
+    routes = torch.einsum("mrn,mrkn->mrk", act, ref2[ids])
+    if not apply_router_weight_on_input:
+        routes = routes * route_weights
+    expected = routes if no_combine else routes.sum(1)
     assert output.shape == expected.shape
     relative_error = (output.float() - expected).norm() / expected.norm()
     assert relative_error < 0.01

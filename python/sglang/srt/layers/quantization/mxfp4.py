@@ -622,7 +622,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 and not get_platform().is_sm120
             ):
                 raise RuntimeError("MXFP4 Marlin requires SM90+.")
-            if not check_moe_marlin_supports_layer(layer, 32, allow_tile_padding=True):
+            # On CUDA, create_weights always registers a w13 bias (zeros when
+            # the checkpoint has none), and the Marlin path passes it on.
+            if not check_moe_marlin_supports_layer(
+                layer, 32, allow_tile_padding=True, has_w13_bias=True
+            ):
                 raise RuntimeError(
                     "Current MXFP4 MoE layer is not supported by Marlin."
                 )
