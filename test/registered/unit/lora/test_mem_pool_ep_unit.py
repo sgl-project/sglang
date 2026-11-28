@@ -235,6 +235,73 @@ class TestDeterministicPoolSlots(unittest.TestCase):
         self.assertEqual(self._evict_after_touch(forward), expected)
         self.assertEqual(self._evict_after_touch(reverse), expected)
 
+    def test_non_strict_loading_skips_unmatched_layer_and_embedding_weights(self):
+        """With strict_loading=False, weights whose names do not match any
+        configured target_modules are logged and skipped without raising."""
+        pool = LoRAMemoryPool.__new__(LoRAMemoryPool)
+        pool.tp_size = 1
+        pool.tp_rank = 0
+        pool.num_layer = 1
+        pool.max_lora_rank = 4
+        pool.target_modules = {"qkv_proj"}
+        pool.strict_loading = False
+        pool.lora_added_tokens_size = 0
+        pool.base_model = torch.nn.Module()
+        pool.base_hf_config = types.SimpleNamespace(vocab_size=16)
+        pool.A_buffer = {"qkv_proj": [torch.zeros(1, 12, 8)]}
+        pool.B_buffer = {"qkv_proj": [torch.zeros(1, 24, 4)]}
+        pool.embedding_A_buffer = {}
+        pool.embedding_B_buffer = {}
+        pool.lm_head_A_buffer = {}
+        pool.lm_head_B_buffer = {}
+        pool.new_embeddings_buffer = {}
+        pool._weight_transfer_cache = {}
+        pool._get_maybe_cached_weight_for_transfer = (
+            lambda _pinned, _key, weight: weight
+        )
+
+        qkv_mod = types.SimpleNamespace(
+            slice_lora_a_weights=lambda w: w,
+            slice_lora_b_weights=lambda w: w,
+        )
+        lora_a = torch.ones(12, 8)
+        lora_b = torch.full((24, 4), 2.0)
+        adapter = types.SimpleNamespace(
+            config=types.SimpleNamespace(r=4, lora_added_tokens_size=0),
+            scaling=1.0,
+            layers=[
+                types.SimpleNamespace(
+                    weights={
+                        "model.layers.0.self_attn.qkv_proj.lora_A.weight": lora_a,
+                        "model.layers.0.self_attn.qkv_proj.lora_B.weight": lora_b,
+                        "vision_tower.layers.0.attn.proj.lora_A.weight": torch.ones(
+                            4, 8
+                        ),
+                    },
+                    pinned_weights={},
+                )
+            ],
+            embedding_layers={
+                "model.embed_tokens.lora_embedding_A": torch.ones(4, 16),
+            },
+            pinned_embedding_layers={},
+            added_tokens_embeddings={},
+            pinned_added_tokens_embeddings={},
+        )
+
+        _load_lora_weight_to_buffer(
+            pool,
+            uid="adapter_with_extra_weights",
+            buffer_id=0,
+            lora_adapter=adapter,
+            lora_modules=[{"model.layers.0.self_attn.qkv_proj": qkv_mod}],
+            lora_embed_tokens_module=None,
+            lora_lm_head_module=None,
+        )
+
+        self.assertTrue(torch.equal(pool.A_buffer["qkv_proj"][0][0], lora_a))
+        self.assertTrue(torch.equal(pool.B_buffer["qkv_proj"][0][0], lora_b))
+
 
 class TestBufferSlotClearing(unittest.TestCase):
     @staticmethod
