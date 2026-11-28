@@ -17,6 +17,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=42, suite="base-a-test-cpu")
 
 
+def _sampling_params_table(num_rows, device):
+    from sglang.srt.sampling import sampling_params_pool as sp_pool
+
+    with patch.object(sp_pool, "num_watermark_fields", return_value=0):
+        return sp_pool.SamplingParamsTable(num_rows, device)
+
+
 @pytest.mark.parametrize("fields", [{}, {"shift_label": False}, {"shift_label": True}])
 def test_legacy_selector_shift_label_parsing_is_unchanged(fields):
     config = parse_dflash_draft_config(
@@ -99,8 +106,10 @@ def test_selector_prediction_rows_follow_shift_label(path, shift_label, position
             max_bs=2,
             device="cpu",
             sampling_enabled=False,
+            sampling_params_table=_sampling_params_table(2, "cpu"),
         )
-        sampler(hidden.view(-1, 2), block_ids.flatten())
+        slots = torch.arange(2)
+        sampler(hidden.view(-1, 2), block_ids.flatten(), slots)
         tokens = sampler.out.view(2, 3)
 
     expected = hidden[:, positions]
@@ -128,16 +137,18 @@ def test_selector_prediction_rows_in_cuda_graph(shift_label, positions):
         max_bs=2,
         device="cuda",
         sampling_enabled=False,
+        sampling_params_table=_sampling_params_table(2, "cuda"),
     )
+    slots = torch.arange(2, device="cuda")
     warmup = torch.cuda.Stream()
     warmup.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup):
         for _ in range(3):
-            sampler(hidden.view(-1, 2), block_ids.flatten())
+            sampler(hidden.view(-1, 2), block_ids.flatten(), slots)
     torch.cuda.current_stream().wait_stream(warmup)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        sampler(hidden.view(-1, 2), block_ids.flatten())
+        sampler(hidden.view(-1, 2), block_ids.flatten(), slots)
 
     # Replay must read fresh rows and anchors, not warmup/capture values.
     hidden.add_(100)
