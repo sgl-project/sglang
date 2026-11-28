@@ -71,6 +71,8 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
     is_non_idle_and_non_empty,
+    router_quant_config,
+    unquantize_router_if_stored_so,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
@@ -268,21 +270,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        # Router gate: description-driven quant. Only the offline ModelSlim path
-        # (which carries a per-layer quant_model_description) may quantise the
-        # gate — if the checkpoint stored it as MXFP8 it is loaded
-        # and dequantised correctly instead of cast to bf16 without its block scale.
-        # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
-        gate_quant_config = (
-            quant_config
-            if (quant_config is not None and quant_config.get_name() == "modelslim")
-            else None
-        )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=gate_quant_config,
+            quant_config=router_quant_config(quant_config),
             prefix=add_prefix("gate", prefix),
         )
         self.topk = self._make_topk(config, layer_id, norm_topk_prob)
@@ -1248,6 +1240,10 @@ class Qwen3MoeForCausalLM(nn.Module):
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
 
+                    # A router the checkpoint stores unquantized although the config quantizes it
+                    unquantize_router_if_stored_so(
+                        self, name, loaded_weight, params_dict, (".mlp.gate",)
+                    )
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue

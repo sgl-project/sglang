@@ -40,6 +40,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
+from sglang.srt.models.utils import unquantize_router_if_stored_so
 
 logger = logging.getLogger(__name__)
 
@@ -694,6 +695,10 @@ class Llama4ForConditionalGeneration(nn.Module):
             ):
                 continue
 
+            # A router the checkpoint stores unquantized although the config quantizes it
+            unquantize_router_if_stored_so(
+                self, name, loaded_weight, params_dict, (".feed_forward.router",)
+            )
             loaded_params.add(name)
             self._handle_default_weight(name, loaded_weight, params_dict)
         unloaded_params = params_dict.keys() - loaded_params
