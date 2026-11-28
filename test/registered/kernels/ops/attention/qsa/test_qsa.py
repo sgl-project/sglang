@@ -486,6 +486,31 @@ def test_qsa_cuda_graph_target_verify_ignores_capture_bucket_requests():
     assert row_prefix_lengths.tolist() == [9, 9, 9, 9, 0, 0, 0, 0]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_qsa_fa2_scratch_outlives_a_larger_eager_batch():
+    # A captured graph keeps writing the scratch it was captured with; a larger
+    # eager batch must not hand that memory back to the allocator.
+    backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
+    backend._fa2_scratch = {}
+    backend._fa2_graph_scratch = {}
+    args = (8, 256, torch.bfloat16, torch.device("cuda"))  # 16 MiB per buffer
+    backend._get_fa2_scratch(4096, *args, in_graph=True)  # warmup before capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        packed_k, packed_v = backend._get_fa2_scratch(4096, *args, in_graph=True)
+        packed_k.fill_(1)
+        packed_v.fill_(1)
+    shape = packed_k.shape
+    del packed_k, packed_v
+    backend._get_fa2_scratch(8192, *args, in_graph=False)
+    # Default caching allocator: if the captured pair was freed, its two 16 MiB
+    # blocks are the only free ones of that size, so these two take them.
+    others = [torch.zeros(shape, dtype=torch.bfloat16, device="cuda") for _ in range(2)]
+    graph.replay()
+    torch.cuda.synchronize()
+    assert all(t.count_nonzero().item() == 0 for t in others)
+
+
 def test_qsa_target_verify_rejects_branching_speculation():
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
     backend.compress_ratio = 4

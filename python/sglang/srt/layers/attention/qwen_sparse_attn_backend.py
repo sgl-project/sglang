@@ -371,6 +371,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             Tuple[int, int, torch.dtype, torch.device],
             Tuple[torch.Tensor, torch.Tensor],
         ] = {}
+        # Scratch handed to CUDA graph capture, by address: the graphs keep raw
+        # pointers to it after a larger eager batch replaces it in _fa2_scratch.
+        self._fa2_graph_scratch: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._graph_seq_lens = None
         self._graph_token_to_batch = None
         self._graph_cu_seqlens_q = None
@@ -1916,6 +1919,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         head_dim: int,
         dtype: torch.dtype,
         device: torch.device,
+        in_graph: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         key = (num_kv_heads, head_dim, dtype, device)
         buffers = self._fa2_scratch.get(key)
@@ -1928,6 +1932,8 @@ class QwenSparseAttnBackend(AttentionBackend):
                 torch.zeros(shape, dtype=dtype, device=device),
             )
             self._fa2_scratch[key] = buffers
+        if in_graph:
+            self._fa2_graph_scratch[buffers[0].data_ptr()] = buffers
         return buffers[0][:capacity], buffers[1][:capacity]
 
     def _get_trtllm_sparse_tables(self, batch, pages_per_row, page, device):
@@ -1992,6 +1998,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer.shape[2],
             packed_dtype,
             k_buffer.device,
+            in_graph=metadata.is_cuda_graph,
         )
         if new_kv is not None:
             k, v, loc, width = new_kv
@@ -2260,6 +2267,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_buffer.shape[2],
             q.dtype,
             k_buffer.device,
+            in_graph=metadata.is_cuda_graph,
         )
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
