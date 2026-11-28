@@ -986,8 +986,17 @@ print("NCCL package and runtime versions are 2.31.2")
 
 import torch
 print(torch.version.cuda)
-import deep_ep
-print(f"deep_ep loads from {deep_ep.__file__}")
+if os.environ.get("SGLANG_CI_IMAGE_BUILD") == "1":
+    # deep_ep refuses to import without a CUDA device, and an image build has
+    # none: check that it is installed instead.
+    import importlib.util
+    deep_ep_spec = importlib.util.find_spec("deep_ep")
+    if deep_ep_spec is None:
+        raise SystemExit("deep_ep is not installed")
+    print(f"deep_ep installed at {deep_ep_spec.origin} (not imported: no GPU in an image build)")
+else:
+    import deep_ep
+    print(f"deep_ep loads from {deep_ep.__file__}")
 import cutlass
 import cutlass.cute
 
