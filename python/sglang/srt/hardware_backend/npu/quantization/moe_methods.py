@@ -186,7 +186,9 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
         self.quant_config = quant_config
 
     @staticmethod
-    def _set_moe_dispatch_dtype(layer: torch.nn.Module, dtype) -> None:
+    def _set_moe_dispatch_dtype(
+        layer: torch.nn.Module, dtype, *, bf16_only=False
+    ) -> None:
         """Record the dtype each path must hand to the Ascend grouped matmuls.
 
         The no-A2A path keeps it on the layer: ``npu_moe_init_routing_v2``'s
@@ -199,7 +201,10 @@ class _NPUMoEMethodBase(FusedMoEMethodBase):
         ascend_dispatch.set_dispatch_dtype(layer, dtype)
         dispatcher = getattr(layer, "dispatcher", None)
         if dispatcher is not None and hasattr(dispatcher, "set_quant_config"):
-            dispatcher.set_quant_config({"dispatcher_output_dtype": dtype})
+            config = {"dispatcher_output_dtype": dtype}
+            if bf16_only:
+                config["npu_expert_requires_bf16"] = True
+            dispatcher.set_quant_config(config)
 
     @staticmethod
     def _validate_weight_prefix(layer: torch.nn.Module, weight_prefix: str) -> None:
@@ -1036,7 +1041,7 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
             weight.data = npu_format_cast(weight)
 
         if weight_prefix == "w13":
-            self._set_moe_dispatch_dtype(layer, "bf16")
+            self._set_moe_dispatch_dtype(layer, "bf16", bf16_only=True)
 
     def apply(
         self,

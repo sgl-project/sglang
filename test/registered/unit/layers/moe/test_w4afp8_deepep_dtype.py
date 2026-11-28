@@ -41,6 +41,45 @@ class TestW4AFP8DeepEPDispatcherDtype(CustomTestCase):
             }
         )
 
+    def test_npu_mixed_experts_with_explicit_int8(self):
+        with (
+            patch.object(moe_utils, "_is_npu", True),
+            patch.object(moe_utils, "get_server_args", return_value=True),
+            patch.object(moe_utils, "get_exec") as execution,
+        ):
+            execution.return_value.moe.deepep_dispatcher_output_dtype = "int8"
+            for mode in (DeepEPMode.NORMAL, DeepEPMode.LOW_LATENCY):
+                for contract, expected in (
+                    ({}, DispatcherOutputDtype.INT8),
+                    ({"npu_expert_requires_bf16": True}, DispatcherOutputDtype.BF16),
+                ):
+                    dispatcher = SimpleNamespace(
+                        quant_config=contract, dispatch_mode=mode
+                    )
+                    self.assertEqual(
+                        moe_utils.get_deepep_output_dtype(dispatcher), expected
+                    )
+
+    def test_bf16_only_legacy_normal_dispatch(self):
+        impl = SimpleNamespace(
+            use_mxfp4=False,
+            use_mxfp8=False,
+            use_fp8=False,
+            quant_config={"npu_expert_requires_bf16": True},
+        )
+        legacy = SimpleNamespace(dispatch=lambda x: x)
+        modern = SimpleNamespace(dispatch=lambda x, quant_mode: x)
+        get_kwargs = deepep._DeepEPDispatcherImplNormal._get_quantization_kwargs
+        with (
+            patch.object(deepep, "_is_npu", True),
+            patch.object(
+                deepep.envs.DEEP_NORMAL_MODE_USE_INT8_QUANT, "get", return_value=True
+            ),
+        ):
+            self.assertEqual(get_kwargs(impl, modern), {"quant_mode": "bf16"})
+            with self.assertRaisesRegex(RuntimeError, "BF16-only expert"):
+                get_kwargs(impl, legacy)
+
     def test_mode_specific_dtype_selection(self):
         quant_config = {
             "normal_dispatcher_output_dtype": "bf16",
