@@ -37,6 +37,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   budget or trusted URLs without --enable-token-space-preprocess-cache -> the core caches nothing
   --token-space-preprocess-cache-dir -> the core caches on disk; the check rate reaches the core
   adjacent images -> two offsets from mm_spans, not one scanned run
+  M-RoPE fallback -> none for a spec without M-RoPE, also for int item fields; else the strategy's
   equal features, different grids -> different item hashes
   equal feature bytes, different feature shapes -> different item hashes
   chat turns' media + partially expanded IDs -> prefix kept, new turn expanded
@@ -66,6 +67,7 @@ from sglang.srt.managers.multimodal_processor import (
     get_mm_processor,
     import_processors,
 )
+from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.multimodal.cache import DiskPreprocessCache, MultimodalPreprocessCache
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -643,6 +645,7 @@ _MODEL_TYPES_BY_ARCH = {
     "Qwen3OmniMoeForConditionalGeneration": ("qwen3_omni_moe",),
     "Qwen4ExpForConditionalGeneration": ("qwen4_exp",),
     "InklingForConditionalGeneration": ("inkling_mm_model",),
+    "DeepseekV4ForCausalLM": ("deepseek_v41",),
 }
 
 
@@ -650,6 +653,16 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
     def test_strategies_keep_the_legacy_processor_defaults(self):
         """A token-space model loads and schedules media like the legacy processor it replaces,
         except the alpha compositing `_STRATEGY_RGB_CONVERSION` records for it."""
+        reset_context()
+        self.addCleanup(reset_context)
+        # Legacy V4.1 reads the image backend before the shared base; pil keeps it off
+        # the Rust extension.
+        publish(
+            ServerArgs(
+                model_path="dummy", model_impl="sglang", image_processor_backend="pil"
+            ),
+            role="test",
+        )
         import_processors("sglang.srt.multimodal.processors")
         register_token_space_models()
         legacy = {
@@ -983,6 +996,61 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             self._item_hash(_PixelShapeStrategy, (1, 2)),
             self._item_hash(_PixelShapeStrategy, (2, 1)),
         )
+
+    def test_mrope_fallback_rebuilds_fields_unless_the_spec_has_no_mrope(self):
+        """A spec without M-RoPE answers the fallback with none, also for int item fields
+        a rebuild could not concatenate; by default the strategy gets the rebuilt fields."""
+
+        class _MropeStrategy(_ImageWidthStrategy):
+            mm_item_fields = {"pixel_values": Modality.IMAGE, "width": Modality.IMAGE}
+
+            def compute_mrope_positions(self, output):
+                return output["width"].tolist(), None
+
+        class _NoMropeSpec(TokenSpaceServingSpec):
+            uses_mrope_positions = False
+
+        reset_context()
+        self.addCleanup(reset_context)
+        server_args = ServerArgs(
+            model_path="dummy",
+            model_impl="sglang",
+            mm_process_config={},
+            enable_token_space_processor=True,
+            mm_processor_worker_num=1,
+        )
+        publish(server_args, role="test")
+
+        def items(width_of):
+            return [
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=torch.ones(width, 1),
+                    offsets=[(start, start + width - 1)],
+                    model_specific_data={"width": width_of(width)},
+                )
+                for start, width in ((1, 2), (4, 3))
+            ]
+
+        input_ids = [1, IMAGE, IMAGE, 2, IMAGE, IMAGE, IMAGE]
+        # Int grids as legacy DeepSeek-V4.1 keeps n_vit_h and n_vit_w; tensors for M-RoPE.
+        for spec_class, width_of, positions in (
+            (_NoMropeSpec, int, (None, None)),
+            (
+                TokenSpaceServingSpec,
+                lambda width: torch.tensor([width]),
+                ([2, 3], None),
+            ),
+        ):
+            processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+                _MropeStrategy, spec_class
+            )(None, server_args, _bare_tokenizer(), None)
+            self.addCleanup(processor.shutdown)
+            with self.subTest(spec=spec_class.__name__):
+                self.assertEqual(
+                    processor.compute_mrope_positions(input_ids, items(width_of)),
+                    positions,
+                )
 
 
 class TestStrategyLoaders(unittest.TestCase):
