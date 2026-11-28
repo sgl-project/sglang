@@ -197,6 +197,38 @@ class PipelineExecutor(ABC):
         if profiler:
             profiler.step_stage()
 
+    @staticmethod
+    def retain_stage_output(current, result):
+        if not isinstance(result, OutputBatch):
+            return result
+        if result.error:
+            raise RuntimeError(result.error)
+        current.extra["_deployment_result"] = result
+        current.output = result.output
+        current.audio = result.audio
+        current.audio_sample_rate = result.audio_sample_rate
+        if result.fps is not None:
+            current.fps = result.fps
+        return current
+
+    def stage_runner(self, server_args, run_stage):
+        """keep the request context across stage outputs; monolithic runs are untouched"""
+        if getattr(server_args, "stage_deployment", None) is None:
+            return run_stage
+
+        def run(stage, current):
+            result = run_stage(stage, current)
+            if isinstance(result, list):
+                if any(isinstance(item, OutputBatch) for item in result):
+                    return [
+                        self.retain_stage_output(req, item)
+                        for req, item in zip(current, result, strict=True)
+                    ]
+                return result
+            return self.retain_stage_output(current, result)
+
+        return run
+
     def execute_with_profiling(
         self,
         stages: List["PipelineStage"],

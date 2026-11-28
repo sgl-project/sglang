@@ -1603,8 +1603,8 @@ class ClassifyRequest(BaseModel):
 
 class ClassifyData(BaseModel):
     index: int
-    label: str
-    probs: List[float]
+    label: Union[str, List[str]]
+    probs: Union[List[float], List[List[float]]]
     num_classes: int
 
 

@@ -129,6 +129,13 @@ This isolation does not make untrusted pickle safe or recover from GPU failures.
 
 ### Disaggregated serving
 
+Experimental [stage deployments](/docs/sglang-diffusion/disaggregation/stage-deployments) place named stage groups from a JSON file instead of the preset roles below. Do not combine the two.
+
+- `--stage-deployment {JSON_PATH}`: stage contracts and named role placement. Without a worker selector, launches the coordinator and existing generation API.
+- `--stage-node {NAME}`: launch all worker processes assigned to this node, using their declared server arguments.
+- `--stage-role {NAME}` and `--stage-endpoint {TCP_ENDPOINT}`: launch one named worker using its own CLI arguments instead of the node launcher.
+- `--disagg-max-slots-per-instance {N}`: retained results per stage worker and coordinator request capacity (default: 8).
+
 - `--disagg-role {monolithic|encoder|prompt_encoder|image_encoder|denoiser|decoder|server}`: select the stages run by this process. `monolithic` is the default; the split `prompt_encoder` and `image_encoder` roles currently support FLUX.3 Image.
 - `--disagg-server-addr {TCP_ENDPOINT}`: head scheduler endpoint used by workers for registration and result routing.
 - `--encoder-urls {ENDPOINTS}`: combined encoder pool on the head. For split encoding, replace it with both `--prompt-encoder-urls` and `--image-encoder-urls`; do not mix the two topologies.
@@ -167,9 +174,18 @@ pipeline's registered module name:
 | Replace a component | `--component-paths.<component> {MODEL}` | `--<component>-path {MODEL}` | Load the replacement component's configuration and weights |
 | Replace only its weights | `--component-weights-paths.<component> {WEIGHTS}` | `--<component>-weights-path {WEIGHTS}` | Retain the base component configuration and replace its weights |
 | Select component precision | `--component-precisions.<component> {DTYPE}` | — | Use a loader-supported exact parameter and execution dtype |
-| Direct-load an eligible component | `--component-direct-gpu-weight-loading.<component>` | None | Use that component's audited direct-GPU loader; it must stay resident |
+| Direct-load an eligible component | `--component-direct-gpu-weight-loading.<component>` | None | Set `false` to force normal loading or `true` to request direct GPU loading for a resident component. |
 | Quantize an unquantized component online | `--component-quantizations.<component> {METHOD}` | `--<component>-quantization {METHOD}` | Apply a method supported by that component's native loader |
 | Keep selected component layers unquantized | `--component-quantization-ignored-layers.<component> {PATTERN...}` | None | Pass component-local ignored-layer patterns to its online quantizer |
+
+On a single NVIDIA B200, the native MiniMax-H3 video VAE and Wan2.1 480p
+T2V/I2V VAEs automatically load local FP32 weights through a CPU file mapping,
+uploading each tensor into its parameter storage. CPU/layerwise offload, FSDP,
+component overrides and other devices keep their existing defaults. An explicit
+`SGLANG_USE_RUNAI_MODEL_STREAMER=1` leaves automatic mmap loading off.
+For another supported resident CUDA VAE, select the same reader explicitly with
+`SGLANG_USE_RUNAI_MODEL_STREAMER=0` and
+`--component-direct-gpu-weight-loading.vae true` (use the actual component name).
 
 For example, pair any replacement text-encoder configuration with a separate
 single-file checkpoint as follows:

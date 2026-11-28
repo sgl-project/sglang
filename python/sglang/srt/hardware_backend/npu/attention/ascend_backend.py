@@ -395,6 +395,7 @@ class AscendAttnBackend(AttentionBackend):
         dense_mla = self.use_mla and not self.use_dsa
         self.dense_mla_dcp_target = dense_mla and self.dcp_size > 1
         self.dsa_dcp_target = self.use_dsa and self.dcp_size > 1
+        self.use_decode_indexer_request_shard = parallel.attn_tp_size > 1
         if self.use_mla:
             self.nope_padding_dtype = self.model_dtype or torch.bfloat16
             if (
@@ -2163,7 +2164,11 @@ class AscendAttnBackend(AttentionBackend):
             k_rope = k_rope.reshape(
                 k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
             )
-            if getattr(self.token_to_kv_pool, "layer_shard_enabled", False):
+            kv_view = (
+                self.token_to_kv_pool.layer_router.wrapped_view()
+                or self.token_to_kv_pool
+            )
+            if getattr(kv_view, "layer_shard_enabled", False):
                 # The split pool caches the CP-gathered full-sequence copy on
                 # non-owner ranks, skipping the get-time owner broadcast.
                 # Only safe when this write covers the whole read range: a

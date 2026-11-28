@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
 import torch
-
-from sglang.srt.utils.device import async_h2d
 
 from ..batch_layout import num_prefill_rows
 from ..config import (
@@ -99,37 +97,40 @@ def resolve_watermark_request(
     return resolved_key, context_window, True
 
 
-def build_rows(
-    requests: Sequence[Req],
-    *,
-    features: ExecFeatures,
-    device: torch.device | str,
-) -> Optional[GumbelRows]:
-    keys = []
-    context_windows = []
-    enabled = []
-    candidates = []
-    for request in requests:
-        config = request.sampling_params.watermark
-        key, context_window, request_enabled = resolve_watermark_request(
-            config,
-            server_enabled=True,
-            default_key=features.watermark_key,
-            default_context_window=features.watermark_context_window,
-            default_enabled=features.watermark_default_enabled,
-            enforce_all=features.watermark_enforce_all,
-        )
-        keys.append(parse_watermark_key(key) if key is not None else 0)
-        context_windows.append(context_window)
-        enabled.append(request_enabled)
-        candidates.append(request_enabled and request.sampling_params.top_k > 1)
-    if not any(candidates):
-        return None
+# The fields a request keeps in `SamplingParamsPool`: its int64 key as (low, high)
+# int32 halves, its context window, and whether it is enabled.
+NUM_POOL_FIELDS = 4
+_KEY_LO, _KEY_HI, _CONTEXT_WINDOW, _ENABLED = range(NUM_POOL_FIELDS)
+
+
+def pool_values(
+    request: Req, *, features: ExecFeatures
+) -> tuple[bool, tuple[int, int, int, int]]:
+    key, context_window, request_enabled = resolve_watermark_request(
+        request.sampling_params.watermark,
+        server_enabled=True,
+        default_key=features.watermark_key,
+        default_context_window=features.watermark_context_window,
+        default_enabled=features.watermark_default_enabled,
+        enforce_all=features.watermark_enforce_all,
+    )
+    key_value = parse_watermark_key(key) if key is not None else 0
+    candidate = request_enabled and request.sampling_params.top_k > 1
+    return candidate, (
+        _as_signed_int32(key_value & 0xFFFFFFFF),
+        key_value >> 32,
+        context_window,
+        int(request_enabled),
+    )
+
+
+def build_rows(values: torch.Tensor, candidates_host: list[bool]) -> GumbelRows:
+    keys = torch.stack((values[_KEY_LO], values[_KEY_HI]), dim=1)
     return GumbelRows(
-        keys=async_h2d(keys, dtype=torch.int64, device=device),
-        context_windows=async_h2d(context_windows, dtype=torch.int32, device=device),
-        enabled=async_h2d(enabled, dtype=torch.bool, device=device),
-        candidates_host=candidates,
+        keys=keys.view(torch.int64).view(-1),
+        context_windows=values[_CONTEXT_WINDOW],
+        enabled=values[_ENABLED].bool(),
+        candidates_host=candidates_host,
     )
 
 

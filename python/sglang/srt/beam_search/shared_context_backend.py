@@ -43,6 +43,7 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
     def __init__(self, model_runner, *args, **kwargs):
         super().__init__(model_runner, *args, **kwargs)
         shared_context_attention.supports_shared_context(model_runner)
+        self.shared_context_kernel = shared_context_attention.resolve_attention_kernel()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if not shared_context_attention.has_shared_context(forward_batch):
@@ -77,4 +78,6 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
                     *self._kv_write_scales(layer),
                 )
 
-        return shared_context_attention.forward(q, layer, forward_batch, self.kv_layers)
+        return shared_context_attention.forward(
+            q, layer, forward_batch, self.kv_layers, self.shared_context_kernel
+        )

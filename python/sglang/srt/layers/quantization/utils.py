@@ -67,6 +67,19 @@ _FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
     "gate_up_proj": ["gate_proj", "up_proj"],
 }
 
+
+def reads_scoped_fused_shards(quant_config: Optional[QuantizationConfig]) -> bool:
+    # Configs whose fused-layer lookup honors dotted packed_modules_mapping
+    # keys (AWQ's is_layer_skipped_awq, AutoRound's first-match fusion loop).
+    from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+    from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
+    from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
+
+    if isinstance(quant_config, MoeWNA16Config):
+        return quant_config.linear_quant_method == "awq"
+    return isinstance(quant_config, (AWQConfig, AWQMarlinConfig, AutoRoundConfig))
+
+
 # GPTQ dynamic negative rules reference checkpoint-side shard names, including
 # split GDN projections (`in_proj_qkv`/`in_proj_z` and `in_proj_b`/`in_proj_a`)
 # that are fused into `in_proj_qkvz` and `in_proj_ba` in SGLang.
