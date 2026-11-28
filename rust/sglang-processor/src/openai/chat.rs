@@ -13,14 +13,17 @@ use sglang_api_types::api::v1::{
     token_ids_or_list,
 };
 
-use super::kimi_k3_tag::auto_tool_call_tag;
+use super::kimi_k3_tag::{
+    ForcedChoice, auto_tool_call_tag, forced_tool_call_tag, none_tool_call_tag,
+};
+use super::kimi_k3_wire::{self, KimiK3Wire};
 use super::request::{
     OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
     lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Reply, StreamState, abort_event, finish_fields, logprob_slice, logprobs_length, now,
-    unary_reply,
+    Reply, StreamState, abort_event, cached_per_prompt, error_reply, finish_fields, logprob_slice,
+    logprobs_length, now, status_abort, unary_reply, unary_response,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 use crate::py::python_json;
@@ -440,8 +443,15 @@ pub fn lower_chat(
     }
     let reasoning_parser = settings.reasoning_parser.as_deref();
     let tool_call_parser = settings.tool_call_parser.as_deref();
+    // Only K3's tool parser has its forced-call structural tag here.
+    let tools = request_tools(&raw, tool_call_parser == Some("kimi_k3"))?;
+    // `tool_choice: "none"` keeps the tools out of parsing and the prompt's
+    // tool framing (`_process_messages` skips both for it).
+    let parses_tools = tools
+        .as_ref()
+        .is_some_and(|choice| *choice != ToolChoice::None);
     // recipe parses DeepSeek output from its token ids in place of both parsers.
-    let deepseek = deepseek::parsing(model, settings, &original, request_tools(&raw)?.is_some())?;
+    let deepseek = deepseek::parsing(model, settings, &original, parses_tools)?;
     let parser = match reasoning_parser {
         Some(name) if deepseek.is_none() => {
             Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?)
@@ -459,11 +469,10 @@ pub fn lower_chat(
     {
         return Err(Unsupported("tool_grammar"));
     }
-    let tools = request_tools(&raw)?;
     let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
-    let tool_parsing = match (tool_call_parser, &tools, &tool_definitions) {
-        (Some(parser), Some(_), Some(definitions)) if deepseek.is_none() => {
+    let tool_parsing = match (tool_call_parser, parses_tools, &tool_definitions) {
+        (Some(parser), true, Some(definitions)) if deepseek.is_none() => {
             tool_detector(parser, definitions).ok_or(Unsupported("tool_parser"))?;
             Some((parser.to_owned(), definitions.clone()))
         }
@@ -485,6 +494,17 @@ pub fn lower_chat(
     {
         return Err(Unsupported("invalid_request"));
     }
+    // The K3 wire's `internal_content` needs token provenance this layer does
+    // not keep.
+    if model.is_kimi_k3()
+        && raw.get("stream") == Some(&Value::Bool(true))
+        && raw
+            .get("stream_options")
+            .and_then(|options| options.get("include_internal_content"))
+            .is_some_and(|wants| !wants.is_null() && wants != false)
+    {
+        return Err(Unsupported("internal_content"));
+    }
     let mut request: ChatRequest =
         serde_json::from_value(Value::Object(raw)).map_err(|_| Unsupported("unparsed_request"))?;
     validate(&request, settings, model)?;
@@ -503,7 +523,7 @@ pub fn lower_chat(
         request.skip_special_tokens = false;
     }
     // `_process_messages`: tool output keeps the parser's special tokens.
-    if tools.is_some() {
+    if parses_tools {
         request.skip_special_tokens = false;
     }
     // K3 also stops on its tool parser's `eot_token`.
@@ -535,9 +555,9 @@ pub fn lower_chat(
         &request, &kwargs, model, prompt_ids, thinking, headers, settings,
     )?;
     lowered.custom_labels = labels;
-    // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
-    // its structural tag, unless the request is already constrained; Python
-    // tests the constraints by truthiness, so empty strings are unset.
+    // `get_structure_constraint`: K3's tool parser constrains tool calls by its
+    // structural tag, unless the request is already constrained; Python tests
+    // the constraints by truthiness, so empty strings are unset.
     let Some(sampling_params_or_list::Value::One(sampling)) = lowered
         .sampling_params
         .as_mut()
@@ -545,11 +565,26 @@ pub fn lower_chat(
     else {
         unreachable!("one sampling configuration")
     };
-    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
+    let constrained = [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
+        .iter()
+        .any(|value| value.as_deref().is_some_and(|v| !v.is_empty()));
+    let forced = tools.as_ref().and_then(ToolChoice::forced);
+    if let (Some(forced), Some((tool_parser, _)), Some(definitions)) =
+        (forced, &tool_parsing, &tool_definitions)
         && tool_parser == "kimi_k3"
-        && [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
-            .iter()
-            .all(|value| value.as_deref().is_none_or(str::is_empty))
+    {
+        // `to_sampling_params` refuses a forced call under another output
+        // constraint, except a JSON `response_format` a renderer states in the
+        // prompt, which it drops; the engine's layer serves both.
+        if constrained {
+            return Err(Unsupported("tool_choice"));
+        }
+        let tag = forced_tool_call_tag(definitions, forced, parallel_tool_calls)
+            .ok_or(Unsupported("invalid_request"))?;
+        sampling.structural_tag = Some(python_json(&tag, true));
+    } else if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
+        && tool_parser == "kimi_k3"
+        && !constrained
     {
         // `strip_structural_tag_excludes`: the reasoning parser owns the think tokens.
         let strip = parser
@@ -559,6 +594,14 @@ pub fn lower_chat(
         if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
             sampling.structural_tag = Some(python_json(&tag, true));
         }
+    } else if tools == Some(ToolChoice::None)
+        && tool_call_parser == Some("kimi_k3")
+        && model.is_kimi_k3()
+        && !constrained
+    {
+        // `_process_messages`: the K3 prompt still lists the tools, so the
+        // output is held to a nonempty response with no tools section.
+        sampling.structural_tag = Some(python_json(&none_tool_call_tag(), true));
     }
     if let Some(stop) = tool_call_stop {
         let mut stops = match sampling.stop.take().and_then(|s| s.value) {
@@ -573,6 +616,8 @@ pub fn lower_chat(
     }
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
+    // The K3 wire reports usage only at each choice's end and in the summary.
+    let continuous_usage_stats = continuous_usage_stats && !model.is_kimi_k3();
     let reasoning = parser
         .filter(|_| request.separate_reasoning)
         .map(|config| ReasoningConfig {
@@ -585,21 +630,9 @@ pub fn lower_chat(
                     == Some(&Value::Bool(true)),
             },
         });
-    let history_tool_calls = request
-        .messages
-        .iter()
-        .filter(|m| {
-            m["role"]
-                .as_str()
-                .is_some_and(|r| r.eq_ignore_ascii_case("assistant"))
-        })
-        .filter_map(|m| m["tool_calls"].as_array())
-        .map(|calls| calls.len() as i64)
-        .sum();
     let responder = ChatResponder {
         model: request.model,
         unreported_prompt_tokens: model.unreported_prompt_tokens(),
-        history_tool_calls,
         n: request.n as usize,
         logprobs: request.logprobs,
         parsing: match deepseek {
@@ -620,23 +653,78 @@ pub fn lower_chat(
         finish_reasons: Vec::new(),
         tool_detectors: HashMap::new(),
         has_tool_calls: HashSet::new(),
+        kimi_k3_wire: model.is_kimi_k3().then(KimiK3Wire::default),
+        interruption: None,
     };
     Ok((lowered, responder))
 }
 
-/// The names of the tools a request lets the model call, or `None` when
-/// `tool_choice` turns them off. Only `auto` without strict tools is served:
-/// it adds no constraint, while the others depend on the engine's xgrammar.
-fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupported> {
-    let choice = raw.get("tool_choice").filter(|c| !c.is_null());
-    if choice.is_some_and(|c| c != "auto" && c != "none")
-        || raw
-            .get("parallel_tool_calls")
-            .is_some_and(|p| !p.is_boolean())
+/// A request's `tool_choice`, among the values the lowered path serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    /// `{"type": "function", "function": {"name": ...}}`.
+    Named(String),
+}
+
+impl ToolChoice {
+    /// The choice as Pydantic reads it; `None` for a value it types otherwise
+    /// or rejects, which the engine's OpenAI layer answers.
+    fn parse(raw: &Map<String, Value>) -> Option<Self> {
+        match raw.get("tool_choice") {
+            None | Some(Value::Null) => Some(Self::Auto),
+            Some(Value::String(choice)) => match choice.as_str() {
+                "auto" => Some(Self::Auto),
+                "none" => Some(Self::None),
+                "required" => Some(Self::Required),
+                _ => None,
+            },
+            Some(Value::Object(choice)) if choice.get("type").is_none_or(|t| t == "function") => {
+                let name = choice.get("function")?.get("name")?.as_str()?;
+                Some(Self::Named(name.to_owned()))
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// `"required"` or a named tool: the output must call a tool.
+    fn forced(&self) -> Option<ForcedChoice<'_>> {
+        match self {
+            Self::Required => Some(ForcedChoice::Required),
+            Self::Named(name) => Some(ForcedChoice::Named(name)),
+            Self::Auto | Self::None => None,
+        }
+    }
+}
+
+/// The `tool_choice` of a request that declares tools, or `None` without any.
+/// `ToolChoice::None` turns the tools off for parsing and the prompt, but K3
+/// still constrains its output.
+///
+/// `auto` over non-strict tools adds no constraint beyond the tool parser's.
+/// A choice that forces a call is served only with `forced_tag`, for a tool
+/// parser whose structural tag for it this layer builds; for the others it
+/// depends on the engine's own grammars.
+fn request_tools(
+    raw: &Map<String, Value>,
+    forced_tag: bool,
+) -> Result<Option<ToolChoice>, Unsupported> {
+    let choice = ToolChoice::parse(raw)
+        .filter(|choice| forced_tag || choice.forced().is_none())
+        .ok_or(Unsupported("tool_choice"))?;
+    if raw
+        .get("parallel_tool_calls")
+        .is_some_and(|p| !p.is_boolean())
     {
         return Err(Unsupported("tool_choice"));
     }
     let tools = match raw.get("tools") {
+        // `_validate_request`: a forced choice needs a tool to call.
+        None | Some(Value::Null) if choice.forced().is_some() => {
+            return Err(Unsupported("invalid_request"));
+        }
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Array(tools)) => tools,
         Some(_) => return Err(Unsupported("invalid_request")),
@@ -645,8 +733,12 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
     for tool in tools {
         let function = &tool["function"];
         let well_formed = tool.get("type").is_none_or(Value::is_string)
-            && tool.get("defer_loading").is_none_or(Value::is_null)
-            && function.get("defer_loading").is_none_or(Value::is_null)
+            // A deferred tool lowers: every renderer dumps the flag as
+            // `Tool._propagate_defer_loading` leaves it, and the templates that
+            // read it (GLM-5.3's) hide the tool as Python's do. A value pydantic
+            // would refuse goes to the engine for its 400.
+            && is_pydantic_flag(tool.get("defer_loading"))
+            && is_pydantic_flag(function.get("defer_loading"))
             && function.get("strict").is_none_or(|s| s == false)
             && function
                 .get("description")
@@ -655,15 +747,37 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         let (true, Some(name)) = (well_formed, function["name"].as_str()) else {
             return Err(Unsupported("tool_definition"));
         };
-        names.push(name.to_owned());
+        names.push(name);
     }
-    let parse = !tools.is_empty() && choice.is_none_or(|c| c == "auto");
-    Ok(parse.then_some(names))
+    // `_validate_request`: a forced choice needs a tool to call, and a named
+    // one a tool of its name.
+    match choice.forced() {
+        Some(_) if tools.is_empty() => return Err(Unsupported("invalid_request")),
+        Some(ForcedChoice::Named(name)) if !names.contains(&name) => {
+            return Err(Unsupported("invalid_request"));
+        }
+        _ => {}
+    }
+    Ok((!tools.is_empty()).then_some(choice))
 }
 
 const SCHEMA_TYPES: &[&str] = &[
     "string", "number", "integer", "boolean", "object", "array", "null",
 ];
+
+/// Whether `value` is an unset `Optional[bool]` or one pydantic's lax `bool`
+/// accepts: a boolean, 0 or 1, or a yes/no word in any case.
+fn is_pydantic_flag(value: Option<&Value>) -> bool {
+    match value {
+        None | Some(Value::Null | Value::Bool(_)) => true,
+        Some(Value::Number(n)) => matches!(n.as_f64(), Some(0.0 | 1.0)),
+        Some(Value::String(s)) => matches!(
+            s.to_lowercase().as_str(),
+            "0" | "off" | "f" | "false" | "n" | "no" | "1" | "on" | "t" | "true" | "y" | "yes"
+        ),
+        Some(_) => false,
+    }
+}
 
 /// A schema `normalize_json_schema_types` leaves as is and `check_schema`
 /// accepts, judged on the keywords tool schemas use.
@@ -1057,8 +1171,6 @@ pub struct ChatResponder {
     model: String,
     /// Prompt tokens `_reported_prompt_tokens` leaves out of usage.
     unreported_prompt_tokens: u64,
-    /// `_get_history_tool_calls_cnt`, which numbers K3 tool-call ids.
-    history_tool_calls: i64,
     n: usize,
     logprobs: bool,
     parsing: OutputParsing,
@@ -1074,6 +1186,21 @@ pub struct ChatResponder {
     tool_detectors: HashMap<u64, Box<dyn ToolDetector>>,
     has_tool_calls: HashSet<u64>,
     finish_reasons: Vec<(u64, String, Value)>,
+    /// The Kimi-K3 response shape a `kimi_k3` chat encoding answers in;
+    /// `None` keeps OpenAI's.
+    kimi_k3_wire: Option<KimiK3Wire>,
+    /// How a K3 stream that cannot finish ends its open choices.
+    interruption: Option<Interruption>,
+}
+
+/// Why a K3 stream ends its open choices as `server_interrupted` rather than
+/// with an error event (`errors_end_choices`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interruption {
+    /// An abort with a status code; the usage summary still follows.
+    Abort,
+    /// An engine error mid-stream; nothing follows the end frames.
+    Error,
 }
 
 impl ChatResponder {
@@ -1114,6 +1241,9 @@ impl ChatResponder {
             if !tool_calls.is_null() {
                 message["tool_calls"] = tool_calls;
             }
+            if self.kimi_k3_wire.is_some() {
+                finish_type = finish_type.map(|f| kimi_k3_wire::finish_reason(&f).to_owned());
+            }
             choices.push(json!({
                 "index": index,
                 "message": message,
@@ -1122,14 +1252,50 @@ impl ChatResponder {
                 "matched_stop": matched_stop,
             }));
         }
-        unary_reply(
+        let cache_report = self.settings.enable_cache_report;
+        let Some(mut wire) = self.kimi_k3_wire else {
+            return unary_reply(
+                &ret,
+                self.n,
+                cache_report,
+                "chat.completion",
+                &self.model,
+                choices,
+            );
+        };
+        let mut response = unary_response(
             &ret,
             self.n,
-            self.settings.enable_cache_report,
+            cache_report,
             "chat.completion",
             &self.model,
             choices,
-        )
+        )?;
+        let rid = response["id"].as_str().unwrap_or_default().to_owned();
+        let created = response["created"].as_u64().unwrap_or_default();
+        response["id"] = json!(wire.response_id(created, &rid));
+        kimi_k3_wire::finalize_usage(&mut response["usage"], cached_per_prompt(&ret, self.n));
+        Some(Reply {
+            status: 200,
+            body: response.to_string(),
+        })
+    }
+
+    /// An error reply in the shape of this response's wire (`error_body`), for
+    /// the host's own errors after lowering as for the engine's.
+    pub fn error_reply(&self, reply: Reply) -> Reply {
+        match self.kimi_k3_wire {
+            Some(_) => kimi_k3_wire::error_reply(reply),
+            None => reply,
+        }
+    }
+
+    /// `response_id`: the K3 wire's own, once a frame set it, else the rid.
+    fn response_id(&self) -> &str {
+        self.kimi_k3_wire
+            .as_ref()
+            .and_then(KimiK3Wire::id)
+            .unwrap_or(&self.stream.last_id)
     }
 
     /// One choice's whole output as `(reasoning, content, tool calls)`; the
@@ -1163,12 +1329,23 @@ impl ChatResponder {
         if self.stream.done {
             return Ok(Vec::new());
         }
+        let started = self.stream.started;
         let mut events = match data {
             Ok(content) => {
                 self.stream.started = true;
-                self.stream_frame(&content)
+                self.stream_frame(&content, started)?
             }
-            Err(error) => self.stream.error(error)?,
+            // `errors_end_choices`: a K3 stream that fails mid-response ends
+            // its open choices instead of sending an error event.
+            Err(_) if self.kimi_k3_wire.is_some() && started => {
+                self.interruption = Some(Interruption::Error);
+                self.stream.stopped = true;
+                Vec::new()
+            }
+            Err(error) => self
+                .stream
+                .error(error)
+                .map_err(|reply| self.error_reply(reply))?,
         };
         if self.stream.ending() {
             events.extend(self.stream_end());
@@ -1181,11 +1358,20 @@ impl ChatResponder {
         self.stream.done
     }
 
-    fn stream_frame(&mut self, content: &GenerateResponse) -> Vec<String> {
+    /// One `/generate` frame; `started` is whether an earlier frame started the
+    /// stream. `Err` is a K3 client error before the stream starts.
+    fn stream_frame(
+        &mut self,
+        content: &GenerateResponse,
+        started: bool,
+    ) -> Result<Vec<String>, Reply> {
         let index = u64::from(content.index.unwrap_or(0));
         let mut meta = content.meta_info.clone().unwrap_or_default();
         self.report_prompt_tokens(&mut meta);
         self.stream.record(index, &meta);
+        if let Some(wire) = &mut self.kimi_k3_wire {
+            wire.response_id(self.created, &meta.id);
+        }
         let (finish_type, matched_stop) = finish_fields(meta.finish_reason.as_ref());
 
         let mut logprobs = None;
@@ -1209,9 +1395,24 @@ impl ChatResponder {
 
         let mut events = Vec::new();
         if let Some(finish_type) = &finish_type {
+            if self.kimi_k3_wire.is_some()
+                && let Some((code, message)) = status_abort(meta.finish_reason.as_ref())
+            {
+                // `check_abort`: before the stream starts, a client error is
+                // the reply, as the `HTTPException` handler shapes it.
+                if !started && code < 500 {
+                    let reply = error_reply(message, &code.to_string(), code);
+                    return Err(kimi_k3_wire::error_reply(reply));
+                }
+                self.finish_reasons
+                    .push((index, "abort".into(), Value::Null));
+                self.interruption = Some(Interruption::Abort);
+                self.stream.stopped = true;
+                return Ok(Vec::new());
+            }
             if let Some(event) = abort_event(meta.finish_reason.as_ref()) {
                 self.stream.stopped = true;
-                return vec![event];
+                return Ok(vec![event]);
             }
             self.finish_reasons
                 .push((index, finish_type.clone(), matched_stop));
@@ -1233,7 +1434,7 @@ impl ChatResponder {
                 self.has_tool_calls.insert(index);
             }
             events.extend(self.token_output_chunks(index, delta, logprobs));
-            return events;
+            return Ok(events);
         }
         let (reasoning_config, tools) = self.parsing.text_parsers();
         // `_generate_stream_content`.
@@ -1256,11 +1457,13 @@ impl ChatResponder {
                 .entry(index)
                 .or_insert_with(|| ThinkDetector::new(config.think, &config.options));
             let (mut reasoning, mut normal) = detector.push(&delta);
-            if finish_type.as_deref().is_some_and(|t| t != "abort") {
+            let finishing = finish_type.as_deref().is_some_and(|t| t != "abort");
+            if finishing {
                 let (end_reasoning, end_normal) = detector.finish();
                 reasoning.push_str(&end_reasoning);
                 normal.push_str(&end_normal);
             }
+            let in_reasoning = detector.in_reasoning();
             delta = normal;
             if !reasoning.is_empty() {
                 let usage = self.chunk_usage(index);
@@ -1270,6 +1473,11 @@ impl ChatResponder {
                     remaining_logprobs.take(),
                     usage,
                 ));
+            }
+            if let Some(wire) = &mut self.kimi_k3_wire
+                && wire.ends_reasoning(index, &reasoning, in_reasoning, finishing)
+            {
+                events.push(self.chunk(index, json!({"reasoning_content": ""}), None, None));
             }
         }
         if let Some(tools) = tools {
@@ -1296,16 +1504,13 @@ impl ChatResponder {
             }
             for call in calls {
                 self.has_tool_calls.insert(index);
-                let mut tool_call = self.tool_call(call.tool_index, &call);
-                // Python streams an id and name only for a non-empty name.
-                if call.name.is_empty() {
-                    tool_call["id"] = Value::Null;
-                    tool_call["function"]["name"] = Value::Null;
+                for tool_call in self.stream_tool_calls(&call) {
+                    let calls = json!([tool_call]);
+                    let mut chunk =
+                        self.chunk_json(index, delta(Value::Null, Some(calls)), None, None);
+                    chunk["usage"] = usage.clone();
+                    events.push(format!("data: {chunk}\n\n"));
                 }
-                let calls = json!([tool_call]);
-                let mut chunk = self.chunk_json(index, delta(Value::Null, Some(calls)), None, None);
-                chunk["usage"] = usage.clone();
-                events.push(format!("data: {chunk}\n\n"));
             }
         } else if !delta.is_empty() {
             let usage = self.chunk_usage(index);
@@ -1327,7 +1532,36 @@ impl ChatResponder {
                 usage,
             ));
         }
-        events
+        Ok(events)
+    }
+
+    /// The `ToolCall` deltas one streamed call item sends. Python streams an id
+    /// and name only for a non-empty name; the K3 wire opens that call with
+    /// `arguments: ""` (`split_tool_call_opening`), and its continuation deltas
+    /// carry only the index and the arguments.
+    fn stream_tool_calls(&self, call: &ToolCallItem) -> Vec<Value> {
+        let named = !call.name.is_empty();
+        if self.kimi_k3_wire.is_none() {
+            let mut tool_call = self.tool_call(call.tool_index, call);
+            if !named {
+                tool_call["id"] = Value::Null;
+                tool_call["function"]["name"] = Value::Null;
+            }
+            return vec![tool_call];
+        }
+        let arguments = |arguments: &str| json!({"index": call.tool_index, "function": {"arguments": arguments}});
+        let mut deltas = Vec::new();
+        if named {
+            let opening = ToolCallItem {
+                parameters: String::new(),
+                ..call.clone()
+            };
+            deltas.push(self.tool_call(call.tool_index, &opening));
+        }
+        if !named || !call.parameters.is_empty() {
+            deltas.push(arguments(&call.parameters));
+        }
+        deltas
     }
 
     /// `token_output_sse_chunks`: a reasoning chunk, a content chunk, then one
@@ -1384,26 +1618,55 @@ impl ChatResponder {
         self.stream.done = true;
         let mut events = Vec::new();
         if !self.stream.failed && self.stream.started {
+            if self.interruption.is_some() {
+                // `end_frames(close_open_choices=True)`: a choice that has not
+                // finished ends as an abort.
+                for index in 0..self.n as u64 {
+                    if !self.finish_reasons.iter().any(|(i, ..)| *i == index) {
+                        self.finish_reasons
+                            .push((index, "abort".into(), Value::Null));
+                    }
+                }
+            }
             for (index, finish_type, matched_stop) in std::mem::take(&mut self.finish_reasons) {
                 let mut chunk =
                     self.chunk_json(index, json!({"reasoning_content": null}), None, None);
-                let tool_calls = self.has_tool_calls.contains(&index);
-                chunk["choices"][0]["finish_reason"] = if finish_type == "stop" && tool_calls {
-                    "tool_calls".into()
-                } else {
-                    finish_type.into()
+                // A call the stream left open does not finish as `tool_calls`.
+                let tool_calls = self.has_tool_calls.contains(&index)
+                    && !self
+                        .tool_detectors
+                        .get(&index)
+                        .is_some_and(|detector| detector.has_incomplete_call());
+                let finish_reason = match finish_type.as_str() {
+                    "stop" if tool_calls => "tool_calls",
+                    _ if self.kimi_k3_wire.is_some() => kimi_k3_wire::finish_reason(&finish_type),
+                    _ => &finish_type,
                 };
+                chunk["choices"][0]["finish_reason"] = json!(finish_reason);
                 chunk["choices"][0]["matched_stop"] = matched_stop;
+                if self.kimi_k3_wire.is_some() {
+                    // `choice_usage`: each choice's end frame carries its usage.
+                    let (mut usage, cached) = self.stream.reported_choice_usage(index);
+                    kimi_k3_wire::finalize_usage(&mut usage, cached);
+                    chunk["choices"][0]["usage"] = usage;
+                }
                 events.push(format!("data: {chunk}\n\n"));
             }
-            if self.include_usage {
+            // A stream that failed mid-response sends no usage summary.
+            if self.include_usage && self.interruption != Some(Interruption::Error) {
+                let mut usage = self
+                    .stream
+                    .total_usage(self.n, self.settings.enable_cache_report);
+                if self.kimi_k3_wire.is_some() {
+                    kimi_k3_wire::finalize_usage(&mut usage, self.stream.cached_per_prompt(self.n));
+                }
                 let chunk = json!({
-                    "id": self.stream.last_id,
+                    "id": self.response_id(),
                     "object": "chat.completion.chunk",
                     "created": self.created,
                     "model": self.model,
                     "choices": [],
-                    "usage": self.stream.total_usage(self.n, self.settings.enable_cache_report),
+                    "usage": usage,
                 });
                 events.push(format!("data: {chunk}\n\n"));
             }
@@ -1422,23 +1685,11 @@ impl ChatResponder {
         }
     }
 
-    /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
+    /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id: a
+    /// uuid for every parser served here, Kimi-K3's included.
     fn tool_call(&self, index: i64, call: &ToolCallItem) -> Value {
-        let id = match self
-            .parsing
-            .text_parsers()
-            .1
-            .map(|(parser, _)| parser.as_str())
-        {
-            Some("kimi_k3") => format!(
-                "{}:{}",
-                call.name,
-                self.history_tool_calls + call.tool_index
-            ),
-            _ => tool_call_id(),
-        };
         json!({
-            "id": id,
+            "id": tool_call_id(),
             "index": index,
             "type": "function",
             "function": {"name": call.name, "arguments": call.parameters},
@@ -1466,8 +1717,15 @@ impl ChatResponder {
         logprobs: Option<Value>,
         usage: Option<Value>,
     ) -> Value {
+        // The K3 wire's deltas leave out null fields (`omit_null_delta`).
+        let delta = match (delta, &self.kimi_k3_wire) {
+            (Value::Object(fields), Some(_)) => {
+                Value::Object(fields.into_iter().filter(|(_, v)| !v.is_null()).collect())
+            }
+            (delta, _) => delta,
+        };
         let mut chunk = json!({
-            "id": self.stream.last_id,
+            "id": self.response_id(),
             "object": "chat.completion.chunk",
             "created": self.created,
             "model": self.model,
@@ -1526,6 +1784,47 @@ impl ChatResponder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Claude Code's deferred tools (`defer_loading: true`, on the tool as the
+    /// Anthropic conversion puts it or on the function) lower with the rest,
+    /// so a request that declares one still takes the token path; a flag
+    /// pydantic refuses goes to the engine.
+    #[test]
+    fn deferred_tools_lower() {
+        let with = |tool: Value| {
+            let raw = json!({"tools": [
+                {"type": "function", "function": {"name": "Read", "parameters": {"type": "object"}}},
+                tool,
+            ]});
+            request_tools(raw.as_object().unwrap(), true)
+        };
+        let placeholder = |defer: Value| {
+            json!({"type": "function", "defer_loading": defer, "function": {
+                "name": "DeferredToolPlaceholder",
+                "description": "Reserved placeholder that keeps deferred tool loading active; never call this tool.",
+                "parameters": {"type": "object", "properties": {}}}})
+        };
+        let auto = Ok(Some(ToolChoice::Auto));
+        for defer in [
+            json!(true),
+            json!(false),
+            json!(null),
+            json!(1),
+            json!("no"),
+        ] {
+            assert_eq!(with(placeholder(defer.clone())), auto, "{defer}");
+        }
+        let on_function = json!({"type": "function", "function": {
+            "name": "DeferredToolPlaceholder", "defer_loading": true, "parameters": {"type": "object"}}});
+        assert_eq!(with(on_function), auto);
+        for defer in [json!(2), json!("maybe"), json!([true]), json!({})] {
+            assert_eq!(
+                with(placeholder(defer.clone())),
+                Err(Unsupported("tool_definition")),
+                "{defer}"
+            );
+        }
+    }
 
     /// Kimi K3 starts in reasoning unless the merged kwargs turn `thinking` off;
     /// a parser the port does not cover keeps its own default.
@@ -1702,8 +2001,216 @@ mod tests {
         }
     }
 
+    /// A K3 request with ordinary and deferred tools whose `tool_choice` forces
+    /// a call gets the forced-call tag and tools-close stop, and its output's
+    /// calls are parsed as under `auto`. Another tool parser has no such tag.
+    #[test]
+    fn forced_tool_choice_lowers_and_parses_kimi_k3_calls() {
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("kimi_k3".into()),
+            tool_call_parser: Some("kimi_k3".into()),
+            ..OpenAiSettings::default()
+        };
+        let tools = json!([
+            {"type": "function", "function": {"name": "get_weather", "parameters": {
+                "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}},
+            {"type": "function", "function": {"name": "get_time"}},
+            {"type": "function", "defer_loading": true, "function": {
+                "name": "DeferredToolPlaceholder", "parameters": {"type": "object", "properties": {}}}},
+        ]);
+        let output = "I need the weather.<|close|>think<|sep|><|open|>tools<|sep|>\
+            <|open|>call tool=\"get_weather\" index=\"1\"<|sep|>\
+            <|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|>\
+            <|close|>call<|sep|>";
+        for (choice, callable) in [
+            (
+                json!("required"),
+                vec!["get_weather", "get_time", "DeferredToolPlaceholder"],
+            ),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                vec!["get_weather"],
+            ),
+        ] {
+            let body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "weather?"}],
+                "tools": tools,
+                "tool_choice": choice,
+            });
+            let lower = |settings: &OpenAiSettings| {
+                lower_chat(
+                    &serde_json::to_vec(&body).unwrap(),
+                    &OpenAiHeaders::default(),
+                    settings,
+                    &k3,
+                    |_: &Value| Some(vec![1]),
+                    None,
+                )
+            };
+            let (generate, responder) = lower(&settings).unwrap();
+            let sampling = serde_json::to_value(&generate).unwrap()["sampling_params"].clone();
+            let tag: Value =
+                serde_json::from_str(sampling["structural_tag"].as_str().unwrap()).unwrap();
+            let calls = &tag["format"]["elements"][1]["content"]["tags"];
+            let names: Vec<&str> = calls
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|call| call["begin"].as_str().unwrap())
+                .map(|begin| begin.split('"').nth(1).unwrap())
+                .collect();
+            assert_eq!(names, callable, "{choice}");
+            assert_eq!(sampling["stop"], json!([KIMI_K3_TOOLS_CLOSE]), "{choice}");
+
+            let frame: GenerateResponse = serde_json::from_value(json!({
+                "text": output,
+                "output_ids": [2],
+                "meta_info": {
+                    "id": "r",
+                    "finish_reason": {"type": "stop", "matched": KIMI_K3_TOOLS_CLOSE},
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                },
+            }))
+            .unwrap();
+            let reply = responder.unary(vec![frame]).expect("unary reply");
+            let choice_out = &serde_json::from_str::<Value>(&reply.body).unwrap()["choices"][0];
+            assert_eq!(choice_out["finish_reason"], "tool_calls", "{choice}");
+            let message = &choice_out["message"];
+            assert_eq!(message["reasoning_content"], "I need the weather.");
+            assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
+            assert_eq!(
+                message["tool_calls"][0]["function"]["arguments"],
+                "{\"city\": \"Paris\"}"
+            );
+
+            let qwen = OpenAiSettings {
+                tool_call_parser: Some("qwen3_coder".into()),
+                ..settings.clone()
+            };
+            assert_eq!(lower(&qwen).err(), Some(Unsupported("tool_choice")));
+        }
+    }
+
+    /// A K3 request with ordinary and deferred tools and `tool_choice: "none"`
+    /// gets the nonempty-response tag, no tools-close stop, and its output as
+    /// content. Another constraint or tool parser leaves it untagged.
+    #[test]
+    fn none_tool_choice_constrains_kimi_k3_to_a_response() {
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("kimi_k3".into()),
+            tool_call_parser: Some("kimi_k3".into()),
+            ..OpenAiSettings::default()
+        };
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "get_time"}},
+                {"type": "function", "defer_loading": true, "function": {
+                    "name": "DeferredToolPlaceholder", "parameters": {"type": "object", "properties": {}}}},
+            ],
+            "tool_choice": "none",
+        });
+        let lower = |body: &Value, settings: &OpenAiSettings| {
+            lower_chat(
+                &serde_json::to_vec(body).unwrap(),
+                &OpenAiHeaders::default(),
+                settings,
+                &k3,
+                |_: &Value| Some(vec![1]),
+                None,
+            )
+        };
+        let (generate, responder) = lower(&body, &settings).unwrap();
+        let sampling = serde_json::to_value(&generate).unwrap()["sampling_params"].clone();
+        let tag: Value =
+            serde_json::from_str(sampling["structural_tag"].as_str().unwrap()).unwrap();
+        let response = &tag["format"]["elements"][0]["elements"];
+        assert_eq!(response[0]["begin"], "<|open|>response<|sep|>");
+        assert_eq!(response[1]["begin"], "");
+        assert!(
+            sampling.get("stop").is_none_or(Value::is_null),
+            "{sampling}"
+        );
+
+        let output = "Greet back.<|close|>think<|sep|>\
+            <|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|>";
+        let frame: GenerateResponse = serde_json::from_value(json!({
+            "text": output,
+            "output_ids": [2],
+            "meta_info": {
+                "id": "r",
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+        }))
+        .unwrap();
+        let reply = responder.unary(vec![frame]).expect("unary reply");
+        let choice = &serde_json::from_str::<Value>(&reply.body).unwrap()["choices"][0];
+        assert_eq!(choice["message"]["reasoning_content"], "Greet back.");
+        assert_eq!(choice["message"]["content"], "Hello!");
+        assert_eq!(choice["message"]["tool_calls"], Value::Null);
+
+        // `to_sampling_params` only warns: another constraint wins, unserved.
+        let mut constrained = body.clone();
+        constrained["regex"] = json!("[a-z]+");
+        let (generate, _) = lower(&constrained, &settings).unwrap();
+        let sampling = serde_json::to_value(&generate).unwrap()["sampling_params"].clone();
+        assert!(sampling.get("structural_tag").is_none_or(Value::is_null));
+
+        let qwen = OpenAiSettings {
+            tool_call_parser: Some("qwen3_coder".into()),
+            ..settings.clone()
+        };
+        let (generate, _) = lower(&body, &qwen).unwrap();
+        let sampling = serde_json::to_value(&generate).unwrap()["sampling_params"].clone();
+        assert!(sampling.get("structural_tag").is_none_or(Value::is_null));
+    }
+
+    /// A K3 stream asking for `internal_content` goes to the engine, which
+    /// keeps the token provenance it needs; other models ignore the option.
+    #[test]
+    fn kimi_k3_internal_content_goes_to_the_engine() {
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        let lower = |model: &ChatModel| {
+            let body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true,
+                "stream_options": {"include_internal_content": true},
+            });
+            lower_chat(
+                &serde_json::to_vec(&body).unwrap(),
+                &OpenAiHeaders::default(),
+                &OpenAiSettings::default(),
+                model,
+                |_: &Value| Some(vec![1]),
+                None,
+            )
+            .err()
+            .map(|reason| reason.0)
+        };
+        assert_eq!(lower(&k3), Some("internal_content"));
+        assert_eq!(lower(&ChatModel::default()), None);
+    }
+
     /// The usage of a one-frame chat reply with cache reporting on: unary
-    /// without `stream_options`, streamed with them.
+    /// without `stream_options`, streamed with them. A K3 stream has no
+    /// continuous usage; its first usage is on the choice's end frame.
     fn one_frame_usage(
         model: &ChatModel,
         stream_options: Option<&Value>,
@@ -1749,7 +2256,13 @@ mod tests {
         events
             .iter()
             .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
-            .find_map(|chunk| chunk.get("usage").filter(|u| !u.is_null()).cloned())
+            .find_map(|chunk| {
+                let choice_usage = chunk["choices"].get(0).and_then(|c| c.get("usage"));
+                choice_usage
+                    .or_else(|| chunk.get("usage"))
+                    .filter(|u| !u.is_null())
+                    .cloned()
+            })
             .expect("usage chunk")
     }
 }

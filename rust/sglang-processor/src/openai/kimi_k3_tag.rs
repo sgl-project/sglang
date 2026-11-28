@@ -1,6 +1,7 @@
-//! Kimi-K3's `tool_choice: "auto"` structural tag
-//! (`get_kimik3_auto_tool_call_structural_tag` in
-//! `function_call/kimik3_structural_tag.py`), dumped as xgrammar's
+//! Kimi-K3's structural tags for `tool_choice` `"auto"`
+//! (`get_kimik3_auto_tool_call_structural_tag`) and for `"required"`, a named
+//! tool or `"none"` (`get_kimik3_structural_tag`), from
+//! `function_call/kimik3_structural_tag.py`, dumped as xgrammar's
 //! `StructuralTag.model_dump(by_alias=True)`.
 
 use serde_json::{Map, Value, json};
@@ -8,10 +9,24 @@ use serde_json::{Map, Value, json};
 use super::Unsupported;
 
 use crate::kimi_k3_format::{
-    CALL_CLOSE, CALL_OPEN, THINK_CLOSE, THINK_OPEN, TOOLS_CLOSE, TOOLS_OPEN,
+    CALL_CLOSE, CALL_OPEN, MESSAGE_CLOSE, RESPONSE_CLOSE, RESPONSE_OPEN, THINK_CLOSE, THINK_OPEN,
+    TOOLS_CLOSE, TOOLS_OPEN,
 };
 
+const OPEN_TOKEN: &str = "<|open|>";
 const CLOSE_TOKEN: &str = "<|close|>";
+const ARGUMENT_CLOSE: &str = "<|close|>argument<|sep|>";
+
+/// `_JSON_TO_XTML_TYPE`: the XTML `type` attribute of each JSON type.
+const XTML_TYPES: [(&str, &str); 7] = [
+    ("string", "string"),
+    ("number", "number"),
+    ("integer", "number"),
+    ("boolean", "boolean"),
+    ("array", "array"),
+    ("object", "object"),
+    ("null", "null"),
+];
 
 const JSON_TYPES: [&str; 7] = [
     "string", "number", "integer", "boolean", "array", "object", "null",
@@ -53,7 +68,11 @@ pub(super) fn auto_tool_call_tag(
     }
     let call_tags = tools
         .iter()
-        .map(|tool| tool_call_tag(&tool["function"]))
+        .map(|tool| {
+            let function = &tool["function"];
+            auto_arguments_format(&function["parameters"])
+                .map(|arguments| tool_call_tag(function, arguments))
+        })
         .collect::<Option<_>>()
         .ok_or(Unsupported("tool_definition"))?;
     let tools_tag = tool_calls_tag(call_tags, parallel_tool_calls);
@@ -62,7 +81,7 @@ pub(super) fn auto_tool_call_tag(
         .into_iter()
         .filter(|token| !strip.contains(token))
         .collect();
-    let format = json!({
+    let triggered = json!({
         "type": "triggered_tags",
         "triggers": [TOOLS_OPEN],
         "tags": [tools_tag],
@@ -70,7 +89,128 @@ pub(super) fn auto_tool_call_tag(
         "stop_after_first": !parallel_tool_calls,
         "excludes": excludes,
     });
+    // A serial grammar completes with the tools section, so it must still
+    // admit the message close K3 emits before EOS.
+    let format = if parallel_tool_calls {
+        triggered
+    } else {
+        sequence(vec![triggered, optional_message_close()])
+    };
     Ok(Some(json!({"type": "structural_tag", "format": format})))
+}
+
+/// A `tool_choice` that forces a call (`_select_tools`): `"required"` keeps
+/// every tool, a named choice only the tools of that name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForcedChoice<'a> {
+    Required,
+    Named(&'a str),
+}
+
+/// `get_kimik3_structural_tag` for a forced choice over non-strict tools: an
+/// optional response, then a tools section of at least one call to a selected
+/// tool. `None` when the choice selects no tool.
+///
+/// SGLang passes `thinking_mode` only when no reasoning parser owns the think
+/// section, and without one `_get_reasoning_from_request` is false, so the
+/// lowered path never prefixes `_with_reasoning`'s think tag. No free-text
+/// `excludes` here holds a think token, so `strip_structural_tag_excludes`
+/// leaves the tag as it is.
+pub(super) fn forced_tool_call_tag(
+    tools: &[Value],
+    choice: ForcedChoice<'_>,
+    parallel_tool_calls: bool,
+) -> Option<Value> {
+    let call_tags: Vec<Value> = tools
+        .iter()
+        .map(|tool| &tool["function"])
+        .filter(|function| match choice {
+            ForcedChoice::Required => true,
+            ForcedChoice::Named(name) => function["name"] == name,
+        })
+        // `_tool_arguments_format` of a non-strict tool: any arguments, strings loose.
+        .map(|function| {
+            tool_call_tag(
+                function,
+                json!({"type": "star", "content": dynamic_argument_format()}),
+            )
+        })
+        .collect();
+    if call_tags.is_empty() {
+        return None;
+    }
+    let format = sequence(vec![
+        // Only a response may precede the tools section, so a model that
+        // decides no tool is needed cannot close the message or end the turn
+        // without making the call.
+        json!({"type": "optional", "content": response(any_text(&[OPEN_TOKEN, CLOSE_TOKEN]))}),
+        tool_calls_tag(call_tags, parallel_tool_calls),
+        optional_message_close(),
+    ]);
+    Some(json!({"type": "structural_tag", "format": format}))
+}
+
+/// `get_kimik3_structural_tag` for `tool_choice: "none"`: the K3 prompt still
+/// lists the tools, so the output is held to a response with no tools section,
+/// and a nonempty one, since a model that wanted a tool otherwise closes an
+/// empty response block and the client gets no content.
+pub(super) fn none_tool_call_tag() -> Value {
+    // `_NONEMPTY_RESPONSE`: one character that opens neither control token,
+    // then free text.
+    let text = sequence(vec![
+        json!({"type": "regex", "pattern": "[^ \\t\\r\\n<]|<[^|<]"}),
+        any_text(&[OPEN_TOKEN, CLOSE_TOKEN]),
+    ]);
+    let format = sequence(vec![response(text), optional_message_close()]);
+    json!({"type": "structural_tag", "format": format})
+}
+
+/// `_dynamic_argument_format(True, ..., loose_strings=True)`: an argument of
+/// any key and any JSON type, a string one as free text.
+fn dynamic_argument_format() -> Value {
+    let variants: Vec<Value> = XTML_TYPES
+        .iter()
+        .map(|(json_type, xtml_type)| {
+            // `_value_format`: the restricted schema of `True` is the bare type.
+            let value = match *json_type {
+                "string" => any_text(&[]),
+                _ => json!({
+                    "type": "json_schema",
+                    "json_schema": {"type": json_type},
+                    "style": "json",
+                    "any_order": false,
+                    "max_whitespace_cnt": null,
+                }),
+            };
+            sequence(vec![
+                json!({"type": "regex", "pattern": "[^\"& \\t\\r\\n\\f\\v=<>]+"}),
+                json!({"type": "const_string", "value": format!("\" type=\"{xtml_type}\"<|sep|>")}),
+                value,
+            ])
+        })
+        .collect();
+    json!({
+        "type": "tag",
+        "begin": "<|open|>argument key=\"",
+        "content": {"type": "or", "elements": variants},
+        "end": ARGUMENT_CLOSE,
+    })
+}
+
+/// `_response`: a response of `text`, which admits no control token, and
+/// without thinking the prompt already opens the response channel, so the
+/// output may start inside it.
+fn response(text: Value) -> Value {
+    json!({"type": "or", "elements": [
+        {"type": "tag", "begin": RESPONSE_OPEN, "content": &text, "end": RESPONSE_CLOSE},
+        {"type": "tag", "begin": "", "content": text, "end": RESPONSE_CLOSE},
+    ]})
+}
+
+/// `_OPTIONAL_MESSAGE_CLOSE`: K3 emits the message close before EOS, and EOS
+/// is masked until the grammar completes.
+fn optional_message_close() -> Value {
+    json!({"type": "optional", "content": {"type": "const_string", "value": MESSAGE_CLOSE}})
 }
 
 fn escape_attr(value: &str) -> String {
@@ -85,19 +225,19 @@ fn sequence(elements: Vec<Value>) -> Value {
     json!({"type": "sequence", "elements": elements})
 }
 
-/// `_tool_call_tag` with `_auto_tool_arguments_format`; `None` past the schema bounds.
-fn tool_call_tag(function: &Value) -> Option<Value> {
+/// `_tool_call_tag`: one call to `function` whose arguments take `arguments`.
+fn tool_call_tag(function: &Value, arguments: Value) -> Value {
     let name = escape_attr(function["name"].as_str().unwrap_or_default());
-    Some(json!({
+    json!({
         "type": "tag",
         "begin": format!("{CALL_OPEN} tool=\"{name}\" index=\""),
         "content": sequence(vec![
             json!({"type": "regex", "pattern": "[1-9][0-9]*"}),
             json!({"type": "const_string", "value": "\"<|sep|>"}),
-            auto_arguments_format(&function["parameters"])?,
+            arguments,
         ]),
         "end": CALL_CLOSE,
-    }))
+    })
 }
 
 /// `_tool_calls_tag`.
@@ -130,7 +270,8 @@ fn nonempty_argument_format(key: &str, xtml_type: &str) -> Value {
     ])
 }
 
-/// `_auto_tool_arguments_format`: required arguments present and non-empty, then any text.
+/// `_auto_tool_arguments_format`: required arguments present and non-empty,
+/// then any text; `None` past the schema bounds.
 fn auto_arguments_format(parameters: &Value) -> Option<Value> {
     let loose = || Some(any_text(&[]));
     let Value::Object(schema) = parameters else {

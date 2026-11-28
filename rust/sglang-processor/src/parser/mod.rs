@@ -703,6 +703,57 @@ mod tests {
         )));
     }
 
+    /// Kimi-K3 streams a call's arguments as they arrive; a call the stream
+    /// leaves open does not finish as `tool_calls`.
+    #[test]
+    fn kimi_k3_open_call_does_not_finish_as_tool_calls() {
+        let opening = "<|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|>\
+                       <|open|>argument key=\"city\" type=\"string\"<|sep|>Par";
+        let endings = [
+            (
+                "is<|close|>argument<|sep|><|close|>call<|sep|>",
+                "{\"city\": \"Paris\"}",
+                ChatFinishReason::ToolCalls,
+            ),
+            (
+                "is<|close|>argument<|sep|>",
+                "{\"city\": \"Paris\"",
+                ChatFinishReason::Stop,
+            ),
+        ];
+        for (ending, arguments, finish_reason) in endings {
+            let events = futures::executor::block_on(
+                processor(Some("kimi_k3"), None, 1)
+                    .process_stream(stream::iter(vec![
+                        chunk(0, opening, false),
+                        chunk(0, ending, true),
+                    ]))
+                    .collect::<Vec<_>>(),
+            );
+            let streamed: Vec<String> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Ok(ChatEvent::Delta {
+                        tool_calls: Some(calls),
+                        ..
+                    }) => Some(calls.iter().filter_map(|c| c.arguments.clone()).collect()),
+                    _ => None,
+                })
+                .collect();
+            // The first chunk already streams the value so far.
+            assert!(streamed[0].ends_with("Par"), "{streamed:?}");
+            assert_eq!(streamed.concat(), arguments);
+            let finished = events.iter().find_map(|event| match event {
+                Ok(ChatEvent::Delta {
+                    finish_reason: Some(reason),
+                    ..
+                }) => Some(*reason),
+                _ => None,
+            });
+            assert_eq!(finished, Some(finish_reason));
+        }
+    }
+
     #[test]
     fn qwen_tool_calls_drop_split_terminal_special_tokens() {
         let events = futures::executor::block_on(
