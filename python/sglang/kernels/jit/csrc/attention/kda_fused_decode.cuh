@@ -1022,6 +1022,7 @@ struct KdaFusedDecodeKernel {
         .with_dtype<fp32_t>()
         .with_device(device)
         .with_strides({-1, 128 * 128, 128, 1})
+        .ensure_alignment(16)  // required by TMA
         .verify(state);
     TensorMatcher({B_}).with_dtype<int32_t>().with_device(device).with_strides({1}).verify(indices);
     TensorMatcher({B_, kSeg}).with_dtype<bf16_t>().with_device(device).with_strides({kSeg, 1}).verify(out);

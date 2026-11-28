@@ -660,7 +660,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         controller._scheduler_init_info_lock = threading.Lock()
         controller._scheduler_init_infos = []
         controller.scheduler_procs = []
-        controller.local_kv_event_sources = []
         controller.attn_replica_size = 1
         controller.prelaunched_schedulers = None
         return controller
@@ -759,16 +758,13 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         finally:
             proceed.set()
             thread.join()
-        controller.local_kv_event_sources = [{"dp_rank": 1}, {"dp_rank": 0}]
         controller.event_loop = lambda: None
         for prelaunched in (None, {(0, 0): (123, object())}):
             with (
                 self.subTest(prelaunched=prelaunched is not None),
                 ExitStack() as stack,
             ):
-                stack.enter_context(
-                    get_context().override_server_args(grpc_port=50051, dp_size=2)
-                )
+                stack.enter_context(get_context().override_server_args(dp_size=2))
                 for name in (
                     "kill_itself_when_parent_died",
                     "configure_logger",
@@ -802,9 +798,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 self.assertEqual(info["startup_time"]["scheduler_e2e"], 8)
                 self.assertEqual(info["startup_time"]["cuda_graph"]["decode"], 2)
                 self.assertEqual(info["startup_time"]["cuda_graph"]["prefill"], 3)
-                self.assertEqual(
-                    info["kv_event_sources"], [{"dp_rank": 0}, {"dp_rank": 1}]
-                )
                 self.assertEqual(
                     info[dp_controller.SCHEDULER_PIDS_ARG], [123] if prelaunched else []
                 )

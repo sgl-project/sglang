@@ -2565,7 +2565,8 @@ class KimiK3DeltaAttention(nn.Module):
             return
         layer = self.attn
         w = layer.conv_weights
-        if _is_npu:
+        # The kernel is JIT-compiled CUDA, and covered() only checks shapes.
+        if not get_platform().is_cuda:
             return
         from sglang.kernels.ops.attention import kda_fused_decode
 

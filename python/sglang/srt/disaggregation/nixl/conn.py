@@ -2386,6 +2386,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     _, mapped_dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
                         item_lens, dst_item_lens, state_type
                     )
+                    if state_type == StateType.DSA:
+                        for i in range(layers_current_pp_stage):
+                            if is_elided_entry(item_lens[i], mapped_dst_lens, i):
+                                continue
+                            if item_lens[i] != mapped_dst_lens[i]:
+                                raise RuntimeError(
+                                    f"{state_type} item length mismatch for positional "
+                                    f"entry {i}: prefill={item_lens[i]} "
+                                    f"decode={mapped_dst_lens[i]}"
+                                )
                 layers_params = [
                     (
                         src_layers[layer_id],
@@ -3380,6 +3390,16 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             src_indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
+            dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else []
+            if (
+                st == StateType.DSA
+                and self.kv_shard_size > 1
+                and src_indices is not None
+            ):
+                # Indexer pages can span earlier KV chunks of the uncached suffix.
+                src_indices, dst_indices = self._prepare_sharded_dsa_indices(
+                    src_indices, dst_indices
+                )
             if src_indices is None or (
                 len(src_indices) == 0 and st != StateType.DSA_TAIL
             ):
@@ -3401,7 +3421,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             src_lids = src_state_layer_ids[i] if i < len(src_state_layer_ids) else []
             dst_ptrs = dst_state_data_ptrs[i] if i < len(dst_state_data_ptrs) else []
-            dst_indices = dst_state_indices[i] if i < len(dst_state_indices) else []
             dst_lens = dst_state_item_lens[i] if i < len(dst_state_item_lens) else []
             dst_dims = (
                 dst_state_dim_per_tensor[i] if i < len(dst_state_dim_per_tensor) else []
@@ -3465,6 +3484,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         f"State index length mismatch at component {i}: "
                         f"prefill={len(src_indices)}, dst={len(dst_indices)}"
                     )
+                if len(dst_lens) != len(dst_ptrs):
+                    raise RuntimeError(
+                        f"DSA decode published {len(dst_lens)} item lengths for "
+                        f"{len(dst_ptrs)} state buffers"
+                    )
                 h = self._send_kvcache_generic(
                     peer_name=peer_name,
                     item_lens=src_lens,
@@ -3472,6 +3496,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     dst_data_indices=np.array(dst_indices, dtype=np.int32),
                     state_type=st,
                     force_flat=True,
+                    src_layer_ids=src_lids,
+                    dst_layer_ids=dst_lids,
+                    dst_item_lens=dst_lens,
                     src_keys=src_keys,
                     dst_keys=dst_keys,
                 )
