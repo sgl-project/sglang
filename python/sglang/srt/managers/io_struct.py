@@ -2765,7 +2765,8 @@ class ExpertDistributionReq(BaseReq, kw_only=True):
 
 
 class ExpertDistributionReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool = True
+    message: str = ""
 
 
 class Function(msgspec.Struct, kw_only=True, array_like=True):
