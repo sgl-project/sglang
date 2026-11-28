@@ -120,6 +120,7 @@ from sglang.srt.managers.io_struct import (
     ScaleElasticEPReqOutput,
     SessionParams,
     ShutdownReq,
+    SubagentKeepaliveReqInput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     TokenizerWorkerRegistrationReq,
@@ -1131,6 +1132,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Log the request
             self.request_logger.log_received_request(obj, self.tokenizer, request)
+
+            self._maybe_send_subagent_keepalive(obj)
 
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -2166,6 +2169,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             or self.request_metrics_exporter_manager.exporter_enabled()
             or bool(self.dump_requests_folder)
             or bool(self.crash_dump_folder)
+        )
+
+    def _maybe_send_subagent_keepalive(
+        self, obj: GenerateReqInput | EmbeddingReqInput
+    ) -> None:
+        if not get_memory().allow_subagent_keepalive or not isinstance(
+            obj, GenerateReqInput
+        ):
+            return
+        parent_session_id = obj.parent_session_id
+        if not parent_session_id:
+            return
+        self._dispatch_to_scheduler(
+            SubagentKeepaliveReqInput(session_id=parent_session_id)
         )
 
     async def _send_one_request(
