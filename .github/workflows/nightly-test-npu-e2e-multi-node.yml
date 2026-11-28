@@ -216,19 +216,35 @@ jobs:
       - name: Clear resources
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
-          kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
+          # The generated k8s_multi_pd_*.yaml files are removed by the runner as
+          # soon as the test ends, so the glob often matches nothing. Iterate
+          # instead of passing the literal pattern to kubectl, which would error
+          # with "the path ... does not exist".
+          for k8s_yaml in ./k8s_multi_pd_*.yaml; do
+            [ -e "${k8s_yaml}" ] || continue
+            kubectl delete -f "${k8s_yaml}" --ignore-not-found=true || true
+          done
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
-            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
-              echo "Found exist sglang job, sleeping for 30 seconds..."
-              sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
-            else
-              echo "No sglang job exist, start test case..."
+          # The DeepSWE eval pod is a standalone Pod (not part of the volcano
+          # job YAML), so the `-f` delete above does not remove it. Always list
+          # and delete in $NAMESPACE: a bare `kubectl get pods` uses the
+          # kubeconfig's default namespace and can silently delete nothing,
+          # which would spin this loop forever.
+          for attempt in $(seq 1 40); do
+            leftover_pods="$(kubectl get pods -n "$NAMESPACE" --no-headers \
+              -o custom-columns=:metadata.name 2>/dev/null \
+              | grep "^${pod_name_prefix}" || true)"
+            if [ -z "${leftover_pods}" ]; then
+              echo "No sglang pod left."
               break
             fi
+            echo "Attempt ${attempt}: deleting leftover pods:"
+            echo "${leftover_pods}"
+            echo "${leftover_pods}" \
+              | xargs -r kubectl delete pod -n "$NAMESPACE" --grace-period=0 --force || true
+            sleep 15
           done
 
       - name: Run test
@@ -374,13 +390,23 @@ jobs:
           tc_name="${tc_name##*/}"
           tc_name="${tc_name%.*}"
 
+          run_tag="-${{ github.run_id }}-${{ github.run_attempt }}"
+          log_root=/root/.cache/tests/logs/log
+
+          # Pod-side logs are ${log_root}/<run_label>/<tc_name>/<pod>/<tc_name>.log,
+          # where run_label is two path segments in the nightly layout and one in
+          # the legacy layout. Match on the run id instead of hard-coding the
+          # depth so a layout change cannot silently collect nothing.
+          matched_logs="$(mktemp)"
+          find "${log_root}" -maxdepth 6 -type f -name "${tc_name}.log" \
+            -path "*${run_tag}/*" 2>/dev/null > "${matched_logs}" || true
+
           collected=0
-          for out_dir in /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/${tc_name}; do
+          for out_dir in /root/.cache/tests/output/*${run_tag}/*/${{ inputs.test_type }}/${tc_name}; do
             [ -d "${out_dir}" ] || continue
-            for src_dir in /root/.cache/tests/logs/log/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${tc_name}/*; do
-              [ -d "${src_dir}" ] || continue
-              [ -f "${src_dir}/${tc_name}.log" ] || continue
-              pod_name="$(basename "${src_dir}")"
+            while IFS= read -r src_file; do
+              [ -n "${src_file}" ] || continue
+              pod_name="$(basename "$(dirname "${src_file}")")"
               dest_dir="${out_dir}/node_logs/${pod_name}"
               # Same name as the pod-side copy and dump_pod_logs: keep whichever
               # archive landed first so each pod ends up with a single log.
@@ -388,14 +414,23 @@ jobs:
                 continue
               fi
               mkdir -p "${dest_dir}"
-              cp -a "${src_dir}/${tc_name}.log" "${dest_dir}/${pod_name}.log"
+              cp -a "${src_file}" "${dest_dir}/${pod_name}.log"
               collected=$((collected + 1))
-            done
+            done < "${matched_logs}"
           done
+          rm -f "${matched_logs}"
           echo "Collected ${collected} pod log dir(s)"
           if [ "${collected}" -eq 0 ]; then
-            echo "No pod-side log dir matched; entries under /root/.cache/tests/logs/log:"
-            ls -1 /root/.cache/tests/logs/log 2>/dev/null | head -n 20 || true
+            echo "No pod-side log matched; matched log files:"
+            find "${log_root}" -maxdepth 6 -type f -name "${tc_name}.log" \
+              -path "*${run_tag}/*" 2>/dev/null || true
+            # Pods write this tree on the shared PVC exactly like output/, so a
+            # differing device id or a missing run-label directory points at the
+            # mount rather than at the filter above.
+            echo "output device: $(stat -c %d /root/.cache/tests/output 2>/dev/null || echo n/a)"
+            echo "log device: $(stat -c %d "${log_root}" 2>/dev/null || echo n/a)"
+            echo "recent entries under ${log_root}:"
+            ls -1t "${log_root}" 2>/dev/null | head -n 20 || true
           fi
 
       - name: Upload metrics artifact
@@ -415,19 +450,35 @@ jobs:
         run: |
           cd ${ASCEND_E2E_TEST_CONFIG_PATH}
           kubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME
-          kubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true
+          # The generated k8s_multi_pd_*.yaml files are removed by the runner as
+          # soon as the test ends, so the glob often matches nothing. Iterate
+          # instead of passing the literal pattern to kubectl, which would error
+          # with "the path ... does not exist".
+          for k8s_yaml in ./k8s_multi_pd_*.yaml; do
+            [ -e "${k8s_yaml}" ] || continue
+            kubectl delete -f "${k8s_yaml}" --ignore-not-found=true || true
+          done
 
           pod_name_prefix="${KUBE_JOB_NAME}-"
           echo "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"
-          while true; do
-            if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then
-              echo "Found exist sglang job, sleeping for 30 seconds..."
-              sleep 30
-              kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true
-            else
-              echo "No sglang job exist, start test case..."
+          # The DeepSWE eval pod is a standalone Pod (not part of the volcano
+          # job YAML), so the `-f` delete above does not remove it. Always list
+          # and delete in $NAMESPACE: a bare `kubectl get pods` uses the
+          # kubeconfig's default namespace and can silently delete nothing,
+          # which would spin this loop forever.
+          for attempt in $(seq 1 40); do
+            leftover_pods="$(kubectl get pods -n "$NAMESPACE" --no-headers \
+              -o custom-columns=:metadata.name 2>/dev/null \
+              | grep "^${pod_name_prefix}" || true)"
+            if [ -z "${leftover_pods}" ]; then
+              echo "No sglang pod left."
               break
             fi
+            echo "Attempt ${attempt}: deleting leftover pods:"
+            echo "${leftover_pods}"
+            echo "${leftover_pods}" \
+              | xargs -r kubectl delete pod -n "$NAMESPACE" --grace-period=0 --force || true
+            sleep 15
           done
           # Cleanup the run-scoped source code directory on the shared PVC.
           rm -rf /root/.cache/tests/sglang-${{ github.run_id }} || true

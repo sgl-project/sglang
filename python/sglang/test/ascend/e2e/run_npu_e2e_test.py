@@ -459,6 +459,12 @@ def monitor_pod_logs(
                 pod_name = pod.metadata.name
                 if pod_name_key_str not in pod_name:
                     continue
+                # The DeepSWE amd64 eval pod is created by the router pod at
+                # test time and is expected to be Pending while pulling images /
+                # waiting for an amd64 node; it must not fail the volcano-job
+                # liveness check here.
+                if (pod.metadata.labels or {}).get("app") == "sgl-deepswe-eval":
+                    continue
                 status = pod.status
                 phase = status.phase
                 if phase != "Running":
