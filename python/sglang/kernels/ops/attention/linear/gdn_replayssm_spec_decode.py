@@ -626,6 +626,7 @@ def gdn_replayssm_exact_fold_kernel(
 @triton.jit
 def gdn_replayssm_compact_commit_kernel(
     h0,
+    h0_scale,
     d_cache,
     k_cache,
     g_cache,
@@ -640,12 +641,14 @@ def gdn_replayssm_compact_commit_kernel(
     mamba_track_indices,
     mamba_steps_to_track,
     stride_state_slot: tl.constexpr,
+    stride_scale_slot: tl.constexpr,
     stride_d_slot: tl.constexpr,
     stride_k_slot: tl.constexpr,
     stride_g_slot: tl.constexpr,
     stride_d_residual_slot: tl.constexpr,
     stride_k_residual_slot: tl.constexpr,
     stride_state_layer: tl.constexpr,
+    stride_scale_layer: tl.constexpr,
     stride_d_layer: tl.constexpr,
     stride_k_layer: tl.constexpr,
     stride_g_layer: tl.constexpr,
@@ -665,6 +668,8 @@ def gdn_replayssm_compact_commit_kernel(
     NULL_BLOCK_ID: tl.constexpr,
     HAS_TRACK: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
+    TEMPORAL_INT8: tl.constexpr,
+    SPLIT_HILO: tl.constexpr = True,
     # Element strides between the replay rows of each cursor: 1 when the
     # cursors are their own arrays, a whole entry when they sit in one.
     STRIDE_WP: tl.constexpr = 1,
@@ -699,6 +704,7 @@ def gdn_replayssm_compact_commit_kernel(
         return
 
     h0 += i_layer * stride_state_layer
+    h0_scale += i_layer * stride_scale_layer
     d_cache += i_layer * stride_d_layer
     k_cache += i_layer * stride_k_layer
     g_cache += i_layer * stride_g_layer
@@ -722,6 +728,13 @@ def gdn_replayssm_compact_commit_kernel(
         + o_k[:, None]
     )
     old_state = tl.load(p_h0, mask=mask_v[None, :], other=0.0).to(tl.float32)
+    if TEMPORAL_INT8:
+        old_scale_v = tl.load(
+            h0_scale + state_idx * stride_scale_slot + i_hv * V + o_v,
+            mask=mask_v,
+            other=1.0,
+        ).to(tl.float32)
+        old_state = old_state * old_scale_v[None, :]
     keys = tl.load(
         k_cache
         + replay_idx * stride_k_slot
@@ -770,19 +783,33 @@ def gdn_replayssm_compact_commit_kernel(
         active_decay = tl.where(active_mask, tl.exp(active_total - active_prefix), 0.0)
         active_updates = updates * active_decay[:, None]
         active_hi = active_updates.to(k_cache.dtype.element_ty)
-        active_lo = (active_updates - active_hi.to(tl.float32)).to(
-            k_cache.dtype.element_ty
-        )
         active_delta = tl.dot(tl.trans(keys), active_hi)
-        active_delta += tl.dot(tl.trans(keys), active_lo)
-        if HAS_RESIDUAL:
-            active_delta += tl.dot(tl.trans(key_residual), active_hi)
-            active_delta += tl.dot(tl.trans(key_residual), active_lo)
-        tl.store(
-            p_h0,
-            (old_state * tl.exp(active_total) + active_delta).to(p_h0.dtype.element_ty),
-            mask=mask_v[None, :],
-        )
+        if SPLIT_HILO:
+            active_lo = (active_updates - active_hi.to(tl.float32)).to(
+                k_cache.dtype.element_ty
+            )
+            active_delta += tl.dot(tl.trans(keys), active_lo)
+            if HAS_RESIDUAL:
+                active_delta += tl.dot(tl.trans(key_residual), active_hi)
+                active_delta += tl.dot(tl.trans(key_residual), active_lo)
+        new_state = old_state * tl.exp(active_total) + active_delta
+        if TEMPORAL_INT8:
+            amax = tl.max(tl.abs(new_state), axis=0)
+            new_scale = tl.maximum(amax / 127.0, 1e-12)
+            q_new = tl.extra.cuda.libdevice.rint(new_state / new_scale[None, :])
+            q_new = tl.maximum(tl.minimum(q_new, 127.0), -127.0).to(tl.int8)
+            tl.store(p_h0, q_new, mask=mask_v[None, :])
+            tl.store(
+                h0_scale + state_idx * stride_scale_slot + i_hv * V + o_v,
+                new_scale,
+                mask=mask_v,
+            )
+        else:
+            tl.store(
+                p_h0,
+                new_state.to(p_h0.dtype.element_ty),
+                mask=mask_v[None, :],
+            )
 
     if HAS_TRACK:
         if has_track:
@@ -793,23 +820,253 @@ def gdn_replayssm_compact_commit_kernel(
             track_decay = tl.where(track_mask, tl.exp(track_total - track_prefix), 0.0)
             track_updates = updates * track_decay[:, None]
             track_hi = track_updates.to(k_cache.dtype.element_ty)
-            track_lo = (track_updates - track_hi.to(tl.float32)).to(
-                k_cache.dtype.element_ty
-            )
             track_delta = tl.dot(tl.trans(keys), track_hi)
-            track_delta += tl.dot(tl.trans(keys), track_lo)
-            if HAS_RESIDUAL:
-                track_delta += tl.dot(tl.trans(key_residual), track_hi)
-                track_delta += tl.dot(tl.trans(key_residual), track_lo)
-            tl.store(
+            if SPLIT_HILO:
+                track_lo = (track_updates - track_hi.to(tl.float32)).to(
+                    k_cache.dtype.element_ty
+                )
+                track_delta += tl.dot(tl.trans(keys), track_lo)
+                if HAS_RESIDUAL:
+                    track_delta += tl.dot(tl.trans(key_residual), track_hi)
+                    track_delta += tl.dot(tl.trans(key_residual), track_lo)
+            track_state = old_state * tl.exp(track_total) + track_delta
+            p_track = (
                 h0
                 + track_idx * stride_state_slot
                 + i_hv * V * K
                 + o_v[None, :] * K
-                + o_k[:, None],
-                (old_state * tl.exp(track_total) + track_delta).to(h0.dtype.element_ty),
-                mask=mask_v[None, :],
+                + o_k[:, None]
             )
+            if TEMPORAL_INT8:
+                t_amax = tl.max(tl.abs(track_state), axis=0)
+                t_scale = tl.maximum(t_amax / 127.0, 1e-12)
+                q_track = tl.extra.cuda.libdevice.rint(track_state / t_scale[None, :])
+                q_track = tl.maximum(tl.minimum(q_track, 127.0), -127.0).to(tl.int8)
+                tl.store(p_track, q_track, mask=mask_v[None, :])
+                tl.store(
+                    h0_scale + track_idx * stride_scale_slot + i_hv * V + o_v,
+                    t_scale,
+                    mask=mask_v,
+                )
+            else:
+                tl.store(
+                    p_track,
+                    track_state.to(h0.dtype.element_ty),
+                    mask=mask_v[None, :],
+                )
+
+
+@triton.jit
+def gdn_replayssm_compact_commit_persistent_kernel(
+    h0,
+    h0_scale,
+    d_cache,
+    k_cache,
+    g_cache,
+    ssm_state_indices,
+    replay_indices,
+    write_pos,
+    cache_base,
+    is_flush_flags,
+    accept_lens,
+    mamba_track_indices,
+    mamba_steps_to_track,
+    n_rows,
+    num_layers: tl.constexpr,
+    stride_state_slot: tl.constexpr,
+    stride_scale_slot: tl.constexpr,
+    stride_d_slot: tl.constexpr,
+    stride_k_slot: tl.constexpr,
+    stride_g_slot: tl.constexpr,
+    stride_state_layer: tl.constexpr,
+    stride_scale_layer: tl.constexpr,
+    stride_d_layer: tl.constexpr,
+    stride_k_layer: tl.constexpr,
+    stride_g_layer: tl.constexpr,
+    stride_indices: tl.constexpr,
+    stride_replay_indices: tl.constexpr,
+    stride_accept: tl.constexpr,
+    stride_track: tl.constexpr,
+    stride_steps: tl.constexpr,
+    H: tl.constexpr,
+    HV: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+    MAX_CACHE_LEN: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    HAS_TRACK: tl.constexpr,
+    STRIDE_WP: tl.constexpr,
+    STRIDE_CB: tl.constexpr,
+    STRIDE_FL: tl.constexpr,
+):
+    """SM-persistent compact commit kernel that filters clean rows before looping."""
+    pid = tl.program_id(0)
+    num_pids = tl.num_programs(0)
+    nv: tl.constexpr = (V + BV - 1) // BV
+    per_row_tasks: tl.constexpr = num_layers * HV * nv
+    o_t = tl.arange(0, MAX_CACHE_LEN)
+    o_k = tl.arange(0, K)
+
+    for i_n in range(n_rows):
+        state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
+        replay_idx = tl.load(replay_indices + i_n * stride_replay_indices).to(tl.int64)
+        row_valid = (state_idx > NULL_BLOCK_ID) & (replay_idx > NULL_BLOCK_ID)
+        fold_active = row_valid & (
+            tl.load(is_flush_flags + replay_idx * STRIDE_FL, mask=row_valid, other=0)
+            != 0
+        )
+        if HAS_TRACK:
+            track_idx = tl.load(
+                mamba_track_indices + i_n * stride_track,
+                mask=row_valid,
+                other=NULL_BLOCK_ID,
+            ).to(tl.int64)
+            track_step = tl.load(
+                mamba_steps_to_track + i_n * stride_steps,
+                mask=row_valid,
+                other=-1,
+            ).to(tl.int32)
+            has_track = row_valid & (track_idx > NULL_BLOCK_ID) & (track_step >= 0)
+        else:
+            track_idx = NULL_BLOCK_ID
+            track_step = -1
+            has_track = False
+
+        if fold_active or has_track:
+            n_history = tl.load(write_pos + replay_idx * STRIDE_WP).to(tl.int32)
+            base = tl.load(cache_base + replay_idx * STRIDE_CB).to(tl.int32)
+            phys = (base + o_t) & (MAX_CACHE_LEN - 1)
+            if HAS_TRACK:
+                n_accepted = tl.load(accept_lens + i_n * stride_accept).to(tl.int32)
+                track_len = n_history - n_accepted + track_step + 1
+            else:
+                track_len = 0
+
+            # Zero rejected lanes at load time. A zero decay does not mask NaN
+            # or Inf, including a non-finite key fed to the tensor-core dot.
+            history_mask = o_t < tl.where(fold_active, n_history, track_len)
+            task = pid
+            while task < per_row_tasks:
+                i_v = task % nv
+                rem = task // nv
+                i_hv = rem % HV
+                i_layer = (rem // HV).to(tl.int64)
+                i_h = i_hv // (HV // H)
+
+                o_v = i_v * BV + tl.arange(0, BV)
+                mask_v = o_v < V
+
+                h0_l = h0 + i_layer * stride_state_layer
+                h0_s_l = h0_scale + i_layer * stride_scale_layer
+                d_l = d_cache + i_layer * stride_d_layer
+                k_l = k_cache + i_layer * stride_k_layer
+                g_l = g_cache + i_layer * stride_g_layer
+
+                p_h0 = (
+                    h0_l
+                    + state_idx * stride_state_slot
+                    + i_hv * V * K
+                    + o_v[None, :] * K
+                    + o_k[:, None]
+                )
+                old_state = tl.load(p_h0, mask=mask_v[None, :], other=0.0).to(
+                    tl.float32
+                )
+                old_scale_v = tl.load(
+                    h0_s_l + state_idx * stride_scale_slot + i_hv * V + o_v,
+                    mask=mask_v,
+                    other=1.0,
+                ).to(tl.float32)
+                old_state = old_state * old_scale_v[None, :]
+
+                keys = tl.load(
+                    k_l
+                    + replay_idx * stride_k_slot
+                    + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
+                    + o_k[None, :],
+                    mask=history_mask[:, None],
+                    other=0.0,
+                )
+                updates = tl.load(
+                    d_l
+                    + replay_idx * stride_d_slot
+                    + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
+                    + o_v[None, :],
+                    mask=history_mask[:, None] & mask_v[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                gates = tl.load(
+                    g_l + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys,
+                    mask=history_mask,
+                    other=0.0,
+                ).to(tl.float32)
+
+                if fold_active:
+                    active_mask = o_t < n_history
+                    active_g = tl.where(active_mask, gates, 0.0)
+                    active_prefix = tl.cumsum(active_g, axis=0)
+                    active_total = tl.sum(active_g, axis=0)
+                    active_decay = tl.where(
+                        active_mask, tl.exp(active_total - active_prefix), 0.0
+                    )
+                    active_updates = updates * active_decay[:, None]
+                    active_hi = active_updates.to(k_cache.dtype.element_ty)
+                    active_delta = tl.dot(tl.trans(keys), active_hi)
+                    new_state = old_state * tl.exp(active_total) + active_delta
+                    amax = tl.max(tl.abs(new_state), axis=0)
+                    new_scale = tl.maximum(amax / 127.0, 1e-12)
+                    q_new = tl.extra.cuda.libdevice.rint(new_state / new_scale[None, :])
+                    q_new = tl.maximum(tl.minimum(q_new, 127.0), -127.0).to(tl.int8)
+                    tl.store(p_h0, q_new, mask=mask_v[None, :])
+                    tl.store(
+                        h0_s_l + state_idx * stride_scale_slot + i_hv * V + o_v,
+                        new_scale,
+                        mask=mask_v,
+                    )
+                if HAS_TRACK:
+                    if has_track:
+                        track_mask = o_t < track_len
+                        track_g = tl.where(track_mask, gates, 0.0)
+                        track_prefix = tl.cumsum(track_g, axis=0)
+                        track_total = tl.sum(track_g, axis=0)
+                        track_decay = tl.where(
+                            track_mask, tl.exp(track_total - track_prefix), 0.0
+                        )
+                        # A simultaneous active fold can have a longer prefix
+                        # than the tracking snapshot.
+                        track_keys = keys
+                        track_updates = updates
+                        if fold_active:
+                            track_keys = tl.where(track_mask[:, None], keys, 0.0)
+                            track_updates = tl.where(track_mask[:, None], updates, 0.0)
+                        track_hi = (track_updates * track_decay[:, None]).to(
+                            k_cache.dtype.element_ty
+                        )
+                        track_delta = tl.dot(tl.trans(track_keys), track_hi)
+                        track_state = old_state * tl.exp(track_total) + track_delta
+                        p_track = (
+                            h0_l
+                            + track_idx * stride_state_slot
+                            + i_hv * V * K
+                            + o_v[None, :] * K
+                            + o_k[:, None]
+                        )
+                        t_amax = tl.max(tl.abs(track_state), axis=0)
+                        t_scale = tl.maximum(t_amax / 127.0, 1e-12)
+                        q_track = tl.extra.cuda.libdevice.rint(
+                            track_state / t_scale[None, :]
+                        )
+                        q_track = tl.maximum(tl.minimum(q_track, 127.0), -127.0).to(
+                            tl.int8
+                        )
+                        tl.store(p_track, q_track, mask=mask_v[None, :])
+                        tl.store(
+                            h0_s_l + track_idx * stride_scale_slot + i_hv * V + o_v,
+                            t_scale,
+                            mask=mask_v,
+                        )
+                task += num_pids
 
 
 @triton.jit
@@ -1358,6 +1615,7 @@ def commit_gdn_replayssm_spec(
 def commit_gdn_replayssm_circular(
     *,
     checkpoint_state: torch.Tensor,
+    checkpoint_scale: torch.Tensor | None = None,
     d_cache: torch.Tensor,
     k_cache: torch.Tensor,
     g_cache: torch.Tensor,
@@ -1377,8 +1635,9 @@ def commit_gdn_replayssm_circular(
 
     ``write_pos`` must already include this step's accepted prefix. Capacity
     rows update their active checkpoint and reset the ring; track rows snapshot
-    the exact state at the requested accepted step without disturbing the active
-    checkpoint.
+    the state at the requested accepted step without disturbing the active
+    checkpoint. INT8 checkpoints without residual buffers use a single BF16
+    dot per materialization. The caller supplies an FP32 scale for every V row.
     """
     num_layers, _, HV, V, K = checkpoint_state.shape
     H = k_cache.shape[2]
@@ -1399,54 +1658,136 @@ def commit_gdn_replayssm_circular(
         track_steps = accept_lens
         stride_track = 0
         stride_steps = 0
-    grid = (triton.cdiv(V, BV), B, HV * num_layers)
-    gdn_replayssm_compact_commit_kernel[grid](
-        checkpoint_state,
-        d_cache,
-        k_cache,
-        g_cache,
-        d_residual_buf,
-        k_residual_buf,
-        state_batch_indices,
-        replay_indices,
-        write_pos,
-        cache_base,
-        is_flush,
-        accept_lens,
-        track_indices,
-        track_steps,
-        checkpoint_state.stride(1),
-        d_cache.stride(1),
-        k_cache.stride(1),
-        g_cache.stride(1),
-        d_residual_buf.stride(1),
-        k_residual_buf.stride(1),
-        checkpoint_state.stride(0),
-        d_cache.stride(0),
-        k_cache.stride(0),
-        g_cache.stride(0),
-        d_residual_buf.stride(0),
-        k_residual_buf.stride(0),
-        state_batch_indices.stride(0),
-        replay_indices.stride(0),
-        accept_lens.stride(0),
-        stride_track,
-        stride_steps,
-        H=H,
-        HV=HV,
-        K=K,
-        V=V,
-        BV=BV,
-        MAX_CACHE_LEN=max_cache_len,
-        NULL_BLOCK_ID=null_block_id,
-        HAS_TRACK=has_track,
-        HAS_RESIDUAL=has_residual,
-        num_warps=4,
-        num_stages=2,
-        STRIDE_WP=write_pos.stride(0),
-        STRIDE_CB=cache_base.stride(0),
-        STRIDE_FL=is_flush.stride(0),
+    temporal_int8 = checkpoint_state.dtype == torch.int8
+    if temporal_int8:
+        if (
+            checkpoint_scale is None
+            or checkpoint_scale.shape != checkpoint_state.shape[:-1]
+            or checkpoint_scale.dtype != torch.float32
+            or checkpoint_scale.device != checkpoint_state.device
+            or checkpoint_scale.stride(-1) != 1
+            or checkpoint_scale.stride(-2) != V
+        ):
+            raise ValueError(
+                "INT8 commit requires FP32 scales with packed [HV, V] rows"
+            )
+        scale_buf = checkpoint_scale
+        stride_scale_slot = checkpoint_scale.stride(1)
+        stride_scale_layer = checkpoint_scale.stride(0)
+    else:
+        scale_buf = d_cache
+        stride_scale_slot = 0
+        stride_scale_layer = 0
+    if B == 0:
+        return
+    one_dot = temporal_int8 and not has_residual
+    use_sm120_int8_persist = (
+        one_dot
+        and checkpoint_state.is_cuda
+        and torch.cuda.get_device_capability(checkpoint_state.device)[0] == 12
     )
+    if use_sm120_int8_persist:
+        # RTX 5090 (170 SMs): launch 340 persistent CTAs with 1-dot INT8 commit.
+        # Skip tiles for requests without a fold or a tracking snapshot.
+        gdn_replayssm_compact_commit_persistent_kernel[(340,)](
+            checkpoint_state,
+            scale_buf,
+            d_cache,
+            k_cache,
+            g_cache,
+            state_batch_indices,
+            replay_indices,
+            write_pos,
+            cache_base,
+            is_flush,
+            accept_lens,
+            track_indices,
+            track_steps,
+            B,
+            num_layers,
+            checkpoint_state.stride(1),
+            stride_scale_slot,
+            d_cache.stride(1),
+            k_cache.stride(1),
+            g_cache.stride(1),
+            checkpoint_state.stride(0),
+            stride_scale_layer,
+            d_cache.stride(0),
+            k_cache.stride(0),
+            g_cache.stride(0),
+            state_batch_indices.stride(0),
+            replay_indices.stride(0),
+            accept_lens.stride(0),
+            stride_track,
+            stride_steps,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BV=BV,
+            MAX_CACHE_LEN=max_cache_len,
+            NULL_BLOCK_ID=null_block_id,
+            HAS_TRACK=has_track,
+            STRIDE_WP=write_pos.stride(0),
+            STRIDE_CB=cache_base.stride(0),
+            STRIDE_FL=is_flush.stride(0),
+            num_warps=4,
+            num_stages=2,
+        )
+    else:
+        grid = (triton.cdiv(V, BV), B, HV * num_layers)
+        gdn_replayssm_compact_commit_kernel[grid](
+            checkpoint_state,
+            scale_buf,
+            d_cache,
+            k_cache,
+            g_cache,
+            d_residual_buf,
+            k_residual_buf,
+            state_batch_indices,
+            replay_indices,
+            write_pos,
+            cache_base,
+            is_flush,
+            accept_lens,
+            track_indices,
+            track_steps,
+            checkpoint_state.stride(1),
+            stride_scale_slot,
+            d_cache.stride(1),
+            k_cache.stride(1),
+            g_cache.stride(1),
+            d_residual_buf.stride(1),
+            k_residual_buf.stride(1),
+            checkpoint_state.stride(0),
+            stride_scale_layer,
+            d_cache.stride(0),
+            k_cache.stride(0),
+            g_cache.stride(0),
+            d_residual_buf.stride(0),
+            k_residual_buf.stride(0),
+            state_batch_indices.stride(0),
+            replay_indices.stride(0),
+            accept_lens.stride(0),
+            stride_track,
+            stride_steps,
+            H=H,
+            HV=HV,
+            K=K,
+            V=V,
+            BV=BV,
+            MAX_CACHE_LEN=max_cache_len,
+            NULL_BLOCK_ID=null_block_id,
+            HAS_TRACK=has_track,
+            HAS_RESIDUAL=has_residual,
+            TEMPORAL_INT8=temporal_int8,
+            SPLIT_HILO=not one_dot,
+            STRIDE_WP=write_pos.stride(0),
+            STRIDE_CB=cache_base.stride(0),
+            STRIDE_FL=is_flush.stride(0),
+            num_warps=4,
+            num_stages=2,
+        )
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
         write_pos,
