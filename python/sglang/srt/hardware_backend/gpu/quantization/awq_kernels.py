@@ -9,10 +9,17 @@ from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.quantization.marlin_utils import (
     apply_awq_marlin_linear,
     awq_to_marlin_zero_points,
+    marlin_commit_param,
+    marlin_link_checkpoint_params,
     marlin_make_empty_g_idx,
     marlin_make_workspace,
     marlin_moe_permute_scales,
     marlin_permute_scales,
+    marlin_restore_checkpoint_params,
+    marlin_stash_checkpoint_params,
+    marlin_to_awq_weights,
+    marlin_to_awq_zero_points,
+    marlin_unpermute_scales,
     moe_awq_to_marlin_zero_points,
 )
 from sglang.srt.layers.quantization.utils import replace_parameter
@@ -105,39 +112,60 @@ class AWQMarlinLinearKernel:
         self.quant_config = quant_config
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "_marlin_repacked", False):
+            return
         device = layer.qweight.device
-        layer.qweight = torch.nn.Parameter(layer.qweight.data, requires_grad=False)
-        layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-
-        layer.workspace = marlin_make_workspace(device)
+        num_bits = self.quant_config.quant_type.size_bits
+        marlin_stash_checkpoint_params(layer, ("qweight", "qzeros", "scales"))
+        if getattr(layer, "workspace", None) is None:
+            layer.workspace = marlin_make_workspace(device)
 
         marlin_qweight = awq_marlin_repack(
-            layer.qweight,
+            layer.qweight.data,
             size_k=layer.input_size_per_partition,
             size_n=layer.output_size_per_partition,
-            num_bits=self.quant_config.quant_type.size_bits,
+            num_bits=num_bits,
         )
-        replace_parameter(layer, "qweight", marlin_qweight)
-
         marlin_scales = marlin_permute_scales(
-            layer.scales,
+            layer.scales.data,
             size_k=layer.input_size_per_partition,
             size_n=layer.output_size_per_partition,
             group_size=self.quant_config.group_size,
         )
-        replace_parameter(layer, "scales", marlin_scales)
-
         marlin_zp = awq_to_marlin_zero_points(
-            layer.qzeros,
+            layer.qzeros.data,
             size_k=layer.num_groups,
             size_n=layer.output_size_per_partition,
-            num_bits=self.quant_config.quant_type.size_bits,
+            num_bits=num_bits,
         )
-        replace_parameter(layer, "qzeros", marlin_zp)
+        marlin_commit_param(layer, "qweight", marlin_qweight)
+        marlin_commit_param(layer, "scales", marlin_scales)
+        marlin_commit_param(layer, "qzeros", marlin_zp)
 
         layer.g_idx = marlin_make_empty_g_idx(device)
         layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
+        marlin_link_checkpoint_params(layer)
+
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        if not getattr(layer, "_marlin_repacked", False):
+            return
+        size_k = layer.input_size_per_partition
+        size_n = layer.output_size_per_partition
+        num_bits = self.quant_config.quant_type.size_bits
+        marlin_restore_checkpoint_params(
+            layer,
+            {
+                "qweight": marlin_to_awq_weights(
+                    layer.qweight.data, size_k, size_n, num_bits
+                ),
+                "qzeros": marlin_to_awq_zero_points(
+                    layer.qzeros.data, layer.num_groups, size_n, num_bits
+                ),
+                "scales": marlin_unpermute_scales(
+                    layer.scales.data, size_k, size_n, self.quant_config.group_size
+                ),
+            },
+        )
 
     def apply(
         self,

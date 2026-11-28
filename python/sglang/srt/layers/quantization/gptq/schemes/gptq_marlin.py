@@ -152,6 +152,9 @@ class GPTQMarlinLinearScheme(GPTQLinearSchemeBase):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self.kernel.process_weights_after_loading(layer)
 
+    def restore_weights_before_loading(self, layer: torch.nn.Module) -> None:
+        self.kernel.restore_weights_before_loading(layer)
+
     def apply_weights(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: Optional[torch.Tensor]
     ):
