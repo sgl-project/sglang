@@ -206,8 +206,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"beam_width or raise --max-running-requests."
             )
 
-        # Effective generation budget: keep prompt + budget + member margin
-        # within the row width so member-side length can never truncate first.
+        # Effective generation budget: keep budget + member margin within the
+        # scheduler's context clamp so member-side length can never truncate first.
         prompt_len = len(req.origin_input_ids)
         max_new_tokens = min(
             (
@@ -215,7 +215,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 if user_params.max_new_tokens is not None
                 else 1 << 30
             ),
-            self.max_req_len - prompt_len - 1 - MEMBER_LENGTH_MARGIN,
+            self.max_req_len - prompt_len - MEMBER_LENGTH_MARGIN,
         )
         if max_new_tokens < 1:
             return (
