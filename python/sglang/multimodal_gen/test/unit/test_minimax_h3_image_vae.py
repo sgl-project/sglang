@@ -16,6 +16,7 @@ from sglang.kernels.ops import diffusion as diffusion_ops
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3ImageVAE
@@ -145,6 +146,54 @@ def test_local_tiling_decode_matches_untiled(tiny_image):
             atol=0,
         )
         assert tiny_image.decode_image_raw(latents).shape == (1, 3, 48, 48)
+
+
+@torch.inference_mode()
+def test_tiled_reference_caches_moments_and_advances_each_generator(tiny_image):
+    tiny_image.setup_forward(
+        encoder_tiling=True, tile_size=32, tile_overlap_min=16, token_drop=0
+    )
+    image = torch.randn(1, 3, 1, 48, 48)
+    changed = image.clone()
+    changed[..., 0, 0] += 1
+    requests = [(image, 42), (image, 43), (changed, 43), (image, 42)]
+
+    def draw(pixels, seed):
+        generator = torch.Generator().manual_seed(seed)
+        latent = tiny_image.encode_base(pixels, process_image=True, generator=generator)
+        return latent, generator.get_state()
+
+    expected = [draw(*request) for request in requests]
+    cache = ConditioningCache(8 << 20)
+    with (
+        cache.scope(),
+        patch.object(
+            tiny_image, "_assemble_tiles", wraps=tiny_image._assemble_tiles
+        ) as assemble,
+    ):
+        actual = [draw(*request) for request in requests]
+    assert assemble.call_count == 2
+    for (latent, state), (expected_latent, expected_state) in zip(actual, expected):
+        assert torch.equal(latent, expected_latent)
+        assert torch.equal(state, expected_state)
+
+
+@torch.inference_mode()
+def test_tiled_reference_leaves_collective_encode_to_all_ranks(tiny_image, monkeypatch):
+    from sglang.multimodal_gen.runtime.models.vaes import minimax_h3
+
+    tiny_image.parallel_tiling = True
+    monkeypatch.setattr(minimax_h3, "get_tile_parallel_state", lambda: (0, 2))
+    pixels = torch.randn(1, 3, 1, 48, 48)
+    with (
+        ConditioningCache(8 << 20).scope(),
+        patch.object(
+            AutoencoderKLLegacy, "tiled_encode", return_value=pixels
+        ) as collective_encode,
+    ):
+        tiny_image.tiled_encode(pixels)
+        tiny_image.tiled_encode(pixels)
+    assert collective_encode.call_count == 2
 
 
 def test_posterior_sample_without_generator_uses_global_cpu_rng():
