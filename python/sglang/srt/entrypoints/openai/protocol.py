@@ -1265,12 +1265,21 @@ class ChatCompletionRequest(PDRoutingFields):
         if json_schema:
             return values
 
+        if schema is not None and not isinstance(schema, dict):
+            raise ValueError(
+                "response_format.schema must be a JSON object when "
+                f"response_format.type is 'json_schema', got {type(schema).__name__}"
+            )
+
         if schema:
             name_ = schema.get("title", "Schema")
             strict_ = None
-            if "properties" in schema and "strict" in schema["properties"]:
-                item = schema["properties"].pop("strict", None)
-                strict_ = bool(item and item.get("default", False))
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                item = properties.get("strict")
+                if isinstance(item, dict):
+                    properties.pop("strict", None)
+                    strict_ = bool(item.get("default", False))
 
             response_format["json_schema"] = {
                 "name": name_,
