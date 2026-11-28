@@ -67,6 +67,7 @@ from sglang.srt.entrypoints.server_utils import (
 )
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers.processor import maybe_prewarm_local_hf_modules
 from sglang.srt.managers.data_parallel_controller import (
     SCHEDULER_PIDS_ARG,
     run_data_parallel_controller_process,
@@ -904,6 +905,7 @@ class Engine(EngineScoreMixin, EngineBase):
             Tuple of (SchedulerInitResult, scheduler_procs).
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
+        maybe_prewarm_local_hf_modules()
         scheduler_procs = []
         # Elastic EP offset joiners always use the DPC; the primary owns the tokenizer.
         use_dp_controller = (

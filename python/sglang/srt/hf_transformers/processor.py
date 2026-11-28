@@ -13,7 +13,11 @@
 # ==============================================================================
 """Processor loading utilities."""
 
+import filecmp
 import json
+import multiprocessing
+import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -22,11 +26,22 @@ from transformers import (
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizerBase,
+    dynamic_module_utils,
 )
 from transformers.utils import cached_file
 
+from sglang.srt.environ import envs
 from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
-from sglang.srt.utils import logger
+from sglang.srt.plugins import load_plugins
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_mm,
+    get_model,
+    get_parallel,
+    get_serving,
+    process_model_config,
+)
+from sglang.srt.utils import kill_itself_when_parent_died, logger
 
 from .common import (
     AutoConfig,
@@ -57,6 +72,184 @@ from .tokenizer import (
 )
 
 _IMAGE_PROCESSOR_BACKENDS = {"auto", "torchvision", "pil"}
+
+
+def _tokenizer_load_options(is_multimodal):
+    serving = get_serving()
+    model = get_model()
+    tokenizer_opts = dict(
+        tokenizer_name=serving.tokenizer_path,
+        tokenizer_mode=serving.tokenizer_mode,
+        tokenizer_backend=serving.tokenizer_backend,
+        trust_remote_code=model.trust_remote_code,
+        revision=model.revision,
+    )
+    processor_opts = None
+    if is_multimodal:
+        processor_opts = dict(
+            image_processor_backend=get_mm().image_processor_backend,
+            model_name=model.model_path,
+        )
+    return tokenizer_opts, processor_opts
+
+
+def load_scheduler_tokenizer(*, is_multimodal: bool):
+    """Load the tokenizer and optional processor with the resolved serving options."""
+    tokenizer_opts, processor_opts = _tokenizer_load_options(is_multimodal)
+    if processor_opts is not None:
+        processor = get_processor(**tokenizer_opts, **processor_opts)
+        return get_tokenizer_from_processor(processor), processor
+    return get_tokenizer(**tokenizer_opts), None
+
+
+def _prewarm_in_subprocess(
+    staging_dir, tokenizer_opts, processor_loads, load_standalone_tokenizer
+):
+    kill_itself_when_parent_died()
+    # The parent may already have died before the watchdog was installed.
+    if not multiprocessing.parent_process().is_alive():
+        return
+    # spawn inherits sys.path. Prefer staged packages even when the launcher
+    # has already imported the checkpoint's AutoConfig from the shared cache.
+    dynamic_module_utils.HF_MODULES_CACHE = staging_dir
+    sys.path.insert(0, staging_dir)
+    load_plugins()
+    for options in processor_loads:
+        get_processor(**options)
+    if load_standalone_tokenizer:
+        # Python detokenizers load a standalone tokenizer even for MM models.
+        get_tokenizer(**tokenizer_opts)
+
+
+def maybe_prewarm_local_hf_modules(*, prewarm_scheduler_nodes=None):
+    """Work around transformers#50843 before concurrent local module readers start."""
+    try:
+        if not get_model().trust_remote_code:
+            return
+        serving = get_serving()
+        parallel = get_parallel()
+        skip_tokenizer = serving.skip_tokenizer_init
+        disagg = get_disagg()
+        # Scheduler.init_disaggregation and TokenizerManager both create receivers.
+        receiver_loads_processor = (
+            disagg.language_only
+            and disagg.encoder_transfer_backend in ("zmq_to_scheduler", "mooncake")
+        )
+        warm_ray_workers = prewarm_scheduler_nodes is not None and (
+            not skip_tokenizer or receiver_loads_processor
+        )
+        has_python_frontend = (
+            parallel.node_rank == 0 and not envs.SGLANG_RUST_SERVER.get()
+        )
+        frontend_loads_processor = (
+            has_python_frontend and not disagg.language_model_only
+        )
+        if (
+            skip_tokenizer
+            and not receiver_loads_processor
+            and (not frontend_loads_processor or serving.tokenizer_worker_num <= 1)
+        ):
+            return
+        if (
+            not warm_ray_workers
+            and not has_python_frontend
+            and parallel.tp_size * parallel.pp_size * parallel.dp_size
+            <= parallel.nnodes
+        ):
+            return
+
+        # Relative paths are resolved in the Ray worker's working directory.
+        if not warm_ray_workers and not Path(serving.tokenizer_path).is_dir():
+            return
+        is_multimodal = (
+            not skip_tokenizer or frontend_loads_processor
+        ) and process_model_config().is_multimodal
+        if skip_tokenizer and not (receiver_loads_processor or is_multimodal):
+            return
+        tokenizer_opts, processor_opts = _tokenizer_load_options(is_multimodal)
+
+        def loader_args(*, scheduler, frontend):
+            processors = []
+            if processor_opts is not None and (
+                (scheduler and not skip_tokenizer)
+                or (frontend and frontend_loads_processor)
+            ):
+                processors.append({**tokenizer_opts, **processor_opts})
+            if receiver_loads_processor and (
+                not processors
+                or get_model().model_path != serving.tokenizer_path
+                or serving.tokenizer_backend is None
+            ):
+                # MMReceiver resolves AutoConfig from tokenizer_path, without model_name.
+                options = dict(
+                    tokenizer_opts,
+                    image_processor_backend=get_mm().image_processor_backend,
+                )
+                if options["tokenizer_backend"] is None:
+                    del options["tokenizer_backend"]
+                processors.append(options)
+            standalone = not skip_tokenizer and (frontend or not is_multimodal)
+            return tokenizer_opts, processors, standalone
+
+        if warm_ray_workers:
+            prewarm_scheduler_nodes(
+                loader_args(scheduler=True, frontend=False),
+                loader_args(scheduler=False, frontend=True)
+                if has_python_frontend
+                else None,
+            )
+        else:
+            prewarm_hf_modules_on_node(
+                *loader_args(scheduler=True, frontend=has_python_frontend)
+            )
+    except Exception:
+        logger.warning(
+            "Could not prewarm the HF modules cache. Continuing with scheduler startup.",
+            exc_info=True,
+        )
+
+
+def prewarm_hf_modules_on_node(
+    tokenizer_opts, processor_loads, load_standalone_tokenizer
+):
+    """Stage imports on this node before publishing complete files to its HF cache."""
+    if not processor_loads and not load_standalone_tokenizer:
+        return
+    if not Path(tokenizer_opts["tokenizer_name"]).is_dir():
+        return
+    cache = Path(dynamic_module_utils.HF_MODULES_CACHE)
+    cache.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=cache) as staging:
+        # Only resolved loader arguments cross spawn: unpickling ServerArgs
+        # could import a custom config before staging is active.
+        proc = multiprocessing.get_context("spawn").Process(
+            target=_prewarm_in_subprocess,
+            args=(staging, tokenizer_opts, processor_loads, load_standalone_tokenizer),
+        )
+        proc.start()
+        try:
+            proc.join()
+            if proc.exitcode != 0:
+                raise RuntimeError(
+                    f"Tokenizer prewarm process exited with {proc.exitcode}"
+                )
+        finally:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join()
+            proc.close()
+
+        # Stage on the same filesystem so readers see only complete files.
+        # HF creates empty package initializers without replacing existing ones.
+        for source in Path(staging).rglob("*.py"):
+            target = cache / source.relative_to(staging)
+            if target.exists() and (
+                (source.name == "__init__.py" and source.stat().st_size == 0)
+                or filecmp.cmp(source, target, shallow=False)
+            ):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(target)
 
 
 def _normalize_image_processor_backend(
