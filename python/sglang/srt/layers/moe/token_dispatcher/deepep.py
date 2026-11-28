@@ -3,8 +3,10 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import socket
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
@@ -217,6 +219,9 @@ class DeepEPBuffer:
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
 
+        # Collective: every rank reaches this together, unlike the config constructor.
+        DeepEPConfig.get_instance().resolve_topology(group)
+
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
             hidden_bytes = hidden_size * param_bytes
@@ -335,6 +340,69 @@ class DeepEPBuffer:
             raise Exception("unsupported mode")
 
 
+# Measured on 8x B200 (4096-token prefill, hidden 6144, top-8 of 256 experts): DeepEP's
+# 20-SM default leaves NVLink dispatch + combine SM-bound at ~2.5 ms per MoE layer;
+# 64 SMs keep the same NVL buffer (32 channels * 80 == 10 * 256 slots) and take ~0.85 ms.
+_SM100_INTRANODE_NORMAL_NUM_SMS = 64
+
+# Per TP group: whether all its ranks share a host. Resolved once, at buffer build.
+_SINGLE_HOST_TP_GROUPS: dict = {}
+
+
+def _host_identity() -> Tuple[str, str]:
+    """Identity of this rank's host. The boot id separates hosts that share a name."""
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        boot = ""
+    return socket.gethostname(), boot
+
+
+def _tp_ranks_share_one_host(group: dist.ProcessGroup) -> bool:
+    """Whether every rank of the TP group runs on the same host.
+
+    Eight ranks do not imply one node and `nnodes` does not settle it: with a Ray
+    custom placement group the bundle-to-rank mapping never consults it, so TP8 can
+    straddle two four-GPU hosts with nnodes at 1. Only the ranks themselves know.
+    Called from buffer construction, which every rank reaches together; a collective
+    in DeepEPConfig's lazy constructor could be entered at different points.
+    """
+    key = id(group)
+    cached = _SINGLE_HOST_TP_GROUPS.get(key)
+    if cached is not None:
+        return cached
+    gathered: List[object] = [None] * group.size()
+    dist.all_gather_object(gathered, _host_identity(), group=group)
+    # An unreadable boot id is not evidence of anything, and two containers on different
+    # hosts can share a hostname, so eight empty boot ids would compare equal and select
+    # the single-host config across two nodes. Decline instead: the tuning is an
+    # optimisation, and the cost of skipping it is far below the cost of 64 SMs and 64
+    # queue pairs per rank on a configuration that cannot carry them.
+    if any(not isinstance(ident, tuple) or not ident[1] for ident in gathered):
+        _SINGLE_HOST_TP_GROUPS[key] = False
+        return False
+    same = len(set(gathered)) == 1
+    _SINGLE_HOST_TP_GROUPS[key] = same
+    return same
+
+
+def _sm100_intranode_normal_configs(
+    num_ranks: int, single_host: bool
+) -> Optional[Tuple[Config, Config]]:
+    """(dispatch, combine) normal-mode configs for one 8-GPU SM100 NVLink node."""
+    if _is_npu or is_hip() or num_ranks != 8 or not single_host:
+        return None
+    num_sms = _SM100_INTRANODE_NORMAL_NUM_SMS
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    if props.major != 10 or props.multi_processor_count < 2 * num_sms:
+        return None
+    # TBO subtracts DeepEPConfig.num_sms from the prefill DeepGEMM budget; 20 -> 64
+    # would cut it on a configuration we have not measured.
+    if is_tbo_enabled():
+        return None
+    return Config(num_sms, 12, 80, 6, 128), Config(num_sms, 6, 80, 6, 128)
+
+
 class DeepEPConfig(BaseDispatcherConfig):
     _instance = None
 
@@ -353,9 +421,40 @@ class DeepEPConfig(BaseDispatcherConfig):
             assert config_dispatch["num_sms"] == config_combine["num_sms"]
             self.num_sms = config_dispatch["num_sms"]
         else:
+            # DeepEP's defaults until resolve_topology() runs. The SM100 tuning needs a
+            # collective to establish that the TP group is one host, so it cannot be
+            # decided here: this constructor is lazy and is also reached from TBO
+            # planning, where ranks do not arrive together.
+            self.explicit = False
             self.normal_dispatch_config = None
             self.normal_combine_config = None
             self.num_sms = Buffer.num_sms
+            return
+        self.explicit = True
+
+    def resolve_topology(self, group: dist.ProcessGroup) -> None:
+        """Pick the SM100 intranode configs once the group's topology is known.
+
+        Called from buffer construction, which is collective, so the all-gather in
+        _tp_ranks_share_one_host() is safe here. A no-op when --deepep-config was
+        given, or once already resolved.
+        """
+        if self.explicit or getattr(self, "_resolved", False):
+            return
+        self._resolved = True
+        tuned = _sm100_intranode_normal_configs(
+            group.size(), _tp_ranks_share_one_host(group)
+        )
+        if tuned is None:
+            return
+        self.normal_dispatch_config, self.normal_combine_config = tuned
+        self.num_sms = _SM100_INTRANODE_NORMAL_NUM_SMS
+        if dist.get_rank() == 0:
+            logger.info(
+                "Single-host SM100 TP%d: DeepEP normal dispatch/combine at %d SMs.",
+                group.size(),
+                _SM100_INTRANODE_NORMAL_NUM_SMS,
+            )
 
     @classmethod
     def get_instance(cls):
