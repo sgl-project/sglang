@@ -967,10 +967,11 @@ def grouped_gemm_triton(
             "BLOCK_SIZE_K": 128,
             "GROUP_SIZE_M": 8,
             "num_warps": 4,
-            # sm_121 (GB10 / DGX Spark) caps shared memory at 99 KB per block and
-            # num_stages=4 needs 108 KB. The BLOCK_SIZE_M=128 branch below fits at
-            # its default 3 (96 KB) and needs no gate.
-            "num_stages": (3 if current_arch().is_sm(12, 1) else 4),
+            # sm_120 (RTX 50 / RTX PRO) and sm_121 (GB10 / DGX Spark) cap shared
+            # memory at 99 KB per block and num_stages=4 needs 108 KB. The
+            # BLOCK_SIZE_M=128 branch below fits at its default 3 (96 KB) and needs
+            # no gate.
+            "num_stages": (3 if current_arch().is_sm(12) else 4),
         }
     else:
         assert block_size_m == BLOCK_SIZE_M, f"{block_size_m=}"
