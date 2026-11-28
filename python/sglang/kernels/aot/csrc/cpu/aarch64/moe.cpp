@@ -237,6 +237,7 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<at::Tensor>& /*w13_zero*/,
     const std::optional<at::Tensor>& /*w2_zero*/,
+    const std::optional<at::Tensor>& /*a1_scale*/,
     const std::optional<std::vector<int64_t>> block_size,
     const std::optional<at::Tensor>& /*w1_bias*/,
     const std::optional<at::Tensor>& /*w2_bias*/,

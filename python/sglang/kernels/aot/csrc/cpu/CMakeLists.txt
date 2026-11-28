@@ -94,8 +94,10 @@ endif()
 set(SGLANG_CPU_X86_ONLY_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/gemm_int8.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/gemm_fp8_w8a8.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_fp8.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/moe_fp8_w8a8.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_int4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/moe_int8.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/qkv_proj.cpp
@@ -115,6 +117,15 @@ endif()
 if("$ENV{SGLANG_CPU_FP8_CVT_FTZ}" STREQUAL "1")
     message(STATUS "Enabling macro: SGLANG_CPU_FP8_CVT_FTZ")
     add_compile_definitions(SGLANG_CPU_FP8_CVT_FTZ)
+endif()
+
+if(NOT DEFINED ENV{SGLANG_CPU_FP8_BRGEMM})
+    set(ENV{SGLANG_CPU_FP8_BRGEMM} "0")
+endif()
+
+if("$ENV{SGLANG_CPU_FP8_BRGEMM}" STREQUAL "1")
+    message(STATUS "Enabling macro: SGLANG_CPU_FP8_BRGEMM")
+    add_compile_definitions(SGLANG_CPU_FP8_BRGEMM)
 endif()
 
 if(MY_ARCH_DIR STREQUAL "x86_64")

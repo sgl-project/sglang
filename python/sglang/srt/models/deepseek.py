@@ -206,6 +206,7 @@ class DeepseekMoE(nn.Module):
                 None,  # w2_scale
                 None,  # w1_zp
                 None,  # w2_zp
+                None,  # a1_scale
                 None,  # block_size
                 None,  # w1_bias
                 None,  # w2_bias
