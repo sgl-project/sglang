@@ -52,6 +52,12 @@ on:
       continue_on_error:
         value: ${{ jobs.run.outputs.continue_on_error }}
 
+# GitHub Actions does not pass the caller's workflow-level env across the
+# workflow_call boundary, so the check-maintenance bypass for runs on main has
+# to be declared here as well.
+env:
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
+
 jobs:
   detect:
     if: inputs.changes == ''
