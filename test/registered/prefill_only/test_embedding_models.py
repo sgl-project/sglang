@@ -20,6 +20,7 @@ from typing import Optional
 import torch
 from transformers import AutoConfig, AutoTokenizer
 
+from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.runners import DEFAULT_PROMPTS, HFRunner, SRTRunner
 from sglang.test.test_utils import (
@@ -99,12 +100,15 @@ class TestEmbeddingModels(CustomTestCase):
             hf_outputs = hf_runner.forward(truncated_prompts)
 
         attention_backend = "triton" if is_in_amd_ci() else None
+        # On a 24 GB XPU the 8B models leave too few KV tokens at the default fraction for the ~6.4k-token prompt.
+        srt_kwargs = {"mem_fraction_static": 0.85} if is_xpu() else {}
         with SRTRunner(
             model_path,
             tp_size=tp_size,
             torch_dtype=torch_dtype,
             model_type="embedding",
             attention_backend=attention_backend,
+            **srt_kwargs,
             json_model_override_args=(
                 {"matryoshka_dimensions": [matryoshka_dim]} if matryoshka_dim else None
             ),
