@@ -12,6 +12,21 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.encoders.qwen3_5 import Qwen3_5Model
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 
+# srt's MLP reads the published runtime context
+pytestmark = pytest.mark.usefixtures("srt_runtime")
+
+
+def _checkpoint_tensor(state_dict, name):
+    """A native parameter's value in the reference checkpoint."""
+    if ".gate_up_proj." in name:
+        return torch.cat(
+            [
+                state_dict[name.replace(".gate_up_proj.", ".gate_proj.")],
+                state_dict[name.replace(".gate_up_proj.", ".up_proj.")],
+            ]
+        )
+    return state_dict[name]
+
 
 @pytest.fixture(autouse=True)
 def restore_attention_backend(monkeypatch):
@@ -91,9 +106,10 @@ def test_native_encoder_registry_and_checkpoint(small_text_encoder):
     assert not model.should_materialize_checkpoint_weight(
         "visual.patch_embed.proj.weight"
     )
+    state_dict = small_text_encoder.state_dict()
     for name, parameter in model.named_parameters():
         torch.testing.assert_close(
-            parameter, small_text_encoder.state_dict()[name], rtol=0, atol=0
+            parameter, _checkpoint_tensor(state_dict, name), rtol=0, atol=0
         )
     with pytest.raises(KeyError):
         model.load_weights([("language_model.invalid.weight", torch.zeros(1))])

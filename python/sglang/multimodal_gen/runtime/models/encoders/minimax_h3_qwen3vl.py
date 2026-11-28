@@ -23,6 +23,9 @@ from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLModel
+from sglang.multimodal_gen.runtime.models.encoders.qwen3vl_text import (
+    load_srt_text_weight,
+)
 from sglang.multimodal_gen.runtime.weights.source import (
     materialize_weight,
     resolve_weight,
@@ -270,7 +273,9 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
             and not _is_unconsumed_checkpoint_weight(name, self.selected_lm_layer)
         )
 
-    def __init__(self, config: MiniMaxH3Qwen3VLConfig) -> None:
+    def __init__(
+        self, config: MiniMaxH3Qwen3VLConfig, *, map_text_layers: bool = False
+    ) -> None:
         super().__init__(config)
         arch = config.arch_config
         selected_layer = int(arch.text_config.num_hidden_layers)
@@ -279,18 +284,19 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
                 "MiniMax H3 Qwen3-VL language-layer configuration is "
                 f"inconsistent: {selected_layer} vs {int(arch.num_hidden_layers)}"
             )
+        self.map_text_layers = map_text_layers
         self.model = Qwen3VLModel(
             arch,
             quant_config=config.quant_config,
-            use_tensor_parallel=True,
             prefix="model",
+            separate_text_projections=map_text_layers,
             vision_replicated=config.vision_replicated,
         )
         if config.vision_replicated and get_parallel().tp_size > 1:
             # stream the three full-width mergers along with the replicated blocks
             self.layer_names = [*self.layer_names, "model.visual.deepstack_merger_list"]
         # H3 and ClipProj consume an unnormalized intermediate residual stream.
-        self.model.language_model.norm = nn.Identity()
+        self.model.language_model.drop_final_norm()
         self.image_token_id = int(arch.image_token_id)
         self.video_token_id = int(arch.video_token_id)
         self.selected_lm_layer = selected_layer
@@ -436,6 +442,17 @@ class MiniMaxH3Qwen3VLEncoder(TextEncoder):
         for name, loaded_weight in weights:
             name = _map_checkpoint_name(name)
             if not self.should_materialize_checkpoint_weight(name):
+                continue
+            if name.startswith("model.language_model."):
+                loaded.add(
+                    load_srt_text_weight(
+                        params,
+                        name,
+                        loaded_weight,
+                        keep_mapping=self.map_text_layers
+                        and name.startswith("model.language_model.layers."),
+                    )
+                )
                 continue
             param_name = name
             param = params.get(param_name)

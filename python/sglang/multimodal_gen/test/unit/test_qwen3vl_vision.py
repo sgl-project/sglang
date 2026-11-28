@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
 
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLArchConfig
 from sglang.multimodal_gen.runtime.layers.quantization.configs.quanto_int8_config import (
@@ -184,6 +185,7 @@ def test_native_vision_keeps_position_math_in_fp32():
     assert block.position_embedding_dtypes == (torch.float32, torch.float32)
 
 
+@pytest.mark.usefixtures("srt_runtime")
 def test_qwen3vl_ties_lm_head_to_input_embeddings():
     vision_config = SimpleNamespace(
         hidden_size=16,
@@ -199,13 +201,24 @@ def test_qwen3vl_ties_lm_head_to_input_embeddings():
         out_hidden_size=16,
         deepstack_visual_indexes=[],
     )
-    text_config = SimpleNamespace(
+    text_config = Qwen3VLTextConfig(
         hidden_size=16,
-        vocab_size=32,
+        intermediate_size=32,
+        # a multiple of srt's 64-row padding, as real vocabularies are
+        vocab_size=64,
         pad_token_id=0,
-        num_hidden_layers=0,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
         rms_norm_eps=1e-6,
         tie_word_embeddings=True,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 5_000_000.0,
+            "mrope_section": [1, 1, 2],
+            "mrope_interleaved": True,
+        },
     )
     arch_config = SimpleNamespace(
         vision_config=vision_config,

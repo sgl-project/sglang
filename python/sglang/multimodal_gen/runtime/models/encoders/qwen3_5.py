@@ -14,13 +14,19 @@ from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.loader.weight_utils import load_stacked_weight
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
-from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextMLP
 from sglang.multimodal_gen.runtime.models.encoders.qwen_vl_rope import (
     apply_qwen_vl_text_rope,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.models.qwen2 import Qwen2MLP
+
+# checkpoint projection -> srt's fused gate/up parameter
+_MLP_STACKED_PARAMS = (
+    (".gate_up_proj.", ".gate_proj.", 0),
+    (".gate_up_proj.", ".up_proj.", 1),
+)
 
 
 def _chunk_gated_delta_rule(
@@ -230,7 +236,9 @@ class Qwen3_5DecoderLayer(nn.Module):
             self.self_attn = Qwen3_5Attention(config)
         else:
             raise ValueError(f"Unsupported Qwen3.5 layer type: {self.layer_type}")
-        self.mlp = Qwen3VLTextMLP(config)
+        self.mlp = Qwen2MLP(
+            config.hidden_size, config.intermediate_size, config.hidden_act
+        )
         self.input_layernorm = Qwen3_5RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -250,7 +258,10 @@ class Qwen3_5DecoderLayer(nn.Module):
                 hidden_states, position_ids, rotary_emb, attention_mask
             )
         hidden_states = residual + hidden_states
-        return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        mlp_input = self.post_attention_layernorm(hidden_states)
+        # srt's MLP takes one row per token
+        mlp_output = self.mlp(mlp_input.reshape(-1, mlp_input.shape[-1]))
+        return hidden_states + mlp_output.view_as(mlp_input)
 
 
 class Qwen3_5TextModel(nn.Module):
@@ -316,9 +327,10 @@ class Qwen3_5Model(TextEncoder):
             if not self.should_materialize_checkpoint_weight(name):
                 continue
             name = _text_weight_name(name)
-            if name not in params:
+            target = load_stacked_weight(name, weight, params, _MLP_STACKED_PARAMS)
+            if target is None:
                 raise KeyError(name)
-            loaded.add(load_stacked_weight(name, weight, params, ()))
+            loaded.add(target)
         return loaded
 
     @torch.no_grad()

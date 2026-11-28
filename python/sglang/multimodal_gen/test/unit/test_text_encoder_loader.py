@@ -65,7 +65,6 @@ from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3ConditioningProjection,
     MiniMaxH3Qwen3VLEncoder,
 )
-from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import Qwen3VLTextModel
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     inspect_comfy_quant_markers,
@@ -461,41 +460,6 @@ class TestTextEncoderClassResolution(unittest.TestCase):
         # e.g. CLIP/Mistral/Qwen text encoders are not encoder-decoder.
         self.assertIs(self._resolve(False, ["CLIPTextModel"]), transformers.AutoModel)
 
-    def test_qwen_text_model_constructs_checkpoint_owned_embedding(self):
-        config = SimpleNamespace(
-            pad_token_id=0,
-            vocab_size=64,
-            hidden_size=256,
-            num_hidden_layers=0,
-            rms_norm_eps=1e-6,
-        )
-        quant_config = mock.Mock()
-        quant_config.quantizes_embedding.return_value = True
-        replacement = nn.Embedding(64, 256)
-        with mock.patch(
-            "sglang.multimodal_gen.runtime.models.encoders.qwen3vl."
-            "VocabParallelEmbedding",
-            return_value=replacement,
-        ) as embedding_cls:
-            model = Qwen3VLTextModel(
-                config,
-                quant_config=quant_config,
-                use_tensor_parallel=True,
-                prefix="model.language_model",
-            )
-
-        self.assertIs(model.embed_tokens, replacement)
-        quant_config.quantizes_embedding.assert_called_once_with(
-            "model.language_model.embed_tokens"
-        )
-        embedding_cls.assert_called_once_with(
-            64,
-            256,
-            params_dtype=torch.get_default_dtype(),
-            quant_config=quant_config,
-            prefix="model.language_model.embed_tokens",
-        )
-
     def test_unknown_architecture_falls_back_to_automodel(self):
         self.assertIs(self._resolve(True, ["NotARealClass"]), transformers.AutoModel)
 
@@ -620,14 +584,24 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
         )
 
     def test_comfy_language_checkpoint_name_maps_to_native_namespace(self):
+        self._check_language_checkpoint(map_text_layers=False)
+
+    def test_host_constrained_dense_language_weight_keeps_checkpoint_storage(self):
+        self._check_language_checkpoint(map_text_layers=True)
+
+    def _check_language_checkpoint(self, *, map_text_layers):
         encoder = MiniMaxH3Qwen3VLEncoder.__new__(MiniMaxH3Qwen3VLEncoder)
         torch.nn.Module.__init__(encoder)
         encoder.selected_lm_layer = 50
         encoder.model = torch.nn.Module()
         encoder.model.language_model = torch.nn.Module()
+        encoder.map_text_layers = map_text_layers
+        # srt's fused q/k/v projection, holding the checkpoint's
+        # q_proj as a layer of its own
         layer = torch.nn.Module()
         layer.self_attn = torch.nn.Module()
-        layer.self_attn.q_proj = torch.nn.Linear(2, 2, bias=False)
+        layer.self_attn.qkv_proj = torch.nn.Module()
+        layer.self_attn.qkv_proj.q_proj = torch.nn.Linear(2, 2, bias=False)
         encoder.model.language_model.layers = torch.nn.ModuleList([layer])
         source = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
 
@@ -635,9 +609,13 @@ class TestMiniMaxH3CheckpointFilter(unittest.TestCase):
             [("model.layers.0.self_attn.q_proj.weight", source)]
         )
 
-        target_name = "model.language_model.layers.0.self_attn.q_proj.weight"
+        target_name = "model.language_model.layers.0.self_attn.qkv_proj.q_proj.weight"
         self.assertEqual(loaded, {target_name})
-        torch.testing.assert_close(layer.self_attn.q_proj.weight, source)
+        torch.testing.assert_close(layer.self_attn.qkv_proj.q_proj.weight, source)
+        self.assertEqual(
+            layer.self_attn.qkv_proj.q_proj.weight.data_ptr() == source.data_ptr(),
+            map_text_layers,
+        )
 
 
 class TestMiniMaxH3ConditioningProjection(unittest.TestCase):

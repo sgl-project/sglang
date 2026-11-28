@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
     use_tensor_parallel_group,
 )
+from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.encoders.qwen3vl import (
     Qwen3VLForConditionalGeneration,
@@ -32,6 +33,7 @@ from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 
+_BF16 = torch.bfloat16
 _IS_RANK = int(os.environ.get("WORLD_SIZE", "1")) == 2
 requires_ranks = pytest.mark.skipif(
     not torch.cuda.is_available() or not _IS_RANK,
@@ -59,6 +61,15 @@ def distributed():
     )
     set_global_server_args(args)
     maybe_init_distributed_environment_and_model_parallel(tp_size=2, sp_size=1)
+    from sglang.srt.runtime_context import get_context, publish
+    from sglang.srt.server_args import ServerArgs as SrtServerArgs
+
+    if get_context()._server_args is None:
+        # as the diffusion GPU worker does, for the srt layers it reuses
+        publish(
+            SrtServerArgs(model_path="dummy", tp_size=2),
+            role="diffusion_gpu_worker",
+        )
     matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
     cudnn_tf32 = torch.backends.cudnn.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -107,18 +118,25 @@ def test_encoder_tp_shards_weights_and_preserves_conditioning(edit):
     arch.stacked_params_mapping = []
     config = SimpleNamespace(arch_config=arch, quant_config=None)
     torch.manual_seed(42)
-    with use_tensor_parallel_group(get_sp_group()):
+    # BF16, the precision the text encoder serves at (srt's Qwen3 layers)
+    with use_tensor_parallel_group(get_sp_group()), set_default_torch_dtype(_BF16):
         reference = Qwen3VLForConditionalGeneration(config).cuda().eval()
         for param in reference.parameters():
             torch.nn.init.normal_(param, std=0.02)
     reference.bind_encoder_tp_group(get_sp_group())
-    with use_tensor_parallel_group(get_tp_group()):
+    with use_tensor_parallel_group(get_tp_group()), set_default_torch_dtype(_BF16):
         model = Qwen3VLForConditionalGeneration(config).cuda().eval()
     model.bind_encoder_tp_group(get_tp_group())
-    model.load_weights(reference.state_dict().items())
+    vocab_size = arch.text_config.vocab_size
+    model.load_weights(
+        # srt's vocab-parallel table pads its rows; a checkpoint holds the vocabulary
+        (name, tensor[:vocab_size] if name.endswith("embed_tokens.weight") else tensor)
+        for name, tensor in reference.state_dict().items()
+    )
     for layer in model.model.language_model.layers:
-        assert layer.self_attn.q_proj.weight.shape == (32, 64)
-        assert layer.mlp.gate_proj.weight.shape == (64, 64)
+        # this rank's q (2 heads), k and v (1 head each) of 16, and gate and up halves
+        assert layer.self_attn.qkv_proj.weight.shape == (64, 64)
+        assert layer.mlp.gate_up_proj.weight.shape == (128, 64)
     tokens = [1, 7, 8, 8, 8, 8, 6, 3] if edit else [1, 2, 3, 4]
     inputs = dict(
         input_ids=torch.tensor([tokens], device="cuda"),
@@ -129,15 +147,16 @@ def test_encoder_tp_shards_weights_and_preserves_conditioning(edit):
     )
     if edit:
         inputs.update(
-            pixel_values=torch.randn(16, 12, device="cuda"),
+            pixel_values=torch.randn(16, 12, device="cuda", dtype=_BF16),
             image_grid_thw=torch.tensor([[1, 4, 4]], device="cuda"),
         )
     with set_forward_context(
         current_timestep=None, attn_metadata=None, forward_batch=Req(prompt="test")
     ):
-        expected = reference(**inputs).hidden_states[-1]
-        actual = model(**inputs).hidden_states[-1]
-    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+        expected = reference(**inputs).hidden_states[-1].float()
+        actual = model(**inputs).hidden_states[-1].float()
+    # TP 2 against TP 1: BF16 rounding of differently ordered reductions
+    assert (actual - expected).norm() / expected.norm() < 1e-2
 
 
 @requires_ranks

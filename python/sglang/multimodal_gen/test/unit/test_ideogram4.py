@@ -6,6 +6,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 import torch.nn.functional as F
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
@@ -1294,112 +1295,6 @@ class TestIdeogram4(unittest.TestCase):
         self.assertFalse(config.arch_config.ideogram_fp8_weight_only)
         self.assertTrue(config.arch_config.requires_gpu_resident_text_encoder)
 
-    def test_ideogram_text_encoder_swaps_linears_to_weight_only_fp8(self):
-        config = Ideogram4TextEncoderConfig()
-        config.post_diffusers_config_update()
-        config.arch_config.text_config = Qwen3VLTextConfig(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=2,
-            num_key_value_heads=2,
-            head_dim=8,
-            max_position_embeddings=64,
-            pad_token_id=0,
-        )
-        import sglang.multimodal_gen.runtime.server_args as server_args_module
-
-        prev_args = server_args_module._global_server_args
-        try:
-            set_global_server_args(
-                SimpleNamespace(
-                    attention_backend="torch_sdpa",
-                    comfyui_mode=False,
-                    kv_gather_degree=1,
-                    sp_split_auto=False,
-                )
-            )
-            with (
-                patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}),
-                torch.device("meta"),
-            ):
-                encoder = IdeogramQwen3VLTextEncoder(config)
-        finally:
-            set_global_server_args(prev_args)
-        fp8_linears = [
-            module
-            for module in encoder.modules()
-            if isinstance(module, WeightOnlyFP8Linear)
-        ]
-        self.assertTrue(fp8_linears)
-        self.assertTrue(all(not module.enable_fused_w8a8 for module in fp8_linears))
-        self.assertFalse(
-            any(isinstance(module, torch.nn.Linear) for module in encoder.modules())
-        )
-
-    def test_ideogram_text_encoder_tp_fp8_uses_megatron_parallel_linears(self):
-        config = Ideogram4TextEncoderConfig()
-        config.post_diffusers_config_update()
-        config.arch_config.text_config = Qwen3VLTextConfig(
-            vocab_size=32,
-            hidden_size=16,
-            intermediate_size=32,
-            num_hidden_layers=1,
-            num_attention_heads=4,
-            num_key_value_heads=4,
-            head_dim=4,
-            max_position_embeddings=64,
-            pad_token_id=0,
-        )
-        import sglang.multimodal_gen.runtime.server_args as server_args_module
-
-        fake_tp_group = SimpleNamespace(world_size=2, rank_in_group=1)
-        prev_args = server_args_module._global_server_args
-        try:
-            set_global_server_args(
-                SimpleNamespace(
-                    attention_backend="torch_sdpa",
-                    comfyui_mode=False,
-                    kv_gather_degree=1,
-                    sp_split_auto=False,
-                )
-            )
-            with (
-                patch(
-                    "sglang.multimodal_gen.runtime.models.encoders.qwen3vl.model_parallel_is_initialized",
-                    return_value=True,
-                ),
-                patch(
-                    "sglang.multimodal_gen.runtime.models.encoders.qwen3vl.get_tp_world_size",
-                    return_value=2,
-                ),
-                patch(
-                    "sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8.get_tp_group",
-                    return_value=fake_tp_group,
-                ),
-            ):
-                with torch.device("meta"):
-                    encoder = IdeogramQwen3VLTextEncoder(config)
-        finally:
-            set_global_server_args(prev_args)
-
-        layer = encoder.language_model.layers[0]
-        self.assertEqual(layer.self_attn.num_heads, 2)
-        self.assertEqual(layer.self_attn.num_key_value_heads, 2)
-        self.assertIsInstance(layer.self_attn.q_proj, WeightOnlyFP8ColumnParallelLinear)
-        self.assertFalse(layer.self_attn.q_proj.gather_output)
-        self.assertIsInstance(layer.self_attn.o_proj, WeightOnlyFP8RowParallelLinear)
-        self.assertTrue(layer.self_attn.o_proj.input_is_parallel)
-        self.assertTrue(layer.self_attn.o_proj.reduce_results)
-        self.assertIsInstance(layer.mlp.gate_proj, WeightOnlyFP8ColumnParallelLinear)
-        self.assertFalse(layer.mlp.gate_proj.gather_output)
-        self.assertIsInstance(layer.mlp.up_proj, WeightOnlyFP8ColumnParallelLinear)
-        self.assertFalse(layer.mlp.up_proj.gather_output)
-        self.assertIsInstance(layer.mlp.down_proj, WeightOnlyFP8RowParallelLinear)
-        self.assertTrue(layer.mlp.down_proj.input_is_parallel)
-        self.assertTrue(layer.mlp.down_proj.reduce_results)
-
     def test_ideogram_nf4_text_encoder_is_replicated_under_tp(self):
         config = Ideogram4TextEncoderConfig()
         config.update_model_arch(
@@ -1435,7 +1330,7 @@ class TestIdeogram4(unittest.TestCase):
             text_model.return_value = torch.nn.Identity()
             IdeogramQwen3VLTextEncoder(config)
 
-        self.assertFalse(text_model.call_args.kwargs["use_tensor_parallel"])
+        self.assertTrue(text_model.call_args.kwargs["replicate_projections"])
 
     def test_denoise_and_decode_shape_check(self):
         import sglang.multimodal_gen.runtime.server_args as server_args_module
@@ -1854,3 +1749,58 @@ def test_decode_reuses_uploaded_latent_constants():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.usefixtures("srt_runtime")
+def test_ideogram_text_encoder_runs_weight_only_fp8_projections():
+    """srt's fused projections hold one weight-only FP8 layer per checkpoint
+    projection; the output projections leave the reduction to srt's layer
+    boundary."""
+    config = Ideogram4TextEncoderConfig()
+    config.post_diffusers_config_update()
+    config.arch_config.text_config = Qwen3VLTextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        max_position_embeddings=64,
+        pad_token_id=0,
+    )
+    import sglang.multimodal_gen.runtime.server_args as server_args_module
+
+    prev_args = server_args_module._global_server_args
+    try:
+        set_global_server_args(
+            SimpleNamespace(
+                attention_backend="torch_sdpa",
+                comfyui_mode=False,
+                kv_gather_degree=1,
+                sp_split_auto=False,
+            )
+        )
+        with patch.dict(os.environ, {W8A8_FP8_GEMM_ENV: "1"}), torch.device("meta"):
+            encoder = IdeogramQwen3VLTextEncoder(config)
+    finally:
+        set_global_server_args(prev_args)
+
+    layer = encoder.language_model.layers[0]
+    for fused, names in (
+        (layer.self_attn.qkv_proj, ("q_proj", "k_proj", "v_proj")),
+        (layer.mlp.gate_up_proj, ("gate_proj", "up_proj")),
+    ):
+        for name in names:
+            projection = getattr(fused, name)
+            assert isinstance(projection, WeightOnlyFP8ColumnParallelLinear)
+            assert not projection.enable_fused_w8a8
+            assert not projection.gather_output
+    for fused, name in (
+        (layer.self_attn.o_proj, "o_proj"),
+        (layer.mlp.down_proj, "down_proj"),
+    ):
+        projection = getattr(fused, name)
+        assert isinstance(projection, WeightOnlyFP8RowParallelLinear)
+        assert projection.input_is_parallel
+        assert not projection.reduce_results
