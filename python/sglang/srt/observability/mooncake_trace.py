@@ -1,3 +1,4 @@
+import functools
 import time
 from typing import Union
 
@@ -54,14 +55,16 @@ def mooncake_trace_slice(
 
 def mooncake_trace_func(stage: RequestStageConfig):
     def decorator(func):
+        @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
-            if self.trace_ctx is None:
+            if self.trace_ctx is None or not self.trace_ctx.tracing_enable:
                 return func(self, *args, **kwargs)
             start_ts = convert_time_to_realtime_ns(time.perf_counter())
             self.trace_ctx.trace_slice_start(stage.stage_name, stage.level, start_ts)
-            ret = func(self, *args, **kwargs)
-            self.trace_ctx.trace_slice_end(stage.stage_name, stage.level)
-            return ret
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                self.trace_ctx.trace_slice_end(stage.stage_name, stage.level)
 
         return wrapper
 

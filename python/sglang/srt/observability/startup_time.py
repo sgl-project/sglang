@@ -41,21 +41,17 @@ def aggregate_scheduler_startup_times(
     for startup_time in startup_times:
         if not startup_time:
             continue
-        result["load_weight"] = max(
-            result["load_weight"], float(startup_time.get("load_weight", 0.0))
-        )
-        result["kv_cache_allocation"] = max(
-            result["kv_cache_allocation"],
-            float(startup_time.get("kv_cache_allocation", 0.0)),
-        )
-        result["scheduler_e2e"] = max(
-            result["scheduler_e2e"],
-            float(startup_time.get("scheduler_e2e", 0.0)),
-        )
-        for phase, duration in startup_time.get("cuda_graph", {}).items():
-            result["cuda_graph"][phase] = max(
-                result["cuda_graph"].get(phase, 0.0), float(duration)
-            )
+        for key in ("load_weight", "kv_cache_allocation", "scheduler_e2e"):
+            val = startup_time.get(key)
+            if val is not None:
+                result[key] = max(result[key], float(val))
+        cuda_graph = startup_time.get("cuda_graph")
+        if isinstance(cuda_graph, Mapping):
+            for phase, duration in cuda_graph.items():
+                if duration is not None:
+                    result["cuda_graph"][phase] = max(
+                        result["cuda_graph"].get(phase, 0.0), float(duration)
+                    )
     return result
 
 
