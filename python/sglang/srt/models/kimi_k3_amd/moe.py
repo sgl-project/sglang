@@ -433,7 +433,6 @@ class KimiK3MoEHipMixin:
         )
         router_logits, routed_input = torch.split(fused, self._front_sizes[1:], dim=-1)
         topk_output = self.topk(normed, router_logits)
-        top_k = topk_output.topk_ids.shape[1]
         # ids ride bit-cast beside the weights
         topk = torch.cat(
             [
@@ -449,21 +448,22 @@ class KimiK3MoEHipMixin:
         widths = (a.shape[1], a_scale.shape[1], topk_bytes.shape[1])
         packed = torch.cat([a, a_scale, topk_bytes], dim=-1)
         packed_all = packed.new_empty(self.tp_size * packed.shape[0], packed.shape[1])
-        # behind the normed gather on the side stream
+        if side_stream is not None:
+            # joins the normed gather; the packed one stays in flight under the
+            # shared experts, and _forward_row_front joins it
+            torch.cuda.current_stream().wait_stream(side_stream)
         _run_on_side_stream(
             side_stream,
             lambda: tp_group.all_gather_into_tensor(
                 packed_all.view(torch.bfloat16), packed.view(torch.bfloat16)
             ),
         )
-        if side_stream is not None:
-            torch.cuda.current_stream().wait_stream(side_stream)
-        a_all, scale_all, topk_all = packed_all[:num_tokens].split(widths, dim=-1)
-        topk_all = topk_all.contiguous().view(torch.float32)
+        # packed is that gather's input: it must outlive the join
         self._row_front_out = (
-            (a_all.contiguous(), scale_all.contiguous()),
-            topk_all[:, :top_k].contiguous().view(torch.int32),
-            topk_all[:, top_k:].contiguous(),
+            packed,
+            packed_all,
+            widths,
+            num_tokens,
             normed,
             normed_all,
         )
@@ -472,13 +472,13 @@ class KimiK3MoEHipMixin:
     def _forward_row_front(self, prefix_sum: torch.Tensor) -> torch.Tensor:
         """The routed experts on what shard_front gathered and the latent
         reduce-scatter (on the side stream in eager batches), then the row-sharded
-        tail. The shared experts run TP-sharded on every gathered row first, their
-        reduce-scatter on the side stream under the routed experts."""
+        tail. The shared experts run TP-sharded on every gathered row first, under
+        shard_front's packed gather, their reduce-scatter on the side stream under
+        the routed experts."""
         from sglang.srt.models.kimi_k3 import _k3_bf16_gemm
 
-        a_mx, topk_ids, topk_weights, normed, normed_all = self._row_front_out
+        packed, packed_all, widths, num_tokens, normed, normed_all = self._row_front_out
         self._row_front_out = None
-        num_tokens = a_mx[0].shape[0]
         rows = normed.shape[0]
         tp_group = get_parallel().tp_group
         side_stream = _eager_side_stream()
@@ -492,10 +492,20 @@ class KimiK3MoEHipMixin:
             self.shared_experts.act_fn(gate_up),
             self.shared_experts.down_proj.weight,
         )
+        if side_stream is not None:
+            # the packed gather
+            torch.cuda.current_stream().wait_stream(side_stream)
+        del packed
         shared = shared_rows.new_empty(rows, shared_rows.shape[1])
         _run_on_side_stream(
             side_stream, lambda: tp_group.reduce_scatter_tensor(shared, shared_rows)
         )
+        a_all, scale_all, topk_all = packed_all[:num_tokens].split(widths, dim=-1)
+        topk_all = topk_all.contiguous().view(torch.float32)
+        top_k = topk_all.shape[1] // 2
+        a_mx = (a_all.contiguous(), scale_all.contiguous())
+        topk_ids = topk_all[:, :top_k].contiguous().view(torch.int32)
+        topk_weights = topk_all[:, top_k:].contiguous()
         latent_rows = normed.new_empty(rows * self.tp_size, self.moe_hidden_size)
         # bf16 rows of the latent's shape; the experts read a_mx instead
         latent_shape = normed.new_empty(1, 1).expand(num_tokens, self.moe_hidden_size)
