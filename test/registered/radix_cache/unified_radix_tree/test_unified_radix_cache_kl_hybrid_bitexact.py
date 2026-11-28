@@ -85,7 +85,7 @@ from sglang.test.test_utils import (
     unified_radix_tree_server_env,
 )
 
-register_cuda_ci(est_time=837, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=1000, stage="extra-a", runner_config="1-gpu-large")
 
 _MODEL_PATH = os.environ.get("INKLING_TEST_MODEL_PATH", "thinkingmachines/Inkling")
 _MODEL_REVISION = os.environ.get("INKLING_TEST_MODEL_REVISION", "test")
@@ -116,6 +116,13 @@ BUFFER_ONLY_SAMPLES = 8
 BUFFER_ONLY_SEED_TOKENS = 512
 BUFFER_ONLY_PROMPT_TOKENS = 768
 BUFFER_ONLY_MAX_NEW_TOKENS = 640
+
+# Suffix tokens appended per turn, one tuple per sample. Samples 0-1 stay on the
+# 256-token grid; samples 2-3 add 612 on turn 1, so every later prompt ends 100 off it.
+RESUME_FIRST_TOKENS = 1024
+RESUME_NEW_TOKENS = [(512, 512), (512, 512), (612, 512), (612, 512)]
+RESUME_ALIGN = 256
+RESUME_FOLLOW_UP_NEW_TOKENS = 256
 
 
 def _random_suffixes(n: int, length: int, seed: int) -> list[list[int]]:
@@ -161,6 +168,29 @@ def _prefill_graph_count(base_url: str) -> float:
         re.MULTILINE,
     )
     return sum(map(float, matches), 0.0)
+
+
+def _generate_resume_point_at_prompt_end(
+    base_url: str, prompts: list[list[int]], max_new_tokens: int
+) -> list[dict]:
+    response = requests.post(
+        base_url + "/generate",
+        json={
+            "input_ids": prompts,
+            "mamba_checkpoint_pos": [len(prompt) for prompt in prompts],
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": max_new_tokens,
+                "ignore_eos": True,
+            },
+            "return_logprob": True,
+            "return_text_in_logprobs": False,
+            "logprob_start_len": -1,
+        },
+        timeout=_FLUSH_TIMEOUT_S,
+    )
+    response.raise_for_status()
+    return response.json()
 
 
 class TestUnifiedHybridBitExact(CustomTestCase):
@@ -590,6 +620,133 @@ class TestUnifiedHybridBufferOnlyBitExact(CustomTestCase):
             # One batch avoids repeated 30s flushes while replay writes drain.
             batch_size=BUFFER_ONLY_SAMPLES,
             sampling_temperature=0,
+        )
+
+
+class TestUnifiedHybridResumePointBitExact(CustomTestCase):
+    """Check bit-exact state reuse when the next turn drops the reply."""
+
+    tree_core_backend = "python"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _MODEL_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        other_args = _base_args() + [
+            "--hybrid-cache-checkpoints-level",
+            "2",
+            "--chunked-prefill-size",
+            "16384",
+        ]
+        if _MODEL_REVISION:
+            other_args += ["--revision", _MODEL_REVISION]
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=other_args,
+            env=unified_radix_tree_server_env(cls.tree_core_backend),
+        )
+        cls.input_ids = get_input_ids(
+            tokenizer_path=cls.model,
+            num_samples=len(RESUME_NEW_TOKENS),
+            trust_remote_code=True,
+        )
+        try:
+            cls.prompts, cls.results = cls._run_turns()
+            cls.follow_ups, cls.follow_up_results = cls._run_follow_ups()
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process, wait_timeout=60)
+
+    def _assert_hits_at(self, results, state_ends, label):
+        for i, (result, end) in enumerate(zip(results, state_ends)):
+            cached = result["meta_info"]["cached_tokens"]
+            floor = end // RESUME_ALIGN * RESUME_ALIGN
+            self.assertTrue(
+                floor <= cached <= end and cached % PAGE_SIZE == 0,
+                f"{label}[{i}]: cached_tokens={cached}, want a multiple of "
+                f"{PAGE_SIZE} in [{floor}, {end}]",
+            )
+
+    def _replay_all(self, prompts, results, label):
+        _replay_and_compare_kl(
+            self.base_url,
+            self.model,
+            KL_DIV_THRESHOLD,
+            [prompts[i] + results[i]["output_ids"] for i in range(len(prompts))],
+            [_extract_output_logprobs(r) for r in results],
+            label=label,
+            batch_size=len(prompts),
+            sampling_temperature=0,
+        )
+
+    @classmethod
+    def _run_turns(cls):
+        n = len(RESUME_NEW_TOKENS)
+        for ids in cls.input_ids[:n]:
+            assert len(ids) >= RESUME_FIRST_TOKENS
+        prompts = [[ids[:RESUME_FIRST_TOKENS] for ids in cls.input_ids[:n]]]
+        for turn in range(len(RESUME_NEW_TOKENS[0])):
+            prompts.append(
+                [
+                    prompts[-1][i]
+                    + _random_suffixes(
+                        1, RESUME_NEW_TOKENS[i][turn], 500 + 10 * turn + i
+                    )[0]
+                    for i in range(n)
+                ]
+            )
+        _flush_cache(cls.base_url)
+        results = []
+        for batch in prompts:
+            batch_results = _generate_resume_point_at_prompt_end(
+                cls.base_url, batch, MAX_NEW_TOKENS
+            )
+            assert len(batch_results) == n
+            results.append(batch_results)
+        return prompts, results
+
+    @classmethod
+    def _run_follow_ups(cls):
+        previous, last = cls.prompts[-2], cls.prompts[-1]
+        # Both prefixes stop before the new checkpoint and need the matched state.
+        follow_ups = [
+            last[i][: len(previous[i]) + PAGE_SIZE]
+            if i % 2 == 0
+            else last[i][: len(last[i]) - PAGE_SIZE]
+            for i in range(len(last))
+        ]
+        results = _generate_resume_point_at_prompt_end(
+            cls.base_url, follow_ups, RESUME_FOLLOW_UP_NEW_TOKENS
+        )
+        assert len(results) == len(follow_ups)
+        return follow_ups, results
+
+    def test_next_turn_resumes_at_prompt_end(self):
+        for turn in range(1, len(self.prompts)):
+            self.assertEqual(len(self.results[turn]), len(self.prompts[turn]))
+            self._assert_hits_at(
+                self.results[turn],
+                [len(p) for p in self.prompts[turn - 1]],
+                f"turn{turn}",
+            )
+        for turn, (batch, batch_results) in enumerate(zip(self.prompts, self.results)):
+            self._replay_all(batch, batch_results, f"resume_point_turn{turn}")
+
+    def test_strict_prefix_follow_up_hits_matched_state(self):
+        self._assert_hits_at(
+            self.follow_up_results,
+            [len(p) for p in self.prompts[-2]],
+            "strict_prefix",
+        )
+        self._replay_all(
+            self.follow_ups, self.follow_up_results, "resume_point_strict_prefix"
         )
 
 

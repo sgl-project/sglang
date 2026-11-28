@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -153,6 +154,10 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+# Maximum resume-point distance from the prompt end.
+_MAX_RESUME_DEPTH = 32
+# None is a cached result, so use a separate sentinel for misses.
+_UNPROBED = object()
 
 
 class _ClosingStreamingResponse(StreamingResponse):
@@ -484,6 +489,9 @@ class OpenAIServingChat(OpenAIServingBase):
         self._chat_template_cache: OrderedDict[bytes, tuple[tuple[int, ...], str]] = (
             OrderedDict()
         )
+        # Resume depth by template kwargs; None for append-only or failed probes.
+        self._resume_depths: OrderedDict[bytes, Optional[int]] = OrderedDict()
+        self._resume_depths_lock = threading.Lock()
         self._doc_splitter = ChatDocSplitter.for_model(
             self, handle_window=super().handle_request
         )
@@ -1348,6 +1356,13 @@ class OpenAIServingChat(OpenAIServingBase):
             extra_key=request.extra_key,
             cache_salt=request.cache_salt,
             require_reasoning=processed_messages.require_reasoning,
+            mamba_checkpoint_pos=(
+                request.mamba_checkpoint_pos
+                if request.mamba_checkpoint_pos is not None
+                else processed_messages.mamba_checkpoint_pos
+                if "input_ids" in prompt_kwargs
+                else None
+            ),
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
@@ -2024,6 +2039,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt = ""
         prompt_ids = []
         decoded_prompt = None
+        mamba_checkpoint_pos = None
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -2240,6 +2256,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 # The cached decode corresponds to prompt_ids before the prefix.
                 decoded_prompt = None
+            elif add_generation_prompt is not False and not is_multimodal:
+                mamba_checkpoint_pos = self._resume_checkpoint_pos(
+                    request=request,
+                    prompt_len=len(prompt_ids),
+                    template_kwargs=extra_template_kwargs,
+                    encode_kwargs=encode_kwargs,
+                )
 
             if is_multimodal:
                 prompt = (
@@ -2261,7 +2284,107 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            mamba_checkpoint_pos=mamba_checkpoint_pos,
         )
+
+    def _resume_checkpoint_pos(
+        self,
+        *,
+        request: ChatCompletionRequest,
+        prompt_len: int,
+        template_kwargs: Dict[str, Any],
+        encode_kwargs: Dict[str, Any],
+    ) -> Optional[int]:
+        # Check the output, not the client's kwargs: some templates think by default.
+        if not (
+            envs.SGLANG_OPT_MAMBA_CHAT_RESUME_CHECKPOINT.get()
+            and self._get_reasoning_from_request(request)
+        ):
+            return None
+        depth = self._resume_depth(template_kwargs, encode_kwargs)
+        return None if depth is None else prompt_len - depth
+
+    def _resume_depth(
+        self, template_kwargs: Dict[str, Any], encode_kwargs: Dict[str, Any]
+    ) -> Optional[int]:
+        """Return the cached divergence depth, or None for append-only/failed probes."""
+        try:
+            key = orjson.dumps((template_kwargs, encode_kwargs))
+        except TypeError:
+            return None
+        # Serialize first probes across request-conversion threads.
+        with self._resume_depths_lock:
+            cached = self._resume_depths.get(key, _UNPROBED)
+            if cached is not _UNPROBED:
+                return cached
+            try:
+                depth = self._probe_resume_depth(template_kwargs, encode_kwargs)
+            except Exception as e:
+                logger.warning("Mamba resume-point probe failed: %s", e)
+                depth = None
+            logger.info(
+                "Mamba resume-point depth %s for template kwargs %s", depth, key
+            )
+            self._resume_depths[key] = depth
+            if len(self._resume_depths) > _CHAT_TEMPLATE_CACHE_MAX_SIZE:
+                self._resume_depths.popitem(last=False)
+            return depth
+
+    def _probe_resume_depth(
+        self, template_kwargs: Dict[str, Any], encode_kwargs: Dict[str, Any]
+    ) -> Optional[int]:
+        tokenizer = self.tokenizer_manager.tokenizer
+        detector = self._reasoning_detector
+        think_start = detector.think_start_token if detector else "<think>"
+        think_end = detector.think_end_token if detector else "</think>"
+
+        def render(messages):
+            return self._render_and_encode_chat_template(
+                messages,
+                tools=None,
+                template_kwargs=template_kwargs,
+                encode_kwargs=encode_kwargs,
+                use_cache=False,
+            )[0]
+
+        user = {"role": "user", "content": "Hi"}
+        prompt_ids = render([user])
+        # The generation prompt may already contain the opening think token.
+        opened = tokenizer.decode(prompt_ids[-4:]).rstrip().endswith(think_start)
+        reasoning, answer = "Some reasoning.", "An answer."
+        depth = 0
+        # An empty answer after max_tokens can change how the template renders.
+        for output, content, finished in (
+            (f"{reasoning}\n{think_end}\n\n{answer}", answer, True),
+            (reasoning, "", False),
+        ):
+            if not opened:
+                output = f"{think_start}\n{output}"
+            generated = prompt_ids + tokenizer.encode(output, add_special_tokens=False)
+            # Match the parsed or raw assistant message returned to the client.
+            assistant = (
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "reasoning_content": reasoning,
+                }
+                if detector is not None
+                else {"role": "assistant", "content": output}
+            )
+            next_ids = render([user, assistant, {"role": "user", "content": "More"}])
+            common = 0
+            for a, b in zip(generated, next_ids):
+                if a != b:
+                    break
+                common += 1
+            # Ignore turn-end tokens missing from the synthetic output.
+            if common >= len(generated) - 2:
+                if finished:
+                    return None
+                continue
+            depth = max(depth, len(prompt_ids) - min(common, len(prompt_ids)))
+        # Rewriting earlier history leaves no fixed resume depth.
+        return depth if depth <= _MAX_RESUME_DEPTH else None
 
     def _render_and_encode_chat_template(
         self,

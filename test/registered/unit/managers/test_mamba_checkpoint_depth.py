@@ -14,6 +14,12 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, create_autospec, patch
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    msgpack_decode,
+    msgpack_encode,
+)
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -25,6 +31,8 @@ from sglang.srt.managers.schedule_policy import (
     mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import get_context, mamba_track_grid
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
@@ -32,6 +40,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -45,6 +54,9 @@ def _prepare_extend(
     extend_len: int,
     dcp_enabled: bool = False,
     next_idx: int = 0,
+    prompt_len: int | None = None,
+    branching: int | None = None,
+    checkpoint_pos: int | None = None,
 ) -> tuple[_MambaRadixCacheV2TrackEntry, Req]:
     """Run one extend through the tracker; return its track entry and the request."""
     server_args = ServerArgs(model_path="dummy", page_size=CHUNK)
@@ -57,14 +69,18 @@ def _prepare_extend(
     req = Req(
         rid="req",
         origin_input_text="",
-        origin_input_ids=array("q", [1] * (prefix_len + extend_len)),
+        origin_input_ids=array(
+            "q", [1] * (prefix_len + extend_len if prompt_len is None else prompt_len)
+        ),
         sampling_params=sampling_params,
         vocab_size=128,
+        mamba_checkpoint_pos=checkpoint_pos,
     )
+    req.refresh_fill_ids()
     req.prefix_len = prefix_len
     req.extend_end = prefix_len + extend_len
     req.kv.mamba_next_track_idx = next_idx
-    req.mamba_branching_seqlen = None
+    req.mamba_branching_seqlen = branching
 
     batch = ScheduleBatch(reqs=[req])
     batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
@@ -135,6 +151,177 @@ class TestMambaCheckpointDepth(unittest.TestCase):
         self.assertEqual(
             _track_seqlen(tree_page=16, prefix_len=4253, extend_len=16384),
             20637,
+        )
+
+
+PREFIX, EXTEND = 16384, 4066  # prompt end 20450
+
+
+def _track(pos, **kwargs):
+    kwargs = {
+        "tree_page": CHUNK,
+        "prefix_len": PREFIX,
+        "extend_len": EXTEND,
+        **kwargs,
+    }
+    entry, req = _prepare_extend(checkpoint_pos=pos, **kwargs)
+    depth = req.kv.mamba_last_track_seqlen if entry.track_mask else None
+    return depth, req.mamba_tail_seqlen, entry.track_seqlen
+
+
+class TestMambaCheckpointPosDepth(CustomTestCase):
+    def test_position_rounds_down_onto_the_grid_past_the_prefix_and_reads_h(self):
+        for tree_page, pos, expected in (
+            (CHUNK, 18500, 18496),
+            (CHUNK, 16384 + CHUNK, 16384 + CHUNK),
+            (256, 18500, 18432),
+            (256, 20449, 20224),
+        ):
+            with self.subTest(tree_page=tree_page, pos=pos):
+                depth, tail, track_seqlen = _track(pos, tree_page=tree_page)
+                self.assertEqual((depth, tail), (expected, expected))
+                # Intermediate h states use the following tracking position.
+                self.assertEqual(track_seqlen, expected + 1)
+
+    def test_position_replaces_the_branching_point_of_the_final_forward(self):
+        self.assertEqual(_track(None, branching=17408)[0], 17408)
+        self.assertEqual(_track(18500, branching=17408)[0], 18496)
+
+    def test_invalid_position_keeps_the_native_depth(self):
+        for label, pos in (
+            ("at the cached prefix", 16384),
+            ("a grid step short of the prefix", 16384 + CHUNK - 1),
+            ("past the prompt end", 30000),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(_track(pos)[:2], (20416, None))
+
+    def test_position_at_the_prompt_end_keeps_the_forward_end_checkpoint(self):
+        # Level 2 publishes the end checkpoint as a tail without changing its read.
+        for extend_len in (EXTEND, 4096):
+            with self.subTest(extend_len=extend_len):
+                main = _track(None, extend_len=extend_len)
+                depth, tail, track_seqlen = _track(
+                    PREFIX + extend_len, extend_len=extend_len
+                )
+                self.assertEqual((depth, tail), (main[0], main[0]))
+                self.assertEqual(track_seqlen, main[2])
+
+    def test_forward_that_stops_short_of_the_prompt_end_ignores_the_position(self):
+        # The requested position is in this chunk, but the prompt ends in a later one.
+        depth, tail, _ = _track(8000, prefix_len=0, extend_len=16384, prompt_len=20000)
+        self.assertEqual((depth, tail), (16384, None))
+
+    def test_dcp_keeps_the_native_depth(self):
+        self.assertEqual(
+            _track(18500, tree_page=256, dcp_enabled=True)[:2], (20224, None)
+        )
+
+
+class TestMambaCheckpointPosReachesReq(CustomTestCase):
+    """Checkpoint positions survive normalization, tokenization, and scheduler IPC."""
+
+    def setUp(self):
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _tokenized(self, **fields):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.preferred_sampling_params = None
+        manager.sampling_params_class = SamplingParams
+        manager.tokenizer = None
+        manager.fake_bootstrap_room_counter = 0
+        manager.model_config = SimpleNamespace(vocab_size=128, token_id_vocab_size=128)
+        fields.setdefault("sampling_params", {"max_new_tokens": 1})
+        obj = GenerateReqInput(**fields)
+        obj.normalize_batch_and_arguments()
+        manager.rid_to_state = {
+            rid: SimpleNamespace(time_stats=APIServerReqTimeStats())
+            for rid in ([obj.rid] if obj.is_single else obj.rid)
+        }
+        items = [obj] if obj.is_single else [obj[i] for i in range(len(obj.rid))]
+        out = []
+        for item in items:
+            tokenized = manager._create_tokenized_object(item, "", list(item.input_ids))
+            tokenized.time_stats = None  # Time stats use a separate pickle hop.
+            tokenized.wrap_pickle_fields()
+            tokenized = msgpack_decode(msgpack_encode(tokenized))
+            tokenized.unwrap_pickle_fields()
+            out.append(tokenized)
+        return out
+
+    def _handle(self, recv_req) -> Req:
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_session_radix_cache = False
+        scheduler.model_config = SimpleNamespace(
+            hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=128
+        )
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
+        scheduler.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        scheduler.tokenizer = None
+        scheduler.dllm_config = None
+        built = []
+
+        def build(*args, **kwargs):
+            built.append(Req(*args, **kwargs))
+            return built[-1]
+
+        # Stop before queueing; only Req construction is under test.
+        class _Stop(Exception):
+            pass
+
+        scheduler._maybe_namespace_elastic_radix_cache = MagicMock(side_effect=_Stop)
+        with (
+            patch("sglang.srt.managers.scheduler.Req", side_effect=build),
+            patch(
+                "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
+                return_value=1,
+            ),
+            self.assertRaises(_Stop),
+        ):
+            scheduler.handle_generate_request(recv_req)
+        (req,) = built
+        return req
+
+    def test_single_request_reaches_req(self):
+        (tokenized,) = self._tokenized(input_ids=[1, 2, 3, 4], mamba_checkpoint_pos=2)
+        self.assertEqual(tokenized.mamba_checkpoint_pos, 2)
+        self.assertEqual(self._handle(tokenized).mamba_checkpoint_pos, 2)
+
+    def test_unset_reaches_req_as_none(self):
+        (tokenized,) = self._tokenized(input_ids=[1, 2, 3, 4])
+        self.assertIsNone(tokenized.mamba_checkpoint_pos)
+        self.assertIsNone(self._handle(tokenized).mamba_checkpoint_pos)
+
+    def test_each_batch_item_keeps_its_own_position(self):
+        tokenized = self._tokenized(
+            input_ids=[[1, 2, 3], [4, 5, 6, 7], [8, 9]],
+            mamba_checkpoint_pos=[2, None, 1],
+        )
+        self.assertEqual(
+            [self._handle(t).mamba_checkpoint_pos for t in tokenized], [2, None, 1]
+        )
+
+    def test_parallel_samples_each_carry_the_position(self):
+        tokenized = self._tokenized(
+            input_ids=[[1, 2, 3], [4, 5, 6, 7]],
+            mamba_checkpoint_pos=[2, 3],
+            sampling_params={"n": 2, "max_new_tokens": 1},
+        )
+        self.assertEqual(len(tokenized), 4)
+        self.assertEqual(
+            [self._handle(t).mamba_checkpoint_pos for t in tokenized], [2, 3, 2, 3]
+        )
+
+    def test_parallel_samples_of_one_prompt_each_carry_the_position(self):
+        tokenized = self._tokenized(
+            input_ids=[1, 2, 3],
+            mamba_checkpoint_pos=2,
+            sampling_params={"n": 2, "max_new_tokens": 1},
+        )
+        self.assertEqual(
+            [self._handle(t).mamba_checkpoint_pos for t in tokenized], [2, 2]
         )
 
 

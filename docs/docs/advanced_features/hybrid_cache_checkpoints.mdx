@@ -15,6 +15,20 @@ The per-path cap is a pruning target, not a strict state-slot bound. Tail, fork,
 
 With HiCache in its default `cache` host memory mode, the cap also counts host copies: a checkpoint the cap prunes loses its host copy as well, unless that copy is locked or a backup or load-back of it is in flight. This keeps the host Mamba pool for the checkpoints each path still uses.
 
+## Resume-point checkpoint (opt-in)
+
+Templates for reasoning models often drop earlier reasoning from the history, and agent clients often trim the newest tool result. Either way the next turn's prompt diverges a few tokens before this turn's prompt end. At level 2 the one state a request keeps lies past that point (with `extra_buffer`, inside the generated output), so the next turn recomputes back to the last fork point.
+
+The resume-point checkpoint makes the prefill forward that reaches the prompt end track its one state at a resume point `R` instead, rounded down to the checkpoint grid. `R` may equal the prompt end. The first source that applies sets `R`:
+
+1. `mamba_checkpoint_pos` on the request (`/generate`, `/v1/completions` as an int or a per-prompt list, `/v1/chat/completions`): an absolute token index into the prompt. It is ignored unless it lies inside the forward that reaches the prompt end.
+2. `SGLANG_OPT_MAMBA_CHAT_RESUME_CHECKPOINT=1` (default off), on the chat endpoint, for a request whose output carries reasoning (a reasoning parser is set and thinking is not turned off). The server probes the chat template once per template kwargs and sets `R` where the next turn will diverge, for a finished turn or one cut off inside its reasoning. A template that keeps the output, rewrites earlier history, or fails to render sets no `R`.
+
+Neither is used with DCP. With neither set, the behavior is unchanged.
+
+- The resume-point state is exempt from level 2's deferral like a fork point. A fork point inside the prompt's final forward yields to it, so shared-prefix traffic whose fork falls in that forward loses the fork checkpoint.
+- A request keeps its matched state locked until it ends, so a running multi-turn path holds up to three states (matched, resume point, finish) instead of two. Size the state pool for one extra state per concurrent conversation.
+
 ## What level 2 changes
 
 - **Request-end checkpoints support continued conversations.** Level 2 preserves the checkpointing path used when the next turn extends the previous request's full context. Actual reuse still depends on checkpoint placement, KV and state capacity, eviction, and usable host backups; equal hit rates across levels are not guaranteed.

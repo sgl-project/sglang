@@ -498,6 +498,7 @@ class Req(ReqDllmMixin):
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
         filler_seed: Optional[int] = None,
+        mamba_checkpoint_pos: Optional[int] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -653,6 +654,12 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Tail checkpoint from the final prefill forward, published at level 2+.
+        self.mamba_tail_seqlen: Optional[int] = None
+        # Keep the matched state locked through finish so the path cap spares it.
+        self.mamba_hit_lock = None
+        # See GenerateReqInput.mamba_checkpoint_pos.
+        self.mamba_checkpoint_pos: Optional[int] = mamba_checkpoint_pos
         # Total cached prefix length (on-device prefix_len + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1563,6 +1570,7 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
+        self.mamba_tail_seqlen = None
         self.already_computed = 0
         self.kv.reset_for_retract()
         self.prefill_weight_versions = None
@@ -1983,6 +1991,18 @@ def prefill_checkpoint_boundary(
     if extend_len < checkpoint_grid:
         return None
     return prefix_len + extend_len // checkpoint_grid * checkpoint_grid
+
+
+def tail_checkpoint_boundary(
+    *, prefix_len: int, extend_len: int, checkpoint_grid: int, request_pos: int
+) -> Optional[int]:
+    """Round request_pos down to the grid; None unless it lands past the prefix."""
+    if not prefix_len < request_pos <= prefix_len + extend_len:
+        return None
+    boundary = (
+        prefix_len + (request_pos - prefix_len) // checkpoint_grid * checkpoint_grid
+    )
+    return boundary if boundary > prefix_len else None
 
 
 def branch_checkpoint(
@@ -2776,6 +2796,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
+            end_track = (mamba_track_seqlen, mamba_track_seqlen_aligned)
+
             # Track the branching point instead, if it lies within this extend.
             branch = branch_checkpoint(
                 req.prefix_len,
@@ -2789,6 +2811,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # See _force_track_h() for more details.
                 mamba_track_seqlen = _force_track_h(branch)
                 mamba_track_seqlen_aligned = branch
+
+            # The final prefill forward can track a reusable tail checkpoint.
+            if (
+                req.mamba_checkpoint_pos is not None
+                and not get_parallel().dcp_enabled
+                and seq_end == len(req.full_untruncated_fill_ids)
+            ):
+                tail = tail_checkpoint_boundary(
+                    prefix_len=prefix_len,
+                    extend_len=req.extend_len,
+                    checkpoint_grid=checkpoint_grid,
+                    request_pos=req.mamba_checkpoint_pos,
+                )
+                if tail is not None:
+                    req.mamba_tail_seqlen = tail
+                    if tail == end_track[1]:
+                        # Reuse the end checkpoint's state read.
+                        mamba_track_seqlen, mamba_track_seqlen_aligned = end_track
+                    else:
+                        mamba_track_seqlen = _force_track_h(tail)
+                        mamba_track_seqlen_aligned = tail
             kv_storage_of(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).advance(

@@ -58,6 +58,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "input_embeds",
         "log_metrics",
         "lora_id",
+        "mamba_checkpoint_pos",
         "max_dynamic_patch",
         "min_dynamic_patch",
         "mm_content_hashes",

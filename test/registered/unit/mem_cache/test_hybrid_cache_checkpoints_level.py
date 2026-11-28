@@ -10,7 +10,12 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.managers.req_types import FINISH_LENGTH, FINISH_MATCHED_TOKEN
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    prefill_checkpoint_boundary,
+    tail_checkpoint_boundary,
+)
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -20,6 +25,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
@@ -37,7 +43,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
 from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 PROMPT = list(range(1, 17))
 
@@ -202,6 +208,216 @@ class TestRequestEndCheckpoints(CustomTestCase):
         self.assertEqual(_cached_len(cache, PROMPT), 8)
         cache.unlock(req.lock)
         cache.sanity_check()
+
+
+GRID = 4
+
+
+def _tail_prefilled_req(cache, allocator, pool, pos=None):
+    tail = (
+        None
+        if pos is None
+        else tail_checkpoint_boundary(
+            prefix_len=0, extend_len=len(PROMPT), checkpoint_grid=GRID, request_pos=pos
+        )
+    )
+    depth = prefill_checkpoint_boundary(0, len(PROMPT), GRID) if tail is None else tail
+    req = _running_req(cache, allocator, pool, up_to=depth)
+    req.extend_end = len(PROMPT)
+    req.mamba_checkpoint_pos = pos
+    req.mamba_tail_seqlen = tail
+    return req
+
+
+class TestTailCheckpointPublish(CustomTestCase):
+    """Tail checkpoints stay reusable through request completion."""
+
+    def _tail_hits(self, level, pos=None):
+        """Return hits for prompts diverging one and two grid steps before the end."""
+        cache, allocator, pool = _build(level)
+        req = _tail_prefilled_req(cache, allocator, pool, pos)
+        cache.checkpoint(req, up_to=len(PROMPT))
+        hits = tuple(
+            _cached_len(cache, PROMPT[:end] + [99])
+            for end in (len(PROMPT) - GRID, len(PROMPT) - 2 * GRID)
+        )
+        cache.unlock(req.lock)
+        cache.sanity_check()
+        return hits
+
+    def test_off_hits_nothing_before_the_prompt_end(self):
+        # Level 2 waits for finish; level 3 publishes the end state during prefill.
+        for level in (2, 3):
+            with self.subTest(level=level):
+                self.assertEqual(self._tail_hits(level), (0, 0))
+
+    def test_request_position_publishes_and_hits_at_the_boundary(self):
+        # Position 13 rounds to 12, leaving no state for a prompt diverging at 8.
+        for level in (2, 3):
+            with self.subTest(level=level):
+                self.assertEqual(self._tail_hits(level, pos=13), (12, 0))
+
+    def test_request_position_on_the_grid_hits_exactly_there(self):
+        for level in (2, 3):
+            with self.subTest(level=level):
+                self.assertEqual(self._tail_hits(level, pos=8), (8, 8))
+
+    def test_request_position_at_the_prompt_end_publishes_it_while_running(self):
+        for level in (2, 3):
+            with self.subTest(level=level):
+                cache, allocator, pool = _build(level)
+                req = _tail_prefilled_req(cache, allocator, pool, len(PROMPT))
+                cache.checkpoint(req, up_to=len(PROMPT))
+                self.assertEqual(_cached_len(cache, PROMPT + [99]), len(PROMPT))
+                cache.unlock(req.lock)
+                cache.sanity_check()
+
+    def test_level2_keeps_the_tail_when_the_request_end_state_lands(self):
+        cache, allocator, pool = _build(2)
+        mamba = cache.components[ComponentType.MAMBA]
+        self.assertEqual(mamba.mamba_max_states_per_path, 1)
+        req = _tail_prefilled_req(cache, allocator, pool, 13)
+        cache.checkpoint(req, up_to=len(PROMPT))
+        self.assertEqual(_cached_len(cache, PROMPT[:12] + [99]), 12)
+        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+
+        # The tail stays locked while the finish insert applies the path cap.
+        req.kv.mamba_last_track_seqlen = len(PROMPT)
+        req.finished_reason = FINISH_LENGTH(length=0)
+        cache.checkpoint(req, up_to=len(PROMPT))
+        cache.unlock(req.lock)
+        self.assertEqual(_cached_len(cache, PROMPT), len(PROMPT))
+        self.assertEqual(_cached_len(cache, PROMPT[:12] + [99]), 12)
+        cache.sanity_check()
+
+
+SESSION_PAGE = 2
+SESSION_DECODE_GRID = 8
+SESSION_OUT = 4
+# Prompt lengths mimic a real multi-turn session; the values are otherwise arbitrary.
+TURNS = (20, 30, 44, 54, 52, 102, 144)
+
+
+def _session_prompts(lens):
+    out, fresh = [], 10_000
+    for i, n in enumerate(lens):
+        if i == 0:
+            out.append(list(range(1, n + 1)))
+            continue
+        keep = min(n, len(out[-1]))
+        out.append(out[-1][:keep] + list(range(fresh, fresh + n - keep)))
+        fresh += 1000
+    return out
+
+
+class _Session:
+    def __init__(self, resume):
+        cfg = CacheConfig(
+            page_size=SESSION_PAGE,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+            enable_mamba_extra_buffer=True,
+            kv_size=4096,
+            max_context_len=512,
+            mamba_cache_size=60,
+            hybrid_cache_checkpoints_level=2,
+            max_num_reqs=16,
+        )
+        with patch(
+            "sglang.test.kits.unified_radix_cache.fixtures.get_device",
+            return_value="cpu",
+        ):
+            self.cache, self.allocator, self.pool = build_fixture(
+                cfg, mamba_cache_chunk_size=GRID
+            )
+        self.resume = resume
+        self.rid = 0
+        self.fresh = 50_000
+
+    def cached(self, prompt):
+        key = RadixKey(array("q", prompt[:-1]))
+        return self.cache.match_prefix(MatchPrefixParams(key=key)).device_prefix_len
+
+    def run(self, prompt):
+        cache, pool = self.cache, self.pool
+        self.rid += 1
+        sampling_params = SamplingParams(temperature=0, max_new_tokens=SESSION_OUT)
+        sampling_params.normalize(None)
+        req = Req(
+            rid=f"r{self.rid}",
+            origin_input_text="",
+            origin_input_ids=array("q", prompt),
+            sampling_params=sampling_params,
+            mamba_checkpoint_pos=len(prompt) if self.resume else None,
+        )
+        acquire_rows(pool, pool.state, [req])
+        req.output_ids = array("q")
+        req.init_next_round_input(cache)
+        prefix, end = req.prefix_len, len(prompt)
+        req.extend_end = end
+        req.lock = cache.lock(req.last_node)
+        if prefix:
+            matched = cache.path_device_indices(req.last_node)[:prefix]
+            pool.write((req.kv.req_pool_idx, slice(0, prefix)), matched)
+        fresh_rows = self.allocator.alloc(end + SESSION_OUT - prefix)
+        pool.write((req.kv.req_pool_idx, slice(prefix, end + SESSION_OUT)), fresh_rows)
+        req.kv.kv_committed_len = end
+        req.kv.kv_allocated_len = end + SESSION_OUT
+
+        batch = ScheduleBatch(reqs=[req])
+        batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
+        batch.model_config = SimpleNamespace(
+            hf_text_config=SimpleNamespace(mamba_chunk_size=GRID)
+        )
+        batch.tree_cache = SimpleNamespace(page_size=SESSION_PAGE)
+        batch.req_to_token_pool = MagicMock()
+        batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = (
+            1 - req.kv.mamba_next_track_idx
+        )
+        req.refresh_fill_ids()
+        batch._mamba_radix_cache_v2_req_prepare_for_extend(req)
+        checkpoint_kv_cache(req, cache)
+
+        # The last sampled token has no forward, so it cannot produce a checkpoint.
+        req.output_ids = array("q", range(self.fresh, self.fresh + SESSION_OUT))
+        self.fresh += SESSION_OUT
+        req.refresh_fill_ids()
+        tracked = [
+            t for t in range(end + 1, end + SESSION_OUT) if t % SESSION_DECODE_GRID == 0
+        ]
+        if tracked:
+            req.kv.mamba_prev_track_seqlen = req.kv.mamba_last_track_seqlen
+            req.kv.mamba_last_track_seqlen = tracked[-1]
+            req.kv.mamba_last_track_idx = req.kv.mamba_next_track_idx
+            req.kv.mamba_next_track_idx = 1 - req.kv.mamba_last_track_idx
+        req.kv.kv_committed_len = end + SESSION_OUT
+        req.finished_reason = FINISH_LENGTH(length=SESSION_OUT)
+        release_kv_cache(req, cache, checkpoint=True)
+        cache.sanity_check()
+
+
+class TestResumePointStrictPrefix(CustomTestCase):
+    """A prompt that stops before the resume point still hits the state matched earlier."""
+
+    def _replay(self, resume):
+        session, hits = _Session(resume), []
+        for prompt in _session_prompts(TURNS):
+            hits.append(session.cached(prompt))
+            session.run(prompt)
+        return hits
+
+    def test_replay_matches_the_server_rows(self):
+        self.assertEqual(self._replay(resume=False), [0, 20, 20, 28, 28, 48, 52])
+        self.assertEqual(self._replay(resume=True), [0, 20, 28, 44, 44, 52, 100])
+
+    def test_prompt_stopping_below_the_resume_point_still_hits(self):
+        # Prefixes shorter than 53 cannot use the state at 52 and fall back to 44.
+        base = _session_prompts(TURNS[:4])
+        for length, expected in ((53, 52), (52, 44), (49, 44), (45, 44)):
+            with self.subTest(length=length):
+                session = _Session(resume=True)
+                for prompt in base:
+                    session.run(prompt)
+                self.assertEqual(session.cached(base[3][:length]), expected)
 
 
 # The decode checkpoint grid is lcm(chunk, page, interval) = the interval. It is

@@ -1668,6 +1668,20 @@ class UnifiedRadixCache(BasePrefixCache):
             ]
         )
 
+    def _keeps_hit_lock(self, req: Req, is_finished: bool, inserted_len: int) -> bool:
+        """Keep the matched state alive for prompts that stop before the tail.
+
+        The path cap could evict it when the tail or finish state is inserted.
+        release_kv_cache unlocks it after the finish insert.
+        """
+        return (
+            not is_finished
+            and req.session_id is None
+            and req.mamba_hit_lock is None
+            and req.mamba_tail_seqlen is not None
+            and inserted_len == req.mamba_tail_seqlen
+        )
+
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
@@ -1824,7 +1838,10 @@ class UnifiedRadixCache(BasePrefixCache):
             new_indices[req.kv.cache_protected_len :],
         )
 
-        self.unlock(req.lock)
+        if self._keeps_hit_lock(req, is_finished, len(radix_key)):
+            req.mamba_hit_lock = req.lock
+        else:
+            self.unlock(req.lock)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
         # already COW'd to the request's own slot, never read from this node again).
         # Safe only because any future COW source is the COWing request's own

@@ -2070,6 +2070,9 @@ class Envs:
     # still writes. Requires --enable-hierarchical-cache. Off keeps the
     # donated GPU slot and the previous ratio.
     SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
+    # Probe chat templates that drop reasoning to find a reusable tail checkpoint.
+    # Cached per template kwargs; mamba_checkpoint_pos overrides the probe.
+    SGLANG_OPT_MAMBA_CHAT_RESUME_CHECKPOINT = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

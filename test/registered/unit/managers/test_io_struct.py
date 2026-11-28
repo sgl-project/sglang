@@ -1544,6 +1544,46 @@ class TestKvHintsTransport(CustomTestCase):
         self.assertEqual(decoded.kv_hints, tokenized.kv_hints)
 
 
+class TestMambaCheckpointPosInput(CustomTestCase):
+    """GenerateReqInput.mamba_checkpoint_pos is one token position per prompt."""
+
+    def test_malformed_values_are_rejected(self):
+        for kwargs in (
+            {"text": "Hello", "mamba_checkpoint_pos": "5"},
+            {"text": "Hello", "mamba_checkpoint_pos": 1.5},
+            {"text": "Hello", "mamba_checkpoint_pos": True},
+            {"text": "Hello", "mamba_checkpoint_pos": [5]},
+            {"text": ["Hello", "World"], "mamba_checkpoint_pos": 5},
+            {"text": ["Hello", "World"], "mamba_checkpoint_pos": [5]},
+            {"text": ["Hello", "World"], "mamba_checkpoint_pos": [5, "7"]},
+            {"text": ["Hello", "World"], "mamba_checkpoint_pos": [5, False]},
+        ):
+            with self.subTest(kwargs=kwargs):
+                req = GenerateReqInput(**kwargs)
+                with self.assertRaises(ValueError):
+                    req.normalize_batch_and_arguments()
+
+    def test_ipc_struct_field_is_last_and_defaults_to_none(self):
+        fields = dict(
+            input_text="",
+            input_ids=array("q", [1, 2]),
+            input_embeds=None,
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+            return_logprob=False,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+        )
+        # Older senders omit trailing fields.
+        self.assertEqual(
+            TokenizedGenerateReqInput.__struct_fields__[-1], "mamba_checkpoint_pos"
+        )
+        self.assertIsNone(TokenizedGenerateReqInput(**fields).mamba_checkpoint_pos)
+
+
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""
 
