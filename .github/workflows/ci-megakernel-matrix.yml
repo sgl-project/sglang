@@ -1,0 +1,35 @@
+name: CI Megakernel Matrix
+
+on:
+  pull_request:
+    paths:
+      - "scripts/ci/megakernel_matrix.py"
+      - "scripts/ci/test_megakernel_matrix.py"
+      - ".github/workflows/pr-test-megakernel.yml"
+      - ".github/workflows/ci-megakernel-matrix.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/ci/megakernel_matrix.py"
+      - "scripts/ci/test_megakernel_matrix.py"
+      - ".github/workflows/pr-test-megakernel.yml"
+      - ".github/workflows/ci-megakernel-matrix.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  megakernel-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Test model selection and runner routing
+        run: |
+          python3 -m pip install PyYAML
+          python3 -m unittest discover -s scripts/ci -p test_megakernel_matrix.py
