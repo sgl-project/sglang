@@ -395,5 +395,152 @@ def test_verify_scratch_pitch_uses_allocated_steps():
     assert torch.isnan(buffer[:N, T:]).all()
 
 
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
+def test_fused_recurrent_update_strided_state_pool():
+    """FusedRecurrentUpdateFunction must update a strided unified-memory pool.
+
+    Regression test for sgl-project/sglang#53615: with --enable-unified-memory,
+    Jet-Nemotron/JetVLM pass temporal[layer] of the state view over the KV arena
+    as initial_state_source. One slot entry holds every state layer's conv and
+    temporal rows, so the pool is strided and a plain @input_guard used to hand
+    the kernel a .contiguous() copy that was then discarded, leaving the pool
+    untouched and every decode step running from a zeroed state. The fix keeps
+    the pool's strides (keep_strides=("initial_state_source",)), as #50307 did
+    for the GDN chunk prefill.
+
+    Runs a prefill step and a decode step on a TensorEntryLayout strided pool
+    and on a contiguous pool holding the same values, and requires the same
+    outputs, the same updated states, and no writes outside the batch slots'
+    rows of the tested layer.
+    """
+    from sglang.srt.mem_cache.kv.decl import TensorPartDecl
+    from sglang.srt.mem_cache.kv.layout.state import state_entry_layout
+
+    # Jet-Nemotron-2B jet geometry, as JetNemotronConfig.mamba2_cache_params
+    # builds it: num_heads 12, head_dim 96, expand_v 2, conv_size 4.
+    H, K = 12, 96
+    V = 2 * K
+    conv_shape = (H * V + 2 * H * K, 4 - 1)
+    temporal_shape = (H, V, K)  # (num_heads, head_dim, state_size)
+    num_layers, layer = 4, 2
+    num_slots = 9  # slot 0 reserved
+    slots = torch.tensor([3, 6, 8], dtype=torch.int32, device="cuda")
+
+    layers = tuple(range(num_layers))
+    layout = state_entry_layout(
+        (
+            TensorPartDecl(
+                name="conv.0",
+                shape=conv_shape,
+                dtype=torch.bfloat16,
+                layer_ids=layers,
+                slice_axis=0,
+            ),
+            TensorPartDecl(
+                name="temporal",
+                shape=temporal_shape,
+                dtype=torch.float32,
+                layer_ids=layers,
+                slice_axis=0,
+            ),
+        )
+    )
+    raw = torch.zeros(num_slots * layout.entry_bytes, dtype=torch.uint8, device="cuda")
+    views = layout.views(raw, num_slots, entry_bytes=layout.entry_bytes)
+    strided_pool = views["temporal"][layer]
+    contiguous_pool = torch.zeros(
+        num_slots, *temporal_shape, dtype=torch.float32, device="cuda"
+    )
+
+    # The pool under test really is a strided unified-memory view: a wider
+    # slot pitch than one packed slot, with each slot's block contiguous.
+    assert not strided_pool.is_contiguous()
+    assert strided_pool.stride(0) > H * V * K
+    assert strided_pool[0].is_contiguous()
+
+    # Random (non-zero) initial state, so the kernel must read the strided
+    # pool as well as write it back.
+    torch.manual_seed(20261127)
+    init_state = torch.randn(
+        len(slots), *temporal_shape, dtype=torch.float32, device="cuda"
+    )
+    strided_pool[slots] = init_state
+    contiguous_pool[slots] = init_state
+
+    A_log = torch.rand(H, device="cuda") * 1.5
+    dt_bias = torch.randn(H, device="cuda") * 0.5
+    scale = K**-0.5
+
+    def run_step(pool, lens):
+        cu = torch.tensor(
+            [0, *torch.tensor(lens).cumsum(0).tolist()],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        total = int(cu[-1])
+        q = torch.nn.functional.silu(
+            torch.randn(total, H, K, device="cuda", dtype=torch.bfloat16)
+        )
+        k = torch.nn.functional.silu(
+            torch.randn(total, H, K, device="cuda", dtype=torch.bfloat16)
+        )
+        v = torch.randn(total, H, V, device="cuda", dtype=torch.bfloat16)
+        a = torch.randn(total, H, device="cuda", dtype=torch.bfloat16)
+        g = -A_log.float().exp() * torch.nn.functional.softplus(a.float() + dt_bias)
+        beta = torch.sigmoid(torch.randn(total, H, device="cuda", dtype=torch.bfloat16))
+        return fused_recurrent_gated_delta_rule_update(
+            q=q.unsqueeze(0),
+            k=k.unsqueeze(0),
+            v=v.unsqueeze(0),
+            g=g.unsqueeze(0),
+            beta=beta.unsqueeze(0),
+            scale=scale,
+            initial_state_source=pool,
+            initial_state_indices=slots,
+            # Jet passes int64 query_start_loc as cu_seqlens.
+            cu_seqlens=cu,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    for step, lens in enumerate(((5, 3, 7), (1, 1, 1))):
+        raw_before = raw.clone()
+        strided_before = strided_pool.clone()
+        contiguous_before = contiguous_pool.clone()
+        other_layers_before = {
+            other: views["temporal"][other].clone()
+            for other in range(num_layers)
+            if other != layer
+        }
+        other_slots = [s for s in range(num_slots) if s not in slots.tolist()]
+
+        # Same inputs for both pools, so any difference is the pool layout.
+        torch.manual_seed(100 + step)
+        out_strided = run_step(strided_pool, lens)
+        torch.manual_seed(100 + step)
+        out_contiguous = run_step(contiguous_pool, lens)
+
+        torch.testing.assert_close(out_strided, out_contiguous, rtol=1e-2, atol=1e-2)
+        # The update must have landed in the strided pool, not in a copy.
+        assert not torch.equal(strided_pool[slots], strided_before[slots])
+        torch.testing.assert_close(
+            strided_pool[slots],
+            contiguous_pool[slots],
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        # Nothing else may change: other slots, other layers, and every other
+        # byte of the arena.
+        assert torch.equal(strided_pool[other_slots], strided_before[other_slots])
+        assert torch.equal(contiguous_pool[other_slots], contiguous_before[other_slots])
+        for other, before in other_layers_before.items():
+            assert torch.equal(views["temporal"][other], before)
+        mask = torch.ones_like(raw, dtype=torch.bool)
+        base = strided_pool.storage_offset() * 4
+        for s in slots.tolist():
+            start = base + s * strided_pool.stride(0) * 4
+            mask[start : start + H * V * K * 4] = False
+        assert torch.equal(raw[mask], raw_before[mask])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

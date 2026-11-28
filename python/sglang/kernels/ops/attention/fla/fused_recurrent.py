@@ -1161,7 +1161,9 @@ def fused_recurrent_gated_delta_rule_update_fwd(
 
 class FusedRecurrentUpdateFunction(torch.autograd.Function):
     @staticmethod
-    @input_guard
+    # The kernel steps initial_state_source's slots by its stride(0), so a
+    # strided (unified-memory) pool is read and updated in place.
+    @input_guard(keep_strides=("initial_state_source",))
     def forward(
         ctx,
         q: torch.Tensor,
