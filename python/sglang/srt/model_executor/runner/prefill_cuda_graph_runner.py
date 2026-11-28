@@ -209,6 +209,25 @@ def _chunked_prefix_variant(num_chunks: int) -> str:
     return f"chunked_prefix:{num_chunks}"
 
 
+def _dsv41_chunk_needs_vision(batch: ForwardBatch) -> bool:
+    prefixes, lengths = batch.extend_prefix_lens_cpu, batch.extend_seq_lens_cpu
+    if prefixes is None or lengths is None:
+        return True
+    for i, mm in enumerate(batch.mm_inputs):
+        if mm is None:
+            continue
+        if not mm.mm_items:
+            return True
+        start = prefixes[i]
+        stop = start + lengths[i]
+        for item in mm.mm_items:
+            if not item.offsets or any(
+                lo < stop and hi >= start for lo, hi in item.offsets
+            ):
+                return True
+    return False
+
+
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
@@ -1633,6 +1652,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 getattr(self.model_runner.model, "vision", None) is not None
                 and forward_batch.mm_inputs is not None
                 and any(item is not None for item in forward_batch.mm_inputs)
+                and (
+                    not self.is_dsv41_model or _dsv41_chunk_needs_vision(forward_batch)
+                )
             ):
                 return False
             assert self.prefill_cp_bcg_input is not None
