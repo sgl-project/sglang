@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.runtime_context import get_exec, get_spec
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
