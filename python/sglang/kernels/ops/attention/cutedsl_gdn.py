@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 _compiled_kernels: Dict[Tuple, object] = {}
 _cu_seqlens_cache: Dict[Tuple, torch.Tensor] = {}
+_SUPPORTED_STATE_DTYPES = (torch.float32,)
+_SUPPORTED_INDEX_DTYPES = (torch.int32, torch.int64)
 TILE_K = 128
 # K-contiguous smem rows; the 8-float pad makes each warp's 8 K x 4 V reads
 # hit distinct banks and keeps rows 16B-aligned for cp.async.
@@ -258,7 +260,7 @@ def _define_kernels():
 
                 if k_local == 0:
                     v_global_out = v_tile * TILE_V_SMALL + v_idx
-                    o[(i_n, 0, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
+                    o[(i_n, 0, i_hv, v_global_out)] = o.element_type(sum_hq)
 
                 cute.arch.barrier()
 
@@ -490,7 +492,7 @@ def _define_kernels():
 
                 if k_local == 0:
                     v_global_out = v_tile * TILE_V_SMALL + v_idx
-                    o[(0, i_n, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
+                    o[(0, i_n, i_hv, v_global_out)] = o.element_type(sum_hq)
 
                 cute.arch.barrier()
 
@@ -707,7 +709,7 @@ def _define_kernels():
 
                 if k_local == 0:
                     v_global_out = v_tile * TILE_V + v_idx
-                    o[(i_n, 0, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
+                    o[(i_n, 0, i_hv, v_global_out)] = o.element_type(sum_hq)
 
                 cute.arch.barrier()
 
@@ -924,7 +926,7 @@ def _define_kernels():
 
                 if k_local == 0:
                     v_global_out = v_tile * TILE_V + v_idx
-                    o[(0, i_n, i_hv, v_global_out)] = cutlass.BFloat16(sum_hq)
+                    o[(0, i_n, i_hv, v_global_out)] = o.element_type(sum_hq)
 
                 cute.arch.barrier()
 
@@ -1275,38 +1277,62 @@ def _get_jit_functions():
     return _jit_functions
 
 
-def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode):
-    """Get or compile the kernel for given dimensions."""
+def _get_compiled_kernel(
+    N, H, HV, K, V, h0_source, dtypes, use_small_batch, is_varlen_decode
+):
+    """Get or compile the kernel for given dimensions, strides, and tensor dtypes.
+
+    ``h0_source`` is the caller's transposed state pool view
+    (``[pool_size, HV, K, V]``): ``from_dlpack`` bakes its exact dtype and
+    strides into the compiled kernel so envelope-strided pools compile against
+    their true layout.
+    """
     global _compiled_kernels
 
-    key = (N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode)
+    pool_size = h0_source.shape[0]
+    state_dtype = h0_source.dtype
+    device = h0_source.device
+    q_dt, k_dt, v_dt, a_dt, b_dt, A_log_dt, dt_bias_dt, idx_dt = dtypes
+
+    key = (
+        N,
+        H,
+        HV,
+        K,
+        V,
+        pool_size,
+        tuple(h0_source.stride()),
+        state_dtype,
+        dtypes,
+        use_small_batch,
+        is_varlen_decode,
+        device,
+    )
     if key in _compiled_kernels:
         return _compiled_kernels[key]
 
-    cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device="cuda")
+    # CuTe launches skip dtype checks; compiling with mismatched dtypes causes
+    # silent bit reinterpretation (or OOB writes for state_dtype / idx_dt).
+    cu_seqlens = torch.zeros(N + 1, dtype=torch.int32, device=device)
 
     if is_varlen_decode:
-        q = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
-        k = torch.zeros(1, N, H, K, dtype=torch.bfloat16, device="cuda")
-        v = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
-        a = torch.zeros(N, HV, dtype=torch.bfloat16, device="cuda")
-        b = torch.zeros(N, HV, dtype=torch.bfloat16, device="cuda")
-        o = torch.zeros(1, N, HV, V, dtype=torch.bfloat16, device="cuda")
+        q = torch.zeros(1, N, H, K, dtype=q_dt, device=device)
+        k = torch.zeros(1, N, H, K, dtype=k_dt, device=device)
+        v = torch.zeros(1, N, HV, V, dtype=v_dt, device=device)
+        a = torch.zeros(N, HV, dtype=a_dt, device=device)
+        b = torch.zeros(N, HV, dtype=b_dt, device=device)
+        o = torch.zeros(1, N, HV, V, dtype=q_dt, device=device)
     else:
-        q = torch.zeros(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
-        k = torch.zeros(N, 1, H, K, dtype=torch.bfloat16, device="cuda")
-        v = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
-        a = torch.zeros(N, 1, HV, dtype=torch.bfloat16, device="cuda")
-        b = torch.zeros(N, 1, HV, dtype=torch.bfloat16, device="cuda")
-        o = torch.zeros(N, 1, HV, V, dtype=torch.bfloat16, device="cuda")
+        q = torch.zeros(N, 1, H, K, dtype=q_dt, device=device)
+        k = torch.zeros(N, 1, H, K, dtype=k_dt, device=device)
+        v = torch.zeros(N, 1, HV, V, dtype=v_dt, device=device)
+        a = torch.zeros(N, 1, HV, dtype=a_dt, device=device)
+        b = torch.zeros(N, 1, HV, dtype=b_dt, device=device)
+        o = torch.zeros(N, 1, HV, V, dtype=q_dt, device=device)
 
-    A_log = torch.zeros(HV, dtype=torch.float32, device="cuda")
-    dt_bias = torch.zeros(HV, dtype=torch.bfloat16, device="cuda")
-    # from_dlpack bakes this layout into the kernel; it must match the runtime view.
-    h0_source = torch.zeros(
-        pool_size, HV, V, K, dtype=torch.float32, device="cuda"
-    ).transpose(-1, -2)
-    h0_indices = torch.zeros(N, dtype=torch.int32, device="cuda")
+    A_log = torch.zeros(HV, dtype=A_log_dt, device=device)
+    dt_bias = torch.zeros(HV, dtype=dt_bias_dt, device=device)
+    h0_indices = torch.zeros(N, dtype=idx_dt, device=device)
 
     cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
     q_tensor = from_dlpack(q, assumed_align=16)
@@ -1316,11 +1342,11 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
     b_tensor = from_dlpack(b, assumed_align=16)
     A_log_tensor = from_dlpack(A_log, assumed_align=16)
     dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-    h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+    h0_source_tensor = from_dlpack(h0_source.detach(), assumed_align=16)
     h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
     o_tensor = from_dlpack(o, assumed_align=16)
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
     run_small, run_small_varlen, run_large, run_large_varlen = _get_jit_functions()
 
@@ -1365,7 +1391,10 @@ def _get_compiled_kernel(N, H, HV, K, V, pool_size, use_small_batch, is_varlen_d
 
     _compiled_kernels[key] = compiled_kernel
     logger.info(
-        f"CuTe DSL GDN kernel compiled: N={N}, H={H}, HV={HV}, K={K}, V={V}, pool_size={pool_size}, small_batch={use_small_batch}, varlen={is_varlen_decode}"
+        f"CuTe DSL GDN kernel compiled: N={N}, H={H}, HV={HV}, K={K}, V={V}, "
+        f"pool_size={pool_size}, pool_strides={tuple(h0_source.stride())}, "
+        f"state_dtype={state_dtype}, dt_bias_dtype={dt_bias_dt}, "
+        f"q_dtype={q_dt}, small_batch={use_small_batch}, varlen={is_varlen_decode}"
     )
 
     return compiled_kernel
@@ -1407,7 +1436,9 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
 ) -> torch.Tensor:
     """CuTe DSL implementation of fused sigmoid gating delta rule update.
 
-    ``initial_state_source`` is the ``[pool_size, HV, V, K]`` state pool.
+    ``initial_state_source`` is the ``[pool_size, HV, V, K]`` state pool
+    (or its flattened 1D view). Envelope-strided pools with compact per-slot
+    ``[HV, V, K]`` blocks are updated in place.
     """
 
     B_q, T_q, H, K = q.shape
@@ -1424,39 +1455,95 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
         softplus_threshold=softplus_threshold,
     )
 
+    if K != TILE_K or V % TILE_V != 0 or HV % H != 0:
+        raise ValueError(
+            f"CuTe DSL GDN decode requires K={TILE_K}, V % {TILE_V} == 0, "
+            f"and HV % H == 0; got H={H}, HV={HV}, K={K}, V={V}"
+        )
+
+    if B_q * T_q != N:
+        raise ValueError(
+            f"CuTe DSL GDN decode expects one token per sequence (B_q * T_q == N); "
+            f"got q.shape={tuple(q.shape)}, N={N}"
+        )
+
+    if initial_state_source.dtype not in _SUPPORTED_STATE_DTYPES:
+        raise ValueError(
+            "CuTe DSL GDN decode only supports initial_state_source dtypes "
+            f"{_SUPPORTED_STATE_DTYPES}; got {initial_state_source.dtype}"
+        )
+
+    if initial_state_indices.dtype not in _SUPPORTED_INDEX_DTYPES:
+        raise ValueError(
+            "CuTe DSL GDN decode only supports initial_state_indices dtypes "
+            f"{_SUPPORTED_INDEX_DTYPES}; got {initial_state_indices.dtype}"
+        )
+
+    o_shape = (1, N, HV, V) if is_varlen_decode else (N, 1, HV, V)
+    if N == 0:
+        return q.new_empty(o_shape)
+
     use_small_batch = N < SMALL_BATCH_THRESHOLD
 
+    slot_elems = HV * V * K
     if initial_state_source.dim() == 1:
-        pool_size = initial_state_source.numel() // (HV * K * V)
-        h0_source = initial_state_source.view(pool_size, HV, V, K)
+        if initial_state_source.numel() % slot_elems != 0:
+            raise ValueError(
+                f"1D initial_state_source numel ({initial_state_source.numel()}) "
+                f"must be divisible by HV * V * K ({slot_elems})"
+            )
+        pool_size = initial_state_source.numel() // slot_elems
+        h0_source_raw = initial_state_source.view(pool_size, HV, V, K)
     elif initial_state_source.dim() == 4:
-        pool_size = initial_state_source.shape[0]
-        h0_source = initial_state_source
+        h0_source_raw = initial_state_source
     else:
         raise ValueError(
             f"Unexpected initial_state_source shape: {initial_state_source.shape}"
         )
+
+    if (
+        h0_source_raw.stride()[1:] != (V * K, K, 1)
+        or (h0_source_raw.stride(0) * h0_source_raw.element_size() % 16 != 0)
+        or (h0_source_raw.data_ptr() % 16 != 0)
+    ):
+        raise ValueError(
+            "CuTe DSL GDN decode requires a compact 16B-aligned per-slot "
+            f"[HV, V, K] state block; got strides {tuple(h0_source_raw.stride())} "
+            f"for shape {tuple(h0_source_raw.shape)} and dtype {h0_source_raw.dtype}"
+        )
+
+    if A_log.numel() != HV or dt_bias.numel() != HV:
+        raise ValueError(
+            f"Expected A_log and dt_bias with numel={HV}; "
+            f"got A_log.shape={tuple(A_log.shape)}, dt_bias.shape={tuple(dt_bias.shape)}"
+        )
+
     # The kernels index (pool, HV, K, V).
-    h0_source = h0_source.transpose(-1, -2)
+    h0_source = h0_source_raw.transpose(-1, -2)
 
     if is_varlen_decode:
         if a.dim() == 3:
             a = a.squeeze(0)
         if b.dim() == 3:
             b = b.squeeze(0)
-        o = q.new_empty(1, N, HV, V, dtype=torch.bfloat16)
     else:
         if a.dim() == 2:
             a = a.unsqueeze(1)
         if b.dim() == 2:
             b = b.unsqueeze(1)
-        o = q.new_empty(N, 1, HV, V, dtype=torch.bfloat16)
 
-    q, k, v = [t.contiguous() for t in (q, k, v)]
+    o = q.new_empty(o_shape)
+    q, k, v, a, b, A_log, dt_bias, initial_state_indices = [
+        t.contiguous() for t in (q, k, v, a, b, A_log, dt_bias, initial_state_indices)
+    ]
 
     global _cu_seqlens_cache
     if cu_seqlens is not None:
-        cu_seqlens_to_use = cu_seqlens
+        cu_seqlens_to_use = (
+            cu_seqlens
+            if cu_seqlens.dtype == torch.int32
+            else cu_seqlens.to(torch.int32)
+        ).contiguous()
     else:
         cache_key = (N, str(q.device))
         if cache_key not in _cu_seqlens_cache:
@@ -1499,12 +1586,14 @@ def cutedsl_fused_sigmoid_gating_delta_rule_update(
         leading_dim=o.ndim - 1
     )
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
+    dtypes = tuple(
+        t.dtype for t in (q, k, v, a, b, A_log, dt_bias, initial_state_indices)
+    )
     compiled_kernel = _get_compiled_kernel(
-        N, H, HV, K, V, pool_size, use_small_batch, is_varlen_decode
+        N, H, HV, K, V, h0_source, dtypes, use_small_batch, is_varlen_decode
     )
 
+    stream = cuda.CUstream(torch.cuda.current_stream(h0_source.device).cuda_stream)
     compiled_kernel(
         cu_seqlens_tensor,
         q_tensor,
