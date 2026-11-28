@@ -109,10 +109,24 @@ def _parse_runner_selector(selector: str) -> Set[str]:
     )
 
 
+def _resolve_load_selector(
+    selector: Optional[str], session_selector: str
+) -> Tuple[Optional[str], Optional[str]]:
+    if selector is None:
+        return session_selector, None
+    if _parse_runner_selector(selector) <= _parse_runner_selector(session_selector):
+        return selector, None
+    # begin restores and end finalizes only the session's runners
+    return None, (
+        f"selector {selector!r} names runners outside the weight-update session "
+        f"opened with selector {session_selector!r}"
+    )
+
+
 class PluginWeightUpdateContext(msgspec.Struct, frozen=True):
     """What a platform weight transport sees on one TP rank."""
 
-    # (role, model runner) of each runner the request selects: "target", then any "draft"
+    # (role, model runner) of each runner the load selects: "target", then any "draft"
     # runners; read-only, except a transport that writes parameters itself
     runners: List[Tuple[str, ModelRunner]]
     tp_rank: int
@@ -131,6 +145,7 @@ class _WeightUpdateSession(msgspec.Struct, frozen=True):
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
     draft_worker: Any
+    spec_algorithm: Any
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
@@ -142,9 +157,17 @@ class SchedulerWeightUpdaterManager:
     _session: Optional[_WeightUpdateSession] = None
     _plugin_state: Dict[str, Any] = field(default_factory=dict)
     tp_cpu_group: Any = field(init=False)
+    # the same on every PP stage, unlike draft_worker: only the last stage hosts the draft runners
+    has_draft_model: bool = field(init=False)
 
     def __post_init__(self) -> None:
         self.tp_cpu_group = get_parallel().tp_group.cpu_group
+        # NGRAM and UNO draft without a model of their own
+        self.has_draft_model = not (
+            self.spec_algorithm.is_none()
+            or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_uno()
+        )
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -229,6 +252,16 @@ class SchedulerWeightUpdaterManager:
             runners += self.draft_worker.weight_update_runners()
         return runners
 
+    def _empty_selection_error(self, selector: str) -> Optional[str]:
+        # a load into no runner would still succeed and record the weight version;
+        # judged for the server, not this PP stage's runners, so every stage answers alike
+        if "target" in _parse_runner_selector(selector) or self.has_draft_model:
+            return None
+        return (
+            f"selector {selector!r} selects no model runner; "
+            "this server has no draft model"
+        )
+
     def update_weights_from_distributed(
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
@@ -240,6 +273,13 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_distributed must run between "
                 "begin_weight_update() and end_weight_update()",
             )
+        selector, error = _resolve_load_selector(
+            selector=recv_req.selector, session_selector=self._session.selector
+        )
+        if error is None:
+            error = self._empty_selection_error(selector)
+        if error is not None:
+            return UpdateWeightsFromDistributedReqOutput(success=False, message=error)
         with self._observe_weight_load("distributed"):
             self.scheduler.wait_for_launched_forward()
             # only the target runner joined the update group; drafts load its receive
@@ -256,9 +296,7 @@ class SchedulerWeightUpdaterManager:
                 success, message = False, f"Failed to receive weights: {e}"
                 logger.error(message)
             else:
-                success, message = self._load_into_selected_runners(
-                    weights, recv_req.selector
-                )
+                success, message = self._load_into_selected_runners(weights, selector)
             if success:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True
@@ -292,12 +330,19 @@ class SchedulerWeightUpdaterManager:
                 message="update_weights_from_tensor must run between "
                 "begin_weight_update() and end_weight_update()",
             )
+        selector, error = _resolve_load_selector(
+            selector=recv_req.selector, session_selector=self._session.selector
+        )
+        if error is None:
+            error = self._empty_selection_error(selector)
+        if error is not None:
+            return UpdateWeightsFromTensorReqOutput(success=False, message=error)
         with self._observe_weight_load("tensor"):
             self.scheduler.wait_for_launched_forward()
             named_tensors = self.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
             )
-            runners = self._select_runners(recv_req.selector)
+            runners = self._select_runners(selector)
             # A PP stage hosting none of the selected runners must not open the handles.
             if runners and recv_req.load_format != "flattened_bucket":
                 named_tensors = unwrap_local_serialized_tensors(
@@ -379,6 +424,9 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
+        error = self._empty_selection_error(recv_req.selector)
+        if error is not None:
+            return BeginWeightUpdateReqOutput(success=False, message=error)
         from sglang.srt.model_executor.model_runner_components.weight_updater import (
             _unsupported_derived_weight_cache_error,
         )
@@ -441,7 +489,14 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message=f"this platform has no weight-update handler {recv_req.handler!r}",
             )
-        runners = self._select_runners(recv_req.selector)
+        selector, error = _resolve_load_selector(
+            selector=recv_req.selector, session_selector=self._session.selector
+        )
+        if error is None:
+            error = self._empty_selection_error(selector)
+        if error is not None:
+            return PluginWeightUpdateReqOutput(success=False, message=error)
+        runners = self._select_runners(selector)
         # The load-side guards, before the transport runs: they are startup-determined and
         # rank-uniform, and a transport that writes parameters itself never reaches a load.
         for _, runner in runners:
@@ -463,9 +518,7 @@ class SchedulerWeightUpdaterManager:
                 logger.exception("weight transport failed on this TP rank")
                 weights, error = [], f"TP rank {context.tp_rank}: {e}"
             if error is None and weights:
-                loaded, message = self._load_into_selected_runners(
-                    weights, recv_req.selector
-                )
+                loaded, message = self._load_into_selected_runners(weights, selector)
                 if not loaded:
                     error = f"TP rank {context.tp_rank}: {message}"
             # only TP rank 0 replies, so its reply must carry every rank's outcome

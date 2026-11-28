@@ -13,6 +13,8 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -332,7 +334,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
         self.addCleanup(override.__exit__, None, None, None)
         self.recorded = []
 
-    def _build_manager(self, target, draft):
+    def _build_manager(self, target, draft, spec_algorithm):
         return SchedulerWeightUpdaterManager(
             tp_worker=SimpleNamespace(
                 model_runner=target,
@@ -344,6 +346,7 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
                 if draft is None
                 else SimpleNamespace(weight_update_runners=lambda: [("draft", draft)])
             ),
+            spec_algorithm=spec_algorithm,
             memory_saver_adapter=None,
             flush_cache=lambda **kwargs: True,
             is_fully_idle=lambda **kwargs: True,
@@ -355,9 +358,15 @@ class _WeightUpdaterManagerTestBase(CustomTestCase):
             ),
         )
 
-    def _manager(self, target, draft=None, *, session=True):
+    def _manager(self, target, draft=None, *, session=True, spec_algorithm=None):
+        if spec_algorithm is None:
+            spec_algorithm = (
+                SpeculativeAlgorithm.NONE
+                if draft is None
+                else SpeculativeAlgorithm.EAGLE
+            )
         with get_parallel().override(tp_group=SimpleNamespace(cpu_group=None)):
-            manager = self._build_manager(target, draft)
+            manager = self._build_manager(target, draft, spec_algorithm)
         if session:
             # update_weights_from_* require an open session
             manager._session = _WeightUpdateSession(selector="all")
@@ -503,6 +512,132 @@ class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
         target.weight_updater.load_weights_from_distributed.assert_called_once()
         draft.weight_updater.load_weights_from_distributed.assert_not_called()
 
+    def _target_only_session(self):
+        target, draft = _runner(), _runner()
+        manager = self._manager(target, draft)
+        manager._session = _WeightUpdateSession(selector="target")
+        return manager, target, draft
+
+    def test_loads_without_a_selector_follow_the_session(self):
+        """Engine update calls set no selector; a target-only session must still
+        keep their weights out of the draft."""
+        cases = (
+            (
+                "distributed",
+                lambda manager: manager.update_weights_from_distributed(
+                    UpdateWeightsFromDistributedReqInput(
+                        names=["model.norm.weight"], dtypes=["float32"], shapes=[[1]]
+                    )
+                ),
+                lambda runner: runner.weight_updater.load_weights_from_distributed,
+            ),
+            (
+                "tensor",
+                lambda manager: manager.update_weights_from_tensor(
+                    UpdateWeightsFromTensorReqInput(serialized_named_tensors=[b""])
+                ),
+                lambda runner: runner.weight_updater.update_weights_from_tensor,
+            ),
+        )
+        for name, update, load_of in cases:
+            with self.subTest(load=name):
+                manager, target, draft = self._target_only_session()
+
+                output = update(manager)
+
+                self.assertTrue(output.success)
+                load_of(target).assert_called_once()
+                self.assertEqual(draft.weight_updater.mock_calls, [])
+
+    def test_a_load_cannot_select_runners_the_session_did_not_open(self):
+        """end finalizes only the session's runners, so a load into another one
+        would leave it unfinalized; the refusal comes before any receive."""
+        cases = (
+            (
+                "distributed",
+                lambda manager, req: manager.update_weights_from_distributed(req),
+            ),
+            ("tensor", lambda manager, req: manager.update_weights_from_tensor(req)),
+        )
+        for name, update in cases:
+            with self.subTest(load=name):
+                manager, target, draft = self._target_only_session()
+
+                output = update(manager, _request(selector="all"))
+
+                self.assertFalse(output.success)
+                self.assertIn("outside the weight-update session", output.message)
+                self.assertEqual(target.weight_updater.mock_calls, [])
+                self.assertEqual(draft.weight_updater.mock_calls, [])
+
+    def test_selectors_that_select_no_runner_are_rejected_without_a_draft(self):
+        """Without a draft model, a "draft" session or load would report success and
+        record the weight version having loaded nothing. NGRAM has a draft worker
+        but no draft model."""
+        for spec_algorithm, draft_worker in (
+            (SpeculativeAlgorithm.NONE, None),
+            (
+                SpeculativeAlgorithm.NGRAM,
+                SimpleNamespace(weight_update_runners=lambda: []),
+            ),
+        ):
+            target = _runner()
+            manager = self._manager(
+                target, session=False, spec_algorithm=spec_algorithm
+            )
+            manager.draft_worker = draft_worker
+            with self.subTest(spec_algorithm=spec_algorithm, call="begin"):
+                begun = manager.begin_weight_update(
+                    BeginWeightUpdateReqInput(selector="draft")
+                )
+
+                self.assertFalse(begun.success)
+                self.assertIsNone(manager._session)
+            manager._session = _WeightUpdateSession(selector="all")
+            for name, update in (
+                ("distributed", manager.update_weights_from_distributed),
+                ("tensor", manager.update_weights_from_tensor),
+            ):
+                with self.subTest(spec_algorithm=spec_algorithm, call=name):
+                    output = update(_request(selector="draft"))
+
+                    self.assertFalse(output.success)
+                    self.assertIn("no model runner", output.message)
+            self.assertEqual(target.weight_updater.mock_calls, [])
+        self.assertEqual(self.recorded, [])
+
+    def test_a_pp_stage_without_the_draft_runner_accepts_draft_selectors(self):
+        """Under PP only the last stage hosts the draft runner; a stage that refused
+        a "draft" call for holding none would answer differently from the stage
+        that loads it."""
+        for stage, draft_worker in (
+            ("no draft worker", None),
+            (
+                "a draft worker with no runner",
+                SimpleNamespace(weight_update_runners=lambda: []),
+            ),
+        ):
+            target = _runner()
+            manager = self._manager(
+                target, session=False, spec_algorithm=SpeculativeAlgorithm.EAGLE
+            )
+            manager.draft_worker = draft_worker
+            with self.subTest(stage=stage, call="begin"):
+                begun = manager.begin_weight_update(
+                    BeginWeightUpdateReqInput(selector="draft")
+                )
+
+                self.assertTrue(begun.success)
+            manager._session = _WeightUpdateSession(selector="draft")
+            for name, update in (
+                ("distributed", manager.update_weights_from_distributed),
+                ("tensor", manager.update_weights_from_tensor),
+            ):
+                with self.subTest(stage=stage, call=name):
+                    self.assertTrue(update(_request(selector="draft")).success)
+            target.weight_updater.load_weights_from_distributed.assert_not_called()
+            target.weight_updater.update_weights_from_tensor.assert_not_called()
+
     def test_end_runs_post_load_on_both_when_load_was_bypassed(self):
         """A P2P/RDMA session never calls load_weights, so end must run post_load_weights."""
         target, draft = _runner(), _runner()
@@ -643,6 +778,39 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         )
         self.assertEqual(self.recorded, ["3"])
         self.assertEqual(len(self.flushes), 1)
+
+    def test_plugin_loads_stay_inside_a_target_only_session(self):
+        """A plugin load without a selector follows the session; one naming
+        runners beyond it is refused before the transport runs."""
+        transport = Mock(return_value=[("w", object())])
+        target, draft = _runner(), _runner()
+        manager = self._manager_serving({"ici": transport}, target=target, draft=draft)
+        manager._session = _WeightUpdateSession(selector="target")
+
+        refused = manager.plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="ici", selector="all")
+        )
+        loaded = manager.plugin_weight_update(PluginWeightUpdateReqInput(handler="ici"))
+
+        self.assertFalse(refused.success)
+        self.assertTrue(loaded.success)
+        transport.assert_called_once()
+        target.weight_updater.load_weights_from_distributed.assert_called_once()
+        self.assertEqual(draft.weight_updater.mock_calls, [])
+
+    def test_a_draft_load_without_a_draft_is_refused_before_the_transport_runs(self):
+        """Selecting no runner, the load would report success and record the version."""
+        transport = Mock(return_value=[("w", object())])
+        manager = self._manager_serving({"ici": transport})
+
+        output = manager.plugin_weight_update(
+            PluginWeightUpdateReqInput(handler="ici", selector="draft")
+        )
+
+        self.assertFalse(output.success)
+        self.assertIn("no model runner", output.message)
+        transport.assert_not_called()
+        self.assertEqual(self.recorded, [])
 
     def test_end_runs_post_load_only_after_writes_that_bypassed_load_weights(self):
         """A transport that writes parameters itself returns no tensors, like p2p peer writes."""
