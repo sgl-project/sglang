@@ -2279,6 +2279,13 @@ class CommonKVManager(BaseKVManager):
             )
             return src_kv_ptrs, sliced_dst
 
+        # NPU DSV4 main pool registers three regions per C4 layer: [C4 KV, index K, index scale].
+        if state_type is None and c4_full and len(dst_kv_ptrs) == 3 * c4_full:
+            dst = []
+            for offset in (0, c4_full, 2 * c4_full):
+                dst.extend(dst_kv_ptrs[offset + c4_off_s : offset + c4_off_e])
+            return src_kv_ptrs, dst
+
         # SWA may omit nextn entries present in mla_ratios; use its buffer count.
         # C128 state ships separately as DSV4_REQUEST_STATE.
         swa_L = len(dst_kv_ptrs) - 2 * c4_full
