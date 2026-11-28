@@ -73,13 +73,55 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                         return "All items in input list must be strings"
                     if not item.strip():
                         return f"Input at index {i} cannot be empty or whitespace only"
-            elif isinstance(first_item, int):
+            elif isinstance(first_item, int) and not isinstance(first_item, bool):
                 # List of integers (token IDs)
                 for i, item in enumerate(input):
-                    if not isinstance(item, int):
+                    if not isinstance(item, int) or isinstance(item, bool):
                         return "All items in input list must be integers"
                     if item < 0:
                         return f"Token ID at index {i} must be non-negative"
+            elif isinstance(first_item, list):
+                # List of token ID lists (batch of token sequences)
+                for i, item in enumerate(input):
+                    if not isinstance(item, list):
+                        return (
+                            "All items in input list must be lists of integers, "
+                            f"got {type(item).__name__} at index {i}"
+                        )
+                    if len(item) == 0:
+                        return f"Token ID list at index {i} cannot be empty"
+                    for j, token in enumerate(item):
+                        if not isinstance(token, int) or isinstance(token, bool):
+                            return (
+                                f"All items in token ID list at index {i} must be "
+                                f"integers, got {type(token).__name__} at index {j}"
+                            )
+                        if token < 0:
+                            return (
+                                f"Token ID at index {j} in list {i} must be "
+                                f"non-negative, got {token}"
+                            )
+            elif isinstance(first_item, MultimodalEmbeddingInput):
+                for i, item in enumerate(input):
+                    if not isinstance(item, MultimodalEmbeddingInput):
+                        return (
+                            "All items in input list must be MultimodalEmbeddingInput, "
+                            f"got {type(item).__name__} at index {i}"
+                        )
+                    if item.text is None and item.image is None and item.video is None:
+                        return "At least one of text, image, or video must be provided"
+                    if (
+                        isinstance(item.text, str)
+                        and not item.text.strip()
+                        and item.image is None
+                        and item.video is None
+                    ):
+                        return (
+                            "Input text cannot be empty or whitespace only when no "
+                            "image or video is provided"
+                        )
+            else:
+                return f"Unsupported input item type: {type(first_item).__name__}"
         return None
 
     def _convert_to_internal_request(
