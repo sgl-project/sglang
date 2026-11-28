@@ -17,8 +17,9 @@ PAGES = ("p0", "p1", "p2", "p3")
 
 
 class _LegacyBinding:
-    def __init__(self, missing=()):
+    def __init__(self, missing=(), evicted_after_probe=()):
         self.missing = set(missing)
+        self.evicted_after_probe = set(evicted_after_probe)
         self.calls = []
 
     def _exists(self, keys):
@@ -26,6 +27,7 @@ class _LegacyBinding:
 
     def batch_is_exist(self, keys):
         self.calls.append(("batch_is_exist", list(keys)))
+        self.missing |= self.evicted_after_probe
         return self._exists(keys)
 
 
@@ -83,6 +85,18 @@ class TestMooncakeTrailingWindowLease(CustomTestCase):
         )
         self.assertEqual(result.restorable_prefix_pages, [1, 2, 3])
         self.assertEqual(result.kv_hit_pages, 3)
+
+    def test_window_evicted_after_probe_is_looked_up_again(self):
+        binding = _ProbeBinding(
+            missing={"p3_conv_0"}, evicted_after_probe={"p2_temporal"}
+        )
+        store = _make_store(binding, kv_pages=4)
+
+        result = store.batch_exists_v2(list(PAGES), _transfers())
+
+        self.assertEqual(binding.calls[-1][0], "batch_is_exist")
+        self.assertEqual(len(binding.calls[-1][1]), 4 * 4)
+        self.assertEqual(result.restorable_prefix_pages, [1, 2])
 
     def test_legacy_binding_leases_every_page(self):
         binding = _LegacyBinding(missing={"p3_conv_0"})

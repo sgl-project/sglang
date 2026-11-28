@@ -1368,7 +1368,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        probe: bool = True,
     ) -> PoolTransferResult:
+        probe = probe and hasattr(self.store, "batch_probe_key")
         if self.mem_pool_host.kv_buffer is None:
             # Logical anchor: no physical KV object exists in Mooncake, so the
             # usable prefix is determined entirely by required sidecar objects.
@@ -1399,7 +1401,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             all_exists = self._batch_exist_pool_pages(
-                all_component_keys, prepared, kv_pages
+                all_component_keys, prepared, kv_pages, probe
             )
         for transfer, key_multiplier, start, end in prepared:
             if not restorable:
@@ -1455,7 +1457,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             restorable = [p for p in restorable if p in pool_restorable_set]
 
         final_pages = restorable[-1] if restorable else 0
-        if final_pages and hasattr(self.store, "batch_probe_key"):
+        if final_pages and probe:
             window = []
             for transfer, key_multiplier, start, _ in prepared:
                 if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
@@ -1466,7 +1468,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 with self.request_context(
                     **self._request_context_from_extra_info(extra_info)
                 ):
-                    self._batch_exist(window)
+                    leased = self._batch_exist(window)
+                # Evicted since the probe: look up again, leasing every page.
+                if any(r != 1 for r in leased):
+                    return self.batch_exists_v2(
+                        keys, pool_transfers, extra_info, probe=False
+                    )
         return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _batch_io_v2(
@@ -2094,9 +2101,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self.store.batch_is_exist(key_strs)
 
     def _batch_exist_pool_pages(
-        self, keys: List[str], prepared: list, kv_pages: int
+        self, keys: List[str], prepared: list, kv_pages: int, probe: bool
     ) -> List[int]:
-        if not keys or not hasattr(self.store, "batch_probe_key"):
+        if not keys or not probe:
             return self._batch_exist(keys) if keys else []
         exists = [0] * len(keys)
         leased = []
