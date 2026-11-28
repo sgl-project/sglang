@@ -1371,6 +1371,8 @@ class Envs:
     # Kimi-K3 attention-TP shared experts: overlap AG / MLP / RS with the
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
+    # DeepSeek-style MoE: overlap shared down with routed combine in decode/verify.
+    SGLANG_NPU_ENABLE_SHARED_DOWN_COMBINE_OVERLAP = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
