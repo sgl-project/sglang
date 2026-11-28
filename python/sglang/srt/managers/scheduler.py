@@ -143,6 +143,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.lora.update import run_lora_update
 from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -7216,7 +7217,14 @@ class Scheduler(
     ) -> LoadLoRAAdapterReqOutput:
         """In-place loading a new lora adapter from disk or huggingface."""
 
-        result = self.tp_worker.load_lora_adapter(recv_req)
+        result = run_lora_update(
+            lambda: self.tp_worker.load_lora_adapter(recv_req),
+            rollback=lambda: self._unload_lora_adapter_local(
+                UnloadLoRAAdapterReqInput(
+                    lora_name=recv_req.lora_name, lora_id=recv_req.lora_id
+                )
+            ),
+        )
         if result.success:
             self.kv_event_lora_names.register(
                 lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
@@ -7228,7 +7236,14 @@ class Scheduler(
     ) -> LoadLoRAAdapterFromTensorsReqOutput:
         """In-place loading a new lora adapter from serialized tensors."""
 
-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
+        result = run_lora_update(
+            lambda: self.tp_worker.load_lora_adapter_from_tensors(recv_req),
+            rollback=lambda: self._unload_lora_adapter_local(
+                UnloadLoRAAdapterReqInput(
+                    lora_name=recv_req.lora_name, lora_id=recv_req.lora_id
+                )
+            ),
+        )
         if result.success:
             self.kv_event_lora_names.register(
                 lora_id=recv_req.lora_id, lora_name=recv_req.lora_name
@@ -7240,12 +7255,14 @@ class Scheduler(
     ) -> UnloadLoRAAdapterReqOutput:
         """Unload the lora adapter."""
 
+        return run_lora_update(lambda: self._unload_lora_adapter_local(recv_req))
+
+    def _unload_lora_adapter_local(self, recv_req: UnloadLoRAAdapterReqInput):
         if self.enable_overlap or get_parallel().pp_size > 1:
             # The unload zeroes the adapter's pool slot on this stream; a step
             # launched before this request may still run that adapter.
             self.schedule_stream.wait_stream(self.forward_stream)
-        result = self.tp_worker.unload_lora_adapter(recv_req)
-        return result
+        return self.tp_worker.unload_lora_adapter(recv_req)
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
