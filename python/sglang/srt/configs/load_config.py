@@ -132,11 +132,23 @@ class LoadConfig:
     load_group: LoadGroup = field(default=_DEFAULT_LOAD_GROUP, repr=False)
 
     def __post_init__(self):
-        model_loader_extra_config = self.model_loader_extra_config or {}
-        if isinstance(model_loader_extra_config, str):
-            self.model_loader_extra_config = orjson.loads(model_loader_extra_config)
+        if not self.model_loader_extra_config:
+            self.model_loader_extra_config = {}
+        elif isinstance(self.model_loader_extra_config, str):
+            self.model_loader_extra_config = orjson.loads(
+                self.model_loader_extra_config
+            )
+        if not isinstance(self.model_loader_extra_config, dict):
+            raise ValueError(
+                "model_loader_extra_config must be a dict or JSON object string, "
+                f"got {type(self.model_loader_extra_config).__name__}"
+            )
         self._verify_load_format()
 
+        if isinstance(self.ignore_patterns, str):
+            self.ignore_patterns = (
+                [self.ignore_patterns] if self.ignore_patterns else []
+            )
         if self.ignore_patterns is not None and len(self.ignore_patterns) > 0:
             logger.info(
                 "Ignoring the following patterns when downloading weights: %s",
@@ -154,6 +166,8 @@ class LoadConfig:
             )
 
     def _verify_load_format(self) -> None:
+        if isinstance(self.fallback_load_format, str):
+            self.fallback_load_format = LoadFormat(self.fallback_load_format.lower())
         if not isinstance(self.load_format, str):
             return
 
