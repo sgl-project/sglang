@@ -768,11 +768,11 @@ class NonHarmonyStreamTestCase(CustomTestCase):
         self.assertEqual(output[0]["phase"], "commentary")
         self.assertEqual(output[2]["phase"], "final_answer")
         for payload in event_payloads(events):
-            if (
-                payload["type"]
-                in ("response.output_item.added", "response.output_item.done")
-                and payload["item"]["type"] == "message"
-            ):
+            if payload.get("item", {}).get("type") != "message":
+                continue
+            if payload["type"] == "response.output_item.added":
+                self.assertIsNone(payload["item"].get("phase"))
+            elif payload["type"] == "response.output_item.done":
                 self.assertEqual(
                     payload["item"]["phase"], output[payload["output_index"]]["phase"]
                 )
