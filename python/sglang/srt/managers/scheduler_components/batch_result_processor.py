@@ -90,9 +90,12 @@ logger = logging.getLogger(__name__)
 
 def _top_logprobs_to_lists(val, idx):
     # Top logprobs arrive as a per-row tensor list, or as one [rows, k] tensor
-    # when every row asks for the same k.
+    # when every row asks for the same k. A dense result stays a [rows, k]
+    # numpy matrix: each request keeps row views instead of lists of Python
+    # numbers, and the output streamer sends each chunk as one array. The copy
+    # also releases the pinned host buffer.
     if torch.is_tensor(val):
-        return val.tolist(), idx.tolist()
+        return val.to("cpu", copy=True).numpy(), idx.to("cpu", copy=True).numpy()
     if val:
         return _rows_to_lists(val), _rows_to_lists(idx)
     return val, idx

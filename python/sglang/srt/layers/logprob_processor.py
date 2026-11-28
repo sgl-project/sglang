@@ -46,8 +46,9 @@ class LogprobResult:
     """
 
     token_logprobs: Optional[torch.Tensor] = None
-    top_logprobs_val: Optional[List] = None
-    top_logprobs_idx: Optional[List] = None
+    # A per-row list, or one [#seq, k] tensor when every row has the same k.
+    top_logprobs_val: Optional[Union[List, torch.Tensor]] = None
+    top_logprobs_idx: Optional[Union[List, torch.Tensor]] = None
     # See LogitsProcessorOutput.input_top_logprobs_weights.
     top_logprobs_weights: Optional[List[List[torch.Tensor]]] = None
     token_ids_logprobs_val: Optional[List] = None
@@ -1064,11 +1065,21 @@ class OutputLogprobProcessor:
         logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
 
         result = LogprobResult()
-        if any(x > 0 for x in top_logprobs_nums):
-            (
-                result.top_logprobs_val,
-                result.top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
+        top_k = max(top_logprobs_nums, default=0)
+        if top_k > 0:
+            if len(top_logprobs_nums) == logprobs.shape[0] and top_logprobs_nums.count(
+                top_k
+            ) == len(top_logprobs_nums):
+                # Every row asks for the same k: keep one [batch, k] pair, as
+                # speculative decoding does, so the scheduler stores numpy row
+                # views and streams array chunks instead of Python lists.
+                result.top_logprobs_val, result.top_logprobs_idx = logprobs.topk(
+                    top_k, dim=-1
+                )
+            else:
+                result.top_logprobs_val, result.top_logprobs_idx = get_top_logprobs(
+                    logprobs, top_logprobs_nums, no_copy_to_cpu=True
+                )
 
         if any(x is not None for x in token_ids_logprobs):
             (
