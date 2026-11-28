@@ -553,9 +553,7 @@ void flashmla_sched_meta(
   auto opt_ptr = [&](const tvm::ffi::Optional<tvm::ffi::TensorView>& t, const char* name) -> const int* {
     if (!t.has_value()) return nullptr;
     auto n = SymbolicSize{"batch_size"};
-    auto dev = SymbolicDevice{};
-    dev.set_options<kDLGPU>();
-    TensorMatcher({n}).with_strides({1}).with_dtype<int32_t>().with_device(dev).verify(t.value());
+    TensorMatcher({n}).with_strides({1}).with_dtype<int32_t>().with_device(device_).verify(t.value());
     RuntimeCheck(static_cast<int>(n.unwrap()) == b, name, " must have ", b, " entries, got ", n.unwrap());
     return static_cast<const int*>(t.value().data_ptr());
   };

@@ -5,7 +5,7 @@ name: PR Test (Rust extensions)
 # unit suite (base-a-test-cpu), which builds the extensions from source; this
 # job covers the pure-Rust core, exactly as sglang-server links it, plus lints.
 #
-# Scoped to sglang-mm on purpose: sglang-server and sglang-grpc have no
+# Scoped to sglang-mm on purpose: sglang-server has no
 # in-crate test suite yet, so a `rust/**` trigger would spawn a job that does
 # not actually cover the changed crate. Widen the paths together with the job.
 
