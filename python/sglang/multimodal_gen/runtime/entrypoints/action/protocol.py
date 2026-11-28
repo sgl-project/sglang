@@ -429,6 +429,7 @@ def _build_action_model_sampling_params(
         ),
         "output_format": output_format,
         "return_timing": _runtime_bool(runtime.get("return_timing"), True),
+        "allow_dynamic_batching": runtime.get("allow_dynamic_batching"),
         "enable_prefix_cache": _runtime_bool(prefix_cache, True),
         "enable_cuda_graph": _runtime_bool(cuda_graph, True),
     }

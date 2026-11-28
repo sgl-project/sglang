@@ -306,7 +306,9 @@ def test_real_action_requests_can_reach_dynamic_batch_admission(monkeypatch):
     monkeypatch.setattr(module, "Req", Req)
     scheduler = ProductionScheduler.__new__(ProductionScheduler)
     config = Pi05PipelineConfig()
-    scheduler.server_args = SimpleNamespace(pipeline_config=config)
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=config, batching_mode="dynamic"
+    )
     a = Req(sampling_params=Pi05SamplingParams(prompt="a", num_inference_steps=3))
     b = Req(sampling_params=Pi05SamplingParams(prompt="b", num_inference_steps=5))
     a.extra["vla"] = {}
@@ -317,6 +319,8 @@ def test_real_action_requests_can_reach_dynamic_batch_admission(monkeypatch):
     for req in (a, b):
         req._dynamic_batch_sig = None
     assert scheduler._can_dynamic_batch(a, b)
+    b.sampling_params.allow_dynamic_batching = False
+    assert not scheduler._can_dynamic_batch(a, b)
     assert scheduler._has_unbatchable_image_conditioning(a, b) is False
     a.image_path = "image.png"
     assert scheduler._has_unbatchable_image_conditioning(a, b) is True

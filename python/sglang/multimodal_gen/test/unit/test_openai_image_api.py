@@ -43,7 +43,7 @@ def test_image_edits_declares_perf_dump_path_form_field():
     assert "perf_dump_path" in inspect.signature(edits).parameters
 
 
-def test_image_edits_forwards_cache_dit_form_fields(monkeypatch):
+def test_image_edits_forwards_request_options(monkeypatch):
     monkeypatch.setattr(
         image_api,
         "get_global_server_args",
@@ -70,6 +70,7 @@ def test_image_edits_forwards_cache_dit_form_fields(monkeypatch):
             data={
                 "prompt": "p",
                 "enable_cache_dit": "true",
+                "allow_dynamic_batching": "false",
                 "cache_dit_params": '{"residual_diff_threshold":0.12}',
             },
             files={"image": ("reference.png", image.getvalue(), "image/png")},
@@ -77,6 +78,7 @@ def test_image_edits_forwards_cache_dit_form_fields(monkeypatch):
         assert response.status_code == 400
         assert response.json()["detail"] == "captured before inference"
         assert captured["enable_cache_dit"] is True
+        assert captured["allow_dynamic_batching"] is False
         assert captured["cache_dit_params"] == {"residual_diff_threshold": 0.12}
         response = client.post(
             "/v1/images/edits",

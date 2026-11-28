@@ -309,6 +309,12 @@ class Req:
 
         object.__setattr__(self, name, value)
 
+    def allows_dynamic_batching(self, mode: str) -> bool:
+        if self.sampling_params is None:
+            return False
+        preference = self.sampling_params.allow_dynamic_batching
+        return mode == "dynamic" if preference is None else preference
+
     @property
     def batch_size(self):
         # Determine batch size

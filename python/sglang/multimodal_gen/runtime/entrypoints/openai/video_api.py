@@ -252,6 +252,7 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         "task_type": request.task_type,
         "request_data_type": DataType.VIDEO,
         "num_outputs_per_prompt": max(1, min(int(num_outputs), 10)),
+        "allow_dynamic_batching": request.allow_dynamic_batching,
         "size": request.size,
         "width": request.width,
         "height": request.height,
@@ -451,6 +452,7 @@ async def create_video(
     task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
     num_outputs_per_prompt: Optional[int] = Form(None),
+    allow_dynamic_batching: Optional[bool] = Form(None),
     seconds: Optional[int] = Form(None),
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
@@ -585,6 +587,9 @@ async def create_video(
                     model=form_value("model", model),
                     task_type=form_text_value("task_type", task_type),
                     n=form_value("n", n),
+                    allow_dynamic_batching=form_value(
+                        "allow_dynamic_batching", allow_dynamic_batching
+                    ),
                     num_outputs_per_prompt=form_value(
                         "num_outputs_per_prompt", num_outputs_per_prompt
                     ),

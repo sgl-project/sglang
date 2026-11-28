@@ -60,6 +60,7 @@ class ImageGenerationsRequest(BaseModel):
     output_format: Optional[str] = None  # png | jpeg | webp
     user: Optional[str] = None
     # SGLang extensions
+    allow_dynamic_batching: Optional[bool] = None
     width: Optional[int] = None
     height: Optional[int] = None
     num_inference_steps: Optional[int] = None
@@ -140,6 +141,7 @@ class VideoGenerationsRequest(BaseModel):
     seed: Optional[Union[int, List[int]]] = None
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
+    allow_dynamic_batching: Optional[bool] = None
     width: Optional[int] = None
     height: Optional[int] = None
     num_inference_steps: Optional[int] = None

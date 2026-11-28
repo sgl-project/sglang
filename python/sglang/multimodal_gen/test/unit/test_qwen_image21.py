@@ -782,7 +782,9 @@ def test_default_image_output_format_preserves_rgba():
 def test_dynamic_batching_preserves_output_order_and_seeds(outputs):
     scheduler = object.__new__(Scheduler)
     config = QwenImage21PipelineConfig()
-    scheduler.server_args = SimpleNamespace(pipeline_config=config)
+    scheduler.server_args = SimpleNamespace(
+        pipeline_config=config, batching_mode="dynamic"
+    )
     scheduler._batch_admission = SimpleNamespace(enabled=True)
     assert scheduler._dynamic_batching_enabled()
     requests = []

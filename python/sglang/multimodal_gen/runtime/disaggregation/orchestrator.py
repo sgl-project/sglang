@@ -633,18 +633,21 @@ class DiffusionServer:
         if state.active_ar_batch is not None or not state.pending_ar_requests:
             return
 
+        base = state.pending_ar_requests[0]
+        mode = state.server_args.batching_mode
         batch_max_size = (
-            max(1, state.server_args.batching_max_size)
-            if state.server_args.batching_mode == "dynamic"
+            state.server_args.batching_max_size
+            if base.req.allows_dynamic_batching(mode)
             else 1
         )
-        base = state.pending_ar_requests[0]
         indices = [0]
         output_slots = max(1, int(base.req.num_outputs_per_prompt or 1))
         for index in range(1, len(state.pending_ar_requests)):
             if output_slots >= batch_max_size:
                 break
             candidate = state.pending_ar_requests[index]
+            if not candidate.req.allows_dynamic_batching(mode):
+                continue
             if (base.req.height, base.req.width) == (
                 candidate.req.height,
                 candidate.req.width,

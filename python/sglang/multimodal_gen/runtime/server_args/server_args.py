@@ -3184,8 +3184,8 @@ class ServerArgs(DisaggServerArgsMixin):
             "--batching-mode",
             type=str,
             default=ServerArgs.batching_mode,
-            choices=["dynamic"],
-            help="Request batching scheduler mode. Currently only 'dynamic' is implemented.",
+            choices=["dynamic", "opt-in"],
+            help="Batch compatible requests by default (dynamic) or only when explicitly requested (opt-in).",
         )
         parser.add_argument(
             "--batching-max-size",
@@ -4389,8 +4389,8 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
     def _validate_batching(self):
-        if self.batching_mode != "dynamic":
-            raise ValueError("batching_mode must be one of: dynamic")
+        if self.batching_mode not in ("dynamic", "opt-in"):
+            raise ValueError("batching_mode must be one of: dynamic, opt-in")
         if self.batching_max_size < 1:
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:

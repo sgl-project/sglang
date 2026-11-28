@@ -1,6 +1,7 @@
 import math
 from dataclasses import dataclass, field
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -34,6 +35,13 @@ class HunyuanImage3SamplingParams(SamplingParams):
     # Pre-generated CoT text from AR stage (think/recaption output)
     cot_text: str | None = None
 
+    batch_condition_images: bool = field(
+        default_factory=lambda: envs.SGLANG_HI3_COND_ENCODE_BATCHING
+    )
+    apply_output_geometry: bool = field(
+        default_factory=lambda: envs.SGLANG_HI3_OUTPUT_CROP
+    )
+
     # Output geometry is separate from the generation canvas: the AR
     # processor picks its own bucket, then the decoder applies this
     # request-scoped policy to the decoded pixels.
@@ -57,7 +65,24 @@ class HunyuanImage3SamplingParams(SamplingParams):
 
     @classmethod
     def image_request_extra_fields(cls) -> frozenset[str]:
-        return frozenset({"bot_task", "system_prompt", "cot_text"})
+        return frozenset(
+            {
+                "bot_task",
+                "system_prompt",
+                "cot_text",
+                "batch_condition_images",
+                "apply_output_geometry",
+            }
+        )
+
+    def _validate(self):
+        super()._validate()
+        if not isinstance(self.batch_condition_images, bool) or not isinstance(
+            self.apply_output_geometry, bool
+        ):
+            raise ValueError(
+                "batch_condition_images and apply_output_geometry must be booleans"
+            )
 
     def _adjust(self, server_args):
         # Pre-aligning each dimension to a 16-px grid here would distort the

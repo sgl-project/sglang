@@ -155,7 +155,6 @@ class BatchAdmissionController:
     """Applies configured caps before adding requests to a batch."""
 
     def __init__(self, server_args: ServerArgs, gpu_id: int):
-        self._mode = getattr(server_args, "batching_mode", "dynamic")
         self._user_max_batch_size = max(1, int(server_args.batching_max_size))
         self._model_path = server_args.model_path
         self._offload = server_args.has_layerwise_offload_components()
@@ -173,7 +172,7 @@ class BatchAdmissionController:
 
     @property
     def enabled(self) -> bool:
-        return self._mode == "dynamic" and self._user_max_batch_size > 1
+        return self._user_max_batch_size > 1
 
     def reject_reason_for_candidate(
         self, current_reqs: list[Req], candidate_req: Req

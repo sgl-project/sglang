@@ -273,6 +273,9 @@ async def generations(
             width=request.width,
             height=request.height,
             num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
+            allow_dynamic_batching=request_field_value(
+                request, "allow_dynamic_batching"
+            ),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
             save_output=write_output_files,
@@ -387,6 +390,7 @@ async def edits(
     model: Optional[str] = Form(None),
     task_type: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
+    allow_dynamic_batching: Optional[bool] = Form(None),
     response_format: Optional[str] = Form(None),
     size: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
@@ -482,6 +486,7 @@ async def edits(
             request_data_type=DataType.IMAGE,
             size=size,
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
+            allow_dynamic_batching=allow_dynamic_batching,
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
             save_output=write_output_files,

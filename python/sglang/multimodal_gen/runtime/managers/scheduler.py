@@ -678,6 +678,8 @@ class Scheduler(
         return tuple(signature_items)
 
     def _get_cached_signature(self, req: Req) -> tuple[Any, ...] | None:
+        if not req.allows_dynamic_batching(self.server_args.batching_mode):
+            return None
         cached = getattr(req, "_dynamic_batch_sig", None)
         if cached is not None:
             return cached
@@ -742,6 +744,12 @@ class Scheduler(
 
         if base_req.is_warmup or candidate_req.is_warmup:
             return "warmup"
+        if any(
+            req.sampling_params is not None
+            and not req.allows_dynamic_batching(self.server_args.batching_mode)
+            for req in (base_req, candidate_req)
+        ):
+            return "request_batching_disabled"
         if self._requires_sequential_multi_output(base_req, candidate_req):
             return "sequential_multi_output"
         if not self._pipeline_supports_dynamic_batching_for_request(
@@ -807,7 +815,6 @@ class Scheduler(
         """Return whether `candidate_req` can be merged into a batch with `base_req`."""
         if base_req.is_warmup or candidate_req.is_warmup:
             return False
-
         if self._requires_sequential_multi_output(base_req, candidate_req):
             return False
 

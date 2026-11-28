@@ -43,6 +43,39 @@ Use `--batching-config /path/to/batching_config.json` to load JSON rules when a 
 }
 ```
 
+## Per-request control
+
+To serve interactive and offline traffic on the same endpoint, start the server
+with `--batching-mode opt-in --batching-max-size 4`. Interactive clients need
+no changes. Offline clients can opt in on each request:
+
+```python
+client.images.generate(
+    model="black-forest-labs/FLUX.1-dev",
+    prompt="A studio portrait",
+    extra_body={"allow_dynamic_batching": True},
+)
+```
+
+| Image/video request | `dynamic` (default) | `opt-in` |
+| --- | --- | --- |
+| Field omitted | Eligible to batch | Run alone |
+| `allow_dynamic_batching: true` | Eligible to batch | Eligible to batch |
+| `allow_dynamic_batching: false` | Run alone | Run alone |
+
+Only compatible, eligible requests can merge. Neither mode overrides
+`--batching-max-size 1` or adds batching support to a pipeline. A request that
+runs alone does not wait for a batch partner once it reaches the head of the
+queue; it does not get higher priority or change its number of outputs (`n`).
+For the action API, set `runtime.allow_dynamic_batching`.
+
+HunyuanImage-3 also accepts two independent image request fields:
+
+| Field | Effect | Default when omitted |
+| --- | --- | --- |
+| `batch_condition_images` | Encode condition images together rather than sequentially. This can use more GPU memory. | `SGLANG_HI3_COND_ENCODE_BATCHING` (off) |
+| `apply_output_geometry` | Apply the requested crop, pad or resize after decoding. Set to `false` to return the full native bucket. | `SGLANG_HI3_OUTPUT_CROP` (on) |
+
 ## Compatibility
 
 An initial implementation of dynamic batching for T2I and T2V models can be found in [#18764](https://github.com/sgl-project/sglang/pull/18764). The current compatibility grid is below and will be updated as more coverage is added. See [Supported Models](./compatibility_matrix) for common model IDs.

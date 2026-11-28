@@ -30,6 +30,9 @@ class ActionSamplingParams:
         default="", metadata={"batch_sig_exclude": True}
     )
     num_outputs_per_prompt: int = 1
+    allow_dynamic_batching: bool | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
     seed: int | list[int] = field(default=42, metadata={"batch_sig_exclude": True})
     generator_device: str | None = None
     num_inference_steps: int = 10
@@ -73,6 +76,10 @@ class ActionSamplingParams:
         req.extra.update(self.build_request_extra())
 
     def _validate(self):
+        if self.allow_dynamic_batching is not None and not isinstance(
+            self.allow_dynamic_batching, bool
+        ):
+            raise ValueError("allow_dynamic_batching must be a boolean")
         if (
             not isinstance(self.num_outputs_per_prompt, int)
             or self.num_outputs_per_prompt <= 0

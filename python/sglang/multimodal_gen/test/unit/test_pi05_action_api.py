@@ -72,7 +72,8 @@ def test_action_adjust_skips_visual_image_video_logic():
     assert params.return_file_paths_only is False
 
 
-def test_action_request_schema_builds_pi05_sampling_params():
+@pytest.mark.parametrize("batching", [None, False, True])
+def test_action_request_schema_builds_pi05_sampling_params(batching):
     image = np.zeros((8, 8, 3), dtype=np.uint8)
     payload = {
         "request_id": "action-req-1",
@@ -106,6 +107,8 @@ def test_action_request_schema_builds_pi05_sampling_params():
         },
     }
 
+    if batching is not None:
+        payload["runtime"]["allow_dynamic_batching"] = batching
     params = build_action_sampling_params(payload, _server_args())
 
     assert params.prompt == "pick up the block"
@@ -114,6 +117,7 @@ def test_action_request_schema_builds_pi05_sampling_params():
     assert params.action_dim == 32
     assert params.num_inference_steps == 4
     assert not params.return_timing
+    assert params.allow_dynamic_batching is batching
     assert not params.enable_prefix_cache
     assert not params.enable_cuda_graph
     assert params.return_file_paths_only is False
