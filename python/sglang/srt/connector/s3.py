@@ -36,6 +36,10 @@ def list_files(
     parts = path.removeprefix("s3://").split("/")
     prefix = "/".join(parts[1:])
     bucket_name = parts[0]
+    # Match the prefix as a directory so that e.g. "model" does not also
+    # match sibling keys such as "model-other/...".
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
 
     objects = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
     paths = [obj["Key"] for obj in objects.get("Contents", [])]
@@ -85,8 +89,17 @@ class S3Connector(BaseFileConnector):
 
         for file in files:
             destination_file = os.path.join(self.local_dir, file.removeprefix(base_dir))
-            local_dir = Path(destination_file).parent
-            os.makedirs(local_dir, exist_ok=True)
+            # S3 keys are arbitrary strings: refuse keys whose destination
+            # would resolve outside the local model directory (e.g. keys
+            # containing "..", or keys that become absolute paths once the
+            # prefix is stripped).
+            if not os.path.realpath(destination_file).startswith(
+                os.path.realpath(self.local_dir) + os.sep
+            ):
+                raise ValueError(
+                    f"S3 key {file!r} resolves outside the local model directory"
+                )
+            os.makedirs(Path(destination_file).parent, exist_ok=True)
             self.client.download_file(bucket_name, file, destination_file)
 
     def weight_iterator(
