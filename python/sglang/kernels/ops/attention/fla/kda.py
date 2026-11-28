@@ -1011,6 +1011,8 @@ def kda_gate_chunk_cumsum(
         assert beta.shape == (B, T, H)
         assert beta.device == g.device
         beta_out = torch.empty((B, T, H), dtype=torch.float32, device=beta.device)
+        if torch.compiler.is_compiling():
+            beta = beta.contiguous()
         beta_strides = beta.stride()
         if cu_seqlens is not None:
             beta_strides = (0, beta_strides[1], beta_strides[2])
