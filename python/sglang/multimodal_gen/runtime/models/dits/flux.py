@@ -89,6 +89,7 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
+    current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -248,11 +249,12 @@ def _rope_complex_freqs(
     freqs_cis: Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, None],
 ) -> Optional[torch.Tensor]:
     """Complex-valued sibling of ``_rope_cos_sin_cache``: build [seq, dim//2]
-    complex64 freqs for the (is_neox=False) NPU fast path in
+    complex64 freqs for the (is_neox=False) complex-multiply RoPE path in
     apply_qk_norm_with_optional_rope. Accepts the same inputs as
     _rope_cos_sin_cache — a raw (cos, sin) tuple, or its already-hoisted
-    cat([cos, sin], dim=-1) cache tensor, split back in half."""
-    if freqs_cis is None:
+    cat([cos, sin], dim=-1) cache tensor, split back in half. Returns None
+    when the platform's RoPE reads only the cos/sin cache."""
+    if freqs_cis is None or not current_platform.uses_complex_rope_freqs():
         return None
     if isinstance(freqs_cis, torch.Tensor):
         cos, sin = freqs_cis.chunk(2, dim=-1)

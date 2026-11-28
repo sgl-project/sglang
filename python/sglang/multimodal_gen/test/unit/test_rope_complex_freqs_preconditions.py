@@ -3,11 +3,13 @@ confusing broadcast error instead of failing at the actual precondition.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.multimodal_gen.runtime.layers.layernorm import apply_qk_norm_rope
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
+from sglang.multimodal_gen.runtime.models.dits import flux
 
 
 def _complex_freqs(seq_len: int, half_dim: int) -> torch.Tensor:
@@ -77,6 +79,29 @@ class TestApplyQkNormRopeRequiresCache(unittest.TestCase):
                 head_dim=head_dim,
                 cos_sin_cache=None,
                 freqs_complex=freqs_complex,
+            )
+
+
+class TestFluxComplexFreqsPlatformGate(unittest.TestCase):
+    def test_complex_freqs_built_only_when_platform_reads_them(self):
+        """Platforms whose RoPE reads only cos_sin_cache must not pay for an
+        unused torch.complex each step (a CPU fallback on devices without a
+        complex kernel); platforms that read it must still get it."""
+        cos = torch.randn(4, 8)
+        sin = torch.randn(4, 8)
+        cache = torch.cat([cos, sin], dim=-1)
+
+        with patch.object(
+            flux.current_platform, "uses_complex_rope_freqs", return_value=False
+        ):
+            self.assertIsNone(flux._rope_complex_freqs((cos, sin)))
+            self.assertIsNone(flux._rope_complex_freqs(cache))
+
+        with patch.object(
+            flux.current_platform, "uses_complex_rope_freqs", return_value=True
+        ):
+            torch.testing.assert_close(
+                flux._rope_complex_freqs(cache), torch.complex(cos, sin)
             )
 
 

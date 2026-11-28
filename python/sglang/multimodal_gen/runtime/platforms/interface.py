@@ -288,6 +288,15 @@ class Platform:
         return True
 
     @classmethod
+    def uses_complex_rope_freqs(cls) -> bool:
+        """Whether this platform's RotaryEmbedding forward reads ``complex_freqs``.
+
+        The default ``forward_native`` path does. Return False when the platform's
+        RoPE only reads ``cos_sin_cache``, so DiTs skip building the complex table.
+        """
+        return True
+
+    @classmethod
     def get_modelopt_fp4_quantize_op(cls) -> Callable | None:
         return None
 
