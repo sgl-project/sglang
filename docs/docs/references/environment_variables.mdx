@@ -2025,6 +2025,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>auto</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_OPUS_FP8_PREFILL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DeepSeek-V4.1 on gfx950, with <code>SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL=1</code>: run the OPUS sparse prefill on the FP8 KV cache rows (AITER's FP8 OPUS kernel) instead of a BF16 copy of them. Applies to layers with the V4 cache layout and at most 32 local heads; other layers keep the BF16 kernel. Needs an AITER build with <code>pa_sparse_prefill_fp8_opus</code>; without it the BF16 kernel runs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_FUSE_KDA_INPROJ</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm: fold the KDA <code>[f_a|b]</code> tail into the wide <code>[q,k,v,g]</code> projection so the whole input projection is one GEMM. Applies to unquantized weights only; falls back to the split projection otherwise.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
