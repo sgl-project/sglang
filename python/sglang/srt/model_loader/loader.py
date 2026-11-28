@@ -3334,11 +3334,13 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         load_config = self.load_config
         instance_ip = socket.gethostbyname(socket.gethostname())
         start_build_group_tic = time.time()
-        client.build_group(
+        success, message = client.build_group(
             gpu_id=device_config.gpu_id,
             tp_rank=load_config.tp_rank,
             instance_ip=instance_ip,
         )
+        if not success:
+            raise RuntimeError(message)
         current_platform.synchronize()
         end_build_group_tic = time.time()
         logger.debug(
@@ -3377,6 +3379,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             client._model_update_group
         )
         current_platform.empty_cache()
+        return model.eval()
 
     def load_model_from_remote_instance_by_transfer_engine(
         self, model, transfer_engine, seed_url, tp_rank
