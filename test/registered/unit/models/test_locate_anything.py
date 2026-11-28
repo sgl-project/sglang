@@ -162,8 +162,6 @@ class TestBoxGrammarLogitProcessor(CustomTestCase):
         self.assertTrue(torch.equal(out, original))
 
     def test_row_prefix_reads_as_output(self):
-        """A speculative verify row's history is the committed output followed
-        by its draft prefix."""
         proc = LocateAnythingBoxGrammarLogitProcessor()
         output = [42, self.BOX_START]
         for prefix in ([], [self.COORD_START], [self.NONE]):

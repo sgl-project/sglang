@@ -1171,7 +1171,6 @@ class SchedulerBatchResultProcessor:
         next_token_ids = result.next_token_ids.tolist()
 
         if not is_decode:
-            # Extend: the single token each completed prefill emits.
             return {
                 batch.reqs[i]: [next_token_ids[i]]
                 for i in rows

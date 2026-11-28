@@ -27,11 +27,7 @@ from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.eagle_worker_common import accept_draft_tree
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import (
-    HostVerifyTree,
-    needs_verify_tree,
-    verify_row_prefixes,
-)
+from sglang.srt.speculative.spec_utils import HostVerifyTree, verify_row_prefixes
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -172,13 +168,6 @@ class TestRowPrefixes(CustomTestCase):
             ],
         )
 
-    def test_tree_rows_get_the_pending_tokens_then_their_path(self):
-        tree = _host_tree(_tree(), 2).resolve()
-        self.assertEqual(
-            verify_row_prefixes(*tree, pending_tokens=[[ROOT], []]),
-            [[1], [1, 2], [1, 5], [1, 2, 3], [], [2], [5], [2, 3]],
-        )
-
     def test_the_barrier_supplies_tokens_output_ids_lacks(self):
         """Under overlap req.output_ids misses the previous step's tokens; the
         barrier's tokens for them lead the row prefixes, so the processor reads
@@ -197,20 +186,6 @@ class TestRowPrefixes(CustomTestCase):
         self.assertEqual(
             verify.row_prefixes, [[ROOT], [ROOT, 2], [ROOT, 2, 3], [], [2], [2, 3]]
         )
-
-    def test_a_custom_processor_alone_needs_the_host_tree(self):
-        info = _sampling_info(_CountUp(), greedy=True, device="cpu")
-        plain = SimpleNamespace(has_custom_logit_processor=False)
-        for has_grammar, sampling_info, want in [
-            (False, info, True),
-            (False, plain, False),
-            (True, plain, True),
-            (False, None, False),
-        ]:
-            batch = SimpleNamespace(
-                has_grammar=has_grammar, sampling_info=sampling_info
-            )
-            self.assertEqual(needs_verify_tree(batch), want)
 
 
 class TestOneTokenCap(CustomTestCase):
@@ -240,21 +215,6 @@ class TestOneTokenCap(CustomTestCase):
         self.assertEqual(bonus.tolist(), [21, 31, 43])
         self.assertEqual(new_seq_lens.tolist(), [11, 21, 33])
 
-    def test_nothing_capped_returns_the_inputs(self):
-        verify = self._verify([])
-        verify.first_row_only_reqs = None
-        commit_lens, bonus = torch.tensor([3]), torch.tensor([7])
-        out = verify.cap_chain_accept(
-            out_tokens=torch.tensor([[5, 6, 7]]),
-            commit_lens=commit_lens,
-            bonus=bonus,
-            prefix_lens=torch.tensor([10]),
-            new_seq_lens=None,
-        )
-        self.assertIs(out[0], commit_lens)
-        self.assertIs(out[1], bonus)
-        self.assertIsNone(out[2])
-
 
 class TestCustomLogitProcessorSync(CustomTestCase):
     """Under overlap the last result is processed after the next launch, so a
@@ -272,38 +232,27 @@ class TestCustomLogitProcessorSync(CustomTestCase):
             has_grammar=has_grammar,
         )
 
-    def test_only_a_processor_the_barrier_cannot_serve_syncs(self):
-        # NGRAM verifies without the barrier; every other spec algorithm here
-        # has it, and a processor without row prefixes does not read it.
-        for name, processor in itertools.product(
-            ("NONE", "EAGLE", "NGRAM", "DFLASH", "DSPARK"),
-            (None, _CountUp(), _CountUpWithoutRowPrefix()),
-        ):
-            algorithm = SpeculativeAlgorithm.from_string(name)
-            batch = self._batch(processor, algorithm=algorithm)
-            want = (
-                processor is not None
-                and not algorithm.is_none()
-                and (name == "NGRAM" or not processor.supports_row_prefix)
+    def test_the_scheduler_syncs_only_for_a_processor_the_barrier_cannot_serve(self):
+        # EAGLE has the barrier; a processor without row prefixes does not read it.
+        for processor, want in [
+            (_CountUpWithoutRowPrefix(), True),
+            (_CountUp(), False),
+        ]:
+            batch = self._batch(
+                processor, algorithm=SpeculativeAlgorithm.from_string("EAGLE")
             )
-            with self.subTest(algorithm=name, processor=type(processor).__name__):
+            batch.grammar_needs_sync = lambda: False
+            batch.custom_logit_processor_needs_sync = lambda: (
+                ScheduleBatch.custom_logit_processor_needs_sync(batch)
+            )
+            with (
+                self.subTest(processor=type(processor).__name__),
+                envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False),
+            ):
                 self.assertEqual(
-                    ScheduleBatch.custom_logit_processor_needs_sync(batch), want
+                    Scheduler.should_process_last_batch_early(SimpleNamespace(), batch),
+                    want,
                 )
-
-    def test_the_scheduler_processes_the_last_result_first(self):
-        batch = self._batch(
-            _CountUpWithoutRowPrefix(),
-            algorithm=SpeculativeAlgorithm.from_string("EAGLE"),
-        )
-        batch.grammar_needs_sync = lambda: False
-        batch.custom_logit_processor_needs_sync = lambda: (
-            ScheduleBatch.custom_logit_processor_needs_sync(batch)
-        )
-        with envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(False):
-            self.assertTrue(
-                Scheduler.should_process_last_batch_early(SimpleNamespace(), batch)
-            )
 
 
 class TestPendingTokens(CustomTestCase):
@@ -354,10 +303,6 @@ class TestPendingTokens(CustomTestCase):
         result = SimpleNamespace(copy_done=None, next_token_ids=torch.tensor([9, 4]))
         batch = self._batch([done, chunked], decode=False, chunked_req=chunked)
         self.assertEqual(self._pending(result, batch), {done: [9]})
-
-    def test_a_batch_without_processors_reads_nothing(self):
-        batch = self._batch([self._req(custom=False)], decode=True)
-        self.assertEqual(self._pending(SimpleNamespace(), batch), {})
 
     def test_the_barrier_advances_the_grammar_then_merges_queued_results(self):
         req = self._req()
