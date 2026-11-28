@@ -6,8 +6,6 @@ penalty index, its seed, and the watermark algorithm's per-request values.
   one `gather`, so a step with no admission copies none of them to the device.
 - Writes and gathers are enqueued on the scheduler's stream in host order: a
   launch's gather runs before a later admission rewrites a reused slot.
-- The host keeps what the batch-level flags and counts need, so a launch derives
-  them without a pass over its requests or a device sync.
 - A launch over the same slots as the previous gather, with no write since,
   reuses that gather's tensors: a decode batch whose requests did not change
   keeps one set of them. Callers must not write them in place.
@@ -63,7 +61,6 @@ class SamplingRows(NamedTuple):
 
     @classmethod
     def empty(cls, device) -> SamplingRows:
-        """The rows of a batch with no requests."""
         return cls(
             temperatures=torch.empty((0, 1), dtype=torch.float32, device=device),
             top_ps=torch.empty(0, dtype=torch.float32, device=device),
@@ -182,7 +179,6 @@ class SamplingParamsPool:
     def _gather_rows(
         self, req_pool_indices: torch.Tensor, slots: np.ndarray
     ) -> tuple[SamplingRows, torch.Tensor]:
-        """The rows without penalties, and the rows' penalty indices."""
         top_ks = self.top_ks_host[slots]
         lo, hi = int(top_ks.min()), int(top_ks.max())
         # Each row of the [rows, bs] result is a contiguous [bs] tensor.
