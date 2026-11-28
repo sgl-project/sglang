@@ -19,14 +19,17 @@ _MAX_THREAD_N = 256
 @cache_once
 def _jit_moe_wna16_marlin_module(
     dtype: torch.dtype,
+    b_q_type_id: int,
     is_ep: bool,
     has_bias: bool,
     expert_ids_are_sorted: bool = False,
     zero_inactive_output: bool = False,
     has_inactive_prefix_count: bool = False,
 ) -> Module:
+    # Keyed by weight type: a module instantiates only that type's kernels.
     args = make_cpp_args(
         dtype,
+        b_q_type_id,
         is_ep,
         has_bias,
         expert_ids_are_sorted,
@@ -181,6 +184,7 @@ def moe_wna16_marlin_gemm(
 
     module = _jit_moe_wna16_marlin_module(
         a.dtype,
+        b_q_type.id,
         is_ep,
         has_bias,
         expert_ids_are_sorted and not is_ep,
