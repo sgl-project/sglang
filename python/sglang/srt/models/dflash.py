@@ -65,7 +65,7 @@ from sglang.srt.models.utils import (
     bind_or_assign,
     keeps_no_quant_config,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_context, get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
@@ -95,7 +95,11 @@ _FC_ROW_SPLIT_MIN_TOKENS = 512
 
 
 def _fast_path() -> bool:
-    return get_spec().speculative_dflash_draft_fast_path
+    # Before the config is published (a draft module in a unit test): the stock path.
+    return (
+        get_context().is_config_namespace_published("spec")
+        and get_spec().speculative_dflash_draft_fast_path
+    )
 
 
 def _gemm_ag(x, w):
