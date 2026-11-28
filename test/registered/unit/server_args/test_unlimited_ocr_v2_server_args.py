@@ -2,7 +2,10 @@
 
 import unittest
 
-from sglang.srt.arg_groups.overrides import collect_model_override_declarations
+from sglang.srt.arg_groups.overrides import (
+    collect_model_override_declarations,
+    resolution_result,
+)
 from sglang.srt.configs.model_config import UNLIMITED_OCR_V2_ARCH
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
 from sglang.srt.server_args import ServerArgs
@@ -59,6 +62,37 @@ class TestUnsupportedServingModes(CustomTestCase):
         overrides = _declared_overrides()
         self.assertEqual(overrides["attention_backend"], "unlimited_ocr_v2")
         self.assertEqual(overrides["page_size"], 32)
+
+    def test_mps_sizes_the_kv_pool_in_windows_by_default(self):
+        from unittest import mock
+
+        from sglang.srt.arg_groups.model_overrides import unlimited_ocr_v2 as uocr_ov
+
+        def pool(*, mem_mib=12124, **fields):
+            """The max_total_tokens resolution decides for a launch with ``fields``."""
+            sa = ServerArgs(model_path="/tmp/uocr", device="mps", **fields)
+            with (
+                mock.patch.object(uocr_ov, "use_mlx", return_value=False),
+                mock.patch.object(
+                    uocr_ov, "get_device_memory_capacity", return_value=mem_mib
+                ),
+            ):
+                uocr_ov.apply_unlimited_ocr_v2_mps_kv_pool_default(sa)
+            return resolution_result(sa, "max_total_tokens")
+
+        split = dict(uocr_doc_split=True, uocr_max_page_tokens=8000)
+        # 16 GB Mac (12,124 MiB working-set limit) -> 2 windows of 15,168 tokens.
+        self.assertEqual(pool(**split), 2 * 15168)
+        # 20 GiB adds one window per 2 GiB above the M5 limit; 48 GiB hits the cap.
+        self.assertEqual(pool(mem_mib=20 * 1024, **split), 6 * 15168)
+        self.assertEqual(pool(mem_mib=48 * 1024, **split), 8 * 15168)
+        # 16 GB Macs that report less, such as an M1 (10,922 MiB), still get two.
+        self.assertEqual(pool(mem_mib=10922, **split), 2 * 15168)
+        self.assertEqual(pool(mem_mib=8 * 1024, **split), 15168)
+        # The per-window slack is one prefill chunk, so a larger chunk widens it.
+        self.assertEqual(pool(chunked_prefill_size=4096, **split), 2 * (15168 + 2048))
+        self.assertEqual(pool(max_total_tokens=16384, **split), 16384)
+        self.assertIsNone(pool(uocr_doc_split=False))
 
     def test_data_parallelism_is_rejected_while_documents_split(self):
         for fields in ({"dp_size": 2}, {"attn_dp_size": 2, "tp_size": 2}):
