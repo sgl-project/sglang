@@ -1466,10 +1466,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            if fine_grained_overlap or (_is_npu and get_is_capture_mode()):
-                # NPU-only: under capture the deferred path leaves an
-                # unconsumed event on the capture stream (EndCapture "events
-                # not joined"); record_stream is capture-safe.
+            # TODO: Remove this workaround once PTA fixes side-stream graph capture.
+            if _is_npu:
                 shared_output.record_stream(current_stream)
             else:
                 shared_alt_output = shared_output

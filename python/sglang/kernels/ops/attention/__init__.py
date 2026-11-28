@@ -64,6 +64,7 @@ _TRITON_KERNELS = [
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
     ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
     ("beam_shared_context", "shared_context_attention"),
+    ("beam_shared_context_split_kv", "shared_context_attention_split_kv"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(

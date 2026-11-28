@@ -17,7 +17,7 @@ import { PopularModels } from "/src/snippets/_popular_models.jsx";
 
 SGLang Diffusion covers image, video, audio, and action generation. Media and
 world-model recipes are in [Diffusion Models](/cookbook/diffusion/intro);
-dedicated robot action policies are in [VLA Models](/cookbook/vla/intro).
+dedicated robot action policies are in [Action Models](/cookbook/vla/intro).
 
 <CardGroup cols={3}>
   <Card
@@ -33,10 +33,23 @@ dedicated robot action policies are in [VLA Models](/cookbook/vla/intro).
     img="/cards/Diffusion-card.png"
   />
   <Card
-    title="VLA (Vision-Language-Action) Models"
+    title="Action Models"
     mode="card"
     href="./vla/intro"
-    img="/cards/VLA-card.png"
+    img="/cards/Action-Models-card.png"
+  />
+</CardGroup>
+
+## Use Cases
+
+Recipes grouped by application, linking to the model pages above.
+
+<CardGroup cols={3}>
+  <Card
+    title="Robotics & Physical AI"
+    mode="card"
+    href="./use-cases/robotics-physical-ai"
+    img="/cards/Robotics-Physical-AI-card.png"
   />
 </CardGroup>
 
