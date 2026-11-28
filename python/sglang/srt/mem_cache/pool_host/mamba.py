@@ -106,6 +106,8 @@ class MambaPoolHost(HostKVCache):
     # skip __init__, still read an empty pair rather than raising.
     slot_state_device_tensors: tuple = ()
     slot_state_buffers: tuple = ()
+    # Per side state: its device pointer for the Mamba transfer kernel, or None (blocking copy).
+    slot_state_device_ptrs: tuple = ()
 
     def __init__(
         self,
@@ -244,6 +246,7 @@ class MambaPoolHost(HostKVCache):
         ]
 
         self.kv_buffer = self.init_kv_buffer()
+        self._init_slot_state_device_ptrs()
         self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
@@ -741,7 +744,9 @@ class MambaPoolHost(HostKVCache):
         # before that layer's completion event, which is what every reader of a
         # restored slot waits on.
         if layer_id == 0:
-            self._transfer_slot_states(host_indices, device_indices, to_device=True)
+            self._transfer_slot_states(
+                host_indices, device_indices, to_device=True, io_backend=io_backend
+            )
         if (
             io_backend == "kernel_ascend"
             and transfer_mamba_state is not None
@@ -834,18 +839,69 @@ class MambaPoolHost(HostKVCache):
                 can_use_jit=self._conv_can_use_jit[conv_idx],
                 src_ptrs=self.conv_device_ptrs[conv_idx],
             )
-        self._transfer_slot_states(host_indices, device_indices, to_device=False)
+        self._transfer_slot_states(
+            host_indices, device_indices, to_device=False, io_backend=io_backend
+        )
 
-    def _transfer_slot_states(self, host_indices, device_indices, *, to_device):
+    def _init_slot_state_device_ptrs(self):
+        self.slot_state_device_ptrs = [
+            (
+                torch.tensor(
+                    [state.data_ptr()], dtype=torch.uint64, device=state.device
+                )
+                if self._slot_rows_fit_kernel(state, host_buf)
+                else None
+            )
+            for state, host_buf in zip(
+                self.slot_state_device_tensors, self.slot_state_buffers
+            )
+        ]
+
+    def _transfer_slot_states(
+        self, host_indices, device_indices, *, to_device, io_backend="kernel"
+    ):
         """Copy the registered side-state rows for these slots, one leg or the
-        other. Blocking copies: the rows are a few hundred KB per checkpoint and
-        correctness of the ordering against the completion event matters more
-        than the microseconds."""
+        other. With the kernel backend, rows the Mamba transfer kernel can move are
+        copied on the current stream, ahead of the completion event that the
+        conv/temporal rows of the same slots ride on; any other side state or
+        backend takes a blocking copy."""
         if not self.slot_state_device_tensors:
             return
-        for state, host_buf in zip(
-            self.slot_state_device_tensors, self.slot_state_buffers
+        kernel_indices = None
+        for state, host_buf, state_ptr in zip(
+            self.slot_state_device_tensors,
+            self.slot_state_buffers,
+            self.slot_state_device_ptrs or [None] * len(self.slot_state_buffers),
         ):
+            if state_ptr is not None and io_backend == "kernel":
+                if kernel_indices is None:
+                    kernel_indices = [
+                        self._kernel_slot_indices(indices, state.device)
+                        for indices in (device_indices, host_indices)
+                    ]
+                dev_idx, host_idx = kernel_indices
+                row_bytes = state.stride(0) * state.element_size()
+                if to_device:
+                    transfer_kv_mamba_pf_lf(
+                        src=host_buf,
+                        dst=state,
+                        src_indices=host_idx,
+                        dst_indices=dev_idx,
+                        layer_id=0,
+                        item_size=row_bytes,
+                        src_layout_dim=row_bytes,
+                    )
+                else:
+                    transfer_kv_mamba_lf_pf(
+                        src_ptrs=state_ptr,
+                        dst=host_buf,
+                        src_indices=dev_idx,
+                        dst_indices=host_idx,
+                        item_size=row_bytes,
+                        dst_layout_dim=row_bytes,
+                        num_layers=1,
+                    )
+                continue
             dev_idx = device_indices.reshape(-1).to(
                 device=state.device, dtype=torch.long
             )
@@ -858,6 +914,33 @@ class MambaPoolHost(HostKVCache):
             else:
                 values = state.index_select(0, dev_idx)
                 host_buf.index_copy_(0, host_idx, values.to(host_buf.device))
+
+    @staticmethod
+    def _slot_rows_fit_kernel(state: torch.Tensor, host_buf: torch.Tensor) -> bool:
+        # The kernel moves whole 16-byte words between contiguous rows; the host
+        # buffer must be pinned so the device can address it.
+        row_bytes = state.stride(0) * state.element_size()
+        return (
+            _is_cuda
+            and state.is_cuda
+            and state.is_contiguous()
+            and host_buf.is_contiguous()
+            and host_buf.is_pinned()
+            and host_buf.dtype == state.dtype
+            and host_buf.shape[1:] == state.shape[1:]
+            and row_bytes > 0
+            and row_bytes % 16 == 0
+            and state.data_ptr() % 16 == 0
+            and host_buf.data_ptr() % 16 == 0
+        )
+
+    @staticmethod
+    def _kernel_slot_indices(indices: torch.Tensor, device) -> torch.Tensor:
+        indices = indices.reshape(-1).to(dtype=torch.int64)
+        if indices.device.type == "cpu":
+            # A pageable H2D copy can wait on the stream's queued work; pinned does not.
+            indices = indices.pin_memory()
+        return indices.to(device=device, non_blocking=True)
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         data_page = torch.cat(

@@ -237,5 +237,57 @@ class TestHiCacheMambaSlotSideStates(CustomTestCase):
             )
 
 
+class TestSlotStateTransferKernelRouting(CustomTestCase):
+    def test_cpu_states_keep_the_blocking_copy(self):
+        host, device_pool = _make_pools(True)
+        short_conv = device_pool._slot_siblings[0].tensor
+        short_conv[1] = 5.0
+        host._init_slot_state_device_ptrs()
+        host._transfer_slot_states(
+            torch.tensor([2]), torch.tensor([1]), to_device=False
+        )
+        self.assertEqual(
+            host.slot_state_device_ptrs, [None] * len(host.slot_state_buffers)
+        )
+        self.assertTrue(torch.equal(host.slot_state_buffers[0][2], short_conv[1]))
+
+    def test_rows_that_fit_take_the_transfer_kernel_on_both_legs(self):
+        host, _ = _make_pools(True)
+        mamba = "sglang.srt.mem_cache.pool_host.mamba."
+        with (
+            mock.patch.object(
+                MambaPoolHost, "_slot_rows_fit_kernel", return_value=True
+            ),
+            mock.patch.object(
+                MambaPoolHost,
+                "_kernel_slot_indices",
+                side_effect=lambda indices, device: indices.reshape(-1),
+            ),
+            mock.patch(mamba + "transfer_kv_mamba_lf_pf", create=True) as backup,
+            mock.patch(mamba + "transfer_kv_mamba_pf_lf", create=True) as load,
+        ):
+            host._init_slot_state_device_ptrs()
+            host._transfer_slot_states(
+                torch.tensor([2]), torch.tensor([1]), to_device=False
+            )
+            host._transfer_slot_states(
+                torch.tensor([2]), torch.tensor([3]), to_device=True
+            )
+            n = len(host.slot_state_buffers)
+            self.assertEqual((backup.call_count, load.call_count), (n, n))
+            self.assertEqual(backup.call_args.kwargs["src_indices"].tolist(), [1])
+            self.assertEqual(backup.call_args.kwargs["dst_indices"].tolist(), [2])
+            self.assertEqual(load.call_args.kwargs["src_indices"].tolist(), [2])
+            self.assertEqual(load.call_args.kwargs["dst_indices"].tolist(), [3])
+            # the direct backend keeps the blocking copy, like the conv/temporal rows
+            host._transfer_slot_states(
+                torch.tensor([2]),
+                torch.tensor([1]),
+                to_device=False,
+                io_backend="direct",
+            )
+            self.assertEqual(backup.call_count, n)
+
+
 if __name__ == "__main__":
     unittest.main()

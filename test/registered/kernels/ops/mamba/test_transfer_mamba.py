@@ -436,5 +436,38 @@ def test_captured_mamba_state_round_trip(layout, io_backend, kind):
         host.destroy()
 
 
+def test_slot_side_states_take_the_transfer_kernel():
+    """Side-state rows (a slot axis, no layer axis) move through the transfer kernel
+    on both legs and match a gather; 7-byte rows keep the blocking copy."""
+    states = [
+        torch.randn(6, 5, 8, device=DEVICE).bfloat16(),
+        torch.randint(0, 1 << 20, (6, 2), device=DEVICE),
+        torch.randint(0, 255, (6, 7), device=DEVICE, dtype=torch.uint8),
+    ]
+    host = MambaPoolHost.__new__(MambaPoolHost)
+    host.slot_state_device_tensors = states
+    host.slot_state_buffers = [
+        torch.zeros((8,) + tuple(s.shape[1:]), dtype=s.dtype).pin_memory()
+        for s in states
+    ]
+    host._init_slot_state_device_ptrs()
+    dev_idx, host_idx = torch.tensor([4, 1], device=DEVICE), torch.tensor([7, 0])
+    host._transfer_slot_states(host_idx, dev_idx, to_device=False)
+    torch.cuda.synchronize()
+    on_cuda = torch.version.hip is None
+    fits = [p is not None for p in host.slot_state_device_ptrs]
+    assert fits == [on_cuda, on_cuda, False]
+    for state, buf in zip(states, host.slot_state_buffers):
+        assert torch.equal(buf[[7, 0]], state[[4, 1]].cpu())
+    host.slot_state_device_tensors = [torch.zeros_like(s) for s in states]
+    host._init_slot_state_device_ptrs()
+    host._transfer_slot_states(
+        host_idx, torch.tensor([2, 5], device=DEVICE), to_device=True
+    )
+    torch.cuda.synchronize()
+    for target, state in zip(host.slot_state_device_tensors, states):
+        assert torch.equal(target[[2, 5]], state[[4, 1]])
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
