@@ -3524,6 +3524,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),
+                needs_capture_safe_ue8m0_pack=self.is_fp4_expert,
             )
         elif self.runner.runner_backend.is_deep_gemm():
             w13_weight = layer.w13_weight

@@ -850,5 +850,166 @@ def test_nvfp4_reload_preserves_layer_and_prepared_weight_storage(
         assert layer._flashinfer_megamoe_input_norm_const == 1.0
 
 
+def test_megamoe_autotune_deduplicates_broadcasts_and_pooled_warmups(monkeypatch):
+    from dataclasses import replace
+
+    module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=2)
+    shared_backend_ws = {1: object(), 2: object()}
+    events = []
+    broadcast_calls = 0
+
+    class Mega:
+        supports_output_view = False
+
+        def __init__(self, **kwargs):
+            self.auto = kwargs.get("backend", first.backend).megakernel.knobs == "auto"
+
+        def warmup(self, inputs, workspace=None):
+            if self.auto:
+                events.append(("tune", inputs.num_tokens))
+            else:
+                events.append(("warmup", workspace.capacity))
+
+        def get_tuned_knobs(self):
+            return {"mma_tiler_mnk": (256, 128, 128)}
+
+        def destroy(self):
+            pass
+
+        def create_workspace(self, capacity, *, knobs):
+            events.append(("create", capacity))
+            return types.SimpleNamespace(
+                capacity=capacity,
+                knobs=knobs.copy(),
+                _backend_workspace=shared_backend_ws[capacity],
+            )
+
+        def forward(self, inputs, *, workspace, return_workspace_view=False):
+            return inputs.hidden_states
+
+    fake_moe = types.ModuleType("flashinfer.moe_ep")
+    fake_moe.MoEEpMegaLayer = Mega
+    monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe)
+
+    def count_broadcast(self, value):
+        nonlocal broadcast_calls
+        broadcast_calls += 1
+        return value
+
+    monkeypatch.setattr(module.MegaMoeTunedForward, "_broadcast", count_broadcast)
+
+    with module.megamoe_autotune_context(decode_num_tokens=2, prefill_num_tokens=2):
+        for scale in (1.0, 2.0, 3.0):
+            backend = replace(
+                first.backend,
+                megakernel=replace(first.backend.megakernel, input_norm_const=scale),
+            )
+            forward = module.MegaMoeTunedForward(
+                first.bootstrap, first.fleet_params, backend
+            )
+            mega = Mega()
+            assert forward(mega, tensors) is tensors.hidden_states
+
+    # Layer 0 broadcasts once per capacity during cache lookup and once after
+    # tuning; layers 1..2 reuse resolved_knobs and skip redundant broadcasts
+    # and pooled-workspace warmups.
+    assert broadcast_calls == 4
+    assert [e for e in events if e[0] == "tune"] == [("tune", 1), ("tune", 2)]
+    assert [e for e in events if e[0] == "warmup"] == [("warmup", 1), ("warmup", 2)]
+    assert [e for e in events if e[0] == "create"] == [
+        ("create", 1),
+        ("create", 2),
+    ] * 3
+
+
+def test_adapter_skips_ue8m0_patch_for_cutedsl_and_reuses_output_buffer(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+
+    class FakeMoEEpTensors:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    fake_moe_ep = types.ModuleType("flashinfer.moe_ep")
+    fake_moe_ep.MoEEpTensors = FakeMoEEpTensors
+    fake_flashinfer = types.ModuleType("flashinfer")
+    fake_flashinfer.moe_ep = fake_moe_ep
+    monkeypatch.setitem(sys.modules, "flashinfer", fake_flashinfer)
+    monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe_ep)
+
+    dgm = sys.modules["deep_gemm.utils.math"]
+    original_pack = lambda value: value  # noqa: E731
+    dgm.pack_ue8m0_to_int = original_pack
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    hidden_states = torch.randn((2, 4), dtype=torch.bfloat16)
+    provided_output = torch.empty_like(hidden_states)
+    sys.modules["sglang.srt.runtime_context"].get_forward = lambda: (
+        types.SimpleNamespace(moe_output_buffer=provided_output)
+    )
+
+    seen_patched = []
+
+    class Mega:
+        supports_output_view = False
+
+        def forward(self, tensors, *, workspace=None):
+            seen_patched.append(dgm.pack_ue8m0_to_int is not original_pack)
+            self.tensors = tensors
+            return getattr(tensors, "output", hidden_states)
+
+    dispatch_output = types.SimpleNamespace(
+        hidden_states=hidden_states,
+        topk_output=types.SimpleNamespace(
+            topk_ids=torch.tensor([[0, 1], [1, 0]], dtype=torch.int32),
+            topk_weights=torch.ones((2, 2), dtype=torch.float32),
+        ),
+    )
+    runner_config = types.SimpleNamespace(routed_scaling_factor=1.0)
+
+    # CuteDSL path (default needs_capture_safe_ue8m0_pack=False) does not touch
+    # deep_gemm and passes the non-aliasing moe_output_buffer.
+    mega = Mega()
+    res = module.run_flashinfer_megamoe(
+        dispatch_output,
+        module.FlashInferMegaMoeQuantInfo(mega=mega),
+        runner_config,
+    )
+    assert seen_patched == [False]
+    assert mega.tensors.output is provided_output
+    assert res.hidden_states is provided_output
+
+    # DeepGEMM path opts in to the capture-safe UE8M0 patch.
+    mega_dg = Mega()
+    module.run_flashinfer_megamoe(
+        dispatch_output,
+        module.FlashInferMegaMoeQuantInfo(
+            mega=mega_dg, needs_capture_safe_ue8m0_pack=True
+        ),
+        runner_config,
+    )
+    assert seen_patched == [False, True]
+    assert dgm.pack_ue8m0_to_int is original_pack
+
+
+def test_validate_nvfp4_fc1_alpha_skips_allclose_when_shared(monkeypatch):
+    module = _load_megamoe_module(monkeypatch)
+    alpha = torch.ones(4, dtype=torch.float32)
+    layer = types.SimpleNamespace(
+        moe_runner_config=types.SimpleNamespace(is_gated=True),
+        num_local_experts=4,
+        g1_alphas=alpha,
+        g1_alphas_up=alpha.clone(),
+        _g1_alphas_shared=True,
+    )
+    monkeypatch.setattr(
+        torch,
+        "allclose",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("unexpected allclose")),
+    )
+    module._validate_nvfp4_fc1_alpha(layer)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

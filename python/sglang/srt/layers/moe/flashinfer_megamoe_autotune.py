@@ -21,7 +21,7 @@ import logging
 import os
 from bisect import bisect_left
 from contextlib import contextmanager
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from functools import cache, cached_property
 from typing import Any
 
@@ -36,6 +36,12 @@ class _AutotuneContext:
     prefill_num_tokens: int
     records: dict
     dirty: bool = False
+    # Profile knobs already agreed across EP ranks in this context; lets
+    # layers 1..N reuse layer 0's decision without repeating object broadcasts.
+    resolved_knobs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Pooled physical workspaces already warmed in this context, keyed by
+    # (id(backend_workspace), has_fc1_norm_const).
+    warmed_workspaces: set[tuple[int, bool]] = field(default_factory=set)
 
 
 _active_context: _AutotuneContext | None = None
@@ -69,7 +75,7 @@ def megamoe_autotune_context(
 
 
 def forward_megamoe(mega, tensors, workspace=None):
-    if mega.supports_output_view:
+    if mega.supports_output_view and getattr(tensors, "output", None) is None:
         return mega.forward(tensors, workspace=workspace, return_workspace_view=True)
     return mega.forward(tensors, workspace=workspace)
 
@@ -258,29 +264,56 @@ class MegaMoeTunedForward:
         context = _active_context
         assert context is not None
         profile_key = f"{self._geometry_key}:{capacity}"
-        profile_inputs = _profile_inputs(
-            tensors, capacity, self.fleet_params.num_experts
-        )
-        # Rank zero decides whether every EP rank reuses or tunes this profile.
-        # The context records also deduplicate layers with the same geometry.
-        knobs = self._broadcast(
-            context.records.get(profile_key) if self.bootstrap.rank == 0 else None
-        )
-        if not _valid_knobs(knobs):
-            knobs = self._tune(profile_inputs, capacity)
-            if self.bootstrap.rank == 0:
-                logger.info("MegaMoE tuned: capacity=%s, knobs=%s", capacity, knobs)
-        if context.records.get(profile_key) != knobs:
-            context.records[profile_key] = knobs
-            context.dirty = True
-        # Restore tuple-valued knobs after AutoTuner's JSON round trip, as
-        # FlashInfer's native cache loader does.
-        knobs = {
-            key: tuple(value) if isinstance(value, list) else value
-            for key, value in knobs.items()
-        }
+        profile_inputs = None
+
+        def get_profile_inputs():
+            nonlocal profile_inputs
+            if profile_inputs is None:
+                profile_inputs = _profile_inputs(
+                    tensors, capacity, self.fleet_params.num_experts
+                )
+            return profile_inputs
+
+        knobs = context.resolved_knobs.get(profile_key)
+        if knobs is None:
+            # Rank zero decides whether every EP rank reuses or tunes this profile.
+            # The context records also deduplicate layers with the same geometry.
+            knobs = self._broadcast(
+                context.records.get(profile_key) if self.bootstrap.rank == 0 else None
+            )
+            if not _valid_knobs(knobs):
+                knobs = self._tune(get_profile_inputs(), capacity)
+                if self.bootstrap.rank == 0:
+                    logger.info("MegaMoE tuned: capacity=%s, knobs=%s", capacity, knobs)
+            if context.records.get(profile_key) != knobs:
+                context.records[profile_key] = knobs
+                context.dirty = True
+            # Restore tuple-valued knobs after AutoTuner's JSON round trip, as
+            # FlashInfer's native cache loader does.
+            knobs = {
+                key: tuple(value) if isinstance(value, list) else value
+                for key, value in knobs.items()
+            }
+            context.resolved_knobs[profile_key] = knobs
+
         workspace = mega.create_workspace(capacity, knobs=knobs)
-        mega.warmup(profile_inputs, workspace=workspace)
+        # Layers with identical geometry share one pooled backend workspace.
+        # Warming each pooled (backend_workspace, has_fc1_norm_const) pair once
+        # avoids repeating collective warmups and device syncs across every layer.
+        backend_workspace = getattr(workspace, "_backend_workspace", None)
+        has_fc1_norm_const = (
+            getattr(tensors, "fc1_norm_const", None) is not None
+            or getattr(self.backend.megakernel, "fc1_norm_const", None) is not None
+        )
+        warm_key = (
+            (id(backend_workspace), has_fc1_norm_const)
+            if backend_workspace is not None
+            else None
+        )
+        if warm_key is None or warm_key not in context.warmed_workspaces:
+            mega.warmup(get_profile_inputs(), workspace=workspace)
+            if warm_key is not None:
+                context.warmed_workspaces.add(warm_key)
         self.workspaces[capacity] = workspace
 
     def __call__(self, mega, tensors):
