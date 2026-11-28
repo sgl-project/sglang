@@ -242,6 +242,8 @@ def _build_server_args(
         # endpoints can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        max_req_len=scheduler.max_req_len,
+        max_req_input_len=scheduler.max_req_input_len,
         deployment_info=json.dumps(deployment_info),
         launch_server_info=_launch_server_info(scheduler),
         launch_model_info=json.dumps(
@@ -516,6 +518,7 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     scheduler_info = {
         "status": "ready",
         "max_total_num_tokens": scheduler.max_total_num_tokens,
+        "max_req_len": scheduler.max_req_len,
         "max_req_input_len": scheduler.max_req_input_len,
     }
     info = msgspec_to_builtins(

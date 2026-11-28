@@ -258,6 +258,9 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// The scheduler's request length limits (`get_request_length_limits`).
+    pub max_req_len: u64,
+    pub max_req_input_len: u64,
     /// Resolved deployment metadata used by out-of-process orchestrators.
     pub deployment_info: DeploymentInfo,
     /// Python's `/server_info` fields that are fixed at launch, which
@@ -345,6 +348,8 @@ impl ServerArgs {
         tokenizer_model_max_length,
         version,
         max_total_num_tokens,
+        max_req_len,
+        max_req_input_len,
         deployment_info,
         launch_server_info,
         launch_model_info,
@@ -414,6 +419,8 @@ impl ServerArgs {
         tokenizer_model_max_length: i64,
         version: String,
         max_total_num_tokens: u64,
+        max_req_len: u64,
+        max_req_input_len: u64,
         deployment_info: DeploymentInfo,
         launch_server_info: JsonObject,
         launch_model_info: JsonObject,
@@ -481,6 +488,8 @@ impl ServerArgs {
             tokenizer_model_max_length,
             version,
             max_total_num_tokens,
+            max_req_len,
+            max_req_input_len,
             deployment_info,
             launch_server_info,
             launch_model_info,
@@ -502,6 +511,9 @@ impl Default for ServerArgs {
     /// complete `model_config` so the runtime boots. Real launches never use
     /// this — Python supplies every field.
     fn default() -> Self {
+        let model_config = ModelConfig::default();
+        // `get_request_length_limits` for an unbounded KV pool, no dLLM block, nothing reserved.
+        let max_req_len = model_config.context_len;
         Self {
             model_path: String::new(),
             served_model_name: String::new(),
@@ -542,7 +554,7 @@ impl Default for ServerArgs {
             enable_request_decompression: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
-            model_config: ModelConfig::default(),
+            model_config,
             preferred_sampling_params: None,
             default_max_new_tokens: Some(128),
             lora_ids: BTreeMap::new(),
@@ -555,6 +567,8 @@ impl Default for ServerArgs {
             tokenizer_model_max_length: -1,
             version: String::new(),
             max_total_num_tokens: 0,
+            max_req_len,
+            max_req_input_len: max_req_len - 1 - 5,
             deployment_info: DeploymentInfo::default(),
             launch_server_info: JsonObject::default(),
             launch_model_info: JsonObject::default(),
