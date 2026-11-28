@@ -17,7 +17,9 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import torch
 from PIL import Image
-from transformers import PretrainedConfig
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import Glm5NextProcessor, PretrainedConfig, PreTrainedTokenizerFast
 from transformers.image_processing_backends import PilBackend
 from transformers.image_processing_utils import BaseImageProcessor
 
@@ -372,6 +374,59 @@ class TestSpeculatorsDsparkConfig(CustomTestCase):
 
 
 class TestGetProcessor(CustomTestCase):
+    def test_glm5_next_keeps_media_with_separate_tokenizer_path(self):
+        """A tokenizer-only override must still load the model's media processors."""
+        with tempfile.TemporaryDirectory() as path:
+            model_path = Path(path, "model")
+            model_path.mkdir()
+            (model_path / "config.json").write_text(
+                json.dumps({"model_type": "glm5_next"})
+            )
+            (model_path / "processor_config.json").write_text(
+                json.dumps(
+                    {
+                        "processor_class": "Glm5NextProcessor",
+                        "image_processor": {
+                            "image_processor_type": "Glm5NextImageProcessor",
+                            "max_image_tokens": 64,
+                        },
+                        "video_processor": {
+                            "video_processor_type": "Glm5NextVideoProcessor",
+                            "fps": 4,
+                        },
+                    }
+                )
+            )
+            model_template = "Model: {{ messages[0].content }}"
+            (model_path / "chat_template.jinja").write_text(model_template)
+            for index, tokenizer_template in enumerate(
+                (None, "Tokenizer: {{ messages[0].content }}")
+            ):
+                with self.subTest(tokenizer_template=tokenizer_template):
+                    tokenizer_path = Path(path, f"tokenizer-{index}")
+                    tokenizer = PreTrainedTokenizerFast(
+                        tokenizer_object=Tokenizer(
+                            WordLevel({"[UNK]": 0, "split_token": 1}, unk_token="[UNK]")
+                        ),
+                        unk_token="[UNK]",
+                        chat_template=tokenizer_template,
+                    )
+                    tokenizer.save_pretrained(tokenizer_path)
+
+                    processor = processor_utils.get_processor(
+                        str(tokenizer_path),
+                        model_name=str(model_path),
+                        local_files_only=True,
+                    )
+
+                    self.assertIsInstance(processor, Glm5NextProcessor)
+                    self.assertEqual(processor.tokenizer.encode("split_token"), [1])
+                    self.assertEqual(
+                        processor.chat_template, tokenizer_template or model_template
+                    )
+                    self.assertEqual(processor.image_processor.max_image_tokens, 64)
+                    self.assertEqual(processor.video_processor.fps, 4)
+
     def test_applies_v5_bos_eos_fix_to_processor_tokenizer(self):
         class ProcessorTokenizer:
             chat_template = "template"

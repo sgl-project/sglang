@@ -471,5 +471,38 @@ def _get_processor(
     patch_mistral_common_tokenizer(tokenizer)
     _fix_special_tokens_pattern(tokenizer)
     _fix_added_tokens_encoding(tokenizer)
+
+    if (
+        config.model_type == "glm5_next"
+        and model_name is not None
+        and model_name != tokenizer_name
+        and isinstance(processor, PreTrainedTokenizerBase)
+    ):
+        from transformers import AutoVideoProcessor, Glm5NextProcessor
+
+        # A tokenizer-only override has no processor config. Load the media
+        # components from the model and derive media token IDs from the override.
+        media_kwargs = dict(
+            kwargs, trust_remote_code=trust_remote_code, revision=revision
+        )
+        if tokenizer.chat_template is None:
+            processor_config, _ = Glm5NextProcessor.get_processor_dict(
+                model_name, **media_kwargs
+            )
+            tokenizer.chat_template = processor_config.get("chat_template")
+        image_kwargs = dict(media_kwargs)
+        if image_processor_backend != "auto":
+            image_kwargs["backend"] = image_processor_backend
+        processor = Glm5NextProcessor(
+            tokenizer=tokenizer,
+            image_processor=AutoImageProcessor.from_pretrained(
+                model_name, *args, **image_kwargs
+            ),
+            video_processor=AutoVideoProcessor.from_pretrained(
+                model_name, *args, **media_kwargs
+            ),
+            chat_template=tokenizer.chat_template,
+        )
+
     attach_additional_stop_token_ids(tokenizer)
     return processor
