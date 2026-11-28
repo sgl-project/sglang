@@ -69,7 +69,14 @@ class DisallowedTokensLogitsProcessor(CustomLogitProcessor):
         assert all(disallowed_token_ids == c["token_ids"] for c in custom_param_list), (
             f"{custom_param_list=}"
         )
-        logits[..., disallowed_token_ids] = -float("inf")
+        vocab_size = logits.shape[-1]
+        valid_token_ids = [
+            t
+            for t in disallowed_token_ids
+            if isinstance(t, int) and 0 <= t < vocab_size
+        ]
+        if valid_token_ids:
+            logits[..., valid_token_ids] = -float("inf")
         return logits
 
 

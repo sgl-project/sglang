@@ -166,10 +166,19 @@ def get_token_ids_logprobs_raw(
                 row = logprobs.new_empty((0,))
                 token_ids = []
             else:
-                token_ids_tensor = torch.tensor(
-                    token_ids, dtype=torch.long, pin_memory=pin_memory
-                ).to(logprobs.device, non_blocking=True)
-                row = logprobs[i, token_ids_tensor]
+                vocab_size = logprobs.shape[-1]
+                valid_token_ids = [
+                    t for t in token_ids if isinstance(t, int) and 0 <= t < vocab_size
+                ]
+                if not valid_token_ids:
+                    row = logprobs.new_empty((0,))
+                    token_ids = []
+                else:
+                    token_ids_tensor = torch.tensor(
+                        valid_token_ids, dtype=torch.long, pin_memory=pin_memory
+                    ).to(logprobs.device, non_blocking=True)
+                    row = logprobs[i, token_ids_tensor]
+                    token_ids = valid_token_ids
             vals.append(row if no_copy_to_cpu else row.tolist())
             idxs.append(token_ids)
     else:  # prefill
@@ -187,12 +196,21 @@ def get_token_ids_logprobs_raw(
                 idxs.append([])
                 pt += pruned_len
                 continue
+            vocab_size = logprobs.shape[-1]
+            valid_token_ids = [
+                t for t in token_ids if isinstance(t, int) and 0 <= t < vocab_size
+            ]
+            if not valid_token_ids:
+                vals.append([])
+                idxs.append([])
+                pt += pruned_len
+                continue
             token_ids_tensor = torch.tensor(
-                token_ids, dtype=torch.long, pin_memory=pin_memory
+                valid_token_ids, dtype=torch.long, pin_memory=pin_memory
             ).to(logprobs.device, non_blocking=True)
             pos_logprobs = logprobs[pt : pt + pruned_len, token_ids_tensor]
             vals.append(pos_logprobs if no_copy_to_cpu else pos_logprobs.tolist())
-            idxs.append([token_ids for _ in range(pruned_len)])
+            idxs.append([valid_token_ids for _ in range(pruned_len)])
             pt += pruned_len
     return vals, idxs
 
