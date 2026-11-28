@@ -166,5 +166,224 @@ class TestBenchServingCiCacheFlush(_BenchmarkRunTestCase):
                 self.assertEqual(len(self.server.flushes), flushes)
 
 
+class _GenerateSSEHandler(BaseHTTPRequestHandler):
+    """Stub /generate endpoint streaming configured SSE frames."""
+
+    def do_POST(self):  # noqa: N802
+        if self.path.startswith("/flush_cache"):
+            self.send_response(200)
+            self.end_headers()
+            return
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.requests.append(body)
+        frames = self.server.response_frames
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for frame in frames:
+            self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+
+    def do_GET(self):  # noqa: N802
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+class TestBenchServingShortOutputWarning(CustomTestCase):
+    def setUp(self):
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _GenerateSSEHandler)
+        self.server.requests = []
+        self.server.response_frames = []
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.output_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.output_dir.cleanup)
+
+    def _run_generate(
+        self,
+        rows,
+        frames,
+        *,
+        disable_ignore_eos=False,
+        extra_request_body=None,
+    ):
+        self.server.requests.clear()
+        self.server.response_frames = frames
+        set_global_args(
+            Namespace(
+                backend="sglang",
+                dataset_name="custom",
+                num_prompts=len(rows),
+                warmup_requests=0,
+                disable_stream=False,
+                disable_ignore_eos=disable_ignore_eos,
+                temperature=0.0,
+                top_p=1.0,
+                return_logprob=False,
+                return_routed_experts=False,
+                logprob_start_len=-1,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                print_requests=False,
+                tokenizer="",
+                header=None,
+                cache_report=False,
+                plot_throughput=False,
+                goodput=None,
+                sharegpt_output_len=None,
+                random_input_len=None,
+                random_output_len=None,
+                random_range_ratio=None,
+                output_file=os.path.join(self.output_dir.name, "result.jsonl"),
+                output_details=False,
+            )
+        )
+        base_url = f"http://127.0.0.1:{self.server.server_port}"
+        import warnings
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = asyncio.run(
+                benchmark(
+                    backend="sglang",
+                    api_url=base_url + "/generate",
+                    base_url=base_url,
+                    model_id="dummy-model",
+                    tokenizer=_Tokenizer(),
+                    input_requests=rows,
+                    request_rate=float("inf"),
+                    max_concurrency=None,
+                    disable_tqdm=True,
+                    lora_names=None,
+                    lora_request_distribution=None,
+                    lora_zipf_alpha=None,
+                    extra_request_body=extra_request_body or {},
+                    profile=False,
+                    warmup_requests=0,
+                    use_trace_timestamps=False,
+                )
+            )
+        return result, [
+            str(w.message)
+            for w in caught
+            if "fixed-length benchmark request(s) finished early" in str(w.message)
+        ]
+
+    def test_warns_once_when_fixed_length_requests_are_clamped(self):
+        rows = [
+            DatasetRow(prompt=f"p{i}", prompt_len=10, output_len=1000) for i in range(8)
+        ]
+        frames = [
+            {
+                "text": "x",
+                "meta_info": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "finish_reason": {"type": "length", "length": 1},
+                },
+            }
+        ]
+        result, warns = self._run_generate(rows, frames)
+        self.assertEqual(result["completed"], 8)
+        self.assertEqual(result["total_output_tokens"], 8)
+        self.assertEqual(len(warns), 1)
+        self.assertIn("8 fixed-length benchmark request(s)", warns[0])
+        self.assertIn("8/8000", warns[0])
+
+    def test_captures_textless_terminal_sse_frame(self):
+        rows = [DatasetRow(prompt="p0", prompt_len=10, output_len=1000)]
+        frames = [
+            {"text": "x", "meta_info": {"prompt_tokens": 10, "completion_tokens": 1}},
+            {
+                "text": "",
+                "meta_info": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "finish_reason": {"type": "length", "length": 1},
+                },
+            },
+        ]
+        _result, warns = self._run_generate(rows, frames)
+        self.assertEqual(len(warns), 1)
+        self.assertIn("1/1000", warns[0])
+
+    def test_no_warning_for_full_output_natural_stop_or_disabled_checks(self):
+        rows = [DatasetRow(prompt="p0", prompt_len=10, output_len=100)]
+        full_frames = [
+            {
+                "text": "x",
+                "meta_info": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 100,
+                    "finish_reason": {"type": "length", "length": 100},
+                },
+            }
+        ]
+        self.assertEqual(self._run_generate(rows, full_frames)[1], [])
+
+        eos_frames = [
+            {
+                "text": "x",
+                "meta_info": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "finish_reason": {"type": "stop"},
+                },
+            }
+        ]
+        self.assertEqual(self._run_generate(rows, eos_frames)[1], [])
+
+        short_frames = [
+            {
+                "text": "x",
+                "meta_info": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 1,
+                    "finish_reason": {"type": "length", "length": 1},
+                },
+            }
+        ]
+        self.assertEqual(
+            self._run_generate(rows, short_frames, disable_ignore_eos=True)[1], []
+        )
+
+        missing_count_frames = [
+            {"text": "", "meta_info": {"finish_reason": {"type": "length"}}}
+        ]
+        self.assertEqual(self._run_generate(rows, missing_count_frames)[1], [])
+
+        self.assertEqual(
+            self._run_generate(
+                rows,
+                short_frames,
+                extra_request_body={
+                    "sampling_params": {
+                        "max_new_tokens": 1,
+                        "ignore_eos": True,
+                    }
+                },
+            )[1],
+            [],
+        )
+        self.assertEqual(
+            self._run_generate(
+                rows,
+                short_frames,
+                extra_request_body={
+                    "sampling_params": {
+                        "max_new_tokens": 100,
+                        "ignore_eos": True,
+                        "stop": ["END"],
+                    }
+                },
+            )[1],
+            [],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
