@@ -1190,11 +1190,13 @@ class PrefillAdder:
 
         if running_batch is not None:
             # Estimate the offset in the remaining token space
-            self.memory_budget.total_offset += sum(
-                [
-                    self._get_running_request_total_token_offset(r)
-                    for r in running_batch.reqs
-                ]
+            running_new_tokens = [
+                self._get_running_request_total_token_offset(r)
+                for r in running_batch.reqs
+            ]
+            self.memory_budget.total_offset += sum(running_new_tokens)
+            self.memory_budget.reserve_running_windows(
+                running_batch.reqs, max_new_tokens=running_new_tokens
             )
 
         self.is_hybrid_swa = self.token_to_kv_pool_allocator.has_window_pool

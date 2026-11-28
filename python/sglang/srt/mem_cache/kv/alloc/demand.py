@@ -95,6 +95,7 @@ def request_demand(
     host_hit_lengths: Optional[Mapping[str, int]] = None,
     extra_tokens: int = 0,
     cached_tokens: int = 0,
+    held_window_tokens: Optional[Mapping[str, int]] = None,
 ) -> KVDemand:
     """What one request still needs to place ``input_tokens`` prompt tokens in
     chunks of at most ``chunk_size`` and then decode ``max_new_tokens``.
@@ -106,12 +107,14 @@ def request_demand(
     one bound over every phase: the request's own rows, capped by the retained
     window plus the larger of a prefill chunk with what retirement keeps beside
     it and what decode keeps past the window, less the rows ``cached_tokens``
-    already hold; plus a rounding page and the pages a host hit restores.
+    already hold and the window's rows ``held_window_tokens`` names (by window);
+    plus a rounding page and the pages a host hit restores.
 
     The bound never falls as the chunk grows. Every site that prices a request
     (the ceiling clip, admission, a chunked request's commitment) calls this,
     so a request the clip lets through is one its chunks can finish."""
     hits = host_hit_lengths or {}
+    own_rows = held_window_tokens or {}
 
     if (
         prefill_retire_lag < 0
@@ -160,8 +163,13 @@ def request_demand(
             tail = max(checkpoint_interval - 1, last_chunk)
             beside = max(prefill_retire_lag + last_chunk + tail, retention - 1)
             # The last chunk is still live when the first decode allocates
-            # ahead, so they add up; the cached prefix's rows are held already.
-            held = min(held, retained + beside + ahead - in_prefix)
+            # ahead, so they add up; the cached prefix's rows are held already,
+            # as are the rows the request holds itself, uncapped: retirement
+            # lets those run past the retained window.
+            held = min(
+                held,
+                max(0, retained + beside + ahead - in_prefix - own_rows.get(name, 0)),
+            )
         return held + page_size + hit_pages
 
     return KVDemand(
@@ -189,6 +197,9 @@ class DemandPurpose(enum.Enum):
     LOAD_BACK = "load_back"
     # A decode node's preallocation of a transferred request.
     DECODE_PREALLOC = "decode_prealloc"
+    # What a running request may still add as it decodes, which each
+    # admission pass commits beside the requests it admits.
+    RUNNING = "running"
 
 
 class StateSlots(enum.Enum):
@@ -208,6 +219,9 @@ class DemandRule(msgspec.Struct, frozen=True, kw_only=True):
     # Whether evictable cached entries count as room. A load-back reclaims
     # first and asks what is free then; a ceiling asks an empty pool.
     credits_evictable: bool
+    # Whether the request still has a prompt to place, whose chunks window
+    # retirement lags (``prefill_retire_lag``); a running request has none.
+    prefills: bool = True
 
 
 DEMAND_RULES: Mapping[DemandPurpose, DemandRule] = {
@@ -230,6 +244,12 @@ DEMAND_RULES: Mapping[DemandPurpose, DemandRule] = {
         estimates_decode=True,
         state_slots=StateSlots.PENDING,
         credits_evictable=True,
+    ),
+    DemandPurpose.RUNNING: DemandRule(
+        estimates_decode=True,
+        state_slots=StateSlots.PENDING,
+        credits_evictable=True,
+        prefills=False,
     ),
 }
 
@@ -313,6 +333,7 @@ class DemandInputs(msgspec.Struct, frozen=True, kw_only=True):
     host_hit_lengths: Mapping[str, int]
     extra_tokens: int
     cached_tokens: int
+    held_window_tokens: Mapping[str, int]
 
     @property
     def rule(self) -> DemandRule:
@@ -334,6 +355,7 @@ class DemandInputs(msgspec.Struct, frozen=True, kw_only=True):
             host_hit_lengths=self.host_hit_lengths,
             extra_tokens=self.extra_tokens,
             cached_tokens=self.cached_tokens,
+            held_window_tokens=self.held_window_tokens,
         )
 
 
@@ -354,14 +376,21 @@ def demand_inputs(
     cached_tokens: int = 0,
     host_hit_lengths: Optional[Mapping[str, int]] = None,
     extra_tokens: int = 0,
+    held_window_tokens: Optional[Mapping[str, int]] = None,
 ) -> DemandInputs:
     """The `request_demand` inputs every pricing site builds alike; the
     purpose's `DEMAND_RULES` row sets what differs. ``chunk_limit`` is the
     chunk the caller admitted, so a request's admission, shape check and
     commitment price the same chunk."""
     rule = DEMAND_RULES[purpose]
-    if purpose is DemandPurpose.CEILING and (cached_tokens or host_hit_lengths):
+    if purpose is DemandPurpose.CEILING and (
+        cached_tokens or host_hit_lengths or held_window_tokens
+    ):
         raise ValueError("a ceiling prices a request with nothing cached")
+    if not rule.prefills:
+        if input_tokens:
+            raise ValueError(f"a {purpose.value} request has no prompt left to place")
+        prefill_retire_lag = 0
     if rule.estimates_decode:
         max_new_tokens = decode_estimate_tokens(max_new_tokens)
     return DemandInputs(
@@ -380,6 +409,7 @@ def demand_inputs(
         host_hit_lengths=dict(host_hit_lengths or {}),
         extra_tokens=extra_tokens,
         cached_tokens=cached_tokens,
+        held_window_tokens=dict(held_window_tokens or {}),
     )
 
 
