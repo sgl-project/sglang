@@ -93,6 +93,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
     is_xpu,
@@ -4909,6 +4910,8 @@ class MLATokenToKVPool(KVCache, MLAKVView):
     # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
     kv_scale_ue8m0 = False
     fp8_cast_on_write = False
+    # Seg-packed pages for aiter's gfx1250 non-persistent asm MLA decode.
+    mla_seg_page_layout = False
 
     def __init__(
         self,
@@ -4958,6 +4961,7 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             range(self.start_layer, self.start_layer + self.layer_num)
         )
         self.kv_scale_buffer = None
+        self.mla_seg_page_layout = self._want_mla_seg_page_layout()
 
         self._create_buffers()
 
@@ -4969,6 +4973,32 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         if not use_dsa:
             # DSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
+
+    def _want_mla_seg_page_layout(self) -> bool:
+        """Seg-packed pages for the gfx1250 asm MLA decode (see mla_seg_buffer)."""
+        if not envs.SGLANG_AITER_MLA_GFX1250_ASM.get():
+            return False
+        ok = (
+            _is_hip
+            and is_gfx1250_supported()
+            and self.dtype == torch.float8_e4m3fn
+            and self.page_size == 64
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and not self.use_dsa
+            and self.kv_cache_dim == 576
+            and type(self) is MLATokenToKVPool
+        )
+        if not ok:
+            raise ValueError(
+                "SGLANG_AITER_MLA_GFX1250_ASM needs gfx1250, an fp8_e4m3 MLA pool "
+                "with page size 64 and a 512 + 64 latent, got "
+                f"{type(self).__name__} dtype={self.dtype} "
+                f"page_size={self.page_size} kv_lora_rank={self.kv_lora_rank} "
+                f"qk_rope_head_dim={self.qk_rope_head_dim} use_dsa={self.use_dsa}"
+            )
+        logger.info("MLA KV pool uses seg-packed 64-token pages for asm decode")
+        return True
 
     def get_device_pool_infos(self) -> tuple[DevicePoolInfo, ...]:
         from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
@@ -5098,7 +5128,9 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> None:
-        if self.write_loc_is_dcp_resolved or self.dcp_replicated:
+        if self.mla_seg_page_layout:
+            self._seg_write(dst_buffer, loc, cache_k_nope, cache_k_rope)
+        elif self.write_loc_is_dcp_resolved or self.dcp_replicated:
             set_mla_kv_buffer_triton(dst_buffer, loc, cache_k_nope, cache_k_rope)
         else:
             set_mla_kv_buffer_dcp_sharded_triton(
@@ -5136,12 +5168,77 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
-        if self.store_dtype != self.dtype:
+        if self.mla_seg_page_layout:
+            cache_k = cache_k.view(-1, self.kv_cache_dim)
+            self._seg_write(
+                self.kv_buffer[layer_id - self.start_layer],
+                loc,
+                cache_k[:, : self.kv_lora_rank],
+                cache_k[:, self.kv_lora_rank :],
+            )
+        elif self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
                 self.store_dtype
             )
         else:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+
+    def _seg_write(
+        self,
+        dst_buffer: torch.Tensor,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> None:
+        from sglang.kernels.ops.kvcache.mla_seg_buffer import seg_set_mla_kv_buffer
+
+        if cache_k_nope.dtype != dst_buffer.dtype:
+            cache_k_nope = cache_k_nope.view(dst_buffer.dtype)
+            cache_k_rope = cache_k_rope.view(dst_buffer.dtype)
+        seg_set_mla_kv_buffer(
+            dst_buffer, loc, cache_k_nope, cache_k_rope, self.page_size
+        )
+
+    def _seg_gather_rows(self, kv_buffer: torch.Tensor, loc: torch.Tensor):
+        """Token-major ``(n, 1, kv_cache_dim)`` rows of ``loc`` in the pool's
+        storage dtype, read out of seg-packed pages."""
+        from sglang.kernels.ops.kvcache.mla_seg_buffer import seg_get_mla_kv_buffer
+
+        rows = torch.empty(
+            (loc.numel(), 1, self.kv_cache_dim),
+            dtype=kv_buffer.dtype,
+            device=kv_buffer.device,
+        )
+        seg_get_mla_kv_buffer(
+            kv_buffer,
+            loc,
+            rows[..., : self.kv_lora_rank],
+            rows[..., self.kv_lora_rank :],
+            self.page_size,
+        )
+        return rows
+
+    def gather_kv_latent(
+        self, layer_id: int, loc: torch.Tensor, dst_dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``get_key_buffer()[loc]`` split into contiguous ``(n, 1, kv_lora_rank)``
+        nope and ``(n, 1, rope)`` rope tensors of ``dst_dtype``, in one pass."""
+        kv_buffer = self.get_key_buffer(layer_id)
+        n = loc.numel()
+        rope_dim = kv_buffer.shape[-1] - self.kv_lora_rank
+        nope = torch.empty(
+            (n, 1, self.kv_lora_rank), dtype=dst_dtype, device=kv_buffer.device
+        )
+        rope = torch.empty((n, 1, rope_dim), dtype=dst_dtype, device=kv_buffer.device)
+        if not self.mla_seg_page_layout:
+            rows = kv_buffer[loc]
+            nope.copy_(rows[..., : self.kv_lora_rank])
+            rope.copy_(rows[..., self.kv_lora_rank :])
+            return nope, rope
+        from sglang.kernels.ops.kvcache.mla_seg_buffer import seg_get_mla_kv_buffer
+
+        seg_get_mla_kv_buffer(kv_buffer, loc, nope, rope, self.page_size)
+        return nope, rope
 
     def _write_mla_kv_buffer(
         self,
@@ -5281,11 +5378,21 @@ class MLATokenToKVPool(KVCache, MLAKVView):
                 dtype=dst_dtype,
                 device=kv_buffer.device,
             )
-        get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        if self.mla_seg_page_layout:
+            from sglang.kernels.ops.kvcache.mla_seg_buffer import (
+                seg_get_mla_kv_buffer,
+            )
+
+            seg_get_mla_kv_buffer(
+                kv_buffer, loc, cache_k_nope, cache_k_rope, self.page_size
+            )
+        else:
+            get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
+        assert not self.mla_seg_page_layout, "seg-packed MLA pages move by page only"
         size_limit = self.size + self.page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
@@ -5311,9 +5418,15 @@ class MLATokenToKVPool(KVCache, MLAKVView):
                 continue
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
-                )
+                if self.mla_seg_page_layout:
+                    # Token rows are not contiguous in a seg-packed page; a
+                    # row copy loses the rope segment of a partly filled page.
+                    kv_rows = self._seg_gather_rows(
+                        self.kv_buffer[layer_id], chunk_indices
+                    )
+                else:
+                    kv_rows = self.kv_buffer[layer_id][chunk_indices]
+                kv_cpu = kv_rows.to("cpu", non_blocking=True)
                 kv_cache_cpu[-1].append(kv_cpu)
         current_platform.synchronize()
         return kv_cache_cpu
@@ -5334,7 +5447,15 @@ class MLATokenToKVPool(KVCache, MLAKVView):
                 kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
                 assert kv_cpu.shape[0] == len(chunk_indices)
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
-                self.kv_buffer[layer_id][chunk_indices] = kv_chunk
+                if self.mla_seg_page_layout:
+                    self._seg_write(
+                        self.kv_buffer[layer_id],
+                        chunk_indices,
+                        kv_chunk[..., : self.kv_lora_rank],
+                        kv_chunk[..., self.kv_lora_rank :],
+                    )
+                else:
+                    self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         current_platform.synchronize()
 
 

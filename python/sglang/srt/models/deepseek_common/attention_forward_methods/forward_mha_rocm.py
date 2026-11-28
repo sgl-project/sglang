@@ -350,7 +350,9 @@ class DeepseekMHARocmForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _use_mla_kv_rows:
+        if _use_mla_kv_rows or getattr(
+            get_token_to_kv_pool(), "mla_seg_page_layout", False
+        ):
             kv_a, k_pe = (
                 get_kv_layers()
                 .read(self.attn_mha.layer_id)
