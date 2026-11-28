@@ -12,8 +12,10 @@ from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbeddingShardIndices,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpForConditionalGeneration,
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
@@ -230,11 +232,94 @@ def single_rank_runtime_context():
     override.install()
     try:
         with get_parallel().override(
-            tp_rank=0, tp_size=1, attn_tp_rank=0, attn_tp_size=1
+            tp_rank=0, tp_size=1, attn_tp_rank=0, attn_tp_size=1, tp_group=None
         ):
             yield
     finally:
         override.restore()
+
+
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("native_fp8", [False, True])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_qwen4_ple_fp8_shard_loading(
+    single_rank_runtime_context, monkeypatch, offload, native_fp8, reverse
+):
+    """BF16 shards with different ranges retain small values in FP8 storage;
+    checkpoint FP8 scales and offload prefetch produce the same lookup values."""
+    config = Qwen4ExpTextConfig(
+        vocab_size=64,
+        hidden_size=16,
+        hc_count=2,
+        ple_embed_dim=16,
+        ngram_size=2,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=31,
+        make_ngram_vocab_size_divisible_by=1,
+        split_ngram_parts=5,
+        eos_token_id=1,
+        ple_offload_embedding=offload,
+        ple_embedding_dtype="float8_e4m3fn",
+    )
+    with torch.device(DEVICE):
+        layer = Qwen4ExpPLELayer(config, layer_id=0)
+    ngram = layer.ple_embedding
+    emb = ngram.ngram_embedding
+    model = Qwen4ExpForConditionalGeneration.__new__(Qwen4ExpForConditionalGeneration)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(text_config=config, num_experts=None)
+    model.language_model_only = True
+    model.model = nn.Module()
+    model.model.start_layer, model.model.end_layer = 0, 1
+    model.model.layers = nn.ModuleList([nn.Module()])
+    model.model.layers[0].ple = layer
+    prefix = "model.layers.0.ple.ple_embedding.ngram_embedding"
+    shard_rows = (emb.org_vocab_size + 4) // 5
+    rows, weights = [], []
+    for i, amplitude in enumerate((0.0, 0.0002, 0.01, 1.0, 512.0)):
+        count = min(shard_rows, emb.org_vocab_size - i * shard_rows)
+        values = torch.arange(count * emb.embedding_dim, dtype=torch.float32).reshape(
+            count, -1
+        )
+        values = values - values.numel() // 4
+        values = values / values.max()
+        values = (
+            (values * 96).to(torch.float8_e4m3fn)
+            if native_fp8
+            else (values * amplitude).to(torch.bfloat16)
+        )
+        rows.append(values.to(torch.bfloat16) * (0.125 if native_fp8 else 1.0))
+        weights.append((f"{prefix}.shard_{i}.weight", values))
+    if native_fp8:
+        weights.append((f"{prefix}.weight_scale", torch.tensor([0.125])))
+    model.load_weights(iter(reversed(weights) if reverse else weights))
+    expected = torch.cat(rows).to(DEVICE)
+    ids = torch.arange(emb.org_vocab_size, device=DEVICE).reshape(-1, ngram.ngram_heads)
+    actual = ngram._embed_ngram_ids(ids, SimpleNamespace(), ids.shape[0])
+    torch.testing.assert_close(
+        actual, expected[ids], rtol=0 if native_fp8 else 0.075, atol=0
+    )
+    assert emb.weight_scale.isfinite().all() and (emb.weight_scale > 0).all()
+    if native_fp8:
+        assert emb.weight_scale.numel() == 1
+    if offload:
+        pool = SimpleNamespace(ple_window_cache=None)
+        monkeypatch.setattr(qwen4_exp_module, "get_req_to_token_pool", lambda: pool)
+        batch = SimpleNamespace(
+            physical_tokens=32,
+            ngram_context=torch.arange(64, device=DEVICE).reshape(32, 2),
+            use_decode_fast_path=True,
+            mode=ForwardMode.DECODE,
+        )
+        lookup_ids = ngram.compute_ngram_ids(batch)
+        layer.start_prefetch(batch, SimpleNamespace())
+        prefetched = layer._consume_prefetched_embeddings(SimpleNamespace())
+        torch.testing.assert_close(
+            prefetched,
+            expected[lookup_ids].flatten(1),
+            rtol=0 if native_fp8 else 0.075,
+            atol=0,
+        )
 
 
 def test_qwen4_ple_offload_avoids_device_table(single_rank_runtime_context):
