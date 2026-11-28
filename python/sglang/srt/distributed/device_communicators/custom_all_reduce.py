@@ -37,6 +37,11 @@ _is_musa = is_musa()
 logger = logging.getLogger(__name__)
 
 
+def _allocate_uncached_ipc_buffer(size: int) -> torch.Tensor:
+    # ROCr cannot IPC-export gfx12 uncached buffers under 1 MiB unless the size is page-aligned.
+    return ops.allocate_meta_buffer((size + 4095) // 4096 * 4096)
+
+
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     # The kernels throw on other dtypes (csrc/allreduce/custom_all_reduce.cu, .hip).
@@ -128,8 +133,16 @@ class CustomAllreduce:
             ops.register_buffer(self._ptr, self.buffer_ptrs)
         else:
             # meta data buffers need to be "uncached" for signal on MI200
-            self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-            self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
+            self.meta = _allocate_uncached_ipc_buffer(ops.meta_size() + max_size)
+            if full_nvlink:
+                self.buffer = torch.empty(
+                    max_size, dtype=torch.uint8, device=self.device
+                )
+            else:
+                # Without XGMI, peers read this buffer over PCIe and would miss
+                # writes still held in this GPU's L2 (gfx11 cannot flush it from
+                # a kernel), so the staging buffer bypasses the cache.
+                self.buffer = _allocate_uncached_ipc_buffer(max_size)
             handle = ops.get_meta_buffer_ipc_handle(self.meta)
             shard_data = (
                 bytes(handle),  # ipc handle to base ptr
