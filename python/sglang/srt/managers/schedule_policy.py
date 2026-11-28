@@ -1981,13 +1981,22 @@ class PrefillAdder:
         ):
             return AddReqResult.NO_TOKEN
 
-        if (self.prefill_delayer_single_pass is not None) and (
-            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                local_prefillable=True,
-                running_batch=self.running_batch.batch_size(),
-                max_prefill_bs=self.max_prefill_bs,
-                max_running_requests=self.max_running_requests,
-                waiting_queue_len=self.waiting_queue_len,
+        # Once this pass prefills, holding the rest back saves no forward, unless
+        # LoRA admission is rank-local and only the shared verdict keeps ranks equal.
+        if (
+            self.prefill_delayer_single_pass is not None
+            and (
+                not self.can_run_list
+                or self.prefill_delayer_single_pass.holds_requests_during_prefill
+            )
+            and (
+                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                    local_prefillable=True,
+                    running_batch=self.running_batch.batch_size(),
+                    max_prefill_bs=self.max_prefill_bs,
+                    max_running_requests=self.max_running_requests,
+                    waiting_queue_len=self.waiting_queue_len,
+                )
             )
         ):
             return AddReqResult.OTHER
@@ -2138,13 +2147,22 @@ class PrefillAdder:
                 return admission
 
             # A rejected candidate must not report prefillable or queue H2D.
-            if (self.prefill_delayer_single_pass is not None) and (
-                not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
-                    local_prefillable=True,
-                    running_batch=self.running_batch.batch_size(),
-                    max_prefill_bs=self.max_prefill_bs,
-                    max_running_requests=self.max_running_requests,
-                    waiting_queue_len=self.waiting_queue_len,
+            # Once this pass prefills, holding the rest back saves no forward, unless
+            # LoRA admission is rank-local and only the shared verdict keeps ranks equal.
+            if (
+                self.prefill_delayer_single_pass is not None
+                and (
+                    not self.can_run_list
+                    or self.prefill_delayer_single_pass.holds_requests_during_prefill
+                )
+                and (
+                    not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                        local_prefillable=True,
+                        running_batch=self.running_batch.batch_size(),
+                        max_prefill_bs=self.max_prefill_bs,
+                        max_running_requests=self.max_running_requests,
+                        waiting_queue_len=self.waiting_queue_len,
+                    )
                 )
             ):
                 return AddReqResult.OTHER

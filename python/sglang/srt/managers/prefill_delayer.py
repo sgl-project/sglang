@@ -10,6 +10,7 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    get_lora,
     get_parallel,
     get_schedule,
 )
@@ -105,6 +106,16 @@ class PrefillDelayer:
         parallel = get_parallel()
         self.num_dp_ranks = parallel.num_dp_ranks
         self.attn_dp_enabled = parallel.attn_dp_enabled
+        # Without attention DP every TP rank sees the same queue and admits the same
+        # batch, so its own row equals rank 0's and an idle verdict needs no gather.
+        # LoRA admission reads rank-local state (an async adapter copy, a wall-clock
+        # drain), so one rank can reach the delayer while another skips the request.
+        lora = get_lora()
+        rank_local_admission = bool(lora.enable_lora) and (
+            bool(lora.enable_lora_overlap_loading) or lora.lora_drain_wait_threshold > 0
+        )
+        self.rank_local_admission = rank_local_admission
+        self._local_row_is_shared = not (self.attn_dp_enabled or rank_local_admission)
         dp_size_dim = self.num_dp_ranks if self.attn_dp_enabled else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
@@ -193,6 +204,9 @@ class PrefillDelayer:
                 and (time.perf_counter() - prev_state.start_time) * 1000.0
                 >= self._max_delay_ms
             ),
+            # When every rank's row equals rank 0's, only an ongoing wait (timed by
+            # each rank's own clock) needs the gather.
+            local_only=prev_state is None and self._local_row_is_shared,
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
@@ -359,6 +373,7 @@ class PrefillDelayer:
         max_prefill_bs: int = 0,
         waiting_queue_len: int = 0,
         queue_timeout_expired: bool = False,
+        local_only: bool = False,
     ):
         local_info = torch.tensor(
             [
@@ -372,6 +387,8 @@ class PrefillDelayer:
             device=self._gather_device,
             dtype=torch.int64,
         )
+        if local_only:
+            return local_info[None]
         all_gather_single(
             self._global_info_buffer.flatten(),
             local_info,
@@ -391,6 +408,14 @@ class PrefillDelayerSinglePassExecutor:
     @property
     def _called(self) -> bool:
         return self._result is not None
+
+    @property
+    def holds_requests_during_prefill(self) -> bool:
+        # With rank-local LoRA admission, TP ranks can disagree on which queued
+        # requests are admissible. Only the shared delay verdict keeps their
+        # batches equal, so it must hold back new requests even when this pass
+        # already prefills a continuing chunk.
+        return self._prefill_delayer.rank_local_admission
 
     def finalize(self, *, actual_prefill_bs: int) -> int:
         if not self._called:
