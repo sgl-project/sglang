@@ -65,7 +65,7 @@ class _Adder(PrefillAdder):
         self.new_chunked_req = None
         self.rem_chunk_tokens = 0
 
-    def add_chunked_req(self, req):
+    def add_chunked_req(self, req, truncation_align_size=None):
         self.can_run_list.append(req)
         return None
 
@@ -80,7 +80,7 @@ class _Adder(PrefillAdder):
 class _ParkingAdder(_Adder):
     """The chunked request finds no budget and stays out of the batch."""
 
-    def add_chunked_req(self, req):
+    def add_chunked_req(self, req, truncation_align_size=None):
         return req
 
 
@@ -95,7 +95,7 @@ class _LimitsAdder(_Adder):
         self.rem_chunk_tokens = limits["rem_chunk_tokens"]
         self.chunked_req_limit = None
 
-    def add_chunked_req(self, req):
+    def add_chunked_req(self, req, truncation_align_size=None):
         self.can_run_list.append(req)
         return req if self.chunk_continues else None
 

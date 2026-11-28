@@ -25,6 +25,35 @@ def _check(align, chunk, attn_dp_size=1, mode=DisaggregationMode.NULL):
         scheduler.check_truncation_align_fits_chunk()
 
 
+def _align(prefill_backend, gdn, deterministic=True):
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.model_config = object()
+    exec_cfg = SimpleNamespace(
+        deterministic=SimpleNamespace(enable_deterministic_inference=deterministic)
+    )
+    with (
+        patch(f"{_MOD}.get_exec", return_value=exec_cfg),
+        patch(f"{_MOD}.attention_backends", return_value=(prefill_backend, "triton")),
+        patch(f"{_MOD}.hybrid_gdn_config", return_value=object() if gdn else None),
+    ):
+        scheduler.init_deterministic_inference_config()
+    return scheduler.truncation_align_size
+
+
+class TestGdnChunkAlign(CustomTestCase):
+    """Gated DeltaNet prefill results depend on where a prompt is split, so deterministic
+    hybrid GDN models must split prompts on the kernel's 64-token block grid."""
+
+    def test_gdn_model_aligns_to_its_block(self):
+        self.assertEqual(_align("triton", gdn=True), 64)
+        self.assertEqual(_align("flashinfer", gdn=True), 4096)
+
+    def test_other_models_and_normal_mode_unchanged(self):
+        self.assertIsNone(_align("triton", gdn=False))
+        self.assertEqual(_align("flashinfer", gdn=False), 4096)
+        self.assertIsNone(_align("triton", gdn=True, deterministic=False))
+
+
 class TestDeterministicChunkAlign(CustomTestCase):
     def test_chunk_shorter_than_alignment_fails_at_startup(self):
         with self.assertRaisesRegex(ValueError, "at least 8192"):
