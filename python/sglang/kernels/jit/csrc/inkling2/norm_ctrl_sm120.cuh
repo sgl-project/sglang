@@ -156,7 +156,7 @@ SGL_DEVICE void attn_res_norm_impl(
     qv0[i] = __ldg(&query[tid + i * kBlock]);
   }
 
-  uint32_t s_pair[N_STACK > 0 ? N_STACK : 1][4];
+  bf16x2_t s_pair[N_STACK > 0 ? N_STACK : 1][4];
   bf16_t s_tail[N_STACK > 0 ? N_STACK : 1];
   float last_x[kElems];
 
@@ -166,10 +166,8 @@ SGL_DEVICE void attn_res_norm_impl(
       bf16_t const* src_n = stack_ptrs.p[n] + row_off;
 #pragma unroll
       for (int32_t p = 0; p < 4; ++p) {
-        bf16x2_t b2;
-        b2.x = src_n[tid + (2 * p) * kBlock];
-        b2.y = src_n[tid + (2 * p + 1) * kBlock];
-        s_pair[n][p] = *reinterpret_cast<uint32_t const*>(&b2);
+        s_pair[n][p].x = src_n[tid + (2 * p) * kBlock];
+        s_pair[n][p].y = src_n[tid + (2 * p + 1) * kBlock];
       }
       s_tail[n] = src_n[tid + 8 * kBlock];
     }
@@ -194,7 +192,7 @@ SGL_DEVICE void attn_res_norm_impl(
       float sq = 0.0f, dp = 0.0f;
 #pragma unroll
       for (int32_t p = 0; p < 4; ++p) {
-        float2 const f2 = __bfloat1622float2(*reinterpret_cast<bf16x2_t const*>(&s_pair[n][p]));
+        float2 const f2 = __bfloat1622float2(s_pair[n][p]);
         sq += f2.x * f2.x;
         dp += qv0[2 * p] * f2.x;
         sq += f2.y * f2.y;
@@ -269,7 +267,7 @@ SGL_DEVICE void attn_res_norm_impl(
       float const wn = s_weights[n];
 #pragma unroll
       for (int32_t p = 0; p < 4; ++p) {
-        float2 const f2 = __bfloat1622float2(*reinterpret_cast<bf16x2_t const*>(&s_pair[n][p]));
+        float2 const f2 = __bfloat1622float2(s_pair[n][p]);
         mix[2 * p] += wn * f2.x;
         mix[2 * p + 1] += wn * f2.y;
       }
@@ -336,7 +334,7 @@ SGL_DEVICE void attn_res_mix_1q_s1_impl(
   for (int32_t i = 0; i < kElems; ++i)
     qv[i] = __ldg(&q_ptr[tid + i * kBlock]);
 
-  uint32_t s_pair[N_STACK][4];
+  bf16x2_t s_pair[N_STACK][4];
   bf16_t s_tail[N_STACK];
   float last_x[kElems];
 #pragma unroll
@@ -344,10 +342,8 @@ SGL_DEVICE void attn_res_mix_1q_s1_impl(
     bf16_t const* src_n = stack_ptrs.p[n] + row_off;
 #pragma unroll
     for (int32_t p = 0; p < 4; ++p) {
-      bf16x2_t b2;
-      b2.x = src_n[tid + (2 * p) * kBlock];
-      b2.y = src_n[tid + (2 * p + 1) * kBlock];
-      s_pair[n][p] = *reinterpret_cast<uint32_t const*>(&b2);
+      s_pair[n][p].x = src_n[tid + (2 * p) * kBlock];
+      s_pair[n][p].y = src_n[tid + (2 * p + 1) * kBlock];
     }
     s_tail[n] = src_n[tid + 8 * kBlock];
   }
@@ -369,7 +365,7 @@ SGL_DEVICE void attn_res_mix_1q_s1_impl(
     float sq = 0.0f, dp = 0.0f;
 #pragma unroll
     for (int32_t p = 0; p < 4; ++p) {
-      float2 const f2 = __bfloat1622float2(*reinterpret_cast<bf16x2_t const*>(&s_pair[n][p]));
+      float2 const f2 = __bfloat1622float2(s_pair[n][p]);
       sq += f2.x * f2.x;
       dp += qv[2 * p] * f2.x;
       sq += f2.y * f2.y;
@@ -439,7 +435,7 @@ SGL_DEVICE void attn_res_mix_1q_s1_impl(
     float const wn = s_weights[n];
 #pragma unroll
     for (int32_t p = 0; p < 4; ++p) {
-      float2 const f2 = __bfloat1622float2(*reinterpret_cast<bf16x2_t const*>(&s_pair[n][p]));
+      float2 const f2 = __bfloat1622float2(s_pair[n][p]);
       mix[2 * p] += wn * f2.x;
       mix[2 * p + 1] += wn * f2.y;
     }
@@ -745,7 +741,7 @@ __global__ void __launch_bounds__(256, 4) ctrl_down_v8_kernel(
   bf16_t const* A = cat + static_cast<int64_t>(s) * M * K;
   bf16_t const* W = W_down + static_cast<int64_t>(s) * R * K;
   bf16_t* C = h_out + static_cast<int64_t>(s) * M * R;
-  bf16_t const* w_base = W + static_cast<int64_t>(n_row) * K + t * 16;
+  bf16_t const* w_base = w_ok ? (W + static_cast<int64_t>(n_row) * K + t * 16) : nullptr;
   bf16_t const* a_base = A + t * 16;
   int32_t const k0 = warp * 64;
 
@@ -1072,8 +1068,8 @@ inline void pre_attn_mix_cross_s1(
   CHECK_HOST(n_stack >= 1 && n_stack <= 3) << "pre_attn_mix_cross_s1: requires 1 <= n_stack <= 3, got " << n_stack;
 
   int64_t const tokens = T.unwrap();
-  CHECK_HOST(tokens >= 0 && tokens <= std::numeric_limits<int32_t>::max())
-      << "pre_attn_mix_cross_s1: invalid token count " << tokens;
+  CHECK_HOST(tokens >= 0 && tokens <= 32)
+      << "pre_attn_mix_cross_s1: requires 0 <= tokens <= 32, got " << tokens;
   if (tokens == 0) return;
 
   dim3 const grid(static_cast<uint32_t>(tokens), is_swa ? 5u : 7u, 1u);
@@ -1148,8 +1144,8 @@ inline void pre_mlp_mix_s1(
   CHECK_HOST(n_stack >= 1 && n_stack <= 3) << "pre_mlp_mix_s1: requires 1 <= n_stack <= 3, got " << n_stack;
 
   int64_t const tokens = T.unwrap();
-  CHECK_HOST(tokens >= 0 && tokens <= std::numeric_limits<int32_t>::max())
-      << "pre_mlp_mix_s1: invalid token count " << tokens;
+  CHECK_HOST(tokens >= 0 && tokens <= 32)
+      << "pre_mlp_mix_s1: requires 0 <= tokens <= 32, got " << tokens;
   if (tokens == 0) return;
 
   bf16_t const* add_p = addend.has_value() ? static_cast<bf16_t const*>(addend.value().data_ptr()) : nullptr;

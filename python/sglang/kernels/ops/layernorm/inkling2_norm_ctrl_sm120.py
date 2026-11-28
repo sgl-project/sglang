@@ -84,16 +84,21 @@ def can_use_attn_res_norm_sm120(
         or not queries.is_cuda
         or queries.dtype != torch.float32
         or queries.device != partial.device
+        or queries.ndim not in (1, 2)
+        or queries.shape[-1] != NORM_CTRL_HIDDEN_SIZE
         or norm_w is None
         or not norm_w.is_cuda
         or norm_w.dtype != torch.bfloat16
         or norm_w.device != partial.device
+        or norm_w.ndim not in (1, 2)
+        or norm_w.shape[-1] != NORM_CTRL_HIDDEN_SIZE
         or not current_arch().is_sm(12)
         or is_batch_invariant_mode_enabled()
     ):
         return False
     num_q = 1 if queries.ndim == 1 else queries.shape[0]
-    return num_q in (1, 3)
+    num_nw = 1 if norm_w.ndim == 1 else norm_w.shape[0]
+    return num_q in (1, 3) and num_nw == num_q
 
 
 def can_use_loop_ctrl_sm120(
