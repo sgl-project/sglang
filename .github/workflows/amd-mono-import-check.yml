@@ -1,0 +1,44 @@
+name: AMD Monokernel Import Check
+
+# sgl-amd-mono (python/pyproject_other.toml, `monokernels_hip`) imports helpers
+# from sglang. This reads the pinned sgl-amd-mono's source and fails when one of
+# those imports no longer resolves in the PR's tree, so a rename or removal is
+# caught here instead of as an ImportError in the monokernel server.
+# Source only: no GPU, no torch.
+
+on:
+  pull_request:
+    paths:
+      - "python/sglang/**"
+      - "python/pyproject_other.toml"
+      - "scripts/ci/amd/check_sgl_amd_mono_imports.py"
+      - ".github/workflows/amd-mono-import-check.yml"
+  push:
+    branches: [main]
+    paths:
+      - "python/sglang/**"
+      - "python/pyproject_other.toml"
+  workflow_dispatch:
+
+concurrency:
+  group: amd-mono-import-check-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check sgl-amd-mono imports against this tree
+        run: python scripts/ci/amd/check_sgl_amd_mono_imports.py
