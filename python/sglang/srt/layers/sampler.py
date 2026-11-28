@@ -817,15 +817,16 @@ def top_k_top_p_min_p_filter_sorted_probs_torch(
     """Zero, in place, the entries of descending-sorted ``probs_sort`` that
     top-k, top-p, and min-p remove."""
     probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
+    probs_sort.masked_fill_(
         torch.arange(0, probs_sort.shape[-1], device=probs_sort.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+        >= top_ks.view(-1, 1),
+        0.0,
+    )
+    probs_sort.masked_fill_((probs_sum - probs_sort) > top_ps.view(-1, 1), 0.0)
 
     if need_min_p_sampling:
         min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+        probs_sort.masked_fill_(probs_sort < min_p_thresholds.view(-1, 1), 0.0)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(
