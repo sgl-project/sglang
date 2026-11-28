@@ -300,16 +300,15 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       test_timeout_minutes: '180'
 
-  # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
-  # Disabled for the temporary PR rerun pipeline: the qwen3.6-27b 1P in3k5/out1k5
-  # GPQA case is replaced by the GLM-5.3-Flash 1P1D 16P case in the multi-node
-  # job below, so the suite is no longer partitioned here.
+  # Temporary rerun: only the two single-node accuracy cases that failed in
+  # nightly run 46030846888 (qwen3.6-27b GPQA 0.8485 < 0.8527, moonlight 16B
+  # gsm8k 0.8279 < 0.82863). All other jobs stay disabled below.
   # HCCL_DETERMINISTIC was removed from the test file to re-measure the
   # temperature=0 run-to-run drift over a few nightly runs; restore it in the
   # test file if accuracy failures beyond the 5-question tolerance reappear.
   nightly-acc-test-2-npu-a3:
     name: nightly-acc-test-2-npu-a3
-    if: false
+    if: true
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -319,6 +318,7 @@ jobs:
       test_suite: nightly-acc-test-2-npu-a3
       only_tests: |
         test/registered/npu/accuracy/qwen3_6_27b/test_npu_qwen3_6_27b_w8a8_1p_in3k5_out1k5_50ms_gpqa.py
+        test/registered/npu/accuracy/moonshotai_moonlight_16b_a3b/test_npu_moonlight_16b_a3b_bf16_1p_gsm8k.py
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
       image: ${{ needs.set-image-config.outputs.image_a3 }}
@@ -361,8 +361,9 @@ jobs:
        run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   # The router launched by the PD-separation cases in nightly-poc-multi-node-specified-tests.
+  # Temporary rerun: disabled, no multi-node case runs in this pipeline.
   sgl-router-build-aarch64:
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-specified-tests,')) }}
+    if: false
     needs: [set-image-config]
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
@@ -484,9 +485,10 @@ jobs:
   # perf case still runs here, so only one PD deployment occupies the shared
   # 4-node pool. The GLM-5.3 32P PCP accuracy case already passed in run
   # 45770380384 and is disabled below.
+  # Temporary rerun: disabled, no multi-node case runs in this pipeline.
   nightly-poc-multi-node-specified-tests:
     name: multi-node-poc-specified-tests
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.job_filter == 'all' || contains(format(',{0},', needs.set-image-config.outputs.job_filter), ',nightly-poc-multi-node-specified-tests,')) }}
+    if: false
     needs: [set-image-config, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
