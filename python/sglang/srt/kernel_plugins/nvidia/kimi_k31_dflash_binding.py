@@ -44,6 +44,10 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.speculative.domino_corrector import (
+    CorrectorContext,
+    TransformerCorrector,
+)
 from sglang.srt.speculative.dspark_components.dspark_observability import (
     resolve_enabled_components,
 )
@@ -109,6 +113,11 @@ BINDINGS: dict[str, WorkerMember] = {
     ),
     "sim_acc_rng": WorkerMember(
         "_simulated_acc_len_rng", (torch.Generator, type(None))
+    ),
+    # the corrector head, and its per-request window (set by alloc_memory_pool)
+    "corrector": WorkerMember("corrector", (TransformerCorrector, type(None))),
+    "corrector_context": WorkerMember(
+        "corrector_context", (CorrectorContext, type(None))
     ),
     # set by init_attention_backends
     "need_mamba_verify_commit": WorkerMember("_need_mamba_verify_commit", bool),
@@ -187,6 +196,7 @@ GUARDS: dict[str, Callable[[DFlashWorkerV2], Any]] = {
     "selector_sampling": lambda w: w._selector_sampling_enabled,
     "lilicorr": lambda w: w.lilicorr is not None,
     "domino": lambda w: w._is_domino,
+    "corrector": lambda w: w.corrector is not None,
     "block_verification": lambda w: w._block_verification,
     "replicated_embed": lambda w: w._full_embed_gpu is not None,
     "aux_graph": lambda w: w._use_aux_graph,
@@ -255,7 +265,9 @@ def bind_dflash_runtime(
 
     runtime_cls = pkgutil.resolve_name(path)
     binding = DFlashBinding(worker, frozenset(runtime_cls.bindings))
-    unmet = DFlashGuard(runtime_cls.guards).unmet(worker)
+    # A runtime's round proposes with its own head and never fills the corrector's
+    # window, so it serves a corrector draft only when it says so.
+    unmet = DFlashGuard({"corrector": False, **runtime_cls.guards}).unmet(worker)
     if unmet:
         if tp0:
             logger.warning(

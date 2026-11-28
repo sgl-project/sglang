@@ -57,6 +57,8 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         worker.draft_kv_ring = None
         worker.selector = None
         worker.lilicorr = None
+        worker._corrector_cold_start = False
+        worker._corrector_sampling_enabled = False
         worker._info_dumper = Mock()
 
         draft_input = DFlashDraftInputV2.create_idle_input(device="cpu")

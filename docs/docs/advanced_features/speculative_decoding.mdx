@@ -627,6 +627,30 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### Domino transformer correctors
+
+For a checkpoint with `architectures: ["DFlash2DominoDraftModel"]` and
+`dflash_config.conditional_head: "transformer"`, use the same DFLASH launch
+flags shown above. The corrector uses the preceding picks and a window of
+target hidden states to adjust the draft logits. A greedy request takes the
+top pick of each position. A sampled request draws each pick from the adjusted
+scores at its temperature, and the target verifies the block against the
+probabilities the picks were drawn from, so
+`--speculative-use-block-verification` applies.
+
+This head requires CUDA with BF16 target embeddings and LM head weights. Its
+rollout is captured in the draft CUDA graph. Under tensor parallelism it scores
+one candidate pool shared by the block, sized by
+`--speculative-domino-candidate-pool-size`. Sampled picks are drawn from that
+pool; `0` scores the full vocabulary and proposes the top pick for every
+request.
+
+The context window holds only target states computed by the serving process.
+After a prefix-cache hit it starts with the first newly computed token, and on
+a PD decode server with the first decoded token. Use `--disable-radix-cache`
+and colocated serving when comparing draft acceptance against a run that
+processes the whole prompt.
+
 ### DFlash and DFlash2 with DP attention
 
 On NVIDIA CUDA, you can use attention DP with plain DFlash drafts and DFlash2

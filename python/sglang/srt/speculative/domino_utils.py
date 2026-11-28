@@ -130,6 +130,82 @@ def _domino_tp_candidate_state(
     return candidate_ids, candidate_base.transpose(0, 1)
 
 
+def corrector_unary_scores(
+    hidden: torch.Tensor,
+    lm_head: nn.Module,
+    *,
+    tp_group,
+    vocab_size: int,
+    num_unary_slots: int,
+    candidate_pool_size: int,
+    in_cuda_graph: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Score a block's draft slots, [batch, slots, hidden], on the vocab-sharded head.
+
+    The first ``num_unary_slots`` slots stay uncorrected and return their exact
+    argmax, [batch, num_unary_slots]. The others return their scores over one
+    block-shared candidate pool, [batch, corrected slots, K], with the pool's
+    token ids, [batch, K], or over the vocabulary with ids None.
+    """
+    weight = lm_head.weight
+    shard = getattr(lm_head, "shard_indices", None)
+    if shard is not None:
+        weight = weight[: shard.num_org_elements_padded]
+    batch_size, num_slots = hidden.shape[:2]
+    # As rows: matmul runs a strided 3-D input one request at a time, 1.3 ms
+    # against 0.07 ms at batch 32 on B300.
+    local = F.linear(hidden.reshape(batch_size * num_slots, -1), weight)
+    local = local.view(batch_size, num_slots, -1)
+    num_corrected = num_slots - num_unary_slots
+    pool_size = min(candidate_pool_size, vocab_size)
+    pooled = num_corrected > 0 and 0 < pool_size < vocab_size
+    if (
+        pooled
+        and tp_group.world_size > 1
+        and _domino_prefers_tp_candidate_pool(
+            batch_size=batch_size,
+            full_base_logits_bytes=num_slots
+            * batch_size
+            * vocab_size
+            * local.element_size(),
+            in_cuda_graph=in_cuda_graph,
+        )
+    ):
+        shard_range = dict(
+            org_vocab_start=shard.org_vocab_start_index,
+            num_org=shard.num_org_elements,
+            tp_group=tp_group,
+        )
+        unary_picks = [
+            _domino_tp_first_ids(local[:, slot], **shard_range)
+            for slot in range(num_unary_slots)
+        ]
+        candidate_ids, scores = _domino_tp_candidate_state(
+            local[:, num_unary_slots:].transpose(0, 1),
+            candidate_pool_size=pool_size,
+            **shard_range,
+        )
+        return (
+            local.new_zeros((batch_size, 0), dtype=torch.int64)
+            if not unary_picks
+            else torch.stack(unary_picks, dim=1),
+            scores.transpose(0, 1),
+            candidate_ids,
+        )
+    scores = tp_group.all_gather(local, dim=-1)[..., :vocab_size]
+    unary_picks = scores[:, :num_unary_slots].argmax(dim=-1)
+    scores = scores[:, num_unary_slots:]
+    if not pooled:
+        return unary_picks, scores, None
+    candidate_ids = torch.topk(
+        scores.amax(dim=1), k=pool_size, dim=-1, sorted=False
+    ).indices
+    scores = torch.gather(
+        scores, 2, candidate_ids[:, None, :].expand(-1, num_corrected, -1)
+    )
+    return unary_picks, scores, candidate_ids
+
+
 def validate_domino_runtime(
     *,
     device: torch.device,
@@ -140,7 +216,7 @@ def validate_domino_runtime(
     hidden_size: int,
     target_embedding: nn.Module,
     lm_head: nn.Module,
-    prefix_gru: nn.GRU,
+    prefix_gru: nn.GRU | None,
     embed_proj: nn.Sequential,
 ) -> None:
     """Validate the deliberately narrow correctness-first Domino runtime."""
@@ -281,23 +357,24 @@ def validate_domino_runtime(
             "DFLASH Domino target embedding/lm_head hidden size does not match "
             f"the draft hidden size {hidden_size}."
         )
-    if int(prefix_gru.input_size) != int(hidden_size):
-        raise ValueError(
-            "DFLASH Domino GRU input size does not match the draft hidden size."
-        )
-    if int(embed_proj[0].in_features) != int(hidden_size + prefix_gru.hidden_size):
-        raise ValueError("DFLASH Domino projector input shape is inconsistent.")
+    if prefix_gru is not None:
+        if int(prefix_gru.input_size) != int(hidden_size):
+            raise ValueError(
+                "DFLASH Domino GRU input size does not match the draft hidden size."
+            )
+        if int(embed_proj[0].in_features) != int(hidden_size + prefix_gru.hidden_size):
+            raise ValueError("DFLASH Domino projector input shape is inconsistent.")
     if int(embed_proj[2].out_features) != int(target_vocab_size):
         raise ValueError("DFLASH Domino projector output vocab size is inconsistent.")
 
     weights = (
         embedding_weight,
         lm_head_weight,
-        prefix_gru.weight_ih_l0,
-        prefix_gru.weight_hh_l0,
         embed_proj[0].weight,
         embed_proj[2].weight,
     )
+    if prefix_gru is not None:
+        weights += (prefix_gru.weight_ih_l0, prefix_gru.weight_hh_l0)
     non_bf16 = [
         str(weight.dtype) for weight in weights if weight.dtype != torch.bfloat16
     ]

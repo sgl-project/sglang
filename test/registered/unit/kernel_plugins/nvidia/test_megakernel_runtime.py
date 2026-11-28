@@ -304,6 +304,7 @@ class _DFlashWorker:
 
     block_size = 8
     _selector_sampling_enabled = True
+    corrector = None
 
     def __getattr__(self, name):
         return f"target worker's {name}"
@@ -378,6 +379,34 @@ class TestDFlashBinding(CustomTestCase):
             self.assertNoLogs(kimi_k31_dflash_binding.logger, "WARNING"),
         ):
             self.assertIsNone(self._bind(names, _selector_sampling_enabled=False))
+
+    def test_a_corrector_draft_binds_only_a_runtime_that_serves_one(self):
+        """The runtime's own round proposes without the corrector, so a runtime
+        that does not name the guard runs stock for such a draft."""
+        names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")
+        with self.assertLogs(kimi_k31_dflash_binding.logger, "WARNING") as logs:
+            self.assertIsNone(self._bind(names, corrector=object()))
+        self.assertIn("corrector is True, expected False", "".join(logs.output))
+        serves = type(
+            "Runtime",
+            (FakeDFlashRuntime,),
+            {
+                "guards": {**FakeDFlashRuntime.guards, "corrector": True},
+                "bindings": frozenset({"corrector", "corrector_context"}),
+            },
+        )
+        self.assertIsNone(self._bind(names, runtime=serves))
+        corrector = kimi_k31_dflash_binding.TransformerCorrector(
+            4,
+            {"d_model": 4, "heads": 2, "layers": 1, "context_window": 2},
+            1e-5,
+        )
+        runtime = self._bind(
+            names, runtime=serves, corrector=corrector, corrector_context=None
+        )
+        self.assertIsInstance(runtime, serves)
+        self.assertIs(runtime.binding.pull("corrector"), corrector)
+        self.assertIsNone(runtime.binding.pull("corrector_context"))
 
     def test_names_sglang_lacks_and_disagreeing_ranks_raise(self):
         names = SimpleNamespace(dflash_runtime="_fakes:FakeDFlashRuntime")

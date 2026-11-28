@@ -1,4 +1,5 @@
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from sglang.srt.models.dflash import (
     candidate_topk,
 )
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.domino_utils import corrector_unary_scores
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=42, suite="base-a-test-cpu")
@@ -335,6 +337,138 @@ def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
     torch.testing.assert_close(unary_logits, expected_logits.float())
 
 
+def _sharded_head(weight, rank):
+    """Seven tokens over two ranks; the last rank holds one padded row."""
+    start = 4 * rank
+    rows = weight[start : start + 4]
+    padded = torch.cat([rows, torch.full((4 - len(rows) + 1, 2), 1000.0)])
+    return SimpleNamespace(
+        weight=padded,
+        shard_indices=SimpleNamespace(
+            num_org_elements_padded=4,
+            org_vocab_start_index=start,
+            num_org_elements=len(rows),
+        ),
+    )
+
+
+def test_corrector_unary_scores_span_only_the_original_vocabulary():
+    hidden = torch.arange(12, dtype=torch.float32).view(2, 3, 2)
+    weight = torch.arange(14, dtype=torch.float32).view(7, 2)
+    other = torch.nn.functional.pad(hidden @ weight[4:].T, (0, 1), value=1000.0)
+    group = SimpleNamespace(
+        world_size=2, all_gather=lambda x, dim: torch.cat([x, other], dim=dim)
+    )
+    full = hidden @ weight.T
+    for pool_size in (0, 7):
+        picks, scores, candidate_ids = corrector_unary_scores(
+            hidden,
+            _sharded_head(weight, rank=0),
+            tp_group=group,
+            vocab_size=7,
+            num_unary_slots=1,
+            candidate_pool_size=pool_size,
+            in_cuda_graph=False,
+        )
+        assert candidate_ids is None
+        torch.testing.assert_close(picks, full[:, :1].argmax(-1))
+        torch.testing.assert_close(scores, full[:, 1:])
+
+
+def _expected_pool(full, num_unary_slots, pool_size):
+    corrected = full[:, num_unary_slots:]
+    ids = corrected.amax(dim=1).topk(pool_size, dim=-1).indices.sort(dim=-1).values
+    return ids, corrected.gather(2, ids[:, None, :].expand(-1, corrected.shape[1], -1))
+
+
+def _sorted_pool(scores, candidate_ids):
+    order = candidate_ids.argsort(dim=-1)
+    return candidate_ids.gather(1, order), scores.gather(
+        2, order[:, None, :].expand(-1, scores.shape[1], -1)
+    )
+
+
+def test_corrector_unary_scores_share_one_candidate_pool():
+    torch.manual_seed(0)
+    hidden, weight = torch.randn(2, 3, 2), torch.randn(7, 2)
+    full = hidden @ weight.T
+    picks, scores, candidate_ids = corrector_unary_scores(
+        hidden,
+        SimpleNamespace(weight=weight),
+        tp_group=SimpleNamespace(world_size=1, all_gather=lambda x, dim: x),
+        vocab_size=7,
+        num_unary_slots=1,
+        candidate_pool_size=3,
+        in_cuda_graph=True,
+    )
+    expected_ids, expected_scores = _expected_pool(full, 1, 3)
+    candidate_ids, scores = _sorted_pool(scores, candidate_ids)
+    torch.testing.assert_close(picks, full[:, :1].argmax(-1))
+    torch.testing.assert_close(candidate_ids, expected_ids)
+    torch.testing.assert_close(scores, expected_scores)
+
+
+class _TwoRankGroup:
+    """One TP group whose two ranks run in two threads and meet at each collective."""
+
+    world_size = 2
+
+    def __init__(self):
+        self._barrier = threading.Barrier(2)
+        self._parts = {}
+        self._rank = threading.local()
+
+    def bind(self, rank):
+        self._rank.value = rank
+
+    def _exchange(self, tensor):
+        self._parts[self._rank.value] = tensor
+        self._barrier.wait(timeout=30)
+        parts = [self._parts[0], self._parts[1]]
+        # Both ranks read before either deposits for the next collective.
+        self._barrier.wait(timeout=30)
+        return parts
+
+    def all_gather_into_tensor(self, output, input_):
+        output.copy_(torch.cat(self._exchange(input_), dim=0))
+
+    def all_reduce(self, input_):
+        first, second = self._exchange(input_)
+        return first + second
+
+
+def test_corrector_candidate_pool_agrees_across_tp_ranks():
+    torch.manual_seed(0)
+    hidden, weight = torch.randn(2, 4, 2), torch.randn(7, 2)
+    full = hidden @ weight.T
+    group, results = _TwoRankGroup(), {}
+
+    def run(rank):
+        group.bind(rank)
+        results[rank] = corrector_unary_scores(
+            hidden,
+            _sharded_head(weight, rank),
+            tp_group=group,
+            vocab_size=7,
+            num_unary_slots=1,
+            candidate_pool_size=3,
+            in_cuda_graph=True,
+        )
+
+    threads = [threading.Thread(target=run, args=(rank,)) for rank in (0, 1)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    expected_ids, expected_scores = _expected_pool(full, 1, 3)
+    for rank in (0, 1):
+        picks, scores, candidate_ids = results[rank]
+        candidate_ids, scores = _sorted_pool(scores, candidate_ids)
+        torch.testing.assert_close(picks, full[:, :1].argmax(-1))
+        torch.testing.assert_close(candidate_ids, expected_ids)
+        torch.testing.assert_close(scores, expected_scores)
+
+
 def test_merged_candidates_gather_over_the_head_group(monkeypatch):
     packed, gathered = torch.zeros(2, 8), torch.ones(2, 16)
     ids, vals = torch.zeros(2, 4, dtype=torch.long), torch.zeros(2, 4)
@@ -465,6 +599,39 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     worker.draft_model.lm_head = None
     assert worker_mod.DFlashWorkerV2._maybe_build_draft_sampler(worker) is None
     assert worker.draft_model.lm_head is None
+
+
+def test_corrector_rollout_is_folded_into_the_draft_graph(monkeypatch):
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    monkeypatch.setattr(
+        worker_mod.envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER, "get", lambda: False
+    )
+    decode = SimpleNamespace(bs=[1, 4])
+    monkeypatch.setattr(
+        worker_mod,
+        "get_exec",
+        lambda: SimpleNamespace(
+            graph=SimpleNamespace(cuda_graph_config=SimpleNamespace(decode=decode))
+        ),
+    )
+    worker = SimpleNamespace(
+        block_size=4,
+        _target_tp_rank=1,
+        selector=None,
+        lilicorr=None,
+        corrector=object(),
+        domino_candidate_pool_size=2048,
+        _build_corrector_sampler=lambda max_bs: ("corrector sampler", max_bs),
+        _target_worker=SimpleNamespace(
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(lm_head=torch.nn.Linear(4, 8, bias=False))
+            )
+        ),
+    )
+    sampler = worker_mod.DFlashWorkerV2._maybe_build_draft_sampler(worker)
+    assert sampler == ("corrector sampler", 4)
+    assert worker._corrector_sampler is sampler
 
 
 def test_disabled_selector_sampling_forces_greedy_draft():
