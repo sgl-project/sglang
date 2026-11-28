@@ -287,5 +287,42 @@ def test_merge_attn_states(
         generate_markdown_table()
 
 
+@pytest.mark.parametrize("output_dtype", [torch.float32] + DTYPES)
+@torch.inference_mode()
+def test_merge_state_v2_both_empty(output_dtype: torch.dtype):
+    # A token whose prefix and suffix both attended to no keys has both LSEs at -inf
+    # (or +inf, which the kernel maps to -inf). It must merge to zeros with an LSE of
+    # -inf instead of NaN, and the other tokens must merge as usual.
+    num_tokens, num_heads, head_size = 6, 8, 128
+    prefix_output = torch.randn(
+        (num_tokens, num_heads, head_size), dtype=output_dtype, device="cuda"
+    )
+    suffix_output = torch.randn_like(prefix_output)
+    prefix_lse = torch.randn(num_tokens, num_heads, dtype=torch.float32, device="cuda")
+    suffix_lse = torch.randn_like(prefix_lse)
+    empty = slice(2, 4)
+    prefix_lse[empty] = float("-inf")
+    suffix_lse[empty] = float("-inf")
+    suffix_lse[3] = float("inf")
+
+    output, output_lse = merge_state_v2(
+        prefix_output, prefix_lse, suffix_output, suffix_lse
+    )
+
+    assert not output.isnan().any()
+    assert torch.all(output[empty] == 0)
+    assert torch.all(output_lse[empty] == float("-inf"))
+    output_ref, output_lse_ref = merge_state_torch(
+        prefix_output, prefix_lse.clone(), suffix_output, suffix_lse.clone()
+    )
+    for rows in (slice(0, 2), slice(4, num_tokens)):
+        torch.testing.assert_close(
+            output[rows].float(), output_ref[rows].float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            output_lse[rows], output_lse_ref[rows], atol=1e-3, rtol=1e-3
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
