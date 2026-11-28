@@ -1,6 +1,7 @@
 """Unit tests for Spark25Detector - no server, no model loading."""
 
 import json
+import time
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -133,6 +134,18 @@ class TestSpark25DetectorDetectAndParse(CustomTestCase):
             result = self.detector.detect_and_parse(unknown, self.tools)
             self.assertEqual(result.calls[0].name, "missing")
             self.assertEqual(json.loads(result.calls[0].parameters), {"value": "1"})
+
+    def test_unclosed_arg_keys_parse_in_linear_time(self):
+        # A lazy regex over the argument pairs rescanned the block from every
+        # unclosed <arg_key>, so ~180 KB took seconds of CPU (#52090).
+        text = "<tool_call>now" + "<arg_key>" * 20000 + "</tool_call>"
+        started = time.perf_counter()
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+        self.assertLess(elapsed, 1.0)
 
     def test_stream_end_flushes_partial_marker_and_required_stays_native(self):
         result = self.detector.parse_streaming_increment("plain<tool_", self.tools)
