@@ -124,6 +124,19 @@ def offer_future_relay_buffers(relay: FutureRelayBuffers) -> None:
     _offered_relay = relay
 
 
+def pre_upload_prefill_input_ids(batch: ScheduleBatch) -> None:
+    """Upload a pure prefill batch's input_ids now, on the current stream,
+    instead of at forward entry; resolve_forward_inputs then has nothing to copy.
+
+    A mixed batch keeps the deferred upload: its input_ids also gather the
+    running rows' tokens from the FutureMap at forward entry.
+    """
+    if batch.prefill_input_ids_cpu is None or batch.mix_running_indices is not None:
+        return
+    batch.input_ids = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+    batch.prefill_input_ids_cpu = None
+
+
 def resolve_forward_inputs(
     batch: ScheduleBatch, future_map: Optional[FutureMap]
 ) -> bool:
