@@ -85,6 +85,10 @@ from sglang.srt.speculative.dflash_draft_ring import (
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_sparse_verify import (
+    DFlashSparseVerify,
+    SparseSupport,
+)
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -765,6 +769,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             is_hip() and envs.SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS.get()
         )
         self._target_logits_processor = self._defer_target_verify_gather()
+        # LiLiCorr stages the same candidate ids and q rows as the selector.
+        self._sparse_verify = DFlashSparseVerify.create(
+            logits_processor=self._target_logits_processor,
+            tp_size=get_parallel().tp_group.world_size,
+            has_selector=self.selector is not None or self._lilicorr_sampling_enabled,
+            block_verification=self._block_verification,
+            lm_head=unwrap_lora_layer(
+                getattr(self.target_worker.model_runner.model, "lm_head", None)
+            ),
+        )
         self._aux_graphs = {}
         self._mamba_commit_buffers = None
         self._use_commit_metadata = (
@@ -890,6 +904,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def clear_info_records(self) -> None:
         self._info_dumper.clear()
+
+    @property
+    def sparse_verify_ct(self) -> Optional[int]:
+        """Verify steps accepted on the top-k support; None when it cannot run."""
+        return None if self._sparse_verify is None else self._sparse_verify.verify_ct
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
         processors = [
@@ -1133,6 +1152,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             or not is_dflash_sampling_verify_available()
         ):
             return self.model_runner.prewarm_sampling()
+        if self._sparse_verify is not None and self.selector is not None:
+            self._sparse_verify.prewarm(
+                device=self.device,
+                block_size=int(self.block_size),
+                selector_top_k=self.selector.top_k,
+                tp_group=get_parallel().tp_group,
+            )
 
         block_size = int(self.block_size)
         vocab_size = self.model_config.vocab_size
@@ -2794,6 +2820,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs: int,
         target_predict: Optional[torch.Tensor] = None,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        sparse_support: Optional[SparseSupport] = None,
     ):
         """With cutoff_verify_lens, request i accepts at most
         cutoff_verify_lens[i] - 1 drafts and takes its bonus from the last row
@@ -2801,8 +2828,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         out_tokens = None
         new_seq_lens = None
         cap_trim_lens = None
-        # A resolved argmax (vocab-sharded verify) means the accept is greedy.
-        if target_predict is None and self._selector_sample is not None:
+        if sparse_support is not None:
+            assert cutoff_verify_lens is None
+            selector_candidate_ids, selector_q_rows = self._selector_sample
+            accept_len, bonus = self._sparse_verify.accept(
+                candidates=candidates,
+                support=sparse_support,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+                sampling_info=sampling_info,
+                max_top_k=draft_input.max_top_k,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+            # The dense selector accept reports zero cutoff trims, so block_accept_lens
+            # still counts this step.
+            cap_trim_lens = torch.zeros_like(accept_len)
+        # Otherwise a resolved argmax (vocab-sharded verify) means the accept is greedy.
+        elif target_predict is None and self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus, cap_trim_lens = self._selector_sampling_accept(
                 candidates=candidates,
@@ -3604,6 +3647,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
+        sparse_support = None
         target_lp = self._target_logits_processor
         if target_lp is not None and target_lp.is_deferred_shard(
             logits_output.next_token_logits
@@ -3612,6 +3656,27 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_predict = target_lp.deferred_argmax(
                     logits_output.next_token_logits
                 )
+                logits_output.next_token_logits = None
+            # A staged selector sample implies a sampled (not all-greedy) batch.
+            elif (
+                self._sparse_verify is not None
+                and layout is None
+                and self._selector_sample is not None
+                and self._sparse_verify.eligible(
+                    batch=batch,
+                    sampling_info=sampling_info,
+                    max_top_k=draft_input.max_top_k,
+                    shard_width=logits_output.next_token_logits.shape[1],
+                )
+            ):
+                sparse_support = self._sparse_verify.support(
+                    tp_group=get_parallel().tp_group,
+                    logits_shard=logits_output.next_token_logits,
+                    max_top_k=draft_input.max_top_k,
+                )
+                # The support's argmax is the full row's torch.argmax, for
+                # simulated acceptance; nothing on this path reads the dense logits.
+                target_predict = sparse_support[2].view(bs, int(self.block_size))
                 logits_output.next_token_logits = None
             else:
                 logits_output.next_token_logits = target_lp.finish_deferred_gather(
@@ -3643,6 +3708,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
+            sparse_support=sparse_support,
         )
         verify.commit(
             VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),

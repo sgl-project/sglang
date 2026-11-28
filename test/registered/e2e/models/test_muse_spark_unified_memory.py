@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.muse_spark_utils import try_cached_muse_spark_model
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
@@ -17,7 +19,8 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=800, stage="nightly", runner_config="8-gpu-b300")
+# Two server launches: the base config and the sparse-verify subclass.
+register_cuda_ci(est_time=1600, stage="nightly", runner_config="8-gpu-b300")
 
 MODEL_PATH = "meta-models/Muse-Spark-Open-816B-A42B-NVFP4"
 DRAFT_MODEL_PATH = "RadixArk/Muse-Spark-Open-DFlash2"
@@ -26,6 +29,9 @@ DRAFT_MODEL_PATH = "RadixArk/Muse-Spark-Open-DFlash2"
 class TestMuseSparkUnifiedMemory(DefaultServerBase):
     timeout = 3600
     gsm8k_accuracy_thres = 0.93
+    eval_top_p = 0.95
+    eval_top_k = None
+    summary_title = "Muse Spark NVFP4 unified memory (TP4/EP4)"
 
     @classmethod
     def setUpClass(cls):
@@ -94,7 +100,8 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
                 reasoning_effort="xhigh",
                 max_tokens=32768,
                 temperature=1.0,
-                top_p=0.95,
+                top_p=self.eval_top_p,
+                top_k=self.eval_top_k,
             )
         )
         result = json.loads(Path(metrics["sgl_eval_metrics_path"]).read_text())
@@ -103,10 +110,29 @@ class TestMuseSparkUnifiedMemory(DefaultServerBase):
         self.assertEqual(metrics["error_rate"], 0.0)
         if is_in_ci():
             write_github_step_summary(
-                f"### Muse Spark NVFP4 unified memory (TP4/EP4)\n"
-                f"GSM8K (1319): {metrics['score']:.4f}\n"
+                f"### {self.summary_title}\nGSM8K (1319): {metrics['score']:.4f}\n"
             )
         self.assertGreaterEqual(metrics["score"], self.gsm8k_accuracy_thres)
+
+
+class TestMuseSparkUnifiedMemorySparseVerify(TestMuseSparkUnifiedMemory):
+    server_env = {"SGLANG_OPT_DFLASH_SPARSE_VERIFY": "1"}
+    # Sparse verify takes only sampled batches without top-p and with top_k <= 64;
+    # 64 is the generation config's top_k.
+    eval_top_p = 1.0
+    eval_top_k = 64
+    summary_title = "Muse Spark NVFP4 unified memory (TP4/EP4), sparse verify"
+
+    def test_gsm8k(self):
+        super().test_gsm8k()
+        response = requests.get(f"{self.base_url}/server_info", timeout=30)
+        response.raise_for_status()
+        states = response.json()["internal_states"]
+        self.assertTrue(states)
+        sparse_verify_ct = states[0].get("dflash_sparse_verify_ct")
+        print(f"dflash_sparse_verify_ct={sparse_verify_ct}")
+        self.assertIsNotNone(sparse_verify_ct, "sparse verify was not enabled")
+        self.assertGreater(sparse_verify_ct, 0)
 
 
 if __name__ == "__main__":
