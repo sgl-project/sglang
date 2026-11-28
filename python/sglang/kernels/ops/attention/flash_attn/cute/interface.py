@@ -30,7 +30,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from sglang.kernels.ops.attention import fa4_sm120
 from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
     get_forward_host,
-    try_cached_paged_decode,
+    try_cached_paged,
     try_cached_varlen,
 )
 from sglang.kernels.ops.attention.flash_attn.cute import fa_logging, utils
@@ -464,7 +464,7 @@ def _flash_attn_fwd(
             )
         )
     ):
-        fast_result = try_cached_paged_decode(
+        fast_result = try_cached_paged(
             arch=arch,
             q=q,
             k=k,
@@ -1967,7 +1967,7 @@ def _flash_attn_fwd(
                 None,
             )
             compiled_combine = _flash_attn_fwd_combine.compile_cache[combine_key]
-        arch_forward_host.register_paged_decode(
+        arch_forward_host.register_paged(
             arch=arch,
             compiled_fn=compiled_fwd,
             compile_key=compile_key,

@@ -6,12 +6,14 @@ No models, GPU, or network: the registry detector tests patch
 ``maybe_download_model_index``; stages run with stand-in encoders.
 """
 
+import contextlib
+import io
 import logging
 import math
 import os
 from dataclasses import fields, replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -1338,14 +1340,18 @@ def _extract_with_fake_reader(monkeypatch, *, sample_rate, samples=None, error=N
     import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.audio as mod
 
     reader_calls: list[tuple] = []
+    video = io.BytesIO(b"drv")
 
-    def fake_decode(path, *, target_sr, mono):
-        reader_calls.append((path, target_sr, mono))
+    def fake_decode(source, *, target_sr, mono):
+        reader_calls.append((source.read(), target_sr, mono))
         if error is not None:
             raise error
         return samples
 
-    monkeypatch.setattr(mod, "_audio_track_sample_rate", lambda path: sample_rate)
+    monkeypatch.setattr(
+        mod, "open_video_source", lambda path: contextlib.nullcontext(video)
+    )
+    monkeypatch.setattr(mod, "_audio_track_sample_rate", lambda source: sample_rate)
     monkeypatch.setattr(mod, "decode_audio_container", fake_decode)
     logs = {"info": [], "warning": [], "no_audio_track": []}
     result = mod.extract_reference_video_audio(
@@ -1363,7 +1369,7 @@ def test_extracted_audio_is_batched_channels_first_at_the_native_rate(monkeypatc
     (audio, sample_rate), logs, reader_calls = _extract_with_fake_reader(
         monkeypatch, sample_rate=48000, samples=samples
     )
-    assert reader_calls == [("drv.mp4", 48000, False)]
+    assert reader_calls == [(b"drv", 48000, False)]
     assert sample_rate == 48000
     assert audio.shape == (1, 2, 480) and audio.dtype == torch.float32
     assert audio.is_contiguous()
@@ -1403,9 +1409,12 @@ def test_reader_failures_warn_with_the_reader_message(monkeypatch):
 def test_missing_reader_dependency_warns_instead_of_raising(monkeypatch):
     import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.audio as mod
 
-    def probe(path):
+    def probe(source):
         raise ImportError("No module named 'av'")
 
+    monkeypatch.setattr(
+        mod, "open_video_source", lambda path: contextlib.nullcontext(io.BytesIO())
+    )
     monkeypatch.setattr(mod, "_audio_track_sample_rate", probe)
     warnings: list[str] = []
     result = mod.extract_reference_video_audio(
@@ -1758,13 +1767,27 @@ def test_reference_video_url_uses_native_media_loading(tmp_path):
     expected = read_reference_video_frames(str(path), 8)
     assert expected.shape == (2, 32, 64, 3)
     with patch(
-        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
-        "wan_animate_2.preprocess.get_video_bytes",
-        return_value=path.read_bytes(),
+        "sglang.multimodal_gen.runtime.utils.vision.download_video_to_stream",
+        side_effect=lambda _, output: output.write(path.read_bytes()),
     ) as download:
         actual = read_reference_video_frames("https://example.com/reference.mp4", 8)
-    download.assert_called_once_with("https://example.com/reference.mp4")
+    download.assert_called_once()
+    assert download.call_args.args[0] == "https://example.com/reference.mp4"
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_reference_video_ffmpeg_protocol_string_is_never_opened():
+    payload = "subfile,,start,0,end,99,,:http:169.254.169.254/latest"
+    reader = MagicMock()
+    fake_decord = SimpleNamespace(VideoReader=reader)
+    with (
+        patch.dict("sys.modules", {"decord": fake_decord, "decord2": fake_decord}),
+        patch("av.open") as av_open,
+        pytest.raises(ValueError),
+    ):
+        read_reference_video_frames(payload, 8)
+    reader.assert_not_called()
+    av_open.assert_not_called()
 
 
 class _StubVae:
