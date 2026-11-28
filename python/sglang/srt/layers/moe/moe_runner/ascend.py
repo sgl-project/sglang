@@ -33,6 +33,7 @@ from sglang.srt.hardware_backend.npu.moe.routing import (
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUMXFP8MoEMethod,
+    NPUUnquantMoEMethod,
     NPUW4A8Int8MoEMethod,
     NPUW4A8MXFP4MoEMethod,
     NPUW8A8Int8MoEMethod,
@@ -180,6 +181,18 @@ class AscendRunnerCore(MoeRunnerCore):
             and config.swiglu_limit > 0
         ):
             self.activation = NPUSwigluWithLimit(config.swiglu_limit)
+        elif (
+            isinstance(kernel, NPUUnquantMoEMethod)
+            and config.activation == "silu"
+            and config.swiglu_limit is not None
+            and config.swiglu_limit > 0
+        ):
+            # GLM clamps gate/up before SiLU, including BF16/FP16 and A2A paths.
+            inner = NPUSwigluWithLimit(config.swiglu_limit)
+            if getattr(config, "use_tp_all_gather_activation", False):
+                self.activation = AllGatherActivationWrapper(inner, dim=-1)
+            else:
+                self.activation = inner
         elif get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
             # DeepEP / Ascend Ops path: the dispatcher hands over tokens grouped
             # by expert, so use a unified kernel that decides quantisation.
