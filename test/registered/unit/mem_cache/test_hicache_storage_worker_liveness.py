@@ -65,8 +65,10 @@ def _controller(cls=HiCacheController):
     cc._host_pool_schemas = []
     if cls is HybridCacheController:
         cc.pp_prefetch_command_thread = None
+        cc.pp_prefetch_command_group = None
         cc.pp_prefetch_state_lock = threading.Lock()
         cc.pp_prefetch_states = {}
+        cc.pp_prefetch_decisions = {}
     return cc
 
 
@@ -953,6 +955,124 @@ class TestStorageWorkerStop(unittest.TestCase):
         cc.pp_prefetch_command_thread = finished
         self.assertEqual(cc._storage_worker_threads(), [])
         self.assertEqual(cc.dead_storage_workers(), [])
+
+
+class TestStorageTouchLifecycle(unittest.TestCase):
+    def _start_touch_worker(self, cls, backend):
+        cc = _controller(cls)
+        cc.enable_storage = True
+        cc.storage_config = SimpleNamespace(is_storage_writer=True)
+        cc.storage_backend = backend
+        cc.backup_thread = cc._start_storage_worker(
+            "hicache-backup", cc.backup_thread_func
+        )
+        self.addCleanup(cc._stop_storage_threads)
+        return cc
+
+    def test_touch_preserves_hints_and_survives_backend_error(self):
+        for cls in (HiCacheController, HybridCacheController):
+            with self.subTest(controller=cls.__name__):
+                backend = SimpleNamespace(
+                    batch_touch=Mock(
+                        side_effect=[RuntimeError("retain unavailable"), None]
+                    )
+                )
+                cc = self._start_touch_worker(cls, backend)
+                with self.assertLogs(cache_controller.logger, level="ERROR") as logs:
+                    cc.touch_storage(["root", "leaf"], ttl_s=90)
+                    cc.touch_storage(["policy-only"], ttl_s=0)
+                    acks = _wait_for(cc.ack_backup_queue, 2, timeout=5.0)
+
+                calls = [
+                    (c.args[0], c.args[1].extra_info)
+                    for c in backend.batch_touch.call_args_list
+                ]
+                self.assertEqual(
+                    calls,
+                    [
+                        (["root", "leaf"], {"retain_ttl_s": 90}),
+                        (["policy-only"], None),
+                    ],
+                )
+                self.assertTrue(all(a.completed_tokens == 0 for a in acks))
+                self.assertIn("retain unavailable", "\n".join(logs.output))
+                self.assertEqual(cc._storage_worker_failures, {})
+                cc.detach_storage_backend()
+
+                # A completed detach does not admit another touch after its stop.
+                cc.touch_storage(["after-detach"], ttl_s=60)
+                self.assertEqual(backend.batch_touch.call_count, 2)
+
+    def test_detach_waits_for_active_touch_and_drops_queued_touch(self):
+        for cls in (HiCacheController, HybridCacheController):
+            with self.subTest(controller=cls.__name__):
+                entered = threading.Event()
+                release = threading.Event()
+                stop_requested = threading.Event()
+                events = []
+
+                class ObservedStopEvent(threading.Event):
+                    def set(self):
+                        super().set()
+                        stop_requested.set()
+
+                def touch(keys, extra_info):
+                    events.append(("touch", keys, extra_info.extra_info))
+                    entered.set()
+                    release.wait(timeout=5.0)
+
+                backend = SimpleNamespace(
+                    batch_touch=Mock(side_effect=touch),
+                    close=Mock(side_effect=lambda: events.append(("close",))),
+                )
+                cc = _controller(cls)
+                cc.storage_stop_event = ObservedStopEvent()
+                cc.enable_storage = True
+                cc.storage_config = SimpleNamespace(is_storage_writer=True)
+                cc.storage_backend = backend
+                cc.backup_thread = cc._start_storage_worker(
+                    "hicache-backup", cc.backup_thread_func
+                )
+                self.addCleanup(cc._stop_storage_threads)
+                self.addCleanup(release.set)
+                cc.touch_storage(["root", "leaf"], ttl_s=300)
+                cc.touch_storage(["after-stop"], ttl_s=600)
+                self.assertTrue(entered.wait(timeout=5.0))
+
+                detach_errors = []
+
+                def detach():
+                    try:
+                        cc.detach_storage_backend()
+                    except BaseException as exc:
+                        detach_errors.append(exc)
+
+                detacher = threading.Thread(target=detach)
+                detacher.start()
+                self.assertTrue(stop_requested.wait(timeout=5.0))
+                backend.close.assert_not_called()
+
+                release.set()
+                detacher.join(timeout=5.0)
+                self.assertFalse(detacher.is_alive())
+                self.assertEqual(detach_errors, [])
+                self.assertEqual(
+                    events[0],
+                    ("touch", ["root", "leaf"], {"retain_ttl_s": 300}),
+                )
+                self.assertEqual(events[1], ("close",))
+                self.assertEqual(len(events), 2)
+                self.assertIsNone(cc.storage_backend)
+                self.assertFalse(cc.enable_storage)
+
+                ack = cc.ack_backup_queue.get(timeout=1.0)
+                self.assertEqual(
+                    (ack.hash_value, ack.completed_tokens), (["root", "leaf"], 0)
+                )
+                # The second operation stays queued, not dispatched after close.
+                self.assertEqual(
+                    cc.backup_queue.get_nowait().hash_value, ["after-stop"]
+                )
 
 
 if __name__ == "__main__":

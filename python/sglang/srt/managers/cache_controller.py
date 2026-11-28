@@ -278,6 +278,14 @@ class StorageOperation:
         return self.id < other.id
 
 
+class StorageTouchOperation(StorageOperation):
+    """A retention/hotness hint processed by the controlled backup worker."""
+
+    def __init__(self, hash_values: List[str], ttl_s: int = 0):
+        super().__init__(None, [], hash_value=hash_values)
+        self.ttl_s = ttl_s
+
+
 # Buffer-mode staging budgets. Prefetch staging is latency-critical
 # (wait_complete gates TTFT), so loads may fill the pool up to this fraction
 # before new prefetches are declined.
@@ -1654,6 +1662,19 @@ class HiCacheController:
         """Advance the backend's prefix context past omitted pages."""
         return prefix_keys + hash_values if prefix_keys is not None else None
 
+    def touch_storage(self, hash_values: List[str], ttl_s: int = 0) -> None:
+        """Tell the storage backend a request just used ``hash_values`` (its
+        whole page-hash chain); see ``HiCacheStorage.batch_touch``. Runs off
+        the scheduler thread; failures only log."""
+        if (
+            not self.enable_storage
+            or self.backup_skip
+            or not hash_values
+            or self.storage_stop_event.is_set()
+        ):
+            return
+        self.backup_queue.put(StorageTouchOperation(hash_values, ttl_s))
+
     def write_storage(
         self,
         host_indices: torch.Tensor,
@@ -1717,6 +1738,22 @@ class HiCacheController:
                 "HiCache backup failed after %d tokens", operation.completed_tokens
             )
 
+    def _touch_storage_or_log(self, operation: StorageTouchOperation) -> None:
+        try:
+            if self.storage_stop_event.is_set():
+                return
+            extra_info = HiCacheStorageExtraInfo(
+                extra_info={"retain_ttl_s": operation.ttl_s}
+                if operation.ttl_s
+                else None
+            )
+            self.storage_backend.batch_touch(operation.hash_value, extra_info)
+        except Exception:
+            logger.exception(
+                "HiCache storage touch failed for %d hashes",
+                len(operation.hash_value),
+            )
+
     def backup_thread_func(self):
         """
         Manage backup operations from host memory to storage backend.
@@ -1728,7 +1765,10 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
-                    self._page_backup_or_log(operation)
+                    if isinstance(operation, StorageTouchOperation):
+                        self._touch_storage_or_log(operation)
+                    else:
+                        self._page_backup_or_log(operation)
                 self.ack_backup_queue.put(operation)
 
             except Empty:

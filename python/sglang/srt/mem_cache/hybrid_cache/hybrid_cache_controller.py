@@ -27,6 +27,9 @@ from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
 from sglang.srt.managers.cache_controller import (
+    StorageTouchOperation,
+)
+from sglang.srt.managers.cache_controller import (
     check_dcp_l3_extra_pool,
 )
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
@@ -2139,7 +2142,10 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup_or_log(operation)
+                if isinstance(operation, StorageTouchOperation):
+                    self._touch_storage_or_log(operation)
+                else:
+                    self._page_backup_or_log(operation)
                 self.ack_backup_queue.put(operation)
             except Empty:
                 continue
