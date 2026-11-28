@@ -152,6 +152,20 @@ def marlin_moe_generate_valid_test_cases():
 
 
 class TestFusedMarlinMoe(CustomTestCase):
+    def test_masked_topk_sum(self):
+        from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
+
+        ids = torch.tensor(
+            [[-1, 2, -1], [-1, -1, -1], [2, 1, 0]], device="cuda", dtype=torch.int32
+        )
+        x = torch.randn(3, 3, 2560, device="cuda", dtype=torch.bfloat16)
+        inactive = ids.unsqueeze(-1) < 0
+        expected = x.masked_fill(inactive, 0).float().sum(dim=1).bfloat16()
+        x.masked_fill_(inactive, float("nan"))
+        out = torch.empty_like(expected)
+        moe_topk_sum(x, out, expert_ids=ids)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
     @classmethod
     def setUpClass(cls):
         if not torch.cuda.is_available():
