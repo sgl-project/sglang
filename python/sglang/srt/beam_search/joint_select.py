@@ -99,6 +99,20 @@ def joint_select(
             num_finished=torch.zeros((), dtype=torch.int64, device=tokens.device),
         )
 
+    # Small ordinary beams fit in one CTA, including stop classification and
+    # both score-ordered outputs. Larger frontiers use the tensor path below.
+    if (
+        tokens.is_cuda
+        and torch.version.cuda is not None
+        and k <= num_candidates <= 64
+        and 0 < stop_token_ids.numel() <= 4
+    ):
+        from sglang.kernels.ops.sampling.beam_selection import compact_candidates
+
+        return SelectResult(
+            *compact_candidates(tokens, parent, cand_scores, stop_token_ids, k)
+        )
+
     if stop_token_ids.numel() > 0:  # static-shape branch, constant under capture
         is_stop = torch.isin(tokens, stop_token_ids)
     else:
