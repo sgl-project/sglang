@@ -25,12 +25,18 @@ if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 1
         allow_module_level=True,
     )
 
+from sglang.srt.layers.attention.linear.kda_backend import (  # noqa: E402
+    KDAKernelDispatcher,
+)
 from sglang.srt.layers.attention.linear.kernels.kda_flashinfer import (  # noqa: E402
     FlashInferKDAKernel,
     _get_flashinfer_kda_kernel,
 )
 from sglang.srt.layers.attention.linear.kernels.kda_triton import (  # noqa: E402
     TritonKDAKernel,
+)
+from sglang.srt.layers.attention.linear.utils import (  # noqa: E402
+    LinearAttnKernelBackend,
 )
 
 _available, _ = _get_flashinfer_kda_kernel()
@@ -104,7 +110,7 @@ def _make_verify_inputs(
     )
 
 
-def _decode(kern, d, ssm):
+def _decode(kern, d, ssm, lower_bound=None):
     # `ssm` is updated in place (committed-pool decode step); pass a fresh clone.
     return kern.decode(
         d["q"],
@@ -117,10 +123,11 @@ def _decode(kern, d, ssm):
         ssm_states=ssm,
         cache_indices=d["cache_indices"],
         query_start_loc=d["qsl"],
+        lower_bound=lower_bound,
     ).reshape(d["B"], HV, V)
 
 
-def _verify(kern, d, ssm, intermediate_states):
+def _verify(kern, d, ssm, intermediate_states, lower_bound=None):
     return kern.target_verify(
         A_log=d["A_log"],
         dt_bias=d["dt_bias"],
@@ -136,6 +143,7 @@ def _verify(kern, d, ssm, intermediate_states):
         intermediate_state_indices=d["intermediate_indices"],
         cache_steps=d["T"],
         retrieve_parent_token=None,
+        lower_bound=lower_bound,
     ).reshape(d["seq"], HV, V)
 
 
@@ -278,6 +286,49 @@ def test_kda_target_verify_flashinfer_rejects_tree_spec():
             cache_steps=d["T"],
             retrieve_parent_token=parent,
         )
+
+
+def _dispatcher(backend):
+    return KDAKernelDispatcher(backend, LinearAttnKernelBackend.TRITON, backend)
+
+
+@pytest.mark.parametrize("batch_size", [8, 128])
+def test_kda_dispatcher_flashinfer_safe_gate_decode(batch_size):
+    torch.manual_seed(batch_size)
+    d = _make_decode_inputs(batch_size)
+    d["ssm"] = (d["ssm"].float() * 100).to(d["ssm"].dtype)
+    fi = _dispatcher(LinearAttnKernelBackend.FLASHINFER)
+    tri = _dispatcher(LinearAttnKernelBackend.TRITON)
+
+    out = _decode(fi, d, d["ssm"].clone(), lower_bound=-5.0).float()
+    ref = _decode(tri, d, d["ssm"].clone(), lower_bound=-5.0).float()
+    ungated = _decode(fi, d, d["ssm"].clone()).float()
+
+    assert (out - ref).abs().max().item() < 5e-2 * ref.abs().max().item()
+    assert (out - ungated).abs().max().item() > 1e-1 * ref.abs().max().item()
+
+
+@pytest.mark.parametrize("batch_size,num_spec", [(8, 3), (32, 5)])
+def test_kda_dispatcher_flashinfer_safe_gate_verify(batch_size, num_spec):
+    torch.manual_seed(batch_size + num_spec)
+    d = _make_verify_inputs(batch_size, 1 + num_spec)
+    d["ssm"] = (d["ssm"].float() * 100).to(d["ssm"].dtype)
+    fi = _dispatcher(LinearAttnKernelBackend.FLASHINFER)
+    tri = _dispatcher(LinearAttnKernelBackend.TRITON)
+
+    def run(disp, lower_bound):
+        return _verify(
+            disp,
+            d,
+            d["ssm"].clone(),
+            d["intermediate_states"].clone(),
+            lower_bound=lower_bound,
+        ).float()
+
+    out, ref, ungated = run(fi, -5.0), run(tri, -5.0), run(fi, None)
+
+    assert (out - ref).abs().max().item() < 5e-2 * ref.abs().max().item()
+    assert (out - ungated).abs().max().item() > 1e-1 * ref.abs().max().item()
 
 
 if __name__ == "__main__":
