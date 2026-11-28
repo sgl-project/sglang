@@ -1496,19 +1496,19 @@ class EngramEmbedding(nn.Module):
                 mxfp4=self.mxfp4,
             )
             return out
-        if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
-            cp_shard_counts = None
-            if cp_all_tokens:
+        if cp_all_tokens and self.tp_size > 1:
+            parallel = get_parallel()
+            if parallel.attn_dp_size > 1:
                 metadata = forward_batch.attn_cp_metadata
-                cp_shard_counts = (
+                shard_counts = (
                     metadata.per_rank_logical_token or metadata.per_rank_actual_token
                 )
-            # Active CP ranks and idle DP ranks must use the same TP collectives.
-            return self._dp_sharded_lookup(indices, forward_batch, cp_shard_counts)
-        if cp_all_tokens and self.tp_size > 1:
+                # Use the same DP collective path as idle ranks.
+                return self._dp_global_buffer_lookup(
+                    indices, forward_batch, shard_counts
+                )
             # Prefill CP: gather the hash ids over the CP group first so every
             # TP rank looks up the same indices, then keep this rank's slice.
-            parallel = get_parallel()
             local_rows = indices.shape[0]
             all_indices = indices.new_empty(
                 (parallel.attn_cp_size * local_rows, *indices.shape[1:])
@@ -1516,6 +1516,8 @@ class EngramEmbedding(nn.Module):
             attn_cp_all_gather_into_tensor(all_indices, indices.contiguous())
             start = parallel.attn_cp_rank * local_rows
             return self._lookup(all_indices)[start : start + local_rows]
+        if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
+            return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
 
     def dequant_staged(
@@ -1616,10 +1618,7 @@ class EngramEmbedding(nn.Module):
         return out
 
     def _dp_sharded_lookup(
-        self,
-        indices: torch.Tensor,
-        forward_batch: Optional[ForwardBatch],
-        cp_shard_counts: Optional[list[int]] = None,
+        self, indices: torch.Tensor, forward_batch: Optional[ForwardBatch]
     ) -> torch.Tensor:
         """Gather DP ranks' indices before looking up TP-sharded rows."""
         assert forward_batch is not None, "the DP engram lookup needs the batch"
@@ -1628,9 +1627,7 @@ class EngramEmbedding(nn.Module):
             self._dp_sizes(indices, forward_batch) if self.lookup in exchanges else None
         )
         if sizes is None:
-            return self._dp_global_buffer_lookup(
-                indices, forward_batch, cp_shard_counts
-            )
+            return self._dp_global_buffer_lookup(indices, forward_batch)
         if sum(sizes) == 0:
             return self.new_rows(indices)
         ids = indices.new_empty((sum(sizes), *indices.shape[1:]))

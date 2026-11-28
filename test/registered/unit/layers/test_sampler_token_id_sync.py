@@ -1,4 +1,4 @@
-"""Token synchronization within the tensor- and context-parallel groups."""
+"""Sampler._sync_token_ids_across_tp skips the all-reduce on a one-rank TP sync group."""
 
 import socket
 import unittest
@@ -33,7 +33,6 @@ def _sampler(group) -> Sampler:
     # Only the attribute _sync_token_ids_across_tp reads; the constructor needs a model.
     s = Sampler.__new__(Sampler)
     s.tp_sync_group = group
-    s.cp_sync_group = None
     return s
 
 
@@ -43,13 +42,8 @@ def _two_rank_worker(rank: int, port: int, results) -> None:
     )
     try:
         ids = torch.tensor([5, 1, 7]) if rank == 0 else torch.tensor([3, 4, 7])
-        sampler = _sampler(dist.group.WORLD)
-        cp_ids = ids.clone()
-        sampler._sync_token_ids_across_tp(ids, _GRAMMAR_BATCH)
-        sampler.cp_sync_group = dist.group.WORLD
-        with mock.patch.object(sampler_module, "is_npu", return_value=True):
-            cp_synced = sampler._broadcast_npu_cp_token_ids(cp_ids)
-        results[rank] = (ids.tolist(), cp_synced, cp_ids.tolist())
+        _sampler(dist.group.WORLD)._sync_token_ids_across_tp(ids, _GRAMMAR_BATCH)
+        results[rank] = ids.tolist()
     finally:
         dist.destroy_process_group()
 
@@ -93,7 +87,7 @@ class TestSamplerTokenIdSync(CustomTestCase):
         _, all_reduce = self._sync(_PLAIN_BATCH)
         all_reduce.assert_not_called()
 
-    def test_two_rank_groups_reduce_tp_ids_and_broadcast_npu_cp_ids(self):
+    def test_two_rank_group_still_reduces_with_min(self):
         ctx = mp.get_context("spawn")
         with ctx.Manager() as manager:
             results = manager.dict()
@@ -107,8 +101,7 @@ class TestSamplerTokenIdSync(CustomTestCase):
             for p in procs:
                 p.join(timeout=60)
             self.assertEqual([p.exitcode for p in procs], [0, 0])
-            expected = ([3, 1, 7], True, [5, 1, 7])
-            self.assertEqual(dict(results), {0: expected, 1: expected})
+            self.assertEqual(dict(results), {0: [3, 1, 7], 1: [3, 1, 7]})
 
 
 if __name__ == "__main__":

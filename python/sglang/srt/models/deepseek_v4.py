@@ -2533,7 +2533,7 @@ class MQALayer(MqaAttentionBase):
                 kv_for_cache = cp_gather_full_sequence_states(
                     kv.contiguous(),
                     forward_batch,
-                    torch.npu.current_stream(),
+                    torch.cuda.current_stream(),
                 )
             attn_backend.store_cache(
                 layer_id=self.layer_id,
