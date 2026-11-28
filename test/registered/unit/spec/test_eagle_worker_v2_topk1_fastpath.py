@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_batch_info import SamplingFacts
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import organize_draft_results
@@ -164,7 +165,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             "sglang.srt.speculative.eagle_worker_v2.forward_context",
             side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
         ):
-            result = worker.draft_forward(forward_batch)
+            result = worker.draft_forward(forward_batch, greedy=False)
 
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
@@ -244,7 +245,7 @@ class TestEagleDraftStepFold(CustomTestCase):
                 "sglang.srt.speculative.eagle_worker_v2.draft_topk1_postprocess", stock
             ),
         ):
-            out = worker.draft_forward(fb)
+            out = worker.draft_forward(fb, greedy=False)
         return SimpleNamespace(
             out=out, fb=fb, seen=seen, logits=logits, stock=stock, positions=positions
         )
@@ -320,7 +321,12 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.tree_mask_mode = None
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
-                forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+                forward_batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    sampling_info=SimpleNamespace(
+                        facts=SamplingFacts(all_greedy=False)
+                    ),
+                )
                 worker.draft_forward = MagicMock(return_value=graph_result)
                 attn_backend = SimpleNamespace(verify_mask=None)
                 worker.target_worker = SimpleNamespace(
