@@ -17,6 +17,7 @@ from fastapi import HTTPException, UploadFile
 from pydantic import BaseModel
 from requests.utils import get_environ_proxies, select_proxy
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
@@ -243,6 +244,51 @@ def choose_output_image_ext(
     return "jpg"
 
 
+# Upper bound for num_profiled_timesteps when request profiling is enabled;
+# -1 means "all denoising steps". Far above any pipeline's step count, it
+# only guards against absurd schedule values reaching torch.profiler.
+_MAX_PROFILED_TIMESTEPS = 1000
+
+
+def _validate_request_profiling(kwargs: dict[str, Any]) -> None:
+    """Reject per-request profiling unless the server operator opted in.
+
+    A client-supplied ``profile`` makes the worker run ``torch.profiler``
+    and write a uniquely named trace file per request, so an unauthenticated
+    caller could fill the disk (and add large host-memory overhead) with
+    ordinary inference requests. Only network entry points call this; the
+    CLI and Python API still accept ``--profile``.
+    """
+    requested = []
+    for name in ("profile", "profile_all_stages"):
+        value = kwargs.get(name)
+        if value is not None and not isinstance(value, bool):
+            raise _bad_request(f"{name} must be a boolean")
+        if value:
+            requested.append(name)
+    num_steps = kwargs.get("num_profiled_timesteps")
+    if num_steps is not None:
+        requested.append("num_profiled_timesteps")
+    if not requested:
+        return
+    if not envs.SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING:
+        raise _bad_request(
+            "Per-request profiling is disabled on this server "
+            f"({', '.join(requested)}); start the server with "
+            "SGLANG_DIFFUSION_ENABLE_REQUEST_PROFILING=1 to allow it"
+        )
+    if num_steps is not None and (
+        isinstance(num_steps, bool)
+        or not isinstance(num_steps, int)
+        or num_steps < -1
+        or num_steps > _MAX_PROFILED_TIMESTEPS
+    ):
+        raise _bad_request(
+            "num_profiled_timesteps must be -1 (all steps) or an integer "
+            f"between 0 and {_MAX_PROFILED_TIMESTEPS}"
+        )
+
+
 _MODEL_PATH_FIELDS = ("upscaling_model_path", "frame_interpolation_model_path")
 
 
@@ -345,6 +391,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
 
     _reject_remote_model_paths(kwargs)
     _validate_remote_media_paths(kwargs)
+    _validate_request_profiling(kwargs)
     has_explicit_compression = kwargs.get("output_compression") is not None
 
     # parse "WxH" size string if provided
