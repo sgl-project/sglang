@@ -4484,6 +4484,15 @@ class UnifiedRadixCache(BasePrefixCache):
         while acks and acks[0].finish_event.query():
             self._log_write_ack_metrics(acks.popleft())
 
+    def wait_fenced_writes(self) -> None:
+        """Wait for the stream-fenced write-back copies, which
+        ongoing_write_through no longer tracks."""
+        acks = self._fenced_write_acks
+        while acks:
+            ack = acks.popleft()
+            ack.finish_event.synchronize()
+            self._log_write_ack_metrics(ack)
+
     def writing_check(
         self, write_back: bool = False, finish_count: Optional[int] = None
     ) -> None:

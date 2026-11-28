@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.sampling.sampling_pipeline import VerifyRoute
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -592,6 +593,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
     # Per-request target-verify geometry.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    # The target verify's sampling route (VerifyStep.route). Set only by
+    # eagle_prepare_for_verify: EAGLE is the one verify whose logits may stay
+    # vocab-sharded, and LogitsProcessor.verify_uses_vocab_shards reads it.
+    verify_route: Optional[VerifyRoute] = None
     extend_logits_row_index: Optional[torch.Tensor] = None
     # trailing speculative-verify requests; None (not 0) when there are none, so
     # the two-batch-overlap split, which rejects unknown non-None fields, still runs
@@ -966,6 +971,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
         return_hidden_states_before_norm: bool,
         ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
+        verify_route: Optional[VerifyRoute] = None,
         extend_position_info=None,
         spec_mrope_positions: Optional[torch.Tensor] = None,
         pp_loras: Optional[set[Optional[str]]] = None,
@@ -1128,6 +1134,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
             ragged_verify_layout=ragged_verify_layout,
+            verify_route=verify_route,
         )
 
         # ScheduleBatch and req_to_token keep allocator-global slot identities,
