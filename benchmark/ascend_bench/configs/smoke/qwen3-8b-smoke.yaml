@@ -1,0 +1,48 @@
+# Minimal single-cell smoke config: validates the whole pipeline
+# (launch -> health -> gsm8k -> bench -> HBM gate -> report) in minutes.
+# 1 server axis value x 1 workload axis value x 1 repeat = 1 cell.
+name: qwen3-8b-smoke
+
+model:
+  path: Qwen/Qwen3-8B
+  dtype: bfloat16
+  trust_remote_code: true
+
+server:
+  args:
+    --device: npu
+    --attention-backend: ascend
+    --tp-size: 2
+    --port: 30000
+    --mem-fraction-static: 0.80
+  env: {}
+  axes: {}
+
+workload:
+  dataset_name: random
+  args:
+    --random-input-len: 256
+    --random-output-len: 64
+    --random-range-ratio: 1.0
+  axes:
+    --max-concurrency: [4]
+  num_prompts_mult: 2
+
+sla:
+  thresholds:
+    p99_ttft_ms: 5000
+  cv_max: 0.15
+
+run:
+  repeats: 1
+  seed: 42
+  warmup_requests: 4
+  health_timeout_s: 1800
+  bench_timeout_s: 900
+  hbm_budget_mb: 500
+  hbm_timeout_s: 120
+  gsm8k:
+    num_questions: 20      # smoke-sized accuracy probe
+    num_shots: 5
+    accuracy_floor: 0.30
+    # data_path: /mnt/data/gsm8k/test.jsonl   # pre-downloaded on offline hosts
