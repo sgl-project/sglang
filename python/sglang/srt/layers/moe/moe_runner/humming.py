@@ -76,6 +76,7 @@ class HummingRunnerInput(RunnerInput):
     expected_m: int | None = None
     hidden_states_scale: torch.Tensor | None = None
     apply_routed_scaling_factor: bool = True
+    is_standard_dispatch: bool = False
 
     @property
     def runner_backend(self) -> MoeRunnerBackend:
@@ -107,6 +108,7 @@ def _humming_moe_runner_core_run_fake(
     expected_m: int | None = None,
     hidden_states_scale: torch.Tensor | None = None,
     apply_routed_scaling_factor: bool = True,
+    is_standard_dispatch: bool = False,
 ) -> torch.Tensor:
     output_shape = hidden_states.shape
     if gemm_type == "grouped_masked" and hidden_states.ndim == 2:
@@ -134,6 +136,7 @@ def humming_moe_runner_core_run(
     expected_m: int | None = None,
     hidden_states_scale: torch.Tensor | None = None,
     apply_routed_scaling_factor: bool = True,
+    is_standard_dispatch: bool = False,
 ) -> torch.Tensor:
     runner = HummingRunnerCore.runner_cores[moe_runner_id]
     if gemm_type == "indexed":
@@ -143,6 +146,7 @@ def humming_moe_runner_core_run(
             topk_weights=topk_weights,
             hidden_states_scale=hidden_states_scale,
             apply_routed_scaling_factor=apply_routed_scaling_factor,
+            is_standard_dispatch=is_standard_dispatch,
         )
     elif gemm_type == "grouped_contiguous":
         return runner._run_grouped_contiguous_gemm(
@@ -151,6 +155,7 @@ def humming_moe_runner_core_run(
             topk_weights=topk_weights,
             hidden_states_scale=hidden_states_scale,
             apply_routed_scaling_factor=apply_routed_scaling_factor,
+            is_standard_dispatch=is_standard_dispatch,
         )
     elif gemm_type == "grouped_masked":
         assert expected_m is not None and expert_num_tokens is not None
@@ -220,12 +225,27 @@ class HummingRunnerCore(MoeRunnerCore):
         self,
         topk_ids: torch.Tensor,
         expected_m: int | None = None,
+        *,
+        is_standard_dispatch: bool = False,
     ):
         # estimate shape_m for kernel tuning
         if expected_m is not None:
             return expected_m * self.num_experts
 
-        # TODO: update for EP and DP
+        if is_standard_dispatch and self.num_experts != self.global_num_experts:
+            # Standard dispatch retains non-local slots as -1. Estimate only
+            # local routed work; replicated shared experts still see every token.
+            shared_experts = self.config.num_fused_shared_experts or 0
+            shared_rows = topk_ids.shape[0] * shared_experts
+            routed_rows = topk_ids.nelement() - shared_rows
+            global_routed_experts = self.global_num_experts - shared_experts
+            local_routed_experts = self.num_experts - shared_experts
+            return (
+                shared_rows
+                + (routed_rows * local_routed_experts + global_routed_experts - 1)
+                // global_routed_experts
+            )
+
         return topk_ids.nelement()
 
     def get_buffer_metas(
@@ -520,17 +540,20 @@ class HummingRunnerCore(MoeRunnerCore):
             expert_num_tokens=runner_input.expert_num_tokens,
             hidden_states_scale=runner_input.hidden_states_scale,
             apply_routed_scaling_factor=runner_input.apply_routed_scaling_factor,
+            is_standard_dispatch=runner_input.is_standard_dispatch,
         )
 
         return HummingRunnerOutput(hidden_states=output)
 
     def _prepare_indexed_gemm_kwargs(
-        self, topk_ids: torch.Tensor
+        self, topk_ids: torch.Tensor, *, is_standard_dispatch: bool = False
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
         configs = self.get_humming_gemm_configs(HummingGemmType.INDEXED)
-        valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
+        valid_shape_m = self.estimate_local_valid_shape_m(
+            topk_ids, is_standard_dispatch=is_standard_dispatch
+        )
 
         alignments = {}
         gemm_kwargs = []
@@ -576,6 +599,7 @@ class HummingRunnerCore(MoeRunnerCore):
         topk_ids: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
         apply_routed_scaling_factor: bool = True,
+        is_standard_dispatch: bool = False,
     ):
         hidden_states = hidden_states.view(-1, hidden_states.size(-1))
         if hidden_states_scale is not None:
@@ -588,7 +612,9 @@ class HummingRunnerCore(MoeRunnerCore):
             gemm_type=HummingGemmType.INDEXED,
         )
 
-        moe_kwargs1, moe_kwargs2 = self._prepare_indexed_gemm_kwargs(topk_ids)
+        moe_kwargs1, moe_kwargs2 = self._prepare_indexed_gemm_kwargs(
+            topk_ids, is_standard_dispatch=is_standard_dispatch
+        )
 
         inputs, input_scale, input_scale_2 = self._prepare_input(
             inputs=hidden_states,
@@ -649,9 +675,12 @@ class HummingRunnerCore(MoeRunnerCore):
         topk_ids: torch.Tensor,
         hidden_states_scale: torch.Tensor | None = None,
         apply_routed_scaling_factor: bool = True,
+        is_standard_dispatch: bool = False,
     ):
         configs = self.get_humming_gemm_configs(HummingGemmType.GROUPED_CONTIGUOUS)
-        valid_shape_m = self.estimate_local_valid_shape_m(topk_ids)
+        valid_shape_m = self.estimate_local_valid_shape_m(
+            topk_ids, is_standard_dispatch=is_standard_dispatch
+        )
 
         buffers = self.prepare_buffers(
             hidden_states=hidden_states,
@@ -829,6 +858,7 @@ def fused_experts_none_to_humming(
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         gemm_type=get_standard_humming_moe_gemm_type(),
+        is_standard_dispatch=True,
     )
 
     # ``humming_moe_runner_core_run`` resolves the runner through
@@ -999,6 +1029,7 @@ def pre_permute_standard_to_humming(
         topk_weights=topk_weights,
         topk_ids=topk_ids.int(),
         gemm_type=get_standard_humming_moe_gemm_type(),
+        is_standard_dispatch=True,
     )
 
 
