@@ -1180,6 +1180,30 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows_a), 3 * 4)
         self.assertEqual(self._row_fields(rows_a), self._row_fields(rows_b))
 
+    def test_gsp_interrupted_cache_write_can_be_retried(self):
+        def interrupt_dump(rows, stream):
+            stream.write(b"\x80")
+            stream.flush()
+            self.assertFalse(list(self.tmpdir_path.rglob("*.pkl")))
+            raise OSError("interrupted write")
+
+        with patch.object(pickle, "dump", side_effect=interrupt_dump):
+            with self.assertRaisesRegex(OSError, "interrupted write"):
+                self._run_gsp()
+
+        rows = self._run_gsp()
+        self.assertEqual(len(rows), 20)
+        self.assertEqual(self._run_gsp(), rows)
+
+    def test_gsp_regenerates_truncated_cache(self):
+        rows = self._run_gsp()
+        (cache_path,) = self.tmpdir_path.rglob("*.pkl")
+        cache_path.write_bytes(cache_path.read_bytes()[:1])
+
+        self.assertEqual(self._run_gsp(), rows)
+        with cache_path.open("rb") as stream:
+            self.assertEqual(pickle.load(stream), rows)
+
     def test_gsp_default_ignores_legacy_fast_cache(self):
         common = dict(num_groups=3, prompts_per_group=4, seed=7)
         fast_rows = self._run_gsp(ordered=False, fast_prepare=True, **common)

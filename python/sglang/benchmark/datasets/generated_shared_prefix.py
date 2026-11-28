@@ -1,6 +1,7 @@
 import math
 import pickle
 import random
+import tempfile
 import uuid
 from argparse import Namespace
 from dataclasses import dataclass
@@ -220,7 +221,10 @@ def sample_generated_shared_prefix_requests(
     if should_cache and cache_path.exists():
         print(f"\nLoading cached generated input data from {cache_path}")
         with open(cache_path, "rb") as f:
-            return pickle.load(f)
+            try:
+                return pickle.load(f)
+            except (EOFError, pickle.UnpicklingError):
+                print(f"Regenerating unreadable dataset cache at {cache_path}")
 
     if not should_cache:
         print(f"\nCache bypassed ({range_ratio=}, {send_routing_key=}, {num_turns=})")
@@ -361,7 +365,11 @@ def sample_generated_shared_prefix_requests(
     if should_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"Caching generated input data to {cache_path}")
-        with open(cache_path, "wb") as f:
-            pickle.dump(input_requests, f)
+        # Readers must see a complete dataset even if another writer is interrupted.
+        with tempfile.TemporaryDirectory(dir=cache_path.parent) as tmpdir:
+            pending = Path(tmpdir) / "dataset.tmp"
+            with pending.open("wb") as f:
+                pickle.dump(input_requests, f)
+            pending.replace(cache_path)
 
     return input_requests
