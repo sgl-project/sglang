@@ -1,4 +1,4 @@
-"""Dispatch contracts for clipped ARCH22 W4A8 GMM1 fusion."""
+"""Dispatch contracts for clipped W4A8 GMM1 fusion."""
 
 import unittest
 from types import SimpleNamespace
@@ -37,17 +37,17 @@ class TestW4A8Int8MoEFusion(unittest.TestCase):
                     "sgl_kernel_npu.operators.moe": operators,
                 },
             ),
-            patch.object(utils, "is_npu_arch22") as arch22,
+            patch.object(utils, "is_npu_arch35") as is_arch35,
         ):
-            for arch, ops, op, expected in (
-                (False, [op_name], w4a8_op, None),
-                (True, [], w4a8_op, None),
-                (True, [op_name], w8a8_op, None),
-                (True, [op_name], w4a8_op, w4a8_op),
+            for arch35, ops, op, expected in (
+                (True, [op_name], w4a8_op, None),
+                (False, [], w4a8_op, None),
+                (False, [op_name], w8a8_op, None),
+                (False, [op_name], w4a8_op, w4a8_op),
             ):
-                with self.subTest(arch=arch, ops=ops, op=op):
+                with self.subTest(arch35=arch35, ops=ops, op=op):
                     loader.cache_clear()
-                    arch22.return_value = arch
+                    is_arch35.return_value = arch35
                     operators.grouped_matmul_swiglu_quant = op
                     package._manifest = {"third_party": [{"ops": ops}]}
                     self.assertIs(loader(), expected)

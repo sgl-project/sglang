@@ -42,9 +42,15 @@ def is_npu_arch22() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def is_npu_arch35() -> bool:
+    """Whether the runtime is on NPU architecture 35."""
+    return _is_npu_arch(3510)
+
+
+@functools.lru_cache(maxsize=1)
 def get_grouped_matmul_swiglu_quant_w4a8() -> Optional[Callable]:
-    """Find the bundled ARCH22 GMM operator with W4A8 compensation support."""
-    if not is_npu_arch22():
+    """Find the bundled GMM operator with W4A8 compensation support."""
+    if is_npu_arch35():
         return None
     try:
         import sgl_kernel_npu
@@ -62,12 +68,6 @@ def get_grouped_matmul_swiglu_quant_w4a8() -> Optional[Callable]:
     if "weight_assist_matrix" in signature(grouped_matmul_swiglu_quant).parameters:
         return grouped_matmul_swiglu_quant
     return None
-
-
-@functools.lru_cache(maxsize=1)
-def is_npu_arch35() -> bool:
-    """Whether the runtime is on NPU architecture 35."""
-    return _is_npu_arch(3510)
 
 
 # SoC version reported by Ascend 950 (Atlas A5) devices; later aclnn-only
