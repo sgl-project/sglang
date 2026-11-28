@@ -19,6 +19,7 @@ from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -89,6 +90,7 @@ class ImageVAEEncodingFingerprint:
     encode_sample_mode: str
     vae_precision: Any
     vae_tiling: bool
+    use_fast_encode: bool
 
 
 def _freeze_image_source_value(value):
@@ -906,6 +908,11 @@ class ImageVAEEncodingStage(PipelineStage):
             )
         ]
 
+    def _use_fast_encode(self, batch: Req) -> bool:
+        return getattr(self.vae, "supports_fast_encode", False) and quality_allows(
+            batch.quality, "high"
+        )
+
     def forward(
         self,
         batch: Req,
@@ -944,6 +951,10 @@ class ImageVAEEncodingStage(PipelineStage):
             assert vae is not None
             self.vae = vae
 
+            # The encode cache includes kwargs in the posterior key.
+            encode_kwargs = (
+                {"use_fast_path": True} if self._use_fast_encode(batch) else {}
+            )
             for image in images:
                 image = self.preprocess(
                     image,
@@ -991,7 +1002,7 @@ class ImageVAEEncodingStage(PipelineStage):
                         ),
                     ):
                         latent_dist: DiagonalGaussianDistribution = vae.encode(
-                            video_condition
+                            video_condition, **encode_kwargs
                         )
                     # for auto_encoder from diffusers
                     if isinstance(latent_dist, AutoencoderKLOutput):
@@ -1076,6 +1087,7 @@ class ImageVAEEncodingStage(PipelineStage):
             encode_sample_mode=sample_mode,
             vae_precision=server_args.pipeline_config.vae_precision,
             vae_tiling=bool(server_args.pipeline_config.vae_tiling),
+            use_fast_encode=self._use_fast_encode(batch),
         )
 
     def retrieve_latents(
