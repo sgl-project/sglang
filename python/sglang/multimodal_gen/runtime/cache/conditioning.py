@@ -578,6 +578,31 @@ class ConditioningCache:
             _refresh_cache.reset(refresh_token)
             _active_cache.reset(token)
 
+    def decoded_image(self, data: bytes, load):
+        key = ("decoded_rgb", _digest(data))
+        entry = self._entries.get(key)
+        if entry is not None:
+            self.hits += 1
+            self._reindex(key=key, entry=entry)
+            return entry.output.copy()
+
+        self.misses += 1
+        image = load(data)
+        # PIL's RGB storage uses four bytes per pixel. Metadata may be mutable.
+        size = image.width * image.height * 4
+        if (
+            image.mode == "RGB"
+            and not image.info
+            and self._make_room(size=size, preferred=False)
+        ):
+            self._put(
+                key=key,
+                entry=_CacheEntry(
+                    image.copy(), size, ready=(), owner=-1, preferred=False
+                ),
+            )
+        return image
+
     def run(
         self,
         model,
@@ -715,6 +740,32 @@ class ConditioningCache:
             size,
         )
         return output
+
+
+def cached_condition_image(source, load):
+    """Decode a local PNG upload against the worker's conditioning budget."""
+    cache = _active_cache.get()
+    if (
+        cache is None
+        or not cache.max_bytes
+        or not _cross_request_cache.get()
+        or _refresh_cache.get()
+        or not isinstance(source, str)
+        or not source.lower().endswith(".png")
+        or not os.path.isfile(source)
+    ):
+        return load(source)
+    with open(source, "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size > cache.max_bytes:
+            return load(source)
+        # Hash and decode the same bytes even if the upload path is replaced.
+        data = stream.read(size + 1)
+        if len(data) > size:
+            return load(source)
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return load(data)
+    return cache.decoded_image(data, load)
 
 
 def _inference_cache(model, *, share_in_group=False, cross_request=True):
