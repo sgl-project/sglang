@@ -85,7 +85,6 @@ from sglang.srt.layers.cp.utils import (
     cp_gather_after_forward,
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
-    cp_shard_hidden_states,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
@@ -4184,7 +4183,7 @@ class DeepseekV4Model(nn.Module):
         if self.engram_hasher is not None:
             if cp_extend:
                 # N-gram hashing needs each token's predecessors, so hash the
-                # whole prompt before selecting this CP rank's rows.
+                # whole prompt before selecting this CP rank's interleaved rows.
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
                 global_input_ids = forward_batch.input_ids[:total]
                 if is_in_breakable_cuda_graph():
@@ -4194,11 +4193,8 @@ class DeepseekV4Model(nn.Module):
                     )
                 else:
                     hash_ids = self.engram_hasher(global_input_ids, forward_batch)
-                if _is_npu:
-                    hash_ids = cp_shard_hidden_states(hash_ids, forward_batch)
-                else:
-                    parallel = get_parallel()
-                    hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
+                parallel = get_parallel()
+                hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
                 if pad_rows > 0:
                     hash_ids = torch.cat(

@@ -28,7 +28,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE, rope_cos
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.layers.cp.utils import cp_materialize_global_token_order
-from sglang.srt.layers.cp.zigzag import ZigzagContextParallelMetadata
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1337,29 +1336,17 @@ class LowRatioCompressAscendBackendMixin:
         positions = forward_batch.positions
         local_rows = strategy.local_q_indices(cp.total_seq_lens, forward_batch)
         local_positions = positions.index_select(0, local_rows)
-        cp.moe_local_token_count = positions.new_tensor(
-            local_rows.numel(), dtype=torch.int32
+        # Give each interleaved query its own logical request so causal masking
+        # applies to its absolute position, including before top-k.
+        extend_lens = forward_batch.extend_seq_lens
+        request_ids = torch.arange(extend_lens.numel(), device=positions.device)
+        request_rows = request_ids.repeat_interleave(
+            extend_lens, output_size=cp.total_seq_lens
+        ).index_select(0, local_rows)
+        seq_lens = local_positions.to(torch.int32) + 1
+        cu_seqlens_q = torch.arange(
+            local_rows.numel() + 1, dtype=torch.int32, device=positions.device
         )
-        if isinstance(cp, ZigzagContextParallelMetadata):
-            # Right-align each contiguous segment to its last absolute position.
-            request_rows = positions.new_tensor(
-                [segment // (2 * strategy.cp_size) for segment in cp.zigzag_index],
-                dtype=torch.long,
-            )
-            seq_lens = cp.kv_len_combined_tensor
-            cu_seqlens_q = cp.cu_seqlens_q_combined_tensor
-        else:
-            # As in V4, a strided query gets its own virtual request so causal
-            # masking applies to its absolute position, including before top-k.
-            extend_lens = forward_batch.extend_seq_lens
-            request_ids = torch.arange(extend_lens.numel(), device=positions.device)
-            request_rows = request_ids.repeat_interleave(
-                extend_lens, output_size=cp.total_seq_lens
-            ).index_select(0, local_rows)
-            seq_lens = local_positions.to(torch.int32) + 1
-            cu_seqlens_q = torch.arange(
-                local_rows.numel() + 1, dtype=torch.int32, device=positions.device
-            )
         read = ForwardMetadata(
             actual_seq_lengths_q_pa=cu_seqlens_q,
             actual_seq_lengths_kv=seq_lens,

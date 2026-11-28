@@ -71,6 +71,7 @@ sys.modules.setdefault("sglang.srt.models.deepseek_v2", _ds2_stub)
 
 import sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend as dsv4_backend
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.srt.arg_groups import deepseek_v4_hook
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendAttnBackend,
     LowRatioCompressAscendBackendMixin,
@@ -83,7 +84,6 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
 )
 from sglang.srt.layers import dp_attention
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
-from sglang.srt.layers.cp.zigzag import ZigzagCPStrategy
 from sglang.srt.layers.engram import EngramEmbedding
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -1162,6 +1162,21 @@ class TestIndexerRopeSource(unittest.TestCase):
 
 
 class TestDSV41PrefillCP(CustomTestCase):
+    def test_npu_v41_prefill_cp_requires_interleave(self):
+        config = SimpleNamespace(enable_prefill_cp=True, cp_strategy="zigzag")
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="deepseek_v41")
+        )
+        with (
+            patch.object(deepseek_v4_hook, "resolving_view", return_value=config),
+            patch.object(
+                deepseek_v4_hook, "model_config_of", return_value=model_config
+            ),
+            patch.object(deepseek_v4_hook, "is_npu", return_value=True),
+            self.assertRaisesRegex(ValueError, "--cp-strategy interleave"),
+        ):
+            deepseek_v4_hook.validate_deepseek_v4_cp(object())
+
     def test_npu_engram_keeps_dp_counts_with_a2a_and_dp_lm_head(self):
         parallel = SimpleNamespace(
             attn_dp_enabled=True,
@@ -1208,7 +1223,7 @@ class TestDSV41PrefillCP(CustomTestCase):
             EngramEmbedding.forward(embed, idle_indices, idle_batch)
             lookup.assert_called_once_with(idle_indices, idle_batch, None)
 
-    def _init_cp_batch(self, strategy_cls=ZigzagCPStrategy):
+    def _init_cp_batch(self):
         backend = _low_ratio_backend(window=4)
         backend._dsv4_has_c4 = backend._dsv4_has_c128 = False
         backend._is_dspark_draft_worker = False
@@ -1233,7 +1248,7 @@ class TestDSV41PrefillCP(CustomTestCase):
         batch.req_pool_indices = torch.tensor([1, 3])
         batch.encoder_swa_replay = False
         batch.spec_algorithm = None
-        strategy = strategy_cls(cp_size=2)
+        strategy = InterleaveCPStrategy(cp_size=2)
         with (
             get_context().override_server_args(device="cpu", tp_size=2, attn_cp_size=2),
             get_parallel().override(attn_cp_rank=1),
@@ -1259,7 +1274,7 @@ class TestDSV41PrefillCP(CustomTestCase):
                     wraps=DS41.quant_lightning_indexer_metadata_dsl,
                 ) as qli_metadata,
             ):
-                backend, batch = self._init_cp_batch(InterleaveCPStrategy)
+                backend, batch = self._init_cp_batch()
                 full_positions = batch.positions
                 backend.prepare_dsv4_cp_metadata(batch)
                 self.assertIs(batch.positions, full_positions)
@@ -1273,7 +1288,6 @@ class TestDSV41PrefillCP(CustomTestCase):
                 self.assertEqual(
                     read.metadata.actual_seq_lengths_q_pa.tolist(), list(range(8))
                 )
-                self.assertEqual(batch.attn_cp_metadata.moe_local_token_count.item(), 7)
                 for field in ("swa_page_table", "c2_page_table", "c2_index_page_table"):
                     table = getattr(fm, field)
                     self.assertTrue(
@@ -1294,7 +1308,7 @@ class TestDSV41PrefillCP(CustomTestCase):
                 self.assertEqual(index["seqused_k"].tolist(), [3, 4, 5, 6, 64, 65, 66])
                 self.assertEqual(index["cmp_residual_k"].tolist(), [1] * 7)
 
-    def test_causal_metadata_and_attention_follow_local_zigzag_segments(self):
+    def test_interleave_attention_uses_local_rows_and_restores_padding(self):
         def a5_attention(q, *, out, **kwargs):
             out.copy_(q + 1)
 
@@ -1316,28 +1330,9 @@ class TestDSV41PrefillCP(CustomTestCase):
                     backend, batch = self._init_cp_batch()
                     fm = backend.forward_metadata
                     read = fm.dsv41_cp_read
-                    self.assertEqual(read.positions.tolist(), [8, 9, 130, 10, 11, 131])
-                    self.assertEqual(read.seq_lens.tolist(), [10, 131, 12, 132])
-                    self.assertEqual(
-                        read.metadata.actual_seq_lengths_q_pa.tolist(), [0, 2, 3, 5, 6]
-                    )
-                    self.assertEqual(
-                        read.metadata.swa_page_table.tolist(), [[11, 12], [15, 16]] * 2
-                    )
-                    self.assertEqual(fm.actual_seq_lengths_q_pa.tolist(), [0, 9, 14])
-                    self.assertEqual(fm.start_pos.tolist(), [5, 128])
-                    self.assertEqual(
-                        fm.positions_cmp_padding_c2.tolist(),
-                        [4, 6, 8, 10, 12, 128, 130, 0, 0],
-                    )
-                    self.assertEqual(batch.seq_lens.tolist(), [14, 133])
-                    self.assertEqual(
-                        batch.attn_cp_metadata.moe_local_token_count.item(), 6
-                    )
 
-                    backend.prepare_dsv4_cp_metadata(batch)
                     read.metadata.c2_topk_indices = torch.zeros(
-                        (6, 512), dtype=torch.int32
+                        (7, 512), dtype=torch.int32
                     )
                     backend.token_to_kv_pool = SimpleNamespace(
                         get_swa_buffer=lambda _: torch.zeros(1, dtype=torch.bfloat16),
@@ -1355,33 +1350,23 @@ class TestDSV41PrefillCP(CustomTestCase):
                     op = a5 if arch35 else a3.attention
                     q = op.call_args.args[0]
                     kwargs = op.call_args.kwargs
-                    self.assertEqual(q.shape[0], 6)
-                    self.assertEqual(kwargs["cu_seqlens_q"].tolist(), [0, 2, 3, 5, 6])
-                    self.assertEqual(kwargs["seqused_cmp_kv"].tolist(), [5, 65, 6, 66])
+                    self.assertEqual(q.shape[0], 7)
+                    self.assertEqual(kwargs["cu_seqlens_q"].tolist(), list(range(8)))
+                    self.assertEqual(
+                        kwargs["seqused_cmp_kv"].tolist(), [3, 4, 5, 6, 64, 65, 66]
+                    )
                     if arch35:
                         self.assertEqual(
-                            kwargs["ori_sparse_indices"][2, 0].tolist(),
-                            [127, 128, 129, 130],
+                            kwargs["ori_sparse_indices"][4, 0].tolist(),
+                            [125, 126, 127, 128],
                         )
                         self.assertEqual(
                             kwargs["cmp_topk_length"].flatten().tolist(),
-                            [4, 5, 65, 5, 6, 66],
+                            [3, 4, 5, 6, 64, 65, 66],
                         )
-                        self.assertIn("c2a_qli_metadata", read.metadata.kernel_metadata)
                     else:
-                        self.assertEqual(
-                            kwargs["cmp_residual_kv"].tolist(), [0, 1, 0, 0]
-                        )
-                        index = backend._dsv41_a3_index_kwargs(batch, 2)
-                        self.assertTrue(
-                            torch.equal(index["seqused_k"], kwargs["seqused_cmp_kv"])
-                        )
-                        self.assertTrue(
-                            torch.equal(
-                                index["cmp_residual_k"], kwargs["cmp_residual_kv"]
-                            )
-                        )
-                    self.assertEqual(out[:, 0, 0].tolist(), [1] * 6 + [0] * 2)
+                        self.assertEqual(kwargs["cmp_residual_kv"].tolist(), [1] * 7)
+                    self.assertEqual(out[:, 0, 0].tolist(), [1] * 7 + [0])
 
     def test_compressor_receives_full_extend_and_writes_global_c2_slots(self):
         a3 = SimpleNamespace(

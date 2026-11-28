@@ -118,15 +118,11 @@ For DSA models, such as the GLM-5 series and DeepSeek V3.2, use `interleave`; `z
 
 ### DeepSeek-V4.1 on Ascend
 
-To evaluate Interleave on a single A3 or A5 node, use the `dsv4` backend with
-`--enable-prefill-cp --cp-strategy interleave --cuda-graph-backend-prefill disabled`
-to use the same token layout as the DeepSeek V4 Ascend accuracy recipes.
-`--cp-strategy zigzag` selects contiguous query segments. Interleave uses
-one logical read request per query row and should be validated for the target
-chunk size and context length on each platform.
-The prefill path uses eager execution and replicated KV caches. Decode can
-continue to use its existing graph configuration. Use a compatible CANN and
-sgl-kernel-npu build for the checkpoint on your platform.
+DeepSeek-V4.1 prefill CP on Ascend uses Interleave, the same token sharding
+strategy as on CUDA. On a single A3 or A5 node, use the `dsv4` backend with
+`--enable-prefill-cp --cp-strategy interleave --cuda-graph-backend-prefill disabled`.
+Prefill runs eagerly with replicated KV caches and one logical read request per
+query row. Use a compatible CANN and sgl-kernel-npu build for your checkpoint.
 
 Attention CP is `--tp-size / --attn-dp-size`, with one attention TP rank per
 CP rank. When combining attention DP with prefill CP, use a supported MoE A2A
