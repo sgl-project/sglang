@@ -206,6 +206,62 @@ class TestRequestLogRedaction(CustomTestCase):
         redacted = redact_watermark_secrets([{"watermark_key": SECRET}])
         self.assertEqual(redacted, [{"watermark_key": "<redacted>"}])
 
+    def test_video_config_question_redacted_at_level_0_and_1(self):
+        req = GenerateReqInput(
+            rid="rid-video",
+            video_config={
+                "fps": 2,
+                "_question": "secret user question",
+                "max_frames": 16,
+            },
+        )
+        for level in (0, 1):
+            for fmt in ("text", "json"):
+                logger = request_logger.RequestLogger(
+                    log_requests=True,
+                    log_requests_level=level,
+                    log_requests_format=fmt,
+                    log_requests_target=None,
+                )
+                target = mock.Mock()
+                logger.targets = [target]
+                logger.log_received_request(req)
+                logger.log_finished_request(req, {"meta_info": {"e2e_latency": 0.1}})
+                logged_output = "\n".join(
+                    call.args[0] for call in target.info.call_args_list
+                )
+                self.assertNotIn("secret user question", logged_output)
+                self.assertNotIn("_question", logged_output)
+                self.assertIn("fps", logged_output)
+                self.assertIn("max_frames", logged_output)
+
+    def test_video_config_question_preserved_at_level_2_and_3(self):
+        req = GenerateReqInput(
+            rid="rid-video",
+            video_config={
+                "fps": 2,
+                "_question": "public user question",
+                "max_frames": 16,
+            },
+        )
+        for level in (2, 3):
+            for fmt in ("text", "json"):
+                logger = request_logger.RequestLogger(
+                    log_requests=True,
+                    log_requests_level=level,
+                    log_requests_format=fmt,
+                    log_requests_target=None,
+                )
+                target = mock.Mock()
+                logger.targets = [target]
+                logger.log_received_request(req)
+                logger.log_finished_request(req, {"meta_info": {"e2e_latency": 0.1}})
+                logged_output = "\n".join(
+                    call.args[0] for call in target.info.call_args_list
+                )
+                self.assertIn("public user question", logged_output)
+                self.assertIn("_question", logged_output)
+
 
 if __name__ == "__main__":
     unittest.main()
