@@ -894,6 +894,62 @@ class TestDcpStorage(unittest.TestCase):
             self.assertFalse(cc.enable_storage)
 
 
+class TestLayoutTagSuffix(unittest.TestCase):
+    """The file backend's per-rank key suffix must distinguish KV layouts."""
+
+    def _suffix_with(self, *, is_page_first_layout, extra_config=None):
+        cfg = HiCacheStorageConfig(
+            tp_rank=0,
+            tp_size=1,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=is_page_first_layout,
+            model_name="testmodel",
+            extra_config=extra_config,
+        )
+        with tempfile.TemporaryDirectory() as d:
+            b = HiCacheFile(cfg, file_path=d)
+            return b.config_suffix, b.tp_config_suffix
+
+    def test_page_first_layout_marks_suffix(self):
+        plain_suffix, plain_tp_suffix = self._suffix_with(is_page_first_layout=False)
+        paged_suffix, paged_tp_suffix = self._suffix_with(is_page_first_layout=True)
+        self.assertNotEqual(plain_suffix, paged_suffix)
+        self.assertIn("_page1st", paged_suffix)
+        self.assertIn("_page1st", paged_tp_suffix)
+        self.assertNotIn("_page1st", plain_suffix)
+        self.assertNotIn("_page1st", plain_tp_suffix)
+
+    def test_extra_backend_tag_marks_suffix(self):
+        plain_suffix, _ = self._suffix_with(is_page_first_layout=False)
+        tagged_suffix, tagged_tp_suffix = self._suffix_with(
+            is_page_first_layout=False,
+            extra_config={"extra_backend_tag": "v2"},
+        )
+        self.assertNotEqual(plain_suffix, tagged_suffix)
+        self.assertIn("_bktv2", tagged_suffix)
+        self.assertIn("_bktv2", tagged_tp_suffix)
+
+    def test_layout_and_backend_tag_compose(self):
+        base, _ = self._suffix_with(is_page_first_layout=False)
+        only_layout, _ = self._suffix_with(is_page_first_layout=True)
+        only_tag, _ = self._suffix_with(
+            is_page_first_layout=False,
+            extra_config={"extra_backend_tag": "v2"},
+        )
+        both, _ = self._suffix_with(
+            is_page_first_layout=True,
+            extra_config={"extra_backend_tag": "v2"},
+        )
+        # All four namespaces are pairwise disjoint.
+        suffixes = {base, only_layout, only_tag, both}
+        self.assertEqual(len(suffixes), 4)
+
+
 class TestUncachedBatchExists(HiCacheFileLRUTestBase):
     def test_lookup_only_checks_requested_component_files(self):
         b = self.make_backend(enable_metadata_cache=False)
