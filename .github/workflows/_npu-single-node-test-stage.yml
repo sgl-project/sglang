@@ -163,14 +163,20 @@ jobs:
             fi
 
             if command -v python3 >/dev/null 2>&1; then
-              python3 -m zipfile -e "${archive}" "${dest}"
+              py=python3
             else
-              python -m zipfile -e "${archive}" "${dest}"
+              py=python
             fi
-            if [ -z "$(find "${dest}" -type f -name install.sh -print -quit)" ]; then
+            "${py}" -m zipfile -e "${archive}" "${dest}"
+            install_sh="$(find "${dest}" -type f -name install.sh -print -quit)"
+            if [ -z "${install_sh}" ]; then
               echo "install.sh not found in ${url}"
               exit 1
             fi
+            # Some archives ship install.sh with a UTF-8 BOM. bash then folds
+            # the BOM into the first command name ("<BOM>pip: command not
+            # found"), so strip it before the file is executed.
+            "${py}" -c 'import sys; p = sys.argv[1]; d = open(p, "rb").read(); open(p, "wb").write(d[3:] if d.startswith(b"\xef\xbb\xbf") else d)' "${install_sh}"
 
             dirs="${dirs:+${dirs},}${dest}"
           done <<< "$(echo "${CONTAINER_PATCHES}" | tr ',' '\n')"
