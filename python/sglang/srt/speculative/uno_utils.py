@@ -9,6 +9,8 @@ from flashinfer import top_k as _flashinfer_top_k
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
+from sglang.kernels.ops.speculative.top_p_mass import top_p_for_top_k_support
+from sglang.srt.environ import envs
 from sglang.srt.speculative.dflash_utils import (
     _adjust_top_p_for_top_k,
     _get_or_create_chain_verify_buffers,
@@ -17,6 +19,7 @@ from sglang.srt.speculative.dflash_utils import (
 from sglang.srt.speculative.spec_utils import fast_sample
 
 _SPARSE_TOP_K_LIMIT = 128
+_FUSED_TOP_P_MASS = envs.SGLANG_OPT_SPEC_FUSED_TOP_P_MASS.get()
 
 
 def _normalize_sparse_topk_probs(
@@ -25,15 +28,17 @@ def _normalize_sparse_topk_probs(
     temperatures: torch.Tensor,
     valid: torch.Tensor,
     top_ps: torch.Tensor | None,
+    adjusted_top_ps: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Normalize compact top-k support with full-distribution top-p semantics."""
     scaled = topk_logits.float() / temperatures
     scaled = scaled.masked_fill(~valid, float("-inf"))
     probs = torch.softmax(scaled, dim=-1)
     if top_ps is not None:
-        adjusted_top_ps = _adjust_top_p_for_top_k(
-            scaled, full_logits, top_ps, temperatures
-        )
+        if adjusted_top_ps is None:
+            adjusted_top_ps = _adjust_top_p_for_top_k(
+                scaled, full_logits, top_ps, temperatures
+            )
         cdf = torch.cumsum(probs, dim=-1)
         probs = probs.masked_fill((cdf - probs) > adjusted_top_ps, 0.0)
     return probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -142,12 +147,18 @@ def _build_sparse_target_support_tensors(
     """Build compact support using the fastest available top-k primitive."""
     # Runs outside torch.compile: Dynamo cannot trace FlashInfer's stream-keyed
     # scratch-buffer lookup, which calls torch._C._cuda_getCurrentRawStream since 0.7.4.
+    logits = next_token_logits.contiguous()
     topk_logits, topk_ids = _flashinfer_top_k(
-        next_token_logits.contiguous(),
+        logits,
         max_top_k,
         sorted=True,
         deterministic=False,
     )
+    adjusted_top_ps = None
+    if top_ps is not None and _FUSED_TOP_P_MASS:
+        adjusted_top_ps = top_p_for_top_k_support(
+            topk_logits, logits, temperatures, top_ks, top_ps, forward_width
+        )
     return _sparse_target_support_from_topk(
         topk_logits=topk_logits,
         topk_ids=topk_ids,
@@ -158,6 +169,7 @@ def _build_sparse_target_support_tensors(
         batch_size=batch_size,
         forward_width=forward_width,
         max_top_k=max_top_k,
+        adjusted_top_ps=adjusted_top_ps,
     )
 
 
@@ -173,6 +185,7 @@ def _sparse_target_support_from_topk(
     batch_size: int,
     forward_width: int,
     max_top_k: int,
+    adjusted_top_ps: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     rows = batch_size * forward_width
     expanded_temperatures = torch.repeat_interleave(
@@ -201,6 +214,7 @@ def _sparse_target_support_from_topk(
         expanded_temperatures,
         ranks < expanded_top_ks,
         expanded_top_ps,
+        adjusted_top_ps,
     )
     return (
         topk_ids.view(batch_size, forward_width, max_top_k),
