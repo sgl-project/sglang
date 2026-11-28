@@ -141,10 +141,24 @@ struct Sm120Fp8GemvKernel {
 
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    TensorMatcher({1, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(x);
-    TensorMatcher({N, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(w);
-    TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(alpha);
-    TensorMatcher({1, N}).with_dtype<bf16_t>().with_device(device).verify(out);
+    TensorMatcher({1, K})  //
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .ensure_alignment(16)
+        .verify(x);
+    TensorMatcher({N, K})  //
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .ensure_alignment(16)
+        .verify(w);
+    TensorMatcher({1})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .verify(alpha);
+    TensorMatcher({1, N})  //
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
 
     constexpr uint32_t kRowsPerBlock = kRows * kNumWarps;
     constexpr uint32_t kNumBlocks = (N + kRowsPerBlock - 1) / kRowsPerBlock;

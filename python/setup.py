@@ -16,12 +16,11 @@ Two filters can narrow the discovered set:
 
 - [tool.sglang] rust-extensions in the active pyproject.toml: a list of
   case-insensitive substrings of the target module. Platform pyprojects use
-  this to build a subset (e.g. pyproject_other.toml builds only "multimodal";
-  grpc needs proto/tonic and is intentionally CUDA-only).
+  this to build a subset (e.g. pyproject_other.toml builds only "multimodal").
 - SGLANG_BUILD_RUST_EXTS env var, applied at build time on top of the above:
   unset or "all" builds everything, "none" builds nothing, and a
-  comma-separated list matches substrings, e.g. "grpc" matches
-  "sglang.srt.rust_extensions._grpc". It is read directly from os.environ
+  comma-separated list matches substrings, e.g. "server" matches
+  "sglang.srt.rust_extensions._server". It is read directly from os.environ
   instead of sglang.srt.environ, which is not importable until the package is
   built.
 """

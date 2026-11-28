@@ -923,7 +923,11 @@ class LlamaForCausalLM(nn.Module):
 
 
 class Phi3ForCausalLM(LlamaForCausalLM):
-    pass
+    # The checkpoint stores qkv_proj and gate_up_proj already fused.
+    packed_modules_mapping = {
+        "qkv_proj": ["qkv_proj"],
+        "gate_up_proj": ["gate_up_proj"],
+    }
 
 
 class InternLM3ForCausalLM(LlamaForCausalLM):

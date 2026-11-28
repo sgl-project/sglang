@@ -45,7 +45,7 @@ class TestAsmContextPrefillGatherIndices(CustomTestCase):
             qo_indptr=None,
             kv_last_page_len=None,
             max_q_len=1,
-            max_kv_len=max(seq_lens),
+            batch_max_kv_len=max(seq_lens),
         )
         backend = types.SimpleNamespace(forward_metadata=fm)
         fb = types.SimpleNamespace(

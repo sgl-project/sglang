@@ -85,7 +85,7 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT": "Python HTTP server (uvicorn) setting.",
     "fastapi_root_path": "Python HTTP server (FastAPI) setting.",
     "enable_http_worker_reuseport": "Python HTTP server (multi-worker) setting.",
-    "grpc_worker_threads": "Python gRPC server thread pool.",
+    "grpc_worker_threads": "Deprecated; the Python gRPC bridge it sized was removed.",
     # Routes the Rust server does not serve: their clients get a 404.
     "asr_max_concurrent_sessions": "/v1/realtime is not served.",
     "enable_response_store": "The Rust frontend serves /v1/responses without a store; stateful requests get Python's store-disabled refusal.",
@@ -143,7 +143,7 @@ RUST_SERVER_KNOWN_GAPS: Dict[str, str] = {
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS": "No crash diagnostics when a scheduler crashes.",
     "speculative_num_draft_tokens": "Native /generate gets the scheduler's per-request speculative-decoding stats (SchedulerOutputStreamer.get_request_stats), but the OpenAI routes drop sglext.spec_tokens_details, and under adaptive speculative decoding the proposed-draft count follows the scheduler's active draft width where Python uses the launch value (also behind the speculative_algorithm read, honored by name).",
     "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Unverified: whether a batch's items are scheduled together.",
-    "enable_encoder_swa_bounded_replay": "Unverified: Python refuses image requests off CUDA and warms up with text.",
+    "enable_encoder_swa_bounded_replay": "Unverified: Python refuses image requests off CUDA.",
     "SGLANG_INKLING_DEFAULT_REASONING_EFFORT": "Chat: the Rust chat route has no Inkling renderer.",
     "trust_request_chat_template": "Chat: the Rust chat route never renders a request's own template.",
     "SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR": "Chat: the Rust chat route builds no per-turn response-template tool grammar.",

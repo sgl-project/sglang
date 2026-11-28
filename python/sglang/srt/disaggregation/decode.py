@@ -4283,6 +4283,9 @@ class SchedulerDisaggregationDecodeMixin:
             batch.seq_lens.record_stream(self.forward_stream)
         else:
             batch.process_prebuilt(self.future_map)
+        if self.spec_algorithm.is_ngram() and self.draft_worker is not None:
+            # No extend ran here, so the decode corpus has none of the prompt yet.
+            self.draft_worker.insert_prompt_tails(batch)
         return batch
 
     def _nonblocking_admit_in_scope(self: Scheduler, batch: ScheduleBatch) -> bool:
@@ -4475,10 +4478,10 @@ class SchedulerDisaggregationDecodeMixin:
 
         # construct fake completed prefill
         new_batch.prepare_for_prebuilt()
-        self.sampler_params_pool.write(new_batch.reqs)
         # Replays the prefill node's output token into the penalty history.
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
+        self.sampling_params_pool.write(new_batch.reqs)
         return new_batch
 
     def _start_host_restores(self: Scheduler) -> None:

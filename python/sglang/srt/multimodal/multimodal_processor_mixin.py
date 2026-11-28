@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
-    configure_media_url_security,
+    configure_worker_media_policy,
     load_audio,
     load_image,
     load_video,
@@ -54,12 +54,7 @@ class MultimodalProcessorMixin:
         self.hf_config = hf_config
         self._processor = _processor
 
-        configure_media_url_security(
-            processor_config.allowed_media_domains,
-            processor_config.media_url_max_file_size_mb,
-            processor_config.media_url_timeout,
-            processor_config.allow_local_media_files,
-        )
+        configure_worker_media_policy(processor_config)
 
         self.image_processor_backend = processor_config.image_processor_backend
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
