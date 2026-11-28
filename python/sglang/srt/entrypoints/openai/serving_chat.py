@@ -46,6 +46,11 @@ _CHAT_TEMPLATE_CLIENT_ERRORS: tuple[type[BaseException], ...] = (
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
+from sglang.srt.constrained.base_grammar_backend import _grammar_key_contains_nul
+from sglang.srt.constrained.json_schema_validation import (
+    UnsupportedJSONSchemaFeature,
+    validate_xgrammar_json_schema,
+)
 from sglang.srt.entrypoints.openai import (
     chat_encoding,
     chat_encoding_adapters,
@@ -82,6 +87,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolCallProcessingResult,
     ToolChoice,
     TopLogprob,
+    convert_json_schema_to_str,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
@@ -101,9 +107,11 @@ from sglang.srt.entrypoints.request_headers import apply_header_overrides
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.glm4_moe_detector import GlmSpecialTokenConfig
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik3_detector import KimiK3Detector
+from sglang.srt.function_call.kimik3_format import strip_response_markers
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -380,6 +388,20 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
         # a model-specific public processor option.
         config["_question"] = question
     return config or None
+
+
+def _continues_closed_thinking(
+    request: ChatCompletionRequest, end_of_thinking: str
+) -> bool:
+    # Same test the reasoning parser applies to a continued assistant message.
+    last = request.messages[-1] if request.messages else None
+    return (
+        request.continue_final_message
+        and last is not None
+        and last.role == "assistant"
+        and isinstance(last.content, str)
+        and end_of_thinking in last.content
+    )
 
 
 class OpenAIServingChat(OpenAIServingBase):
@@ -1276,9 +1298,9 @@ class OpenAIServingChat(OpenAIServingBase):
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
-            renderer_handles_response_format=(
-                self._encoding_adapter is not None
-                and self._encoding_adapter.renders_response_format
+            renderer_handles_response_format=self._renders_response_format(),
+            tool_call_constraint_covers_answer=(
+                processed_messages.tool_call_constraint_covers_answer
             ),
         )
         set_request_reasoning_end_token_ids(
@@ -1741,12 +1763,79 @@ class OpenAIServingChat(OpenAIServingBase):
             and issubclass(tool_detector, ResponseTemplateToolDetector)
         )
 
+    def _renders_response_format(self) -> bool:
+        return (
+            self._encoding_adapter is not None
+            and self._encoding_adapter.renders_response_format
+        )
+
+    def _answer_json_schema(self, request: ChatCompletionRequest) -> Optional[str]:
+        """The JSON schema response_format holds the answer to, if any."""
+        response_format = request.response_format
+        if response_format is None or request.regex or request.ebnf:
+            return None
+        if response_format.type == "json_object":
+            return '{"type": "object"}'
+        if response_format.type != "json_schema":
+            return None
+        # Mirrors to_sampling_params: the renderer states a non-strict schema
+        # in the prompt instead of constraining the output.
+        if (
+            response_format.json_schema.strict is False
+            and self._renders_response_format()
+        ):
+            return None
+        return convert_json_schema_to_str(response_format.json_schema.schema_)
+
+    def _answer_tool_call_constraint(
+        self,
+        request: ChatCompletionRequest,
+        parser: FunctionCallParser,
+        answer_json_schema: Optional[str],
+        thinking_mode: bool,
+    ) -> Optional[ToolCallConstraint]:
+        """The constraint admitting tool calls or the JSON answer, or None
+        when there is no JSON answer or the parser cannot express both.
+
+        None keeps the answer on the plain json path, whose backend checks
+        reject a bad schema instead of the combined grammar bypassing them.
+        """
+        if (
+            answer_json_schema is None
+            or request.tool_choice != "auto"
+            # Response templates frame a JSON answer with their own grammar.
+            or isinstance(parser.detector, ResponseTemplateToolDetector)
+            # Other backends cannot compile the combined EBNF or structural tag.
+            or self.tokenizer_manager.config_value("grammar_backend") != "xgrammar"
+            or _grammar_key_contains_nul("json", answer_json_schema)
+        ):
+            return None
+        try:
+            validate_xgrammar_json_schema(json.loads(answer_json_schema))
+        except (UnsupportedJSONSchemaFeature, json.JSONDecodeError):
+            return None
+        return parser.get_answer_structure_constraint(
+            answer_json_schema,
+            parallel_tool_calls=request.parallel_tool_calls,
+            thinking_mode=thinking_mode,
+            any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
+            max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
+            # A full-assistant grammar skips the reasoner wrapper, which exists only
+            # with a reasoning parser and caps only a thinking request's reasoning.
+            allow_full_assistant_grammar=not (
+                get_serving().enable_strict_thinking
+                and self.reasoning_parser
+                and thinking_mode
+            ),
+        )
+
     def _process_messages(
         self,
         request: ChatCompletionRequest,
         is_multimodal: bool,
         *,
         output_constrained: bool = False,
+        answer_json_schema: Optional[str] = None,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
         self._apply_request_defaults(request)
@@ -1762,8 +1851,15 @@ class OpenAIServingChat(OpenAIServingBase):
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
         xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
+        # That prefix is unconstrained, and unseparated it reaches the tool parser.
+        request._response_parser_unconstrained_thinking = (
+            bool(self.reasoning_parser) and not request.separate_reasoning
+        )
         tool_call_constraint = None
+        tool_call_constraint_covers_answer = False
         template_tool_parser = None
+        if answer_json_schema is None:
+            answer_json_schema = self._answer_json_schema(request)
 
         effective_tools = self._effective_tools(request)
         # A grammar reaching its terminal state ends generation regardless of
@@ -1780,13 +1876,38 @@ class OpenAIServingChat(OpenAIServingBase):
                 "enable_thinking"
             )
             parser = FunctionCallParser(effective_tools, self.tool_call_parser)
-            tool_call_constraint = parser.get_structure_constraint(
-                request.tool_choice,
-                parallel_tool_calls=request.parallel_tool_calls,
-                thinking_mode=(
-                    True if enable_thinking is None else bool(enable_thinking)
-                ),
+            glm_thinking = True if enable_thinking is None else bool(enable_thinking)
+            # GLM-5.3 thinks even with enable_thinking=false, and a grammar
+            # without the block leaves the JSON in reasoning_content.
+            answer_thinking = thinking_mode if self.reasoning_parser else glm_thinking
+            # The reasoning parser reads thinking as closed in a continued message
+            # that ends it, so a second block would reach the content.
+            if _continues_closed_thinking(
+                request, GlmSpecialTokenConfig().end_of_thinking
+            ):
+                answer_thinking = False
+            tool_call_constraint = self._answer_tool_call_constraint(
+                request, parser, answer_json_schema, thinking_mode=answer_thinking
             )
+            tool_call_constraint_covers_answer = tool_call_constraint is not None
+            request._response_parser_answer_excludes_calls = (
+                tool_call_constraint_covers_answer
+            )
+            # Unseparated reasoning reaches the tool parser as it does without a
+            # reasoning parser, so the same marker skips it.
+            request._response_parser_thinking_end = (
+                GlmSpecialTokenConfig().end_of_thinking
+                if tool_call_constraint_covers_answer
+                and answer_thinking
+                and (not self.reasoning_parser or not request.separate_reasoning)
+                else ""
+            )
+            if tool_call_constraint is None:
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                    thinking_mode=glm_thinking,
+                )
 
         # Apply chat template and its stop strings
         tools = None
@@ -1813,11 +1934,33 @@ class OpenAIServingChat(OpenAIServingBase):
                     self.tool_call_parser,
                     tokenizer=self.tokenizer_manager.tokenizer,
                 )
-                tool_call_constraint = parser.get_structure_constraint(
-                    request.tool_choice,
-                    parallel_tool_calls=request.parallel_tool_calls,
+                tool_call_constraint = self._answer_tool_call_constraint(
+                    request,
+                    parser,
+                    answer_json_schema,
                     thinking_mode=xgrammar_reasoning,
                 )
+                tool_call_constraint_covers_answer = tool_call_constraint is not None
+                # The kimi_k3 reasoning parser unwraps a separated answer itself.
+                request._response_parser_json_answer_channel = (
+                    tool_call_constraint_covers_answer
+                    and isinstance(parser.detector, KimiK3Detector)
+                    and not (
+                        self.reasoning_parser == "kimi_k3"
+                        and request.separate_reasoning
+                    )
+                )
+                # A separating reasoning parser hands over the text after the
+                # thinking, where the answer grammar starts.
+                request._response_parser_answer_after_thinking = thinking_mode and not (
+                    self.reasoning_parser and request.separate_reasoning
+                )
+                if tool_call_constraint is None:
+                    tool_call_constraint = parser.get_structure_constraint(
+                        request.tool_choice,
+                        parallel_tool_calls=request.parallel_tool_calls,
+                        thinking_mode=xgrammar_reasoning,
+                    )
                 if (
                     tool_call_constraint is not None
                     and tool_call_constraint[0] == "structural_tag"
@@ -1863,6 +2006,21 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_choice="none",
                     thinking_mode=xgrammar_reasoning,
                 ),
+            )
+
+        if (
+            tool_call_constraint is None
+            and answer_json_schema is not None
+            and request.tool_choice == "auto"
+            and effective_tools
+            and self.tool_call_parser
+            and template_tool_parser is None
+        ):
+            logger.warning(
+                "The %s tool-call parser cannot combine tool calls with a JSON "
+                "response format; the format covers the whole output, so the "
+                "model cannot call tools.",
+                self.tool_call_parser,
             )
 
         if tool_call_constraint is None and self._takes_turn_grammar(
@@ -1918,6 +2076,7 @@ class OpenAIServingChat(OpenAIServingBase):
             configure_response_template_request(request)
             result.uses_response_template = True
         result.tool_call_constraint = tool_call_constraint
+        result.tool_call_constraint_covers_answer = tool_call_constraint_covers_answer
         result.require_reasoning = thinking_mode
         if template_tool_parser is not None and result.uses_response_template:
             self._record_template_tool_call_grammar(
@@ -3024,6 +3183,7 @@ class OpenAIServingChat(OpenAIServingBase):
             reasoning_text = None
             tool_calls = None
             answer_started = False
+            response_unwrapped = False
             if encoding_output is not None:
                 reasoning_text, text, tool_calls, finish_reason = (
                     encoding_output.parse_chat_response(
@@ -3048,6 +3208,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     reasoning_text, text = parser.parse_non_stream(text)
                     answer_started = self._answer_started(parser)
+                    # The kimi_k3 parser already took the answer out of its
+                    # response channel, so markers left in it are answer text.
+                    response_unwrapped = self.reasoning_parser == "kimi_k3"
                 except Exception as e:
                     logger.error(f"Reasoning parsing error: {e}")
                     return self.create_error_response(
@@ -3074,6 +3237,19 @@ class OpenAIServingChat(OpenAIServingBase):
                     grammar_holds_calls(
                         request._response_parser_tool_grammar,
                         request._response_parser_grammar_start,
+                    ),
+                    thinking_end=request._response_parser_thinking_end,
+                    keep_thinking_before_calls=not request.separate_reasoning,
+                    answer_excludes_calls=(
+                        request._response_parser_answer_excludes_calls
+                    ),
+                    response_unwrapped=response_unwrapped,
+                    json_answer_channel=request._response_parser_json_answer_channel,
+                    json_answer_after_thinking=(
+                        request._response_parser_answer_after_thinking
+                    ),
+                    unconstrained_thinking=(
+                        request._response_parser_unconstrained_thinking
                     ),
                 )
 
@@ -3289,6 +3465,14 @@ class OpenAIServingChat(OpenAIServingBase):
         history_tool_calls_cnt: int = 0,
         response_parser_prefix: str = "",
         constrained: bool = False,
+        *,
+        thinking_end: str = "",
+        keep_thinking_before_calls: bool = False,
+        answer_excludes_calls: bool = False,
+        response_unwrapped: bool = False,
+        json_answer_channel: bool = False,
+        json_answer_after_thinking: bool = False,
+        unconstrained_thinking: bool = False,
     ) -> ToolCallProcessingResult:
         """Process tool calls in the response"""
 
@@ -3305,12 +3489,19 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_choice=tool_choice,
                 prefix=response_parser_prefix,
                 constrained=constrained,
+                thinking_end=thinking_end,
+                keep_thinking_before_calls=keep_thinking_before_calls,
+                answer_excludes_calls=answer_excludes_calls,
+                unconstrained_thinking=unconstrained_thinking,
             )
+            answers = parser.answers_without_calls(text)
+            thinking, text = parser.split_thinking(text)
             detector_owns_format = parser.owns_tool_format()
             should_try_parser = not is_required or detector_owns_format
-            if should_try_parser and parser.has_tool_call(text):
+            if should_try_parser and not answers and parser.has_tool_call(text):
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
+                    text, thinking = thinking + text, ""
                     if not call_info_list:
                         logger.warning(
                             "Tool call marker present but no complete call parsed "
@@ -3347,7 +3538,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
-                    return ToolCallProcessingResult(None, text, finish_reason)
+                    return ToolCallProcessingResult(
+                        None, thinking + text, finish_reason
+                    )
+            text = thinking + text
 
             if is_required and detector_owns_format:
                 logger.warning(
@@ -3357,6 +3551,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 logger.debug("Unparsed required tool call output: %r", text[:2000])
                 return ToolCallProcessingResult(None, text, finish_reason)
+
+            if isinstance(parser.detector, KimiK3Detector) and not response_unwrapped:
+                text = strip_response_markers(
+                    text, json_answer_channel, json_answer_after_thinking
+                )
 
         # json_schema constraint → JSON array output for required/named
         if is_required:
@@ -3803,6 +4002,18 @@ class OpenAIServingChat(OpenAIServingBase):
                     tokenizer=self.tokenizer_manager.tokenizer,
                     prefix=request._response_parser_prefix,
                     constrained=constrained,
+                    thinking_end=request._response_parser_thinking_end,
+                    keep_thinking_before_calls=not request.separate_reasoning,
+                    answer_excludes_calls=(
+                        request._response_parser_answer_excludes_calls
+                    ),
+                    json_answer_channel=request._response_parser_json_answer_channel,
+                    json_answer_after_thinking=(
+                        request._response_parser_answer_after_thinking
+                    ),
+                    unconstrained_thinking=(
+                        request._response_parser_unconstrained_thinking
+                    ),
                 )
 
         parser = parser_dict[index]

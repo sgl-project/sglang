@@ -1,4 +1,5 @@
 import inspect
+import json
 import logging
 from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
 
@@ -31,6 +32,7 @@ from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
 from sglang.srt.function_call.glm4_moe_detector import (
     Glm4MoeDetector,
     GlmSpecialTokenConfig,
+    generate_glm_answer_grammar,
     generate_glm_grammar,
 )
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
@@ -44,7 +46,10 @@ from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
 from sglang.srt.function_call.k2_v3_detector import K2V3Detector
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
-from sglang.srt.function_call.kimik3_detector import KimiK3Detector
+from sglang.srt.function_call.kimik3_detector import (
+    KimiK3Detector,
+    KimiK3JsonAnswerDetector,
+)
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.ling3_detector import Ling3Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
@@ -139,9 +144,38 @@ class FunctionCallParser:
         tool_choice=None,
         prefix: str = "",
         constrained: bool = False,
+        thinking_end: str = "",
+        keep_thinking_before_calls: bool = False,
+        answer_excludes_calls: bool = False,
+        json_answer_channel: bool = False,
+        json_answer_after_thinking: bool = False,
+        unconstrained_thinking: bool = False,
     ):
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+        # The output opens with a thinking block ending at thinking_end that no
+        # reasoning parser took out; it is dropped, or with
+        # keep_thinking_before_calls dropped only on a turn that answers.
+        self._thinking_end = thinking_end
+        self._keep_thinking_before_calls = keep_thinking_before_calls
+        # A reasoning parser's grammar wrapper leaves the thinking unconstrained,
+        # so it also ends the block at an earlier call marker, as the parser does.
+        self._calls_end_thinking = bool(thinking_end) and unconstrained_thinking
+        # The grammar makes a turn either start with a tool call or answer
+        # without any, so an answer is never parsed for calls.
+        self._answer_excludes_calls = answer_excludes_calls or bool(thinking_end)
+        # Where the stream is before the detector takes over: in the thinking
+        # block, undecided between a call and an answer, or in an answer.
+        self._stream_phase: Optional[Literal["thinking", "undecided", "answer"]] = (
+            "thinking"
+            if thinking_end
+            else "undecided"
+            if answer_excludes_calls
+            else None
+        )
+        self._thinking_tail = ""
+        self._held_thinking: List[str] = []
+        self._undecided_text = ""
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
             kwargs = {}
@@ -155,6 +189,9 @@ class FunctionCallParser:
                 kwargs["constrained"] = constrained
                 # Forced calls are parsed in the format of the tag for these tools.
                 kwargs["tools"] = self.structural_tag_tools()
+            if detector_class is KimiK3Detector and json_answer_channel:
+                detector_class = KimiK3JsonAnswerDetector
+                kwargs["after_thinking"] = json_answer_after_thinking
             detector = detector_class(**kwargs)
         else:
             message = removed_choice_message("tool_call_parser", tool_call_parser)
@@ -177,6 +214,58 @@ class FunctionCallParser:
             or self.detector.supports_structural_tag()
             or self.detector.parses_required_natively()
         )
+
+    def strip_thinking(self, text: str) -> str:
+        """Non-streaming `text` without the thinking block it opens with; text
+        cut off inside the block has no content unless the block is kept."""
+        return "".join(self.split_thinking(text))
+
+    def split_thinking(self, text: str) -> Tuple[str, str]:
+        """Non-streaming `text` as the thinking block it keeps, if any, and the
+        rest, which alone is parsed for tool calls."""
+        if not self._thinking_end:
+            return "", text
+        call = self._call_in_thinking(text)
+        if call != -1:
+            return text[:call] if self._keep_thinking_before_calls else "", text[call:]
+        thinking, end, answer = text.partition(self._thinking_end)
+        if not self._keep_thinking_before_calls:
+            return "", answer
+        if not end:
+            return text, ""
+        if not self._starts_answer(answer):
+            return thinking + end, answer
+        return "", answer
+
+    def answers_without_calls(self, text: str) -> bool:
+        """Whether non-streaming `text`, thinking block included, is a turn
+        that the grammar let end without any tool call."""
+        if not self._answer_excludes_calls:
+            return False
+        if self._thinking_end:
+            if self._call_in_thinking(text) != -1:
+                return False
+            _, end, text = text.partition(self._thinking_end)
+            if not end:
+                return True
+        return not self._starts_with_call(text)
+
+    def _call_in_thinking(self, text: str) -> int:
+        # Where a call marker ends the thinking block before its end marker, or -1.
+        if not self._calls_end_thinking:
+            return -1
+        call = text.find(self.detector.bot_token)
+        end = text.find(self._thinking_end)
+        return call if call != -1 and (end == -1 or call < end) else -1
+
+    def _starts_with_call(self, text: str) -> bool:
+        return text.lstrip().startswith(self.detector.bot_token)
+
+    def _starts_answer(self, text: str) -> bool:
+        # Neither a tool call nor text that could still open one.
+        head = text.lstrip()
+        bot_token = self.detector.bot_token
+        return not (head.startswith(bot_token) or bot_token.startswith(head))
 
     def has_tool_call(self, text: str) -> bool:
         """
@@ -241,12 +330,22 @@ class FunctionCallParser:
         Each segment is sent text first, then calls; the segments are in
         generation order.
         """
+        leading_text = ""
+        if self._stream_phase is not None:
+            leading_text, chunk_text = self._advance_stream_phase(chunk_text)
+            if chunk_text is None:
+                return [(leading_text, [])]
         if not self.tools and not self.detector.parses_without_tools():
-            return [(chunk_text, [])]
-        return [
+            return [(leading_text + chunk_text, [])]
+        segments = [
             (result.normal_text, result.calls)
             for result in self.detector.parse_streaming_segments(chunk_text, self.tools)
         ]
+        if leading_text:
+            # It precedes anything the detector parsed in the chunk.
+            text, calls = segments[0]
+            segments[0] = (leading_text + text, calls)
+        return segments
 
     def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
         """
@@ -269,16 +368,74 @@ class FunctionCallParser:
             calls.extend(segment_calls)
         return normal_text, calls
 
+    def _advance_stream_phase(self, chunk_text: str) -> Tuple[str, Optional[str]]:
+        # Returns the text to emit as is, and the text for the detector or None.
+        if self._stream_phase == "answer":
+            return chunk_text, None
+        if self._stream_phase == "thinking":
+            text = self._thinking_tail + chunk_text
+            call = self._call_in_thinking(text)
+            if call != -1:
+                self._thinking_tail = ""
+                self._stream_phase = None
+                thinking = "".join(self._held_thinking) + text[:call]
+                self._held_thinking = []
+                return thinking if self._keep_thinking_before_calls else "", text[call:]
+            end = text.find(self._thinking_end)
+            if end == -1:
+                # Keep what may be the start of a marker split across chunks.
+                markers = [self._thinking_end]
+                if self._calls_end_thinking:
+                    markers.append(self.detector.bot_token)
+                tail = max(map(len, markers)) - 1
+                self._thinking_tail = text[-tail:]
+                if self._keep_thinking_before_calls:
+                    self._held_thinking.append(
+                        text[: len(text) - len(self._thinking_tail)]
+                    )
+                return "", None
+            self._thinking_tail = ""
+            end += len(self._thinking_end)
+            if self._keep_thinking_before_calls:
+                self._held_thinking.append(text[:end])
+            self._stream_phase = "undecided"
+            chunk_text = text[end:]
+        text = self._undecided_text + chunk_text
+        head = text.lstrip()
+        bot_token = self.detector.bot_token
+        if len(head) < len(bot_token) and bot_token.startswith(head):
+            self._undecided_text = text
+            return "", None
+        self._undecided_text = ""
+        thinking = "".join(self._held_thinking)
+        self._held_thinking = []
+        if head.startswith(bot_token):
+            self._stream_phase = None
+            return thinking, text
+        self._stream_phase = "answer"
+        return text, None
+
     def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
         """Flush detector state once the stream ends.
 
         Text a detector held back waiting for a marker (which can no longer
         arrive) is released as normal text; see BaseFormatDetector.finish().
         """
+        # A kept thinking block stays when the stream ends before the answer
+        # starts, the same as a turn that calls a tool.
+        normal_text = ""
+        if self._stream_phase == "thinking" and self._keep_thinking_before_calls:
+            normal_text = "".join(self._held_thinking) + self._thinking_tail
+        elif self._stream_phase == "undecided":
+            normal_text = "".join(self._held_thinking) + self._undecided_text
+        self._stream_phase = None
+        self._thinking_tail = ""
+        self._held_thinking = []
+        self._undecided_text = ""
         if not self.tools and not self.detector.parses_without_tools():
-            return "", []
+            return normal_text, []
         sp_result = self.detector.finish(self.tools)
-        return sp_result.normal_text, sp_result.calls
+        return normal_text + sp_result.normal_text, sp_result.calls
 
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
@@ -362,9 +519,8 @@ class FunctionCallParser:
             or None if no constraint applies.
         """
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
-        should_constrain_auto = tool_choice == "auto" and (
-            any(tool.function.strict for tool in self.tools)
-            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        should_constrain_auto = (
+            tool_choice == "auto" and self._constrains_auto_arguments()
         )
         structural_tag_tools = self.structural_tag_tools()
         if isinstance(self.detector, ResponseTemplateToolDetector):
@@ -454,3 +610,59 @@ class FunctionCallParser:
         except Exception as e:
             logger.error(f"Error getting structure constraint: {e}")
             return None
+
+    def get_answer_structure_constraint(
+        self,
+        answer_json_schema: str,
+        parallel_tool_calls: bool = True,
+        thinking_mode: bool = False,
+        any_whitespace: bool = True,
+        max_whitespace_cnt: Optional[int] = None,
+        allow_full_assistant_grammar: bool = True,
+    ) -> Optional[ToolCallConstraint]:
+        """
+        Returns a constraint for tool_choice="auto" that admits tool calls or a
+        final answer matching answer_json_schema, or None if the format cannot
+        express both.
+        """
+        if not self.tools:
+            return None
+        if (
+            isinstance(self.detector, Glm47MoeDetector)
+            and self.detector.parses_required_natively()
+        ):
+            if not allow_full_assistant_grammar:
+                return None
+            try:
+                grammar = generate_glm_answer_grammar(
+                    enable_thinking=thinking_mode,
+                    functions=[tool.function for tool in self.tools],
+                    special_tokens=GlmSpecialTokenConfig(),
+                    answer_json_schema=answer_json_schema,
+                    parallel_tool_calls=parallel_tool_calls,
+                    any_whitespace=any_whitespace,
+                    max_whitespace_cnt=max_whitespace_cnt,
+                )
+            except RuntimeError:
+                # An invalid schema keeps the plain json path, where the
+                # grammar backend rejects the request with a 400.
+                return None
+            return ("full_assistant_ebnf", grammar)
+        strict_arguments = self._constrains_auto_arguments()
+        structural_tag = self.detector.get_answer_structural_tag(
+            tools=self.structural_tag_tools() if strict_arguments else self.tools,
+            answer_json_schema=json.loads(answer_json_schema),
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+            strict_arguments=strict_arguments,
+            max_whitespace_cnt=max_whitespace_cnt,
+        )
+        if structural_tag is None:
+            return None
+        return ("structural_tag", structural_tag)
+
+    def _constrains_auto_arguments(self) -> bool:
+        return (
+            any(tool.function.strict for tool in self.tools)
+            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        )

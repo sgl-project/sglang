@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from xgrammar import StructuralTag
 
@@ -16,13 +16,17 @@ from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
     RESPONSE_CLOSE,
     RESPONSE_OPEN,
+    THINK_CLOSE,
+    THINK_THEN_RESPONSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
+    closing_markers_len,
     partial_suffix_len,
     strip_partial_marker_suffix,
     strip_response_wrappers,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
+    get_kimik3_answer_structural_tag,
     get_kimik3_auto_tool_call_structural_tag,
     get_kimik3_structural_tag,
 )
@@ -106,6 +110,24 @@ class KimiK3Detector(BaseFormatDetector):
             tools or [],
             thinking_mode=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
+        )
+
+    def get_answer_structural_tag(
+        self,
+        tools: List[Tool],
+        answer_json_schema: Dict[str, Any],
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+        strict_arguments: bool = False,
+        max_whitespace_cnt: Optional[int] = None,
+    ) -> Optional[StructuralTag]:
+        return get_kimik3_answer_structural_tag(
+            tools,
+            answer_json_schema,
+            thinking_mode=thinking_mode,
+            parallel_tool_calls=parallel_tool_calls,
+            strict_arguments=strict_arguments,
+            max_whitespace_cnt=max_whitespace_cnt,
         )
 
     def get_structural_tag(
@@ -343,3 +365,51 @@ class KimiK3Detector(BaseFormatDetector):
                 pending = pending.replace(marker, "")
         self._sent_normal_idx = limit
         return pending
+
+
+class KimiK3JsonAnswerDetector(KimiK3Detector):
+    """KimiK3Detector for a turn whose response channel holds a JSON answer:
+    only the channel's own opener and the closers that end it are markers, so
+    any others in the output are quoted text."""
+
+    def __init__(self, after_thinking: bool = False):
+        super().__init__()
+        # As the answer grammar lays it out, the opener starts the output or,
+        # when the output thinks first, follows the first think closer; that
+        # thinking is unconstrained, so it may also be skipped.
+        self._after_thinking = after_thinking
+        self._start_checked = False
+        self._answer_opener_seen = False
+
+    def _emit_normal_text(self, limit: int | None = None) -> str:
+        # A given limit ends the text, so closers there end the answer; until
+        # then they are held, with any marker they run into, since quoted text
+        # may still follow them.
+        start = self._sent_normal_idx
+        end = len(self._buffer) if limit is None else limit
+        pending = self._buffer[start:end]
+        if limit is None:
+            partial = partial_suffix_len(
+                pending, [self.bot_token, RESPONSE_OPEN, THINK_THEN_RESPONSE]
+            )
+            holdback = partial + closing_markers_len(pending[: len(pending) - partial])
+            pending = pending[: len(pending) - holdback]
+            self._sent_normal_idx = start + len(pending)
+        else:
+            pending = pending[: len(pending) - closing_markers_len(pending)]
+            self._sent_normal_idx = end
+        if self._answer_opener_seen or not pending:
+            return pending
+        if not self._start_checked:
+            self._start_checked = True
+            if pending.startswith(RESPONSE_OPEN) or not self._after_thinking:
+                self._answer_opener_seen = True
+                return pending.removeprefix(RESPONSE_OPEN)
+        idx = pending.find(THINK_CLOSE)
+        if idx == -1:
+            return pending
+        self._answer_opener_seen = True
+        idx += len(THINK_CLOSE)
+        if not pending.startswith(RESPONSE_OPEN, idx):
+            return pending
+        return pending[:idx] + pending[idx + len(RESPONSE_OPEN) :]

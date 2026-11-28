@@ -24,6 +24,7 @@ from sglang.srt.function_call.kimik3_format import (
     TOOLS_OPEN,
 )
 from sglang.srt.function_call.kimik3_structural_tag import (
+    get_kimik3_answer_structural_tag,
     get_kimik3_auto_tool_call_structural_tag,
     get_kimik3_structural_tag,
 )
@@ -998,6 +999,37 @@ def test_output_may_start_inside_the_prefilled_response():
 def test_single_call_auto_admits_the_turn_close():
     grammar = _grammar([_tool()], parallel_tool_calls=False)
     assert _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
+
+
+@pytest.mark.parametrize("strict_arguments", [False, True])
+@pytest.mark.parametrize("thinking_mode", [False, True])
+def test_answer_tag_admits_calls_or_a_schema_answer(strict_arguments, thinking_mode):
+    """Under a JSON answer format, auto mode still admits a tools section, and
+    a response that is not a tool call must match the answer schema (#47167)."""
+    tag = get_kimik3_answer_structural_tag(
+        [_tool(strict=strict_arguments)],
+        {
+            "type": "object",
+            "properties": {"word": {"type": "string"}},
+            "required": ["word"],
+            "additionalProperties": False,
+        },
+        thinking_mode=thinking_mode,
+        strict_arguments=strict_arguments,
+    )
+    prefix = "Plan." + THINK_CLOSE if thinking_mode else ""
+    response = "<|open|>response<|sep|>{}<|close|>response<|sep|>"
+    call = _tools_section(_valid_weather_call())
+
+    assert _token_accepts(tag, prefix + call + MESSAGE_CLOSE)
+    assert _token_accepts(tag, prefix + response.format("") + call)
+    # A prose answer must not be able to end in a forced call.
+    assert not _token_accepts(tag, prefix + response.format("The word is hi.") + call)
+    assert _token_accepts(
+        tag, prefix + response.format('{"word": "hi"}') + MESSAGE_CLOSE
+    )
+    assert not _token_accepts(tag, prefix + response.format("The word is hi."))
+    assert not _token_accepts(tag, prefix + response.format('{"other": 1}'))
 
 
 if __name__ == "__main__":

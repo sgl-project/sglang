@@ -978,6 +978,19 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
+    # Ends the thinking block that the tool-call grammar opens the output with
+    # and that no reasoning parser takes out of the content.
+    _response_parser_thinking_end: str = PrivateAttr(default="")
+    # The grammar lets a turn either open with tool calls or answer without any.
+    _response_parser_answer_excludes_calls: bool = PrivateAttr(default=False)
+    # Kimi-K3's answer is a JSON response block that reaches the tool parser
+    # still framed, so markers quoted inside the JSON are answer text.
+    _response_parser_json_answer_channel: bool = PrivateAttr(default=False)
+    # The output thinks before that answer.
+    _response_parser_answer_after_thinking: bool = PrivateAttr(default=False)
+    # The thinking in the output came through a reasoning parser's grammar
+    # wrapper, unconstrained, and no reasoning parser takes it out.
+    _response_parser_unconstrained_thinking: bool = PrivateAttr(default=False)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
 
@@ -1295,6 +1308,7 @@ class ChatCompletionRequest(PDRoutingFields):
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
         renderer_handles_response_format: bool = False,
+        tool_call_constraint_covers_answer: bool = False,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -1360,6 +1374,8 @@ class ChatCompletionRequest(PDRoutingFields):
             and response_format
             and response_format.type in ("json_object", "json_schema")
         ):
+            response_format = None
+        if tool_call_constraint_covers_answer:
             response_format = None
 
         if response_format and response_format.type == "json_schema":
@@ -2105,6 +2121,10 @@ class ResponsesRequest(PDRoutingFields):
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
+    _response_parser_thinking_end: str = PrivateAttr(default="")
+    _response_parser_answer_excludes_calls: bool = PrivateAttr(default=False)
+    _response_parser_json_answer_channel: bool = PrivateAttr(default=False)
+    _response_parser_answer_after_thinking: bool = PrivateAttr(default=False)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False
@@ -2303,6 +2323,7 @@ class ResponsesRequest(PDRoutingFields):
         default_params: Optional[Dict] = None,
         stop: Optional[Union[str, List[str]]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        tool_call_constraint_covers_answer: bool = False,
     ) -> Dict[str, Any]:
         """Convert to sampling parameters for generation.
 
@@ -2355,7 +2376,7 @@ class ResponsesRequest(PDRoutingFields):
                 params[key] = value
 
         json_schema = self._json_schema_from_text_format(self.text)
-        if json_schema is not None:
+        if json_schema is not None and not tool_call_constraint_covers_answer:
             params["json_schema"] = json_schema
 
         has_existing_constraints = (
@@ -2620,6 +2641,9 @@ class MessageProcessingResult:
         Callable[[], Optional[ToolCallConstraint]]
     ] = None
     uses_response_template: bool = False
+    # The tool-call constraint also holds the final answer to the requested
+    # JSON format, so the format must not be applied on its own.
+    tool_call_constraint_covers_answer: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):
