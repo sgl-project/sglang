@@ -23,6 +23,7 @@ def _sm120_deep_gemm_apis_available() -> bool:
         callable(getattr(deep_gemm, name, None))
         for name in (
             "fp8_einsum",
+            "fp8_fp4_gemm_nt",
             "m_grouped_fp8_fp4_gemm_nt_contiguous",
             "transform_sf_into_required_layout",
         )
@@ -55,6 +56,9 @@ def _compute_enable_deep_gemm():
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
 DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
+DEEPGEMM_PACKED_BLOCK32 = (
+    ENABLE_JIT_DEEPGEMM and _is_cuda and get_device_sm() in (120, 121)
+)
 DEEPGEMM_SCALE_UE8M0 = ENABLE_JIT_DEEPGEMM and (
     get_platform().is_sm100 or get_device_sm() in (120, 121)
 )
@@ -62,6 +66,9 @@ DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)
 
 
 def _supports_paged_sparse_mqa_logits() -> bool:
+    # Not a hardware gap: the kernel needs tcgen05 UMMA and TMEM, absent on SM12x, but
+    # DeepGEMM's sm120 port (deepseek-ai/DeepGEMM#324, nv_dev) has it on block-scaled
+    # mma.sync. No published sgl-deep-gemm build does, so SM12x keeps dense blocks.
     if not DEEPGEMM_BLACKWELL:
         return False
     import deep_gemm
