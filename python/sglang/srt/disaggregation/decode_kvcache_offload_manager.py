@@ -214,8 +214,6 @@ class DecodeKVCacheOffloadManager:
         if token_indices.dim() == 0 or token_indices.numel() == 0:
             return False
 
-        # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
-        all_tokens = req.origin_input_ids + req.output_ids[:-1]
         prefill_offloaded_len = self._prefill_offloaded_len(req)
         state = self.offloaded_state.get(req)
         if state is None:
@@ -227,7 +225,10 @@ class DecodeKVCacheOffloadManager:
             )
             state = OffloadedState(last_hash=last_prefill_hash)
             self.offloaded_state[req] = state
-        incremental_total = len(all_tokens) - prefill_offloaded_len
+        # The latest sampled token receives KV on the next decode step.
+        incremental_total = (
+            len(req.origin_input_ids) + len(req.output_ids) - 1 - prefill_offloaded_len
+        )
         incremental_new = incremental_total - state.inc_len
         incremental_aligned_len = (
             incremental_new // self.offload_stride * self.offload_stride
@@ -237,6 +238,7 @@ class DecodeKVCacheOffloadManager:
             return False
 
         # Extract incremental tokens and indices for the newly available chunk
+        all_tokens = req.origin_input_ids + req.output_ids[:-1]
         start = prefill_offloaded_len + state.inc_len
         end = start + incremental_aligned_len
         incremental_tokens = all_tokens[start:end]

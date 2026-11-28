@@ -8,6 +8,7 @@ Requires: torch, sglang (run in an environment with sglang installed)
 """
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from weakref import WeakKeyDictionary as WeakKeyDict
@@ -130,6 +131,41 @@ def _make_manager(pool_size: int, page_size: int = 1):
 class _FinishedEvent:
     def synchronize(self):
         pass
+
+
+class TestOffloadStride(CustomTestCase):
+    def test_waits_for_full_stride_before_copying_prompt(self):
+        """An incomplete decode stride can be checked using only token counts."""
+
+        class UnreadyPrompt(array):
+            def __add__(self, other):
+                raise AssertionError("Prompt copied before a stride was ready")
+
+        manager, _ = _make_manager(pool_size=256, page_size=64)
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.write.return_value = torch.arange(64)
+        manager.decode_host_mem_pool = MagicMock()
+        manager.request_counter = 0
+        manager.offload_stride = 64
+        req = _make_mock_req(0, 192, 192)
+        req.origin_input_ids = UnreadyPrompt("q", range(130))
+        req.output_ids = array("q", range(130, 192))
+        state = OffloadedState(last_hash="prefill_hash")
+        manager.offloaded_state[req] = state
+
+        self.assertFalse(manager.offload_kv_cache(req))
+        self.assertEqual(state.inc_len, 0)
+        self.assertEqual(manager.ongoing_offload, {})
+        manager.cache_controller.write.assert_not_called()
+
+        # The two-token prompt tail and 62 committed output tokens now fit.
+        req.origin_input_ids = array("q", req.origin_input_ids)
+        req.output_ids.append(192)
+        self.assertTrue(manager.offload_kv_cache(req))
+        self.assertEqual(state.inc_len, 64)
+        self.assertEqual(list(manager.ongoing_offload[1][2]), list(range(128, 192)))
+        indices = manager.cache_controller.write.call_args.kwargs["device_indices"]
+        self.assertEqual(indices.tolist(), list(range(128, 192)))
 
 
 class TestReleaseFinishedReq(unittest.TestCase):
