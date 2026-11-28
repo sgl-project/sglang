@@ -232,6 +232,7 @@ def _case_split_path_mixed_precomputed():
         forward_batch=forward_batch,
         input_embedding=embedding,
         multimodal_model=_FakeVLM(),
+        rids=None,
     )
 
     assert bool((input_ids[image_positions] == IMAGE_TOKEN_ID).all())

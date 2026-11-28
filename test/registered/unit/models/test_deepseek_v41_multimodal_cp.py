@@ -357,6 +357,7 @@ class TestDSV41MultimodalCP(CustomTestCase):
                 original = ids.clone()
                 image = MultimodalInputs(mm_items=[])
                 batch = NS(
+                    rids=None,
                     mm_inputs=[None, image],
                     extend_prefix_lens_cpu=prefixes,
                     extend_seq_lens_cpu=lengths,
@@ -422,6 +423,7 @@ class TestDSV41MultimodalCP(CustomTestCase):
         ids = torch.tensor([7, MM_PAD_SHIFT_VALUE + 12, 8])
         original = ids.clone()
         batch = NS(
+            rids=None,
             mm_inputs=[MultimodalInputs(mm_items=[])],
             extend_prefix_lens_cpu=[0],
             extend_seq_lens_cpu=[3],
@@ -453,6 +455,7 @@ class TestDSV41MultimodalInputs(CustomTestCase):
         )
         self.batch = NS(
             input_ids=self.ids,
+            rids=None,
             forward_mode=ForwardMode.EXTEND,
             mm_inputs=[MultimodalInputs(mm_items=[])],
         )

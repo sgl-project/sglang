@@ -31,6 +31,7 @@ from sglang.srt.distributed.communication_op import (
     control_request_all_gather_object,
     control_request_barrier,
 )
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -521,6 +522,8 @@ class SchedulerWeightUpdaterManager:
                 "running or queued. Finish them, or pause generation in retract "
                 "mode, then retry.",
             )
+        # A weights-only release does not reach flush_cache.
+        mm_schedule.release_prefill_rows()
 
         tags = recv_req.tags
 
