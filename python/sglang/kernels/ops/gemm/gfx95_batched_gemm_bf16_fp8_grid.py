@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Batched bf16 GEMM Y[g] = X[g] @ W[g]^T with the consumer's fp8-grid rounding in the epilogue
 (the DeepSeek-V4 wo_a absorb GEMM on gfx950). Above _SPLIT_K_MAX_M rows aiter's tile loop,
-bitwise aiter's; at or below, the same tile split eight ways along K and reduced in a fixed order."""
+bitwise aiter's; at or below, the tile split along K and reduced in a fixed order."""
 
 from __future__ import annotations
 
@@ -32,7 +32,10 @@ _TILE_BY_MAX_M = (
 )
 
 
-def _tile_config(T: int):
+def _tile_config(T: int, G: int):
+    if G == 2 and _SPLIT_K_MAX_M < T <= 128:
+        # TP4's 2 groups launch half the CTAs of 4, so they keep 32-row tiles
+        return 32, 32, 512, 4
     return next(tile for max_m, tile in _TILE_BY_MAX_M if max_m is None or T <= max_m)
 
 
@@ -311,11 +314,15 @@ def _batched_gemm_split_k(
 ) -> None:
     T, G, D = x.shape
     R = w.shape[1]
-    tiles_m, tiles_n = triton.cdiv(T, _BLOCK_M), triton.cdiv(R, _BLOCK_N)
-    partials = torch.empty(
-        (G, _SPLIT_K, tiles_m * _BLOCK_M, R), dtype=torch.float32, device=x.device
+    # TP4's 2 groups: past 32 rows, 32-row tiles in 4 splits are faster (MI355X)
+    block_m, split_k, num_warps = (
+        (32, 4, 4) if G == 2 and T > 32 else (_BLOCK_M, _SPLIT_K, _NUM_WARPS)
     )
-    _batched_gemm_bf16_split_k_partial_kernel[(G, tiles_m * tiles_n, _SPLIT_K)](
+    tiles_m, tiles_n = triton.cdiv(T, block_m), triton.cdiv(R, _BLOCK_N)
+    partials = torch.empty(
+        (G, split_k, tiles_m * block_m, R), dtype=torch.float32, device=x.device
+    )
+    _batched_gemm_bf16_split_k_partial_kernel[(G, tiles_m * tiles_n, split_k)](
         x,
         w,
         partials,
@@ -328,12 +335,12 @@ def _batched_gemm_split_k(
         w.stride(0),
         w.stride(2),
         w.stride(1),
-        BLOCK_SIZE_M=_BLOCK_M,
+        BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=_BLOCK_N,
         BLOCK_SIZE_K=_SPLIT_K_BLOCK_K,
-        SPLIT_K=_SPLIT_K,
+        SPLIT_K=split_k,
         cache_modifier=_CACHE_MODIFIER,
-        num_warps=_NUM_WARPS,
+        num_warps=num_warps,
         num_stages=_NUM_STAGES,
         waves_per_eu=_WAVES_PER_EU,
         matrix_instr_nonkdim=_MFMA_NONKDIM,
@@ -348,12 +355,12 @@ def _batched_gemm_split_k(
         scale if scale is not None else out,
         R // 32,
         G * R // 32,
-        BLOCK_SIZE_M=_BLOCK_M,
+        BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=_BLOCK_N,
-        SPLIT_K=_SPLIT_K,
+        SPLIT_K=split_k,
         FP8_GRID=fp8_grid,
         EMIT_FP8=scale is not None,
-        num_warps=_NUM_WARPS,
+        num_warps=num_warps,
     )
 
 
@@ -394,7 +401,7 @@ def batched_gemm_bf16_fp8_grid(
         assert _split_k_applies(T, D, R), (T, D, R)
         _batched_gemm_split_k(x, w, out, fp8_grid, scale)
         return result
-    block_m, block_n, block_k, num_warps = _tile_config(T)
+    block_m, block_n, block_k, num_warps = _tile_config(T, G)
     grid = (G, triton.cdiv(T, block_m) * triton.cdiv(R, block_n))
     _batched_gemm_bf16_fp8_grid_kernel[grid](
         x,
