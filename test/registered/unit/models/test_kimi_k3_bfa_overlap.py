@@ -535,6 +535,587 @@ class TestKimiK3BfaOverlap(CustomTestCase):
 
         self.assertEqual(_get_k3_dense_weight(module).data_ptr(), weight.data_ptr())
 
+    def test_cuda_kda_inproj_merge_and_dispatch(self):
+        """CUDA merges [qkvg | f_a | b] into one view-backed buffer; side-stream
+        overlap stays active for small graphed M and falls over to the single
+        merged GEMM when side-stream overlap is inactive (M > limit or eager)."""
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        qm = UnquantizedLinearMethod()
+        gen = torch.Generator(device="cuda").manual_seed(7)
+
+        def _randn(*shape):
+            return (
+                torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32)
+                .mul(0.05)
+                .to(torch.bfloat16)
+            )
+
+        class _CallableLinear:
+            def __init__(self, rows, cols):
+                self.weight = _randn(rows, cols)
+                self.bias = None
+                self.quant_method = qm
+
+            def __call__(self, x):
+                return qm.apply(self, x, None), None
+
+        owner = SimpleNamespace(
+            use_full_rank_gate=True,
+            _qkvg_gate_float_shard=False,
+            _bfa_uses_block_fp8=False,
+            _bfa_uses_mxfp8=False,
+            _kda_dwdp=False,
+            fused_qkvg_proj=_CallableLinear(_QKVG, _H),
+            f_a_proj=_CallableLinear(_N_FA, _H),
+            b_proj=_CallableLinear(_N_B, _H),
+            f_b_proj=_CallableLinear(1536, _N_FA),
+            split_sizes=[3 * 1536, 1536],
+            _bfa_w=None,
+            _bfa_f_b_w=None,
+            _qkvgbfa_layer=None,
+            _qkvgbfa_sizes=None,
+            _bfa_alt_stream=torch.cuda.Stream(),
+            _bfa_bs_limit=8,
+            _bfa_side_tgv_m_ranges=None,
+        )
+        ref_qkvg = owner.fused_qkvg_proj.weight.clone()
+        ref_fa = owner.f_a_proj.weight.clone()
+        ref_b = owner.b_proj.weight.clone()
+        ref_fb = owner.f_b_proj.weight.clone()
+
+        owner._may_fuse_kda_inproj = lambda: KimiK3DeltaAttention._may_fuse_kda_inproj(
+            owner
+        )
+        owner._merge_kda_inproj_weights = (
+            lambda: KimiK3DeltaAttention._merge_kda_inproj_weights(owner)
+        )
+        KimiK3DeltaAttention._merge_bfa_weights(owner)
+
+        self.assertIsNotNone(owner._qkvgbfa_layer)
+        self.assertEqual(owner._qkvgbfa_layer.weight.shape, (6288, _H))
+        self.assertEqual(owner._bfa_w.shape, (_BFA_W_ROWS, _H))
+        self.assertEqual(
+            owner.fused_qkvg_proj.weight.data_ptr(),
+            owner._qkvgbfa_layer.weight.data_ptr(),
+        )
+
+        # M > _bfa_bs_limit (and eager) must take the single merged GEMM and match
+        # the separate reference projections.
+        for T, capture_mode in ((4, False), (16, True)):
+            with (
+                self.subTest(T=T, capture_mode=capture_mode),
+                patch(
+                    "sglang.srt.models.kimi_k3.get_is_capture_mode",
+                    return_value=capture_mode,
+                ),
+            ):
+                x = _randn(T, _H)
+                qkv, beta, fg, g = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
+                exp_qkvg = torch.nn.functional.linear(x, ref_qkvg)
+                exp_qkv, exp_g = exp_qkvg.split([3 * 1536, 1536], dim=-1)
+                exp_fa = torch.nn.functional.linear(x, ref_fa)
+                exp_b = torch.nn.functional.linear(x, ref_b)
+                exp_fg = torch.nn.functional.linear(exp_fa, ref_fb)
+                torch.testing.assert_close(qkv, exp_qkv, rtol=1e-2, atol=2e-3)
+                torch.testing.assert_close(g, exp_g, rtol=1e-2, atol=2e-3)
+                torch.testing.assert_close(beta, exp_b, rtol=1e-2, atol=2e-3)
+                torch.testing.assert_close(fg, exp_fg, rtol=2e-2, atol=4e-3)
+
+    def test_cuda_mla_qkv_a_gate_merge_and_strided_gate(self):
+        """CUDA merges [fused_qkv_a_proj_with_mqa | g_proj] into one view-backed
+        buffer for breakable prefill graphs / eager / M > limit, and strided
+        mla_output_gate matches torch.sigmoid + mul bit-for-bit."""
+        from sglang.kernels.ops.elementwise import mla_output_gate
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        qm = UnquantizedLinearMethod()
+        gen = torch.Generator(device="cuda").manual_seed(11)
+
+        def _randn(*shape):
+            return (
+                torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32)
+                .mul(0.05)
+                .to(torch.bfloat16)
+            )
+
+        qkv_a_w = _randn(2112, _H)
+        gate_w = _randn(1536, _H)
+        ref_qkv_a_w = qkv_a_w.clone()
+        ref_gate_w = gate_w.clone()
+
+        owner = SimpleNamespace(
+            use_output_gate=True,
+            has_fused_proj=True,
+            _kimi_split_gguf_kv_b=False,
+            fused_qkv_a_proj_with_mqa=SimpleNamespace(
+                weight=qkv_a_w, bias=None, quant_method=qm
+            ),
+            g_proj=SimpleNamespace(weight=gate_w, bias=None, quant_method=qm),
+            _qkv_a_gate_layer=None,
+            _qkv_a_gate_sizes=None,
+            _gate_alt_stream=torch.cuda.Stream(),
+            _gate_bs_limit=8,
+            _gate_pending_stream=None,
+            _gate_hidden_states=None,
+            _use_merged_qkv_a_gate=False,
+            _precomputed_output_gate=None,
+        )
+        self.assertTrue(KimiK3MLAAttention._merge_qkv_a_gate_weights(owner))
+        self.assertEqual(owner._qkv_a_gate_layer.weight.shape, (3648, _H))
+        self.assertEqual(
+            owner.fused_qkv_a_proj_with_mqa.weight.data_ptr(),
+            owner._qkv_a_gate_layer.weight.data_ptr(),
+        )
+        self.assertEqual(
+            owner.g_proj.weight.data_ptr(),
+            owner._qkv_a_gate_layer.weight[2112:].data_ptr(),
+        )
+
+        # In breakable prefill graph or M > _gate_bs_limit, _fork_output_gate
+        # stays inactive and prepare_qkv_latent computes both in one GEMM.
+        x = _randn(16, _H)
+        attn_out = _randn(16, 1536)
+        owner._gate_hidden_states = x
+        with (
+            patch(
+                "sglang.srt.models.kimi_k3.get_is_capture_mode",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.models.kimi_k3.is_in_breakable_cuda_graph",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.layer_boundary.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+        ):
+            KimiK3MLAAttention._fork_output_gate(owner, x)
+            self.assertIsNone(owner._gate_pending_stream)
+            owner._use_merged_qkv_a_gate = True
+            qkv_a = KimiK3MLAAttention.prepare_qkv_latent(owner, x, None)
+            gate = KimiK3MLAAttention._compute_output_gate(owner, x)
+
+        self.assertFalse(gate.is_contiguous())
+        self.assertTrue(mla_output_gate.covered(attn_out, gate))
+        gated = mla_output_gate.kimi_k3_mla_output_gate(attn_out, gate)
+        expected_gated = attn_out * torch.sigmoid(gate.contiguous())
+        self.assertTrue(torch.equal(gated, expected_gated))
+        torch.testing.assert_close(
+            qkv_a, torch.nn.functional.linear(x, ref_qkv_a_w), rtol=1e-2, atol=2e-3
+        )
+        torch.testing.assert_close(
+            gate, torch.nn.functional.linear(x, ref_gate_w), rtol=1e-2, atol=2e-3
+        )
+
+    def test_cuda_merged_projections_fallback_for_lora_wrappers(self):
+        """Runtime LoRA replacement after weight load (and M > cap) must skip
+        the merged quant_method.apply path and dispatch adapter-aware wrappers."""
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+
+        qm = UnquantizedLinearMethod()
+        gen = torch.Generator(device="cuda").manual_seed(13)
+
+        def _randn(*shape):
+            return (
+                torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32)
+                .mul(0.05)
+                .to(torch.bfloat16)
+            )
+
+        class _LoRAWrapper:
+            """Mimics BaseLayerWithLoRA: has base_layer & weight, no quant_method."""
+
+            def __init__(self, base_layer, delta: float):
+                self.base_layer = base_layer
+                self.weight = base_layer.weight
+                self.bias = None
+                self.delta = delta
+                self.calls = 0
+
+            def __call__(self, x):
+                self.calls += 1
+                return torch.nn.functional.linear(x, self.weight) + self.delta, None
+
+        class _StubMLA(KimiK3MLAAttention):
+            def __init__(self, **attrs):
+                torch.nn.Module.__init__(self)
+                for key, value in attrs.items():
+                    setattr(self, key, value)
+
+        base_qkv_a = SimpleNamespace(
+            weight=_randn(2112, _H), bias=None, quant_method=qm
+        )
+        base_g = SimpleNamespace(weight=_randn(1536, _H), bias=None, quant_method=qm)
+        mla = _StubMLA(
+            use_output_gate=True,
+            has_fused_proj=True,
+            _kimi_split_gguf_kv_b=False,
+            fused_qkv_a_proj_with_mqa=base_qkv_a,
+            g_proj=base_g,
+            _qkv_a_gate_layer=None,
+            _qkv_a_gate_sizes=None,
+            _gate_alt_stream=torch.cuda.Stream(),
+            _gate_bs_limit=8,
+            _gate_pending_stream=None,
+            _gate_hidden_states=None,
+            _use_merged_qkv_a_gate=False,
+            _precomputed_output_gate=None,
+        )
+        self.assertTrue(mla._merge_qkv_a_gate_weights())
+        x = _randn(16, _H)
+        mla._gate_hidden_states = x
+        mla._use_merged_qkv_a_gate = True
+
+        # 1) LoRA wraps fused_qkv_a_proj_with_mqa after weight loading.
+        lora_qkv_a = _LoRAWrapper(base_qkv_a, delta=0.25)
+        mla.fused_qkv_a_proj_with_mqa = lora_qkv_a
+        with (
+            patch(
+                "sglang.srt.layers.layer_boundary.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+            patch.object(
+                DeepseekV2AttentionMLA,
+                "prepare_qkv_latent",
+                lambda self_, hs, fb: self_.fused_qkv_a_proj_with_mqa(hs)[0],
+            ),
+        ):
+            out_qkv_a = mla.prepare_qkv_latent(x, None)
+        self.assertEqual(lora_qkv_a.calls, 1)
+        self.assertIsNone(mla._precomputed_output_gate)
+        torch.testing.assert_close(
+            out_qkv_a,
+            torch.nn.functional.linear(x, base_qkv_a.weight) + 0.25,
+            rtol=1e-2,
+            atol=2e-3,
+        )
+
+        # 2) LoRA wraps only g_proj; prepare_qkv_latent must still fall back so
+        #    _compute_output_gate executes the g_proj LoRA adapter.
+        mla.fused_qkv_a_proj_with_mqa = base_qkv_a
+        lora_g = _LoRAWrapper(base_g, delta=0.5)
+        mla.g_proj = lora_g
+        with (
+            patch(
+                "sglang.srt.layers.layer_boundary.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+            patch.object(
+                DeepseekV2AttentionMLA,
+                "prepare_qkv_latent",
+                lambda self_, hs, fb: torch.nn.functional.linear(
+                    hs, self_.fused_qkv_a_proj_with_mqa.weight
+                ),
+            ),
+        ):
+            mla.prepare_qkv_latent(x, None)
+            out_gate = mla._compute_output_gate(x)
+        self.assertEqual(lora_g.calls, 1)
+        torch.testing.assert_close(
+            out_gate,
+            torch.nn.functional.linear(x, base_g.weight) + 0.5,
+            rtol=1e-2,
+            atol=2e-3,
+        )
+
+        # 3) Token count above _MERGED_QKV_A_GATE_MAX_TOKENS falls back too.
+        mla.g_proj = base_g
+        mla._MERGED_QKV_A_GATE_MAX_TOKENS = 8
+        fallback_calls = 0
+
+        def _super_prepare(self_, hs, fb):
+            nonlocal fallback_calls
+            fallback_calls += 1
+            return torch.nn.functional.linear(
+                hs, self_.fused_qkv_a_proj_with_mqa.weight
+            )
+
+        with (
+            patch(
+                "sglang.srt.layers.layer_boundary.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+            patch.object(
+                DeepseekV2AttentionMLA,
+                "prepare_qkv_latent",
+                _super_prepare,
+            ),
+        ):
+            mla.prepare_qkv_latent(x, None)
+        self.assertEqual(fallback_calls, 1)
+        self.assertIsNone(mla._precomputed_output_gate)
+
+        # 4) KDA: LoRA wraps fused_qkvg_proj after _merge_bfa_weights().
+        base_qkvg = SimpleNamespace(
+            weight=_randn(_QKVG, _H), bias=None, quant_method=qm
+        )
+        kda = SimpleNamespace(
+            use_full_rank_gate=True,
+            _qkvg_gate_float_shard=False,
+            _bfa_uses_block_fp8=False,
+            _bfa_uses_mxfp8=False,
+            _kda_dwdp=False,
+            fused_qkvg_proj=base_qkvg,
+            f_a_proj=SimpleNamespace(
+                weight=_randn(_N_FA, _H), bias=None, quant_method=qm
+            ),
+            b_proj=SimpleNamespace(weight=_randn(_N_B, _H), bias=None, quant_method=qm),
+            f_b_proj=SimpleNamespace(
+                weight=_randn(1536, _N_FA), bias=None, quant_method=qm
+            ),
+            split_sizes=[3 * 1536, 1536],
+            _bfa_w=None,
+            _bfa_f_b_w=None,
+            _qkvgbfa_layer=None,
+            _qkvgbfa_sizes=None,
+            _bfa_alt_stream=torch.cuda.Stream(),
+            _bfa_bs_limit=8,
+            _bfa_side_tgv_m_ranges=None,
+        )
+        KimiK3DeltaAttention._merge_bfa_weights(kda)
+        self.assertIsNotNone(kda._qkvgbfa_layer)
+        lora_qkvg = _LoRAWrapper(base_qkvg, delta=0.125)
+        kda.fused_qkvg_proj = lora_qkvg
+        qkv, _beta, _fg, g = KimiK3DeltaAttention.forward_qkvbfg_fused(kda, x)
+        self.assertEqual(lora_qkvg.calls, 1)
+        exp_qkv, exp_g = (
+            torch.nn.functional.linear(x, base_qkvg.weight) + 0.125
+        ).split([3 * 1536, 1536], dim=-1)
+        torch.testing.assert_close(qkv, exp_qkv, rtol=1e-2, atol=2e-3)
+        torch.testing.assert_close(g, exp_g, rtol=1e-2, atol=2e-3)
+
+    def test_cuda_fp16_preserves_existing_layout_at_tp16(self):
+        """TP16 + float16 must keep the existing 136-row [f_a|b] tail layout so
+        1-token capture never hits BF16-only tiny_gemm_bf16 at 144 rows."""
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        qm = UnquantizedLinearMethod()
+        gen = torch.Generator(device="cuda").manual_seed(17)
+
+        def _randn_fp16(*shape):
+            return (
+                torch.randn(*shape, generator=gen, device="cuda", dtype=torch.float32)
+                .mul(0.05)
+                .to(torch.float16)
+            )
+
+        class _CallableLinear:
+            def __init__(self, rows, cols):
+                self.weight = _randn_fp16(rows, cols)
+                self.bias = None
+                self.quant_method = qm
+
+            def __call__(self, x):
+                return qm.apply(self, x, None), None
+
+        # TP16 KDA geometry: local_heads=6 -> qkvg=3072, f_a=128, b=6 (tail=134 -> pad8=136)
+        owner = SimpleNamespace(
+            use_full_rank_gate=True,
+            _qkvg_gate_float_shard=False,
+            _bfa_uses_block_fp8=False,
+            _bfa_uses_mxfp8=False,
+            _kda_dwdp=False,
+            fused_qkvg_proj=_CallableLinear(3072, _H),
+            f_a_proj=_CallableLinear(128, _H),
+            b_proj=_CallableLinear(6, _H),
+            f_b_proj=_CallableLinear(768, 128),
+            split_sizes=[3 * 768, 768],
+            _bfa_w=None,
+            _bfa_f_b_w=None,
+            _qkvgbfa_layer=None,
+            _qkvgbfa_sizes=None,
+            _bfa_alt_stream=torch.cuda.Stream(),
+            _bfa_bs_limit=8,
+            _bfa_side_tgv_m_ranges=None,
+        )
+        KimiK3DeltaAttention._merge_bfa_weights(owner)
+        self.assertIsNone(owner._qkvgbfa_layer)
+        self.assertEqual(tuple(owner._bfa_w.shape), (136, _H))
+
+        x = _randn_fp16(1, _H)
+        with patch(
+            "sglang.srt.models.kimi_k3.get_is_capture_mode",
+            return_value=True,
+        ):
+            qkv, beta, fg, g = KimiK3DeltaAttention.forward_qkvbfg_fused(owner, x)
+        self.assertEqual(qkv.dtype, torch.float16)
+        self.assertEqual(beta.shape, (1, 6))
+        self.assertEqual(fg.shape, (1, 768))
+        self.assertEqual(g.shape, (1, 768))
+
+        mla = SimpleNamespace(
+            use_output_gate=True,
+            has_fused_proj=True,
+            _kimi_split_gguf_kv_b=False,
+            fused_qkv_a_proj_with_mqa=SimpleNamespace(
+                weight=_randn_fp16(2112, _H), bias=None, quant_method=qm
+            ),
+            g_proj=SimpleNamespace(
+                weight=_randn_fp16(768, _H), bias=None, quant_method=qm
+            ),
+            _qkv_a_gate_layer=None,
+            _qkv_a_gate_sizes=None,
+        )
+        self.assertFalse(KimiK3MLAAttention._merge_qkv_a_gate_weights(mla))
+        self.assertIsNone(mla._qkv_a_gate_layer)
+
+    def test_cuda_merge_skips_cpu_offloaded_weights(self):
+        """Mixed CPU/CUDA and all-CPU offloaded weights must skip CUDA weight merges."""
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        qm = UnquantizedLinearMethod()
+
+        def _mod(rows, device):
+            return SimpleNamespace(
+                weight=torch.zeros((rows, 64), device=device, dtype=torch.bfloat16),
+                bias=None,
+                quant_method=qm,
+            )
+
+        for devs in (("cpu", "cuda"), ("cuda", "cpu"), ("cpu", "cpu")):
+            with self.subTest(mla_devices=devs):
+                mla = SimpleNamespace(
+                    use_output_gate=True,
+                    has_fused_proj=True,
+                    _kimi_split_gguf_kv_b=False,
+                    fused_qkv_a_proj_with_mqa=_mod(32, devs[0]),
+                    g_proj=_mod(16, devs[1]),
+                    _qkv_a_gate_layer=None,
+                    _qkv_a_gate_sizes=None,
+                )
+                self.assertFalse(KimiK3MLAAttention._merge_qkv_a_gate_weights(mla))
+                self.assertIsNone(mla._qkv_a_gate_layer)
+
+        for devs in (
+            ("cpu", "cuda", "cuda"),
+            ("cuda", "cpu", "cuda"),
+            ("cpu", "cpu", "cpu"),
+        ):
+            with self.subTest(kda_devices=devs):
+                kda = SimpleNamespace(
+                    use_full_rank_gate=True,
+                    _qkvg_gate_float_shard=False,
+                    _bfa_uses_block_fp8=False,
+                    _bfa_uses_mxfp8=False,
+                    _kda_dwdp=False,
+                    fused_qkvg_proj=_mod(64, devs[0]),
+                    f_a_proj=_mod(16, devs[1]),
+                    b_proj=_mod(4, devs[2]),
+                    split_sizes=[48, 16],
+                    _qkvgbfa_layer=None,
+                    _qkvgbfa_sizes=None,
+                )
+                self.assertFalse(KimiK3DeltaAttention._merge_kda_inproj_weights(kda))
+                self.assertIsNone(kda._qkvgbfa_layer)
+
+    def test_k31_verify_binding_shares_merged_projection_storage(self):
+        """K3.1 verify binding must reuse stock merged KDA/MLA buffers in place
+        at both TP8 and TP16 (zero duplicate allocation) and retarget on mismatch."""
+        from sglang.srt.kernel_plugins.nvidia.kimi_k31_verify_binding import (
+            _pack_or_reuse_projection_weights,
+        )
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        qm = UnquantizedLinearMethod()
+        cols = 64
+
+        def _param_mod(rows):
+            return SimpleNamespace(
+                weight=torch.nn.Parameter(
+                    torch.randn((rows, cols), device="cuda", dtype=torch.bfloat16)
+                    * 0.05,
+                    requires_grad=False,
+                ),
+                bias=None,
+                quant_method=qm,
+            )
+
+        # Both TP8 (qkvg=6144, fa=128, b=12 -> 6288; qkv_a=2112, g=1536 -> 3648)
+        # and TP16 (qkvg=3072, fa=128, b=6 -> 3208; qkv_a=2112, g=768 -> 2880).
+        for tp, qkvg_r, b_r, g_r in ((8, 6144, 12, 1536), (16, 3072, 6, 768)):
+            with self.subTest(tp=tp):
+                kda = SimpleNamespace(
+                    use_full_rank_gate=True,
+                    _qkvg_gate_float_shard=False,
+                    _bfa_uses_block_fp8=False,
+                    _bfa_uses_mxfp8=False,
+                    _kda_dwdp=False,
+                    fused_qkvg_proj=_param_mod(qkvg_r),
+                    f_a_proj=_param_mod(128),
+                    b_proj=_param_mod(b_r),
+                    f_b_proj=_param_mod(b_r * 128),
+                    split_sizes=[3 * b_r * 128, b_r * 128],
+                    _bfa_w=None,
+                    _bfa_f_b_w=None,
+                    _qkvgbfa_layer=None,
+                    _qkvgbfa_sizes=None,
+                )
+                self.assertTrue(KimiK3DeltaAttention._merge_kda_inproj_weights(kda))
+                orig_kda_w = kda._qkvgbfa_layer.weight
+                parts = (
+                    kda.fused_qkvg_proj.weight,
+                    kda.f_a_proj.weight,
+                    kda.b_proj.weight,
+                )
+                padding = -sum(p.shape[0] for p in parts) % 8
+                packed = _pack_or_reuse_projection_weights(
+                    kda, parts, padding, "_qkvgbfa_layer", "_qkvgbfa_sizes"
+                )
+                self.assertIs(packed, orig_kda_w)
+                self.assertEqual(packed.data_ptr(), orig_kda_w.data_ptr())
+                self.assertIs(kda._k31_verify_projection_storage, orig_kda_w)
+                self.assertEqual(
+                    kda.fused_qkvg_proj.weight.data_ptr(), packed.data_ptr()
+                )
+                self.assertEqual(
+                    kda.f_a_proj.weight.data_ptr(), packed[qkvg_r:].data_ptr()
+                )
+
+                mla = SimpleNamespace(
+                    use_output_gate=True,
+                    has_fused_proj=True,
+                    _kimi_split_gguf_kv_b=False,
+                    fused_qkv_a_proj_with_mqa=_param_mod(2112),
+                    g_proj=_param_mod(g_r),
+                    _qkv_a_gate_layer=None,
+                    _qkv_a_gate_sizes=None,
+                )
+                self.assertTrue(KimiK3MLAAttention._merge_qkv_a_gate_weights(mla))
+                orig_mla_w = mla._qkv_a_gate_layer.weight
+                mla_parts = (mla.fused_qkv_a_proj_with_mqa.weight, mla.g_proj.weight)
+                mla_packed = _pack_or_reuse_projection_weights(
+                    mla, mla_parts, 0, "_qkv_a_gate_layer", "_qkv_a_gate_sizes"
+                )
+                self.assertIs(mla_packed, orig_mla_w)
+                self.assertEqual(mla_packed.data_ptr(), orig_mla_w.data_ptr())
+                self.assertIs(mla._k31_verify_projection_storage, orig_mla_w)
+
+        # Mismatched existing buffer must be retargeted so only one allocation lives.
+        stale = torch.zeros((48, cols), device="cuda", dtype=torch.bfloat16)
+        mla_mismatch = SimpleNamespace(
+            fused_qkv_a_proj_with_mqa=_param_mod(24),
+            g_proj=_param_mod(16),
+            _qkv_a_gate_layer=SimpleNamespace(weight=stale),
+            _qkv_a_gate_sizes=[24, 16, 8],
+        )
+        m_parts = (
+            mla_mismatch.fused_qkv_a_proj_with_mqa.weight,
+            mla_mismatch.g_proj.weight,
+        )
+        repacked = _pack_or_reuse_projection_weights(
+            mla_mismatch, m_parts, 0, "_qkv_a_gate_layer", "_qkv_a_gate_sizes"
+        )
+        self.assertIsNot(repacked, stale)
+        self.assertIs(mla_mismatch._qkv_a_gate_layer.weight, repacked)
+        self.assertEqual(mla_mismatch._qkv_a_gate_sizes[-1], 0)
+        self.assertEqual(
+            mla_mismatch.fused_qkv_a_proj_with_mqa.weight.data_ptr(),
+            repacked.data_ptr(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

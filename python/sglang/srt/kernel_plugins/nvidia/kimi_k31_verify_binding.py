@@ -32,6 +32,70 @@ def covers_short_verify(forward_batch, query_width):
     return int(lengths.max()) + query_width <= 2048
 
 
+def _pack_or_reuse_projection_weights(
+    m,
+    parts: tuple[torch.Tensor, ...],
+    padding: int,
+    merged_attr: str,
+    sizes_attr: str,
+) -> torch.Tensor:
+    """Share one contiguous packed projection buffer with stock merged forward.
+
+    Reuses the stock merged weight in place when it already has the exact layout
+    and backs every part parameter (zero duplicate VRAM). Otherwise packs once,
+    rebinds the parameters, and retargets any existing stock merged layer onto
+    the new buffer so the earlier allocation is freed immediately.
+    """
+    total_rows = sum(p.shape[0] for p in parts)
+    cols = parts[0].shape[1]
+    expected_shape = (total_rows + padding, cols)
+    merged_layer = getattr(m, merged_attr, None)
+    existing = getattr(merged_layer, "weight", None)
+    if (
+        isinstance(existing, torch.Tensor)
+        and existing.is_contiguous()
+        and tuple(existing.shape) == expected_shape
+        and existing.dtype == parts[0].dtype
+        and existing.device == parts[0].device
+    ):
+        offset = 0
+        same_views = True
+        for param in parts:
+            rows = param.shape[0]
+            if (
+                not param.is_contiguous()
+                or param.dtype != existing.dtype
+                or param.device != existing.device
+                or param.data_ptr() != existing[offset : offset + rows].data_ptr()
+            ):
+                same_views = False
+                break
+            offset += rows
+        if same_views:
+            if padding:
+                existing[offset:].zero_()
+            m.__dict__["_k31_verify_projection_storage"] = existing
+            return existing
+
+    packed = torch.cat(
+        tuple(p.detach() for p in parts)
+        + (parts[0].new_zeros((padding, cols)),),
+        dim=0,
+    )
+    offset = 0
+    for param in parts:
+        rows = param.shape[0]
+        param.data = packed[offset : offset + rows]
+        offset += rows
+    m.__dict__["_k31_verify_projection_storage"] = packed
+    if merged_layer is not None:
+        merged_layer.weight = packed
+        sizes = getattr(m, sizes_attr, None)
+        if isinstance(sizes, list) and sizes:
+            sizes[-1] = padding
+    return packed
+
+
 class K31VerifyHostBinding:
     def __init__(self, binding: MegakernelBinding):
         self.model = binding.model
@@ -73,22 +137,18 @@ class K31VerifyHostBinding:
                     )
                 parts = (m.fused_qkv_a_proj_with_mqa.weight, m.g_proj.weight)
                 padding = 0
+                merged_attr = "_qkv_a_gate_layer"
+                sizes_attr = "_qkv_a_gate_sizes"
             else:
                 parts = (m.fused_qkvg_proj.weight, m.f_a_proj.weight, m.b_proj.weight)
                 # Pad rows to a multiple of 8, matching the stock layout.
                 padding = -sum(p.shape[0] for p in parts) % 8
-            # Stock Parameters become views of packed, which the module keeps alive.
-            packed = torch.cat(
-                tuple(p.detach() for p in parts)
-                + (parts[0].new_zeros((padding, 7168)),),
-                dim=0,
+                merged_attr = "_qkvgbfa_layer"
+                sizes_attr = "_qkvgbfa_sizes"
+            # Share one contiguous packed buffer with stock merged forward (0 duplicate VRAM).
+            packed = _pack_or_reuse_projection_weights(
+                m, parts, padding, merged_attr, sizes_attr
             )
-            offset = 0
-            for param in parts:
-                rows = param.shape[0]
-                param.data = packed[offset : offset + rows]
-                offset += rows
-            m.__dict__["_k31_verify_projection_storage"] = packed
             if is_mla:
                 full_ids.append(idx)
                 indexer = m.indexer
