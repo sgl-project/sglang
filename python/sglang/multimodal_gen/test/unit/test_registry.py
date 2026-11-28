@@ -7,6 +7,8 @@ import pytest
 
 from sglang.multimodal_gen import registry
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    TurboWanT2V1_3B480PConfig,
+    Wan2_2_I2V_A14B_Config,
     Wan_Animate_2_14B_Config,
     Wan_Animate_2_14B_Distilled_Config,
 )
@@ -136,6 +138,60 @@ def test_model_id_short_name_selects_the_variant_for_a_neutral_directory():
         "/models/ckpt-7f3a", model_id="Wan2.2-Animate-2-14B-Distilled-Diffusers"
     )
     assert info.pipeline_config_cls is Wan_Animate_2_14B_Distilled_Config
+
+
+@pytest.mark.parametrize(
+    ("model_id", "config_cls"),
+    [
+        ("Wan-AI/Wan2.2-I2V-A14B-Diffusers", Wan2_2_I2V_A14B_Config),
+        ("wan-ai/wan2.2-i2v-a14b-diffusers", Wan2_2_I2V_A14B_Config),
+        ("other/Wan2.2-I2V-A14B-Diffusers", Wan_Animate_2_14B_Config),
+    ],
+)
+def test_qualified_model_id_takes_precedence_only_for_its_namespace(
+    tmp_path, model_id, config_cls
+):
+    path = _checkpoint_dir(
+        tmp_path, index_class=_WAN_ANIMATE_2, modular_class="WanAnimate2ModularPipeline"
+    )
+    assert (
+        registry._get_config_info(path, model_id=model_id).pipeline_config_cls
+        is config_cls
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_id", "same_config", "expected"),
+    [
+        (
+            "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers",
+            False,
+            TurboWanT2V1_3B480PConfig,
+        ),
+        ("TurboWan2.1-T2V-1.3B-Diffusers", True, TurboWanT2V1_3B480PConfig),
+        ("TurboWan2.1-T2V-1.3B-Diffusers", False, Wan_Animate_2_14B_Config),
+    ],
+)
+def test_model_id_with_a_shared_short_name(
+    tmp_path, monkeypatch, caplog, model_id, same_config, expected
+):
+    # Local metadata selects a third config, making fallback observable.
+    path = _checkpoint_dir(tmp_path, index_class=_WAN_ANIMATE_2)
+    registered = registry._MODEL_HF_PATH_TO_NAME
+    repo = "IPostYellow/TurboWan2.1-T2V-1.3B-Diffusers"
+    mirror = "another-org/TurboWan2.1-T2V-1.3B-Diffusers"
+    monkeypatch.setitem(
+        registered,
+        mirror,
+        registered[repo if same_config else "Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
+    )
+    assert registry._get_config_info(path, model_id).pipeline_config_cls is expected
+    if expected is Wan_Animate_2_14B_Config:
+        assert (
+            "ambiguous" in caplog.text and repo in caplog.text and mirror in caplog.text
+        )
+    else:
+        assert "--model-id" not in caplog.text
 
 
 @pytest.mark.parametrize("entry", ["Model", '[Model, "Model"]', '(Model, "Model")'])

@@ -4095,12 +4095,15 @@ class TestModelIdResolution(unittest.TestCase):
         self.assertIs(info.pipeline_config_cls, QwenImagePipelineConfig)
 
     def test_hf_cache_snapshot_path_resolves_registered_nvfp4_model(self):
-        path = (
-            "/root/.cache/huggingface/hub/"
-            "models--black-forest-labs--FLUX.2-dev-NVFP4/"
-            "snapshots/142b87e70bc3006937b7093d89ff287b5f59f071"
-        )
-        info = _get_config_info(path)
+        with tempfile.TemporaryDirectory() as hub:
+            path = os.path.join(
+                hub,
+                "models--black-forest-labs--FLUX.2-dev-NVFP4",
+                "snapshots",
+                "142b87e70bc3006937b7093d89ff287b5f59f071",
+            )
+            os.makedirs(path)
+            info = _get_config_info(path)
         self.assertIsNotNone(info)
 
     def test_sana_wm_model_path_resolves_registry(self):

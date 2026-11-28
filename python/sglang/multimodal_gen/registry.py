@@ -455,18 +455,25 @@ def _get_config_info(
     load_external_model_package()
     all_model_hf_paths = sorted(_MODEL_HF_PATH_TO_NAME.keys(), key=len, reverse=True)
 
-    # 0. Explicit model_id override: match by short name
+    # 0. Explicit model_id override: match a complete repo ID or its short name
     if model_id is not None:
         model_id_lower = model_id.lower()
-        for registered_hf_id in all_model_hf_paths:
-            if get_model_short_name(registered_hf_id).lower() == model_id_lower:
-                logger.debug(
-                    f"Resolved model via explicit --model-id '{model_id}' → '{registered_hf_id}'."
-                )
-                return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[registered_hf_id])
+        matches = {
+            repo: config_id
+            for repo, config_id in _MODEL_HF_PATH_TO_NAME.items()
+            if model_id_lower in (repo.lower(), get_model_short_name(repo).lower())
+        }
+        # Mirrors can share a short name without making the config ambiguous.
+        config_ids = set(matches.values())
+        if len(config_ids) == 1:
+            return _CONFIG_REGISTRY[config_ids.pop()]
+        reason = (
+            f"is ambiguous (use one of: {', '.join(sorted(matches))})"
+            if matches
+            else "did not match any registered model"
+        )
         logger.warning(
-            f"--model-id '{model_id}' did not match any registered model; "
-            "falling back to automatic detection."
+            "--model-id '%s' %s; falling back to automatic detection.", model_id, reason
         )
 
     # SenseNova Hub IDs require an exact match, while local checkpoints are

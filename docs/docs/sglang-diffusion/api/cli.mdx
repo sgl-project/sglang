@@ -73,6 +73,7 @@ Use `sglang generate --help` and `sglang serve --help` for the full argument lis
 ### Model and runtime
 
 - `--model-path {MODEL}`: model path or Hugging Face model ID
+- `--model-id {ID}`: select the registered configuration for a local checkpoint. Use the full Hugging Face ID (e.g. `Qwen/Qwen-Image`) or a short name that identifies one configuration (e.g. `Qwen-Image`).
 - `--served-model-name {NAME}`: stable model name exposed by serving APIs. Defaults to `--model-id` when set, otherwise `--model-path`.
 - `--model-variant {NAME}`: semantic checkpoint variant to load when one model repository contains multiple weight partitions. The pipeline maps this stable name to the repository layout before loading; for example, MiniMax-H3 accepts `fl2va` and `ref2va`, `fl2va+ref2va` to keep both transformers in one server and run each request on the one for its task (see [One server for both partitions](/cookbook/diffusion/MiniMax/MiniMax-H3#one-server-for-both-partitions)), or `hybrid` with explicit merged transformer weights to serve all three tasks (see the [H3 cookbook](/cookbook/diffusion/MiniMax/MiniMax-H3#singularity-hybrid-weights)). This is a server/load-time choice, unlike a request's `task`.
 - `--minimax-h3-adaln-cache-path {FILE}`: advanced MiniMax-H3-only inference cache. It replaces the checkpoint's AdaLN projection weights with precomputed outputs and only accepts requests whose exact FP32 timestep plan is included in the cache. It requires unquantized weights and the matching model variant.
