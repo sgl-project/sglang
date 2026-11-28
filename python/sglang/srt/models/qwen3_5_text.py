@@ -255,6 +255,9 @@ class Qwen3_5ForCausalLM(nn.Module):
                     if factors is not None:
                         loaded_weight = _merge_lora(loaded_weight, *factors)
                     yield name, loaded_weight
+                elif name.startswith(_BASE_TEXT_PREFIX):
+                    # Text-only checkpoints exported from the VL stack keep its prefix.
+                    yield name[len(_BASE_TEXT_PREFIX) :], loaded_weight
                 elif name.startswith(_MODEL_PREFIX):
                     yield name[len(_MODEL_PREFIX) :], loaded_weight
                 elif name == "lm_head.weight":
