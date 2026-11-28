@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.moe.map_local_experts import map_topk_ids_to_local_experts
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -29,7 +30,9 @@ from sglang.srt.layers.moe.utils import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.runtime_context import get_lora, get_parallel
-from sglang.srt.utils.device import get_device
+from sglang.srt.utils.device import get_device, is_cuda
+
+_is_cuda = is_cuda()
 
 _MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
@@ -86,6 +89,17 @@ def _map_topk_ids_to_local_experts(
     topk_ids: torch.Tensor, local_expert_mapping: torch.Tensor
 ) -> torch.Tensor:
     """Map global expert ids while preserving the ``-1`` drop sentinel."""
+    if (
+        _is_cuda
+        and topk_ids.is_cuda
+        and local_expert_mapping.is_cuda
+        and topk_ids.is_contiguous()
+        and local_expert_mapping.is_contiguous()
+    ):
+        return map_topk_ids_to_local_experts(
+            topk_ids=topk_ids,
+            local_expert_mapping=local_expert_mapping,
+        )
     return torch.where(
         topk_ids < 0,
         -1,
