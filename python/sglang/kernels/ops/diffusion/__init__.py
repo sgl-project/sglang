@@ -610,6 +610,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.usp_merge_heads",
+        KernelBackend.TRITON,
+        "layout.usp_relayout_triton:usp_merge_heads_triton",
+        _HIP,
+    ),
+    (
         "diffusion.minimax_h3_vae_temporal_blend_write",
         KernelBackend.JIT,
         "layout.minimax_h3_vae_output_jit:minimax_h3_vae_temporal_blend_write",

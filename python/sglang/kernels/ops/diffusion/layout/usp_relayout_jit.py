@@ -5,6 +5,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.ops.diffusion.layout.usp_relayout_triton import (
+    can_use_usp_merge_heads_triton,
+    usp_merge_heads_triton,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -60,13 +64,29 @@ def can_use_usp_merge_heads(x: torch.Tensor) -> bool:
     )
 
 
-def usp_merge_heads(x: torch.Tensor) -> torch.Tensor:
+def usp_merge_heads(x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """Merge Ulysses output heads with an exact eager fallback.
 
-    The backend selection lives here so callers only express the layout
-    transformation. Unsupported devices, layouts, and compiled regions retain
-    the original PyTorch operation.
+    ``[W, S, B, H, D] -> [B, S, W, H, D]``. ``out``, a ``[B, S, W * H, D]`` view
+    with heads contiguous in a row, receives the result when given. The backend
+    selection lives here so callers only express the layout transformation.
+    Unsupported devices, layouts, and compiled regions retain the original
+    PyTorch operation. The ROCm Triton merge serves only callers that pass
+    ``out``; the others keep the aten merge.
     """
+    world, seq, batch, heads, head_dim = x.shape
+    merged_shape = (batch, seq, world, heads, head_dim)
+    if (
+        out is not None
+        and not torch.compiler.is_compiling()
+        and can_use_usp_merge_heads_triton(x, out)
+    ):
+        return usp_merge_heads_triton(x, out).view(merged_shape)
     if not torch.compiler.is_compiling() and can_use_usp_merge_heads(x):
-        return _usp_merge_heads_cuda(x)
-    return x.permute(2, 1, 0, 3, 4).contiguous()
+        merged = _usp_merge_heads_cuda(x)
+    else:
+        merged = x.permute(2, 1, 0, 3, 4).contiguous()
+    if out is None:
+        return merged
+    out.copy_(merged.view(out.shape))
+    return out.view(merged_shape)
