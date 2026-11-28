@@ -151,6 +151,7 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         adder = object.__new__(PrefillAdder)
         adder.mamba_chunk_grid = grid
         adder.strict_chunk_grid = strict
+        adder.windows_retire_behind_checkpoints = strict
         return adder
 
     def _floor(self, trunc_len: int, remaining: int, grid: int = CHUNK) -> int:
@@ -221,6 +222,21 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         ):
             scheduler.init_mamba_truncation_align()
         self.assertEqual(scheduler.truncation_align_size, 192)
+
+    def test_deterministic_inference_cuts_mamba_prefill_on_the_chunk_grid(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        tree = create_autospec(UnifiedRadixCache, instance=True)
+        tree.supports_mamba.return_value = True
+        for strategy in ("extra_buffer", "no_buffer"):
+            with get_context().override_server_args(
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy=strategy,
+                dcp_size=1,
+                enable_deterministic_inference=True,
+                _mamba_cache_chunk_size=CHUNK,
+            ):
+                self.assertEqual(mamba_prefill_chunk_grid(tree), CHUNK)
 
     def _window_tree(self, *, windows=(("swa", 512),), checkpoints=256):
         # Specced to the real cache: the grid asks only what it defines.

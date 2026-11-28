@@ -102,8 +102,23 @@ class Mm(msgspec.Struct):
         List[str],
         "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "
         "exact hostnames. Redirect destinations are checked against the same "
-        "allowlist. When unset, remote media from any domain is allowed.",
+        "allowlist, and an allowlisted host may resolve to a private address. "
+        "When unset, any host that resolves only to public addresses is allowed "
+        "(see --allow-private-media-hosts).",
     ] = msgspec.field(default_factory=list)
+    allow_private_media_hosts: A[
+        bool,
+        Arg(
+            help=(
+                "Allow client-supplied HTTP(S) media URLs to resolve to private, "
+                "loopback, or link-local IP addresses (including cloud metadata "
+                "endpoints such as 169.254.169.254). Disabled by default; enable "
+                "only when the server intentionally fetches media from a private "
+                "network. An explicitly allowlisted domain is exempt regardless."
+            ),
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = False
     media_url_max_file_size_mb: A[
         int,
         "Maximum size in MiB for one client-supplied remote media download. "
@@ -112,8 +127,9 @@ class Mm(msgspec.Struct):
     media_url_timeout: A[
         Optional[float],
         "Seconds to download one client-supplied media URL, redirects and body "
-        "included, for every media type. When unset, REQUEST_TIMEOUT applies, "
-        "else each loader's default.",
+        "included, for every media type; a server that sends the body slowly "
+        "is cut off when the budget runs out. When unset, REQUEST_TIMEOUT "
+        "applies, else each loader's default.",
     ] = None
     allow_local_media_files: A[
         bool,

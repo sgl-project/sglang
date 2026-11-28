@@ -436,6 +436,28 @@ def test_backend_directories_register_their_backend():
             assert spec.backend is expected, spec
 
 
+def test_tlx_kernels_register_the_tlx_backend():
+    """TLX kernels need facebookexperimental/triton or uTLX, so they must not take an op's ``TRITON`` slot."""
+    for spec in K.registry.all_specs():
+        is_tlx = "tlx" in re.split(r"[.:_]", spec.target)
+        assert (spec.backend is KernelBackend.TLX) == is_tlx, spec
+
+
+def test_tlx_kernels_are_inventoried_by_operator():
+    tlx = {s.op for s in K.registry.all_specs() if s.backend is KernelBackend.TLX}
+    assert tlx == {
+        "attention.tlx_qk_norm_rope_kv_cache",
+        "gemm.router_gemm_tlx",
+        "gemm.tlx_linear",
+        "gemm.unpool_gemm_norm_residual",
+        "layernorm.tlx_norm_residual_norm",
+        "layernorm.tlx_rmsnorm",
+        "moe.tlx_moe",
+    }
+    backends = {s.backend for s in K.registry.get("gemm.unpool_gemm_norm_residual")}
+    assert backends == {KernelBackend.TRITON, KernelBackend.TLX}
+
+
 def _module_file(module: str) -> Path | None:
     kernels = Path(K.__file__).resolve().parent
     package, *_ = module.split(".")

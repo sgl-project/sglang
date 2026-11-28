@@ -878,6 +878,7 @@ class DataParallelController:
         with self._scheduler_init_info_lock:
             self._scheduler_init_infos.extend(infos)
             self.max_total_num_tokens = infos[0]["max_total_num_tokens"]
+            self.max_req_len = infos[0]["max_req_len"]
             self.max_req_input_len = infos[0]["max_req_input_len"]
             self.startup_time = aggregate_scheduler_startup_times(
                 info.get("startup_time") for info in self._scheduler_init_infos
@@ -888,6 +889,7 @@ class DataParallelController:
         with self._scheduler_init_info_lock:
             init_info = {
                 "max_total_num_tokens": self.max_total_num_tokens,
+                "max_req_len": self.max_req_len,
                 "max_req_input_len": self.max_req_input_len,
                 "startup_time": self.startup_time,
             }

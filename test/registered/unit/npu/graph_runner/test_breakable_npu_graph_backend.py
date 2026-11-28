@@ -22,10 +22,10 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     breakable_cuda_graph as bcg,
 )
 from sglang.srt.runtime_context import get_forward, get_parallel
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_npu_ci(est_time=2, suite="extra-a-test-npu")
 
 
 def _make_runner():

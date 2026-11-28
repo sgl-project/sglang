@@ -75,6 +75,8 @@ const CORE: &[(&str, Zero)] = &[
     ("total_prefill_busy_us", Zero::Int),
     ("total_storage_prefetch_hit_tokens", Zero::Null),
     ("total_storage_prefetch_unfulfilled_tokens", Zero::Null),
+    ("total_backuped_tokens", Zero::Null),
+    ("total_backup_dropped_tokens", Zero::Null),
     ("decode_moments", Zero::Null),
 ];
 
