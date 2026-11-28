@@ -571,6 +571,7 @@ POSITIONAL_FIELD_ORDER = (
     "decode_state_free_radix_default",
     "disable_multimodal",
     "gc_freeze_on_idle_secs",
+    "cp_decode_attn_mode",
     "elastic_ep_retiree_lifecycle",
     "elastic_ep_reuse_cuda_graph",
     "enable_dsa_fp4_indexer",
