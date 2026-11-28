@@ -55,6 +55,17 @@ _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
 _use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
+# SGLANG_ROCM_TRITON_NORM_SCALE_SHIFT=true is set on the serve command line by whoever
+# wants the FP32-compute Triton LayerNorm + scale/shift on ROCm Wan. It is off by
+# default because its output differs from the default norm at BF16 rounding, and a
+# 40-step Wan2.2 run has not matched the default path yet.
+_use_rocm_triton_norm = _is_rocm and get_bool_env_var(
+    "SGLANG_ROCM_TRITON_NORM_SCALE_SHIFT", "false"
+)
+if _use_rocm_triton_norm:
+    from sglang.kernels.ops.diffusion.norm.rocm_norm_scale_shift_triton import (
+        rocm_norm_scale_shift,
+    )
 _npu_layer_norm = None
 
 if _is_cuda or _is_xpu:
@@ -718,6 +729,19 @@ class _ScaleResidualNormScaleShift(CustomOp):
             WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(self) is not None
             and not WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.is_enabled(self)
         ):
+            if _use_rocm_triton_norm and self.norm_type == "layer":
+                fused = rocm_norm_scale_shift(
+                    x,
+                    getattr(self.norm, "weight", None),
+                    getattr(self.norm, "bias", None),
+                    scale,
+                    shift,
+                    self.eps,
+                    residual=residual,
+                    gate=gate,
+                )
+                if fused is not None:
+                    return fused
             return self.forward_native(residual, x, gate, shift, scale)
 
         try:
@@ -970,6 +994,17 @@ class _NormScaleShift(CustomOp):
             WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(self) is not None
             and not WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.is_enabled(self)
         ):
+            if _use_rocm_triton_norm and self.norm_type == "layer":
+                fused = rocm_norm_scale_shift(
+                    x,
+                    getattr(self.norm, "weight", None),
+                    getattr(self.norm, "bias", None),
+                    scale,
+                    shift,
+                    self.eps,
+                )
+                if fused is not None:
+                    return fused[0]
             return self.forward_native(x, shift, scale)
 
         try:
