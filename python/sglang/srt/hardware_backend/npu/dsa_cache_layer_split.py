@@ -16,7 +16,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+    NPUDSATokenToKVPool,
+    NPUMLATokenToKVPool,
+)
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
 from sglang.srt.mem_cache.memory_pool import unwrap_write_loc
 from sglang.srt.runtime_context import get_parallel
@@ -88,7 +91,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         my_start, my_end = self._owned_local_layer_range()
         logger.info(
             "Layer shard plan (continuous, NPU): "
-            f"layer_num={self.layer_num}, shard_size={self.layer_shard_size}, "
+            f"pool={type(self).__name__}, layer_num={self.layer_num}, shard_size={self.layer_shard_size}, "
             f"rank={self.layer_shard_rank}, local=[{my_start},{my_end}), "
             f"global=[{self.start_layer + my_start},{self.start_layer + my_end}), "
             f"partitions={'; '.join(partitions)}"
@@ -139,7 +142,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     self.kr_cache_dim,
                 ),
                 dtype=(
-                    torch.bfloat16 if self.dsa_kv_cache_store_fp8 else self.store_dtype
+                    torch.bfloat16 if self.dsa_kv_cache_store_c8 else self.store_dtype
                 ),
                 device=self.device,
             )
@@ -156,7 +159,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     dtype=self.store_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                if self.dsa_kv_cache_store_c8 and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
@@ -174,7 +177,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
             # live in ONE flat byte allocation (one allocation, two dtype
             # views).
             _v_dtype = (
-                torch.bfloat16 if self.dsa_kv_cache_store_fp8 else self.store_dtype
+                torch.bfloat16 if self.dsa_kv_cache_store_c8 else self.store_dtype
             )
             _k_bytes = (
                 kv_pages
@@ -196,7 +199,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 .view(self.store_dtype)
                 .view(kv_pages, self.page_size, 1, self.kv_cache_dim)
             )
-            # v_buffer is always materialized (bfloat16 in fp8 mode), so the
+            # v_buffer is always materialized (bfloat16 in c8 mode), so the
             # remote v scratch mirrors that dtype instead of store_dtype.
             self.remote_v_buffer = (
                 self.remote_kv_all[_k_bytes:]
@@ -235,9 +238,26 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         self._kv_used_bound = 0
         self._idx_used_bound = 0
 
+    def get_kv_size_bytes(self):
+        # Scratch storage is persistent and must be included in memory reports.
+        size = super().get_kv_size_bytes()
+        for name in (
+            "remote_kv_all",
+            "remote_index_k_buffer",
+            "remote_index_k_scale_buffer",
+        ):
+            buffer = getattr(self, name, None)
+            if buffer is not None:
+                size += buffer.nbytes
+        return size
+
     def _kv_local_offset(self, layer_id: int) -> int:
         owned_start, _ = self._owned_local_layer_range()
         return layer_id - self.start_layer - owned_start
+
+    def _kv_buffer_layer_ids(self) -> range:
+        owned_start, owned_end = self._owned_local_layer_range()
+        return range(self.start_layer + owned_start, self.start_layer + owned_end)
 
     def _kv_slice_tokens(self, used_bound: Optional[int]) -> int:
         """Row-space slice of the remote scratches for a bound.
@@ -540,12 +560,12 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
         if self.use_combined_kv_buffer or self.use_fia_nz:
             return
         loc, _, _ = unwrap_write_loc(loc_info)
-        if self.dsa_kv_cache_store_fp8:
+        if self.dsa_kv_cache_store_c8:
             if cache_v is None:
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
-            packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
+            packed = self._pack_dsa_quant_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
                 self.remote_k_buffer.view(-1, 1, self.kv_cache_dim),
                 loc.view(-1, 1),
@@ -687,28 +707,21 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                         self.index_k_scale_buffer[slot][src_flat]
                     )
 
-    def get_kv_layer_ids(self):
-        owned_start, owned_end = self._owned_local_layer_range()
-        owned = list(
-            range(self.start_layer + owned_start, self.start_layer + owned_end)
-        )
-        return owned * 2 + self.get_state_layer_ids()
-
     def get_kv_transfer_layer_span(self, num_entries: int) -> int:
         """Layer count covered by ``num_entries`` contiguous buf entries.
 
         ``get_contiguous_buf_infos`` reports one entry per layer per buffer
-        group (the groups of ``_get_disagg_buffer_entries``: latent k, non-fp8
-        v, indexer k, fp8 index scale), so the owned layer count is the entry
+        group (the groups of ``_get_disagg_buffer_entries``: latent k, non-c8
+        v, indexer k, index scale), so the owned layer count is the entry
         count divided by the group count — not the raw entry count.
         """
-        groups = 1  # latent k (v stays packed into k in fp8 mode)
-        if not self.dsa_kv_cache_store_fp8:
+        groups = 1  # latent k (v stays packed into k in c8 mode)
+        if not self.dsa_kv_cache_store_c8:
             groups += 1  # v
         if self.index_head_dim is not None:
             groups += 1  # indexer k
             if self.index_k_scale_buffer is not None:
-                groups += 1  # fp8 index scale
+                groups += 1  # index scale
         assert groups > 0 and num_entries % groups == 0, (
             f"layer-split transfer reported {num_entries} entries, "
             f"not a multiple of {groups} buffer groups"
@@ -808,3 +821,11 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                     assert cpu.shape[0] == len(target_indices)
                     buffer[target_indices] = cpu.to(buffer.device, non_blocking=True)
         torch.npu.synchronize()
+
+
+class LayerSplitNPUDSATokenToKVPool(LayerSplitNPUMLATokenToKVPool, NPUDSATokenToKVPool):
+    """Hybrid DSA constructor/layout with the NPU layer-split storage contract.
+
+    The DSA constructor translates skipped indexer layers before the common
+    NPU MLA constructor calls the split buffer allocator.
+    """

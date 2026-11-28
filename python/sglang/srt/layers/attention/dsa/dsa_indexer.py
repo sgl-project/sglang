@@ -593,22 +593,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             # sees the real free memory. Deferring it left the pools sized against memory
             # that was about to be taken.
             _PAGE_SLACK = 4  # pages of headroom over the derived width
-            max_ctx = getattr(config, "max_position_embeddings", 0) or 0
-            extra = 4
-            try:
-                from sglang.srt.runtime_context import get_spec
+            max_positions = getattr(config, "max_position_embeddings", 0) or 0
+            from sglang.srt.mem_cache.allocation_sizing import (
+                get_req_to_token_row_width,
+            )
 
-                if get_spec().speculative_num_draft_tokens is not None:
-                    extra += int(get_spec().speculative_num_draft_tokens)
-            except Exception:  # spec config not available: the +4 still applies
-                pass
-            if max_ctx:
-                pages = -(-(max_ctx + extra) // 64) + _PAGE_SLACK
-                max_ctx = pages * 64
-            if max_ctx:
+            if max_positions:
+                req_to_token_row_width = get_req_to_token_row_width(max_positions)
                 prealloc_workspace(
                     device=torch.device("cuda", torch.cuda.current_device()),
-                    max_cols=max_ctx,
+                    max_cols=(-(-req_to_token_row_width // 64) + _PAGE_SLACK) * 64,
                     fp8_dtype=fp8_dtype,
                 )
 
@@ -1026,12 +1020,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if not _is_hip:
                 return False
             if fb.seq_lens_cpu is not None and fb.seq_lens_cpu.numel() > 0:
-                max_kv_len = int(fb.seq_lens_cpu.max().item())
+                batch_max_kv_len = int(fb.seq_lens_cpu.max().item())
             elif fb.seq_lens is not None and fb.seq_lens.numel() > 0:
-                max_kv_len = int(fb.seq_lens.max().item())
+                batch_max_kv_len = int(fb.seq_lens.max().item())
             else:
                 return False
-            return max_kv_len <= self.index_topk
+            return batch_max_kv_len <= self.index_topk
 
         return False
 

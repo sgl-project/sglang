@@ -1777,6 +1777,44 @@
       "canonical": "{\"background\":false,\"input\":[{\"role\":\"user\",\"content\":\"hi\"}],\"model\":\"m\",\"parallel_tool_calls\":true,\"reasoning\":{\"effort\":\"high\"},\"service_tier\":\"auto\",\"store\":true,\"stream\":false,\"text\":{\"format\":{\"type\":\"text\"}},\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{\"type\":\"object\"},\"strict\":false}],\"top_logprobs\":0,\"truncation\":\"disabled\",\"priority\":0,\"frequency_penalty\":0.0,\"presence_penalty\":0.0}"
     },
     {
+      "type": "OpenAiClassifyResponse",
+      "name": "sequence classification keeps scalar labels and flat probabilities",
+      "input": {
+        "id": "classify-1",
+        "object": "list",
+        "created": 1,
+        "model": "m",
+        "data": [
+          {
+            "index": 0,
+            "label": "POSITIVE",
+            "probs": [0.1, 0.9],
+            "num_classes": 2
+          }
+        ]
+      },
+      "canonical": "{\"id\":\"classify-1\",\"object\":\"list\",\"created\":1,\"model\":\"m\",\"data\":[{\"index\":0,\"label\":\"POSITIVE\",\"probs\":[0.1,0.9],\"num_classes\":2}]}"
+    },
+    {
+      "type": "OpenAiClassifyResponse",
+      "name": "token classification carries one label and probability row per token",
+      "input": {
+        "id": "classify-2",
+        "object": "list",
+        "created": 2,
+        "model": "m",
+        "data": [
+          {
+            "index": 0,
+            "label": ["O", "B-PER"],
+            "probs": [[0.9, 0.1], [0.2, 0.8]],
+            "num_classes": 2
+          }
+        ]
+      },
+      "canonical": "{\"id\":\"classify-2\",\"object\":\"list\",\"created\":2,\"model\":\"m\",\"data\":[{\"index\":0,\"label\":[\"O\",\"B-PER\"],\"probs\":[[0.9,0.1],[0.2,0.8]],\"num_classes\":2}]}"
+    },
+    {
       "type": "OpenAiModelList",
       "name": "the OpenAI model list",
       "input": {

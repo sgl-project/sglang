@@ -1,7 +1,6 @@
 ---
 title: FLUX.3
 description: Serve FLUX.3 Image Klein text-to-image generation and image editing with SGLang Diffusion.
-tag: NEW
 metatags:
     description: "Serve FLUX.3 Image Klein, Black Forest Labs' 5.6B text-to-image and image editing model, with SGLang Diffusion."
 ---

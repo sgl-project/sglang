@@ -164,7 +164,7 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
             "sglang.srt.speculative.eagle_worker_v2.forward_context",
             side_effect=lambda *_args, **_kwargs: contextlib.nullcontext(),
         ):
-            result = worker.draft_forward(forward_batch)
+            result = worker.draft_forward(forward_batch, greedy=False)
 
         self.assertEqual(worker.draft_runner.forward.call_count, 2)
 
@@ -244,7 +244,7 @@ class TestEagleDraftStepFold(CustomTestCase):
                 "sglang.srt.speculative.eagle_worker_v2.draft_topk1_postprocess", stock
             ),
         ):
-            out = worker.draft_forward(fb)
+            out = worker.draft_forward(fb, greedy=False)
         return SimpleNamespace(
             out=out, fb=fb, seen=seen, logits=logits, stock=stock, positions=positions
         )
@@ -320,15 +320,17 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 worker.tree_mask_mode = None
                 worker.seed_dsa_topk_from_draft_extend = seed_enabled
                 worker.index_share_for_mtp_iteration = True
-                forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
-                worker.draft_forward = MagicMock(return_value=graph_result)
-                attn_backend = SimpleNamespace(
-                    verify_mask=None,
-                    max_context_len=1,
+                forward_batch = SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    sampling_info=SimpleNamespace(is_all_greedy=False),
                 )
+                worker.draft_forward = MagicMock(return_value=graph_result)
+                attn_backend = SimpleNamespace(verify_mask=None)
                 worker.target_worker = SimpleNamespace(
                     model_runner=SimpleNamespace(
-                        attn_backend=attn_backend, runner_ids=None
+                        attn_backend=attn_backend,
+                        runner_ids=None,
+                        req_to_token_pool=SimpleNamespace(row_width=1),
                     )
                 )
                 draft_input = SimpleNamespace(
