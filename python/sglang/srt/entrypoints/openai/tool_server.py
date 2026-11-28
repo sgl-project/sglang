@@ -104,7 +104,7 @@ class MCPToolServer(ToolServer):
                 tools=[
                     ToolDescription.new(
                         name=tool.name,
-                        description=tool.description,
+                        description=tool.description or "",
                         parameters=tool.inputSchema,
                     )
                     for tool in list_tools_response.tools
