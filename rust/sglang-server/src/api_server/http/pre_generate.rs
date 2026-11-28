@@ -53,7 +53,7 @@ pub async fn abortable_before_generate<T>(
     let Some(PreGenerateCore(core)) = extensions.get::<PreGenerateCore>() else {
         return Ok(work.await);
     };
-    let mut pending = core.hold_generation(rid);
+    let mut pending = core.hold_admitted_generation(rid).await;
     let output = tokio::select! {
         biased;
         aborted = pending.cancelled() => Err(aborted),
