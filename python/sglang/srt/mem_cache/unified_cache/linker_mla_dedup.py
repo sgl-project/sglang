@@ -81,13 +81,21 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
 
     def broadcast_loaded_layer(self, layer_id, prepared):
         for name, pool in self.pools.items():
-            layer = pool.layer_mapping.get(layer_id)
-            if layer is None or name not in prepared:
+            layers = pool.layer_mapping.get(layer_id)
+            if layers is None or name not in prepared:
                 continue
+            # Packed MTP transfers include both target and draft physical layers.
+            if isinstance(layers, int):
+                layers = (layers,)
             indices, _ = prepared[name]
             if indices.is_cuda:
                 indices.record_stream(device_module.current_stream())
-            for buffers in self.buffers[name]:
-                self._bcast_layer(
-                    buffers, self.kv_staging, indices, buffers[layer].shape[1], layer
-                )
+            for layer in layers:
+                for buffers in self.buffers[name]:
+                    self._bcast_layer(
+                        buffers,
+                        self.kv_staging,
+                        indices,
+                        buffers[layer].shape[1],
+                        layer,
+                    )
