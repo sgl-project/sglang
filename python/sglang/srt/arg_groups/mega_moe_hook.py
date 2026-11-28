@@ -11,7 +11,7 @@ from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import ceil_align, parse_connector_type
+from sglang.srt.utils.common import ceil_align, ceil_div, parse_connector_type
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +249,20 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
             1,
         )
         local_chunked_prefill_size = cfg.chunked_prefill_size
+        # CP has its own padding and layout; keep its existing budget.
+        if cfg.attn_cp_size == 1 and token_alignment > 1:
+            graph = cfg.cuda_graph_config.prefill if cfg.cuda_graph_config else None
+            if graph is not None and graph.backend != "disabled":
+                local_chunked_prefill_size = max(
+                    local_chunked_prefill_size,
+                    graph.max_bs or 0,
+                    max(graph.bs or [0]),
+                )
+            token_partition_size, token_alignment = token_alignment, 1
+            token_partition_name = "attn_tp_size (after attention DP)"
+            local_chunked_prefill_size = ceil_div(
+                local_chunked_prefill_size, token_partition_size
+            )
     elif kimi and cfg.tp_size // cfg.attn_cp_size > 1:
         token_partition_size = cfg.tp_size // cfg.attn_cp_size
         token_partition_name = "attn_tp_size (SP-MoE rows)"

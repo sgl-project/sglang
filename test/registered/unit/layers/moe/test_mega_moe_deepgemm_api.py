@@ -58,6 +58,60 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
         super().tearDown()
 
+    def test_selector_uses_largest_sp_moe_shard(self):
+        cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK
+        with (
+            get_context().override_server_args(
+                tp_size=16,
+                attn_dp_size=2,
+                ep_size=16,
+                _model_config=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[])
+                ),
+            ),
+            get_flags().moe.override(a2a_backend=MoeA2ABackend.MEGAMOE),
+            cap.override(1024),
+            patch.multiple(
+                mega_moe,
+                _is_hip=False,
+                is_mega_moe_experts_ready=lambda _: True,
+            ),
+        ):
+            moe = SimpleNamespace(experts=None)
+            local = torch.empty((512, 1))
+            for dp_rows, selected in (
+                ([4096, 8192], True),
+                ([4096, 8200], False),
+                ([4096], False),
+            ):
+                with patch.object(
+                    mega_moe, "get_dp_global_num_tokens", return_value=dp_rows
+                ):
+                    self.assertEqual(mega_moe.should_use_mega_moe(moe, local), selected)
+
+            localized_moe = SimpleNamespace(
+                experts=SimpleNamespace(_mega_moe_weights_localized=True)
+            )
+            with patch.object(
+                mega_moe, "get_dp_global_num_tokens", return_value=[4096, 8192]
+            ):
+                self.assertTrue(mega_moe.should_use_mega_moe(localized_moe, local))
+            with (
+                patch.object(
+                    mega_moe, "get_dp_global_num_tokens", return_value=[4096, 8200]
+                ),
+                self.assertRaisesRegex(AssertionError, "1025 tokens per rank"),
+            ):
+                mega_moe.should_use_mega_moe(localized_moe, local)
+
+            with (
+                get_parallel().override(attn_cp_size=2, attn_tp_size=4),
+                patch.object(
+                    mega_moe, "get_dp_global_num_tokens", return_value=[4096, 8192]
+                ),
+            ):
+                self.assertFalse(mega_moe.should_use_mega_moe(moe, local))
+
     def test_mxf4_buffer_uses_typed_api(self):
         deep_gemm = self.deep_gemm
         expected_buffer = object()
