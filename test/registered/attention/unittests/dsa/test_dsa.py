@@ -245,6 +245,13 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
             with self.subTest(case=case.name, mode=case.forward_mode.name):
                 run_dsa_sparse_speculative_forward_mode_case(self, case)
 
+    def test_sparse_fp8_speculative_flashmla_sparse(self):
+        for case in self.SPECULATIVE_FORWARD_MODE_CASES:
+            with self.subTest(mode=case.forward_mode.name):
+                run_dsa_sparse_speculative_forward_mode_case(
+                    self, case, dsa_decode_backend="flashmla_sparse", fp8_kv_cache=True
+                )
+
     # FP8 KV cache (`dsa_kv_cache_store_fp8=True`) — the production
     # deployment dtype. Switches `DSATokenToKVPool` to packed
     # FP8-nope/BF16-rope storage at 656 bytes/token; `set_mla_kv_buffer`
@@ -385,7 +392,7 @@ class TestDSAAttentionBackendCorrectness(CustomTestCase):
                 run_dsa_eagle_draft_cuda_graph_runner_case(self, case)
 
     # CG decode replay with FP8 KV cache. Captures and replays through
-    # `flashmla_kv` (the only FP8-compatible decode kernel). The
+    # `flashmla_kv`. The
     # `_clone_dsa_sparse_cache` hook is reused as-is — it snapshots the
     # raw uint8 K buffer bytes, which round-trip correctly across
     # capture/replay regardless of bf16 vs FP8 packing.

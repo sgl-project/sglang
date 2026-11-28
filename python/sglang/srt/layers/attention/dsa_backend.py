@@ -40,6 +40,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     dequantize_k_cache_paged_dsa,
     gather_cast_kv_fp8_pad_paged,
     gather_dequant_requant_fp8_paged_dsa,
+    gather_sparse_decode_kv,
 )
 from sglang.kernels.ops.attention.dsa.metadata import gather_physical_token_table
 from sglang.kernels.ops.attention.dsa.transform_index import (
@@ -3048,6 +3049,9 @@ class DeepseekSparseAttnBackend(
                     )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
+            elif dsa_impl == "flashmla_sparse" and self.dsa_kv_cache_store_fp8:
+                # PAGED top-k indices address physical slots, including during MTP.
+                kv_cache, page_table_1 = gather_sparse_decode_kv(kv_cache, page_table_1)
 
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -3268,6 +3272,8 @@ class DeepseekSparseAttnBackend(
         if dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            if self.dsa_kv_cache_store_fp8:
+                kv_cache, page_table_1 = gather_sparse_decode_kv(kv_cache, page_table_1)
             return self._forward_flashmla_sparse(
                 q_all=q_all,
                 kv_cache=kv_cache,
