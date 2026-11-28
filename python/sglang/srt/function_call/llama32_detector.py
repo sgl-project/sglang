@@ -142,3 +142,10 @@ class Llama32Detector(BaseFormatDetector):
             end="}",
             trigger="<|python_tag|>",
         )
+
+    def finish(self, tools):
+        normal = ""
+        if self._buffer:
+            normal = self._buffer
+            self._buffer = ""
+        return StreamingParseResult(normal_text=normal, calls=[])
