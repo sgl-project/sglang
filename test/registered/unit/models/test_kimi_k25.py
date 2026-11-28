@@ -115,15 +115,30 @@ def _image_item(feature, grid_thw):
     )
 
 
-def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
+@pytest.mark.parametrize(
+    "source_budget,target,expected_batches",
+    [
+        (2**30, (16, 12), [3, 1]),
+        (23040, (16, 12), [2, 1, 1]),
+        (23040, (24, 18), [3, 1]),
+    ],
+)
+def test_kimi_gpu_preprocess_batches_only_source_compatible_images(
+    monkeypatch, source_budget, target, expected_batches
+):
+    monkeypatch.setattr(
+        "sglang.srt.multimodal.processors.kimi_k25._RESIZE_SOURCE_BATCH_BYTES",
+        source_budget,
+    )
     torch.manual_seed(0)
     indexed_images = [
         (0, torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8)),
         (1, torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8)),
         (2, torch.randint(0, 256, (3, 28, 20), dtype=torch.uint8)),
+        (3, torch.randint(0, 256, (3, 32, 24), dtype=torch.uint8)),
     ]
     expected = [
-        _resize_bicubic_if_needed(image.unsqueeze(0), 16, 12)
+        _resize_bicubic_if_needed(image.unsqueeze(0), *target)
         for _, image in indexed_images
     ]
     real_interpolate = F.interpolate
@@ -137,9 +152,11 @@ def test_kimi_gpu_preprocess_batches_only_source_compatible_images():
         "sglang.srt.multimodal.processors.kimi_k25.F.interpolate",
         side_effect=record_interpolate,
     ):
-        actual = _resize_images_by_source_shape(indexed_images, 16, 12)
+        actual = _resize_images_by_source_shape(indexed_images, *target)
 
-    assert input_shapes == [(2, 3, 32, 24), (1, 3, 28, 20)]
+    assert [shape[0] for shape in input_shapes] == expected_batches
+    assert all(shape[1:] == (3, 32, 24) for shape in input_shapes[:-1])
+    assert input_shapes[-1][1:] == (3, 28, 20)
     assert len(actual) == len(expected)
     for result, reference in zip(actual, expected):
         torch.testing.assert_close(result, reference)

@@ -25,6 +25,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.srt.runtime_context import get_mm
 
 _FORCE_CPU_IMAGE_PREPROCESSING = envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+_RESIZE_SOURCE_BATCH_BYTES = 2 * 1024**3
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -245,12 +246,35 @@ def _resize_images_by_source_shape(
             )
             continue
 
-        source_batch = torch.cat([image.unsqueeze(0) for _, image in images], dim=0)
-        resized_batch = _resize_bicubic_if_needed(
-            source_batch, target_height, target_width
-        )
-        for local_index, (index, _) in enumerate(images):
-            resized_by_index[index] = resized_batch[local_index : local_index + 1]
+        sample = images[0][1]
+        batch_size = len(images)
+        # near-native resizes retain large outputs regardless of source chunking
+        if sample.shape[-2] * sample.shape[-1] >= 4 * target_height * target_width:
+            # source concat and its fp32 conversion coexist before downsampling
+            source_bytes = sample.nbytes
+            if sample.dtype != torch.float32:
+                source_bytes += sample.numel() * 4
+            batch_size = max(1, _RESIZE_SOURCE_BATCH_BYTES // max(1, source_bytes))
+        for start in range(0, len(images), batch_size):
+            chunk = images[start : start + batch_size]
+            if len(chunk) == 1:
+                source = chunk[0][1].unsqueeze(0)
+            elif len(chunk) < len(images) and sample.dtype == torch.uint8:
+                # cast into the resize input without staging an extra raw concat
+                source = torch.empty(
+                    (len(chunk), *sample.shape),
+                    dtype=torch.float32,
+                    device=sample.device,
+                )
+                torch.stack([image for _, image in chunk], out=source)
+            else:
+                source = torch.cat([image.unsqueeze(0) for _, image in chunk], dim=0)
+            resized_batch = _resize_bicubic_if_needed(
+                source, target_height, target_width
+            )
+            del source
+            for local_index, (index, _) in enumerate(chunk):
+                resized_by_index[index] = resized_batch[local_index : local_index + 1]
 
     return [resized_by_index[index] for index, _ in indexed_images]
 
