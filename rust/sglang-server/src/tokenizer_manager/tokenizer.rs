@@ -29,6 +29,7 @@ use crate::utils::{error::Error, fsm::Event};
 pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,
+    backend: &str,
     skip_tokenizer_init: bool,
 ) -> Result<Option<DynamoTokenizer>, String> {
     if skip_tokenizer_init {
@@ -38,7 +39,7 @@ pub fn load_tokenizer(
     let path = tokenizer_path.ok_or_else(|| {
         "no tokenizer configured: set tokenizer_path or enable skip_tokenizer_init".to_string()
     })?;
-    DynamoTokenizer::load(path, revision).map(Some)
+    DynamoTokenizer::load_with_backend(path, revision, backend.parse()?).map(Some)
 }
 
 /// Widened once here, in the parallel pool: the scheduler's `array("q")` is

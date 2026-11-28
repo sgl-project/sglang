@@ -180,6 +180,7 @@ def _build_server_args(
         enable_cache_report=get_serving().enable_cache_report,
         tokenizer_worker_num=get_serving().tokenizer_worker_num,
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
+        tokenizer_backend=get_serving().tokenizer_backend,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
         vlm_warmup_image_base64=vlm_warmup_image_base64,

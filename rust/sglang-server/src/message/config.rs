@@ -182,6 +182,8 @@ pub struct ServerArgs {
     /// Pinned tokenizer threads / detok shards (Python asserts both ≥ 1).
     pub tokenizer_worker_num: usize,
     pub detokenizer_worker_num: usize,
+    /// `--tokenizer-backend`: `huggingface` or `fastokens`.
+    pub tokenizer_backend: String,
     /// Token-ids-in / token-ids-out mode: no tokenizer load, raw `output_ids`
     /// frames.
     pub skip_tokenizer_init: bool,
@@ -323,6 +325,7 @@ impl ServerArgs {
         enable_cache_report,
         tokenizer_worker_num,
         detokenizer_worker_num,
+        tokenizer_backend,
         skip_tokenizer_init,
         skip_server_warmup,
         vlm_warmup_image_base64,
@@ -394,6 +397,7 @@ impl ServerArgs {
         enable_cache_report: bool,
         tokenizer_worker_num: usize,
         detokenizer_worker_num: usize,
+        tokenizer_backend: String,
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
         vlm_warmup_image_base64: Option<String>,
@@ -463,6 +467,7 @@ impl ServerArgs {
             enable_cache_report,
             tokenizer_worker_num,
             detokenizer_worker_num,
+            tokenizer_backend,
             skip_tokenizer_init,
             skip_server_warmup,
             vlm_warmup_image_base64,
@@ -542,6 +547,7 @@ impl Default for ServerArgs {
             enable_cache_report: false,
             tokenizer_worker_num: 1,
             detokenizer_worker_num: 1,
+            tokenizer_backend: "huggingface".into(),
             skip_tokenizer_init: false,
             skip_server_warmup: false,
             vlm_warmup_image_base64: None,
