@@ -742,6 +742,7 @@ def test_bias_residual_add_predicates():
         ((2, 65, 3072), 1e-6),
         ((1, 13, 128), 1e-6),
         ((1, 4416, 3840), 1e-5),
+        ((1, 7040, 4096), 1e-6),
         ((1, 4416, 30, 128), 1e-5),
     ],
 )
@@ -798,7 +799,15 @@ def test_rmsnorm_cast_before_weight_extreme_values():
 @torch.no_grad()
 @pytest.mark.parametrize(
     "dim,eps",
-    [(128, 1e-6), (256, 1e-6), (3072, 1e-6), (128, 1e-5), (2560, 1e-5), (3840, 1e-5)],
+    [
+        (128, 1e-6),
+        (256, 1e-6),
+        (3072, 1e-6),
+        (128, 1e-5),
+        (2560, 1e-5),
+        (3840, 1e-5),
+        (4096, 1e-6),
+    ],
 )
 @pytest.mark.parametrize("rows", [1, 15, 16, 17])
 def test_rmsnorm_cast_before_weight_reduction_boundaries(dim, eps, rows):

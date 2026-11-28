@@ -168,7 +168,7 @@ Several norms look interchangeable and are not. Start here.
 
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
-| `rmsnorm_cast_before_weight_bitexact` | Triton / aten | FP32 reduction, BF16 round before learned scale | MOSS-Image token and head RMSNorm |
+| `rmsnorm_cast_before_weight_bitexact` | Triton / aten | FP32 reduction, BF16 round before learned scale | MOSS-Image token and head RMSNorm, SM120 Nomas VAE width-4096 token RMSNorm |
 | `rmsnorm_mean_square_bitexact` | Triton | ATen-ordered `x.float().square().mean(-1, keepdim=True)` | BF16 head-64/128 views or contiguous width 4096, at least 16 rows and fewer than 2^29 elements; Nomas DiT/VAE, verified against the live reference per reduction layout |
 | `triton_group_norm_silu` / `apply_group_norm_silu` | Triton | close | NCHW-contiguous, any channels-per-group, always applies SiLU |
 | `group_norm_silu_4d` / `group_norm_silu_rows` | Triton | close | **channels_last only**; power-of-two `C <= 2048`; optional SiLU. This is what lets a VAE decoder run channels_last end-to-end with no `nchwToNhwc` |
