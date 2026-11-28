@@ -78,7 +78,6 @@ class _CPUController:
         self.layer_done_counter = SimpleNamespace(
             producer_index=-1,
             num_counters=3,
-            finish_submissions=lambda: None,
             events=[
                 SimpleNamespace(finish_event=_Event(), finish_submission=lambda: None)
                 for _ in range(3)
@@ -87,6 +86,9 @@ class _CPUController:
         self.load_queue = []
         self.ack_load_queue = []
         self.ack_write_queue = []
+
+    def finish_load_submissions(self):
+        pass
 
     def write(self, device_indices, node_id, extra_pools, flush=True):
         self.ack_write_queue.append(HiCacheAck(_Event(), _Event(), [node_id]))

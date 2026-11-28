@@ -239,7 +239,7 @@ def _arm_tick(cache, sync_counts=False):
         cache._shm_count_exchange = lambda: None
         cc.ack_write_queue = []
         cc.ack_load_queue = []
-        cc.layer_done_counter = Mock()
+        cc.finish_load_submissions = lambda: None
         for name in (
             "prefetch_hit_queue",
             "ack_prefetch_queue",

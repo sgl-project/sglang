@@ -111,7 +111,8 @@ class LayerLoadingEvent:
 
     def wait(self, layer_index: int):
         if self._submission is not None:
-            # A wait queued ahead of its load on a shared hardware queue never resolves.
+            # A wait on an event not yet recorded this round passes on its
+            # previous record and reads stale KV: enqueue the layer first.
             self._submission.advance(layer_index + 1 + _LOAD_LAYER_WINDOW)
             if self._submission.finished:
                 self._submission = None
@@ -1089,7 +1090,7 @@ class HiCacheController:
         # Reuse detach's queue wakeups and bounded joins, and fail if any
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
-        self.layer_done_counter.finish_submissions()
+        self.finish_load_submissions()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -1274,6 +1275,10 @@ class HiCacheController:
         pool_transfers: Optional[List[PoolTransfer]] = None,
     ) -> list[L2Transfer]:
         return self._l2_transfers(host_indices, device_indices, pool_transfers)
+
+    def finish_load_submissions(self) -> None:
+        """Enqueue all pending load-back layers before reading load events."""
+        self.layer_done_counter.finish_submissions()
 
     def start_loading(self) -> int:
         if len(self.load_queue) == 0:

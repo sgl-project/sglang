@@ -4345,7 +4345,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _count_ready_load_acks(self, cc) -> int:
         # A load's finish event is recorded only once all its layers are enqueued.
-        cc.layer_done_counter.finish_submissions()
+        cc.finish_load_submissions()
         return self._count_ready_acks(cc.ack_load_queue)
 
     def _count_ready_acks(self, ack_queue) -> int:

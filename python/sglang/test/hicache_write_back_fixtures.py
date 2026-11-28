@@ -105,7 +105,9 @@ class InstantWriteBackController:
         self.ack_write_queue = []
         self.load_queue = []
         self.ack_load_queue = []
-        self.layer_done_counter = SimpleNamespace(finish_submissions=lambda: None)
+
+    def finish_load_submissions(self):
+        pass
 
     def _done_ack(self, queue):
         op = CacheOperation.merge_ops(queue)

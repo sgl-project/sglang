@@ -159,7 +159,7 @@ class TestUnifiedPPSyncBatching(CustomTestCase):
         cache.loading_check = MagicMock()
         cache.cache_controller = SimpleNamespace(
             start_writing=MagicMock(),
-            layer_done_counter=MagicMock(),
+            finish_load_submissions=lambda: None,
             # The tick's rank-local dead-worker check; no workers started here.
             dead_storage_workers=lambda: [],
             ack_write_queue=[
