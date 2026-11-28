@@ -133,8 +133,9 @@ def main() -> int:
     amd = ci_register.HWBackend.AMD
 
     # Same exclusion as run_suite.py: pytest+package structure files.
+    # glob returns OS-native separators; CI sources and the taxonomy use POSIX paths.
     files = sorted(
-        f
+        Path(f).as_posix()
         for f in glob.glob("test/registered/**/*.py", recursive=True)
         if os.path.basename(f) not in ("conftest.py", "__init__.py")
     )
