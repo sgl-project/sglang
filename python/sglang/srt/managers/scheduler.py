@@ -1975,8 +1975,9 @@ class Scheduler(
         Without DCP the prefix-relative rule already donates, so leave the
         existing alignment alone, except where unified memory retires window
         rows behind the checkpoints (`mamba_prefill_chunk_grid`): there every
-        cut lands on the checkpoint grid. Use the LCM to preserve any alignment
-        that is already set."""
+        cut lands on the checkpoint grid. Under deterministic inference with a
+        mamba cache every cut also lands on the kernel chunk grid. Use the LCM
+        to preserve any alignment that is already set."""
         chunk_size = mamba_prefill_chunk_grid(getattr(self, "tree_cache", None))
         if chunk_size <= 1:
             return
@@ -2009,11 +2010,12 @@ class Scheduler(
             f"chunked prefill size is {chunk}{dp_note}; a prompt longer than "
             f"{chunk} tokens could never be scheduled. Raise --chunked-prefill-size "
             f"to at least {align * attn_dp_size}. The alignment includes the Mamba "
-            f"state checkpoint grid under DCP, and under --enable-unified-memory "
+            f"state checkpoint grid (under DCP, or under --enable-unified-memory "
             f"when sliding-window layers retire their rows behind the cached "
-            f"checkpoints; with the flashinfer backend under deterministic "
-            f"inference, lowering SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also "
-            f"helps."
+            f"checkpoints) and the Mamba kernel chunk grid (under "
+            f"--enable-deterministic-inference); with the flashinfer backend "
+            f"under deterministic inference, lowering "
+            f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also helps."
         )
 
     def init_request_dispatcher(self):
