@@ -1801,6 +1801,78 @@ def test_qwen21_cuda_qk_rope_does_not_verify_during_capture(monkeypatch):
     assert torch.equal(out, qwen_image21.apply_rope(norm(x), rope))
 
 
+_QWEN21_ROCM_KERNELS = (
+    "layernorm_modulate",
+    "gated_residual_add",
+    "gated_residual_layernorm_modulate",
+    "fused_complex_rope",
+    "qknorm_complex_rope",
+)
+
+
+def _run_qwen21_rocm_paths(monkeypatch, quality):
+    monkeypatch.setattr(qwen_image21, "_is_cuda", False)
+    monkeypatch.setattr(qwen_image21, "_is_rocm", True)
+    spies = {}
+    for name in _QWEN21_ROCM_KERNELS:
+        spies[name] = MagicMock(wraps=getattr(qwen_image21, name))
+        monkeypatch.setattr(qwen_image21, name, spies[name])
+    x = torch.randn(2, 17, 3072, device="cuda", dtype=torch.bfloat16)
+    update = torch.randn_like(x)
+    gate = torch.randn(2, 1, 3072, device=x.device, dtype=x.dtype).tanh()
+    scale = 0.1 * torch.randn(2, 1, 3072, device=x.device, dtype=x.dtype)
+    norm = nn.LayerNorm(3072, eps=1e-6, elementwise_affine=False).cuda()
+    q = torch.randn(1, 17, 4, 128, device=x.device, dtype=x.dtype)
+    rope = _qwen21_rope(17, x.device)
+    qk_norm = qwen_image21.RMSNorm(
+        128, 1e-6, cast_x_before_out_mul=True, force_native=True
+    ).to(device=x.device, dtype=x.dtype)
+    qk_norm.weight.normal_()
+    forward_batch = SimpleNamespace(sampling_params=SimpleNamespace(quality=quality))
+    with set_forward_context(0, None, forward_batch):
+        outputs = SimpleNamespace(
+            modulation=qwen_image21.apply_modulation(x, norm, scale),
+            residual=qwen_image21.gated_residual(x, update, gate),
+            residual_modulation=qwen_image21.gated_residual_modulation(
+                x, update, gate, norm, scale
+            ),
+            rope=qwen_image21.apply_rope(q, rope),
+            qk_rope=qwen_image21.apply_qk_norm_rope(q, qk_norm, rope),
+        )
+    inputs = SimpleNamespace(
+        x=x, update=update, gate=gate, scale=scale, norm=norm, q=q, rope=rope
+    )
+    return spies, outputs, inputs, qk_norm
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("quality", ["exact", "lossless"])
+def test_qwen21_rocm_paths_follow_request_quality(monkeypatch, quality):
+    # The kernels are plain Triton, so the ROCm dispatch also runs on CUDA.
+    spies, out, inp, qk_norm = _run_qwen21_rocm_paths(monkeypatch, quality)
+    if quality == "exact":
+        assert all(spy.call_count == 0 for spy in spies.values())
+        assert torch.equal(out.modulation, inp.norm(inp.x) * (1 + inp.scale))
+        assert torch.equal(out.rope, qwen_image21._eager_rope(inp.q, inp.rope))
+        assert torch.equal(
+            out.qk_rope, qwen_image21._eager_rope(qk_norm(inp.q), inp.rope)
+        )
+    else:
+        assert {name: spy.call_count for name, spy in spies.items()} == {
+            name: 1 for name in _QWEN21_ROCM_KERNELS
+        }
+        residual = inp.x + inp.update * inp.gate
+        assert torch.equal(out.residual, residual)
+        assert torch.equal(out.residual_modulation[0], residual)
+
+
+@torch.no_grad()
+def test_qwen21_rocm_paths_stay_eager_while_compiling(monkeypatch):
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    spies, _, _, _ = _run_qwen21_rocm_paths(monkeypatch, "lossless")
+    assert all(spy.call_count == 0 for spy in spies.values())
+
+
 # -------------------------------------------------------------------------
 # Qwen-Image 2.1 VAE -- bit-exact norm / bias fusions and the quality-gated channels_last decode
 # -------------------------------------------------------------------------
