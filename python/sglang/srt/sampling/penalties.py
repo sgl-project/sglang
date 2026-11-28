@@ -373,6 +373,13 @@ class StepPenalties:
             self._logit_penalties = self._build_logit_penalties()
         return self._logit_penalties
 
+    def apply(self, logits: torch.Tensor) -> None:
+        additive, scaling = self.logit_penalties()
+        if additive is not None:
+            logits.add_(additive)
+        if scaling is not None:
+            apply_scaling_penalties(logits, scaling)
+
     def _build_logit_penalties(
         self,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:

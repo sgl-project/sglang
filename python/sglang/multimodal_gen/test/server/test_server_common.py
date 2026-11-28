@@ -22,10 +22,12 @@ import openai
 import pytest
 import requests
 from openai import OpenAI
+from PIL import ImageOps
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
+from sglang.multimodal_gen.runtime.utils.vision import load_image
 from sglang.multimodal_gen.test.server.realtime_consistency import (
     RealtimeChunkStats,
     pop_realtime_e2e_ms,
@@ -1928,6 +1930,19 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     diffusion_server, case, perf_record, request_index
                 ),
             )
+
+        if case.min_input_first_frame_psnr is not None:
+
+            def check_first_frame():
+                frame = extract_key_frames_from_video(content)[0]
+                source = load_image(str(case.sampling_params.image_path))
+                reference = ImageOps.fit(source, (frame.shape[1], frame.shape[0]))
+                psnr = compute_psnr(frame, np.asarray(reference))
+                assert psnr >= case.min_input_first_frame_psnr, (
+                    f"input vs first frame: {psnr:.2f} dB, expected >= {case.min_input_first_frame_psnr} dB"
+                )
+
+            run_case_check("first-frame conditioning", check_first_frame)
 
         if case.server_args.custom_validator == "mesh":
             from sglang.multimodal_gen.test.server.test_server_utils import (

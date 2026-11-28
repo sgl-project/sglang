@@ -9,6 +9,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
+from sglang.srt.sampling.sampling_pipeline import SamplingPipeline
 from sglang.srt.speculative import eagle_worker_common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -146,7 +147,15 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
             out_cache_loc=None,
             has_grammar=False,
             return_logprob=False,
-            sampling_info=SimpleNamespace(step_penalties=None),
+            sampling_info=SimpleNamespace(
+                step_penalties=None,
+                logit_bias=None,
+                has_custom_logit_processor=False,
+                watermark=None,
+                need_top_k_sampling=False,
+                need_top_p_sampling=False,
+                need_min_p_sampling=False,
+            ),
         )
         tokens = torch.tensor([1])
         post = (tokens, tokens, tokens, tokens, tokens, None)
@@ -154,7 +163,7 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
             forward_batch_generation=lambda **_: output,
             model_runner=SimpleNamespace(
                 canary_manager=None,
-                watermark=None,
+                sampling_pipeline=SamplingPipeline(sampler=None, watermark=None),
                 attn_backend=SimpleNamespace(verify_mask=None),
             ),
         )
