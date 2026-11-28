@@ -114,6 +114,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         scheduler.enable_unified_cache_external_linker = False
         scheduler.page_size = 64
         scheduler.max_total_num_tokens = 8192
+        scheduler.max_req_len = 4102
         scheduler.max_req_input_len = 4096
         scheduler.startup_time = None
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)

@@ -125,7 +125,7 @@ class TestDcpLogicalCapacity(CustomTestCase):
         info = TpModelWorker.get_worker_info(worker)
 
         self.assertEqual(info[0], 64)
-        self.assertEqual(info[4], 64 * 3 - 1)
+        self.assertEqual(info[4], 64 * 3)
         self.assertEqual(info[5], 64 * 3 - 6)
 
     def test_logical_capacity(self):
@@ -133,7 +133,7 @@ class TestDcpLogicalCapacity(CustomTestCase):
             with self.subTest(dcp_size=dcp_size):
                 info = TpModelWorker.get_worker_info(self.make_worker(dcp_size))
                 self.assertEqual(info[0], PHYSICAL * dcp_size)
-                self.assertEqual(info[4], min(CONTEXT, PHYSICAL * dcp_size) - 1)
+                self.assertEqual(info[4], min(CONTEXT, PHYSICAL * dcp_size))
 
         # Unified Mamba's allocator.size also counts Mamba state bytes, so
         # capacity must come from the configured rows.

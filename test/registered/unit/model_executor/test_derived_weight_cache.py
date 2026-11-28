@@ -59,7 +59,7 @@ class TestDerivedWeightCache(unittest.TestCase):
         )
         update = WeightUpdater.update_weights_from_tensor
         self.assertEqual(update(stub, [], load_format="direct"), (False, "no direct"))
-        with get_parallel().override(tp_rank=0):
+        with get_parallel().override(tp_size=1, pp_size=1, pp_rank=0, tp_rank=0):
             self.assertTrue(update(stub, [], load_format=None)[0])
         self.assertEqual(loaded, [[]])
 

@@ -120,10 +120,7 @@ class TestGLM52PDShardedHiCache(PDDisaggregationServerBase, ShardedHiCacheTestMi
     model = "nvidia/GLM-5.2-NVFP4"
     prefill_tp_size = decode_tp_size = 2
     decode_base_gpu_id = 2
-    extra_prefill_env = {
-        **MOONCAKE_ENV,
-        "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "python",
-    }
+    extra_prefill_env = dict(MOONCAKE_ENV)
     extra_decode_env = dict(MOONCAKE_ENV)
     extra_prefill_args = COMMON_ARGS + [
         "--enable-kv-cache-sharding",
@@ -268,10 +265,7 @@ class TestGLM52PDShardedHiCacheAccuracy(
 
     # Use the same exportable KV allocator and fabric transport as the reload
     # regression on this four-GB300 runner.
-    extra_prefill_env = {
-        **MOONCAKE_ENV,
-        "SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "python",
-    }
+    extra_prefill_env = dict(MOONCAKE_ENV)
     extra_decode_env = dict(MOONCAKE_ENV)
     extra_prefill_args = ACCURACY_COMMON_ARGS + [
         "--enable-kv-cache-sharding",

@@ -567,6 +567,8 @@ def build_rust_loads_fixture() -> dict:
             "storage_transfer": 333,
             "device_covered": 44,
         },
+        total_backuped_tokens=77777,
+        total_backup_dropped_tokens=6666,
         decode_moments=[100.0, 2.5, 0.125],
         memory=MemoryMetrics(
             weight_gb=60.5, kv_cache_gb=120.25, graph_gb=2.0, token_capacity=1048576

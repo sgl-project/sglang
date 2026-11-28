@@ -75,8 +75,6 @@ class TestDisaggregationKVCacheSharding(PDDisaggregationServerBase, GSM8KMixin):
     prefill_tp_size = 2
     decode_tp_size = 2
     decode_base_gpu_id = 2
-    # KV sharding with the radix cache on requires the Python tree core.
-    extra_prefill_env = {"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND": "python"}
     # 256-token chunks split each 5-shot prompt, so later chunks read a
     # sharded prefix and every rank sends pages from several chunks.
     extra_prefill_args = COMMON_ARGS + [

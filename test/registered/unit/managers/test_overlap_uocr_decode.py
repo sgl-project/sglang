@@ -161,6 +161,7 @@ class TestDeferredThenEagerDecode(CustomTestCase):
             has_sampled_token_ids=True,
             next_token_ids=published,
             can_run_cuda_graph=True,
+            logits_output=None,
         )
         deferred = _decode_batch()
         scheduler._relay_forward_payload(deferred, indices, result)

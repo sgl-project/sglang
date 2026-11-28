@@ -121,7 +121,6 @@ def test_sglang_entry_forwards_the_request_to_its_core(media_source):
             image_data=["image"],
             input_text=[1, 101, 2],
             request_obj=request_obj,
-            max_req_input_len=8,
             **media,
         )
     )

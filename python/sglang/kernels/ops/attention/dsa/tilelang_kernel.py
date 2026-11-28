@@ -8,7 +8,7 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.utils import is_gfx95_supported, is_hip
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_sm90_supported
 
 tilelang.set_log_level("WARNING")
 
@@ -46,6 +46,7 @@ elif hasattr(tilelang.PassConfigKey, "TL_ENABLE_FAST_MATH"):
 
 _is_hip = is_hip()
 _is_gfx95_supported = is_gfx95_supported()
+_is_sm90 = is_sm90_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 BF16 = "bfloat16"
@@ -1196,6 +1197,19 @@ def sparse_mla_fwd_decode_partial_fp8(
     return main
 
 
+# Measured on H200 over 8-128 heads, cold L2: split wins at <= 1024 on every shape;
+# it first loses at 1536-2048. Re-tune when either kernel changes.
+_CUDA_BF16_SPLIT_MAX_TOKEN_HEADS = 1024
+
+
+def _use_cuda_bf16_split(*, num_tokens: int, num_heads: int) -> bool:
+    # Only swept on SM90; Blackwell keeps the single-pass kernel until measured.
+    if num_heads % 4 != 0 or not _is_sm90:
+        return False
+    padded_heads = max(1 << (num_heads - 1).bit_length(), 16)
+    return num_tokens * padded_heads <= _CUDA_BF16_SPLIT_MAX_TOKEN_HEADS
+
+
 def tilelang_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1211,7 +1225,10 @@ def tilelang_sparse_fwd(
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
     is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
-    if _is_hip or is_fp8_kv:
+    use_cuda_bf16_split = not (_is_hip or is_fp8_kv) and _use_cuda_bf16_split(
+        num_tokens=q.shape[0], num_heads=num_heads
+    )
+    if _is_hip or is_fp8_kv or use_cuda_bf16_split:
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
@@ -1244,12 +1261,18 @@ def tilelang_sparse_fwd(
                 threads=threads,
             )
         else:
-            if _is_gfx95_supported:
-                block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+            if use_cuda_bf16_split:
+                # One KV tile per CTA: the batch is too small to fill the GPU.
+                block_I, threads = 64, 256
+                ni = topk // block_I
+                inner_iter = 1
             else:
-                block_I, threads, block_per_cu, cu = 32, 128, 1, 304
-            ni = topk // block_I
-            inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
+                if _is_gfx95_supported:
+                    block_I, threads, block_per_cu, cu = 64, 256, 2, 256
+                else:
+                    block_I, threads, block_per_cu, cu = 32, 128, 1, 304
+                ni = topk // block_I
+                inner_iter = _pick_inner_iter(q.shape[0], ni, cu, block_per_cu)
             kernel_partial = sparse_mla_fwd_decode_partial(
                 num_heads,
                 d_v,

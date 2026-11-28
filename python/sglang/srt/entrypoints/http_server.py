@@ -295,6 +295,7 @@ async def init_multi_tokenizer() -> ServerArgs:
         completion_template=get_serving().completion_template,
     )
 
+    tokenizer_manager.max_req_len = scheduler_info["max_req_len"]
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
 
@@ -1244,6 +1245,18 @@ async def hicache_storage_backend_status():
             "hicache_write_policy",
         )
     }
+
+
+@app.api_route("/unified-cache/external-linker", methods=["PUT", "DELETE"])
+async def update_cache_linker(request: Request):
+    """Re-attach (PUT) or detach (DELETE) the launch-time external linker while all schedulers are idle."""
+    ret = await _global_state.tokenizer_manager.update_cache_linker(
+        attach=request.method == "PUT"
+    )
+    return ORJSONResponse(
+        msgspec_to_builtins(ret),
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
 
 
 # example usage:
