@@ -443,6 +443,20 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.device import is_confidential_compute, is_npu
 from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
+from sglang.srt.utils.npu_affinity import (
+    NpuAffinityError,
+    apply_npu_cpu_affinity,
+    build_npu_affinity_report,
+    build_npu_pd_affinity_assignment,
+    migrate_npu_pages,
+    query_npu_smi_topology,
+    resolve_npu_affinity_assignment,
+)
+from sglang.srt.utils.npu_pd_affinity import (
+    get_pd_affinity_budget,
+    install_pd_thread_affinity,
+    make_pd_thread_binder,
+)
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
@@ -7493,7 +7507,10 @@ def configure_scheduler_process(
     suppress_other_loggers()
 
     # Set cpu affinity to this gpu process
-    if envs.SGLANG_SET_CPU_AFFINITY.get():
+    # NPU schedulers only plan their CPU assignment before initialization and
+    # bind all threads after warmup. Keep the existing binding point and policy
+    # for other devices.
+    if envs.SGLANG_SET_CPU_AFFINITY.get() and not _is_npu:
         set_gpu_proc_affinity(gpu_id)
     if envs.SGLANG_DISABLE_THP.get():
         disable_transparent_hugepages()
@@ -7501,6 +7518,54 @@ def configure_scheduler_process(
         numa_node = get_numa_node_if_available(server_args, gpu_id)
         if numa_node is not None:
             numa_bind_to_node(numa_node)
+
+
+def _prepare_npu_scheduler_cpu_affinity(server_args: ServerArgs, gpu_id: int):
+    if not (_is_npu and envs.SGLANG_SET_CPU_AFFINITY.get()):
+        return None, None
+
+    try:
+        # Save the original allowed CPUs before runtime initialization can
+        # change affinity. Do not bind any threads here.
+        assignment = resolve_npu_affinity_assignment(
+            logical_npu_id=gpu_id, emit_topology_log=False
+        )
+        if server_args.numa_node is not None:
+            configured_node = server_args.numa_node[gpu_id]
+            if configured_node != assignment.numa_node:
+                raise NpuAffinityError(
+                    f"Configured NUMA node {configured_node} conflicts with "
+                    f"NPU topology NUMA node {assignment.numa_node}",
+                    stage="validate_configured_numa_node",
+                    logical_npu_id=assignment.logical_npu_id,
+                    physical_npu_id=assignment.physical_npu_id,
+                )
+        return assignment, None
+    except NpuAffinityError as exc:
+        # Logging is configured below. Do not fall back to whole-machine CPU
+        # slices, which can leave the actual NPU's affinity range.
+        return None, exc
+
+
+def _log_npu_scheduler_affinity_failure(exc: NpuAffinityError, phase: str):
+    logger.warning(
+        "\n================ NPU CPU AFFINITY FAILED ================\n"
+        "PID              : %s\n"
+        "Phase            : %s\n"
+        "Runtime NPU      : %s\n"
+        "Physical NPU     : %s\n"
+        "Topology source  : npu-smi info -t topo\n"
+        "Failure stage    : %s\n"
+        "Reason           : %s\n"
+        "Result           : automatic binding failed; no GPU affinity fallback\n"
+        "=========================================================\n",
+        os.getpid(),
+        phase,
+        exc.logical_npu_id,
+        exc.physical_npu_id,
+        exc.stage,
+        exc,
+    )
 
 
 def run_scheduler_process(
@@ -7514,9 +7579,34 @@ def run_scheduler_process(
     display_tp_rank: Optional[int] = None,
     display_dp_rank: Optional[int] = None,
     display_moe_ep_rank: Optional[int] = None,
+    defer_npu_affinity_final: bool = False,
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    npu_assignment, npu_affinity_error = _prepare_npu_scheduler_cpu_affinity(
+        server_args, gpu_id
+    )
+    pd_affinity = install_pd_thread_affinity(None)
+    pd_affinity_error = None
+    try:
+        pd_budget = get_pd_affinity_budget(server_args, is_npu=_is_npu)
+        if pd_budget:
+            if npu_assignment is None:
+                raise NpuAffinityError(
+                    f"PD affinity needs a valid compute plan: {npu_affinity_error}",
+                    stage="plan_pd_affinity",
+                )
+            pd_assignment = build_npu_pd_affinity_assignment(
+                # Cached topology and the compute plan's saved allowed CPUs:
+                # do not re-read affinity after the runtime has narrowed it.
+                query_npu_smi_topology(),
+                npu_assignment,
+                pd_budget,
+            )
+            pd_affinity = install_pd_thread_affinity(pd_assignment)
+    except NpuAffinityError as exc:
+        pd_affinity_error = exc
+
     # Foundry CUDA graph persistence (--cuda-graph-persistence) for this rank.
     activate_foundry(server_args)
     dp_rank = resolve_spawn_dp_rank(dp_rank)
@@ -7538,6 +7628,8 @@ def run_scheduler_process(
         display_dp_rank=display_dp_rank,
         display_moe_ep_rank=display_moe_ep_rank,
     )
+    if npu_affinity_error is not None:
+        _log_npu_scheduler_affinity_failure(npu_affinity_error, phase="plan")
     parent_process = psutil.Process().parent()
 
     # Set up tracing
@@ -7558,11 +7650,76 @@ def run_scheduler_process(
     scheduler = None
     hit_exception = False
     try:
+        if pd_affinity_error is not None:
+            raise pd_affinity_error
         scheduler = Scheduler(server_args, port_args)
         get_foundry_adapter().log_init_summary()
 
+        # HTTP launchers finalize after HTTP warmup. Entrypoints without that
+        # callback still finalize after model/runtime initialization.
+        npu_final_result = None
+        if npu_assignment is not None and not defer_npu_affinity_final:
+            try:
+                binding_options = {}
+                if pd_affinity is not None:
+                    binding_options = {
+                        "pd_assignment": pd_affinity.assignment,
+                        "thread_binder": make_pd_thread_binder(
+                            npu_assignment,
+                            pd_affinity.assignment,
+                            pd_affinity.snapshot(),
+                        ),
+                        "pid": os.getpid(),
+                    }
+                npu_final_result = apply_npu_cpu_affinity(
+                    npu_assignment,
+                    phase="final",
+                    bind_all_threads=True,
+                    **binding_options,
+                )
+                if pd_affinity is not None and not npu_final_result.success:
+                    raise NpuAffinityError(
+                        "Grouped PD CPU binding failed", stage="finalize_scheduler"
+                    )
+                if npu_final_result.success:
+                    migrate_npu_pages(os.getpid(), npu_assignment.numa_node)
+            except NpuAffinityError as exc:
+                if pd_affinity is not None:
+                    raise
+                npu_affinity_error = exc
+                _log_npu_scheduler_affinity_failure(exc, phase="final")
+
         # Send initialization info back to the parent process
-        pipe_writer.send(scheduler.get_init_info())
+        init_info = scheduler.get_init_info()
+        if npu_assignment is not None and defer_npu_affinity_final:
+            parallel = get_parallel()
+            init_info["npu_cpu_affinity_plan"] = {
+                "assignment": npu_assignment,
+                "pid": os.getpid(),
+                "create_time": psutil.Process().create_time(),
+                "tp_rank": parallel.tp_rank,
+                "pp_rank": parallel.pp_rank,
+                "dp_rank": dp_rank,
+            }
+            if pd_affinity is not None:
+                # Current dummy warmup does not create transfer pool workers.
+                # Later workers bind in their initializer, after ready/final.
+                init_info["npu_cpu_affinity_plan"].update(
+                    pd_assignment=pd_affinity.assignment,
+                    python_pd_threads=pd_affinity.snapshot(),
+                )
+        elif _is_npu and envs.SGLANG_SET_CPU_AFFINITY.get():
+            parallel = get_parallel()
+            init_info["npu_cpu_affinity"] = build_npu_affinity_report(
+                npu_assignment,
+                npu_final_result,
+                runtime_npu_id=gpu_id,
+                tp_rank=parallel.tp_rank,
+                pp_rank=parallel.pp_rank,
+                dp_rank=dp_rank,
+                error=npu_affinity_error,
+            )
+        pipe_writer.send(init_info)
 
         # Ex-joiner: server_args is read-only, so override; the offset must stay.
         if scheduler.server_args.ep_join_mode in ("recover", "scale"):

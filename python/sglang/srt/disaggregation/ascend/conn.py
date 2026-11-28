@@ -20,6 +20,7 @@ from sglang.srt.disaggregation.transport.base import Copy
 from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.npu_pd_affinity import get_pd_thread_affinity
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,19 @@ class AscendKVManager(MooncakeKVManager):
             None if dcp_remote_decode_layout is None else list(dcp_remote_decode_layout)
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+
+    def _start_transfer_thread(self, target, *, role, args=(), name=None, daemon=None):
+        affinity = get_pd_thread_affinity()
+        start = (
+            affinity.start_thread
+            if affinity is not None
+            else super()._start_transfer_thread
+        )
+        return start(target, role=role, args=args, name=name, daemon=daemon)
+
+    def _get_transfer_pool_initializer(self):
+        affinity = get_pd_thread_affinity()
+        return affinity.initialize_pool_thread if affinity is not None else None
 
     def _uses_page_interleaved_dcp(self) -> bool:
         return (

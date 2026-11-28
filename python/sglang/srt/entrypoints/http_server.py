@@ -2667,6 +2667,7 @@ def _wait_and_warmup(
     launch_callback: Optional[Callable[[], None]] = None,
     execute_warmup_func: Callable = _execute_server_warmup,
     post_warmup_callback: Optional[Callable[[], None]] = None,
+    finalize_npu_affinity: Optional[Callable[[], None]] = None,
 ):
     if get_model().checkpoint_engine_wait_weights_before_ready:
         _wait_weights_ready()
@@ -2684,6 +2685,17 @@ def _wait_and_warmup(
             return
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
+
+    # Final NPU CPU binding must happen after warmup created every worker
+    # thread, but before the server is announced ready. Skipping warmup above
+    # must not skip this binding.
+    if finalize_npu_affinity is not None:
+        try:
+            finalize_npu_affinity()
+        except Exception:
+            logger.exception("NPU startup affinity finalization failed")
+            _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
+            return
 
     if post_warmup_callback is not None:
         post_warmup_callback()
@@ -3060,6 +3072,7 @@ def _setup_and_run_http_server(
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
     reserved_socket: Optional[socket.socket] = None,
+    finalize_npu_affinity: Optional[Callable[[], None]] = None,
 ):
     """Set up global state, configure middleware, and run uvicorn.
 
@@ -3090,6 +3103,7 @@ def _setup_and_run_http_server(
             server_args=server_args,
             launch_callback=launch_callback,
             execute_warmup_func=execute_warmup_func,
+            finalize_npu_affinity=finalize_npu_affinity,
         )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
@@ -3354,6 +3368,20 @@ def launch_server(
     1. The HTTP server, Engine, and TokenizerManager all run in the main process.
     2. Inter-process communication is done through IPC (each process uses a different port) via the ZMQ library.
     """
+    # Only this launcher has a single local HTTP warmup/ready boundary. Other
+    # entrypoints retain final binding at scheduler initialization completion.
+    defer_npu_affinity = (
+        server_args.device == "npu"
+        and envs.SGLANG_SET_CPU_AFFINITY.get()
+        and server_args.nnodes == 1
+        and server_args.tokenizer_worker_num == 1
+        and not envs.SGLANG_RUST_SERVER.get()
+    )
+    if defer_npu_affinity:
+        run_scheduler_process_func = partial(
+            run_scheduler_process_func, defer_npu_affinity_final=True
+        )
+
     reserved_socket = _reserve_http_socket(server_args)
     try:
         # Launch subprocesses
@@ -3416,6 +3444,11 @@ def launch_server(
                 execute_warmup_func=execute_warmup_func,
                 launch_callback=launch_callback,
                 reserved_socket=reserved_socket,
+                finalize_npu_affinity=(
+                    partial(scheduler_init_result.finalize_npu_affinity, server_args)
+                    if defer_npu_affinity
+                    else None
+                ),
             )
     finally:
         if reserved_socket is not None:

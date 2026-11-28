@@ -89,6 +89,7 @@ from sglang.srt.utils.network import (
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.npu_affinity import log_npu_affinity_summary
 from sglang.srt.utils.process import kill_itself_when_parent_died
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
@@ -247,6 +248,7 @@ class DataParallelController:
 
         # Launch data parallel workers
         self.scheduler_procs = []
+        self.npu_affinity_plans = []
         self.local_kv_event_sources = []
         self.workers: list[zmq.Socket | None] = [None] * self.max_dp_size
         self.status: list[bool] = list(self.dp_active)
@@ -872,6 +874,20 @@ class DataParallelController:
                 for source in info.get("kv_event_sources", [])
             )
 
+        # Forward every local scheduler's plan, not just the DP controller PID.
+        # The launcher applies them after HTTP warmup.
+        self.npu_affinity_plans.extend(
+            info.pop("npu_cpu_affinity_plan")
+            for info in scheduler_info
+            if "npu_cpu_affinity_plan" in info
+        )
+        log_npu_affinity_summary(
+            scheduler_info,
+            base_gpu_id=server_args.base_gpu_id + base_gpu_id,
+            tp_size=server_args.tp_size,
+            port=server_args.port,
+        )
+
         self._record_scheduler_init_infos(scheduler_info)
 
     def _record_scheduler_init_infos(self, infos: list[dict]) -> None:
@@ -1079,6 +1095,7 @@ def run_data_parallel_controller_process(
             "status": "ready",
             **controller.get_init_info(),
             SCHEDULER_PIDS_ARG: scheduler_pids,
+            "npu_cpu_affinity_plans": controller.npu_affinity_plans,
         }
         if get_serving().grpc_port is not None:
             init_info["kv_event_sources"] = sorted(

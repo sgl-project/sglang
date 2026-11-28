@@ -166,6 +166,10 @@ from sglang.srt.utils.network import (
     get_free_port,
     is_port_available,
 )
+from sglang.srt.utils.npu_affinity import (
+    finalize_npu_cpu_affinity,
+    log_npu_affinity_summary,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.srt.weight_cache.daemon import spawn_weight_cache_daemon
@@ -204,6 +208,28 @@ class SchedulerInitResult:
     # listener.
     scheduler_procs: List[Any] = dataclasses.field(default_factory=list)
     rust_listener_procs: List[Any] = dataclasses.field(default_factory=list)
+    npu_affinity_plans: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+
+    def finalize_npu_affinity(self, server_args: ServerArgs) -> None:
+        """Finalize only the schedulers that explicitly deferred their binding."""
+        infos = []
+        failed_pd_pids = []
+        for plan in self.npu_affinity_plans:
+            report = finalize_npu_cpu_affinity(plan)
+            infos.append({"npu_cpu_affinity": report})
+            if plan.get("pd_assignment") is not None and report["status"] != "SUCCESS":
+                failed_pd_pids.append(plan["pid"])
+        self.npu_affinity_plans.clear()
+        log_npu_affinity_summary(
+            infos,
+            base_gpu_id=server_args.base_gpu_id,
+            tp_size=server_args.tp_size,
+            port=server_args.port,
+        )
+        if failed_pd_pids:
+            raise RuntimeError(
+                f"PD CPU affinity finalization failed for schedulers {failed_pd_pids}"
+            )
 
     def stop_grpc_server(self) -> None:
         if self.grpc_server is not None:
@@ -1011,9 +1037,21 @@ class Engine(EngineScoreMixin, EngineBase):
 
         all_child_pids = [proc.pid for proc in scheduler_procs]
         scheduler_infos = []
+        npu_affinity_plans = []
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
+            for info in infos:
+                plan = info.pop("npu_cpu_affinity_plan", None)
+                if plan is not None:
+                    npu_affinity_plans.append(plan)
+                npu_affinity_plans.extend(info.pop("npu_cpu_affinity_plans", []))
+            log_npu_affinity_summary(
+                infos,
+                base_gpu_id=server_args.base_gpu_id,
+                tp_size=server_args.tp_size,
+                port=server_args.port,
+            )
             if any("kv_event_sources" in info for info in infos):
                 # Both gRPC entrypoints consume the first scheduler info. Keep
                 # the sources from every local scheduler, not just the first.
@@ -1057,6 +1095,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 block_until_scheduler_exits=block_until_scheduler_exits,
                 scheduler_procs=local_scheduler_procs,
                 rust_listener_procs=rust_listener_procs,
+                npu_affinity_plans=npu_affinity_plans,
             ),
             scheduler_procs,
         )
