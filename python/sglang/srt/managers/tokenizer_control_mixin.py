@@ -89,6 +89,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromModelExpressReqInput,
+    UpdateWeightsFromModelExpressReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
     UpdateWeightVersionReqInput,
@@ -136,6 +138,7 @@ _COMMUNICATOR_SPECS = [
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
     ("check_weights", CheckWeightsReqOutput),
+    ("modelexpress", UpdateWeightsFromModelExpressReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("pd_role_switch", PdRoleSwitchReqOutput),
     ("flush_cache", FlushCacheReqOutput),
@@ -930,6 +933,20 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
+
+    async def update_weights_from_modelexpress(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromModelExpressReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> UpdateWeightsFromModelExpressReqOutput:
+        success, message = await self._weight_update_session_call(
+            self.modelexpress_communicator, obj
+        )
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
+        if success:
+            self._update_weight_version_if_provided(obj.weight_version)
+        return UpdateWeightsFromModelExpressReqOutput(success=success, message=message)
 
     async def collective_rpc(self: TokenizerManager, obj: RpcReqInput) -> RpcReqOutput:
         self.auto_create_handle_loop()

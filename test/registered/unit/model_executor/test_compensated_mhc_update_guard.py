@@ -30,6 +30,7 @@ class TestCompensatedMhcUpdateGuard(CustomTestCase):
                 ("load_weights_from_distributed", ([],)),
                 ("update_weights_from_disk", ("unused", "auto")),
                 ("update_weights_from_ipc", (SimpleNamespace(),)),
+                ("update_weights_from_modelexpress", ("v2",)),
             ):
                 with self.subTest(field=field, method=method, args=args):
                     model = torch.nn.Sequential(torch.nn.Linear(1, 1))
