@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
     use_vae_fast_path,
 )
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import MiniMaxH3VideoVAE
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     AutoencoderKLLegacy,
     klvae,
@@ -122,6 +123,30 @@ def test_installer_shares_one_gate_between_attention_and_batched_decode(monkeypa
     with use_vae_fast_path(vae, True):
         assert gate.enabled and vae._batch_caps() == (0, 1)
     assert not gate.enabled
+
+
+def test_video_vae_registers_its_gate_so_other_platforms_batch_too(monkeypatch):
+    # Only the CUDA installer used to call register_vae_fast_path_gate, so on
+    # every other platform use_vae_fast_path() was a no-op and the caps stayed
+    # at one tile/window per forward. The full VAE needs the production layer
+    # shapes, so the parent init is stubbed while the gate wiring is exercised.
+    config = MiniMaxH3VideoVAEConfig()
+    config.post_init()
+
+    def stub_init(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+
+    monkeypatch.setattr(AutoencoderKLLegacy, "__init__", stub_init)
+    vae = MiniMaxH3VideoVAE(config)
+    vae.decoder_tile_batch = config.decoder_tile_batch
+    vae.window_batch = config.window_batch
+
+    gate = vae._sgl_gate
+    assert isinstance(gate, VaeFastPathGate) and not gate.enabled
+    assert vae._batch_caps() == (1, 1)
+    with use_vae_fast_path(vae, True):
+        assert gate.enabled and vae._batch_caps() == (64, 1)
+    assert not gate.enabled and vae._batch_caps() == (1, 1)
 
 
 @pytest.mark.parametrize(

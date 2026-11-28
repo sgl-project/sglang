@@ -83,10 +83,12 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         self.sglang_config = config
         self.use_parallel_decode = config.use_parallel_decode
         self.parallel_decode_mode = parallel_decode_mode
-        # The tiled decode batches under this gate; the CUDA installer registers
-        # it for use_vae_fast_path and adds its attention fusion, so other
-        # platforms keep the one-tile-per-forward decode.
+        # The tiled decode batches under this gate; the CUDA installer adds the
+        # attention fusion and reuses this gate. Registering it here is what
+        # enables the batching, so other platforms get it too instead of
+        # falling back to one tile/window per forward.
         self._sgl_gate = VaeFastPathGate()
+        register_vae_fast_path_gate(self, self._sgl_gate)
 
     def prepare_decoder_autocast_weights(self, dtype) -> int:
         return self.decoder.prepare_autocast_linear_weights(dtype)
