@@ -1,6 +1,6 @@
 """KV-canary end-to-end on Intel XPU with pipeline parallelism.
 
-``--pp 2`` routes the run through ``Qwen3ForCausalLM.set_embed_and_head`` (mha mode
+``--pp-size 2`` routes the run through ``Qwen3ForCausalLM.set_embed_and_head`` (mha mode
 is Qwen/Qwen3-0.6B), the embedding/head handoff that syncs and releases the device
 cache. Needs two XPU cards, so it is manual until a 2-card lane is confirmed.
 """
@@ -18,7 +18,7 @@ class TestXPUCanaryPipelineParallel(CanaryE2EBase):
 
     model_mode = "mha"
     kv_canary_mode = CanaryMode.LOG
-    # --disable-decode-cuda-graph --disable-prefill-cuda-graph is mandatory, not tuning: install_canary refuses a captured decode
+    # Disabling both CUDA graphs is mandatory, not tuning: install_canary refuses a captured decode
     # on a device that routes to the torch reference (host work and D2H, so replay checks nothing).
     extra_server_args = (
         "--device",
