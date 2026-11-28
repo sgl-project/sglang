@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
 from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import (
     IdSpace,
     IdSpaceKind,
@@ -53,7 +54,7 @@ from sglang.srt.mem_cache.kv.alloc.id_space import (
     window_read,
 )
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
+from sglang.srt.mem_cache.memory_pool import KVCache, KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -77,6 +78,7 @@ from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+    from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
@@ -1786,6 +1788,17 @@ class FlashInferAttnBackend(AttentionBackend):
         raise ValueError(f"Unknown dispatch reason: {self.dispatch_reason}")
 
 
+def _swa_fused_token_mapping(
+    swa_kv_pool: Optional[KVCache],
+    *,
+    runner_ids: RunnerIds,
+) -> Optional[torch.Tensor]:
+    """Static SWA pool's full->swa table for fusing into pack_read_stream."""
+    if runner_ids.is_translating or not isinstance(swa_kv_pool, BaseSWAKVPool):
+        return None
+    return swa_kv_pool.full_to_swa_index_mapping
+
+
 class FlashInferIndicesUpdaterDecode:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
@@ -1990,6 +2003,10 @@ class FlashInferIndicesUpdaterDecode:
         runner_ids = self.attn_backend.runner_ids
         use_swa_source = use_sliding_window_kv_pool and runner_ids.reads_are_translated
         read_kind = IdSpaceKind.SLIDING_WINDOW if use_swa_source else IdSpaceKind.FULL
+        need_swa_translate = (
+            use_sliding_window_kv_pool and not use_swa_source and not window_rail
+        )
+        translated = False
         if window_rail:
             # A multi-step draft step's window layers read the step's
             # window-clipped rail, already in the window storage's ids.
@@ -2009,7 +2026,12 @@ class FlashInferIndicesUpdaterDecode:
                     paged_kernel_lens_sum, dtype=torch.int32, device="cuda"
                 )
 
-            runner_ids.pack_read_stream(
+            token_mapping = (
+                _swa_fused_token_mapping(self._swa_kv_pool, runner_ids=runner_ids)
+                if need_swa_translate
+                else None
+            )
+            translated = runner_ids.pack_read_stream(
                 plan,
                 req_pool_indices=req_pool_indices,
                 seq_lens=paged_kernel_lens,
@@ -2017,14 +2039,19 @@ class FlashInferIndicesUpdaterDecode:
                 out=kv_indices,
                 kv_start_idx=kv_start_idx,
                 kind=read_kind,
+                token_mapping=token_mapping,
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
-        if use_sliding_window_kv_pool and not use_swa_source and not window_rail:
+        if need_swa_translate and not translated:
             assert self._swa_kv_pool is not None
-            kv_last_index = kv_indptr[-1]
+            kv_last_index = (
+                paged_kernel_lens_sum
+                if spec_info is None or getattr(spec_info, "kv_indptr", None) is None
+                else kv_indptr[-1]
+            )
             kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
 
         global global_override_indptr_cpu
@@ -2256,9 +2283,18 @@ class FlashInferIndicesUpdaterPrefill:
                 paged_kernel_lens = window.lens
                 kv_start_idx = window.start
                 if use_ragged:
-                    paged_kernel_lens_sum = paged_kernel_lens.sum().item()
+                    if extend_prefix_lens_cpu is not None:
+                        paged_kernel_lens_sum = sum(
+                            min(p, sliding_window_size) for p in extend_prefix_lens_cpu
+                        )
+                    else:
+                        paged_kernel_lens_sum = paged_kernel_lens.sum().item()
                     swa_paged_custom_mask = self._build_swa_prefix_custom_mask(
-                        prefix_lens, seq_lens, kv_start_idx
+                        prefix_lens,
+                        seq_lens,
+                        kv_start_idx,
+                        seq_lens_cpu=seq_lens_cpu,
+                        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
                     )
                 else:
                     if prefix_is_full_seq and seq_lens_cpu is not None:
@@ -2266,6 +2302,18 @@ class FlashInferIndicesUpdaterPrefill:
                         # summing the host mirror avoids draining the stream.
                         paged_kernel_lens_sum = int(
                             torch.clamp(seq_lens_cpu, max=sliding_window_size).sum()
+                        )
+                    elif (
+                        not prefix_is_full_seq
+                        and seq_lens_cpu is not None
+                        and extend_prefix_lens_cpu is not None
+                        and len(seq_lens_cpu) == len(extend_prefix_lens_cpu)
+                    ):
+                        paged_kernel_lens_sum = sum(
+                            min(s, sliding_window_size + s - p)
+                            for s, p in zip(
+                                seq_lens_cpu.tolist(), extend_prefix_lens_cpu
+                            )
                         )
                     else:
                         paged_kernel_lens_sum = paged_kernel_lens.sum().item()
@@ -2312,6 +2360,9 @@ class FlashInferIndicesUpdaterPrefill:
         prefix_lens: torch.Tensor,
         seq_lens: torch.Tensor,
         kv_start_idx: torch.Tensor,
+        *,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
     ) -> Optional[torch.Tensor]:
         """Custom SWA mask for the paged wrapper in the ragged merge_state EXTEND path.
 
@@ -2322,15 +2373,31 @@ class FlashInferIndicesUpdaterPrefill:
         if window is None or window < 0:
             return None
 
-        prefix_lens_cpu = prefix_lens.detach().cpu().tolist()
-        extend_lens_cpu = (seq_lens - prefix_lens).detach().cpu().tolist()
-        kv_start_cpu = kv_start_idx.detach().cpu().tolist()
-        if all(p == 0 for p in prefix_lens_cpu):
+        if (
+            extend_prefix_lens_cpu is not None
+            and seq_lens_cpu is not None
+            and len(seq_lens_cpu) == len(extend_prefix_lens_cpu)
+        ):
+            prefix_lens_cpu = extend_prefix_lens_cpu
+            extend_lens_cpu = [
+                s - p for s, p in zip(seq_lens_cpu.tolist(), prefix_lens_cpu)
+            ]
+            kv_start_cpu = [max(0, p - window) for p in prefix_lens_cpu]
+        else:
+            prefix_lens_cpu = prefix_lens.detach().cpu().tolist()
+            extend_lens_cpu = (seq_lens - prefix_lens).detach().cpu().tolist()
+            kv_start_cpu = kv_start_idx.detach().cpu().tolist()
+
+        # Minimum k_abs - (q_abs - window) sits at k = kv_start, q = prefix_len + extend_len - 1.
+        need_mask = any(
+            (p - s) > 0 and e > 0 and s < p + e - 1 - window
+            for p, e, s in zip(prefix_lens_cpu, extend_lens_cpu, kv_start_cpu)
+        )
+        if not need_mask:
             return None
 
         device = prefix_lens.device
         mask_parts: List[torch.Tensor] = []
-        need_mask = False
         for prefix_len, extend_len, kv_start in zip(
             prefix_lens_cpu, extend_lens_cpu, kv_start_cpu
         ):
@@ -2339,13 +2406,8 @@ class FlashInferIndicesUpdaterPrefill:
                 continue
             q_abs = torch.arange(extend_len, device=device).view(-1, 1) + prefix_len
             k_abs = torch.arange(paged_len, device=device).view(1, -1) + kv_start
-            block = (k_abs >= (q_abs - window)).to(torch.uint8)
-            if not bool(block.all()):
-                need_mask = True
-            mask_parts.append(block.view(-1))
+            mask_parts.append((k_abs >= (q_abs - window)).to(torch.uint8).view(-1))
 
-        if not need_mask or not mask_parts:
-            return None
         return torch.cat(mask_parts)
 
     def update_cross_attention(
@@ -2435,6 +2497,13 @@ class FlashInferIndicesUpdaterPrefill:
         runner_ids = self.attn_backend.runner_ids
         use_swa_source = use_sliding_window_kv_pool and runner_ids.reads_are_translated
         read_kind = IdSpaceKind.SLIDING_WINDOW if use_swa_source else IdSpaceKind.FULL
+        need_swa_translate = use_sliding_window_kv_pool and not use_swa_source
+        token_mapping = (
+            _swa_fused_token_mapping(self._swa_kv_pool, runner_ids=runner_ids)
+            if need_swa_translate
+            else None
+        )
+        translated = False
         if spec_info is None:
             assert prefix_lens is not None
             assert len(seq_lens) == len(req_pool_indices)
@@ -2460,7 +2529,7 @@ class FlashInferIndicesUpdaterPrefill:
                     dtype=torch.int32,
                     device=req_pool_indices.device,
                 )
-                runner_ids.pack_read_stream(
+                translated = runner_ids.pack_read_stream(
                     plan,
                     req_pool_indices=req_pool_indices,
                     seq_lens=paged_kernel_lens,
@@ -2468,6 +2537,7 @@ class FlashInferIndicesUpdaterPrefill:
                     out=kv_indices,
                     kv_start_idx=kv_start_idx,
                     kind=read_kind,
+                    token_mapping=token_mapping,
                 )
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
@@ -2486,8 +2556,10 @@ class FlashInferIndicesUpdaterPrefill:
                     plan=plan,
                     kind=read_kind,
                     window=window,
+                    token_mapping=token_mapping,
                 )
             )
+            translated = token_mapping is not None
 
         # extend part
         if use_ragged:
@@ -2503,9 +2575,13 @@ class FlashInferIndicesUpdaterPrefill:
                 window_left=window.window if window is not None else -1,
             )
 
-        if use_sliding_window_kv_pool and not use_swa_source:
+        if need_swa_translate and not translated:
             assert self._swa_kv_pool is not None
-            kv_last_index = kv_indptr[-1]
+            kv_last_index = (
+                paged_kernel_lens_sum
+                if spec_info is None and custom_kv_indices is None
+                else kv_indptr[-1]
+            )
             kv_indices[:kv_last_index] = self._swa_space.ids(kv_indices[:kv_last_index])
 
         # cached part
