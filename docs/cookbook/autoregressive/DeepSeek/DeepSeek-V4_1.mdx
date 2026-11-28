@@ -24,7 +24,7 @@ DeepSeek-V4.1 Flash support has **not shipped in an SGLang release yet**, so a s
 
 For how to launch the image, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker).
 
-**NVIDIA GPUs** — the H200 / B200 / B300 / GB300 cells use `lmsysorg/sglang:latest`. The RTX PRO 6000 cell uses `lmsysorg/sglang:nightly-dev-20261119-6b374a55`, the first nightly that includes [#45261](https://github.com/sgl-project/sglang/pull/45261), which SM120 needs to start this model. The command panel picks the image automatically.
+**NVIDIA GPUs** — the H200 / B200 / B300 / GB300 cells use `lmsysorg/sglang:latest`. The RTX PRO 6000 cells use `lmsysorg/sglang:nightly-dev-20261119-6b374a55`, the first nightly that includes [#45261](https://github.com/sgl-project/sglang/pull/45261), which SM120 needs to start this model. The command panel picks the image automatically.
 
 ```bash Command
 docker pull lmsysorg/sglang:latest
@@ -97,7 +97,7 @@ import { agentx } from "/src/snippets/agentx/deepseek-ai/deepseek-v4_1.jsx";
 
 ## 1. Model Introduction
 
-**DeepSeek-V4.1 Flash** is a sparse-attention Mixture-of-Experts model (`model_type: deepseek_v4.1`) served through SGLang's `dsv4` backend: 40 decoder layers, 384 routed experts at top-6 plus one shared expert, fp8 dense weights at a 32-wide `ue8m0` block scale with fp4 routed experts. It also carries **DSpark**, its own three-stage speculative draft, which the Low-Latency recipe turns on.
+**DeepSeek-V4.1 Flash** is a sparse-attention Mixture-of-Experts model (`model_type: deepseek_v4.1`) served through SGLang's `dsv4` backend: 40 decoder layers, 384 routed experts at top-6 plus one shared expert, fp8 dense weights at a 32-wide `ue8m0` block scale with fp4 routed experts. It also carries **DSpark**, its own three-stage speculative draft, which the Low-Latency recipes (and the DP8 RTX PRO 6000 High-Throughput recipe) turn on.
 
 **Architecture.** Every layer keeps one 512-wide KV latent per position and uses it as both key and value for all 64 query heads, with no separate value projection. Each layer reads two stores that behave oppositely: **compressed latents**, produced only at source layers and shared forward, collapsing 2 positions into 1 in layers 2–19 and 1-to-1 from layer 20 on; and a **128-position sliding window**, recomputed per layer from that layer's own activations, so it can never be shared but also never grows with context. Consumers address a source's cache by plain `loc // ratio` arithmetic with no mapping table, so compressed state lives and dies with the full prefix for free. The residual stream is four parallel copies mixed by a per-token doubly stochastic matrix; each sublayer's mixing coefficients are consumed by the *next* sublayer, which lets that projection overlap the main GEMMs.
 
@@ -117,21 +117,23 @@ import { agentx } from "/src/snippets/agentx/deepseek-ai/deepseek-v4_1.jsx";
 
 ### Do not override the backends
 
-`--attention-backend`, `--moe-runner-backend` and `--fp8-gemm-backend` are selected automatically from the model, hardware, forward mode and shape. On GB300 they resolve to `dsv4` / `flashinfer_mxfp4` / `flashinfer_cutedsl`. Confirm them in the startup log rather than passing them. On gfx950 the MI355X recipes pin `--fp8-gemm-backend aiter` and leave the other two to resolve. The RTX PRO 6000 recipe pins `--fp8-gemm-backend flashinfer_cutlass`, which is faster there than the automatic choice; see [RTX PRO 6000 (SM120)](#rtx-pro-6000-sm120).
+`--attention-backend`, `--moe-runner-backend` and `--fp8-gemm-backend` are selected automatically from the model, hardware, forward mode and shape. On GB300 they resolve to `dsv4` / `flashinfer_mxfp4` / `flashinfer_cutedsl`. Confirm them in the startup log rather than passing them. On gfx950 the MI355X recipes pin `--fp8-gemm-backend aiter` and leave the other two to resolve. The RTX PRO 6000 recipes pin `--fp8-gemm-backend flashinfer_cutlass`, which is faster there than the automatic choice; see [RTX PRO 6000 (SM120)](#rtx-pro-6000-sm120).
 
 Overriding them is the most common cause of a disappointing measurement: it leaves the 32-wide ue8m0 blocks on the Triton `_w8a8_block_fp8_matmul` fallback, which dominates the decode step and costs most of the model's bs=1 throughput. If your decode rate looks like a small fraction of what you expected, check the resolved backends first.
 
 ### RTX PRO 6000 (SM120)
 
-The RTX PRO 6000 cell serves the 1017 checkpoint on eight 96 GB cards with TP8 and EP8. The cards are connected over PCIe only, without NVLink. The base Flash checkpoint has not been run on this hardware.
+The RTX PRO 6000 cells serve the 1017 checkpoint on eight 96 GB cards connected over PCIe only, without NVLink: **Low-Latency** uses TP8 + EP8 at 256K context, and **High-Throughput** uses DP8 attention (`--attn-dp-size 8 --enable-dp-lm-head`) + EP8 at 1M context. In the Playground, keep `TP=8` and `EP=8` on the High-Throughput cell (smaller TP values fail `tp % attn_dp_size == 0`, and other EP values are untested). The base Flash checkpoint has not been run on this hardware.
 
 - **Image.** Use a build that includes [#45261](https://github.com/sgl-project/sglang/pull/45261). Without it, SM120 fails at startup with a DeepGEMM `t.is_cuda()` assertion unless `--enable-deepseek-v4-fp4-indexer` is passed, and at the default 1M context decode graph capture then runs out of memory.
-- **Memory.** The engram tables live on the host, one copy per node. With `--context-length 262144` and `--mem-fraction-static 0.70`, the DSpark decode graphs capture up to batch 128.
+- **Memory.** The engram tables live on the host, one copy per node. On Low-Latency, `--context-length 262144` and `--mem-fraction-static 0.70` capture DSpark decode graphs up to batch 128. On High-Throughput, DP8 attention avoids 8x KV replication and `--mem-fraction-static 0.80` gives 132.9M KV tokens (16.6M/rank) at 1M context, peaking at 86.7 GiB per GPU under mixed-workload testing (87.2 GiB during 88-way profiling).
 - **NCCL.** `NCCL_P2P_LEVEL=SYS` lets NCCL use PCIe peer-to-peer between GPUs on different CPU sockets.
-- **FP8 GEMM backend.** The cell pins `--fp8-gemm-backend flashinfer_cutlass`. With the backend left to automatic selection, output throughput at random 1K in / 1K out was 17% lower at 32 concurrent requests (2,142 against 2,592 tokens/s) and 18% lower at 128 (3,491 against 4,271), and single-request decode was 31 to 44% slower.
-- **Measured** on 8x RTX PRO 6000 Blackwell Server Edition with this cell: sgl-eval GSM8K 96.59% (1,319 questions, thinking off, temperature 0); needle retrieval 9/9 at 20K, 60K and 120K prompt tokens; 2,592 and 4,271 output tokens/s at 32 and 128 concurrent requests (random 1K in / 1K out); single-request decode of 512 tokens at 160 to 303 tokens/s for 20K to 120K prompt tokens.
+- **FP8 GEMM backend.** Both cells pin `--fp8-gemm-backend flashinfer_cutlass`. On Low-Latency, leaving the backend to automatic selection lowered output throughput at random 1K in / 1K out by 17% at 32 concurrent requests (2,142 against 2,592 tokens/s) and 18% at 128 (3,491 against 4,271), and slowed single-request decode (113–160 against 160–303 tokens/s across 20K–120K prompts).
+- **DSpark and interleaving (High-Throughput).** Because DP8 keeps per-rank batches small (11 requests/rank at 88-way), DSpark still beat plain decode by 31.9% at 88-way 1M-tier shared-prefix load (3,243 against 2,458 tokens/s). Setting `--prefill-decode-interval 1 --prefill-decode-interval-min-bs 0` with `--chunked-prefill-size 16384` (2,048 tokens/rank) reduces long cold-prefill stalls across EP collectives: at 66-way 512K-tier load, ~131K cold-prefill P95 SSE ITL dropped from 17.7 s to 0.39 s (0.52 s at 116-way), while in separate 512K-tier (~393K input) tests, cold TTFT dropped from 55.1 s (untuned DP8) to 42.5 s.
+- **Measured (Low-Latency)** on 8x RTX PRO 6000 Blackwell Server Edition: sgl-eval GSM8K 96.59% (1,319 questions, thinking off, temperature 0); needle retrieval 9/9 at 20K, 60K and 120K prompt tokens; 2,592 and 4,271 output tokens/s at 32 and 128 concurrent requests (random 1K in / 1K out); single-request decode of 512 tokens at 160 to 303 tokens/s for 20K to 120K prompt tokens.
+- **Measured (High-Throughput)** on 8x RTX PRO 6000 Blackwell Server Edition: sgl-eval GSM8K 96.51% (1,273/1,319, thinking off, temperature 0); needle retrieval 9/9 at 20K, 60K and 120K prompt tokens; 2,309 (C=32, 128 prompts post-warmup after cache flush, ITL P50 7.93 ms) and 4,421 output tokens/s (C=128, 384 prompts, ITL P50 14.26 ms) at random 1K in / 1K out. On a mixed code/QA/JSON workload (thinking `max`, zero retractions), ≥ 95% of streams sustained ≥ 30 tokens/s at 82 (short), 116 (512K tier, ~393K input), and 89 (1M tier, ~786K input) concurrent requests — the highest passing points tested — with single-request decode at 89 / 221 / 155 tokens/s for the short / 512K / 1M tiers.
 
-`--tp 8 --ep-size 8` with no other flags also starts on this image, at the default 1M context, but it decodes a single request at about 34 tokens/s, against 160 to 303 with this cell. `--tp 8` alone does not load: the MXFP4 MoE runner needs the per-partition intermediate size to be a multiple of 128, and at TP8 without EP it is 288.
+`--tp 8 --ep-size 8` with no other flags also starts on this image, at the default 1M context, but it decodes a single request at about 34 tokens/s, against 160 to 303 with the Low-Latency cell. `--tp 8` alone does not load: the MXFP4 MoE runner needs the per-partition intermediate size to be a multiple of 128, and at TP8 without EP it is 288.
 
 ## 3. Advanced Usage
 
@@ -202,13 +204,13 @@ A successful call returns `finish_reason: "tool_calls"` with a single `get_weath
 
 ### 3.3 Speculative Decoding (DSpark)
 
-DSpark is DeepSeek-V4.1 Flash's own bundled draft — there is no EAGLE or MTP path for this model, and no `--speculative-num-steps` knob (the draft-token count is resolved from the checkpoint). Turn it on with `--speculative-algorithm DSPARK --speculative-dspark-block-size 5`, which is what the Low-Latency cells do.
+DSpark is DeepSeek-V4.1 Flash's own bundled draft — there is no EAGLE or MTP path for this model, and no `--speculative-num-steps` knob (the draft-token count is resolved from the checkpoint). Turn it on with `--speculative-algorithm DSPARK --speculative-dspark-block-size 5`, which is what the Low-Latency cells and the DP8 RTX PRO 6000 High-Throughput cell do.
 
 What to expect:
 
 - A DSpark step costs meaningfully more than a plain decode step, so the win at bs=1 is roughly the accept length divided by that fixed step cost. It is a real speed-up on interactive workloads, but not proportional to the number of draft tokens.
 - Acceptance is strongly workload-dependent — highest on maths and code, lower on open-ended chat, lower still on agentic traces. Size your expectations from the workload you actually run, and measure it rather than assuming.
-- The step cost does not move with accept length or with the draft block size, so tuning `--speculative-dspark-block-size` will not buy throughput. This is also why the High-Throughput recipe turns speculation off: at large batch the fixed step cost stops paying for itself.
+- The step cost does not move with accept length or with the draft block size, so tuning `--speculative-dspark-block-size` will not buy throughput. This is also why the TP-only High-Throughput recipes turn speculation off: at large per-GPU batch the fixed step cost stops paying for itself (RTX PRO 6000 High-Throughput keeps it on because DP8 spreads load to small per-rank batches).
 
 ### 3.4 PD Disaggregation
 

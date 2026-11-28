@@ -8,8 +8,9 @@
 // tightest board at 140 GiB and needs the cap on both cells plus a lower memory
 // fraction; the B200 / B300 / GB300 High-Throughput cells start without either.
 //
-// DP-Attention, DeepEP and MegaMoE are absent by design. DeepEP and MegaMoE have
-// never been enabled on this model; DP-Attention runs in the MI355X agentic recipe
+// DeepEP and MegaMoE are absent by design and have never been enabled on this model.
+// DP-Attention is used on the RTX PRO 6000 High-Throughput cell (avoiding 8x KV
+// replication at 1M context on 96 GB cards) and in the MI355X agentic recipe
 // (cookbook §3.6). EP is set equal to TP on every shape except MI355X.
 
 export const config = {
@@ -647,7 +648,8 @@ export const config = {
     },
 
     // ---------- RTX PRO 6000: 8x RTX PRO 6000 Blackwell Server Edition (SM120,
-    // 96 GB, PCIe only), TP8 + EP8. Verified on the 1017 checkpoint only.
+    // 96 GB, PCIe only). Low-Latency: TP8 + EP8 (256K); High-Throughput:
+    // DP8 attention + EP8 (1M). Verified on the 1017 checkpoint only.
     {
       match: { hw: "rtxpro6000", variant: "flash-1017", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
@@ -676,6 +678,47 @@ export const config = {
         "--cuda-graph-max-bs-decode 128",
         "--max-running-requests 128",
         "--chunked-prefill-size 8192",
+        "--reasoning-parser auto",
+        "--tool-call-parser auto",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "rtxpro6000", variant: "flash-1017", quant: "fp4", strategy: "high-throughput", nodes: "single" },
+      nnodes: 1,
+      verified: true,
+      env: [
+        // No NVLink: let NCCL use PCIe peer-to-peer across the CPU sockets.
+        "NCCL_P2P_LEVEL=SYS",
+        "NCCL_MIN_NCHANNELS=16",
+        "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tp 8",
+        // DP8 attention avoids 8x KV replication (132.9M KV tokens at 0.80).
+        "--attn-dp-size 8",
+        "--enable-dp-lm-head",
+        "--ep-size 8",
+        // One host copy of the engram tables per node; the freed HBM goes to KV.
+        "--engram-config '{\"placement\": \"cpu\", \"replication\": \"per_node\"}'",
+        "--enable-deepseek-v4-fp4-indexer",
+        "--context-length 1048576",
+        "--mem-fraction-static 0.80",
+        // Matches the SM120 Low-Latency cell, where cutlass beat auto selection.
+        "--fp8-gemm-backend flashinfer_cutlass",
+        // Per-rank batches stay small under DP8, so DSpark still pays off.
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
+        "--cuda-graph-max-bs-decode 128",
+        "--max-running-requests 256",
+        // Interleave prefill and decode to reduce long-prefill decode stalls
+        // across shared EP collectives; 16384 = 2048 tokens/rank.
+        "--chunked-prefill-size 16384",
+        "--prefill-decode-interval 1",
+        "--prefill-decode-interval-min-bs 0",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
         "--host {{HOST_IP}}",
