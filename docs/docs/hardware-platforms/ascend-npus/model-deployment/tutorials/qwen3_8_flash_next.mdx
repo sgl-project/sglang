@@ -1,0 +1,426 @@
+---
+title: "Qwen3.8-Flash-Next"
+description: "Deploy Qwen3.8-Flash-Next W8A8 with SGLang on Ascend A2 NPUs, including single-node deployment."
+---
+
+## Introduction
+
+Qwen3.8-Flash-Next is a hybrid
+Mixture-of-Experts (MoE) model developed by the Qwen team, featuring a 125B-parameter
+language model with 6B active parameters, plus 51B n-gram embedding parameters and
+a 4B multi-token prediction (MTP) module. Its 48-layer architecture repeats three
+Gated DeltaNet layers followed by one Qwen Sparse Attention (QSA) layer. QSA selects
+micro-blocks of the context for sparse attention, while Gated Residual connections
+control information flow across layers. The model supports a native 262,144-token
+context window and includes a vision encoder and an MTP draft head.
+
+This document demonstrates the deployment of Qwen3.8-Flash-Next on Ascend NPUs using SGLang, including
+single-node PD mixed mode with QSA enabled.
+
+## Supported features
+
+The following features are used in the validated Ascend A2 deployment:
+
+| Feature | Example usage |
+|---|---|
+| Tensor Parallelism | `--tp-size 8` |
+| Quantization | `--quantization modelslim` |
+| Qwen Sparse Attention (QSA) | `--attention-backend ascend` with `SGLANG_ENABLE_QWEN4_NPU_DENSE_FALLBACK=0` |
+| Chunked Prefill | `--chunked-prefill-size 4096 --max-prefill-tokens 4096` |
+| Prefix Caching | `--mamba-radix-cache-strategy extra_buffer` |
+| NPU Graph | `--cuda-graph-backend-decode full --cuda-graph-bs-decode 1 2 3 4 5 6 7 8` |
+| Text-only Inference | `--json-model-override-args '{"language_model_only":true}'` |
+
+<Note>
+The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
+mode, and workload. For parameter details, see
+[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions).
+</Note>
+
+For feature compatibility and conflict information between features,
+see [Feature Compatibility](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-compatibility).
+
+## Prerequisites
+
+### Environment
+
+For general environment setup, refer to the documents below:
+
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) — the fastest way to get started.
+  It walks you through launching the official container image, starting the SGLang server, and sending a test request.
+  Recommended if you are new to SGLang on Ascend.
+- [SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/getting-started/installation) — the full installation guide.
+  It covers the component version mapping (CANN, TorchNPU, Triton, kernels, etc.), building from source or from a
+  Dockerfile, and recommended system settings (CPU power scheme, NUMA, swap). Use it when you need to install or customize
+  the environment instead of using the official image.
+
+Prepare an aarch64 Linux host with eight Ascend 910B1 devices and the following
+software stack, then follow the model-specific steps in [Installation](#installation).
+
+| Component | Configuration |
+|---|---|
+| Hardware | 8×Ascend 910B1, 64 GiB HBM/device, aarch64; driver 25.5.1 |
+| Runtime | CANN 9.2.0; NNAL/ATB 9.2.0; Python 3.11.15; torch 2.10.0; torch-npu 2.10.0.post7; torchvision 0.25.0; torchaudio 2.10.0 |
+| Model libraries | transformers 5.19.0; tokenizers 0.23.3 |
+| Kernel packages | triton-ascend 3.6.0; sgl-kernel-npu source 2026.9.0.post11 (package metadata 2026.9.0); custom-ops 1.0 |
+
+### Model weights
+
+Before downloading model weights, check the model size to reserve enough disk space.
+Download the weights to a directory accessible from within the serving container.
+
+- [Qwen3.8-Flash-Next-w8a8-mtp](https://www.modelscope.cn/models/Eco-Tech/Qwen3.8-Flash-Next-w8a8-mtp) (ModelSlim W8A8 quantized version, 250.70GB)
+
+<Info>
+The W8A8 checkpoint was validated on eight Ascend 910B1 NPUs with 64 GiB HBM per
+device (`--tp-size 8`), corresponding to a single Ascend A2 Series node.
+</Info>
+
+<Info>
+The checkpoint includes MTP weights, but this deployment runs text inference with MTP disabled.
+</Info>
+
+For the hardware specifications (memory per die and dies per card),
+see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
+
+## Installation
+
+This deployment uses a CANN 9.2 environment with SGLang and the native dependencies built from source.
+The base image used for the build is
+`quay.io/ascend/triton:3.6.0-cann9.2.0-torch_npu2.10.0.post7-910b-ubuntu24.04-py3.11`.
+Install NNAL/ATB 9.2.0 separately and make its environment script available at
+`/usr/local/Ascend/nnal/atb/set_env.sh`.
+
+Run the installation and serving commands below inside the aarch64 container.
+Make all eight NPU devices, the host's Ascend driver, and the model weights directory
+accessible inside it, following the container setup in
+[SGLang Installation with NPU Support](/docs/hardware-platforms/ascend-npus/getting-started/installation#method-2-using-docker-image).
+
+The serving implementation comes from
+[SGLang PR #43102](https://github.com/sgl-project/sglang/pull/43102).
+The commands below pin its implementation to
+`7a988321` and install the QSA kernels from
+[sgl-kernel-npu PR #807](https://github.com/sgl-project/sgl-kernel-npu/pull/807).
+Use these revisions to reproduce the tested deployment.
+
+### Install SGLang from source
+
+Check out the tested implementation and create a Python environment that inherits
+the base image's Torch, torch-npu, and Triton-Ascend packages:
+
+```bash Command
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git fetch origin refs/pull/43102/head
+git checkout --detach 7a9883216db73ac0c2031e8ea4ab4ba9a0c18b1a
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+source /usr/local/Ascend/cann-9.2.0/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+```
+
+Install the native build prerequisites:
+
+```bash Command
+apt-get update
+apt-get install -y \
+  build-essential pkg-config git patch unzip \
+  libnuma-dev libibverbs-dev librdmacm-dev rdma-core \
+  libcurl4-openssl-dev libssl-dev liburing-dev zlib1g-dev
+```
+
+From the SGLang checkout root, install the runtime and build dependencies from
+`python/pyproject_npu.toml`, together with the matching Torch audio and vision packages.
+The editable installation below uses `--no-deps --no-build-isolation` to reuse this
+environment and keep the NPU dependencies selected here.
+
+```bash Command
+python3 - <<'PYTHON'
+import tomllib
+from pathlib import Path
+project = tomllib.loads(Path("python/pyproject_npu.toml").read_text())
+requirements = sorted(set(
+    project["project"]["dependencies"] + project["build-system"]["requires"]
+    + ["build", "packaging", "pybind11", "ninja", "cmake", "pyyaml", "decorator", "attrs"]
+    + ["torchvision==0.25.0", "torchaudio==2.10.0"]
+))
+Path("npu-requirements.txt").write_text("\n".join(requirements) + "\n")
+Path("npu-constraints.txt").write_text(
+    "torch==2.10.0\ntorch-npu==2.10.0.post7\ntriton-ascend==3.6.0\n"
+    "tokenizers==0.23.3\nwheel==0.45.1\n"
+)
+PYTHON
+
+python3 -m pip install --prefer-binary \
+  -r npu-requirements.txt -c npu-constraints.txt
+export PIP_CONSTRAINT="$PWD/npu-constraints.txt"
+
+# Install the checked-out serving implementation.
+python3 -m pip install --no-deps --no-build-isolation -e ./python
+```
+
+### Build the native dependencies
+
+Build the native packages against CANN 9.2.0 using
+[sgl-kernel-npu 2026.9.0.post11](https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post11).
+That release's prebuilt packages target CANN 9.0/9.1. The following CANN 9.2
+procedure follows its
+[release workflow](https://github.com/sgl-project/sgl-kernel-npu/blob/2026.9.0.post11/.github/workflows/build_and_release.yml)
+with the Torch-header and opbase-header adjustments used for this deployment.
+
+<Accordion title="CANN 9.2 source build instructions">
+
+#### Prepare the sources
+
+Set `BUILD_ROOT` to an absolute build directory and `CUSTOM_OPP_ROOT` to the
+custom operator installation directory. Keep the serving Python environment
+activated throughout the build.
+
+```bash Command
+export BUILD_ROOT=/path/to/build-root
+export CUSTOM_OPP_ROOT=/path/to/custom-opp
+mkdir -p "$BUILD_ROOT/build/third-party/pkg" "$CUSTOM_OPP_ROOT"
+
+git clone --recursive --branch 2026.9.0.post11 \
+  https://github.com/sgl-project/sgl-kernel-npu.git \
+  "$BUILD_ROOT/build/sgl-kernel-npu"
+git clone https://gitcode.com/cann/cann-recipes-infer.git \
+  "$BUILD_ROOT/build/cann-recipes-infer"
+git -C "$BUILD_ROOT/build/cann-recipes-infer" checkout 35a476c
+git clone https://gitcode.com/cann/ops-transformer.git \
+  "$BUILD_ROOT/build/ops-transformer"
+git -C "$BUILD_ROOT/build/ops-transformer" checkout bcc6304
+git clone https://gitcode.com/cann/opbase.git "$BUILD_ROOT/ops-base"
+git -C "$BUILD_ROOT/ops-base" checkout ee5334d157016d2afa736d4a23381855dbf1fe37
+git clone https://gitcode.com/cann/ops-tensor.git "$BUILD_ROOT/build/ops-tensor"
+git -C "$BUILD_ROOT/build/ops-tensor" checkout f2e975775ca754c04084dece850dd6cc76bfbc5b
+git clone --branch master-016 https://gitcode.com/cann/cmake.git \
+  "$BUILD_ROOT/build/third-party/cann-cmake"
+```
+
+Download these archives into the indicated paths, relative to
+`$BUILD_ROOT/build/third-party/`:
+
+| Archive | Destination |
+|---|---|
+| [JSON](https://cann-3rd.obs.cn-north-4.myhuaweicloud.com/json/json-3.11.3.tar.gz) | `json-3.11.3.tar.gz` |
+| [Eigen](https://gitcode.com/cann-src-third-party/eigen/releases/download/5.0.0-h0.trunk/eigen-5.0.0.tar.gz) | `eigen-5.0.0.tar.gz` |
+| [makeself](https://gitcode.com/cann-src-third-party/makeself/releases/download/release-2.5.0-patch1.0/makeself-release-2.5.0-patch1.tar.gz) | `makeself-release-2.5.0-patch1.tar.gz` |
+| [Abseil](https://gitcode.com/cann-src-third-party/abseil-cpp/releases/download/20230802.1/abseil-cpp-20230802.1.tar.gz) | `pkg/abseil-cpp-20230802.1.tar.gz` |
+| [Protobuf](https://gitcode.com/cann-src-third-party/protobuf/releases/download/v25.1/protobuf-25.1.tar.gz) | `pkg/protobuf-25.1.tar.gz` |
+
+#### Adjust header discovery
+
+Resolve `torch` and `torch_npu` independently in the attention extension's
+CMake configuration so the build finds packages inherited from the base image:
+
+```bash Command
+python3 - <<'PY'
+import os
+from pathlib import Path
+p = Path(os.environ["BUILD_ROOT"]) / "build/sgl-kernel-npu/csrc/attentions/csrc/CMakeLists.txt"
+s = p.read_text()
+for variable, package in (("PYTORCH_INSTALL_PATH", "torch"), ("PYTORCH_NPU_INSTALL_PATH", "torch_npu")):
+    old = f"set({variable} ${{python_site_packages_path}}/{package})"
+    new = (
+        'execute_process(\n  COMMAND python3 -c "import importlib.util, pathlib; '
+        f"print(pathlib.Path(importlib.util.find_spec('{package}').origin).parent)"
+        f'"\n  OUTPUT_VARIABLE {variable}\n'
+        '  OUTPUT_STRIP_TRAILING_WHITESPACE\n  COMMAND_ERROR_IS_FATAL ANY\n)'
+    )
+    if old in s:
+        s = s.replace(old, new, 1)
+    elif new not in s:
+        raise RuntimeError(f"Unexpected package lookup: {package}")
+p.write_text(s)
+PY
+```
+
+Prepend the following block to
+`$BUILD_ROOT/build/ops-transformer/cmake/obj_func.cmake` before configuring the
+build. This makes the pinned opbase headers take precedence over the CANN 9.2
+installation's headers.
+
+```cmake
+if(NOT EXISTS "${OPBASE_SOURCE_PATH}/pkg_inc/op_common/atvoss/elewise/elewise_tiling.h")
+  message(FATAL_ERROR "Pinned opbase headers are missing")
+endif()
+include_directories(BEFORE
+  "${OPBASE_SOURCE_PATH}/pkg_inc"
+  "${OPBASE_SOURCE_PATH}/include"
+  "${OPBASE_SOURCE_PATH}/pkg_inc/op_common"
+  "${OPBASE_SOURCE_PATH}/include/op_common"
+  "${OPBASE_SOURCE_PATH}/include/op_common/op_host"
+)
+```
+
+#### Build and install
+
+Run the builds in order in the activated serving environment:
+
+```bash Command
+export VERSION=2026.9.0.post11
+cd "$BUILD_ROOT/build/sgl-kernel-npu"
+bash build.sh -a kernels Ascend910B2
+bash build.sh -a deepep2 Ascend910B1
+bash build.sh -a attentions
+bash build.sh -a memory-saver
+python3 -m pip install --no-deps --force-reinstall output/*.whl
+
+cd "$BUILD_ROOT/build/cann-recipes-infer"
+git apply "$BUILD_ROOT/build/sgl-kernel-npu/contrib/patch/Adapt-custom-ops-A2.patch"
+cd ops/ascendc/torch_ops_extension
+bash build_and_install.sh
+python3 -m pip install --no-deps --force-reinstall dist/custom_ops-*.whl
+cd ..
+bash build.sh -c ascend910b
+for installer in output/CANN-custom_ops-*.run; do
+  bash "$installer" --install-path="$CUSTOM_OPP_ROOT"
+done
+
+cd "$BUILD_ROOT/build/ops-transformer"
+bash build.sh --pkg --experimental --soc=ascend910b \
+  --cann_3rd_lib_path="$BUILD_ROOT/build/third-party" \
+  --ops=sparse_attn_sharedkv,sparse_attn_sharedkv_metadata,quant_lightning_indexer,quant_lightning_indexer_metadata,compressor
+for installer in build_out/*.run; do
+  bash "$installer" --install-path="$CUSTOM_OPP_ROOT"
+done
+```
+
+</Accordion>
+
+### Install the QSA kernels
+
+Copy the QSA Python package from the pinned #807 revision into the installed
+`sgl_kernel_npu` package:
+
+```bash Command
+git -C "$BUILD_ROOT/build/sgl-kernel-npu" fetch origin refs/pull/807/head
+export QSA_SOURCE="$BUILD_ROOT/build/sgl-kernel-npu-qsa"
+git -C "$BUILD_ROOT/build/sgl-kernel-npu" worktree add --detach \
+  "$QSA_SOURCE" 36467f5176c3e1d0a36c8ba4be12a277fe0f8815
+
+python3 - <<'PY'
+import importlib.util
+import os
+import shutil
+from pathlib import Path
+
+source = (
+    Path(os.environ["QSA_SOURCE"])
+    / "python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next"
+)
+spec = importlib.util.find_spec("sgl_kernel_npu")
+destination = Path(next(iter(spec.submodule_search_locations))) / source.name
+shutil.copytree(source, destination, dirs_exist_ok=True)
+print(f"Installed QSA kernels in {destination}")
+PY
+```
+
+## Online service deployment
+
+### Single-node PD mixed deployment
+
+Single-node deployment completes prefill and decode on the same node (PD mixed
+mode). The configuration below uses eight Ascend 910B1 NPUs with 64 GiB HBM per
+device, TP8, and a 33,024-token context window for up to eight concurrent requests. This configuration serves text input
+with MTP disabled.
+
+Activate the serving environment and set `MODEL_PATH` and `CUSTOM_OPP_ROOT` to
+the directories prepared during installation. Load both custom operator
+environments before starting the server:
+
+<Note>
+Set `SGLANG_NPU_ALLOW_INTERNAL_FORMAT=0` to disable torch-npu internal tensor formats
+for NPU graph capture compatibility. On the tested Ascend A2 / CANN 9.0.0 stack, enabling internal formats routed Conv2D through an aclop path that failed during graph capture.
+</Note>
+
+```bash Command
+source /usr/local/Ascend/cann-9.2.0/set_env.sh
+export CUSTOM_OPP_ROOT=/path/to/custom-opp
+source "$CUSTOM_OPP_ROOT/vendors/customize/bin/set_env.bash"
+source "$CUSTOM_OPP_ROOT/vendors/custom_transformer/bin/set_env.bash"
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export MODEL_PATH=/path/to/Qwen3.8-Flash-Next-w8a8-mtp
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export SGLANG_NPU_ALLOW_INTERNAL_FORMAT=0
+export SGLANG_ENABLE_QWEN4_NPU_DENSE_FALLBACK=0
+export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=0
+export HCCL_DETERMINISTIC=strict
+
+sglang serve \
+  --model-path "$MODEL_PATH" \
+  --served-model-name Qwen3.8-Flash-Next \
+  --quantization modelslim --dtype bfloat16 \
+  --tp-size 8 --ep-size 1 --moe-a2a-backend none \
+  --attention-backend ascend \
+  --json-model-override-args '{"language_model_only":true}' \
+  --context-length 33024 --max-total-tokens 270336 \
+  --page-size 64 --chunked-prefill-size 4096 --max-prefill-tokens 4096 \
+  --max-running-requests 8 --max-mamba-cache-size 64 \
+  --mamba-radix-cache-strategy extra_buffer --mem-fraction-static 0.97 \
+  --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled \
+  --cuda-graph-bs-decode 1 2 3 4 5 6 7 8 \
+  --host 127.0.0.1 --port 30010 --log-level info
+```
+
+## Functional verification
+
+After the service is started, check its health from another terminal on the serving host:
+
+```bash Command
+# Set HOST and PORT to the address and port used in the launch command.
+HOST=127.0.0.1
+PORT=30010
+
+curl --fail "http://${HOST}:${PORT}/health"
+```
+
+Invoke the model by sending a prompt:
+
+```bash Command
+curl --fail "http://${HOST}:${PORT}/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.8-Flash-Next",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "temperature": 0,
+    "max_tokens": 128,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+Expected result: an HTTP 200 response with the generated text containing "Paris" in
+`choices[0].message.content`.
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For more
+testing examples (Health Check, Generate, Chat Completions, and port usage guidance),
+see [Testing the Service](/docs/hardware-platforms/ascend-npus/getting-started/installation#testing-the-service).
+
+## Accuracy evaluation
+
+For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
+
+## Performance
+
+For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing).
+
+## Best practices
+
+### Best practice configuration reference
+
+The [Single-node PD mixed deployment](#single-node-pd-mixed-deployment) section above provides
+the ready-to-use script for Qwen3.8-Flash-Next W8A8 text inference on Ascend A2 NPUs.
+
+For the full catalog of optimization features and their parameter and compatibility details,
+see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
+
+## Performance tuning
+
+For the full list of supported features, see [Supported features](#supported-features). For detailed optimization
+guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
+
+## FAQ
+
+For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/faq).
