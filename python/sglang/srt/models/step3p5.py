@@ -340,6 +340,7 @@ class Step3p5Attention(nn.Module):
                 hidden_size,
                 self.total_num_heads,
                 bias=False,
+                quant_config=quant_config,
                 parallel_group="attn_tp",
                 prefix=add_prefix("g_proj", prefix),
             )
