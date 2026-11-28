@@ -25,6 +25,9 @@ from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
 
+# RoPE width npu_kv_quant_sparse_flash_attention reads from the packed record.
+_INT8_KV_ROPE_HEAD_DIM = 64
+
 _NVFP4_PREFILL_BACKEND = {
     "fp8_e4m3": "flashinfer",
     "nvfp4": "trtllm_mha",
@@ -110,6 +113,12 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
         )
+    # SM120 kernels read the per-layer pools' interleaved scales; the unified
+    # pool stores them token-major.
+    if get_platform().is_sm120 and cfg.enable_unified_memory:
+        raise ValueError(
+            "--kv-cache-dtype mxfp8 on SM120 does not support --enable-unified-memory."
+        )
 
 
 def handle_platform_kv_cache_dtype_compatibility(server_args: Any) -> None:
@@ -149,6 +158,54 @@ def handle_platform_kv_cache_dtype_compatibility(server_args: Any) -> None:
             "the in-tree per-head KV layout. Disable them or choose another "
             "--kv-cache-dtype."
         )
+
+
+def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
+    """``--kv-cache-dtype int8`` stores the DSA MLA KV as the packed record
+    (INT8 latent | BF16 rope | per-tile scales) that arch35 stores in FP8.
+    Readers without a packed path are rejected when the pool is built, for
+    either dtype; this rejects what is specific to INT8."""
+    cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype != "int8":
+        return
+    if not get_platform().is_npu:
+        raise ValueError(
+            "--kv-cache-dtype int8 is supported on Ascend NPUs only; no other "
+            "platform has kernels that read an INT8 KV cache."
+        )
+    import torch
+
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    model_config = model_config_of(server_args)
+    hf_config = model_config.hf_config
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "--kv-cache-dtype int8 stores the packed DSA MLA record, which only "
+            "DSA sparse attention reads back; "
+            f"{hf_config.architectures[0]} is not a DSA model. Use "
+            "--kv-cache-dtype bf16 or auto."
+        )
+    # The kernel reading the INT8 record takes a 64-wide RoPE; the record keeps
+    # its RoPE in BF16 and the reader asserts a BF16 query next to it.
+    if model_config.qk_rope_head_dim != _INT8_KV_ROPE_HEAD_DIM:
+        raise ValueError(
+            "--kv-cache-dtype int8 needs a DSA model with qk_rope_head_dim="
+            f"{_INT8_KV_ROPE_HEAD_DIM}, which is what the sparse attention "
+            "reading the packed record supports; this model has "
+            f"qk_rope_head_dim={model_config.qk_rope_head_dim}. Use "
+            "--kv-cache-dtype bf16 or auto."
+        )
+    if model_config.dtype != torch.bfloat16:
+        raise ValueError(
+            "--kv-cache-dtype int8 needs a bfloat16 model dtype: the packed "
+            "record stores its RoPE in BF16 and is read with a BF16 query; got "
+            f"{model_config.dtype}. Use --dtype bfloat16, or --kv-cache-dtype "
+            "bf16 or auto."
+        )
+    # SGLANG_NPU_USE_MLAPO needs no check here: MLAProlog writes the INT8
+    # record from dynamic INT8 projections, and NPUFusedMLAPreprocess rejects
+    # other projection weights once they are loaded, as it does for FP8.
 
 
 def handle_kv4_compatibility(server_args: Any) -> None:

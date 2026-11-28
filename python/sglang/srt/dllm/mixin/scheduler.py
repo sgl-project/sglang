@@ -363,7 +363,7 @@ class SchedulerDllmMixin:
             dllm_config=self.dllm_config,
         )
         new_batch.prepare_for_extend()
-        self.sampler_params_pool.write(new_batch.reqs)
+        self.sampling_params_pool.write(new_batch.reqs)
         new_batch.forward_mode = forward_mode
         new_batch.decoding_reqs = None
 

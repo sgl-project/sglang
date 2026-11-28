@@ -10,7 +10,7 @@ from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 
 
 def tree_mask_numel(
-    mode: TreeMaskMode, bs: int, num_draft_tokens: int, max_context_len: int
+    mode: TreeMaskMode, bs: int, num_draft_tokens: int, max_kv_len: int
 ) -> int:
     """Cells the tree kernel writes for ``bs`` requests under ``mode``.
 
@@ -21,7 +21,7 @@ def tree_mask_numel(
     if mode == TreeMaskMode.QLEN_ONLY:
         per_req = num_draft_tokens * num_draft_tokens
     elif mode == TreeMaskMode.FULL_MASK:
-        per_req = num_draft_tokens * (max_context_len + num_draft_tokens)
+        per_req = num_draft_tokens * (max_kv_len + num_draft_tokens)
     else:
         raise NotImplementedError(f"Invalid tree mask: {mode=}")
     return bs * per_req
@@ -50,7 +50,7 @@ class VerifyMask(msgspec.Struct, frozen=True):
         """Whether this batch's writes stay inside the buffer.
 
         ``tree_mask_numel`` is ``bs * per_req`` and per_req is fixed at
-        allocation (FULL_MASK's spans max_context_len), so max_bs bounds it.
+        allocation (FULL_MASK's spans max_kv_len), so max_bs bounds it.
         """
         return bs <= self.max_bs
 
@@ -60,7 +60,7 @@ def maybe_create_verify_mask(
     is_draft_runner: bool,
     skip_prefill: bool,
     max_bs: int,
-    max_context_len: int,
+    max_kv_len: int,
     num_draft_tokens: Optional[int],
     device: torch.device | str,
     is_read: bool,
@@ -72,7 +72,7 @@ def maybe_create_verify_mask(
     mode = default_tree_mask_mode() if is_read else TreeMaskMode.QLEN_ONLY
     return VerifyMask(
         buffer=torch.zeros(
-            tree_mask_numel(mode, max_bs, num_draft_tokens, max_context_len),
+            tree_mask_numel(mode, max_bs, num_draft_tokens, max_kv_len),
             dtype=dtype,
             device=device,
         ),

@@ -64,7 +64,6 @@ from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.entrypoints.server_utils import (
     launch_dummy_health_check_server,
     set_prometheus_multiproc_dir,
-    start_follower_grpc_server,
 )
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
@@ -197,18 +196,12 @@ class SchedulerInitResult:
     engine_info_bootstrap_server: Optional[Any] = None
     # Rust-server mode only: a KV bootstrap server the Rust server cannot serve.
     kv_bootstrap_server: Optional[Any] = None
-    grpc_server: Optional[Any] = None
     # Rust-server mode only, for the SIGTERM drain (see
     # `sglang.srt.rust_server.shutdown`): the scheduler processes this process
     # started (not a data parallel controller), and those hosting a Rust
     # listener.
     scheduler_procs: List[Any] = dataclasses.field(default_factory=list)
     rust_listener_procs: List[Any] = dataclasses.field(default_factory=list)
-
-    def stop_grpc_server(self) -> None:
-        if self.grpc_server is not None:
-            self.grpc_server.shutdown()
-            self.grpc_server = None
 
 
 def init_tokenizer_manager(
@@ -912,8 +905,9 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs is None for RayEngine (uses Ray actors instead).
         """
         scheduler_procs = []
+        # Elastic EP offset joiners always use the DPC; the primary owns the tokenizer.
         use_dp_controller = (
-            get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
+            get_parallel().num_dp_ranks > 1 or get_exec().moe.is_ep_offset_joiner
         )
         prelaunch_dp_schedulers = (
             use_dp_controller
@@ -1013,17 +1007,6 @@ class Engine(EngineScoreMixin, EngineBase):
 
         def wait_for_ready():
             infos = _wait_for_scheduler_ready(scheduler_pipe_readers, scheduler_procs)
-            if any("kv_event_sources" in info for info in infos):
-                # Both gRPC entrypoints consume the first scheduler info. Keep
-                # the sources from every local scheduler, not just the first.
-                infos[0]["kv_event_sources"] = sorted(
-                    (
-                        source
-                        for info in infos
-                        for source in info.get("kv_event_sources", [])
-                    ),
-                    key=lambda source: source["dp_rank"],
-                )
             # Each PP stage reports only its own L3 pools; give every info the merged layout.
             merge_scheduler_info_layouts(infos)
             scheduler_infos.extend(infos)
@@ -1302,18 +1285,6 @@ class Engine(EngineScoreMixin, EngineBase):
             # Non-zero-rank nodes do not run tokenizer processes.
             scheduler_init_result.wait_for_ready()
 
-            try:
-                scheduler_init_result.grpc_server = start_follower_grpc_server(
-                    server_args, scheduler_init_result.scheduler_infos[0]
-                )
-            except BaseException:
-                # Engine.__init__ has not received these handles yet. Do not
-                # leave GPU workers behind if binding the metadata port fails.
-                for proc in scheduler_procs or []:
-                    kill_process_tree(proc.pid, wait_timeout=60)
-                cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
-                raise
-
             if not envs.SGLANG_BLOCK_NONZERO_RANK_CHILDREN.get():
                 # When using `Engine` as a Python API, we don't want to block here.
                 return (
@@ -1338,21 +1309,18 @@ class Engine(EngineScoreMixin, EngineBase):
             rust_server_owns_base_port = (
                 envs.SGLANG_RUST_SERVER.get() and node_hosts_rust_server()
             )
-            try:
-                if not rust_server_owns_base_port:
-                    launch_dummy_health_check_server(
-                        get_serving().host,
-                        get_serving().port,
-                        get_observability().enable_metrics,
-                    )
-                _block_until_follower_schedulers_exit(
-                    scheduler_init_result,
-                    scheduler_procs,
-                    port_args.instance_id,
-                    rust_server_owns_base_port,
+            if not rust_server_owns_base_port:
+                launch_dummy_health_check_server(
+                    get_serving().host,
+                    get_serving().port,
+                    get_observability().enable_metrics,
                 )
-            finally:
-                scheduler_init_result.stop_grpc_server()
+            _block_until_follower_schedulers_exit(
+                scheduler_init_result,
+                scheduler_procs,
+                port_args.instance_id,
+                rust_server_owns_base_port,
+            )
             return (
                 None,
                 None,
@@ -1426,9 +1394,9 @@ class Engine(EngineScoreMixin, EngineBase):
             )
 
             # Get back some info from scheduler to tokenizer_manager
-            tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
-                0
-            ]["max_req_input_len"]
+            scheduler_info = scheduler_init_result.scheduler_infos[0]
+            tokenizer_manager.max_req_len = scheduler_info["max_req_len"]
+            tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
 
             # Set up subprocess liveness watchdog to detect crashes
             # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
@@ -1470,6 +1438,7 @@ class Engine(EngineScoreMixin, EngineBase):
             port_args,
             TokenizerManagerClass=get_tokenizer_worker_class(server_args),
         )
+        tokenizer_manager.max_req_len = scheduler_info["max_req_len"]
         tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
         tokenizer_manager.set_startup_time(scheduler_info["startup_time"])
         return tokenizer_manager, template_manager
@@ -1539,9 +1508,6 @@ class Engine(EngineScoreMixin, EngineBase):
                 pass
             self._multi_tokenizer_shm = None
         try:
-            scheduler_init_result = getattr(self, "_scheduler_init_result", None)
-            if scheduler_init_result is not None:
-                scheduler_init_result.stop_grpc_server()
             if (
                 self.tokenizer_manager is not None
                 and self.tokenizer_manager._subprocess_watchdog is not None
@@ -1758,7 +1724,7 @@ class Engine(EngineScoreMixin, EngineBase):
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        serialized_named_tensors = self._serialize_tensors_per_rank(
+        serialized_named_tensors = self.serialize_tensors_per_rank(
             named_tensors, load_format
         )
         obj = UpdateWeightsFromTensorReqInput(
@@ -1811,22 +1777,24 @@ class Engine(EngineScoreMixin, EngineBase):
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
 
-    def _serialize_tensors_per_rank(
+    def serialize_tensors_per_rank(
         self,
         tensors,
         load_format: Optional[str],
     ) -> List[bytes]:
-        """One serialized payload per TP rank: each rank deserializes only its
-        own copy, so producer-side CUDA-IPC refcounts drop cleanly after every
-        load. flattened_bucket callers pass pre-serialized per-rank payloads."""
+        """One serialized payload per engine rank (tp_size * pp_size, in world
+        rank order): each rank deserializes only its own copy, so producer-side
+        CUDA-IPC refcounts drop cleanly after every load. flattened_bucket
+        callers pass pre-serialized per-rank payloads."""
         if load_format == "flattened_bucket":
             return normalize_serialized_named_tensor_payloads(
                 cast(List[SerializedTensorPayload], tensors)
             )
         else:
+            parallel = get_parallel()
             return [
                 MultiprocessingSerializer.serialize(tensors)
-                for _ in range(get_parallel().tp_size)
+                for _ in range(parallel.tp_size * parallel.pp_size)
             ]
 
     def load_lora_adapter_from_tensors(
@@ -1836,9 +1804,7 @@ class Engine(EngineScoreMixin, EngineBase):
         config_dict: Dict,
         load_format: Optional[str] = None,
     ):
-        serialized_named_tensors = self._serialize_tensors_per_rank(
-            tensors, load_format
-        )
+        serialized_named_tensors = self.serialize_tensors_per_rank(tensors, load_format)
         lora_req = LoadLoRAAdapterFromTensorsReqInput(
             lora_name=lora_name,
             config_dict=config_dict,

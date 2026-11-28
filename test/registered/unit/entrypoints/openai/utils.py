@@ -71,6 +71,8 @@ class MockTokenizerManager:
         self.tokenizer.chat_template = None
         self.tokenizer.bos_token_id = 1
         self.num_reserved_tokens = 0
+        self.max_req_len = 4096
+        self.max_req_input_len = 4090
         self.generate_request = Mock()
         self.create_abort_task = Mock()
 
