@@ -315,6 +315,13 @@ def _should_emit_normal_text_as_message(
 
 
 _RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotation)
+_TOOL_OUTPUT_MEDIA_PART_TYPES = (
+    "input_image",
+    "image_url",
+    "video_url",
+    "audio_url",
+    "input_audio",
+)
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -1996,13 +2003,40 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         return content_part
 
-    @staticmethod
-    def _flatten_tool_output(output: Any) -> str:
+    @classmethod
+    def _tool_output_for_chat(cls, output: Any, *, keep_media: bool = True) -> Any:
         """``output`` may be a string or an array of content parts (OpenAI allows
-        both); the chat tool message needs a string."""
-        if isinstance(output, list):
-            return "".join(p.get("text", "") for p in output if isinstance(p, dict))
-        return output
+        both). Text-only arrays flatten to a string; arrays with images keep
+        their parts so the chat template renders the images. Without
+        ``keep_media`` (a text-only model, where media validation would reject
+        the images) every array flattens to its text."""
+        if not isinstance(output, list):
+            return output
+        parts = [p for p in output if isinstance(p, dict)]
+        if not keep_media or not any(
+            p.get("type") in ("input_image", "image_url") for p in parts
+        ):
+            return "".join(p.get("text", "") for p in parts)
+        # Other parts keep only their text, as in the string path above, so
+        # parts chat validation rejects (input_file, untyped, refusal) drop out.
+        chat_parts = []
+        skipped_image = False
+        for part in parts:
+            part_type = part.get("type")
+            if part_type == "input_image" and not part.get("image_url"):
+                skipped_image = True  # A file_id-only image has no URL to load.
+            elif part_type in _TOOL_OUTPUT_MEDIA_PART_TYPES:
+                chat_parts.append(cls._normalize_response_content_part_for_chat(part))
+            elif "text" in part:
+                chat_parts.append({"type": "text", "text": part["text"]})
+        if skipped_image and not any(
+            p["type"] != "text" or p["text"] for p in chat_parts
+        ):
+            raise _MediaInputValidationError(
+                "function_call_output has no usable content: its image has no "
+                "image_url, and file_id images are not supported."
+            )
+        return chat_parts
 
     @staticmethod
     def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:
@@ -2019,7 +2053,11 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @classmethod
     def _normalize_response_message_for_chat(
-        cls, message: Any, *, tool_call_parser: Optional[str] = None
+        cls,
+        message: Any,
+        *,
+        tool_call_parser: Optional[str] = None,
+        keep_media: bool = True,
     ) -> Any:
         """Convert one Responses-API input item to a chat-completions message."""
         if hasattr(message, "model_dump"):
@@ -2069,7 +2107,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             return {
                 "role": "tool",
                 "tool_call_id": message.get("call_id"),
-                "content": cls._flatten_tool_output(message.get("output", "")),
+                "content": cls._tool_output_for_chat(
+                    message.get("output", ""), keep_media=keep_media
+                ),
             }
         # Reasoning items render as {role: assistant, reasoning_content};
         # empty ones drop instead of injecting an empty assistant block.
@@ -2219,7 +2259,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             if tool_adapter is not None:
                 input_item = tool_adapter.input_item(input_item)
             normalized = self._normalize_response_message_for_chat(
-                input_item, tool_call_parser=self.tool_call_parser
+                input_item,
+                tool_call_parser=self.tool_call_parser,
+                keep_media=self.tokenizer_manager.model_config.is_multimodal,
             )
             if normalized is not None:
                 messages.append(normalized)

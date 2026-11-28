@@ -4,6 +4,7 @@ import functools
 import sys
 import unittest
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -17,6 +18,8 @@ from openai.types.responses import (
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
 from openai_harmony import Author, Conversation, Message, Role, ToolNamespaceConfig
+from pydantic import ValidationError
+from transformers.utils.chat_template_utils import _compile_jinja_template
 from utils import (
     MockTemplateManager,
     MockTokenizerManager,
@@ -35,6 +38,7 @@ from sglang.srt.entrypoints.context import (
 )
 from sglang.srt.entrypoints.harmony_utils import get_encoding
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageGenericParam,
     MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
@@ -43,8 +47,13 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
+    _MediaInputValidationError,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.jinja_template_utils import (
+    detect_jinja_template_content_format,
+    process_content_for_template_format,
+)
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
@@ -1269,6 +1278,191 @@ class InputItemNormalizationTestCase(CustomTestCase):
             normalized,
             {"role": "tool", "tool_call_id": "call_abc", "content": "42"},
         )
+
+    def test_function_call_output_keeps_media_parts(self):
+        video = {"type": "video_url", "video_url": {"url": "https://x/clip.mp4"}}
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_text", "text": "Screenshot captured."},
+                    {"type": "input_image", "image_url": "data:image/png;base64,AA"},
+                    video,
+                ],
+            }
+        )
+
+        ChatCompletionMessageGenericParam(**normalized)
+        self.assertEqual(
+            normalized["content"],
+            [
+                {"type": "text", "text": "Screenshot captured."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA", "detail": "auto"},
+                },
+                video,
+            ],
+        )
+
+    def test_function_call_output_with_image_drops_parts_chat_rejects(self):
+        image = {"type": "input_image", "image_url": "data:image/png;base64,AA"}
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_text", "text": "Page 1 preview."},
+                    {
+                        "type": "input_file",
+                        "file_data": "data:application/pdf;base64,JVBE",
+                        "filename": "report.pdf",
+                    },
+                    {"type": "input_image", "file_id": "file-123"},
+                    {"type": "refusal", "refusal": "no"},
+                    {"note": "untyped"},
+                    {"type": "tool_reference"},
+                    image,
+                ],
+            }
+        )
+
+        ChatCompletionMessageGenericParam(**normalized)
+        self.assertEqual(
+            normalized["content"],
+            [
+                {"type": "text", "text": "Page 1 preview."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA", "detail": "auto"},
+                },
+            ],
+        )
+
+    def test_function_call_output_with_only_a_file_id_image_is_rejected(self):
+        file_id_image = {"type": "input_image", "file_id": "file-123"}
+        for output in [
+            [file_id_image],
+            [file_id_image, {"type": "input_text", "text": ""}],
+        ]:
+            with self.subTest(output=output):
+                with self.assertRaises(_MediaInputValidationError):
+                    OpenAIServingResponses._normalize_response_message_for_chat(
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_abc",
+                            "output": output,
+                        }
+                    )
+
+        kept = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [{"type": "input_text", "text": "No screen."}, file_id_image],
+            }
+        )
+        self.assertEqual(kept["content"], [{"type": "text", "text": "No screen."}])
+
+    def test_function_call_output_image_flattens_on_a_text_only_model(self):
+        request = ResponsesRequest(
+            model="m",
+            input=[
+                {"type": "message", "role": "user", "content": "Take a screenshot."},
+                {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "screenshot",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": [
+                        {"type": "input_text", "text": "Screenshot captured."},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AA",
+                        },
+                    ],
+                },
+            ],
+        )
+
+        # Media validation would turn a kept image into a 400 on this model.
+        messages = make_serving(is_multimodal=False)._construct_input_messages(request)
+        self.assertEqual(messages[-1]["content"], "Screenshot captured.")
+
+    def test_function_call_output_with_a_malformed_image_url_fails_validation(self):
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [{"type": "image_url", "image_url": ["data:,"]}],
+            }
+        )
+
+        # Chat validation turns this into a 400; a crash here would be a 500.
+        with self.assertRaises(ValidationError):
+            ChatCompletionMessageGenericParam(**normalized)
+
+    def test_tool_output_image_keeps_its_slot_before_a_user_image(self):
+        template = (
+            Path(__file__).resolve().parents[5]
+            / "examples/chat_template/tool_chat_template_llama4_pythonic.jinja"
+        ).read_text()
+        screenshot, photo = "data:image/png;base64,AA", "data:image/png;base64,BB"
+        items = [
+            {"type": "message", "role": "user", "content": "Take a screenshot."},
+            {
+                "type": "function_call",
+                "call_id": "call_abc",
+                "name": "screenshot",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_text", "text": "Screenshot captured."},
+                    {"type": "input_image", "image_url": screenshot},
+                ],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Compare it with my photo."},
+                    {"type": "input_image", "image_url": photo},
+                ],
+            },
+        ]
+        content_format = detect_jinja_template_content_format(template)
+        image_data = []
+        messages = [
+            process_content_for_template_format(
+                OpenAIServingResponses._normalize_response_message_for_chat(item),
+                content_format,
+                image_data,
+                [],
+                [],
+                [],
+            )
+            for item in items
+        ]
+        prompt = _compile_jinja_template(template).render(
+            messages=messages, bos_token="", add_generation_prompt=True
+        )
+
+        # The loader fills placeholders with image_data in order, so the n-th
+        # <|image|> must sit in the turn that carried the n-th image.
+        placeholder_turns = [
+            chunk.rsplit("<|header_start|>", 1)[1].split("<|header_end|>")[0]
+            for chunk in prompt.split("<|image|>")[:-1]
+        ]
+        self.assertEqual(placeholder_turns, ["ipython", "user"])
+        self.assertEqual([image.url for image in image_data], [screenshot, photo])
 
     def test_unknown_input_item_type_raises(self):
         with self.assertRaises(ValueError):

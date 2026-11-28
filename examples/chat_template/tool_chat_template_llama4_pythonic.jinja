@@ -99,7 +99,9 @@
             {{- message.content | tojson }}
         {%- else %}
             {%- for content in message['content']  %}
-                {%- if content['type']  == 'text' %}
+                {%- if content['type'] == 'image' %}
+                    {{- '<|image|>' }}
+                {%- elif content['type']  == 'text' %}
                     {{- content['text'] | tojson }}
                 {%- endif %}
             {%- endfor %}
