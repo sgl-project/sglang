@@ -2194,6 +2194,14 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 return False
             param = params_dict[name]
             weight_loader = param.weight_loader
+            experts = self.get_submodule(name.rpartition(".")[0])
+            if isinstance(experts, FusedMoE) and experts.weight_loader_stacked(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=name,
+                shard_id=shard_id,
+            ):
+                return True
             # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
             for expert_id in range(num_experts):
                 curr_expert_weight = loaded_weight[expert_id]
@@ -2775,6 +2783,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 return False
             param = params_dict[name]
             weight_loader = param.weight_loader
+            experts = self.get_submodule(name.rpartition(".")[0])
+            if isinstance(experts, FusedMoE) and experts.weight_loader_stacked(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=name,
+                shard_id=shard_id,
+            ):
+                return True
             # let ep moe layer to gracefully handle expert_ids that do not belong to local moe rank
             for expert_id in range(num_experts):
                 curr_expert_weight = loaded_weight[expert_id]
