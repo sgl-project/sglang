@@ -81,6 +81,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
+    should_use_flashinfer_cutlass_moe_fp4_allgather,
     sum_post_experts_output,
     uses_per_rank_fused_shared_slots,
 )
@@ -407,6 +408,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                         or get_moe_a2a_backend().is_flashinfer_megamoe()
                         or get_moe_a2a_backend().is_megamoe()
                         or get_moe_a2a_backend().is_ascend_fuseep()
+                        # The dispatcher reduces only the routed experts;
+                        # shared experts also consume DP-local tokens here.
+                        or should_use_flashinfer_cutlass_moe_fp4_allgather()
                     )
                     else {}
                 ),
