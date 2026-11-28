@@ -69,8 +69,8 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
             patch.object(kcc, "_should_elide_dsa_index_k", return_value=True),
             patch.object(
                 kcc,
-                "dsa_layer_skips_topk",
-                side_effect=lambda _config, layer_id: layer_id in (11, 13),
+                "dsa_layer_has_index_k",
+                side_effect=lambda _config, layer_id: layer_id not in (11, 13),
             ),
             patch(
                 "sglang.srt.hardware_backend.npu.utils.is_npu_arch35",

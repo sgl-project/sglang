@@ -387,6 +387,44 @@ class TestDefaultConfigurator(CustomTestCase):
         self.assertEqual(packed_configurator._cell_size, (656 + 132) * num_layers)
         self.assertEqual(mock_calculate_mla_kv_cache_dim.call_count, 2)
 
+    @patch(
+        "sglang.srt.mem_cache.kv_cache_configurator.calculate_mla_kv_cache_dim",
+        return_value=656,
+    )
+    def test_hy4_flash_window_layers_get_no_index_k(self, _):
+        """Hy4-Flash sliding-window layers select their window without the indexer,
+        so only its DSA layers hold (and are priced for) an index-K cache."""
+        from sglang.srt.configs.hy_v4_flash import (
+            SLIDING_ATTENTION,
+            SPARSE_ATTENTION,
+            HYV4FlashConfig,
+        )
+        from sglang.srt.configs.model_config import dsa_layer_has_index_k
+        from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
+        )
+
+        layer_types = [SPARSE_ATTENTION] + [SLIDING_ATTENTION] * 2 + [SPARSE_ATTENTION]
+        mr = _make_model_runner(self, num_layers=len(layer_types), use_mla_backend=True)
+        hf_config = HYV4FlashConfig(
+            text_config={
+                "num_hidden_layers": len(layer_types),
+                "layer_types": layer_types,
+            },
+            architectures=["HYV4FlashForConditionalGeneration"],
+        )
+        mr.model_config.hf_config = hf_config
+        self.assertEqual(
+            [dsa_layer_has_index_k(hf_config, i) for i in range(len(layer_types))],
+            [True, False, False, True],
+        )
+        with mock_cpu_env(kv_size=1):
+            configurator = DefaultPoolConfigurator(mr)
+            indexer_bytes = configurator._compute_dsa_indexer_cell_size(
+                kvc=mr, num_layers=len(layer_types)
+            )
+        self.assertEqual(indexer_bytes, 2 * 132)
+
     def test_fused_draft_entry_overrides_the_layer_ratio(self):
         """A fused draft prices the exact fused entry (host + draft + pad);
         the per-draft-layer ratio under-reserves the pad."""

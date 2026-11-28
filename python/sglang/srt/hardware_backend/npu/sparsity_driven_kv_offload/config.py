@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.configs.model_config import (
-    dsa_layer_skips_topk,
+    dsa_layer_has_index_k,
     get_dsa_index_head_dim,
     get_dsa_index_topk,
     is_deepseek_dsa,
@@ -102,7 +102,7 @@ def get_sparsity_driven_kv_offload_cell_size(
 
     if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
         num_indexer_layers = sum(
-            not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+            dsa_layer_has_index_k(model_config.hf_config, layer_id)
             for layer_id in range(start_layer, start_layer + num_layers)
         )
     else:

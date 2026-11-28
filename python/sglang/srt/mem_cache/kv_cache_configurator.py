@@ -23,7 +23,7 @@ from sglang.srt.configs.hybrid_arch import (
 from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
-    dsa_layer_skips_topk,
+    dsa_layer_has_index_k,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
     get_dsa_index_kpool_compress,
@@ -140,7 +140,7 @@ logger = logging.getLogger(__name__)
 
 
 def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
-    """Shared-topk layers get a 0-row index-K buffer; HiCache and PD must skip those entries."""
+    """Layers without an index-K cache get a 0-row buffer; HiCache and PD must skip those entries."""
     memory_config = get_memory()
     # Ascend PD slices the KV list positionally (index-K rides in it, not in
     # StateType.DSA), so a compact layout would mis-slice PP>1 against PP=1.
@@ -1090,7 +1090,7 @@ class KVCacheConfigurator:
             layer_ids=tuple(
                 layer_id
                 for layer_id in full_layer_ids
-                if not dsa_layer_skips_topk(hf_config, layer_id)
+                if dsa_layer_has_index_k(hf_config, layer_id)
             ),
             geometry=IndexKeyGeometry(
                 index_head_dim=get_dsa_index_head_dim(hf_config),
@@ -2401,8 +2401,8 @@ class KVCacheConfigurator:
             index_size = max_total_num_tokens
         else:
             index_size = max_total_num_tokens * dcp_size
-        # Shared layers never access the indexer; pool sizing uses the same gate
-        # so the saved indexer memory can be used for additional KV tokens.
+        # Layers without an index-K cache never access the indexer; pool sizing
+        # uses the same gate so the saved indexer memory can go to extra KV tokens.
         use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
             is_draft_worker=self.is_draft_worker
         )
@@ -2414,7 +2414,7 @@ class KVCacheConfigurator:
                     self.layer_info.start_layer,
                     self.layer_info.end_layer,
                 )
-                if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                if dsa_layer_has_index_k(self.model_config.hf_config, layer_id)
             )
         # Only the DSA layout has a packed record; dense MLA and ModelSlim KV
         # pools keep their own layouts.
@@ -2433,7 +2433,7 @@ class KVCacheConfigurator:
                     None
                     if self.is_draft_worker
                     else [
-                        dsa_layer_skips_topk(hf_config, layer_id)
+                        not dsa_layer_has_index_k(hf_config, layer_id)
                         for layer_id in range(
                             self.layer_info.start_layer, self.layer_info.end_layer
                         )
@@ -2596,7 +2596,7 @@ class KVCacheConfigurator:
             pool_kwargs["dcp_replicated"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
             pool_kwargs["skip_topk_layers"] = [
-                dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                not dsa_layer_has_index_k(self.model_config.hf_config, layer_id)
                 for layer_id in range(
                     self.layer_info.start_layer, self.layer_info.end_layer
                 )
@@ -2909,7 +2909,9 @@ class KVCacheConfigurator:
                         None
                         if self.is_draft_worker
                         else [
-                            dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                            not dsa_layer_has_index_k(
+                                self.model_config.hf_config, layer_id
+                            )
                             for layer_id in full_attention_layer_ids
                         ]
                     ),

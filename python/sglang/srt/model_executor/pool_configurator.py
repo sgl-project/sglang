@@ -22,7 +22,7 @@ from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     AttentionArch,
-    dsa_layer_skips_topk,
+    dsa_layer_has_index_k,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
     get_minimax_sparse_attention_config,
@@ -816,7 +816,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     for layer_id in range(
                         kvc.layer_info.start_layer, kvc.layer_info.end_layer
                     )
-                    if not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    if dsa_layer_has_index_k(kvc.model_config.hf_config, layer_id)
                 ]
                 active_set = set(active_indexer_layers)
                 max_owned = 0
@@ -832,7 +832,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 num_indexer_layers = max_owned + 1
             else:
                 num_indexer_layers = sum(
-                    not dsa_layer_skips_topk(kvc.model_config.hf_config, layer_id)
+                    dsa_layer_has_index_k(kvc.model_config.hf_config, layer_id)
                     for layer_id in _get_dsa_cache_layer_ids(kvc, num_layers)
                 )
 

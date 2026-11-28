@@ -52,8 +52,8 @@ class IndexKeyCache:
         return buffer.view(-1, buffer.shape[1] // kernel_pages_per_row)
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
-        # Layers that reuse the previous layer's top-k never write index-K, so
-        # they get a 0-row placeholder that keeps ``buffer`` layer-aligned.
+        # Layers without an index-K cache (shared top-k, Hy4-Flash window layers)
+        # get a 0-row placeholder that keeps ``buffer`` layer-aligned.
         return 0 if self.pool.skip_topk_layers[layer_idx] else num_pages
 
     def clear(self) -> None:
