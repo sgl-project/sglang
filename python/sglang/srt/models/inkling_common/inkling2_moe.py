@@ -74,6 +74,9 @@ from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.models.inkling_common.inkling2_expert_placement import (
+    expert_slots_for_layer,
+)
 from sglang.srt.models.inkling_common.moe import renorm_topk_logits_scaled
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
@@ -115,7 +118,7 @@ class RoutedOutput(NamedTuple):
 
 
 class Inkling2Gate(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, expert_slots: torch.Tensor | None = None):
         super().__init__()
         self.topk = config.num_experts_per_tok
         self.route_scale = config.route_scale
@@ -134,6 +137,21 @@ class Inkling2Gate(nn.Module):
         self.register_buffer(
             "_one", torch.ones((), dtype=torch.float32), persistent=False
         )
+        # Row s scores the logical expert in physical slot s, so routed ids are slot ids.
+        self.expert_slots = expert_slots
+        if expert_slots is not None:
+            for param in (self.weight, self.bias):
+                if param is not None:
+                    set_weight_attrs(param, {"weight_loader": self._load_placed_rows})
+
+    def _load_placed_rows(self, param, loaded):
+        # Keeps default_weight_loader's size check: index_select would silently
+        # take a subset of a wrong-sized checkpoint tensor.
+        if loaded.shape != param.shape:
+            raise ValueError(
+                f"Gate tensor shape mismatch: {tuple(loaded.shape)} != {tuple(param.shape)}"
+            )
+        param.data.copy_(loaded.index_select(0, self.expert_slots.to(loaded.device)))
 
     def partials(self, x):
         """FP32 router split-K partials, [groups, tokens, experts]."""
@@ -156,13 +174,22 @@ class Inkling2Gate(nn.Module):
 
 
 class Inkling2Experts(nn.Module):
-    def __init__(self, config, num_experts, checkpoint_prefix, quant_config):
+    def __init__(
+        self,
+        config,
+        num_experts,
+        checkpoint_prefix,
+        quant_config,
+        expert_slots: torch.Tensor | None = None,
+    ):
         super().__init__()
         parallel = get_parallel()
         self.tp_rank, self.tp_size = parallel.moe_tp_rank, parallel.moe_tp_size
         self.ep_rank = parallel.moe_ep_rank
         self.ep_size = parallel.moe_ep_size
         self.num_global_experts = num_experts
+        # Logical expert per physical slot (see inkling2_expert_placement); None is contiguous.
+        self.expert_slots = expert_slots
         if num_experts % self.ep_size:
             raise ValueError("The expert count must be divisible by expert parallelism")
         num_experts //= self.ep_size
@@ -341,12 +368,22 @@ class Inkling2Experts(nn.Module):
                 f"Expert tensor dtype mismatch: {loaded.dtype} != {param.dtype}"
             )
         if expert_axis:
-            loaded = loaded.chunk(self.ep_size, dim=0)[self.ep_rank]
+            loaded = self._local_expert_rows(loaded)
         target.copy_(
             loaded if dim is None else loaded.chunk(self.tp_size, dim=dim)[self.tp_rank]
         )
         if swizzled:
             param.data.copy_(swizzle_blockscale(target).flatten(1))
+
+    # loaded is a [num_global_experts, ...] checkpoint tensor; returns this rank's experts.
+    def _local_expert_rows(self, loaded):
+        if self.expert_slots is None:
+            return loaded.chunk(self.ep_size, dim=0)[self.ep_rank]
+        num_local = self.num_global_experts // self.ep_size
+        slots = self.expert_slots[
+            self.ep_rank * num_local : (self.ep_rank + 1) * num_local
+        ]
+        return loaded.index_select(0, slots.to(loaded.device))
 
     def _mega_covers(self, low, high):
         return self.mega is not None and (low > high or self.mega.min_tokens <= low)
@@ -1295,10 +1332,20 @@ class Inkling2MoE(nn.Module):
             parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1
         ):
             raise ValueError("Inkling2 experts support tensor or expert parallelism")
-        self.gate = Inkling2Gate(config)
+        # Gate rows and expert shards must use the same placement, so resolve it once.
+        expert_slots = expert_slots_for_layer(
+            layer_id=layer_id,
+            num_experts=config.n_routed_experts,
+            ep_size=parallel.moe_ep_size,
+        )
+        self.gate = Inkling2Gate(config, expert_slots=expert_slots)
         checkpoint_prefix = "model." + prefix + ".experts."
         self.experts = Inkling2Experts(
-            config, config.n_routed_experts, checkpoint_prefix, quant_config
+            config,
+            config.n_routed_experts,
+            checkpoint_prefix,
+            quant_config,
+            expert_slots=expert_slots,
         )
 
     def local_input_rows(self, tokens, combine):
