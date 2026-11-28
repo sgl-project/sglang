@@ -48,7 +48,12 @@ class _SglangServerHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length)) if length else None
         self.server.posts.append((self.path, body))
-        if self.path in ("/generate", "/start_profile"):
+        if self.path == "/generate" and body and body.get("stream"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(_sse(self.server.stream_chunks))
+        elif self.path in ("/generate", "/start_profile"):
             self._reply(200, {"text": "", "meta_info": {}})
         else:
             self._reply(404)
@@ -61,6 +66,7 @@ class _StubServerTestCase(CustomTestCase):
     def setUp(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _SglangServerHandler)
         self.server.posts = []
+        self.server.stream_chunks = ()
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -83,6 +89,48 @@ class TestRuntimeEndpointJoin(_StubServerTestCase):
 
         self.assertIsNone(state.error())
         self.assertEqual(state.text(), "A[0][1]")
+
+
+class TestRuntimeEndpointStream(_StubServerTestCase):
+    def test_stream_error_preserves_server_message(self):
+        message = "The input is longer than the model's context length."
+        self.server.stream_chunks = [
+            {"text": "Hello", "meta_info": {}},
+            {
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "code": 400,
+                    "retryable": False,
+                }
+            },
+        ]
+        backend = RuntimeEndpoint(self.base_url)
+        sampling_params = SglSamplingParams(max_new_tokens=4)
+        executor = StreamExecutor(
+            backend, {}, sampling_params, None, stream=False, use_thread=False
+        )
+        stream = backend.generate_stream(executor, sampling_params)
+
+        self.assertEqual(next(stream), ("Hello", {}))
+        with self.assertRaisesRegex(RuntimeError, "model's context length"):
+            next(stream)
+
+    def test_stream_yields_text_deltas_until_done(self):
+        self.server.stream_chunks = [
+            {"text": "Hello", "meta_info": {"completion_tokens": 1}},
+            {"text": "Hello world", "meta_info": {"completion_tokens": 2}},
+        ]
+        backend = RuntimeEndpoint(self.base_url)
+        sampling_params = SglSamplingParams(max_new_tokens=4)
+        executor = StreamExecutor(
+            backend, {}, sampling_params, None, stream=False, use_thread=False
+        )
+
+        self.assertEqual(
+            list(backend.generate_stream(executor, sampling_params)),
+            [("Hello", {"completion_tokens": 1}), (" world", {"completion_tokens": 2})],
+        )
 
 
 class TestRuntimeStartProfile(_StubServerTestCase):

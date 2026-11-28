@@ -241,6 +241,9 @@ class RuntimeEndpoint(BaseBackend):
                 if chunk == "data: [DONE]":
                     break
                 data = json.loads(chunk[5:].strip("\n"))
+                if "error" in data:
+                    res.close()
+                    raise RuntimeError(data["error"])
                 chunk_text = data["text"][pos:]
                 meta_info = data["meta_info"]
                 pos += len(chunk_text)
