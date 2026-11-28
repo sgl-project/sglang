@@ -249,6 +249,83 @@ class TestAiterDcpVerifyGraphReplay(CustomTestCase):
         )
 
 
+class TestFp8QAsmVerifyMetadataModes(CustomTestCase):
+    """With SGLANG_AITER_MLA_PERSIST=0 the module modes are off,
+    so the opt-in's verify metadata must be planned with the modes its launch passes."""
+
+    def _planned_modes(self, use_mla_auto_kv_splits):
+        recorded = {}
+        backend = _dcp_verify_backend(asm_cprr=False)
+        backend.dcp_world_size = 1
+        backend.cprr_kernel_heads = 0
+        backend.use_mla_fp8_q_asm = True
+        backend.use_mla_auto_kv_splits = use_mla_auto_kv_splits
+
+        def make_buffer(*_args, **kwargs):
+            recorded["buffer"] = (
+                kwargs.get("metadata_fast_mode"),
+                kwargs.get("metadata_intra_batch_mode"),
+            )
+            return (torch.zeros(1),) * 6
+
+        def make_meta(*_args, **kwargs):
+            recorded["plan"] = (kwargs.get("fast_mode"), kwargs.get("intra_batch_mode"))
+
+        backend.make_mla_decode_meta_data_buffer = make_buffer
+        backend.make_mla_meta_data = make_meta
+        with (
+            patch.object(
+                aiter_backend, "create_flashinfer_kv_indices_triton", _NoopKernel()
+            ),
+            patch.object(aiter_backend, "_use_mla_ps_kernel", False),
+            patch.object(aiter_backend, "fast_mode", False),
+            patch.object(aiter_backend, "intra_batch_mode", False),
+        ):
+            backend.init_cuda_graph_state(
+                max_bs=_BATCH_SIZE, max_num_tokens=_BATCH_SIZE * _DRAFT_TOKENS
+            )
+            backend._apply_cuda_graph_metadata(
+                bs=_BATCH_SIZE,
+                req_pool_indices=torch.arange(_BATCH_SIZE, dtype=torch.int32),
+                seq_lens=_DCP_SEQ_LENS.clone(),
+                seq_lens_sum=int(_DCP_SEQ_LENS.sum()),
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                spec_info=None,
+                seq_lens_cpu=None,
+                verify_tokens_per_req=_DRAFT_TOKENS,
+            )
+        return recorded, backend._mla_decode_metadata_modes()
+
+    def test_verify_metadata_is_planned_with_the_launch_modes(self):
+        for auto_kv_splits, modes in ((False, (False, True)), (True, (True, False))):
+            with self.subTest(use_mla_auto_kv_splits=auto_kv_splits):
+                recorded, launch_modes = self._planned_modes(auto_kv_splits)
+                self.assertEqual(launch_modes, modes)
+                self.assertEqual(recorded, {"buffer": modes, "plan": modes})
+
+    def test_eager_verify_rejects_a_window_other_than_the_selected_one(self):
+        backend = _dcp_verify_backend(asm_cprr=False)
+        backend.use_mla_fp8_q_asm = True
+        backend.num_draft_tokens = 8
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=_BATCH_SIZE,
+            spec_info=SimpleNamespace(draft_token_num=4),
+            seq_lens_cpu=_DCP_SEQ_LENS,
+            out_cache_loc=None,
+        )
+        with (
+            patch.object(
+                aiter_backend,
+                "reset_verify_attn_plan_cache",
+                lambda: None,
+                create=True,
+            ),
+            self.assertRaisesRegex(AssertionError, "8-token verify window, got 4"),
+        ):
+            backend.init_forward_metadata(forward_batch)
+
+
 class _MHAPool:
     start_layer = 0
     layer_num = 1

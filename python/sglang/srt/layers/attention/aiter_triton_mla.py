@@ -52,17 +52,20 @@ def resolve_aiter_mla_decode_backend(
 
     "auto" is "triton" for MLA where ``supports_aiter_triton_mla_decode``
     holds, else "asm". Explicit values are honored as-is: "asm" and "gluon"
-    are returned unchanged on every arch. Unknown values raise, and so does
-    "triton" where this backend does not call aiter's Triton
+    are returned unchanged on every arch. "asm_fp8q" resolves to "asm"; the
+    aiter backend decides whether its fp8-query route applies. Unknown values raise,
+    and so does "triton" where this backend does not call aiter's Triton
     ``mla_decode_fwd``: off gfx1250, and on gfx1250 without bf16 activations,
     with DCP or with ``qk_rope_head_dim`` 0.
     """
     backend = value.lower()
-    if backend not in ("auto", "asm", "gluon", "triton"):
+    if backend not in ("auto", "asm", "asm_fp8q", "gluon", "triton"):
         raise ValueError(
-            "SGLANG_AITER_MLA_DECODE_BACKEND must be 'auto', 'asm', 'gluon' or "
-            f"'triton', got {value!r}"
+            "SGLANG_AITER_MLA_DECODE_BACKEND must be 'auto', 'asm', 'asm_fp8q', "
+            f"'gluon' or 'triton', got {value!r}"
         )
+    if backend == "asm_fp8q":
+        return "asm"
     if backend in ("asm", "gluon"):
         return backend
     gfx1250 = is_gfx1250_supported()

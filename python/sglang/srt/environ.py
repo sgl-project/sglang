@@ -1318,6 +1318,8 @@ class Envs:
     # --decode-attention-backend triton; gfx1250 with bf16 activations, no DCP
     # and qk_rope_head_dim > 0, else startup raises). "auto" is "triton" there,
     # else "asm". Explicit values are honored as-is.
+    # "asm_fp8q" is "asm", except where the persistent fp8-query asm kernel applies;
+    # the gates are in environment_variables.mdx.
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStr("auto")
     # Select the AITER MLA kernel for target verify, "asm" or "gluon".
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
