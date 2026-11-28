@@ -49,6 +49,7 @@ mod sealed {
     impl SealedItem for i64 {}
     impl SealedItem for String {}
     impl SealedItem for super::TokenIds {}
+    impl SealedItem for crate::message::config::HiddenStatesMode {}
     /// `mm_hashes`: a flat list is one request's hashes, nested is per-request.
     impl SealedItem for Vec<String> {}
     // Nullable elements for the PD bootstrap fields (`List[Optional[...]]` in

@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use sglang_api_types::api::v1 as api;
 
+use super::config::HiddenStatesMode;
 use super::multimodal::{MediaHints, MmDataInput, MmItem};
 use super::request::GenerateRequest;
 use super::sampling::{CustomParamValue, SamplingParams, WatermarkRequestConfig};
@@ -38,6 +39,53 @@ pub fn bool_or_list(v: api::BoolOrList) -> Option<OneOrMany<bool>> {
         Value::One(x) => OneOrMany::One(x),
         Value::Many(l) => OneOrMany::Many(l.items),
     })
+}
+
+/// Python's message for a `return_hidden_states` string other than `"last"`
+/// (`get_return_hidden_states_mode`).
+const HIDDEN_STATES_MODE_ERROR: &str =
+    "return_hidden_states must be a boolean or the string literal 'last'.";
+
+/// The schema takes any string for `return_hidden_states`, the contract only
+/// `"last"`: the error for another string, alone or in a list. The HTTP
+/// handler refuses it like a decode error, before a stream starts.
+pub fn return_hidden_states_contract_error(v: &api::BoolOrStringOrList) -> Option<&'static str> {
+    use api::bool_or_string::Value as Item;
+    use api::bool_or_string_or_list::Value;
+    let unknown =
+        |item: &api::BoolOrString| matches!(&item.value, Some(Item::Mode(mode)) if mode != "last");
+    let found = match v.value.as_ref()? {
+        Value::One(item) => unknown(item),
+        Value::Many(list) => list.items.iter().any(unknown),
+    };
+    found.then_some(HIDDEN_STATES_MODE_ERROR)
+}
+
+/// `return_hidden_states` per item: `false`, `true` (every position) or `"last"`.
+pub fn return_hidden_states_or_list(
+    v: api::BoolOrStringOrList,
+) -> Result<Option<OneOrMany<HiddenStatesMode>>, Error> {
+    use api::bool_or_string::Value as Item;
+    use api::bool_or_string_or_list::Value;
+    let to_mode = |item: api::BoolOrString| match item.value {
+        Some(Item::Flag(true)) => Ok(HiddenStatesMode::Full),
+        Some(Item::Flag(false)) => Ok(HiddenStatesMode::Null),
+        Some(Item::Mode(mode)) if mode == "last" => Ok(HiddenStatesMode::Last),
+        Some(Item::Mode(_)) => Err(Error::Validation(HIDDEN_STATES_MODE_ERROR.into())),
+        // JSON always carries a value; only a protobuf client can leave it unset.
+        None => Ok(HiddenStatesMode::Null),
+    };
+    v.value
+        .map(|v| match v {
+            Value::One(item) => to_mode(item).map(OneOrMany::One),
+            Value::Many(l) => l
+                .items
+                .into_iter()
+                .map(to_mode)
+                .collect::<Result<_, _>>()
+                .map(OneOrMany::Many),
+        })
+        .transpose()
 }
 
 fn token_ids(v: api::TokenIds) -> TokenIds {

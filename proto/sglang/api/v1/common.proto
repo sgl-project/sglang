@@ -60,6 +60,30 @@ message BoolList {
   repeated bool items = 1;
 }
 
+// A bool or a string. The field that uses it says which strings it takes.
+message BoolOrString {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    bool flag = 1;
+    string mode = 2;
+  }
+}
+
+// One value for every batch item, or one per item.
+// Untagged, not one_or_many: the `one` arm is itself a union.
+message BoolOrStringOrList {
+  oneof value {
+    option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_UNTAGGED;
+    BoolOrString one = 1;
+    BoolOrStringList many = 2;
+  }
+}
+
+message BoolOrStringList {
+  option (sglang.json.v1.message_json).shape = MESSAGE_SHAPE_BARE_LIST;
+  repeated BoolOrString items = 1;
+}
+
 message Int64OrList {
   oneof value {
     option (sglang.json.v1.oneof_json).shape = ONEOF_SHAPE_ONE_OR_MANY;
