@@ -26,8 +26,12 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from .vit_utils import apply_rotary_pos_emb_qk, native_rope_cache
 
 logger = init_logger(__name__)
-_FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
-    torch.cuda.get_device_properties(0).gcnArchName
+# gfx95x and gfx1151 both end up on the math backend for these ViT shapes
+# (no ROCm flash backend); the aten math path then pays the _safe_softmax
+# all-``-inf``-row guard on every unmasked call.
+_FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and any(
+    a in str(torch.cuda.get_device_properties(0).gcnArchName)
+    for a in ("gfx95", "gfx1151")
 )
 _rocm_flash_attn = None
 if _FORCE_ROCM_MATH_SDPA:
@@ -35,6 +39,10 @@ if _FORCE_ROCM_MATH_SDPA:
         from aiter import flash_attn_func as _rocm_flash_attn
     except ImportError:
         pass
+    # aiter's CK mha_fwd rejects gfx1151 (``invalid argument for fmha_fwd``);
+    # keep it for gfx95x only and let gfx1151 fall through to the math replica.
+    if "gfx95" not in str(torch.cuda.get_device_properties(0).gcnArchName):
+        _rocm_flash_attn = None
 
 
 def _math_sdpa(query, key, value):
