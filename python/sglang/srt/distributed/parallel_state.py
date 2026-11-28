@@ -40,6 +40,7 @@ from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from unittest.mock import patch
 
+import msgspec
 import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
@@ -177,6 +178,40 @@ def _split_tensor_dict(
         else:
             metadata_list.append((key, value))
     return metadata_list, tensor_list
+
+
+def _is_send_allgather_slice(
+    value: TensorMetadata, all_gather_group: Optional["GroupCoordinator"]
+) -> bool:
+    """Whether the sender split this tensor for a send-allgather and sent only
+    this rank's slice."""
+    numel = value.size.numel()
+    return (
+        all_gather_group is not None
+        and numel > 0
+        and numel % all_gather_group.world_size == 0
+    )
+
+
+def _recv_buffer(
+    value: TensorMetadata, all_gather_group: Optional["GroupCoordinator"]
+) -> torch.Tensor:
+    """The buffer one tensor of a tensor dict message is received into."""
+    tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
+    if _is_send_allgather_slice(value, all_gather_group):
+        tensor = tensor.reshape(all_gather_group.world_size, -1)[
+            all_gather_group.rank_in_group
+        ]
+    return tensor
+
+
+class HostTensorDictPart(msgspec.Struct, frozen=True):
+    """The CPU-group half of one tensor dict message: its metadata and its CPU
+    tensors (already sliced for a send-allgather), from
+    ``GroupCoordinator.recv_tensor_dict_host_part``."""
+
+    metadata_list: List[Tuple[str, Any]]
+    cpu_tensors: Dict[str, torch.Tensor]
 
 
 _group_name_counter: Dict[str, int] = {}
@@ -1846,22 +1881,43 @@ class GroupCoordinator:
                 p2p_works.append(P2PWork(work, tensor))
         return p2p_works
 
+    def recv_tensor_dict_host_part(
+        self,
+        src: Optional[int] = None,
+        all_gather_group: Optional["GroupCoordinator"] = None,
+    ) -> HostTensorDictPart:
+        """The CPU-group half of ``recv_tensor_dict`` (a multi-rank group): the
+        metadata, then each non-empty CPU tensor in key order. It allocates no
+        device memory and posts nothing on the device group, so another thread may
+        run it ahead of the device half.
+        """
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        metadata_list = self.recv_object(src=src)
+        cpu_tensors: Dict[str, torch.Tensor] = {}
+        for key, value in metadata_list:
+            if isinstance(value, TensorMetadata) and value.device == "cpu":
+                tensor = _recv_buffer(value, all_gather_group)
+                if tensor.numel() > 0:
+                    torch.distributed.irecv(
+                        tensor, src=self.ranks[src], group=self.cpu_group
+                    ).wait()
+                    cpu_tensors[key] = tensor
+        return HostTensorDictPart(metadata_list=metadata_list, cpu_tensors=cpu_tensors)
+
     def recv_tensor_dict(
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        host_part: Optional[HostTensorDictPart] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
+        `host_part`: this message's ``recv_tensor_dict_host_part``, already received.
         """
         # Bypass the function if we are using only 1 GPU.
         if not torch.distributed.is_initialized() or self.world_size == 1:
             return None
-
-        all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
-        all_gather_rank = (
-            0 if all_gather_group is None else all_gather_group.rank_in_group
-        )
 
         group = self.device_group
         metadata_group = self.cpu_group
@@ -1870,36 +1926,32 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
+        recv_metadata_list = (
+            self.recv_object(src=src) if host_part is None else host_part.metadata_list
+        )
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
-                tensor = torch.empty(value.size, dtype=value.dtype, device=value.device)
-                if tensor.numel() == 0:
-                    # Skip broadcasting empty tensors.
-                    tensor_dict[key] = tensor
-                    continue
-
                 # send-allgather: send only a slice, then do allgather.
-                use_all_gather = (
-                    all_gather_group is not None
-                    and tensor.numel() % all_gather_size == 0
-                )
-
-                if use_all_gather:
-                    orig_shape = tensor.shape
-                    tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
-
-                # We have to use irecv here to make it work for both isend and send.
-                comm_group = metadata_group if tensor.is_cpu else group
-                work = torch.distributed.irecv(
-                    tensor, src=self.ranks[src], group=comm_group
-                )
-                work.wait()
+                use_all_gather = _is_send_allgather_slice(value, all_gather_group)
+                if host_part is not None and key in host_part.cpu_tensors:
+                    tensor = host_part.cpu_tensors[key]
+                else:
+                    tensor = _recv_buffer(value, all_gather_group)
+                    if tensor.numel() == 0:
+                        # Skip broadcasting empty tensors.
+                        tensor_dict[key] = tensor
+                        continue
+                    # We have to use irecv here to make it work for both isend and send.
+                    comm_group = metadata_group if tensor.is_cpu else group
+                    work = torch.distributed.irecv(
+                        tensor, src=self.ranks[src], group=comm_group
+                    )
+                    work.wait()
 
                 if use_all_gather:
                     tensor = all_gather_group.all_gather(tensor, dim=0)
-                    tensor = tensor.reshape(orig_shape)
+                    tensor = tensor.reshape(value.size)
 
                 tensor_dict[key] = tensor
             else:

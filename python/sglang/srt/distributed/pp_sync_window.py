@@ -1,9 +1,14 @@
-"""Bounded window of un-waited sends on a PP-sync channel."""
+"""Bounded window of un-waited sends on a PP-sync channel, and an in-order
+receiver that posts a PP host channel's receives ahead on a thread."""
 
 from __future__ import annotations
 
+import queue
+import threading
 from collections import deque
-from typing import Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
+
+import msgspec
 
 
 class _Waitable(Protocol):
@@ -44,3 +49,64 @@ class PPSyncSendWindow:
     def __len__(self) -> int:
         """Rounds currently held un-waited, the opened one included."""
         return len(self._outstanding)
+
+
+class _ReceiveFailure(msgspec.Struct, frozen=True):
+    exc: Exception
+
+
+class PPReceiveAhead:
+    """In-order receiver for one PP host (gloo) channel, with a single consumer.
+
+    A daemon thread runs the channel's blocking ``recv_one`` back to back, at most
+    ``depth`` receives ahead of ``pop`` (each in flight or done and queued). A gloo
+    send completes only once its receive is posted, so the sender's window drains
+    while the receiving scheduler is busy elsewhere. Gloo matches receives in
+    posting order, so the channel (source and tag) belongs to this receiver: no
+    other code may receive on it.
+
+    A receive that raises fails that pop and every later one. ``close()`` ends the
+    channel: no further receive is posted and later pops raise. A receive already
+    posted stays posted until the sender's next message, or until the group is
+    destroyed, which fails it and ends the thread.
+    """
+
+    def __init__(self, recv_one: Callable[[], Any], depth: int, name: str) -> None:
+        assert depth >= 1, depth
+        self._recv_one = recv_one
+        self._permits = threading.Semaphore(depth)
+        self._closed = threading.Event()
+        self._queue: queue.Queue = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def ready(self) -> bool:
+        """Whether ``pop`` would return without blocking."""
+        return not self._queue.empty()
+
+    def pop(self) -> Any:
+        if self._closed.is_set():
+            raise RuntimeError(f"PP receive channel {self._thread.name} is closed")
+        item = self._queue.get()
+        if isinstance(item, _ReceiveFailure):
+            self._queue.put(item)
+            raise RuntimeError(
+                f"PP receive thread {self._thread.name} failed"
+            ) from item.exc
+        self._permits.release()
+        return item
+
+    def close(self) -> None:
+        self._closed.set()
+        # Wakes a thread waiting for a permit, so it sees the flag and exits.
+        self._permits.release()
+
+    def _run(self) -> None:
+        try:
+            while True:
+                self._permits.acquire()
+                if self._closed.is_set():
+                    return
+                self._queue.put(self._recv_one())
+        except Exception as exc:
+            self._queue.put(_ReceiveFailure(exc=exc))
