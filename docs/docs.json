@@ -1805,8 +1805,8 @@
                 "group": "Disaggregated serving",
                 "pages": [
                   "docs/sglang-diffusion/disaggregation",
-                  "docs/sglang-diffusion/disaggregation/stage-contracts",
-                  "docs/sglang-diffusion/disaggregation/preset-roles"
+                  "docs/sglang-diffusion/disaggregation/stage-deployments",
+                  "docs/sglang-diffusion/disaggregation/stage-contracts"
                 ]
               },
               {
