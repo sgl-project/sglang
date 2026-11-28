@@ -28,6 +28,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
 )
+from sglang.srt.layers.moe.moe_runner.dual_runner import DualMoeRunner
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     route_dropped_experts_to_local,
@@ -1356,6 +1357,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             )
         self._cache_permute_indices = dict({})
         self.runner: Optional[MoeRunner] = None
+        self.dual_runner: Optional[DualMoeRunner] = None
         self._aiter_runner: Optional[MoeRunner] = None
         # Set by process_weights_after_loading when w13 rows are permuted to
         # interleave gate/up for the fused swiglu up-GEMM epilogue.
@@ -1550,6 +1552,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         runner_backend = self.get_moe_runner_backend(layer)
         if not (
             _is_cuda
+            and self.dual_runner is None
             and runner_backend is not None
             and runner_backend.is_triton()
             and get_moe_a2a_backend().is_none()
@@ -1784,6 +1787,26 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        self.dual_runner = None
+        self._aiter_runner: Optional[MoeRunner] = None
+
+        self.dual_runner = DualMoeRunner.try_create(
+            layer,
+            moe_runner_config,
+            is_fp8=False,
+            with_bias=self.with_bias or getattr(layer, "with_bias", False),
+            quant_unsupported_reason_fn=lambda: self._dual_runner_unsupported_reason(
+                layer, moe_runner_config
+            ),
+            get_triton_quant_info=self.get_triton_quant_info,
+            get_deep_gemm_quant_info=self._get_deep_gemm_quant_info,
+            owner_name="UnquantizedFusedMoEMethod",
+            label="BF16",
+        )
+        if self.dual_runner is not None:
+            self.runner = self.dual_runner
+            return
+
         if self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
@@ -1832,6 +1855,34 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                     "using triton MoE runner."
                 )
 
+    def _dual_runner_unsupported_reason(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ) -> Optional[str]:
+        if (
+            self.use_flashinfer_trtllm_moe
+            or self.use_flashinfer_cutlass
+            or self.use_deep_gemm
+            or _is_npu
+            or _is_hip
+            or is_xpu()
+        ):
+            return "incompatible runner override or non-CUDA platform"
+        if layer.w13_weight.dtype != torch.bfloat16:
+            return f"requires bfloat16 weights, got {layer.w13_weight.dtype}"
+        inter = int(getattr(layer, "intermediate_size_per_partition", 0))
+        if inter <= 0 or inter % 64 != 0:
+            return f"intermediate_size_per_partition={inter} is not divisible by 64"
+        return None
+
+    def _get_deep_gemm_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+        return DeepGemmMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            use_fp8=False,
+        )
+
     def get_moe_runner_backend(self, layer):
         runner = self._aiter_runner if self._aiter_runner is not None else self.runner
         return runner.runner_backend if runner is not None else None
@@ -1871,6 +1922,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
         x = dispatch_output.hidden_states
+
+        if self.dual_runner is not None:
+            return self.dual_runner.run(dispatch_output, layer)
 
         backend = self.runner.runner_backend
         if backend.is_deep_gemm():

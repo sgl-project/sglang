@@ -68,6 +68,9 @@ class MoeRunnerConfig:
     # Request FP32 SiLU/multiply intermediates until FP8 quantization.
     # False preserves backend defaults, including their existing FP32 paths.
     silu_mul_keep_fp32: bool = False
+    # Resolved token threshold for Dual-Runner (0 disables; set once at runner
+    # init so forward hot paths avoid reading environment variables).
+    dual_runner_threshold: int = 0
 
     # The MoE placement a fused func needs is the layer's own, not the
     # deployment's: DWDP's `FusedMoE.bind_full_expert_weights` collapses a

@@ -334,6 +334,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Precompile less kernels during warmup, which reduces the warmup time from 30min to less than 3min. Might cause performance degradation during runtime.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`"false"`</td>
     </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MOE_DUAL_RUNNER_THRESHOLD</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Token cutoff for routing-aware dual MoE dispatch on SM90/SM100 CUDA (<code>--moe-runner-backend auto</code> and <code>--moe-a2a-backend none</code>): runs batches with fewer than <code>threshold</code> tokens on Triton and larger batches on DeepGEMM compact contiguous layout. <code>0</code> disables (default), positive values set a fixed token threshold, and negative values (e.g. <code>-1</code>) derive an auto <code>M_eff</code> crossover (<code>512</code> for BF16, <code>1024</code> for SM90 FP8, <code>256</code> for SM100 UE8M0 FP8). Note: for 128-expert top-8 models on SM90 FP8, auto resolves to <code>16384</code>, so default <code>--chunked-prefill-size 8192</code> stays on Triton unless raised or overridden positively; on SM100 UE8M0 FP8, weights are requantized to power-of-two scales so Triton decode matches DeepGEMM numerics.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
 </tbody>
 </table>
 
