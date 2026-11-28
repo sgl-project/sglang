@@ -59,9 +59,15 @@ class HostPoolGroup:
         self.layout = self.anchor_entry.host_pool.layout
         self.page_size = self.anchor_entry.host_pool.page_size
         self.device = self.anchor_entry.host_pool.device
-        self.size = self.anchor_entry.host_pool.size
-        self.logical_size = self.anchor_entry.host_pool.logical_size
         self._refresh_transfer_capabilities()
+
+    @property
+    def size(self):
+        return self.anchor_entry.host_pool.size
+
+    @property
+    def logical_size(self):
+        return self.anchor_entry.host_pool.logical_size
 
     def _refresh_transfer_capabilities(self) -> None:
         child_write_back_jit = [

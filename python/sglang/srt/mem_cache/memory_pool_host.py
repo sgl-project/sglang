@@ -90,7 +90,23 @@ from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 # ---- V4 Compressed KV Host Pools ----
 
 
-class LogicalHostPool:
+class _V4HostPageCapacity:
+    _page_owner = None
+
+    @property
+    def size(self):
+        if self._page_owner is not None:
+            return self._page_owner.capacity() * self.page_size
+        return self._fixed_slots
+
+    @size.setter
+    def size(self, value):
+        if self._page_owner is not None:
+            raise ValueError("Shared host pool capacity is managed by its page arena")
+        self._fixed_slots = value
+
+
+class LogicalHostPool(_V4HostPageCapacity):
     """Pure-logical anchor pool for V4 HiCache.
 
     The pool manages page-aligned token slots but holds no KV tensor. V4
@@ -101,15 +117,16 @@ class LogicalHostPool:
     stores_page_envelope = False
     storage_format_tag = None
 
-    def __init__(self, size: int, page_size: int, layout: str = "layer_first"):
+    def __init__(
+        self, size: int, page_size: int, layout: str = "layer_first", page_owner=None
+    ):
         if size % page_size != 0:
             raise ValueError(
                 "LogicalHostPool size must be page-aligned, "
                 f"got size={size}, page_size={page_size}"
             )
-        self.size = size
-        # Stands in for a host pool (and group anchor); DCP never widens it.
-        self.logical_size = size
+        self._fixed_slots = size
+        self._page_owner = page_owner
         self.page_size = page_size
         self.device = "cpu"
         self.layout = layout
@@ -124,8 +141,16 @@ class LogicalHostPool:
         self.lock = threading.RLock()
         self.clear()
 
+    @property
+    def logical_size(self):
+        # The FULL anchor is not DCP-widened.
+        return self.size
+
     @synchronized
     def clear(self):
+        if self._page_owner is not None:
+            self._page_owner.clear()
+            return
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         # Match HostKVCache's lazy release path: defer large free-list merges
         # until an allocation needs the released slots.
@@ -137,6 +162,8 @@ class LogicalHostPool:
         return None
 
     def available_size(self):
+        if self._page_owner is not None:
+            return self._page_owner.available() * self.page_size
         return len(self.free_slots) + self.num_release_slots
 
     def _merge_release_slots(self):
@@ -158,6 +185,8 @@ class LogicalHostPool:
                 "LogicalHostPool allocation must be page-aligned, "
                 f"got need_size={need_size}, page_size={self.page_size}"
             )
+        if self._page_owner is not None:
+            return self._page_owner.alloc(need_size // self.page_size, self.page_size)
         if need_size > self.available_size():
             return None
 
@@ -170,6 +199,8 @@ class LogicalHostPool:
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        if self._page_owner is not None:
+            return self._page_owner.free(indices, self.page_size)
         if len(indices) % self.page_size != 0:
             raise ValueError(
                 "LogicalHostPool free must be page-aligned, "
@@ -239,7 +270,7 @@ class LogicalHostPool:
         return 0
 
 
-class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
+class DeepSeekV4PagedHostPool(_V4HostPageCapacity, HiSparseHostPoolMixin, HostKVCache):
     """Host mirror for a DeepSeek V4 paged KV/indexer sub-pool."""
 
     def __init__(
@@ -254,6 +285,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         pin_memory: bool = True,
         allocator_type: str = "default",
         page_aligned_only: bool = False,
+        host_region=None,
     ):
         if _is_xpu:
             require_kvcacheio_ops(
@@ -282,7 +314,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.pin_memory = pin_memory
         self.allocator = get_allocator_from_storage(allocator_type)
         self.page_size = slot_page_size
-        self.size = num_host_pages * slot_page_size
+        self._fixed_slots = num_host_pages * slot_page_size
+        self.host_region = host_region
+        self.transfer_layout_domain = getattr(
+            host_region, "transfer_layout_domain", None
+        )
+        self._page_owner = host_region.owner if host_region is not None else None
         self.layout = layout
         self.size_per_token = item_bytes
         self.start_layer = 0
@@ -292,21 +329,22 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         self.device_buffers = device_buffers
         self.gpu_device = device_buffers[0].device if device_buffers else device
 
-        if layout == "layer_first":
-            mapping_lengths = [num_host_pages * self.item_bytes] * self.layer_num
-        else:
-            mapping_lengths = [num_host_pages * self.layer_num * self.item_bytes]
-        allocation_bytes, available_bytes = host_memory_preflight(
-            mapping_lengths,
-            allocator=self.allocator,
-            device=self.gpu_device,
-        )
-        if allocation_bytes > available_bytes:
-            raise ValueError(
-                f"Not enough host memory for V4 paged pool {pool_name}. "
-                f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
-                f"{available_bytes / 1e9:.2f} GB free."
+        if host_region is None:
+            if layout == "layer_first":
+                mapping_lengths = [num_host_pages * self.item_bytes] * self.layer_num
+            else:
+                mapping_lengths = [num_host_pages * self.layer_num * self.item_bytes]
+            allocation_bytes, available_bytes = host_memory_preflight(
+                mapping_lengths,
+                allocator=self.allocator,
+                device=self.gpu_device,
             )
+            if allocation_bytes > available_bytes:
+                raise ValueError(
+                    f"Not enough host memory for V4 paged pool {pool_name}. "
+                    f"Requesting {allocation_bytes / 1e9:.2f} GB but only have "
+                    f"{available_bytes / 1e9:.2f} GB free."
+                )
 
         # ALLOC_MEMORY_FUNCS is keyed by device *type* string ("npu"/"musa"/...),
         # not torch.device objects; a torch.device key silently falls back to
@@ -318,7 +356,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         )
         alloc_func = ALLOC_MEMORY_FUNCS[_alloc_key]
         self.data_refs = []
-        if self.layout == "layer_first":
+        if host_region is not None:
+            self.kv_buffer = host_region.arena.buffer
+        elif self.layout == "layer_first":
             self.kv_buffer = [
                 alloc_func(
                     (num_host_pages, self.item_bytes),
@@ -351,16 +391,17 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
-        logger.info(
-            "Allocating %.2f GB host memory for V4 paged pool '%s' "
-            "(layers=%d, pages=%d, item_bytes=%d, layout=%s).",
-            allocation_bytes / 1e9,
-            self.pool_name,
-            self.layer_num,
-            num_host_pages,
-            self.item_bytes,
-            self.layout,
-        )
+        if host_region is None:
+            logger.info(
+                "Allocating %.2f GB host memory for V4 paged pool '%s' "
+                "(layers=%d, pages=%d, item_bytes=%d, layout=%s).",
+                allocation_bytes / 1e9,
+                self.pool_name,
+                self.layer_num,
+                num_host_pages,
+                self.item_bytes,
+                self.layout,
+            )
 
         self.device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.device_buffers],
@@ -384,7 +425,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
         if (
-            self.layout != "page_first"
+            self.host_region is not None
+            or self.layout != "page_first"
             or not current_platform.capabilities.hicache_device_kernels
         ):
             return
@@ -403,6 +445,9 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         """View a host layer in the layout required by its Ascend copy op."""
         device_buffer = self.device_buffers[l]
         page_shape = (device_buffer.shape[1], 1, device_buffer.shape[-1])
+        if self.host_region is not None:
+            rows = self.host_region.layer_rows(l).view(device_buffer.dtype)
+            return rows.view(-1, 1, *page_shape)
         if self.layout == "layer_first":
             layer_buffer = self.kv_buffer[l]
             shape = (1, self.num_host_pages, *page_shape)
@@ -419,6 +464,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def get_contiguous_buf_infos(self):
         """Return per-layer page-row buffers for PD direct-to-host transfer."""
+        if self.host_region is not None:
+            raise ValueError(
+                "DSv4.1 shared host extents do not support direct host registration"
+            )
         data_ptrs = [tensor.data_ptr() for tensor in self.data_refs]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.item_bytes * self.dtype.itemsize] * self.layer_num
@@ -469,11 +518,16 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
     def clear(self):
+        if self._page_owner is not None:
+            self._page_owner.clear()
+            return
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
         self.release_slots = []
         self.num_release_slots = 0
 
     def available_size(self):
+        if self._page_owner is not None:
+            return self._page_owner.available() * self.page_size
         return len(self.free_slots) + self.num_release_slots
 
     @synchronized
@@ -481,6 +535,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         need_size = (
             (need_size + self.slot_page_size - 1) // self.slot_page_size
         ) * self.slot_page_size
+        if self._page_owner is not None:
+            return self._page_owner.alloc(need_size // self.page_size, self.page_size)
         if need_size > self.available_size():
             return None
 
@@ -493,6 +549,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        if self._page_owner is not None:
+            return self._page_owner.free(indices, self.page_size)
         indices_cpu = indices.cpu()
         if indices_cpu.numel() == 0:
             return 0
@@ -522,7 +580,37 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             dst_indices=host_indices.to(dtype=torch.int64),
         )
 
+    def prepare_transfer_indices(self, host_indices, device_indices, io_backend):
+        if self.transfer_layout_domain is None:
+            return host_indices, device_indices
+        if host_indices is None or host_indices.numel() == 0:
+            return host_indices, device_indices
+        if io_backend != "kernel_ascend" or host_indices.numel() % self.slot_page_size:
+            raise ValueError("DSV4 shared host storage requires whole Ascend pages")
+        page_rows = self.host_region.physical_rows(self._to_page_indices(host_indices))
+        offsets = torch.arange(self.slot_page_size, device=page_rows.device)
+        return (page_rows[:, None] * self.slot_page_size + offsets).reshape(
+            -1
+        ), device_indices
+
     def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if self.transfer_layout_domain is not None and self._has_transfer_indices(
+            host_indices, device_indices
+        ):
+            with self.transfer_layout_domain.submission(self.gpu_device):
+                h, d = self.prepare_transfer_indices(
+                    host_indices, device_indices, io_backend
+                )
+                return self.backup_from_device_all_layer_physical(
+                    device_pool, h, d, io_backend
+                )
+        return self.backup_from_device_all_layer_physical(
+            device_pool, host_indices, device_indices, io_backend
+        )
+
+    def backup_from_device_all_layer_physical(
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if not self._has_transfer_indices(host_indices, device_indices):
@@ -598,7 +686,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dev_view = self.device_buffers[l].unsqueeze(0)
                 # dev_view: [1, dev_pages, native_page_size, 1, kv_dim]
                 host_view = self._host_page_view(l)
-                if self.layout == "layer_first":
+                if self.host_region is None and self.layout == "layer_first":
                     transfer_kv_all_layer_kv_split(
                         device_indices=native_device_indices,
                         host_indices=native_host_indices,
@@ -628,6 +716,35 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             )
 
     def load_to_device_per_layer(
+        self,
+        device_pool,
+        host_indices,
+        device_indices,
+        layer_id,
+        io_backend,
+        *,
+        is_draft=False,
+    ):
+        if self.transfer_layout_domain is not None and self._has_transfer_indices(
+            host_indices, device_indices
+        ):
+            with self.transfer_layout_domain.submission(self.gpu_device):
+                h, d = self.prepare_transfer_indices(
+                    host_indices, device_indices, io_backend
+                )
+                return self.load_to_device_per_layer_physical(
+                    device_pool, h, d, layer_id, io_backend, is_draft=is_draft
+                )
+        return self.load_to_device_per_layer_physical(
+            device_pool,
+            host_indices,
+            device_indices,
+            layer_id,
+            io_backend,
+            is_draft=is_draft,
+        )
+
+    def load_to_device_per_layer_physical(
         self,
         device_pool,
         host_indices,
@@ -704,7 +821,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             dev_view = self.device_buffers[layer_id].unsqueeze(0)
             # dev_view: [1, dev_pages, native_page_size, 1, kv_dim]
             host_view = self._host_page_view(layer_id)
-            if self.layout == "layer_first":
+            if self.host_region is None and self.layout == "layer_first":
                 transfer_kv_per_layer_kv_split(
                     device_indices=native_device_indices,
                     host_indices=native_host_indices,
@@ -738,6 +855,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def get_data_page(self, index, flat=True):
         index = int(index) // self.slot_page_size
+        if self.host_region is not None:
+            raise ValueError("Movable DSV4 host pages support L2 transfers only")
         if self.layout == "layer_first":
             data_page = torch.stack(
                 [self.kv_buffer[i][index] for i in range(self.layer_num)]
@@ -758,6 +877,8 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
 
     def set_from_flat_data_page(self, index, data_page):
         index = int(index) // self.slot_page_size
+        if self.host_region is not None:
+            raise ValueError("Movable DSV4 host pages support L2 transfers only")
         if self.layout == "layer_first":
             data = data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
             for i in range(self.layer_num):
@@ -774,6 +895,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported layout: {self.layout}")
 
     def get_page_buffer_meta(self, indices):
+        if self.transfer_layout_domain is not None:
+            raise ValueError(
+                "Movable DSv4.1 L2 pages cannot export raw storage pointers"
+            )
         ptr_list = []
         rows = self._to_page_indices(indices).tolist()
         if self.layout == "layer_first":

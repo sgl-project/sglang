@@ -99,9 +99,11 @@ def shared_host_layout_domains(host_pools: Iterable[object]) -> list:
     domains = []
     seen = set()
     for pool in host_pools:
-        if not uses_shared_host_layout(pool):
-            continue
-        domain = pool.shared_allocation_domain
+        domain = getattr(pool, "transfer_layout_domain", None)
+        if domain is None:
+            if not uses_shared_host_layout(pool):
+                continue
+            domain = pool.shared_allocation_domain
         if id(domain) not in seen:
             seen.add(id(domain))
             domains.append(domain)
