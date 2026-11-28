@@ -602,7 +602,6 @@ class WeightsUpdater:
                 # what reaches here only has caches to drop.
                 module.refresh_weight_derived_caches(weights_path=None)
 
-        gc.collect()
         torch.cuda.empty_cache()
         names = ", ".join(updated_modules)
         message = f"Updated {len(updated_modules)} modules from tensor ({names})."
