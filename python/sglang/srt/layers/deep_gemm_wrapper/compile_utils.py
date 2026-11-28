@@ -157,11 +157,7 @@ def _maybe_compile_deep_gemm_one_type_all(
     global _BUILTIN_M_LIST
 
     query_key = (kernel_type, n, k, num_groups)
-    if (
-        _ENABLE_JIT_DEEPGEMM_PRECOMPILE
-        and _DO_COMPILE_ALL
-        and _INITIALIZATION_DICT.get(query_key) is None
-    ):
+    if _ENABLE_JIT_DEEPGEMM_PRECOMPILE and _INITIALIZATION_DICT.get(query_key) is None:
         _INITIALIZATION_DICT[query_key] = True
 
         # TODO maybe improve logs
@@ -176,20 +172,33 @@ def _maybe_compile_deep_gemm_one_type_all(
                 "`python3 -m sglang.compile_deep_gemm --model deepseek-ai/DeepSeek-V3 --tp 8 --trust-remote-code`"
             )
 
-        logger.info(
-            f"Try DeepGEMM JIT Compiling for "
-            f"<{kernel_type.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
-            f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
-        )
+        if _IS_FIRST_RANK_ON_NODE:
+            logger.info(
+                f"Try DeepGEMM JIT Compiling for "
+                f"<{kernel_type.name}> N={n}, K={k}, num_groups={num_groups} with all Ms."
+                f"{' It only takes a little time (typically 1 sec) if you have run `python3 -m sglang.compile_deep_gemm`. ' if not _IN_PRECOMPILE_STAGE else ''}"
+            )
 
         with _local_rank_compile_lock(kernel_type, n, k, num_groups):
-            _compile_deep_gemm_one_type_all(
-                kernel_type=kernel_type,
-                n=n,
-                k=k,
-                num_groups=num_groups,
-                m_list=_BUILTIN_M_LIST,
-            )
+            if _IS_FIRST_RANK_ON_NODE:
+                _compile_deep_gemm_one_type_all(
+                    kernel_type=kernel_type,
+                    n=n,
+                    k=k,
+                    num_groups=num_groups,
+                    m_list=_BUILTIN_M_LIST,
+                )
+
+        try:
+            parallel = get_parallel()
+            if (
+                parallel is not None
+                and parallel.tp_group is not None
+                and parallel.tp_size > 1
+            ):
+                parallel.tp_group.barrier()
+        except Exception:
+            pass
 
 
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
