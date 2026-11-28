@@ -26,6 +26,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_track_grid,
 )
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -1119,11 +1120,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         # Simulated acceptance overrides correct_len; the bonus is drawn at that row
         # with the request's sampling params. SGLANG_SIMULATE_ACC_GREEDY also runs the
-        # draft and accept greedy.
+        # draft and accept greedy, on a greedy stand-in for the batch's info.
         simulate_bonus_sampling_info = None
         if (
             self._simulated_correct_len is not None
-            and sampling_info is not None
             and not sampling_info.facts.all_greedy
         ):
             simulate_bonus_sampling_info = sampling_info
@@ -1132,7 +1132,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 and not verify.facts.edits_logits
                 and not verify.facts.truncates
             ):
-                sampling_info = None
+                sampling_info = SamplingBatchInfo.greedy(
+                    bs, vocab_size=sampling_info.vocab_size, device=device
+                )
         if self._sim_draw_ahead:
             self._begin_simulated_step_ahead(
                 bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
@@ -1201,7 +1203,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
             # draft proposal itself folded.
-            and (sampling_info is None or sampling_info.facts.all_greedy)
+            and sampling_info.facts.all_greedy
             # A live grammar forces the eager path: the folded epilogue accepts inside
             # the cuda graph off its own buffers, where the mask below never lands.
             and not verify.facts.edits_logits
@@ -1254,9 +1256,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             grammar_tree, logits_output=logits_output, barrier=grammar_barrier
         )
         target_logits = logits_output.next_token_logits
-        # Without sampling info (a simulated greedy accept drops it), nothing
-        # adjusts the logits: the drop requires facts where nothing edits them.
-        if sampling_info is not None:
+        # Skipped with no stage, where the adjust would only return the batch's own
+        # info: a simulated greedy accept, taken only when no stage runs, keeps its
+        # stand-in.
+        if verify.facts.edits_logits:
             # run_compact scatters its rows back to (bs * chain_len), so the rows
             # line up with the verify ids on both verify paths.
             target_logits, sampling_info = verify.adjust(
@@ -1438,7 +1441,6 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._sampling_accept_graph is not None
             and proposal_folded
             and self._verify_planner.mode_value == "static"
-            and sampling_info is not None
             and not sampling_info.facts.any_greedy
             and not sampling_info.facts.truncates
             and not sampling_info.facts.edits_logits

@@ -9,7 +9,7 @@ import msgspec
 import pytest
 import torch
 
-from sglang.srt.sampling.sampling_batch_info import SamplingFacts
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.speculative.dspark_components import dspark_sampling_accept_graph as sag
 from sglang.srt.speculative.dspark_components import (
     dspark_verify,
@@ -60,7 +60,9 @@ def test_routes_only_all_sampled_static_steps():
     worker = _worker()
     assert _eligible(worker, _sampling_info())
     # Greedy and mixed batches keep the greedy fold / the eager mixed accept.
-    assert not _eligible(worker, None)
+    assert not _eligible(
+        worker, SamplingBatchInfo.greedy(2, vocab_size=8, device="cpu")
+    )
     assert not _eligible(worker, _sampling_info(any_greedy=True))
     assert not _eligible(worker, _sampling_info(need_top_k=True))
     assert not _eligible(worker, _sampling_info(need_top_p=True))

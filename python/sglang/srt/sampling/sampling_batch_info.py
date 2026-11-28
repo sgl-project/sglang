@@ -120,6 +120,27 @@ class SamplingBatchInfo:
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
+    @classmethod
+    def greedy(cls, bs: int, *, vocab_size: int, device) -> SamplingBatchInfo:
+        """`bs` argmax rows at temperature 1 with no stage, for a step that decides
+        greedily whatever its requests ask (DSpark's simulated greedy accept). The
+        facts are those `SamplingParamsPool.gather` derives for top_k 1 rows."""
+        return cls(
+            vocab_size=vocab_size,
+            device=device,
+            temperatures=torch.ones((bs, 1), dtype=torch.float32, device=device),
+            top_ps=torch.ones(bs, dtype=torch.float32, device=device),
+            top_ks=torch.ones(bs, dtype=torch.int32, device=device),
+            min_ps=torch.zeros(bs, dtype=torch.float32, device=device),
+            facts=SamplingFacts(
+                all_greedy=True,
+                any_greedy=True,
+                need_top_k=True,
+                npu_top_k_top_p_eligible=True,
+                max_top_k=1,
+            ),
+        )
+
     def set_step_state(self, reqs: List[Req], rows: SamplingRows) -> None:
         """Set one launch's state: the gathered `rows`, the stages' inputs built from
         `reqs`, then the facts over both."""

@@ -187,7 +187,7 @@ def propose_lilicorr_block(
     lm_head,
     embed_tokens,
     anchor: Optional[torch.Tensor],
-    sampling_info=None,
+    sampling_info,
     sampling_enabled: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     bs, block_size, hidden_size = draft_hidden.shape
@@ -222,13 +222,13 @@ def propose_lilicorr_block(
         anchor_valid=anchor_valid,
     )
     device = draft_hidden.device
-    if sampling_enabled and sampling_info is not None:
+    if sampling_enabled:
         # A greedy row's temperature may be 0, and it divides before greedy_mask applies.
         temperatures = sampling_info.temperatures.view(-1)[:bs].float().clamp_min(1e-5)
     else:
         temperatures = torch.ones(bs, dtype=torch.float32, device=device)
     greedy_mask = (
-        resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
+        resolve_greedy_mask(sampling_info)
         if sampling_enabled
         else torch.ones(bs, dtype=torch.bool, device=device)
     )

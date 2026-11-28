@@ -74,7 +74,7 @@ class SpeculativeSamplingMaskCapture(msgspec.Struct):
     ) -> SpeculativeSamplingMaskCapture | None:
         """Rebuild the verified target policy after acceptance; returns None
         when no request in the batch asked for sampling masks."""
-        if sampling_info is None or sampling_info.sampling_mask_batch_indices is None:
+        if sampling_info.sampling_mask_batch_indices is None:
             return None
         target_probs = None
         if not sampling_info.facts.all_greedy:
