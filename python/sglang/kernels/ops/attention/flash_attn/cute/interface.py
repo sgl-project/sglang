@@ -813,6 +813,17 @@ def _flash_attn_fwd(
             head_dim_v=head_dim_v,
             tile_mn=tile_mn,
             has_bias=rel_bias is not None,
+            is_plain_packed_self_attention=(
+                cu_seqlens_q is not None
+                and cu_seqlens_q is cu_seqlens_k
+                and seqused_q is None
+                and seqused_k is None
+                and not use_block_sparsity
+                and score_mod is None
+                and mask_mod is None
+                and softcap is None
+                and learnable_sink is None
+            ),
             total_q_rows=total_q * num_head,
             num_sms=None if fake_mode else num_SMs,
             num_batch=batch_size,
