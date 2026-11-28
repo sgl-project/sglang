@@ -53,7 +53,7 @@ from sglang.test.scheduler_test_utils import (
 )
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _ChunkedSlot(SimpleNamespace):

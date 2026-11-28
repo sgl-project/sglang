@@ -29,7 +29,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
-    est_time=120,
+    est_time=49,
     stage="extra-b",
     runner_config="8-gpu-h200",
 )

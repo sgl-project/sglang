@@ -8,7 +8,7 @@ from sglang.srt.function_call.minicpm5_detector import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(1.0, "base-a-test-cpu")
+register_cpu_ci(2, "base-a-test-cpu")
 
 
 def make_tools_weather():

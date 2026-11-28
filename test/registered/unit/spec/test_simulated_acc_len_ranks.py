@@ -12,7 +12,7 @@ from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyE
 from sglang.srt.speculative.spec_utils import simulated_acc_len_generator
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _dspark_draw(monkeypatch):

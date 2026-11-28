@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _DEV = "cpu"
 _FULL_V_HEAD_DIM = 8

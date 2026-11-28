@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=71, stage="base-b", runner_config="1-gpu-small")
 declare_models(skip_models=[DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST])  # AMD only
 # Backend-specific: the thinking-token and separate-reasoning assertions read
 # decoded output from a 30B MoE, so a ROCm fused-MoE or sampling regression

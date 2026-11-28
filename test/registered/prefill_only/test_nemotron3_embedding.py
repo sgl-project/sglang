@@ -21,7 +21,7 @@ from sglang import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=40, stage="extra-a", runner_config="1-gpu-small")
 
 PROMPTS = ["t3 t4", "t5 t6 t7 t8 t9", " ".join(["t10", "t11"] * 24)]
 

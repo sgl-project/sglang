@@ -8,7 +8,7 @@ is checkable on CPU is everything that decides *whether* the scheme is picked,
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 maybe_stub_sgl_kernel()
 

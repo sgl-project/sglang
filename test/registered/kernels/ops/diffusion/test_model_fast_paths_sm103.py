@@ -11,7 +11,7 @@ import torch
 from sglang.kernels.ops.diffusion import try_flux2_token_cat_nvfp4
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=5, stage="base-c", runner_config="8-gpu-b300")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),

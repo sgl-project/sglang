@@ -18,7 +18,7 @@ from sglang.srt.managers.scheduler_input_blocker import (  # noqa: E402
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _publish(case, interval, attn_dp_size=1):

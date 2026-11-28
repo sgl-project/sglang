@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     publish_build_topology,
 )
 
-register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 # Shrunk from inclusionAI/Ling-mini-2.0; the field names are the real

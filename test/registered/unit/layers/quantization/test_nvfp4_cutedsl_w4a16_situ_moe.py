@@ -25,7 +25,7 @@ from sglang.test.quant_ref_utils import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=16, stage="base-b", runner_config="4-gpu-b200")
 
 # Kimi-K3 MoE activation parameters (config.activation_situ_beta / _linear_beta).
 SITU_BETA, SITU_LINEAR_BETA = 4.0, 25.0

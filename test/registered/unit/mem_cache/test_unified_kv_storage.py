@@ -30,7 +30,7 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _P16 = dict(page_size=16, full_tokens=64 * 16, swa_tokens=64 * 16)
 CHAINS = {

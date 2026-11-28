@@ -29,7 +29,7 @@ from sglang.test.vlm_utils import (
     VideoOpenAITestMixin,
 )
 
-register_cuda_ci(est_time=641, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=944, stage="extra-a", runner_config="1-gpu-large")
 
 
 # --- Qwen3-VL grounding regression (deepstack fusion) --------------------------

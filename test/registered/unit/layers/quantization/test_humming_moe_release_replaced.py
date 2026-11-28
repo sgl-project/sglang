@@ -18,7 +18,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.layers.quantization import humming as humming_mod  # noqa: E402
 from sglang.srt.layers.quantization import humming_utils  # noqa: E402
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 NUM_EXPERTS, HIDDEN, INTERMEDIATE = 4, 64, 96
 

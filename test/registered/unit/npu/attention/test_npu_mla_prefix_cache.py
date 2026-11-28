@@ -16,7 +16,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_cache import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=5, suite="extra-a-test-npu")
+register_npu_ci(est_time=0, suite="extra-a-test-npu")
 
 DEVICES = ["cpu"]
 if os.environ.get("SGLANG_TEST_NPU") == "1":

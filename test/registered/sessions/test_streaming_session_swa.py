@@ -20,7 +20,7 @@ from sglang.test.server_fixtures.streaming_session_fixture import (
     StreamingSessionServerBase,
 )
 
-register_cuda_ci(est_time=329, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=388, stage="extra-a", runner_config="1-gpu-small")
 
 
 class TestStreamingSessionSWA(StreamingSessionServerBase, StreamingSessionKitMixin):

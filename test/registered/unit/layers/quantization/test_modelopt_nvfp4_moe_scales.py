@@ -20,7 +20,7 @@ intermediate 1856, ReLU2 experts) needs a 128-aligned intermediate and a
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace

@@ -10,7 +10,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.req_types import FINISH_MATCHED_STR
 from sglang.srt.managers.schedule_batch import Req
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 VOCAB_SIZE = 1000
 

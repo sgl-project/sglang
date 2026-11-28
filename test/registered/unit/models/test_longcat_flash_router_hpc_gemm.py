@@ -17,7 +17,7 @@ from sglang.srt.models.longcat_flash import (  # noqa: E402
 )
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _longcat_config(hidden_size, n_routed_experts, *, router_bias=False):

@@ -10,8 +10,8 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
 )
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 register_amd_ci(est_time=15, stage="base-b", runner_config="1-gpu-small-amd")
 
 _TRITON_OK = torch.cuda.is_available() or os.environ.get("TRITON_INTERPRET") == "1"

@@ -41,7 +41,7 @@ from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.utils.device import is_cuda, is_xpu
 from sglang.test.test_utils import CustomTestCase, empty_gpu_cache
 
-register_cuda_ci(est_time=213, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=324, stage="extra-a", runner_config="1-gpu-large")
 
 IMAGE_MAN_IRONING_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"
 IMAGE_SGL_LOGO_URL = "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/sgl_logo.png"

@@ -76,7 +76,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 from sglang.srt.utils.aio_rwlock import RWLock  # noqa: E402
 from sglang.srt.utils.weight_versions import WeightVersionSpan  # noqa: E402
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestSamplingParamsTruncation(CustomTestCase):

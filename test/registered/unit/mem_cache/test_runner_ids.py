@@ -30,7 +30,7 @@ from sglang.test.unified_allocator_fixtures import (
     stand_in_views,
 )
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace

@@ -13,7 +13,7 @@ from sglang.kernels.ops.diffusion.common.fallback_torch import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_mlx_ci
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=0, suite="base-a-test-cpu")
 register_cpu_ci(est_time=1, suite="extra-test-cpu-intel")
 register_cpu_ci(est_time=1, suite="extra-test-cpu-arm64")
 register_mlx_ci(est_time=1, suite="extra-unit-test-mlx")

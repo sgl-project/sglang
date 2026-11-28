@@ -20,7 +20,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def setUpModule():

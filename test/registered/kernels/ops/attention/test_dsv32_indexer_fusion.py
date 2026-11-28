@@ -31,7 +31,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 _is_hip = is_hip()
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=50, stage="base-b", runner_config="1-gpu-small")
 
 HEAD_DIM = 128
 ROPE_DIM = 64

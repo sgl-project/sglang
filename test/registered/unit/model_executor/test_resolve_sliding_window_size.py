@@ -36,7 +36,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, stage="extra-a", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="extra-a", runner_config="1-gpu-small")
 
 
 def _head(*, depth, local_layer_ids=(1,), local_extent=64, window=128):
