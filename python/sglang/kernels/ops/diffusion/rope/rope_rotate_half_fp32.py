@@ -12,7 +12,9 @@ import triton.language as tl
 from sglang.kernels.numerics import mul_rn_f32
 
 
-@triton.jit
+# N and S change with the resolution, so they stay out of the constexprs. N is a
+# multiple of 128 and keeps Triton's divisibility hint.
+@triton.jit(do_not_specialize=["S"])
 def _rope_rotate_half_fp32_kernel(
     Q,
     K,
@@ -20,8 +22,8 @@ def _rope_rotate_half_fp32_kernel(
     Sin,
     OutQ,
     OutK,
-    N: tl.constexpr,
-    S: tl.constexpr,
+    N,
+    S,
     H: tl.constexpr,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
