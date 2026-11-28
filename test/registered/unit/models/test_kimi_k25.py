@@ -40,6 +40,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
     KimiK3DeferredPreprocessing,
 )
+from sglang.srt.multimodal.media_artifacts.base import MediaArtifactInput
 from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
     KimiK3ImagePreprocessArtifact,
     KimiK3PreprocessConfig,
@@ -824,6 +825,120 @@ def test_kimi_k3_cached_artifact_is_composed_per_prompt():
     assert first.mm_items[0].hash == second.mm_items[0].hash
     assert first.mm_items[0].pad_values == second.mm_items[0].pad_values
     torch.testing.assert_close(first.mm_items[0].feature, second.mm_items[0].feature)
+
+
+_K3_PATCH_COUNTS = [4, 8]
+_K3_RESIZE_CONFIG = {
+    "num_tokens": 1,
+    "new_width": 2,
+    "new_height": 2,
+    "pad_width": 0,
+    "pad_height": 0,
+}
+
+
+class _DeviceFeature(torch.Tensor):
+    """Reports a device while its storage stays on the host."""
+
+    cpu_copy = None
+
+    @staticmethod
+    def __new__(cls, data):
+        return torch.Tensor._make_subclass(cls, data)
+
+    @property
+    def device(self):
+        return torch.device("cuda", 0)
+
+    def cpu(self):
+        # A real transfer allocates on the host, so the copy owns its storage.
+        self.cpu_copy = self.detach().as_subclass(torch.Tensor).clone()
+        return self.cpu_copy
+
+
+def _k3_eager_artifacts(wrap=lambda feature: feature, handed_out=None):
+    """Run prepare_artifact_batch over a two-image eager batch."""
+    processor = object.__new__(KimiK3ImageProcessor)
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
+    batch = torch.arange(sum(_K3_PATCH_COUNTS) * 2, dtype=torch.float32).view(-1, 2)
+
+    def _features(images):
+        parts = [wrap(part) for part in batch.split(_K3_PATCH_COUNTS)]
+        if handed_out is not None:
+            handed_out.extend(parts)
+        return parts
+
+    hf_processor = SimpleNamespace(
+        preprocess_config=None,
+        prepare_image_features=lambda images: (
+            _features(images),
+            [(2, 2)] * len(images),
+            [_K3_RESIZE_CONFIG] * len(images),
+            [(1, 1, 4), (1, 2, 4)],
+        ),
+    )
+    entries = [
+        MediaArtifactInput(
+            content_digest=f"sha256:{index:064d}",
+            artifact_key=f"sha256:{index:064d}",
+            modality=Modality.IMAGE,
+            media=Image.new("RGB", (2, 2)),
+        )
+        for index in range(len(_K3_PATCH_COUNTS))
+    ]
+    with patch("sglang.srt.multimodal.processors.kimi_k3.is_cuda", return_value=False):
+        return processor.prepare_artifact_batch(entries, processor=hf_processor)
+
+
+def _assert_k3_artifacts_own_their_patches(artifacts):
+    assert len(artifacts) == len(_K3_PATCH_COUNTS)
+    for artifact, patch_count in zip(artifacts, _K3_PATCH_COUNTS):
+        feature = artifact.feature
+        assert feature.shape[0] == patch_count
+        # The bytes estimate_cache_size_bytes charges for this entry.
+        assert (
+            feature.untyped_storage().nbytes()
+            == feature.numel() * feature.element_size()
+        )
+
+
+def test_kimi_k3_batched_artifacts_own_their_patches():
+    """Each artifact of a multi-image call is charged only its own patches.
+
+    prepare_image_features splits one batch tensor, and the preprocess cache
+    charges an entry for its tensor's whole storage, so retaining a view
+    charges every image of the request for all of them -- and past the budget
+    `put` keeps none of them.
+    """
+    _assert_k3_artifacts_own_their_patches(_k3_eager_artifacts())
+
+
+def test_kimi_k3_device_features_are_not_copied_a_second_time():
+    """A device feature reaches the cache owned without being copied here.
+
+    _make_artifact already transfers each image to the host on its own, and a
+    feature the transport keeps on the device is dropped by cache_value, so
+    copying the batch slices would add a device-to-device copy per image that
+    buys no independence.
+    """
+    handed_out = []
+
+    # A device feature is fingerprinted by the CUDA BLAKE3 kernel, which a CPU
+    # runner cannot reach; the copies are what this case is about.
+    with patch(
+        "sglang.srt.multimodal.processors.kimi_k3.resolve_multimodal_item_hash",
+        return_value=1,
+    ):
+        artifacts = _k3_eager_artifacts(wrap=_DeviceFeature, handed_out=handed_out)
+
+    # The transfer in _make_artifact is the only copy: each artifact holds the
+    # host tensor it returned, taken from the slice the processor handed out.
+    assert len(handed_out) == len(_K3_PATCH_COUNTS)
+    for artifact, slice_ in zip(artifacts, handed_out):
+        assert artifact.feature is slice_.cpu_copy
+    _assert_k3_artifacts_own_their_patches(artifacts)
 
 
 def test_kimi_k3_cached_deferred_artifact_has_model_contract():
