@@ -8,15 +8,29 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 
 
+def _packed_qk_rope_arches_measured() -> bool:
+    """Arches where the fused packed QK RMSNorm+RoPE has been measured.
+
+    SM90 is the original target. SM120 (GeForce RTX 50) was measured through
+    ``_flux2_single_qk_rope`` at 24 and 48 local heads with the full QKV+MLP
+    packed stride, the runtime ``RMSNorm`` and FlashInfer as the live reference:
+    2.7-2.9x, bitwise identical. SM100 is deliberately not included: nothing
+    here has been measured on Blackwell-DC, and an exact match stays the
+    conservative default until it has been.
+    """
+    arch = current_arch()
+    return arch.is_sm(9, 0) or arch.is_sm(12, 0)
+
+
 def can_use_flux2_strided_qknorm_rope(q, k, q_weight, k_weight, cache) -> bool:
     if (
         torch.compiler.is_compiling()
         or torch.is_grad_enabled()
         or torch.version.hip is not None
         or not q.is_cuda
-        or not current_arch().is_sm(9, 0)
+        or not _packed_qk_rope_arches_measured()
         or q.ndim != 4
-        or q.shape[-2:] != (24, 128)
+        or q.shape[-1] != 128
         or q.numel() == 0
         or q.is_contiguous()
         or k.shape != q.shape
@@ -24,7 +38,7 @@ def can_use_flux2_strided_qknorm_rope(q, k, q_weight, k_weight, cache) -> bool:
         or q.stride(-1) != 1
         or q.stride(-2) != 128
         or q.stride(0) != q.shape[1] * q.stride(1)
-        or q.stride(1) < 24 * 128
+        or q.stride(1) < q.shape[-2] * 128
     ):
         return False
     if any(

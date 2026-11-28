@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_flux2_strided_qknorm_rope,
@@ -14,6 +15,9 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNorm,
     apply_qk_norm_with_optional_rope,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
+    flashinfer_apply_rope_inplace,
+)
 from sglang.multimodal_gen.runtime.models.dits import flux_2
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -21,10 +25,12 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
-def inputs(batch, tokens):
-    packed = torch.randn(batch, tokens, 9 * 3072, device="cuda", dtype=torch.bfloat16)
-    q, k, _ = packed[:, :, : 3 * 3072].chunk(3, dim=-1)
-    q, k = (x.unflatten(-1, (24, 128)) for x in (q, k))
+def inputs(batch, tokens, heads=24):
+    packed = torch.randn(
+        batch, tokens, 9 * heads * 128, device="cuda", dtype=torch.bfloat16
+    )
+    q, k, _ = packed[:, :, : 3 * heads * 128].chunk(3, dim=-1)
+    q, k = (x.unflatten(-1, (heads, 128)) for x in (q, k))
     qn, kn = (RMSNorm(128, eps=1e-6).to("cuda", torch.bfloat16) for _ in range(2))
     qn.weight.normal_()
     kn.weight.normal_()
@@ -45,6 +51,31 @@ def reference(q, k, qn, kn, cache):
         allow_inplace=True,
         allow_strided_qk=False,
     )
+
+
+def _documented_arithmetic(x, weight, cache, eps):
+    """Emulate the kernel's steps per row: fp32 RMSNorm, cast to bf16, then an
+    interleaved rotation in fp32, cast back to bf16."""
+    v = x.float()
+    rstd = torch.rsqrt((v * v).sum(-1, keepdim=True) / 128.0 + eps)
+    normed = (v * rstd * weight.float()).to(torch.bfloat16).float()
+    positions = torch.arange(x.shape[1], device=x.device)
+    cos = cache[positions, :64].view(1, x.shape[1], 1, 64)
+    sin = cache[positions, 64:].view(1, x.shape[1], 1, 64)
+    even, odd = normed[..., 0::2], normed[..., 1::2]
+    out = torch.empty_like(normed)
+    out[..., 0::2] = even * cos - odd * sin
+    out[..., 1::2] = odd * cos + even * sin
+    return out.to(torch.bfloat16)
+
+
+def _packed_qk_fusion_supported() -> bool:
+    """The dispatch this test covers mounts on the arches it was measured on:
+    SM90 (the original target) and SM120 (GeForce RTX 50, measured end to end)."""
+    if not (torch.cuda.is_available() and torch.version.hip is None):
+        return False
+    arch = current_arch()
+    return arch.is_sm(9, 0) or arch.is_sm(12, 0)
 
 
 @unittest.skipUnless(
@@ -76,20 +107,126 @@ class TestFlux2StridedQKNormRoPE(CustomTestCase):
                             packed.view(torch.int16), original.view(torch.int16)
                         )
                     )
-                    if can_use_flux2_strided_qknorm_rope(
-                        q, k, qn.weight, kn.weight, cache
-                    ):
-                        self.assertTrue(gate.verified)
-                        self.assertFalse(gate.disabled)
-                        self.assert_bits(
-                            flux2_strided_qknorm_rope(
-                                q, k, qn.weight, kn.weight, cache, qn.variance_epsilon
-                            ),
-                            reference(q, k, qn, kn, cache),
+                    if _packed_qk_fusion_supported():
+                        self.assertTrue(
+                            can_use_flux2_strided_qknorm_rope(
+                                q, k, qn.weight, kn.weight, cache
+                            )
                         )
+                        if flashinfer_apply_rope_inplace is not None:
+                            # Bit-exactness is contracted against
+                            # FlashInfer's interleaved RoPE, the dispatch
+                            # this kernel replaces. Without FlashInfer the
+                            # reference takes a different rounding path, so
+                            # the gate correctly returns the reference Q/K
+                            # and stays unverified; the output check above
+                            # still covers that case unconditionally.
+                            self.assertTrue(gate.verified)
+                            self.assertFalse(gate.disabled)
+                            self.assert_bits(
+                                flux2_strided_qknorm_rope(
+                                    q,
+                                    k,
+                                    qn.weight,
+                                    kn.weight,
+                                    cache,
+                                    qn.variance_epsilon,
+                                ),
+                                reference(q, k, qn, kn, cache),
+                            )
                     else:
                         self.assertFalse(gate.verified)
                         self.assertFalse(gate.disabled)
+
+    @torch.inference_mode()
+    def test_eligibility_does_not_depend_on_the_head_count(self):
+        """The kernel indexes rows by ``(token, head)``; ``HEADS`` is a
+        ``constexpr``. Neither the fusion's math nor its cost model has a
+        24-head term, so the gate must accept any head count the packed
+        layout can express (FLUX.2-dev is 48 heads; a TP split makes
+        ``heads / tp_size``, which must not have to land on 24).
+        """
+
+        class _Hopper:
+            def is_sm(self, major, minor=None):
+                return True
+
+            def is_sm_at_least(self, major, minor=0):
+                return True
+
+        with patch(
+            "sglang.kernels.ops.diffusion.rope.flux2_qknorm_rope_triton.current_arch",
+            _Hopper,
+        ):
+            for heads in (8, 12, 24, 32, 48):
+                with self.subTest(heads=heads):
+                    _, q, k, qn, kn, cache = inputs(1, 64, heads)
+                    self.assertTrue(
+                        can_use_flux2_strided_qknorm_rope(
+                            q, k, qn.weight, kn.weight, cache
+                        ),
+                        f"head count {heads} must not be rejected",
+                    )
+
+    @torch.inference_mode()
+    def test_dispatch_is_widened_only_to_measured_arches(self):
+        """SM90 keeps the original allow-list entry, SM120 was added after it was
+        measured through the production entry point, and SM100 stays on the split
+        path until Blackwell-DC data exists."""
+
+        def _arch(major, minor):
+            class _A:
+                def is_sm(self, mj, mn=None):
+                    return (mj, mn) == (major, minor)
+
+                def is_sm_at_least(self, mj, mn=0):
+                    return (major, minor) >= (mj, mn)
+
+            return _A
+
+        _, q, k, qn, kn, cache = inputs(1, 64, heads=48)
+        target = (
+            "sglang.kernels.ops.diffusion.rope.flux2_qknorm_rope_triton.current_arch"
+        )
+        for arch, expected in (
+            ((9, 0), True),
+            ((12, 0), True),
+            ((10, 0), False),
+        ):
+            with self.subTest(sm=f"{arch[0]}.{arch[1]}"):
+                with patch(target, _arch(*arch)):
+                    self.assertEqual(
+                        can_use_flux2_strided_qknorm_rope(
+                            q, k, qn.weight, kn.weight, cache
+                        ),
+                        expected,
+                    )
+
+    @torch.inference_mode()
+    def test_head_generic_kernel_matches_its_documented_arithmetic(self):
+        """Run the fused kernel at a non-24 head count and compare against a
+        per-row emulation of the arithmetic the kernel documents. Differences
+        are bf16 ULP-scale rounding-order only, which is what proves the
+        row -> (token, head) mapping is right at any head count."""
+        for heads in (24, 48):
+            with self.subTest(heads=heads):
+                _, q, k, qn, kn, cache = inputs(1, 257, heads)
+                for magnitude in (0.005, 1.0):
+                    q.normal_().mul_(magnitude)
+                    k.normal_().mul_(magnitude)
+                    fused_q, fused_k = flux2_strided_qknorm_rope(
+                        q, k, qn.weight, kn.weight, cache, qn.variance_epsilon
+                    )
+                    for fused, src, norm in ((fused_q, q, qn), (fused_k, k, kn)):
+                        expected = _documented_arithmetic(
+                            src, norm.weight, cache, norm.variance_epsilon
+                        )
+                        differing = (
+                            fused.view(torch.int16) != expected.view(torch.int16)
+                        ).sum()
+                        # A wrong row mapping moves whole rows (hundreds of
+                        # thousands of elements), not a handful of roundings.
+                        self.assertLess(differing.item() / fused.numel(), 1e-4)
 
     @torch.inference_mode()
     def test_changed_inputs_weights_cache_and_graph_replay(self):
