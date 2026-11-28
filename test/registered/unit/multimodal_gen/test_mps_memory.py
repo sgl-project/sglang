@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from sglang.multimodal_gen.runtime.platforms.mps import MpsPlatform
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 GIB = 1 << 30
 
@@ -45,3 +48,7 @@ def test_available_memory_in_gib(
 
     assert MpsPlatform.get_available_gpu_memory(empty_cache=empty_cache) == expected
     assert clear.call_count == int(empty_cache)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
