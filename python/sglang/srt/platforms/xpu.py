@@ -55,7 +55,6 @@ class XpuDeviceMixin(DeviceMixin):
         torch.xpu.synchronize()
 
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
-        # TODO: simple return of torch.xpu.mem_get_info
         """Return the available and total device memory in Bytes."""
 
         if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
@@ -73,11 +72,7 @@ class XpuDeviceMixin(DeviceMixin):
                 current,
             )
 
-        used_memory = torch.xpu.memory_allocated(device_id)
-        total_gpu_memory = torch.xpu.get_device_properties(device_id).total_memory
-        free_gpu_memory = total_gpu_memory - used_memory
-
-        return free_gpu_memory, total_gpu_memory
+        return torch.xpu.mem_get_info(device_id)
 
     def is_pin_memory_available(self, device=None) -> bool:
         if device is not None and str(device) == "cpu":

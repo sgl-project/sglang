@@ -58,6 +58,13 @@ pip install -v ".[dev,diffusion]" \
     --extra-index-url https://docs.sglang.io/whl/xpu/
 ```
 
+SGLang uses `torch.xpu.mem_get_info()` to query device-wide free memory for
+memory sizing and diffusion prefetch. Its accuracy depends on the PyTorch,
+driver, and hardware combination: some `torch 2.14.0+xpu` environments have
+reported free memory equal to total memory even while allocations are live.
+Verify the query on your deployment before relying on automatic memory sizing,
+especially when the XPU is shared with other processes.
+
 ### Install Using Docker
 
 It is recommended to use Docker for setting up the SGLang environment.

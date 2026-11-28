@@ -280,6 +280,20 @@ class TestXpuDeviceMixin(CustomTestCase):
         base = XpuSRTPlatform()
         self.assertEqual(base.get_device(2), torch.device("xpu", 2))
 
+    def test_available_memory_uses_device_query(self):
+        with (
+            patch.object(torch.xpu, "is_available", return_value=True),
+            patch.object(torch.xpu, "device_count", return_value=2),
+            patch.object(torch.xpu, "current_device", return_value=1),
+            patch.object(
+                torch.xpu, "mem_get_info", return_value=(3 << 30, 16 << 30)
+            ) as mem_get_info,
+        ):
+            self.assertEqual(
+                XpuSRTPlatform().get_available_memory(1), (3 << 30, 16 << 30)
+            )
+            mem_get_info.assert_called_once_with(1)
+
     def test_pin_memory_available_for_xpu_targets(self):
         base = XpuSRTPlatform()
         self.assertTrue(base.is_pin_memory_available())
@@ -588,6 +602,33 @@ class TestMpsDeviceMixin(CustomTestCase):
             finally:
                 device_utils.get_device_count.cache_clear()
                 device_utils.get_device.cache_clear()
+
+
+class TestXpuAvailableMemory(CustomTestCase):
+    def test_srt_memory_source_and_cache(self):
+        from sglang.srt.utils import device as device_utils
+
+        for empty_cache in (True, False):
+            with (
+                self.subTest(empty_cache=empty_cache),
+                patch.object(torch.xpu, "device_count", return_value=2),
+                patch.object(torch.xpu, "current_device", return_value=1),
+                patch.object(
+                    torch.xpu, "mem_get_info", return_value=(3 << 30, 16 << 30)
+                ) as mem_get_info,
+                patch.object(device_utils, "empty_device_cache") as clear_cache,
+            ):
+                self.assertEqual(
+                    device_utils.get_available_gpu_memory(
+                        "xpu", 1, empty_cache=empty_cache
+                    ),
+                    3.0,
+                )
+                mem_get_info.assert_called_once_with(1)
+                if empty_cache:
+                    clear_cache.assert_called_once_with(torch.xpu)
+                else:
+                    clear_cache.assert_not_called()
 
 
 class TestMusaAvailableMemory(CustomTestCase):
