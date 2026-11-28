@@ -2,6 +2,9 @@ import re
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Tuple
 
+# Harmony header recipient, e.g. "analysis to=browser.search" or "assistant to=python".
+_RECIPIENT_PATTERN = re.compile(r"\sto=\S")
+
 
 @dataclass
 class Event:
@@ -234,6 +237,15 @@ class CanonicalStrategy:
         channel_type = self._extract_channel_type(channel_header)
         if channel_type != "analysis":
             return None  # Only stream analysis content - tool calls wait for completion
+
+        # A recipient makes this a built-in tool call; its arguments wait for <|call|>.
+        # The recipient precedes <|constrain|>; what follows is the content type.
+        header_end = next(
+            (t.start for t in tokens[start_pos:message_pos] if t.type == "CONSTRAIN"),
+            tokens[message_pos].start,
+        )
+        if _RECIPIENT_PATTERN.search(text[tokens[start_pos].start : header_end]):
+            return None
 
         # Extract partial content after <|message|>
         content_start = tokens[message_pos].end
