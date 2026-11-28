@@ -45,7 +45,10 @@ from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
 from sglang.srt.distributed import moe_tensor_model_parallel_all_reduce
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.muse_spark.muse_spark_layers import MuseSpark1xRMSNorm
+from sglang.srt.layers.muse_spark.muse_spark_layers import (
+    MuseSpark1xRMSNorm,
+    refill_cached,
+)
 from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
     MuseSparkNvFp4FusedMoEMethod,
 )
@@ -196,6 +199,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             )
         )
         self.register_buffer("_post_expert_norm_weight", None, persistent=False)
+        self._post_expert_norm_weight_f32: Optional[torch.Tensor] = None
 
         expert_map = None
         if num_local_experts != num_experts:
@@ -262,7 +266,10 @@ class MuseSpark1xFp4Experts(nn.Module):
                 device=self.gate_up_proj.device,
             )
         object.__setattr__(self, "_post_expert_norm", post_expert_norm)
-        self._post_expert_norm_weight = weight.detach().to(torch.bfloat16)
+        # In place on a reload: captured graphs keep the first build's addresses.
+        self._post_expert_norm_weight = refill_cached(
+            self._post_expert_norm_weight, weight.detach().to(torch.bfloat16)
+        )
         eps = float(getattr(post_expert_norm, "eps", 1e-8))
         weight_first = isinstance(post_expert_norm, MuseSpark1xRMSNormWithInputScale)
         self._post_expert_norm_eps = eps
@@ -279,7 +286,9 @@ class MuseSpark1xFp4Experts(nn.Module):
                 eps=eps,
                 weight_first=weight_first,
             )
-        self._post_expert_norm_weight_f32 = self._post_expert_norm_weight.float()
+        self._post_expert_norm_weight_f32 = refill_cached(
+            self._post_expert_norm_weight_f32, self._post_expert_norm_weight.float()
+        )
 
     def _pre_norm_weight(self, pre_expert_norm: nn.Module) -> Optional[torch.Tensor]:
         weight = pre_expert_norm._get_effective_weight()
@@ -878,6 +887,18 @@ def finalize_expert_tp(
         apply_norm=apply_norm,
         slot_expert_ids=topk_ids,
     )
+
+
+def refresh_post_expert_norms(modules) -> None:
+    """After a weight reload, rewrite the FP4 experts' copies of the post-expert norm
+    weight (BF16 and the FP32 one the W4A16 launch reads) from the refreshed norm.
+    On the first load the quant method builds them later, so nothing is set yet."""
+    for module in modules:
+        if (
+            isinstance(module, MuseSpark1xFp4Experts)
+            and module._post_expert_norm is not None
+        ):
+            module.set_post_expert_norm(module._post_expert_norm)
 
 
 def finalize_with_post_expert_norm(

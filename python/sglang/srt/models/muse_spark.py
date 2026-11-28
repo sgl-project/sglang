@@ -86,6 +86,7 @@ from sglang.srt.layers.muse_spark.muse_spark_dynamic_guests import (
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
     MuseSpark1xFp4Experts,
     _pre_expert_rms_norm,
+    refresh_post_expert_norms,
 )
 from sglang.srt.layers.muse_spark.muse_spark_layers import (
     MuseSpark1xNormPreservingResidualConnection,
@@ -2289,6 +2290,7 @@ class MuseSparkTextForCausalLM(nn.Module):
         for module in self.modules():
             if isinstance(module, MuseSpark1xRMSNorm):
                 module.precompute_effective_weight()
+        refresh_post_expert_norms(self.modules())
         # Must follow precompute_effective_weight: the finalize op binds the weight.
         for module in self.modules():
             if (

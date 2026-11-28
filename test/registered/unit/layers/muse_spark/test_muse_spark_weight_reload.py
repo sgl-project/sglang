@@ -7,9 +7,14 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
+    MuseSpark1xFp4Experts,
+    refresh_post_expert_norms,
+)
 from sglang.srt.layers.muse_spark.muse_spark_layers import (
     MuseSpark1xNormPreservingResidualConnection,
     MuseSpark1xRMSNorm,
+    MuseSpark1xRMSNormWithInputScale,
 )
 from sglang.srt.models import muse_spark
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -71,6 +76,43 @@ class TestMuseSparkWeightReload(CustomTestCase):
         hilo = router._split2_hilo.t().float().view(1, 2, 8, 16)
         torch.testing.assert_close(
             hilo.sum(1).view(8, 16), router.weight.detach(), rtol=1e-3, atol=1e-3
+        )
+
+    def test_reload_refills_the_fp4_experts_post_norm_copies(self):
+        """The W4A16 MoE launch reads the experts' FP32 copy of the post-expert norm
+        weight by address; a weight update of the norm must reach that copy and the
+        BF16 one, in the tensors the first build made."""
+        norm = MuseSpark1xRMSNormWithInputScale(
+            16,
+            eps=1e-8,
+            is_post_norm=True,
+            zero_centered_gamma=True,
+            post_norm_gain_center_type="one",
+        )
+        with torch.no_grad():
+            norm.weight.normal_()
+        norm.precompute_effective_weight()
+        experts = object.__new__(MuseSpark1xFp4Experts)
+        nn.Module.__init__(experts)
+        experts.top_k, experts._fused_finalize_op = 2, None
+        object.__setattr__(experts, "_post_expert_norm", None)
+        experts.register_buffer("_post_expert_norm_weight", None, persistent=False)
+        experts._post_expert_norm_weight_f32 = None
+
+        refresh_post_expert_norms([experts])  # first load: built later
+        self.assertIsNone(experts._post_expert_norm_weight_f32)
+        experts.set_post_expert_norm(norm)  # the quant method's first build
+        first = (experts._post_expert_norm_weight, experts._post_expert_norm_weight_f32)
+
+        with torch.no_grad():
+            norm.weight.add_(1.0)
+        norm.precompute_effective_weight()
+        refresh_post_expert_norms([experts])
+        self.assertIs(experts._post_expert_norm_weight, first[0])
+        self.assertIs(experts._post_expert_norm_weight_f32, first[1])
+        effective = norm._get_effective_weight().detach()
+        torch.testing.assert_close(
+            experts._post_expert_norm_weight_f32, effective.to(torch.bfloat16).float()
         )
 
 
