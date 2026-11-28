@@ -11,7 +11,7 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.utils import is_gfx95_supported, is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
 from sglang.srt.utils.common import calc_diff
 from sglang.srt.utils.device import get_device_core_count, get_dispatch_device_backend
 
@@ -378,7 +378,7 @@ def _segment_reduce_kernel(
     tl.store(c_ptr + offs, total.to(c_ptr.dtype.element_ty), mask=mask)
 
 
-def _segmented_matmul_launch(M: int, N: int) -> tuple:
+def _segmented_matmul_launch_amd(M: int, N: int) -> tuple:
     """(BLOCK_SIZE_M, BLOCK_SIZE_N, num_warps, num_stages, split) by M and N.
 
     None of these change the bits. Measured on MI350X over the bf16 linear shapes of
@@ -407,6 +407,56 @@ def _segmented_matmul_launch(M: int, N: int) -> tuple:
     return 256, 128, 8, 1, False
 
 
+def _segmented_matmul_launch_cuda(M: int, N: int, K: int) -> tuple | None:
+    """Same tuple as `_segmented_matmul_launch_amd`, or None to keep the persistent kernel.
+
+    Measured on A100-80GB (SM80) over the bf16 linear shapes of Qwen3-8B and
+    Qwen3-30B-A3B (qkv / o_proj / gate_up / down / lm_head / MoE expert), M = 1-2048,
+    after sweeping 48 tile/warp/stage/split combinations per shape. Every bucket below
+    is at least as fast as the persistent kernel (1.2x-4.5x); buckets that would lose
+    (K < 1024) return None.
+
+    Unlike the AMD table the split is only used for long K with a narrow N: on SM80
+    most of the win comes from the smaller tiles alone, and the split's fp32 partial
+    buffer plus the reduce pass costs more than the extra parallelism it buys. This
+    keeps num_stages > 1 on the un-split path, which is safe here: the run-to-run and
+    batch-invariance checks pass for K = 1024-12289 (including non-multiples of the
+    block size) on SM80.
+    """
+    if K < 1024:
+        return None
+    if K < 4096:
+        if M <= 64:
+            return 32, 64, 4, 3, False
+        if M <= 256:
+            return 64, 64, 4, 3, False
+        return 128, 128, 8, 3, False
+    if M <= 16:
+        return 32, 256, 4, 3, N <= 8192
+    if M <= 64:
+        return 64, 128, 4, 3, N <= 8192 and K >= 8192
+    if N > 8192:
+        return 128, 128, 8, 3, False
+    if M <= 256:
+        return 64, 128, 4, 3, K >= 8192
+    return 128, 128, 8, 3, K >= 8192
+
+
+def _segmented_matmul_launch(M: int, N: int, K: int) -> tuple | None:
+    """Picks the launch for this device, or None to keep the persistent kernel."""
+    if _is_gfx95:
+        return _segmented_matmul_launch_amd(M=M, N=N)
+    if _is_npu or is_hip():
+        # Not calibrated on these devices; keep the previous behaviour.
+        return None
+    return _segmented_matmul_launch_cuda(M=M, N=N, K=K)
+
+
+# matrix_instr_nonkdim only exists in the gfx9xx Triton backend; the CUDA
+# backend rejects it as an unknown keyword argument.
+_SEGMENT_EXTRA_OPTS = {"matrix_instr_nonkdim": 16} if _is_gfx95 else {}
+
+
 def _matmul_segmented_triton(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -415,7 +465,9 @@ def _matmul_segmented_triton(
 ):
     M, K = a.shape
     N = b.shape[1]
-    block_m, block_n, num_warps, num_stages, split = _segmented_matmul_launch(M, N)
+    block_m, block_n, num_warps, num_stages, split = _segmented_matmul_launch(
+        M=M, N=N, K=K
+    )
     num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
     segment_k = (
         triton.cdiv(triton.cdiv(K, _SEGMENT_COUNT), _SEGMENT_BLOCK_K) * _SEGMENT_BLOCK_K
@@ -451,7 +503,7 @@ def _matmul_segmented_triton(
         GROUP_SIZE_M=8,
         num_warps=num_warps,
         num_stages=num_stages,
-        matrix_instr_nonkdim=16,
+        **_SEGMENT_EXTRA_OPTS,
     )
     if split:
         # Measured on MI350X: the smaller block is faster up to M = 64.
@@ -557,10 +609,10 @@ def matmul_persistent(
         return out
 
     if (
-        _is_gfx95
-        and a.dtype == torch.bfloat16
+        a.dtype == torch.bfloat16
         and out_dtype == torch.bfloat16
         and K > _SEGMENT_MIN_K
+        and _segmented_matmul_launch(M=a.shape[0], N=b.shape[1], K=K) is not None
     ):
         return _matmul_segmented_triton(a=a, b=b, bias=bias, out_dtype=out_dtype)
 
