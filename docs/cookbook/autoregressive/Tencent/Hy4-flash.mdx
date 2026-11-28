@@ -43,6 +43,10 @@ Then run the **Python** output of the command panel below in that environment.
 
 </Accordion>
 
+<Note>
+The commands on this page target the `lmsysorg/sglang:hy4-flash` image and the [#51159](https://github.com/sgl-project/sglang/pull/51159) branch above. The Hy4-flash support in `main` ([#51668](https://github.com/sgl-project/sglang/pull/51668)) serves the base model only: it skips the DFly draft weights and rejects speculative decoding, PD disaggregation, DP attention, `--moe-a2a-backend`, `--enable-hierarchical-cache`, `--enable-hisparse` and two-/single-batch overlap at startup. Run the Low-Latency recipe and the Playground cards on the pinned image.
+</Note>
+
 Pick your hardware + recipe to generate the launch command.
 
 import { Deployment } from "/src/snippets/_deployment.jsx";
@@ -72,8 +76,8 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 ### 2.1 HiCache (Hierarchical KV Caching)
 
-Hy4-flash supports SGLang's hierarchical KV cache, including the host-memory (L2) tier and storage (L3) backends. Toggle it in the **HiCache** card of the [Playground above](#playground) to add the flags to your launch command.
+On the `lmsysorg/sglang:hy4-flash` image, Hy4-flash supports SGLang's hierarchical KV cache, including the host-memory (L2) tier and storage (L3) backends. Toggle it in the **HiCache** card of the [Playground above](#playground) to add the flags to your launch command. `main` rejects `--enable-hierarchical-cache` for this model.
 
 ### 2.2 PD Disaggregation
 
-Prefill and decode can run on separate SGLang instances. Pick a role and transfer backend in the **PD Disagg** card of the [Playground above](#playground); it also generates the `sgl-router` command that fronts both roles.
+On the `lmsysorg/sglang:hy4-flash` image, prefill and decode can run on separate SGLang instances. Pick a role and transfer backend in the **PD Disagg** card of the [Playground above](#playground); it also generates the `sgl-router` command that fronts both roles. `main` rejects `--disaggregation-mode` for this model.
