@@ -24,6 +24,7 @@ from sglang.srt.disaggregation import utils  # noqa: E402
 from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
 from sglang.srt.disaggregation.common.conn import (  # noqa: E402
     CommonKVManager,
+    CommonKVSender,
     _pp_held_key,
     _PPStagingOutstanding,
 )
@@ -79,10 +80,15 @@ class _PPGroup:
 class _Sender:
     """Reads the stage's real store the way CommonKVSender does."""
 
+    check_transfer_timeout = CommonKVSender.check_transfer_timeout
+    _check_transfer_timeout = CommonKVSender._check_transfer_timeout
+
     def __init__(self, kv_mgr, room):
         self.kv_mgr = kv_mgr
         self.bootstrap_room = room
         self.local_polls = 0
+        self.conclude_state = None
+        self._last_chunk_time = None
 
     def poll(self):
         self.local_polls += 1
@@ -111,6 +117,8 @@ class _Stage(SchedulerDisaggregationPrefillMixin):
             request_status=self.store,
             failure_records={},
             failure_lock=threading.Lock(),
+            pp_rank=pp_rank,
+            transfer_timeout=0.0,
         )
         self.pp_group = SimpleNamespace(
             recv_object=pp_group.recv_object, send_object=pp_group.send_object
@@ -288,6 +296,35 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
                 for stage in (self.pp0, self.pp1):
                     self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
                     self.assertEqual(stage.streamed, [("x", "error")])
+
+    def test_a_stage_past_its_transfer_deadline_fails_the_transfer_everywhere(self):
+        # PP1 never polls its own sender before PP0 decides, so it must apply
+        # its own deadline first, or a transfer stuck there is held forever.
+        for stage in (self.pp0, self.pp1):
+            mgr = stage.kv_mgr
+            mgr.transfer_timeout = 60
+            mgr.staging_holds_success = lambda room: False
+            mgr.fail_transfer_on_timeout = partial(
+                CommonKVManager.fail_transfer_on_timeout, mgr
+            )
+            mgr.conclude_failure = lambda bootstrap_room, failure_reason, stage=stage: (
+                stage.fail(bootstrap_room, failure_reason)
+            )
+        req0, req1 = self._both("x", 50)
+        req0.disagg_kv_sender._last_chunk_time = time.perf_counter()
+        req1.disagg_kv_sender._last_chunk_time = time.perf_counter() - 61
+        self.pp0.store[50] = KVPoll.Success
+        self._replicated(50, [KVPoll.Success, KVPoll.Transferring])
+
+        self._iterate()
+        self._replicated(50, [KVPoll.Success, KVPoll.Failed])
+        self.assertIn("timed out after 61", self.pp1.kv_mgr.failure_records[50])
+        self.assertEqual(req1.disagg_kv_sender.local_polls, 0)
+
+        self._iterate()
+        for stage in (self.pp0, self.pp1):
+            self.assertEqual(stage.streamed, [("x", "error")])
+            self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
 
     def test_success_waits_for_staging_chunks_on_every_stage(self):
         # A stage holds Success while its staging chunks are outstanding; PP0

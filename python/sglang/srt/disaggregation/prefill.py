@@ -1463,6 +1463,9 @@ class SchedulerDisaggregationPrefillMixin:
         # The polls are reduced across ranks in this order.
         transfer_queue = list(self.disagg_prefill_transfer_queue)
         senders = [req.disagg_kv_sender for req in transfer_queue]
+        # Each stage's own transfer deadline, before any consensus on the polls.
+        for sender in senders:
+            sender.check_transfer_timeout()
         parallel = get_parallel()
         if parallel.pp_size > 1:
             # PP0 decides from every stage's status and forwards the decision,

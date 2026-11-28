@@ -130,6 +130,88 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         self.assertEqual(sender.poll_pp_consensus(), KVPoll.Success)
         self.assertEqual(sender.conclude_state, KVPoll.Success)
 
+    def _stuck_sender(self, status, timeout=60.0):
+        """A room whose last chunk is queued but whose transfer never finishes."""
+        sender, manager, _ = make_sender(MooncakeKVManager)
+        manager.transfer_timeout = timeout
+        manager.pp_rank = 0
+        manager.deferred_bootstrap = None
+        manager.failure_records = {}
+        manager.failure_lock = threading.Lock()
+        manager.transfer_infos[42] = {
+            "10.0.0.2:7": SimpleNamespace(
+                is_dummy=False, endpoint="10.0.0.2", dst_port=7
+            )
+        }
+        manager.send_kv_status_message = Mock()
+        manager.request_status[42] = status
+        sender.init(1, aux_index=9)
+        sender.send(np.array([10], dtype=np.int32))
+        return sender, manager
+
+    def test_transfer_timeout_fails_a_room_that_never_finishes(self):
+        for status in (KVPoll.WaitingForInput, KVPoll.Transferring):
+            with self.subTest(status=status):
+                sender, manager = self._stuck_sender(status)
+                self.assertEqual(sender.poll(), status)
+                sender._last_chunk_time -= 61
+                self.assertEqual(sender.poll(), KVPoll.Failed)
+                self.assertEqual(sender.conclude_state, KVPoll.Failed)
+                self.assertEqual(manager.request_status[42], KVPoll.Failed)
+                self.assertIn("timed out after 61", manager.failure_records[42])
+                # Decode is told once, so it frees its side without waiting.
+                manager.send_kv_status_message.assert_called_once_with(
+                    targets=[("10.0.0.2", 7)],
+                    bootstrap_room=42,
+                    status=KVPoll.Failed,
+                    failure_reason=manager.failure_records[42],
+                )
+                self.assertEqual(sender.poll(), KVPoll.Failed)
+                manager.send_kv_status_message.assert_called_once()
+
+    def test_transfer_timeout_covers_success_held_by_a_staging_chunk(self):
+        sender, manager = self._stuck_sender(KVPoll.Success)
+        manager._staging_outstanding[42] = 1
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        sender._last_chunk_time -= 61
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+
+    def test_transfer_timeout_off_or_before_the_last_chunk_never_fires(self):
+        sender, manager = self._stuck_sender(KVPoll.Transferring, timeout=0)
+        sender._last_chunk_time -= 10**6
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        # Before its last chunk the room is still being prefilled, not transferred.
+        sender, manager = self._stuck_sender(KVPoll.WaitingForInput)
+        sender._last_chunk_time = None
+        self.assertEqual(sender.poll(), KVPoll.WaitingForInput)
+        manager.send_kv_status_message.assert_not_called()
+
+    def test_stage_deadline_fails_the_room_without_concluding_the_sender(self):
+        # Every stage runs it before PP0 decides; only the decision concludes.
+        sender, manager = self._stuck_sender(KVPoll.Transferring)
+        sender.check_transfer_timeout()
+        self.assertEqual(manager.request_status[42], KVPoll.Transferring)
+        sender._last_chunk_time -= 61
+        sender.check_transfer_timeout()
+        sender.check_transfer_timeout()
+        self.assertEqual(manager.request_status[42], KVPoll.Failed)
+        self.assertIsNone(sender.conclude_state)
+        manager.send_kv_status_message.assert_called_once()
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+
+    def test_pp_release_poll_does_not_time_out_a_later_stage(self):
+        # PP0's last chunk is long queued, but stage 1 has not finished its
+        # forward: PP0's release poll must not count that against the timeout.
+        sender, manager = self._stuck_sender(KVPoll.Success)
+        manager.request_status = FakePPStatus(
+            manager.request_status, {42: KVPoll.WaitingForInput}
+        )
+        sender._last_chunk_time -= 61
+        sender.check_transfer_timeout()
+        self.assertEqual(sender.poll_pp_release(), KVPoll.WaitingForInput)
+        self.assertEqual(sender.poll(), KVPoll.Success)
+        manager.send_kv_status_message.assert_not_called()
+
     def test_mooncake_trace_context_reaches_worker_and_finishes(self):
         trace = Mock(tracing_enable=True)
         with (

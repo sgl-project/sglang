@@ -383,6 +383,8 @@ class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
+    # SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT on a prefill manager; 0 = off.
+    transfer_timeout: float = 0.0
     _status_lock = threading.Lock()
 
     # Wire layout of the prefill->decode terminal status message. The legacy
@@ -585,6 +587,8 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+            # A room whose transfer never ends would otherwise hold its KV forever.
+            self.transfer_timeout = envs.SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self._staging_handler = None
@@ -1183,6 +1187,22 @@ class CommonKVManager(BaseKVManager):
             status=KVPoll.Failed,
             targets=targets,
             failure_reason=failure_reason,
+        )
+
+    def fail_transfer_on_timeout(
+        self, bootstrap_room: int, stuck_in: str, elapsed: float
+    ) -> None:
+        """Fail a room past SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT and tell decode;
+        the scheduler then frees its KV through the transfer-failure path."""
+        if self.request_status.get(bootstrap_room) == KVPoll.Failed:
+            return
+        self.conclude_failure(
+            bootstrap_room=bootstrap_room,
+            failure_reason=(
+                f"KV transfer timed out after {elapsed:.1f}s in {stuck_in} "
+                f"(SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT={self.transfer_timeout:g}s, "
+                f"pp_rank={self.pp_rank})"
+            ),
         )
 
     def apply_prefill_status(
@@ -2431,6 +2451,9 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
+    # Monotonic time the last chunk was queued; the transfer timeout counts from it.
+    _last_chunk_time: Optional[float] = None
+
     def __init__(
         self,
         mgr: CommonKVManager,
@@ -2641,6 +2664,8 @@ class CommonKVSender(BaseKVSender):
             return
 
         state_indices = self.kv_mgr.prepare_send_state_indices(state_indices)
+        if is_last_chunk and self._last_chunk_time is None:
+            self._last_chunk_time = time.perf_counter()
         if self._transfer_start_time is None and (
             len(kv_indices) > 0 or state_indices is not None
         ):
@@ -2665,15 +2690,21 @@ class CommonKVSender(BaseKVSender):
         self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
-        return self._poll_with_status(self.kv_mgr.check_status)
+        return self._poll_with_status(
+            self.kv_mgr.check_status, check_transfer_timeout=True
+        )
 
     def poll_pp_consensus(self) -> KVPoll:
+        # Like poll_pp_release, only propagates: each PP stage times out its own
+        # transfer in check_transfer_timeout().
         return self._poll_with_status(self.kv_mgr.check_status_pp_consensus)
 
     def poll_pp_release(self) -> KVPoll:
         return self._poll_with_status(self.kv_mgr.check_status_pp_release)
 
-    def _poll_with_status(self, check_status) -> KVPoll:
+    def _poll_with_status(
+        self, check_status, check_transfer_timeout: bool = False
+    ) -> KVPoll:
         if self.conclude_state is not None:
             return self.conclude_state
 
@@ -2685,9 +2716,16 @@ class CommonKVSender(BaseKVSender):
         if status == KVPoll.Success and self.kv_mgr.staging_holds_success(
             self.bootstrap_room
         ):
-            return KVPoll.Transferring
+            status = KVPoll.Transferring
         if status == KVPoll.Bootstrapping:
             timeout_status = self._check_bootstrap_timeout()
+            if timeout_status is not None:
+                status = timeout_status
+        elif check_transfer_timeout and status in (
+            KVPoll.WaitingForInput,
+            KVPoll.Transferring,
+        ):
+            timeout_status = self._check_transfer_timeout(status)
             if timeout_status is not None:
                 status = timeout_status
         if status in (KVPoll.Success, KVPoll.Failed):
@@ -2725,6 +2763,42 @@ class CommonKVSender(BaseKVSender):
             f"in KVPoll.Bootstrapping",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        return KVPoll.Failed
+
+    def check_transfer_timeout(self) -> None:
+        # Local status only, and never concludes: under PP, PP0's release
+        # decision then sees this stage's Failed once every stage has concluded.
+        if (
+            self.conclude_state is not None
+            or self.kv_mgr.transfer_timeout <= 0
+            or self._last_chunk_time is None
+        ):
+            return
+        status = self.kv_mgr.request_status.get(self.bootstrap_room)
+        if status == KVPoll.Success and self.kv_mgr.staging_holds_success(
+            self.bootstrap_room
+        ):
+            status = KVPoll.Transferring
+        if status in (KVPoll.WaitingForInput, KVPoll.Transferring):
+            self._check_transfer_timeout(status)
+
+    def _check_transfer_timeout(self, status: KVPoll) -> Optional[KVPoll]:
+        # Only the transfer is left once the last chunk is queued.
+        timeout = self.kv_mgr.transfer_timeout
+        if timeout <= 0 or self._last_chunk_time is None:
+            return None
+        elapsed = time.perf_counter() - self._last_chunk_time
+        if elapsed < timeout:
+            return None
+        self.kv_mgr.fail_transfer_on_timeout(
+            bootstrap_room=self.bootstrap_room,
+            stuck_in=(
+                "KVPoll.Transferring"
+                if status == KVPoll.Transferring
+                else "KVPoll.WaitingForInput"
+            ),
+            elapsed=elapsed,
+        )
         return KVPoll.Failed
 
     def clear(self) -> None:
