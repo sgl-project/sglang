@@ -1997,6 +1997,14 @@ def run_benchmark(args_: argparse.Namespace):
     global args
     args = args_
 
+    if args.backend in _EMBEDDING_BACKENDS:
+        goodput = dict(getattr(args, "goodput", None) or ())
+        if "ttft" in goodput or "tpot" in goodput:
+            raise ValueError(
+                "For embedding backends, --goodput only supports e2el "
+                "(end-to-end latency)."
+            )
+
     # The Rust client owns the whole run, from dataset to result file, so hand
     # it the arguments before this module sets up anything of its own.
     if getattr(args, "rust_client", False):
@@ -2514,7 +2522,8 @@ def cli_main():
         metavar="KEY:VALUE",
         help="SLOs for goodput as KEY:VALUE pairs in milliseconds, with KEY in "
         f"{', '.join(GOODPUT_SLO_METRICS)}, e.g. --goodput ttft:500 tpot:50. A request "
-        "counts toward goodput only if it succeeds and meets every given SLO.",
+        "counts toward goodput only if it succeeds and meets every given SLO. "
+        "Embedding backends support only e2el.",
     )
     parser.add_argument(
         "--print-requests",

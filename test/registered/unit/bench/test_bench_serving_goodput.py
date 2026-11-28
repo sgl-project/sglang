@@ -2,9 +2,10 @@
 
 import argparse
 import unittest
+from unittest.mock import patch
 
 from sglang.benchmark.goodput import calculate_goodput
-from sglang.benchmark.serving import RequestFuncOutput, _goodput_slo
+from sglang.benchmark.serving import RequestFuncOutput, _goodput_slo, run_benchmark
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -56,6 +57,22 @@ class TestBenchServingGoodput(CustomTestCase):
             with self.subTest(entry=entry):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     _goodput_slo(entry)
+
+    def test_embeddings_reject_token_generation_slos_before_setup(self):
+        for backend in ("sglang-embedding", "vllm-embedding"):
+            for metric in ("ttft", "tpot"):
+                with self.subTest(backend=backend, metric=metric):
+                    args = argparse.Namespace(
+                        backend=backend, goodput=[(metric, 100.0), ("e2el", 500.0)]
+                    )
+                    with patch(
+                        "sglang.benchmark.serving.set_ulimit",
+                        side_effect=AssertionError(
+                            "Invalid SLO reached benchmark setup"
+                        ),
+                    ):
+                        with self.assertRaisesRegex(ValueError, "embedding.*e2el"):
+                            run_benchmark(args)
 
 
 if __name__ == "__main__":
