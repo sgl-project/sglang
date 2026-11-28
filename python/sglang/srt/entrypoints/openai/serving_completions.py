@@ -17,6 +17,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionStreamResponse,
     ErrorResponse,
     SglExt,
+    SpecTokensDetails,
     convert_json_schema_to_str,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
@@ -442,18 +443,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     )
 
             sglext_spec_tokens_details = None
-            if request.return_spec_tokens_details and spec_tokens_details:
-                spec_details = [
-                    spec_tokens_details[index]
-                    for index in sorted(spec_tokens_details)
-                    if spec_tokens_details[index] is not None
-                ]
-                if spec_details:
-                    sglext_spec_tokens_details = (
-                        spec_details
-                        if (request.n > 1 or len(spec_tokens_details) > 1)
-                        else spec_details[0]
-                    )
+            if request.return_spec_tokens_details and any(
+                detail is not None for detail in spec_tokens_details.values()
+            ):
+                num_choices = max(max(spec_tokens_details) + 1, request.n)
+                if num_choices > 1:
+                    sglext_spec_tokens_details = [
+                        spec_tokens_details[index]
+                        if spec_tokens_details.get(index) is not None
+                        else SpecTokensDetails()
+                        for index in range(num_choices)
+                    ]
+                else:
+                    sglext_spec_tokens_details = spec_tokens_details[0]
 
             if any(
                 obj is not None
@@ -553,18 +555,19 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
-        spec_details = [
-            detail
-            for detail in (
-                process_spec_tokens_details_from_ret(item, request) for item in ret
-            )
-            if detail is not None
+        raw_spec_details = [
+            process_spec_tokens_details_from_ret(item, request) for item in ret
         ]
-        spec_tokens_details = (
-            (spec_details if (request.n > 1 or len(ret) > 1) else spec_details[0])
-            if spec_details
-            else None
-        )
+        if any(detail is not None for detail in raw_spec_details):
+            if request.n > 1 or len(ret) > 1:
+                spec_tokens_details = [
+                    detail if detail is not None else SpecTokensDetails()
+                    for detail in raw_spec_details
+                ]
+            else:
+                spec_tokens_details = raw_spec_details[0]
+        else:
+            spec_tokens_details = None
         response_sglext = None
         if routed_experts or cached_tokens_details or spec_tokens_details:
             response_sglext = SglExt(

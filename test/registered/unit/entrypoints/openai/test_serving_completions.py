@@ -681,13 +681,13 @@ class ServingCompletionTestCase(unittest.TestCase):
             single_list_resp.sglext.spec_tokens_details.spec_cap_length, 1.0
         )
 
-        # Partial spec stats across a batched prompt still return a list.
+        # Partial spec stats keep choice.index alignment via zero-verify entries.
         plain_result = {
             "text": "choice-0",
             "meta_info": {
                 "id": "cmpl-spec-test",
                 "prompt_tokens": 10,
-                "completion_tokens": 2,
+                "completion_tokens": 1,
                 "cached_tokens": 0,
                 "cached_tokens_details": {"device": 2},
                 "finish_reason": {"type": "stop"},
@@ -695,6 +695,7 @@ class ServingCompletionTestCase(unittest.TestCase):
             },
             "index": 0,
         }
+        plain_result_1 = {**plain_result, "text": "choice-1", "index": 1}
         batch_req = CompletionRequest(
             model="x",
             prompt=["Hello", "World"],
@@ -702,30 +703,45 @@ class ServingCompletionTestCase(unittest.TestCase):
             n=1,
             return_spec_tokens_details=True,
         )
-        partial_resp = self.sc._build_completion_response(
-            batch_req, [plain_result, _spec_result(1)], 1234567890
+        parallel_req = CompletionRequest(
+            model="x",
+            prompt="Hello",
+            max_tokens=100,
+            n=2,
+            return_spec_tokens_details=True,
         )
-        self.assertIsInstance(partial_resp.sglext.spec_tokens_details, list)
-        self.assertEqual(
-            [item.spec_cap_length for item in partial_resp.sglext.spec_tokens_details],
-            [2.0],
-        )
+        for req in (batch_req, parallel_req):
+            with self.subTest(partial="choice0_missing", prompt=req.prompt, n=req.n):
+                partial_resp = self.sc._build_completion_response(
+                    req, [plain_result, _spec_result(1)], 1234567890
+                )
+                details = partial_resp.sglext.spec_tokens_details
+                self.assertIsInstance(details, list)
+                self.assertEqual(len(details), 2)
+                self.assertEqual(details[0], SpecTokensDetails())
+                self.assertEqual(details[1].spec_verify_ct, 1)
+                self.assertEqual(details[1].spec_cap_length, 2.0)
+                self.assertEqual(details[1].spec_cap_lens_histogram, [1, 1])
+
+            with self.subTest(partial="choice1_missing", prompt=req.prompt, n=req.n):
+                partial_resp = self.sc._build_completion_response(
+                    req, [_spec_result(0), plain_result_1], 1234567890
+                )
+                details = partial_resp.sglext.spec_tokens_details
+                self.assertIsInstance(details, list)
+                self.assertEqual(len(details), 2)
+                self.assertEqual(details[0].spec_verify_ct, 1)
+                self.assertEqual(details[0].spec_cap_length, 1.0)
+                self.assertEqual(details[1], SpecTokensDetails())
 
         # When no choice has spec metrics, omit spec_tokens_details (None, not []).
         for empty_req in (
             batch_req.model_copy(update={"return_cached_tokens_details": True}),
-            CompletionRequest(
-                model="x",
-                prompt="Hello",
-                max_tokens=100,
-                n=2,
-                return_spec_tokens_details=True,
-                return_cached_tokens_details=True,
-            ),
+            parallel_req.model_copy(update={"return_cached_tokens_details": True}),
         ):
             with self.subTest(prompt=empty_req.prompt, n=empty_req.n):
                 empty_resp = self.sc._build_completion_response(
-                    empty_req, [plain_result, plain_result], 1234567890
+                    empty_req, [plain_result, plain_result_1], 1234567890
                 )
                 self.assertIsNotNone(empty_resp.sglext)
                 self.assertIsNone(empty_resp.sglext.spec_tokens_details)
@@ -758,6 +774,14 @@ class ServingCompletionTestCase(unittest.TestCase):
             stream=True,
             return_spec_tokens_details=True,
         )
+        parallel_req = CompletionRequest(
+            model="x",
+            prompt="Hello",
+            max_tokens=100,
+            n=2,
+            stream=True,
+            return_spec_tokens_details=True,
+        )
         parsed = get_or_create_event_loop().run_until_complete(run_stream(batch_req))
         details = next(chunk["sglext"] for chunk in parsed if "sglext" in chunk)[
             "spec_tokens_details"
@@ -769,33 +793,79 @@ class ServingCompletionTestCase(unittest.TestCase):
             [[0, 1], [1, 1]],
         )
 
-        # Partial spec stats on a batched prompt still return a list.
+        # Partial spec stats preserve choice.index alignment with zero-verify entries.
         plain_choice_0 = {
             "text": "choice-0",
             "meta_info": {
                 "id": "cmpl-spec-test",
                 "prompt_tokens": 10,
-                "completion_tokens": 2,
+                "completion_tokens": 1,
                 "cached_tokens": 0,
+                "cached_tokens_details": {"device": 2},
                 "finish_reason": {"type": "stop"},
                 "weight_version": "default",
             },
             "index": 0,
         }
+        plain_choice_1 = {**plain_choice_0, "text": "choice-1", "index": 1}
+        zero_entry = SpecTokensDetails().model_dump()
 
-        async def mock_partial_generate(*args, **kwargs):
+        async def mock_partial_choice0_missing(*args, **kwargs):
             yield _spec_result(1)
             yield plain_choice_0
 
-        self.sc.tokenizer_manager.generate_request = mock_partial_generate
-        partial_parsed = get_or_create_event_loop().run_until_complete(
-            run_stream(batch_req)
-        )
-        partial_details = next(
-            chunk["sglext"] for chunk in partial_parsed if "sglext" in chunk
-        )["spec_tokens_details"]
-        self.assertIsInstance(partial_details, list)
-        self.assertEqual([item["spec_cap_length"] for item in partial_details], [2.0])
+        async def mock_partial_choice1_missing(*args, **kwargs):
+            yield plain_choice_1
+            yield _spec_result(0)
+
+        async def mock_gap_choice0_absent(*args, **kwargs):
+            yield _spec_result(1)
+
+        for req in (batch_req, parallel_req):
+            for name, mock_gen, expected in (
+                ("choice0_missing", mock_partial_choice0_missing, (zero_entry, 2.0)),
+                ("choice1_missing", mock_partial_choice1_missing, (1.0, zero_entry)),
+                ("choice0_absent", mock_gap_choice0_absent, (zero_entry, 2.0)),
+            ):
+                with self.subTest(case=name, prompt=req.prompt, n=req.n):
+                    self.sc.tokenizer_manager.generate_request = mock_gen
+                    partial_parsed = get_or_create_event_loop().run_until_complete(
+                        run_stream(req)
+                    )
+                    partial_details = next(
+                        chunk["sglext"] for chunk in partial_parsed if "sglext" in chunk
+                    )["spec_tokens_details"]
+                    self.assertIsInstance(partial_details, list)
+                    self.assertEqual(len(partial_details), 2)
+                    for idx, exp in enumerate(expected):
+                        if isinstance(exp, dict):
+                            self.assertEqual(partial_details[idx], exp)
+                        else:
+                            self.assertEqual(partial_details[idx]["spec_verify_ct"], 1)
+                            self.assertEqual(
+                                partial_details[idx]["spec_cap_length"], exp
+                            )
+
+        # When no choice has spec metrics in streaming, omit spec_tokens_details (None).
+        async def mock_all_plain(*args, **kwargs):
+            yield plain_choice_0
+            yield plain_choice_1
+
+        self.sc.tokenizer_manager.generate_request = mock_all_plain
+        for empty_req in (
+            batch_req.model_copy(update={"return_cached_tokens_details": True}),
+            parallel_req.model_copy(update={"return_cached_tokens_details": True}),
+        ):
+            with self.subTest(
+                empty_stream=True, prompt=empty_req.prompt, n=empty_req.n
+            ):
+                empty_parsed = get_or_create_event_loop().run_until_complete(
+                    run_stream(empty_req)
+                )
+                sglext = next(
+                    chunk["sglext"] for chunk in empty_parsed if "sglext" in chunk
+                )
+                self.assertNotIn("spec_tokens_details", sglext)
 
         # Single-element prompt list returns a single dict.
         async def mock_single_generate(*args, **kwargs):
