@@ -6,10 +6,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.lora.moe.families import CONFIG_QUANTIZATIONS
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -203,16 +204,13 @@ def check_lora_moe_runner_args(server_args: Any):
             f"--moe-runner-backend {backend} requires --lora-backend triton_v2"
         )
     _check_v2_lora_modes(cfg, f"--moe-runner-backend {backend}")
-    # Layer attachment checks the specific weight layout within each scheme.
-    if cfg.quantization not in (None, "fp8", "modelopt_fp4"):
+    # The checkpoint's resolved method, not the flag (often unset or an alias).
+    quantization = model_config_of(cfg).quantization
+    if quantization not in CONFIG_QUANTIZATIONS:
+        supported = ", ".join(q or "unquantized" for q in CONFIG_QUANTIZATIONS)
         raise ValueError(
-            f"--moe-runner-backend {backend} supports unquantized BF16, 128-block "
-            f"FP8 and ModelOpt NVFP4 MoE, got --quantization {cfg.quantization}"
-        )
-    if cfg.quantization == "modelopt_fp4" and backend != "lora_marlin":
-        raise ValueError(
-            f"--moe-runner-backend {backend} cannot run ModelOpt NVFP4 MoE; "
-            "use --moe-runner-backend lora_marlin"
+            f"--moe-runner-backend {backend} cannot serve {quantization} MoE "
+            f"weights. Checkpoint methods accepted at startup are {supported}."
         )
     if cfg.moe_a2a_backend != "none":
         raise ValueError(

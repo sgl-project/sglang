@@ -7,7 +7,9 @@ import torch
 
 from sglang.srt.layers.quantization.marlin_utils import (
     USE_FP32_REDUCE_DEFAULT,
+    check_moe_marlin_supports_layer,
     marlin_make_workspace,
+    marlin_moe_permute_scales,
     marlin_permute_scales,
     should_use_atomic_add_reduce,
 )
@@ -25,18 +27,16 @@ ScalarType, scalar_types = get_scalar_types()
 logger = logging.getLogger(__name__)
 
 
-def fp8_fused_exponent_bias_into_scales(scales):
-    fp8_exponent = 4
-    if scales.dtype == torch.half:
-        target_exponent = 5
-    elif scales.dtype == torch.bfloat16:
-        target_exponent = 8
-    # exponent_bias_fp16 = 2 ** 4 - 2 ** 3 = 8
-    # exponent_bias_bf16 = 2 ** 7 - 2 ** 3 = 120
-    exponent_bias = 2 ** (target_exponent - 1) - 2 ** (fp8_exponent - 1)
-    s = torch.ones_like(scales) * 2
-    s = s**exponent_bias
-    return scales * s
+# Compensate for the destination exponent bias minus the E4M3 bias (7).
+_FP8_SCALE_COMPENSATION = {torch.float16: 2.0**8, torch.bfloat16: 2.0**120}
+
+
+def fp8_fused_exponent_bias_into_scales(
+    scales: torch.Tensor, *, output_dtype: Optional[torch.dtype] = None
+) -> torch.Tensor:
+    if output_dtype is None:
+        output_dtype = scales.dtype
+    return (scales * _FP8_SCALE_COMPENSATION[output_dtype]).to(output_dtype)
 
 
 def fake_apply_fp8_marlin_linear(
@@ -193,6 +193,200 @@ def prepare_fp8_layer_for_marlin(
         layer.bias = torch.nn.Parameter(layer.bias.detach(), requires_grad=False)
 
 
+def marlin_fp8_scales_to_bf16(
+    scales: torch.Tensor, *, name: str = "scales"
+) -> torch.Tensor:
+    """Compensate before the BF16 cast to preserve tiny scales."""
+    scales = scales.to(torch.float32)
+    if not bool(torch.isfinite(scales).all()):
+        raise ValueError(f"FP8 Marlin {name} must be finite")
+    limit = torch.finfo(torch.bfloat16).max / _FP8_SCALE_COMPENSATION[torch.bfloat16]
+    largest = float(scales.abs().amax()) if scales.numel() else 0.0
+    if largest > limit:
+        raise ValueError(
+            f"FP8 Marlin {name} exceed the BF16 range after exponent compensation: "
+            f"largest absolute scale {largest:.4g} > {limit:.6g}"
+        )
+    return fp8_fused_exponent_bias_into_scales(scales, output_dtype=torch.bfloat16)
+
+
+def marlin_moe_fp8_channel_scales(scales: torch.Tensor) -> torch.Tensor:
+    """[E, N, 1] per-output-row scales as Marlin's [E, 1, N] channel-wise groups."""
+    return scales.reshape(scales.shape[0], 1, -1)
+
+
+def marlin_moe_fp8_tensor_scales(scales: torch.Tensor, *, size_n: int) -> torch.Tensor:
+    """Repeat each expert or shard scale over its own output channels."""
+    scales = scales.to(torch.float32)
+    if scales.ndim == 1:
+        scales = scales[:, None]
+    experts, shards = scales.shape
+    return scales.repeat_interleave(size_n // shards, dim=1).reshape(experts, 1, size_n)
+
+
+def marlin_moe_fp8_block_scales(
+    scales: torch.Tensor, *, size_n: int, block_n: int
+) -> torch.Tensor:
+    """Expand block scales along N into Marlin [E, K / block_k, N] order."""
+    scales = scales.transpose(1, 2).repeat_interleave(block_n, dim=2)
+    return scales[:, :, :size_n].contiguous()
+
+
+def marlin_moe_mxfp8_scales(scales: torch.Tensor) -> torch.Tensor:
+    """[E, N, K / 32] E8M0 bytes as [E, K / 32, N] FP32 values 2 ** (e - 127)."""
+    return scales.view(torch.float8_e8m0fnu).float().transpose(1, 2).contiguous()
+
+
+def marlin_fp8_moe_group_size(
+    w13_scales: torch.Tensor,
+    w2_scales: torch.Tensor,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+) -> int:
+    """Use multiple K groups so Marlin scales before the MMA,
+    avoiding underflow from the E4M3 exponent shift.
+    """
+    present = [
+        size_k // scales.shape[1]
+        for scales, size_k in (
+            (w13_scales, hidden_size),
+            (w2_scales, intermediate_size),
+        )
+        if scales.shape[1] > 1
+    ]
+    group_size = min(present) if present else 128
+    # The MoE kernel instantiates E4M3 weights for these group sizes only.
+    if group_size not in (32, 128):
+        raise NotImplementedError(
+            f"the Marlin FP8 MoE kernels take 32- or 128-wide K groups, got {group_size}"
+        )
+    if group_size == 128 and not all(
+        k % 128 == 0 and k >= 256 for k in (hidden_size, intermediate_size)
+    ):
+        group_size = 32
+    return group_size
+
+
+def marlin_fp8_scales_at_group(
+    scales: torch.Tensor, *, size_k: int, group_size: int
+) -> torch.Tensor:
+    """Expand scales from [E, groups, N] to the kernel's K group width."""
+    groups = size_k // group_size
+    if scales.shape[1] == groups:
+        return scales
+    if groups % scales.shape[1] == 0:
+        return scales.repeat_interleave(groups // scales.shape[1], dim=1)
+    raise ValueError(
+        f"{scales.shape[1]} K groups over {size_k} cannot be served with "
+        f"{group_size}-wide groups"
+    )
+
+
+def check_lora_marlin_fp8_moe_layer(
+    params_dtype: torch.dtype, *, with_bias: bool
+) -> None:
+    if params_dtype != torch.bfloat16:
+        raise NotImplementedError(
+            "--moe-runner-backend lora_marlin serves FP8 MoE experts with BF16 "
+            f"activations only (--dtype bfloat16), got {params_dtype}"
+        )
+    if with_bias:
+        raise NotImplementedError(
+            "--moe-runner-backend lora_marlin serves FP8 MoE experts without expert "
+            "biases, and this layer has them"
+        )
+
+
+def repack_moe_fp8_layer_for_marlin(
+    layer: torch.nn.Module,
+    layout: str,
+    *,
+    scales: str = "weight_scale",
+    block_n: int | None = None,
+) -> None:
+    converted = []
+    for name in ("w13", "w2"):
+        scale = getattr(layer, f"{name}_{scales}")
+        size_n = getattr(layer, f"{name}_weight").shape[1]
+        match layout:
+            case "block":
+                converted.append(
+                    marlin_moe_fp8_block_scales(scale, size_n=size_n, block_n=block_n)
+                )
+            case "mxfp8":
+                converted.append(marlin_moe_mxfp8_scales(scale))
+            case "channel":
+                converted.append(marlin_moe_fp8_channel_scales(scale))
+            case "tensor":
+                converted.append(marlin_moe_fp8_tensor_scales(scale, size_n=size_n))
+            case _:
+                raise ValueError(f"unknown FP8 weight-scale layout {layout!r}")
+    prepare_moe_fp8_layer_for_marlin(
+        layer,
+        w13_scales=converted[0],
+        w2_scales=converted[1],
+    )
+
+
+def prepare_moe_fp8_layer_for_marlin(
+    layer: torch.nn.Module,
+    *,
+    w13_scales: torch.Tensor,
+    w2_scales: torch.Tensor,
+) -> None:
+    """Repack E4M3 weights and FP32 [E, groups, N] scales for Marlin W8A16."""
+    hidden_size = layer.w13_weight.shape[2]
+    intermediate_size = layer.w2_weight.shape[2]
+    group_size = marlin_fp8_moe_group_size(
+        w13_scales,
+        w2_scales,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+    )
+    w13_scales = marlin_fp8_scales_at_group(
+        w13_scales, size_k=hidden_size, group_size=group_size
+    )
+    w2_scales = marlin_fp8_scales_at_group(
+        w2_scales, size_k=intermediate_size, group_size=group_size
+    )
+    # The kernel tiles N in 128s; without a gate, gate/up N is the intermediate size.
+    if (
+        not check_moe_marlin_supports_layer(layer, group_size)
+        or layer.w13_weight.shape[1] % 128
+    ):
+        raise ValueError(
+            "this FP8 MoE layer does not satisfy the Marlin constraints: "
+            "hidden_size % 128 == 0, intermediate_size % "
+            f"{max(64, group_size)} == 0 (% 128 without a gate), SiLU/SiTU or ReLU2 "
+            "without router weights on the input"
+        )
+    stages = (("w13", w13_scales), ("w2", w2_scales))
+    # Validate both scale tensors before modifying either expert weight.
+    converted = {
+        name: marlin_fp8_scales_to_bf16(scales, name=f"{name} scales")
+        for name, scales in stages
+    }
+    for name, scales in converted.items():
+        weight = getattr(layer, f"{name}_weight")
+        _, size_n, size_k = weight.shape
+        qweight = marlin_moe_fp8_weights(weight)
+        marlin_scales = marlin_moe_permute_scales(
+            s=scales, size_k=size_k, size_n=size_n, group_size=group_size
+        )
+        setattr(
+            layer, f"{name}_weight", torch.nn.Parameter(qweight, requires_grad=False)
+        )
+        setattr(
+            layer,
+            f"{name}_weight_scale",
+            torch.nn.Parameter(marlin_scales, requires_grad=False),
+        )
+    for stale in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+        if hasattr(layer, stale):
+            delattr(layer, stale)
+
+
 def pack_fp8_to_int32(
     fp8_tensor: torch.Tensor, size_k_first: bool = True
 ) -> torch.Tensor:
@@ -208,6 +402,26 @@ def pack_fp8_to_int32(
     # with `.view(torch.int32)`, it become (N, K // 4)
     int32_tensor = fp8_tensor.view(torch.int32)
     return int32_tensor.T.contiguous() if size_k_first else int32_tensor
+
+
+def marlin_moe_fp8_weights(weight: torch.Tensor) -> torch.Tensor:
+    """[E, N, K] E4M3 experts as Marlin tiles, int32 [E, K / 16, 4 * N]."""
+    num_experts, size_n, size_k = weight.shape
+    perm = torch.empty(0, dtype=torch.int32, device=weight.device)
+    output = torch.empty(
+        (num_experts, size_k // 16, size_n * 4),
+        dtype=torch.int32,
+        device=weight.device,
+    )
+    for i, expert in enumerate(weight):
+        output[i] = gptq_marlin_repack(
+            b_q_weight=pack_fp8_to_int32(expert, size_k_first=False).T.contiguous(),
+            perm=perm,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=8,
+        )
+    return output
 
 
 def prepare_moe_mxfp8_layer_for_marlin(layer: torch.nn.Module) -> None:
@@ -240,25 +454,6 @@ def prepare_moe_mxfp8_layer_for_marlin(layer: torch.nn.Module) -> None:
             f"== 0, got {hidden_size} and {intermediate_size}"
         )
 
-    perm = torch.empty(0, dtype=torch.int32, device=w13.device)
-
-    def repack(weight: torch.Tensor) -> torch.Tensor:
-        _, size_n, size_k = weight.shape
-        output = torch.empty(
-            (num_experts, size_k // 16, size_n * 4),
-            dtype=torch.int32,
-            device=weight.device,
-        )
-        for i, expert in enumerate(weight):
-            output[i] = gptq_marlin_repack(
-                b_q_weight=pack_fp8_to_int32(expert, size_k_first=False).T.contiguous(),
-                perm=perm,
-                size_k=size_k,
-                size_n=size_n,
-                num_bits=8,
-            )
-        return output
-
     def permute_scales(scales: torch.Tensor, size_n: int, size_k: int) -> torch.Tensor:
         if scales.shape != (num_experts, size_n, size_k // 32):
             raise ValueError(
@@ -282,8 +477,12 @@ def prepare_moe_mxfp8_layer_for_marlin(layer: torch.nn.Module) -> None:
     w2_scale = permute_scales(
         layer.w2_weight_scale_inv.data, hidden_size, intermediate_size
     )
-    layer.w13_weight = torch.nn.Parameter(repack(w13), requires_grad=False)
-    layer.w2_weight = torch.nn.Parameter(repack(w2), requires_grad=False)
+    layer.w13_weight = torch.nn.Parameter(
+        marlin_moe_fp8_weights(w13), requires_grad=False
+    )
+    layer.w2_weight = torch.nn.Parameter(
+        marlin_moe_fp8_weights(w2), requires_grad=False
+    )
     layer.w13_weight_scale = torch.nn.Parameter(w13_scale, requires_grad=False)
     layer.w2_weight_scale = torch.nn.Parameter(w2_scale, requires_grad=False)
     del layer.w13_weight_scale_inv

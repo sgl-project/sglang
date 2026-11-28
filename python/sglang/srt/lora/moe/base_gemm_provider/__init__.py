@@ -81,6 +81,13 @@ def select_provider_cls(
             )
 
             return MarlinMxfp4PairProvider
+        case "marlin", ("fp8" | "fp8_channel" | "fp8_tensor" | "mxfp8"):
+            # One W8A16 provider: every FP8 scale layout repacks into Marlin groups.
+            from sglang.srt.lora.moe.base_gemm_provider.marlin import (
+                MarlinFp8PairProvider,
+            )
+
+            return MarlinFp8PairProvider
         case "cutedsl", "mxfp4":
             from sglang.srt.lora.moe.base_gemm_provider.cutedsl_blockscaled import (
                 CuteDslMxfp4ContiguousProvider,

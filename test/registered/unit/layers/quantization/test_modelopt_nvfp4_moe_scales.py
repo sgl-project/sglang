@@ -216,6 +216,118 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
                             up_alpha, torch.tensor([0.5 * (reload + 1)])
                         )
 
+    def test_lora_loaders_keep_checkpoint_scales_without_swizzled_copies(self):
+        from sglang.srt.lora.moe.quant_info import MoeLoraNvFp4QuantInfo
+
+        for backend in (
+            MoeRunnerBackend.FLASHINFER_CUTLASS,
+            MoeRunnerBackend.LORA_CUTEDSL,
+            MoeRunnerBackend.LORA_MARLIN,
+        ):
+            with (
+                self.subTest(backend=backend),
+                get_flags().moe.override(
+                    runner_backend=backend, a2a_backend=MoeA2ABackend.NONE
+                ),
+                mock.patch.object(
+                    modelopt_quant,
+                    "get_platform",
+                    return_value=SimpleNamespace(is_blackwell=True),
+                ),
+                mock.patch.object(modelopt_quant, "is_cuda", return_value=False),
+            ):
+                layer = torch.nn.Module()
+                layer.moe_runner_config = MoeRunnerConfig(is_gated=True)
+                layer.num_experts = layer.num_local_experts = 2
+                method = ModelOptNvFp4FusedMoEMethod(
+                    modelopt_quant.ModelOptFp4Config(
+                        is_checkpoint_nvfp4_serialized=True,
+                        group_size=16,
+                        use_per_token_activation=False,
+                    )
+                )
+                method.create_weights(layer, 2, 128, 128, torch.bfloat16)
+                for stage in ("w13", "w2"):
+                    scale = getattr(layer, f"{stage}_weight_scale")
+                    swizzled = getattr(layer, f"{stage}_blockscale_swizzled")
+                    self.assertEqual(scale.dtype, torch.float8_e4m3fn)
+                    if backend is MoeRunnerBackend.FLASHINFER_CUTLASS:
+                        self.assertEqual(swizzled.shape, scale.shape)
+                    else:
+                        self.assertIsNone(swizzled)
+
+                if backend is MoeRunnerBackend.LORA_CUTEDSL:
+                    layer.quant_method = method
+                    layer.hidden_size = 128
+                    layer.w13_weight_scale_2.data.copy_(
+                        torch.tensor([[0.5, 1.0], [2.0, 4.0]])
+                    )
+                    layer.w2_weight_scale_2.data.copy_(torch.tensor([1.0, 2.0]))
+                    layer.w13_input_scale.data.copy_(
+                        torch.tensor([[0.25, 0.5], [0.125, 0.25]])
+                    )
+                    layer.w2_input_scale.data.copy_(torch.tensor([0.25, 0.0]))
+                    static = MoeLoraNvFp4QuantInfo.from_layer(layer)
+                    method.quant_config.use_per_token_activation = True
+                    per_token = MoeLoraNvFp4QuantInfo.from_layer(layer)
+                    self.assertEqual(
+                        (per_token.w13_input_scale, per_token.w2_input_scale),
+                        (None, None),
+                    )
+                    torch.testing.assert_close(
+                        static.alpha,
+                        (
+                            torch.tensor([[0.25, 0.5], [1.0, 2.0]]),
+                            torch.tensor([[0.25], [0.5]]),
+                        ),
+                    )
+                    torch.testing.assert_close(
+                        per_token.alpha,
+                        (
+                            torch.tensor([[0.5, 1.0], [2.0, 4.0]]),
+                            torch.tensor([[1.0], [2.0]]),
+                        ),
+                    )
+
+                    method.quant_config.use_per_token_activation = False
+                    for name, bad in (
+                        ("w13_input_scale", float("inf")),
+                        ("w2_input_scale", 0.0),
+                    ):
+                        scale = getattr(layer, name).data
+                        saved = scale.clone()
+                        scale.fill_(bad)
+                        with (
+                            self.subTest(scale=name),
+                            self.assertRaisesRegex(ValueError, name),
+                        ):
+                            MoeLoraNvFp4QuantInfo.from_layer(layer)
+                        scale.copy_(saved)
+
+                    # Load-time NVFP4 (no checkpoint metadata) has no is_w4a16.
+                    method.quant_config = modelopt_quant.ModelOptFp4Config.for_online_weight_quantization()
+                    torch.testing.assert_close(
+                        MoeLoraNvFp4QuantInfo.from_layer(layer).alpha, static.alpha
+                    )
+
+                    prefix = "model.layers.0.mlp.experts"
+                    w4a16 = {"quant_algo": "W4A16_NVFP4"}
+                    for config in (
+                        modelopt_quant.ModelOptFp4Config.from_config(w4a16),
+                        modelopt_quant.ModelOptMixedPrecisionConfig.from_config(
+                            {
+                                "quant_algo": "MIXED_PRECISION",
+                                "quantized_layers": {prefix: w4a16},
+                            }
+                        ),
+                    ):
+                        with self.subTest(config=type(config).__name__):
+                            layer.quant_method = config.get_quant_method(
+                                FusedMoE.__new__(FusedMoE), prefix
+                            )
+                            with self.assertRaisesRegex(ValueError, "W4A16_NVFP4"):
+                                MoeLoraNvFp4QuantInfo.from_layer(layer)
+
     def test_non_gated_trtllm_loads_one_projection(self):
         with get_flags().moe.override(
             runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
