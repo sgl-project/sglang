@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from sglang.srt.constrained.base_grammar_backend import InvalidGrammarObject
 from sglang.srt.constrained.json_schema_validation import (
     UnsupportedJSONSchemaFeature,
+    _iter_subschemas,
     validate_outlines_json_schema,
     validate_xgrammar_json_schema,
 )
@@ -111,6 +112,40 @@ class TestXGrammarJSONSchemaValidation(unittest.TestCase):
                 "examples": [{"multipleOf": 2}],
             }
         )
+
+    def test_deterministic_subschema_traversal_and_boolean_subschemas(self):
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "unevaluatedProperties": False,
+            "items": {"multipleOf": 2},
+            "additionalItems": {"uniqueItems": True},
+            "allOf": [{"not": {}}],
+            "anyOf": [{"contains": {}}],
+            "$defs": {"a": {"multipleOf": 3}},
+            "properties": {"b": {"uniqueItems": True}},
+            "dependencies": {"b": False, "a": {"multipleOf": 4}},
+        }
+        pointers = [pointer for _, pointer in _iter_subschemas(schema)]
+        self.assertEqual(
+            pointers,
+            [
+                "#",
+                "#/additionalItems",
+                "#/items",
+                "#/allOf/0",
+                "#/allOf/0/not",
+                "#/anyOf/0",
+                "#/anyOf/0/contains",
+                "#/$defs/a",
+                "#/properties/b",
+                "#/dependencies/a",
+            ],
+        )
+        with self.assertRaisesRegex(
+            UnsupportedJSONSchemaFeature, "#/additionalItems"
+        ):
+            validate_xgrammar_json_schema(schema)
 
 
 class TestOutlinesJSONSchemaValidation(unittest.TestCase):
