@@ -22,7 +22,12 @@ from typing import List, Tuple
 import torch
 
 from sglang.kernels.jit.utils.arch import CompileArch, get_compile_arch
-from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime, is_sail_runtime
+from sglang.kernels.jit.utils.common import (
+    cache_once,
+    is_hip_runtime,
+    is_musa_runtime,
+    is_sail_runtime,
+)
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
@@ -73,8 +78,23 @@ def rocm_home() -> str:
 
 
 @cache_once
+def musa_home() -> str:
+    from torch_musa.utils.musa_extension import MUSA_HOME
+
+    return MUSA_HOME
+
+
+@cache_once
+def torchada_cuda_compat_include_dir() -> str:
+    """Torchada's CUDA-named headers for direct JIT compiler consumers."""
+    from torchada.cuda_compat import cuda_compat_include_dir
+
+    return cuda_compat_include_dir()
+
+
+@cache_once
 def device_compiler_path() -> str:
-    """The nvcc/hipcc/hgcc that JIT builds actually invoke.
+    """The nvcc/hipcc/mcc/hgcc that JIT builds actually invoke.
 
     Resolved the same way tvm-ffi resolves it, so the binary the cache
     fingerprints is the binary that does the compiling.
@@ -83,6 +103,8 @@ def device_compiler_path() -> str:
         return hgcc_path()
     if is_hip_runtime():
         return os.path.join(rocm_home(), "bin", "hipcc")
+    if is_musa_runtime():
+        return os.path.join(musa_home(), "bin", "mcc")
     return os.path.join(cuda_home(), "bin", "nvcc")
 
 
@@ -138,26 +160,40 @@ def host_compiler_path() -> str:
 
 
 @cache_once
-def gpu_arch_name() -> str:
+def gpu_arch_name(arch: CompileArch | None = None) -> str:
     """The compile target as the vendor names it.
 
     On ROCm this is ``gcnArchName`` (``gfx942:sramecc+:xnack-``) rather than the
     CUDA-shaped ``(major, minor)`` capability: the latter maps gfx940/gfx941/
     gfx942 onto a single ``9.4``, which are three different compile targets.
+    For MUSA, an explicit ``arch`` takes precedence over ``MTGPU_TARGET``,
+    which in turn takes precedence over the device detected at runtime.
     """
-    if not is_hip_runtime():
-        return get_compile_arch().target_name
-    try:
-        device = torch.cuda.current_device()
-        return str(torch.cuda.get_device_properties(device).gcnArchName)
-    except Exception:
-        logger.warning("Cannot detect ROCm gcnArchName; the JIT cache target degrades.")
-        return "unknown"
+    if is_hip_runtime():
+        try:
+            device = torch.cuda.current_device()
+            return str(torch.cuda.get_device_properties(device).gcnArchName)
+        except Exception:
+            logger.warning(
+                "Cannot detect ROCm gcnArchName; the JIT cache target degrades."
+            )
+            return "unknown"
+    if is_musa_runtime():
+        if arch is not None and (arch.major, arch.minor) != (0, 0):
+            return f"mp_{arch.major}{arch.minor}{arch.suffix}"
+        configured = os.environ.get("MTGPU_TARGET")
+        if configured:
+            return configured
+        arch = arch or get_compile_arch()
+        if (arch.major, arch.minor) == (0, 0):
+            return "unknown"
+        return f"mp_{arch.major}{arch.minor}{arch.suffix}"
+    return (arch or get_compile_arch()).target_name
 
 
 @cache_once
 def toolkit_home() -> pathlib.Path:
-    """The CUDA/ROCm root, derived from the compiler already resolved."""
+    """The CUDA/ROCm/MUSA root, derived from the compiler already resolved."""
     return pathlib.Path(device_compiler_path()).parent.parent
 
 
@@ -192,6 +228,8 @@ def target_flags(arch: CompileArch | None = None) -> List[str]:
         return [f"--gpu-architecture={sail_arch}"]
     if is_hip_runtime():
         return [f"--offload-arch={gpu_arch_name()}"]
+    if is_musa_runtime():
+        return [f"--offload-arch={gpu_arch_name(arch)}"]
     arch = arch or get_compile_arch()
     target = f"{arch.major}{arch.minor}{arch.suffix}"
     return [f"-gencode=arch=compute_{target},code=sm_{target}"]
@@ -210,6 +248,8 @@ def base_cxx_flags() -> List[str]:
 def base_cuda_flags() -> List[str]:
     if is_hip_runtime():
         return ["-fPIC", "-D__HIP_PLATFORM_AMD__=1", "-fno-gpu-rdc"]
+    if is_musa_runtime():
+        return ["-fPIC", "-x", "musa"]
     return ["-Xcompiler", "-fPIC"]
 
 
@@ -217,6 +257,12 @@ def base_include_paths() -> List[str]:
     includes, _, _ = tvm_ffi_paths()
     if is_hip_runtime():
         return [*includes, f"{rocm_home()}/include"]
+    if is_musa_runtime():
+        return [
+            torchada_cuda_compat_include_dir(),
+            *includes,
+            f"{musa_home()}/include",
+        ]
     return list(includes)
 
 
@@ -239,6 +285,8 @@ def base_link_flags(*, with_device: bool) -> List[str]:
         ]
     if is_hip_runtime():
         return flags + [f"-L{rocm_home()}/lib", "-lamdhip64"]
+    if is_musa_runtime():
+        return flags + [f"-L{musa_home()}/lib", "-lmusart"]
     return flags + [f"-L{cuda_home()}/lib64", "-lcudart"]
 
 

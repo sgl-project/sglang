@@ -492,7 +492,7 @@ def test_pure_cpp_module_does_not_link_the_gpu_runtime():
         for line in ninja.generate(with_device).splitlines()
         if line.startswith("ldflags = ")
     )
-    assert "cudart" in ldflags or "amdhip" in ldflags
+    assert any(runtime in ldflags for runtime in ("cudart", "amdhip", "musart"))
 
 
 def test_generated_ninja_is_deterministic():
@@ -578,7 +578,13 @@ def test_layout_is_readable_and_scoped_by_build_key():
     assert scope.parent.parent.name == cache._target_tag()
 
 
-def test_a_family_target_compiles_and_caches_as_itself():
+def test_a_family_target_compiles_and_caches_as_itself(monkeypatch):
+    monkeypatch.setattr(toolchain, "is_sail_runtime", lambda: False)
+    monkeypatch.setattr(toolchain, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(toolchain, "is_musa_runtime", lambda: False)
+    monkeypatch.setattr(cache, "is_sail_runtime", lambda: False)
+    monkeypatch.setattr(cache, "is_hip_runtime", lambda: False)
+    monkeypatch.setattr(cache, "is_musa_runtime", lambda: False)
     family = CompileArch(10, 0, "f")
     assert "-gencode=arch=compute_100f,code=sm_100f" in ninja.generate(
         _spec(compile_arch=family)

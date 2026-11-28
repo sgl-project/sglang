@@ -226,8 +226,10 @@ def _target_tag(arch: Optional[CompileArch] = None) -> str:
         return f"sail_{safe}"
     if is_hip_runtime():
         return toolchain.gpu_arch_name().split(":")[0] or "unknown"
+    if is_musa_runtime():
+        return toolchain.gpu_arch_name(arch)
     arch = arch or get_compile_arch()
-    prefix = "mp" if is_musa_runtime() else "sm"
+    prefix = "sm"
     return f"{prefix}{arch.major}{arch.minor}{arch.suffix}"
 
 
@@ -253,8 +255,8 @@ def _environment_fingerprint(arch: Optional[CompileArch] = None) -> str:
     elif is_hip_runtime():
         target = f"hip:{toolchain.gpu_arch_name()}"
     else:
-        arch = arch or get_compile_arch()
-        target = f"{'musa' if is_musa_runtime() else 'cuda'}:{arch.target_name}"
+        platform = "musa" if is_musa_runtime() else "cuda"
+        target = f"{platform}:{toolchain.gpu_arch_name(arch)}"
 
     compilers = []
     for path in (toolchain.device_compiler_path(), toolchain.host_compiler_path()):
