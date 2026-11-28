@@ -42,6 +42,29 @@ def _default_on_in_ci() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+# Parsed values by name once `freeze_env_reads` ran; None reads os.environ every time.
+_frozen_reads: Optional[Dict[str, Any]] = None
+
+
+def freeze_env_reads() -> None:
+    """Serve every later ``EnvField.get`` from a per-process memo.
+
+    Gated by SGLANG_OPT_FREEZE_ENV_READS, for a process whose hot loop reads the
+    same variables every step, once its startup is over. Writes through ``set`` /
+    ``override`` / ``clear`` drop the memo; a raw ``os.environ`` write after this
+    call is not seen.
+    """
+    global _frozen_reads
+    if _frozen_reads is None and envs.SGLANG_OPT_FREEZE_ENV_READS.get():
+        _frozen_reads = {}
+
+
+def _drop_frozen_reads() -> None:
+    # Callable defaults read other fields, so one write can change several values.
+    if _frozen_reads is not None:
+        _frozen_reads.clear()
+
+
 class EnvField:
     _allow_set_name = True
     # An empty value reads as unset for a type where "" cannot parse; a string
@@ -68,6 +91,16 @@ class EnvField:
         return self.default() if callable(self.default) else self.default
 
     def get(self) -> Any:
+        frozen = _frozen_reads
+        if frozen is None:
+            return self._read()
+        try:
+            return frozen[self.name]
+        except KeyError:
+            value = frozen[self.name] = self._read()
+            return value
+
+    def _read(self) -> Any:
         value = os.getenv(self.name)
 
         # Explicitly set to None
@@ -90,6 +123,7 @@ class EnvField:
     def set(self, value: Any):
         self._set_to_none = value is None
         os.environ[self.name] = str(value)
+        _drop_frozen_reads()
 
     @contextmanager
     def override(self, value: Any):
@@ -105,10 +139,12 @@ class EnvField:
             else:
                 os.environ.pop(self.name, None)
             self._set_to_none = backup_set_to_none
+            _drop_frozen_reads()
 
     def clear(self):
         os.environ.pop(self.name, None)
         self._set_to_none = False
+        _drop_frozen_reads()
 
     def __bool__(self):
         raise RuntimeError(
@@ -178,7 +214,7 @@ class _DeprecatedEnvFallback:
         super().__init__(default, secret=secret)
         self.deprecated_name = deprecated_name
 
-    def get(self) -> Any:
+    def _read(self) -> Any:
         if not self.is_set():
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
@@ -192,7 +228,7 @@ class _DeprecatedEnvFallback:
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
-        return super().get()
+        return super()._read()
 
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
@@ -762,6 +798,12 @@ class Envs:
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
+    # Replay decode batches made only of beam requests as CUDA graphs.
+    SGLANG_ENABLE_BEAM_DECODE_GRAPH = EnvBool(False)
+    # Beam width of the shared-context beam graphs.
+    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH = EnvInt(None)
+    # Tokens per request the beam graphs hold; needed when the model has no trie.
+    SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY = EnvInt(None)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
@@ -1832,6 +1874,13 @@ class Envs:
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Once the scheduler's event loop starts, serve EnvField reads from a memo
+    # (freeze_env_reads). Opt-in: torch.compile traces EnvField.get, so a function
+    # compiled before the freeze and called outside graph replay recompiles once at
+    # the freeze and again whenever a new variable enters the memo.
+    SGLANG_OPT_FREEZE_ENV_READS = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
     SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED = EnvBool(
@@ -2253,6 +2302,35 @@ class Envs:
     # CUDA: fuse inverse RoPE into the UE8M0 FP8 wo_a activation quantization.
     # Off by default; requires the FP8 wo_a path.
     SGLANG_OPT_FP8_WO_A_FUSED_INVROPE = EnvBool(False)
+    # ROCm gfx950 TP-only: overlap wo_b's all-reduce with its GEMM through mori
+    # cco. Off by default: it reserves a symmetric window outside torch's
+    # allocator, so a run that enables it wants a lower --mem-fraction-static.
+    # It also substitutes the GEMM, so the output moves. Only where wo_a hands
+    # over an Fp8GridActivation -- the gfx950 native mxfp8 route -- do the two
+    # quantise identically and agree bit for bit. On --fp8-gemm-backend aiter,
+    # which the MI355X recipes pin, wo_b gets a plain bf16 tensor and each path
+    # rounds it itself: relative L2 7.5e-3 to 8.2e-3, measured at M=16384 TP4.
+    SGLANG_OPT_FUSED_WO_B_AR = EnvBool(False)
+    # Send the fused wo_b's all-gather leg as fp8 e4m3 with a per-row scale,
+    # halving its bytes. Off by default: it costs accuracy, and that is e4m3's
+    # mantissa width rather than a granularity that can be tuned away.
+    SGLANG_OPT_FUSED_WO_B_AR_FP8_GATHER = EnvBool(False)
+    # Which transport carries the fused wo_b's all-gather leg, "lsa" or "sdma".
+    # LSA pulls, so with an fp8 gather it widens on the way in rather than in a
+    # second kernel. Only read when the fused path is on.
+    SGLANG_OPT_FUSED_WO_B_AR_GATHER_TRANSPORT = EnvStr("lsa")
+    # Seconds the fused wo_b's self-test may spend in its device phases. They end
+    # in cross-rank barriers with no timeout of their own, so a stack whose SDMA
+    # queues exist but never complete wedges every rank there; past this the path
+    # is turned off instead. A healthy self-test is well under a second -- the
+    # compile already happened in warmup -- so this is a loose upper bound.
+    SGLANG_OPT_FUSED_WO_B_AR_SELF_TEST_TIMEOUT_S = EnvFloat(60.0)
+    # Debug: log the distribution of M the fused wo_b is offered. M is the token
+    # count of one forward, not of one request, so this is the only way to see
+    # what the scheduler actually batches.
+    SGLANG_OPT_FUSED_WO_B_AR_SHAPE_LOG = EnvBool(False)
+    # Debug: run both the fused and the unfused wo_b and log their relative L2.
+    SGLANG_DEBUG_FUSED_WO_B_AR = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     # DSpark decode: build the verify window and the draft anchor column in one

@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     DENOISING_LOOP_STATE,
     get_forward_context,
+    get_forward_context_or_none,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -262,12 +263,19 @@ class AnimaAttention(nn.Module):
             prefix=prefix,
         )
 
+    def project_context_kv(self, context):
+        shape = (self.heads, self.head_dim)
+        k = self.to_k(context)[0].unflatten(-1, shape)
+        v = self.to_v(context)[0].unflatten(-1, shape)
+        return self.norm_k(k), v
+
     def forward(self, x, context=None, rope=None, attn_mask_meta=None):
-        context = x if context is None else context
         q = self.to_q(x)[0].unflatten(-1, (self.heads, self.head_dim))
-        k = self.to_k(context)[0].unflatten(-1, (self.heads, self.head_dim))
-        v = self.to_v(context)[0].unflatten(-1, (self.heads, self.head_dim))
-        q, k = self.norm_q(q), self.norm_k(k)
+        if isinstance(context, tuple):
+            k, v = context
+        else:
+            k, v = self.project_context_kv(x if context is None else context)
+        q = self.norm_q(q)
         if rope is not None:
             q, k = _anima_rope(q, k, *rope)
         out = self.attn(q, k, v, attn_mask_meta=attn_mask_meta).flatten(2)
@@ -363,6 +371,7 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
         if arch.num_attention_heads % get_tp_world_size():
             raise ValueError("Anima attention heads must be divisible by TP size")
+        self._cache_unquantized_text_kv = quant_config is None
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.in_channels
@@ -432,8 +441,76 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         cached[id(self)] = (timestep, key, values)
         return values
 
+    def _text_kvs(self, source, context):
+        if (
+            not self._cache_unquantized_text_kv
+            or not context.is_cuda
+            or torch.compiler.is_compiling()
+            or torch.is_grad_enabled()
+            or is_in_breakable_cuda_graph()
+            or is_device_stream_capturing(context.device)
+            or self.layerwise_offload_managers
+        ):
+            return None
+        ctx = get_forward_context_or_none()
+        req = ctx.forward_batch if ctx is not None else None
+        if req is None or not all(
+            type(block) is AnimaTransformerBlock
+            and "forward" not in vars(block)
+            and type(block.attn2) is AnimaAttention
+            and "forward" not in vars(block.attn2)
+            and type(block.attn2.to_k) is ColumnParallelLinear
+            and type(block.attn2.to_v) is ColumnParallelLinear
+            for block in self.transformer_blocks
+        ):
+            return None
+        # Only the two fixed conditioning tensors live for the whole loop.
+        if getattr(req, "prompt_embeds", None) and source is req.prompt_embeds[0]:
+            branch = "positive"
+        elif (
+            getattr(req, "negative_prompt_embeds", None)
+            and source is req.negative_prompt_embeds[0]
+        ):
+            branch = "negative"
+        else:
+            return None
+        cache = req.extra.setdefault(DENOISING_LOOP_STATE, {}).setdefault(
+            "anima_kv", {}
+        )
+        key = (id(self), branch)
+        entry = cache.get(key)
+        if entry is None or entry[0] is not source or entry[1] != context.dtype:
+            tokens = math.prod(context.shape[:-1])
+            if (
+                req.do_classifier_free_guidance
+                and get_classifier_free_guidance_world_size() == 1
+            ):
+                tokens = sum(
+                    math.prod(embeds[0].shape[:-1])
+                    for embeds in (req.prompt_embeds, req.negative_prompt_embeds)
+                    if embeds
+                )
+            local_features = sum(
+                block.attn2.heads * block.attn2.head_dim
+                for block in self.transformer_blocks
+            )
+            cache_bytes = 2 * tokens * local_features * context.element_size()
+            free_bytes, _ = torch.cuda.mem_get_info(context.device)
+            # Leave at least three quarters of free memory for denoising.
+            kvs = None
+            if cache_bytes <= free_bytes // 4:
+                kvs = [
+                    block.attn2.project_context_kv(context)
+                    for block in self.transformer_blocks
+                ]
+            cache[key] = (source, context.dtype, kvs)
+            return kvs
+        return entry[2]
+
     def forward(self, hidden_states, encoder_hidden_states, timestep, **kwargs):
-        encoder_hidden_states = encoder_hidden_states.to(hidden_states.dtype)
+        source = encoder_hidden_states
+        encoder_hidden_states = source.to(hidden_states.dtype)
+        context_kvs = self._text_kvs(source, encoder_hidden_states)
         b, _, t, h, w = hidden_states.shape
         pt, ph, pw = self.config.patch_size
         if t % pt or h % ph or w % pw:
@@ -461,7 +538,7 @@ class AnimaTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
             hidden_states = block(
                 hidden_states,
-                encoder_hidden_states,
+                encoder_hidden_states if context_kvs is None else context_kvs[i],
                 embedded_timestep,
                 temb,
                 rope,

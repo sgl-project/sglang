@@ -2,7 +2,7 @@
 title: FLUX 3 Action
 metatags:
     description: "Deploy Black Forest Labs FLUX 3 Action robot policies (joint video + action flow matching) with SGLang's native multimodal_gen runtime."
-tag: dVLA
+tag: WAM
 ---
 
 ## 1. Model Introduction

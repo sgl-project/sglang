@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
+import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -999,6 +1001,8 @@ def _validate_args(**overrides):
         tp_size=1,
         ring_degree=1,
         num_gpus=4,
+        layerwise_offload_components=None,
+        explicit_residency_mode=lambda component: None,
     )
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -1140,6 +1144,15 @@ class TestServerArgsValidation(unittest.TestCase):
                         _validate_args(attention_backend=backend)
                     )
 
+    def test_text_encoder_streams_unless_placed_explicitly(self):
+        args = _validate_args(layerwise_offload_components=["vae"])
+        Magi2PipelineConfig().validate_server_args(args)
+        self.assertEqual(args.layerwise_offload_components, ["vae", "text_encoder"])
+
+        explicit = _validate_args(explicit_residency_mode=lambda component: "resident")
+        Magi2PipelineConfig().validate_server_args(explicit)
+        self.assertIsNone(explicit.layerwise_offload_components)
+
     def test_data_parallel_is_rejected(self):
         """EP groups span the global world, so dp replicas would share experts."""
         with self.assertRaisesRegex(ValueError, "--dp-size"):
@@ -1177,6 +1190,59 @@ class TestSinkAttentionBackend(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "FlashAttention"):
                 attention._ensure_impl(torch.bfloat16)
+
+
+class TestTextEncoderSourceRank(unittest.TestCase):
+    def test_non_source_ranks_load_no_weights(self):
+        """Only the source rank encodes, so the others must not hold a host copy."""
+        with mock.patch.object(
+            magi2_loader, "get_sp_group", return_value=SimpleNamespace(rank_in_group=1)
+        ):
+            model = magi2_loader.load_magi2_text_encoder(
+                component_path="/nonexistent",
+                server_args=None,
+                component_name="text_encoder",
+                param_dtype=torch.bfloat16,
+            )
+        self.assertLessEqual(sum(p.numel() for p in model.parameters()), 1)
+        with self.assertRaises(RuntimeError):
+            model(input_ids=None)
+
+    def test_source_rank_encoder_joins_no_fold_group(self):
+        """A fold group spanning ranks that never encode deadlocks the cache all-reduce."""
+        from sglang.multimodal_gen.runtime.loader.component_loaders import (
+            text_encoder_loader,
+        )
+
+        pipeline_config = Magi2PipelineConfig()
+        pipeline_config.text_encoder_configs[0].parallel_folding_mode = "world"
+        seen = {}
+
+        def load_model(_self, path, config, server_args, **kwargs):
+            seen["mode"] = config.parallel_folding_mode
+            seen["dtype"] = kwargs["dtype"]
+            return _M()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(f"{tmp}/config.json", "w") as f:
+                json.dump({"text_config": {"num_hidden_layers": 2}}, f)
+            with (
+                mock.patch.object(
+                    magi2_loader,
+                    "get_sp_group",
+                    return_value=SimpleNamespace(rank_in_group=0),
+                ),
+                mock.patch.object(
+                    text_encoder_loader.TextEncoderLoader, "load_model", load_model
+                ),
+            ):
+                magi2_loader.load_magi2_text_encoder(
+                    component_path=tmp,
+                    server_args=SimpleNamespace(pipeline_config=pipeline_config),
+                    component_name="text_encoder",
+                    param_dtype=torch.bfloat16,
+                )
+        self.assertEqual(seen, {"mode": None, "dtype": "bfloat16"})
 
 
 class TestLoaderPrecision(unittest.TestCase):

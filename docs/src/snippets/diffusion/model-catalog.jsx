@@ -273,6 +273,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#pika-h3-flex-six-step-adapters",
     },
     {
+      name: "pi-H3",
+      modelIds: ["Lakonik/pi-H3"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#pi-h3-2-and-4-step-adapters-decoder-free-video",
+    },
+    {
       name: "VDN-H3",
       modelIds: ["OpenVDN/vdn-minimax-h3"],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#7-vdn-h3-hybrid-attention-8-step-distill",

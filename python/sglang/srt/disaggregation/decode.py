@@ -4283,6 +4283,9 @@ class SchedulerDisaggregationDecodeMixin:
             batch.seq_lens.record_stream(self.forward_stream)
         else:
             batch.process_prebuilt(self.future_map)
+        if self.spec_algorithm.is_ngram() and self.draft_worker is not None:
+            # No extend ran here, so the decode corpus has none of the prompt yet.
+            self.draft_worker.insert_prompt_tails(batch)
         return batch
 
     def _nonblocking_admit_in_scope(self: Scheduler, batch: ScheduleBatch) -> bool:

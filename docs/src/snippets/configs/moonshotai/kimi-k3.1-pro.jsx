@@ -6,6 +6,9 @@
 // + 24 MLA with DSA sparse attention on every MLA layer, 896 routed experts (top-16) + 2 shared.
 // K3.1 forces --kv-cache-dtype fp8_e4m3, --page-size 64 and the `dsa` attention backend, so no
 // cell pins them.
+//
+// Ascend A3 Series: a single Unified recipe transcribed from the NPU model-deployment script —
+// four 8-card nodes (16 dies each = one PP stage per node), TP16 · EP16 · PP4, W4A8 ModelSlim.
 
 export const config = {
   modelName: "Kimi-K3.1-Pro",
@@ -13,8 +16,10 @@ export const config = {
   // B300 (1×8) and GB300 (2×4 MNNVL) run the same recipes and have K3.1 serving
   // rounds. MI350X and MI355X have the AgentX recipes: High-Throughput (DCP8) on every PD mode (1P1D
   // on 2×8) and Low-Latency (TP8) on Unified.
+  // The A3 Series ships one Unified recipe (4 nodes × 8 cards / 16 dies); the
+  // 950PR/DT Series is not covered yet.
   // Vera Rubin, B200, GB200 and Hopper carry placeholder cells until a recipe is collected.
-  supportedHardware: ["vera-rubin", "b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "m890", "810e", "tpu7x"],
+  supportedHardware: ["vera-rubin", "b300", "gb300", "b200", "gb200", "h200", "h100", "mi350x", "mi355x", "a3", "m890", "810e", "tpu7x"],
 
   // GPUs the shared engine catalog does not carry. Vera Rubin follows the Mistral-Large-4 entry;
   // PPU is T-HEAD's SAIL device (docs/docs/hardware-platforms/sail.mdx); TPU7x runs sglang-torchtpu.
@@ -55,6 +60,9 @@ export const config = {
   isAmd(s) {
     return ["mi350x", "mi355x"].includes(s.hw);
   },
+  isNpu(s) {
+    return s.hw === "a3";
+  },
   isPipelined(s) {
     return config.sizeOf(config.cellFor(s), "--pp-size") > 1;
   },
@@ -72,8 +80,8 @@ export const config = {
       title: "PD Mode",
       options: [
         { id: "unified", label: "Unified" },
-        { id: "prefill", label: "Prefill" },
-        { id: "decode",  label: "Decode"  },
+        { id: "prefill", label: "Prefill", disabled: (s) => config.isNpu(s), disableReason: "The A3 Series recipe serves Unified only; no NPU PD split has been published." },
+        { id: "decode",  label: "Decode",  disabled: (s) => config.isNpu(s), disableReason: "The A3 Series recipe serves Unified only; no NPU PD split has been published." },
       ],
     },
     {
@@ -92,6 +100,8 @@ export const config = {
         { id: "high-throughput",    label: "High-Throughput (DCP8)",       showWhen: (s) => (["b300", "gb300"].includes(s.hw) && s.pdMode === "decode") || config.isAmd(s) },
         { id: "balanced-ep32-dp4", label: "Balanced (TP32 · EP32 · DP4)", showWhen: (s) => s.hw === "m890" && s.pdMode === "decode" },
         { id: "balanced-pp4", label: "Balanced (TP16 · PP4)", showWhen: (s) => s.hw === "810e" && s.pdMode === "prefill" },
+        // A3 Series: one Unified shape — four 16-die nodes, one PP stage each.
+        { id: "balanced-tp16-pp4-ep16", label: "Balanced (TP16 · PP4 · EP16)", showWhen: (s) => config.isNpu(s) },
         // Other platforms: one placeholder shape each, named by its layout.
         { id: "balanced-tp8",       label: "Balanced (TP8)",               showWhen: (s) => s.hw === "vera-rubin" },
         { id: "balanced-dcp16",     label: "Balanced (DCP16)",             showWhen: (s) => ["b200", "gb200"].includes(s.hw) },
@@ -114,8 +124,9 @@ export const config = {
           id: "dflash",
           label: "DFLASH",
           // The draft path (cutedsl_mla draft attention, ReplaySSM) has only run on Blackwell and
-          // Vera Rubin; MI350X / MI355X run it on the Triton draft backend.
-          disabled: (s) => ["h200", "h100", "m890", "810e"].includes(s.hw),
+          // Vera Rubin; MI350X / MI355X run it on the Triton draft backend. The A3 Series recipe
+          // ships Non-Spec: its SGLANG_DSPARK_* env carries no --speculative-algorithm.
+          disabled: (s) => ["h200", "h100", "m890", "810e"].includes(s.hw) || config.isNpu(s),
           disableReason: "Kimi K3.1 Pro DFLASH has not run on this platform yet; use Non-Spec until a recipe is collected.",
           // K3.1 has no NextN layer, so DFLASH (a separate draft) is the only speculative
           // algorithm. It runs on every recipe here: PD prefill accepts it under PP (the draft
@@ -151,10 +162,11 @@ export const config = {
     {
       // HiCache tiers the paged MLA KV, the DSA indexer, the KDA state and the DFLASH draft.
       // Unlike Kimi-K3, L2 and L3 both keep DCP on K3.1, so no option strips --dcp-size.
+      // The A3 Series recipe runs without HiCache, so the row is hidden there.
       id: "hicache",
       title: "HiCache",
       default: "off",
-      showWhen: (s) => s.hw !== "tpu7x",
+      showWhen: (s) => s.hw !== "tpu7x" && !config.isNpu(s),
       options: [
         { id: "off", label: "Off", showWhen: (s) => !config.isAmd(s) },
         {
@@ -232,6 +244,10 @@ export const config = {
 
   modelNames: {
     default: "moonshotai/Kimi-K3.1-Pro",
+    // The A3 Series recipe serves a mounted ModelSlim W4A8 checkpoint, as its
+    // deployment script does; the path doubles as the served name (no
+    // --served-model-name). Docs tell the reader to swap in their mount point.
+    a3: "/path/to/Kimi-K3.1-Pro-w4a8",
   },
 
   placeholders: {
@@ -281,6 +297,8 @@ export const config = {
     "vera-rubin": "lmsysorg/sglang:dev-kimi-k31-pro-cu134",
     mi350x: "lmsysorg/sglang:dev-kimi-k31-pro-mi35x",
     mi355x: "lmsysorg/sglang:dev-kimi-k31-pro-mi35x",
+    // Ascend A3 Series: the CANN 9.2.0 A3 build used for this recipe.
+    a3: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B050",
   },
   // MI35x PD roles take the host network and RDMA flags for the bootstrap ports and Mooncake.
   dockerHostNetworkWhen: (s) => config.isAmd(s) && ["prefill", "decode"].includes(s.pdMode),
@@ -463,7 +481,7 @@ export const config = {
       },
       {
         id: "prefillGraph", title: "Prefill CUDA Graph",
-        showWhen: (b) => b.pdMode !== "decode" && !config.isPpu(b) && b.hw !== "tpu7x",
+        showWhen: (b) => b.pdMode !== "decode" && !config.isPpu(b) && b.hw !== "tpu7x" && !config.isNpu(b),
         stripPrefixes: ["--cuda-graph-backend-prefill", "--cuda-graph-max-bs-prefill"],
         options: [
           { id: "auto", label: "Auto" },
@@ -526,6 +544,9 @@ export const config = {
         // KDA state slots on the GPU, as a count. Replaces the memory-ratio sizing; under
         // attention DP the count is split across the DP ranks.
         id: "kdaSlots", title: "KDA State Slots",
+        // The A3 Series cell already pins 64 slots; larger values raise the FP32
+        // state pool past what the recipe's --mem-fraction-static leaves free.
+        showWhen: (b) => !config.isNpu(b),
         stripPrefixes: ["--max-mamba-cache-size", "--mamba-full-memory-ratio"],
         options: [
           { id: "128",  label: "128",  flags: ["--max-mamba-cache-size 128"] },
@@ -537,7 +558,7 @@ export const config = {
       {
         // KDA checkpoints kept per root-to-leaf radix path. 1 keeps more distinct prefixes.
         id: "kdaPerPath", title: "KDA States per Path",
-        showWhen: (b) => b.pdMode !== "decode" && !config.isPpu(b),
+        showWhen: (b) => b.pdMode !== "decode" && !config.isPpu(b) && !config.isNpu(b),
         stripPrefixes: ["--mamba-max-states-per-path"],
         options: [
           { id: "unlimited", label: "Unlimited" },
@@ -572,7 +593,7 @@ export const config = {
         // Layers per PP stage (93 in total). The draft lives on the last stage, so the recipe gives
         // it 21 layers; 24,24,24,21 measured 3-6% faster than the default 23,23,23,24.
         id: "ppPartition", title: "PP Layer Partition",
-        showWhen: (b) => config.isPipelined(b) && !config.isPpu(b),
+        showWhen: (b) => config.isPipelined(b) && !config.isPpu(b) && !config.isNpu(b),
         stripEnv: ["SGLANG_PP_LAYER_PARTITION"],
         options: [
           { id: "recipe", label: "24,24,24,21", flags: () => [], env: ["SGLANG_PP_LAYER_PARTITION=24,24,24,21"] },
@@ -1422,6 +1443,68 @@ export const config = {
         "--port {{PORT}}",
       ],
     },
+    // ----- Ascend A3 Series: the four-node Unified recipe of the NPU deployment script. -----
+    {
+      // 4 nodes × 8 cards (16 dies each = one PP stage per node), TP16 · EP16 · PP4 = 64 dies.
+      // Unified only: the A3 script has no PD roles, so prefill/decode are disabled in the panel.
+      // The KDA pool is sized directly (--max-mamba-cache-size 64): the Ascend path takes no
+      // --mamba-full-memory-ratio, so the ratio calculator and the HiCache overlay do not apply.
+      // Script deltas: --node-rank / --dist-init-addr / --host / --port come from the panel
+      // placeholders like every other multi-node cell, and --served-model-name $MODEL_PATH is
+      // dropped because the model path is the served name. The model path is the mounted W4A8
+      // checkpoint ({{MODEL_NAME}}), not a hub id: swap in your own mount point. The script's
+      // SGLANG_ENABLE_SPEC_V2 / SGLANG_RAGGED_VERIFY_MODE / SGLANG_DSPARK_* env is carried
+      // verbatim; with no --speculative-algorithm it is inert.
+      match: { hw: "a3", pdMode: "unified", strategy: "balanced-tp16-pp4-ep16" },
+      nnodes: 4,
+      verified: false,
+      verificationStatus: "in-progress",
+      env: [
+        "HCCL_BUFFSIZE=300",
+        "HCCL_OP_EXPANSION_MODE=AIV",
+        "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True",
+        "STREAMS_PER_DEVICE=32",
+        "SGLANG_ENABLE_SPEC_V2=1",
+        "SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1",
+        "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "HCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "TP_SOCKET_IFNAME={{NETWORK_IFACE}}",
+        "DEEP_NORMAL_MODE_USE_INT8_QUANT=1",
+        "DEEPEP_HCCL_BUFFSIZE=1800",
+        "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1",
+        "SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE=1",
+        "SGLANG_RAGGED_VERIFY_MODE=static",
+        "SGLANG_DSPARK_FOLDED_PROPOSAL=0",
+        "SGLANG_DSPARK_STACKED_CTX_KV=0",
+        "SGLANG_DSPARK_EMBED_IN_GRAPH=0",
+      ],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--tokenizer-path {{MODEL_NAME}}",
+        "--attention-backend ascend",
+        "--device npu",
+        "--quantization modelslim",
+        "--tp-size 16",
+        "--ep-size 16",
+        "--pp-size 4",
+        "--enable-shared-experts-attn-tp",
+        "--enable-dense-mlp-attn-tp",
+        "--mem-fraction-static 0.72",
+        "--chunked-prefill-size 8192",
+        "--max-running-requests 64",
+        "--max-mamba-cache-size 64",
+        "--moe-a2a-backend ascend_ops",
+        "--moe-ascend-ops-config '{\"prefill\":\"alltoallv\",\"decode\":\"low_latency\"}'",
+        "--reasoning-parser kimi_k3",
+        "--watchdog-timeout 9000",
+        "--model-loader-extra-config '{\"enable_multithread_load\": true}'",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+        "--skip-server-warmup",
+        "--cuda-graph-max-bs-decode 16",
+      ],
+    },
     {
       match: { hw: "m890", pdMode: "prefill", strategy: "balanced-ep16" },
       nnodes: 2,
@@ -1688,6 +1771,17 @@ export const config = {
       "Pin the cross-node NIC on every tray:",
       "  GLOO_SOCKET_IFNAME=<your-nic>   NCCL_SOCKET_IFNAME=<your-nic>   SGLANG_HOST_IP=<this-node-ip>",
       "Restart the prefill role whenever the decode role restarts (it keeps the old decode's Mooncake mapping).",
+    ],
+    a3: [
+      "Run the same command on all four nodes with --node-rank 0/1/2/3 (one PP stage per node).",
+      "Point --model-path and --tokenizer-path at the W4A8 checkpoint mounted on every node",
+      "(the command shows /path/to/Kimi-K3.1-Pro-w4a8).",
+      "NPU collectives use HCCL. Pin the cross-node NIC on EVERY node:",
+      "  GLOO_SOCKET_IFNAME=<your-nic>   # bootstrap interface",
+      "  HCCL_SOCKET_IFNAME=<your-nic>   # HCCL transport interface",
+      "  TP_SOCKET_IFNAME=<your-nic>     # TP / scheduler interface",
+      "If you run outside the image above, source both set_env.sh scripts on every node first:",
+      "  /usr/local/Ascend/ascend-toolkit/set_env.sh and /usr/local/Ascend/nnal/atb/set_env.sh",
     ],
   },
 };

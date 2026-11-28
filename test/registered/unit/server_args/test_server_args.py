@@ -66,7 +66,10 @@ from sglang.srt.arg_groups.mamba_hook import (
     handle_int8_mamba_checkpoint,
     handle_mamba_backend,
 )
-from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.memory_hook import (
+    finalize_prefill_token_budget,
+    handle_gpu_memory_settings,
+)
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -139,7 +142,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
-    enter_scope,
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -3850,6 +3852,47 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 
+class TestPrefillTokenBudget(CustomTestCase):
+    def test_cli_budget_covers_a_chunk_and_preserves_larger_caps(self):
+        cases = (
+            (None, None, 16384),
+            (-1, 8192, 8192),
+            (8192, None, 16384),
+            (32000, None, 32000),
+            (32000, 16000, 32000),
+            (32000, 64000, 64000),
+        )
+        for chunk, cap, expected in cases:
+            with self.subTest(chunk=chunk, cap=cap):
+                argv = ["--model-path", "dummy"]
+                if chunk is not None:
+                    argv += ["--chunked-prefill-size", str(chunk)]
+                if cap is not None:
+                    argv += ["--max-prefill-tokens", str(cap)]
+                args = prepare_server_args(argv)
+                args.resolve_once()
+                self.assertEqual(
+                    resolution_result(args, "max_prefill_tokens"), expected
+                )
+                self.assertEqual(args.max_prefill_tokens, cap or 16384)
+
+    def test_rerun_after_a_chunk_shrink_refits_to_the_raw_cap(self):
+        args = ServerArgs(model_path="dummy", chunked_prefill_size=128000)
+        declare_resolution(args, "attention_dp", chunked_prefill_size=32000)
+        with self.assertLogs("sglang.srt.arg_groups.memory_hook", "INFO") as logs:
+            finalize_prefill_token_budget(args)
+        self.assertIn("from 16384 to the chunked prefill size 32000", logs.output[0])
+        self.assertEqual(resolution_result(args, "max_prefill_tokens"), 32000)
+
+        declare_resolution(args, "shrink", chunked_prefill_size=8192)
+        finalize_prefill_token_budget(args)
+        self.assertEqual(resolution_result(args, "max_prefill_tokens"), 16384)
+        self.assertEqual(args.max_prefill_tokens, 16384)
+        decisions = len(args._resolved_overrides)
+        finalize_prefill_token_budget(args)
+        self.assertEqual(len(args._resolved_overrides), decisions)
+
+
 class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
     def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None, **overrides):
         args = ServerArgs(
@@ -4951,13 +4994,6 @@ class TestIntelXpuLoRABackend(CustomTestCase):
 
 
 class TestKvCacheShardingCompatibility(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        # Sharding currently requires Python, independent of the default backend.
-        enter_scope(
-            self, envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("python")
-        )
-
     def _args(self, **overrides):
         model_config = overrides.pop("model_config", None)
         args = ServerArgs(
@@ -5002,22 +5038,22 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         ]
         return args
 
-    def test_sharding_defaults_to_python_when_backend_is_unset(self):
-        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
-        with patch.dict(os.environ), envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
-            handle_kv_cache_sharding(args, 80 * 1024)
-            self.assertEqual(
-                envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "python"
-            )
-
-    def test_unsharded_launch_keeps_the_general_backend_default(self):
-        args = self._args(enable_kv_cache_sharding=False)
-        with patch.dict(os.environ):
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
-            handle_kv_cache_sharding(args, 80 * 1024)
-            self.assertFalse(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set())
-            self.assertEqual(envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get(), "rust")
+    def test_launch_keeps_the_general_backend_default(self):
+        for sharded in (True, False):
+            with self.subTest(sharded=sharded):
+                args = self._rounding_args(
+                    raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                )
+                args.enable_kv_cache_sharding = sharded
+                with (
+                    patch.dict(os.environ),
+                    envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+                ):
+                    envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
+                    handle_kv_cache_sharding(args, 80 * 1024)
+                    self.assertFalse(
+                        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set()
+                    )
 
     def test_encoder_decoder_is_rejected_before_backend_setup(self):
         args = self._args(model_config=SimpleNamespace(is_encoder_decoder=True))
@@ -5120,21 +5156,24 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     handle_kv_cache_sharding(self._args(**overrides))
 
-    def test_rust_unified_tree_core_is_rejected(self):
-        with envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"):
-            with self.assertRaisesRegex(ValueError, "requires the Python"):
-                handle_kv_cache_sharding(self._args())
-
-    def test_rust_tree_core_is_allowed_with_radix_disabled(self):
-        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
-        args.disable_radix_cache = True
-        with (
-            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override("rust"),
-            envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
-        ):
-            handle_kv_cache_sharding(args, 80 * 1024)
-
-        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
+    def test_both_tree_cores_are_accepted(self):
+        for backend in ("python", "rust"):
+            for disable_radix_cache in (False, True):
+                with self.subTest(
+                    backend=backend, disable_radix_cache=disable_radix_cache
+                ):
+                    args = self._rounding_args(
+                        raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                    )
+                    args.disable_radix_cache = disable_radix_cache
+                    with (
+                        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(backend),
+                        envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+                    ):
+                        handle_kv_cache_sharding(args, 80 * 1024)
+                    self.assertEqual(
+                        resolution_result(args, "chunked_prefill_size"), 2112
+                    )
 
     def test_dynamic_chunking_is_rejected_only_when_pipeline_parallelism_uses_it(self):
         for pp_size in (1, 2):
@@ -5921,6 +5960,7 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "ssl_keyfile_password": ["--ssl-keyfile-password", "pw"],
         "enable_ssl_refresh": ["--enable-ssl-refresh"],
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
+        "allow_private_media_hosts": ["--allow-private-media-hosts"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
         "enable_trace": ["--enable-trace"],
         "completion_template": ["--completion-template", "deepseek_coder"],
