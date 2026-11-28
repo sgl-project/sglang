@@ -31,6 +31,7 @@ from sglang.kernels.ops.layernorm.hy4_ihc import (
     hy4_ihc_post_pre_norm,
     ihc_fuses_out_norm,
 )
+from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.srt.configs.hy_v4_flash import (
     SLIDING_ATTENTION,
     HYV4FlashConfig,
@@ -547,13 +548,24 @@ class FlashIndexPool(nn.Module):
 
 
 def _topk(logits: torch.Tensor, k: int):
-    """Unordered top-k (values, indices); -inf values mark non-candidates."""
+    """Unordered top-k (values, indices); -inf values mark non-candidates.
+
+    Uses FlashInfer's radix top-k when it is available, and falls back to
+    ``torch.topk`` otherwise. FlashInfer's ``top_k`` JIT-compiles a CUDA
+    extension on first call, which raises (no nvcc) on non-CUDA accelerators
+    and would block decode CUDA-graph capture there; ``torch.topk`` keeps the
+    model usable on those platforms.
+    """
     if logits.shape[1] <= k:
         idx = torch.arange(logits.shape[1], device=logits.device)
         return logits, idx.expand(logits.shape[0], -1).contiguous()
-    import flashinfer
-
-    return flashinfer.top_k(logits, k)
+    try:
+        return radix_topk(logits, k)
+    except RuntimeError:
+        # FlashInfer's JIT can still fail at call time (e.g. no nvcc on a
+        # CUDA build); fall back to torch.topk instead of failing the
+        # whole decode graph capture.
+        return torch.topk(logits, k, dim=-1)
 
 
 def layout_clamp(slots: torch.Tensor, size: int) -> torch.Tensor:
