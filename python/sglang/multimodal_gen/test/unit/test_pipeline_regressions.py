@@ -19,6 +19,9 @@ from sglang.multimodal_gen.runtime.pipelines.sana_video import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
+    TextEncodingStage,
+)
 from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
     ImageProcessorV2,
     MeshRender,
@@ -111,6 +114,19 @@ def test_sana_video_negative_prompt_uses_requested_sequence_length():
         SimpleNamespace(negative_prompt="Blurry", max_sequence_length=None), None, [0]
     )
     assert captured["max_length"] == 300
+
+
+def test_negative_prompt_uses_requested_sequence_length():
+    """The shared stage encoded the negative prompt at the tokenizer default, so a
+    custom max_sequence_length gave the CFG branches different text lengths."""
+    stage = TextEncodingStage.__new__(TextEncodingStage)
+    captured = {}
+    stage.encode_text = lambda *args, **kwargs: captured.update(kwargs)
+
+    stage.get_or_compute_negative_text_embedding(
+        SimpleNamespace(negative_prompt="Blurry", max_sequence_length=128), None, [0]
+    )
+    assert captured["max_length"] == 128
 
 
 @pytest.mark.parametrize(
