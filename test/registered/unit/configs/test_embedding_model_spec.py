@@ -21,6 +21,33 @@ register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 class TestEmbeddingModelSpec(unittest.TestCase):
+    def test_privacy_filter_disables_causal_cache_optimizations(self):
+        spec = resolve_embedding_model_spec(
+            ["OpenAIPrivacyFilterForTokenClassification"],
+            is_embedding_requested=False,
+            is_embedding_gemma=False,
+        )
+        self.assertEqual(spec.task, EmbeddingTask.TOKEN_CLASSIFY)
+        self.assertEqual(spec.attention, AttentionPattern.BIDIRECTIONAL)
+        self.assertFalse(spec.normalize)
+        self.assertFalse(spec.supports_dimensions)
+        for backend in ("fa3", "fa4"):
+            args = ServerArgs(model_path="dummy", attention_backend=backend)
+            args._model_config = SimpleNamespace(
+                embedding_model_spec=spec,
+                joint_head_config=None,
+                pointer_head=None,
+                is_multimodal=False,
+                hf_config=SimpleNamespace(
+                    architectures=["OpenAIPrivacyFilterForTokenClassification"]
+                ),
+            )
+            handle_model_capability_adjustments(args)
+            self.assertTrue(resolution_result(args, "is_embedding"))
+            self.assertTrue(resolution_result(args, "disable_radix_cache"))
+            self.assertEqual(resolution_result(args, "chunked_prefill_size"), -1)
+            self.assertTrue(resolution_result(args, "prefill_only_disable_kv_cache"))
+
     def test_embedding_gemma_declares_full_encoder_bcg_contract(self):
         spec = resolve_embedding_model_spec(
             ["Gemma3TextModel"],
@@ -107,7 +134,7 @@ class TestEmbeddingModelSpec(unittest.TestCase):
         matrix = embedding_support_matrix()
         by_architecture = {row["architecture"]: row for row in matrix}
 
-        self.assertEqual(len(matrix), 9)
+        self.assertEqual(len(matrix), 10)
         self.assertIn("EmbeddingGemma2Model", by_architecture)
         self.assertTrue(by_architecture["EmbeddingGemma2Model"]["supports_multimodal"])
         self.assertEqual(by_architecture["BertModel"]["family"], "bert")

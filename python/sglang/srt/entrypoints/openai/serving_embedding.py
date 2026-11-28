@@ -8,6 +8,7 @@ import jinja2
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
+from sglang.srt.configs.embedding_model_spec import EmbeddingTask
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingObject,
     EmbeddingRequest,
@@ -43,6 +44,11 @@ class OpenAIServingEmbedding(OpenAIServingBase):
 
     def _validate_request(self, request: EmbeddingRequest) -> Optional[str]:
         """Validate that the input is not empty or whitespace only."""
+        spec = getattr(
+            self.tokenizer_manager.model_config, "embedding_model_spec", None
+        )
+        if spec is not None and spec.task == EmbeddingTask.TOKEN_CLASSIFY:
+            return "Token classification models return per-token logits; use /encode."
         if request.encoding_format not in ("float", "base64"):
             return (
                 "encoding_format must be either 'float' or 'base64', "
