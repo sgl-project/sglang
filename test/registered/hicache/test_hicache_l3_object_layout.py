@@ -72,9 +72,7 @@ def _sidecar(pool_name: PoolName, hit_policy: PoolHitPolicy) -> SidecarPoolSpec:
 class TestHiCacheL3ObjectLayout(CustomTestCase):
     def setUp(self):
         super().setUp()
-        override = get_context().override_server_args(
-            tp_size=1, pp_size=1, dp_size=2, enable_dp_attention=False
-        )
+        override = get_context().override_server_args(tp_size=1, pp_size=1, dp_size=2)
         override.install()
         self.addCleanup(override.restore)
 
@@ -92,6 +90,8 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         store.dcp_size = 1
         store.config_prefix = "tag_my-model"
         store.should_split_heads = False
+        store.unified_suffixes = None
+        store.unified_chunk_spans = None
         store.enable_storage_metrics = False
         store._use_group_semantics = False
         return store
@@ -114,6 +114,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         scheduler.enable_unified_cache_external_linker = False
         scheduler.page_size = 64
         scheduler.max_total_num_tokens = 8192
+        scheduler.max_req_len = 4102
         scheduler.max_req_input_len = 4096
         scheduler.startup_time = None
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
@@ -585,6 +586,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
             DeepSeekV4TokenToKVPool
         )
         # The storage config reads the pool's layer range through its router.
+        controller.mem_pool_device.dtype = torch.bfloat16
         controller.mem_pool_device.start_layer = 0
         controller.mem_pool_device.layer_num = 1
         controller.mem_pool_host = SimpleNamespace(

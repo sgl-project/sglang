@@ -162,12 +162,15 @@ class ComponentResidencyManager:
         # phase key -> peak allocated bytes
         self._warmup_phase_peaks: dict[str, int] = {}
         self._completed_warmup_phase_peaks: dict[str, int] = {}
+        self._debug_requests_seen = 0
 
     @property
     def host_pin_budget(self) -> HostPinBudget:
         # measure headroom after loading, when the first offload path needs it
         if self._host_pin_budget is None:
-            self._host_pin_budget = HostPinBudget()
+            self._host_pin_budget = HostPinBudget(
+                node_local_ranks=self.server_args.node_local_gpu_worker_count
+            )
         return self._host_pin_budget
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
@@ -670,9 +673,9 @@ class ComponentResidencyManager:
                     log_host_memory_breakdown,
                 )
 
-                self._debug_requests_seen = getattr(self, "_debug_requests_seen", 0) + 1
+                self._debug_requests_seen += 1
                 log_host_memory_breakdown(
-                    self.placement_modules(),
+                    self.pipeline.modules,
                     label=f"after request {self._debug_requests_seen}",
                 )
         self._prefetch_next_request()

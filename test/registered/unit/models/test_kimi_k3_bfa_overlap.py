@@ -42,6 +42,7 @@ def _make_owner(with_stream: bool):
 
     owner = SimpleNamespace(
         use_full_rank_gate=True,
+        _qkvg_gate_float_shard=False,
         _bfa_w=_randn(_BFA_W_ROWS, _H).contiguous(),
         _bfa_f_b_w=_randn(1536, _N_FA).contiguous(),
         _bfa_fa_size=_N_FA,
@@ -310,6 +311,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
 
         owner = SimpleNamespace(
             _may_fuse_kda_inproj=lambda: True,
+            _kda_dwdp=None,
             _qkvgbfa_layer=None,
             fused_qkvg_proj=module(8),
             f_a_proj=module(4),
@@ -390,7 +392,10 @@ class TestKimiK3BfaOverlap(CustomTestCase):
         owner = SimpleNamespace(
             config=SimpleNamespace(full_attention_layer_ids=[]),
             model=SimpleNamespace(
-                layers=[], output_attn_res_proj=proj, output_attn_res_norm=norm
+                layers=[],
+                output_attn_res_proj=proj,
+                output_attn_res_norm=norm,
+                kda_dwdp=None,
             ),
         )
 
@@ -428,7 +433,8 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             model=SimpleNamespace(
                 layers=[
                     SimpleNamespace(self_attn=attn, use_attn_residuals=False, mlp=None)
-                ]
+                ],
+                kda_dwdp=None,
             ),
         )
         post_load = KimiK3LinearForCausalLM.post_load_weights

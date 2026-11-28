@@ -12,7 +12,7 @@ from sglang.test.send_one import BenchArgs, send_one_prompt
 
 register_npu_ci(
     est_time=8400,
-    suite="nightly-acc-2-npu-a3",
+    suite="nightly-acc-test-2-npu-a3",
     nightly=True,
 )
 
@@ -34,9 +34,16 @@ QWEN3_6_27B_3K5_1K5_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "130",
     "ASCEND_USE_FIA": "1",
+    # HCCL_DETERMINISTIC removed to re-measure the temperature=0 drift over
+    # a few nightly runs; put back "HCCL_DETERMINISTIC": "true" if accuracy
+    # failures beyond the 5-question tolerance reappear.
+    # GDN attention path used by the other qwen3.6-27b cases
+    # (test_npu_qwen3_6_27b_1p_gpqa.py and
+    # test_npu_qwen3_6_27b_w8a8_2p_in16k_out1k_50ms.py). The nightly stage
+    # already exports this, so it is a no-op in CI and only pins the value
+    # when the case runs outside the CI wrapper.
+    "GDN_ATTN_BACKEND_TRITON": "1",
 }
 
 QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
@@ -54,8 +61,11 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     60000,
     "--disable-radix-cache",
     "--trust-remote-code",
+    # Peak concurrency stays near the stable 1P GPQA case (20): the torch_npu
+    # pinned host allocator never releases cached blocks, so 64 concurrent
+    # 3.5k-token prompts exhaust pinned host memory (NPU error 207001).
     "--max-running-requests",
-    64,
+    24,
     "--max-mamba-cache-size",
     74,
     "--mem-fraction-static",
@@ -90,6 +100,9 @@ QWEN3_6_27B_3K5_1K5_OTHER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen3_coder",
+    "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    "130",
 ]
 
 
@@ -101,7 +114,8 @@ class TestNPUQwen3_6_27B_1P_In3k5_Out1k5_gpqa(TestNpuAccuracyTestCaseBase):
     accuracy = 0.878
     datasets = ["gpqa_diamond"]
     few_shot_num = 0
-    eval_batch_size = 16
+    # Smaller eval batches keep pinned host memory spikes low.
+    eval_batch_size = 8
     generation_config = {
         "max_tokens": 81920,
         "temperature": 0,

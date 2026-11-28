@@ -29,6 +29,11 @@ class Mm(msgspec.Struct):
         Optional[bool],
         "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
     ] = None
+    disable_multimodal: A[
+        bool,
+        "Disable the multimodal functionality to serve a multimodal model as text-only. "
+        "Cannot be combined with --enable-multimodal.",
+    ] = False
     mm_attention_backend: A[
         Optional[str],
         Arg(
@@ -69,10 +74,18 @@ class Mm(msgspec.Struct):
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`",
+            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`, "
+            "and `video_preprocessing_device`, the device the token-space processor decodes and preprocesses "
+            'a video request on (e.g. `{"video_preprocessing_device": "cpu"}`)',
             type_parser=json.loads,
         ),
     ] = None
+    enable_token_space_processor: A[
+        bool,
+        "Enable token-space multimodal preprocessing for supported models. "
+        "Unsupported models keep their existing processor. Not supported with "
+        "--encoder-only or --language-only.",
+    ] = False
     mm_processor_worker_num: A[
         int,
         "Number of threads for multimodal processor calls. 0 selects the "
@@ -89,8 +102,23 @@ class Mm(msgspec.Struct):
         List[str],
         "Restrict client-supplied HTTP(S) image, video, and audio URLs to these "
         "exact hostnames. Redirect destinations are checked against the same "
-        "allowlist. When unset, remote media from any domain is allowed.",
+        "allowlist, and an allowlisted host may resolve to a private address. "
+        "When unset, any host that resolves only to public addresses is allowed "
+        "(see --allow-private-media-hosts).",
     ] = msgspec.field(default_factory=list)
+    allow_private_media_hosts: A[
+        bool,
+        Arg(
+            help=(
+                "Allow client-supplied HTTP(S) media URLs to resolve to private, "
+                "loopback, or link-local IP addresses (including cloud metadata "
+                "endpoints such as 169.254.169.254). Disabled by default; enable "
+                "only when the server intentionally fetches media from a private "
+                "network. An explicitly allowlisted domain is exempt regardless."
+            ),
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = False
     media_url_max_file_size_mb: A[
         int,
         "Maximum size in MiB for one client-supplied remote media download. "
@@ -99,8 +127,9 @@ class Mm(msgspec.Struct):
     media_url_timeout: A[
         Optional[float],
         "Seconds to download one client-supplied media URL, redirects and body "
-        "included, for every media type. When unset, REQUEST_TIMEOUT applies, "
-        "else each loader's default.",
+        "included, for every media type; a server that sends the body slowly "
+        "is cut off when the budget runs out. When unset, REQUEST_TIMEOUT "
+        "applies, else each loader's default.",
     ] = None
     allow_local_media_files: A[
         bool,
@@ -152,9 +181,6 @@ class Mm(msgspec.Struct):
             choices=["mooncake"],
         ),
     ] = "mooncake"
-    disable_fast_image_processor: A[
-        bool, "Deprecated. Use --image-processor-backend=pil instead."
-    ] = False
     mm_feature_transport: A[
         Optional[Literal["cpu", "cuda_ipc", "cuda_vmm"]],
         Arg(

@@ -3,9 +3,11 @@
 
 import copy
 import hashlib
+import os
 import pickle
 import weakref
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, is_dataclass
@@ -81,6 +83,20 @@ def conditioning_cache_group(*, enabled):
 
 
 @contextmanager
+def use_gpu_conditioning_hash(*, enabled: bool = True):
+    """Opt into GPU hashing; disabled scopes preserve the parent policy."""
+    cache = _active_cache.get()
+    if not enabled or cache is None:
+        yield
+        return
+    token = cache._gpu_conditioning_hash.set(True)
+    try:
+        yield
+    finally:
+        cache._gpu_conditioning_hash.reset(token)
+
+
+@contextmanager
 def prefer_conditioning_cache():
     # retain reusable negative conditioning ahead of changing positive prompts
     token = _prefer_cache.set(True)
@@ -99,11 +115,38 @@ _SPARSE_HASH_MIN_BYTES = 16 * 1024 * 1024
 # for tiled VAE references that store one small entry per tile.
 DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES = 4096
 
+# a key hashes every input byte on the request path (tens of MB per reference
+# image), so large buffers hash in chunks on threads; hashlib releases the GIL
+_DIGEST_CHUNK_BYTES = 2 * 1024 * 1024
+_digest_pool = ThreadPoolExecutor(
+    max_workers=min(8, os.cpu_count() or 1),
+    thread_name_prefix="sgl-conditioning-digest",
+)
+
+
+def _sha256(chunk):
+    return hashlib.sha256(chunk).digest()
+
+
+def _digest(buffer):
+    """SHA-256 of a byte buffer, or of its length and chunk digests when large"""
+    data = memoryview(buffer).cast("B")
+    if data.nbytes <= _DIGEST_CHUNK_BYTES:
+        return _sha256(data)
+    chunks = [
+        data[start : start + _DIGEST_CHUNK_BYTES]
+        for start in range(0, data.nbytes, _DIGEST_CHUNK_BYTES)
+    ]
+    digest = hashlib.sha256(data.nbytes.to_bytes(8, "little"))
+    for chunk_digest in _digest_pool.map(_sha256, chunks):
+        digest.update(chunk_digest)
+    return digest.digest()
+
 
 def _tensor_digest(tensor):
     data = tensor.reshape(-1).view(torch.uint8)
     if not data.is_cuda or data.numel() < _SPARSE_HASH_MIN_BYTES:
-        return hashlib.sha256(data.cpu().numpy()).digest()
+        return _digest(data.cpu().numpy())
     num_blocks = data.numel() // _SPARSE_HASH_BLOCK_BYTES
     split = num_blocks * _SPARSE_HASH_BLOCK_BYTES
     blocks = data[:split].view(num_blocks, _SPARSE_HASH_BLOCK_BYTES)
@@ -111,9 +154,17 @@ def _tensor_digest(tensor):
     digest = hashlib.sha256(nonzero.tobytes())
     edges = np.flatnonzero(np.diff(np.concatenate(([0], nonzero.view(np.int8), [0]))))
     for start, end in zip(edges[::2], edges[1::2]):
-        digest.update(blocks[start:end].cpu().numpy())
-    digest.update(data[split:].cpu().numpy())
+        digest.update(_digest(blocks[start:end].cpu().numpy()))
+    digest.update(_digest(data[split:].cpu().numpy()))
     return digest.digest()
+
+
+def _gpu_tensor_digest(tensor):
+    if not tensor.is_cuda:
+        return _tensor_digest(tensor)
+    from sglang.kernels.ops.memory.gpu_tensor_hash_blake3 import gpu_tensor_blake3
+
+    return gpu_tensor_blake3(tensor)
 
 
 def _fingerprint(value):
@@ -124,20 +175,23 @@ def _fingerprint(value):
             or value.requires_grad
         ):
             raise Uncacheable("only dense inference tensors can be cached")
+        cache = _active_cache.get()
         return (
             "tensor",
             str(value.dtype),
             str(value.device),
             tuple(value.shape),
             tuple(value.stride()),
-            _tensor_digest(value.detach().contiguous()),
+            _gpu_tensor_digest(value.detach().contiguous())
+            if cache is not None and cache._gpu_conditioning_hash.get()
+            else _tensor_digest(value.detach().contiguous()),
         )
     if isinstance(value, Image.Image):
         return (
             "image",
             value.mode,
             value.size,
-            hashlib.sha256(value.tobytes()).digest(),
+            _digest(value.tobytes()),
             _fingerprint(value.getpalette()),
             _fingerprint(value.info.get("transparency")),
         )
@@ -148,7 +202,7 @@ def _fingerprint(value):
             "array",
             value.dtype.str,
             value.shape,
-            hashlib.sha256(value.tobytes()).digest(),
+            _digest(value.tobytes()),
         )
     if type(value) in (str, bytes, int, float, bool, type(None)):
         return (type(value).__name__, value)
@@ -354,6 +408,9 @@ class ConditioningCache:
         self._models = weakref.WeakKeyDictionary()
         self._next_model = 0
         self._group_entries = ContextVar("conditioning_group_entries", default=None)
+        self._gpu_conditioning_hash = ContextVar(
+            "conditioning_gpu_conditioning_hash", default=False
+        )
         self.group_hits = 0
 
     def clear(self):
