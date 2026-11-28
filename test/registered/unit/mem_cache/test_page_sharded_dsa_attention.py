@@ -548,6 +548,8 @@ class TestPageInterleaveIndexer(CustomTestCase):
     def _test_world(self, world):
         if torch.cuda.device_count() < world:
             self.skipTest(f"indexer KV sharding test requires {world} GPUs")
+        if torch.cuda.get_device_capability() < (8, 9):
+            self.skipTest("DSA indexer K cache stores FP8 E4M3, which needs SM 8.9+")
         with tempfile.TemporaryDirectory(prefix="sglang-indexer-shard-") as tmp:
             mp.spawn(
                 _run_indexer,
