@@ -24,7 +24,6 @@ import logging
 import multiprocessing as multiprocessing
 import os
 import pickle
-import signal
 import sys
 import threading
 import traceback
@@ -34,7 +33,6 @@ from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
-import psutil
 import setproctitle
 import zmq
 import zmq.asyncio
@@ -75,6 +73,7 @@ from sglang.srt.utils import (
     configure_logger,
     kill_itself_when_parent_died,
     kill_process_tree,
+    notify_parent_of_failure,
 )
 from sglang.srt.utils.network import await_zmq_send, get_zmq_socket
 
@@ -634,7 +633,6 @@ def run_multi_detokenizer_router_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer_router")
     configure_logger(server_args)
-    parent_process = psutil.Process().parent()
 
     router = None
     try:
@@ -648,7 +646,7 @@ def run_multi_detokenizer_router_process(
         )
         if router is not None:
             router.socket_mapping.clear_all_sockets()
-        parent_process.send_signal(signal.SIGQUIT)
+        notify_parent_of_failure()
 
 
 async def print_exception_wrapper(func):
