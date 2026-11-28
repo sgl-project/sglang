@@ -347,11 +347,10 @@ class TestCopyForForward(CustomTestCase):
 class TestStepBuilds(CustomTestCase):
     def setUp(self):
         super().setUp()
-        # These read two flags from the exec bag; give
-        # each test a mutable stand-in so it does not depend on a published
-        # (or leaked) process context.
+        # These read a flag from the exec bag; give each test a mutable
+        # stand-in so it does not depend on a published (or leaked) process
+        # context.
         self._exec_ns = SimpleNamespace(
-            deterministic=SimpleNamespace(enable_deterministic_inference=False),
             features=SimpleNamespace(enable_custom_logit_processor=False),
         )
         exec_patch = patch(
@@ -360,13 +359,6 @@ class TestStepBuilds(CustomTestCase):
         )
         exec_patch.start()
         self.addCleanup(exec_patch.stop)
-        self._spec_ns = SimpleNamespace(speculative_algorithm=None)
-        spec_patch = patch(
-            "sglang.srt.sampling.sampling_batch_info.get_spec",
-            return_value=self._spec_ns,
-        )
-        spec_patch.start()
-        self.addCleanup(spec_patch.stop)
 
     def _make_req(
         self,
@@ -374,80 +366,32 @@ class TestStepBuilds(CustomTestCase):
         freq=0.0,
         presence=0.0,
         min_tokens=0,
-        seed=None,
         stop_ids=None,
         eos_id=2,
         mask_mode=None,
-        filler_seed=0,
     ):
         req = MagicMock()
         req.sampling_params.top_k = top_k
         req.sampling_params.frequency_penalty = freq
         req.sampling_params.presence_penalty = presence
         req.sampling_params.min_new_tokens = min_tokens
-        req.sampling_params.sampling_seed = seed
         req.sampling_params.logit_bias = None
         req.sampling_params.stop_token_ids = stop_ids
         req.sampling_params.custom_params = None
         req.custom_logit_processor = None
         req.grammar = None
-        req.filler_seed = filler_seed
         req.return_sampling_mask = mask_mode is not None
         req.sampling_logprobs_mode = mask_mode
         req.tokenizer.additional_stop_token_ids = None
         req.tokenizer.eos_token_id = eos_id
         return req
 
-    def test_deterministic_seed(self):
-        """Test that explicit seed=123 is kept and missing seed defaults to 42."""
-        self._exec_ns.deterministic.enable_deterministic_inference = True
-
-        info = _make_info()
-        info.set_step_state([self._make_req(seed=123), self._make_req()])
-        self.assertEqual(info.sampling_seed.tolist(), [123, 42])
-
-        # An idle batch still seeds, with no rows.
-        info.set_step_state([])
-        self.assertEqual(info.sampling_seed.tolist(), [])
-
-    def test_seed_without_deterministic_inference(self):
-        """A non-greedy request's seed applies; a greedy seed, or speculative
-        decoding, leaves the batch unseeded."""
-        info = _make_info()
-        info.set_step_state([self._make_req(seed=123, top_k=50)])
-        self.assertEqual(info.sampling_seed.tolist(), [123])
-
-        info.set_step_state([self._make_req(seed=123, top_k=1)])
-        self.assertIsNone(info.sampling_seed)
-
-        self._spec_ns.speculative_algorithm = "EAGLE"
-        info.set_step_state([self._make_req(seed=123, top_k=50)])
-        self.assertIsNone(info.sampling_seed)
-
-    def test_unseeded_row_samples_with_its_filler_seed(self):
-        """An unseeded request samples with its own filler seed in every seeded
-        step, wherever its row is, and unseeded once no seeded row is left."""
-        seeded, a, b = (
-            self._make_req(seed=123, top_k=50),
-            self._make_req(filler_seed=456),
-            self._make_req(filler_seed=789),
-        )
-        info = _make_info()
-        info.set_step_state([seeded, a])
-        self.assertEqual(info.sampling_seed.tolist(), [123, 456])
-
-        info.set_step_state([b, a, seeded])
-        self.assertEqual(info.sampling_seed.tolist(), [789, 456, 123])
-
-        info.set_step_state([b, a])
-        self.assertIsNone(info.sampling_seed)
-
     def test_mask_rows(self):
         """Mask rows index the batch; support rows index the mask rows."""
         reqs = [
             self._make_req(top_k=5),
             self._make_req(top_k=7, mask_mode="full"),
-            self._make_req(top_k=50, mask_mode="support", seed=9),
+            self._make_req(top_k=50, mask_mode="support"),
             self._make_req(top_k=3, mask_mode="support"),
         ]
         info = _make_info()
@@ -457,12 +401,10 @@ class TestStepBuilds(CustomTestCase):
             info.sampling_support_logprobs_capture_indices.tolist(), [1, 2]
         )
         self.assertEqual(info.sampling_mask_top_ks, [1, 7, 50, 3])
-        self.assertEqual(info.sampling_seed[2].item(), 9)
 
         info.set_step_state(reqs[:2])
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
         self.assertIsNone(info.sampling_support_logprobs_capture_indices)
-        self.assertIsNone(info.sampling_seed)
 
         info.set_step_state(reqs[:1])
         self.assertIsNone(info.sampling_mask_batch_indices)

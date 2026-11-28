@@ -1,4 +1,4 @@
-"""gfx950 residual-stream boundary from fbtriton ``tlx.ops.norm_residual_norm``, vendored in ``sglang.kernels.tlx_ops``.
+"""gfx950 residual-stream boundary from upstream ``tlx.ops.norm_residual_norm``, vendored as ``tlx_norm_residual_norm``.
 
 ``norm_residual_norm`` RMS-normalizes a BF16 branch (weight after the norm, or the input-scale form that applies it
 first), rounds it to BF16, updates the FP32 stream as ``alpha * stream + beta * y`` (per-channel or scalar gate) or
@@ -41,7 +41,7 @@ def norm_residual_norm(
     pre_norm_bf16: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(output, new_stream)``; ``alpha``/``beta`` FP32 ``(H,)`` or ``(1,)``, both or neither."""
-    from sglang.kernels.tlx_ops.kernels.fused.norm_residual_norm.gfx950 import (
+    from sglang.kernels.ops.layernorm.tlx_norm_residual_norm import (
         norm_residual_norm as _norm_residual_norm,
     )
 

@@ -796,6 +796,8 @@ class Envs:
     # ===================================================================
     # Shared-prompt decode attention for wide beam batches (FlashInfer MHA only).
     SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
+    # Run shared-context attention with the split-KV kernel (prompt split across CTAs).
+    SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV = EnvBool(False)
     # Replay the trie beam selection step as a CUDA graph.
     SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
     # Replay decode batches made only of beam requests as CUDA graphs.
@@ -1151,6 +1153,9 @@ class Envs:
     SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
     # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
     SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
+    # Qwen4-Exp HC sites with <= 128 rows on gfx950: fold the per-branch norm and the
+    # inject GEMV into a FlyDSL mix. Off by default: not bit-exact (~1 bf16 ulp).
+    SGLANG_ROCM_OPT_QWEN4_FUSED_HC = EnvBool(False)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
@@ -1796,6 +1801,9 @@ class Envs:
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
     # reference implementations for numerical-bug bisection.
     SGLANG_FORCE_FUSED_OP_BACKEND = EnvStr(None)
+    # SM120: fuse SiLU-and-mul into unquantized bf16 gate_up GEMMs (quack) through
+    # DualGemm, for MLPs built on LlamaMLP or Qwen2MLP.
+    SGLANG_USE_QUACK_SWIGLU_GEMM = EnvBool(False)
     USE_TRITON_W8A8_FP8_KERNEL = EnvBool(False)
     SGLANG_MOE_PADDING = EnvBool(False)
 

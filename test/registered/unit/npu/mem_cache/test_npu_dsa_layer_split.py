@@ -21,12 +21,18 @@ from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
     LayerSplitNPUMLATokenToKVPool,
 )
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
-from sglang.srt.layers.attention.dsa.utils import _dsa_split_row_bound
+from sglang.srt.layers.attention.dsa.utils import (
+    _dsa_split_row_bound,
+    maybe_prefetch_next_kimi_full_attention_kv,
+)
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.mem_cache.static_kv_storage import _static_owner_region
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_npu_ci(est_time=9, suite="extra-a-test-npu")
 
 POOL = LayerSplitNPUMLATokenToKVPool
 
@@ -56,6 +62,7 @@ def _make_pool(
     pool.store_dtype = torch.float32
     pool.dtype = torch.float32
     pool.use_combined_kv_buffer = False
+    pool.dsa_kv_cache_store_c8 = False
     pool.use_fia_nz = False
 
     owned_start, owned_end = get_layer_shard_range(shard_rank, shard_size, layer_num)
@@ -86,6 +93,116 @@ class _FakeWork:
 
 
 class TestShardBookkeeping(CustomTestCase):
+    def _hybrid_prefetch_pool(self):
+        pool = object.__new__(HybridLinearKVPool)
+        pool.start_layer = 8
+        waits = []
+        pool.layer_transfer_counter = SimpleNamespace(wait_until=waits.append)
+        pool.full_attention_layer_id_mapping = {11: 0, 15: 1, 19: 2}
+        pool.full_kv_pool = _make_pool(layer_num=3, shard_rank=2)
+        child = pool.full_kv_pool
+        child.remote_kv_layer_id = None
+        child.remote_index_layer_id = None
+        child.pending_remote_kv_layer_id = None
+        child.pending_remote_index_layer_id = None
+        child.pending_remote_kv_broadcast = False
+        child.pending_remote_index_broadcast = False
+        child.pending_kv_works = []
+        child.pending_index_works = []
+        return pool, waits
+
+    def test_kimi_prefetch_translates_model_ids_and_waits_before_broadcast(self):
+        pool, waits = self._hybrid_prefetch_pool()
+        child = pool.full_kv_pool
+        ctx = ForwardContext(
+            attn_backend=SimpleNamespace(
+                token_to_kv_pool=pool,
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.arange(8, 16).unsqueeze(0)
+                ),
+            )
+        )
+        fb = SimpleNamespace(
+            req_pool_indices=torch.tensor([0]), extend_prefix_lens_cpu=[8]
+        )
+        broadcast_waits = []
+
+        def kick_kv(layer_id, bound):
+            broadcast_waits.append(list(waits))
+            return [_FakeWork()]
+
+        def kick_index(layer_id):
+            broadcast_waits.append(list(waits))
+            return _FakeWork()
+
+        with (
+            forward_context(ctx),
+            patch("sglang.srt.layers.attention.dsa.utils.is_npu", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.get_memory",
+                return_value=SimpleNamespace(disable_radix_cache=True),
+            ),
+            patch.object(child, "_broadcast_kv_from_owner", side_effect=kick_kv),
+            patch.object(child, "_broadcast_index_from_owner", side_effect=kick_index),
+        ):
+            maybe_prefetch_next_kimi_full_attention_kv(fb, 19)
+            child.layer_shard_enabled = False
+            maybe_prefetch_next_kimi_full_attention_kv(fb, 999)
+        self.assertEqual(child.pending_remote_kv_layer_id, 2)
+        self.assertEqual(child.pending_remote_index_layer_id, 2)
+        self.assertTrue(child.pending_remote_kv_broadcast)
+        self.assertTrue(child.pending_remote_index_broadcast)
+        self.assertEqual((child._kv_used_bound, child._idx_used_bound), (16, 16))
+        # Model layer 19 is offset 11 in this PP span, not compact layer 2.
+        self.assertEqual(waits, [11])
+        self.assertEqual(broadcast_waits, [[11], [11]])
+
+    def test_kimi_prefetch_without_prefix_keeps_scratch_unprepared(self):
+        pool, waits = self._hybrid_prefetch_pool()
+        child = pool.full_kv_pool
+        ctx = ForwardContext(attn_backend=SimpleNamespace(token_to_kv_pool=pool))
+        fb = SimpleNamespace(extend_prefix_lens_cpu=[0])
+        with (
+            forward_context(ctx),
+            patch("sglang.srt.layers.attention.dsa.utils.is_npu", return_value=True),
+            patch(
+                "sglang.srt.layers.attention.dsa.utils.dsa_use_prefill_cp",
+                return_value=True,
+            ),
+        ):
+            maybe_prefetch_next_kimi_full_attention_kv(fb, 19)
+        self.assertEqual(waits, [])
+        self.assertFalse(child.pending_remote_kv_broadcast)
+        self.assertFalse(child.pending_remote_index_broadcast)
+
+    def test_kimi_prefetch_on_non_npu_is_noop_without_forward_context(self):
+        with patch("sglang.srt.layers.attention.dsa.utils.is_npu", return_value=False):
+            maybe_prefetch_next_kimi_full_attention_kv(SimpleNamespace(), 19)
+
+    def test_hybrid_write_preserves_cp_gather_patch_flags(self):
+        """Dropping chunk flags discards a prefetched prefix and broadcasts again."""
+        pool = object.__new__(HybridLinearKVPool)
+        pool.use_mla = True
+        pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
+        writes = []
+        pool.full_kv_pool = SimpleNamespace(
+            set_kv_buffer=lambda layer, loc, k, v, **kw: writes.append(
+                (layer.layer_id, kw)
+            )
+        )
+        layer = SimpleNamespace(layer_id=7)
+        pool.set_kv_buffer(
+            layer, torch.tensor([128]), None, None, cp_gathered_chunk=True
+        )
+        self.assertEqual(
+            writes, [(1, dict(cp_gathered_full=False, cp_gathered_chunk=True))]
+        )
+        self.assertEqual(layer.layer_id, 7)
+
     def test_uneven_split_ownership_and_offsets(self):
         pool = _make_pool(layer_num=10, shard_rank=1, shard_size=4)
         self.assertEqual(pool._owned_local_layer_range(), (3, 6))
@@ -137,6 +254,27 @@ class TestShardBookkeeping(CustomTestCase):
             ptrs, _, _ = pool.get_contiguous_buf_infos()
             self.assertEqual(pool.get_kv_layer_ids(), expected)
             self.assertEqual(len(ptrs), len(expected))
+
+    def test_static_owner_layer_ids_match_exported_buffer_groups(self):
+        # Packed FP8 does not export V. The owned global IDs must only follow
+        # buffer groups that are actually registered for PD transfer.
+        pool = _make_pool(layer_num=8, start_layer=5, shard_rank=1, shard_size=4)
+        pool.is_draft_worker = False
+        pool.dcp_size = 1
+        pool.indexer_layer_ids = [7, 8]
+        pool.index_k_scale_buffer = torch.zeros_like(pool.index_k_buffer)
+
+        cases = (
+            (False, (7, 8, 7, 8, 7, 8, 7, 8)),
+            (True, (7, 8, 7, 8, 7, 8)),
+        )
+        for packed, expected_ids in cases:
+            with self.subTest(packed=packed):
+                pool.dsa_kv_cache_store_c8 = packed
+                region = _static_owner_region(pool)
+                self.assertEqual(region.layer_ids, expected_ids)
+                self.assertEqual(len(region.layer_ids), len(region.ptrs))
+                self.assertEqual(len(region.layer_ids), len(region.item_lens))
 
     def test_get_kv_transfer_layer_span_counts_buffer_groups(self):
         pool = _make_pool()
@@ -600,60 +738,52 @@ class TestFinalizeAndPrefetchKv(CustomTestCase):
 
 
 class TestDsaSplitRowBound(CustomTestCase):
-    def test_bound_is_max_chunk_first_row(self):
-        # Three chunks of one batch, each starting at its own pool row (the
-        # request slots are not zero-based). The bound must be the max FIRST
-        # ROW, never a token count.
+    def test_prefix_above_new_chunk_after_page_recycling(self):
+        # A real 64K request's last chunk reused low pages after the allocator
+        # merged its free list. The old new-row bound of 128 missed the prefix.
+        mapping = torch.arange(131328, 180480).unsqueeze(0)
         fb = SimpleNamespace(
-            out_cache_loc=torch.tensor([500, 501, 9100, 9101, 17700]),
-            extend_seq_lens_cpu=[2, 2, 1],
+            req_pool_indices=torch.tensor([0]),
+            extend_prefix_lens_cpu=[49152],
+            out_cache_loc=torch.tensor([128, 129]),
+            extend_seq_lens_cpu=[2],
         )
-        self.assertEqual(_dsa_split_row_bound(fb), 17700)
+        ctx = ForwardContext(
+            attn_backend=SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(req_to_token=mapping)
+            )
+        )
+        with forward_context(ctx):
+            bound = _dsa_split_row_bound(fb)
+        self.assertEqual(bound, 180480)
+        self.assertTrue(torch.all(mapping < bound))
 
-    def test_bound_with_slot_base_offset(self):
-        # Regression shape for the base-offset bug: with a non-zero slot base
-        # the chunk first-ROW values differ from the chunk token counts, and
-        # only the row value is a valid broadcast bound.
-        base = 384
-        loc = [base, 10, base + 2, 11, 12]
+    def test_bound_covers_only_active_prefixes_in_request_order(self):
+        mapping = torch.tensor([[40, 1700, 99999], [99999, 99999, 99999], [900, 2, 12]])
         fb = SimpleNamespace(
-            out_cache_loc=torch.tensor(loc), extend_seq_lens_cpu=[2, 3]
+            req_pool_indices=torch.tensor([2, 0, 1]),
+            extend_prefix_lens_cpu=[3, 2, 0],
+            out_cache_loc=torch.tensor([1, 2, 3]),
+            extend_seq_lens_cpu=[1, 1, 1],
         )
-        # Chunk 0 starts at pool row 384, chunk 1 at row 386; a token-space
-        # computation would have yielded 3.
-        self.assertEqual(_dsa_split_row_bound(fb), 386)
+        ctx = ForwardContext(
+            attn_backend=SimpleNamespace(
+                req_to_token_pool=SimpleNamespace(req_to_token=mapping)
+            )
+        )
+        with forward_context(ctx):
+            self.assertEqual(_dsa_split_row_bound(fb), 1701)
 
     def test_cached_bound_is_reused(self):
-        fb = SimpleNamespace(
-            out_cache_loc=torch.tensor([5, 6]),
-            extend_seq_lens_cpu=[1, 1],
-            _dsa_split_row_bound=42,
-        )
+        fb = SimpleNamespace(_dsa_split_row_bound=42)
         self.assertEqual(_dsa_split_row_bound(fb), 42)
 
-    def test_degenerate_batches_return_none(self):
-        self.assertIsNone(_dsa_split_row_bound(SimpleNamespace()))
-        self.assertIsNone(
-            _dsa_split_row_bound(
-                SimpleNamespace(
-                    out_cache_loc=torch.tensor([1, 2]), extend_seq_lens_cpu=[]
+    def test_no_prefix_returns_full_broadcast_sentinel(self):
+        for lens in (None, [], [0, 0]):
+            with self.subTest(prefix_lens=lens):
+                self.assertIsNone(
+                    _dsa_split_row_bound(SimpleNamespace(extend_prefix_lens_cpu=lens))
                 )
-            )
-        )
-        self.assertIsNone(
-            _dsa_split_row_bound(
-                SimpleNamespace(
-                    out_cache_loc=torch.tensor([1, 2]), extend_seq_lens_cpu=[0, 0]
-                )
-            )
-        )
-        self.assertIsNone(
-            _dsa_split_row_bound(
-                SimpleNamespace(
-                    out_cache_loc=torch.tensor([1, 2]), extend_seq_lens_cpu=[4, 4]
-                )
-            )
-        )
 
 
 if __name__ == "__main__":

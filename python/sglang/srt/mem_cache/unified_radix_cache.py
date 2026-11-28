@@ -109,6 +109,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     SWAComponent,
     TreeComponent,
 )
+from sglang.srt.mem_cache.unified_cache.linker_attachment import LinkerAttachment
 from sglang.srt.mem_cache.unified_cache.session_ref_tracker import (
     UnifiedSessionRefTracker,
 )
@@ -387,6 +388,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.linker: Optional[UnifiedCacheLinkerWrapper] = None
+        # Owns the external linker lifecycle; built by the registry.
+        self.linker_attachment: Optional[LinkerAttachment] = None
         self.prefetch_stop_policy = "best_effort"
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
