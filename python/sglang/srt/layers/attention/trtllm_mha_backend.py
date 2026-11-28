@@ -375,9 +375,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
 
-        # True iff the model declares ENCODER_ONLY (bidirectional) layers, which
-        # need the expanded TARGET_VERIFY metadata (TRTLLMMHAMetadata.encoder_*).
-        self.expand_encoder_only_verify = any(
+        # True iff ENCODER_ONLY (bidirectional) layers need the expanded
+        # TARGET_VERIFY metadata (TRTLLMMHAMetadata.encoder_*). GenMHA with
+        # FP8/BF16 output folds the verify window into the GQA group instead.
+        self.expand_encoder_only_verify = (
+            self.is_xqa_impl or self.uses_trtllm_gen_native_fp4
+        ) and any(
             getattr(module, "attn_type", None) == AttentionType.ENCODER_ONLY
             for module in model_runner.model.modules()
         )
@@ -2010,26 +2013,52 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ):
                 # ENCODER_ONLY layers need bidirectional attention over the
                 # verify window; the spec-decode kernel is causal in-window, so
-                # run bs*L single-token rows over the full window instead (the
+                # run single-token rows over the full window instead (the
                 # window's K/V are already in the pool).
                 assert not self.forward_metadata.is_ragged_verify, (
                     "ENCODER_ONLY target_verify does not support ragged verify layouts"
                 )
-                assert self.forward_metadata.encoder_cache_seqlens is not None, (
-                    "ENCODER_ONLY target_verify requires the expanded decode "
-                    "metadata (built only on the draft worker)"
-                )
+                if self.expand_encoder_only_verify:
+                    assert self.forward_metadata.encoder_cache_seqlens is not None, (
+                        "ENCODER_ONLY target_verify requires the expanded decode "
+                        "metadata (built only on the draft worker)"
+                    )
+                    encoder_q = q
+                    encoder_page_table = self.forward_metadata.encoder_page_table
+                    encoder_seq_lens = self.forward_metadata.encoder_cache_seqlens
+                    encoder_sinks = attention_sink
+                else:
+                    # One row per request: the window's tokens join the GQA
+                    # group, so each request's K/V is read once, not per token.
+                    bs = forward_batch.batch_size
+                    window = self.forward_metadata.max_seq_len_q
+                    kv_heads = layer.tp_k_head_num
+                    group = layer.tp_q_head_num // kv_heads
+                    encoder_q = (
+                        q.reshape(bs, window, kv_heads, group, layer.head_dim)
+                        .transpose(1, 2)
+                        .reshape(bs, -1, layer.head_dim)
+                    )
+                    encoder_page_table = page_table
+                    encoder_seq_lens = self.forward_metadata.cache_seqlens_int32
+                    encoder_sinks = (
+                        None
+                        if attention_sink is None
+                        else attention_sink.reshape(kv_heads, 1, group)
+                        .expand(-1, window, -1)
+                        .reshape(-1)
+                    )
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-                    query=q,
+                    query=encoder_q,
                     kv_cache=kv_cache,
                     workspace_buffer=self.workspace_buffer,
-                    block_tables=self.forward_metadata.encoder_page_table,
-                    seq_lens=self.forward_metadata.encoder_cache_seqlens,
+                    block_tables=encoder_page_table,
+                    seq_lens=encoder_seq_lens,
                     max_seq_len=self.max_kv_len,
                     bmm1_scale=bmm1_scale,
                     bmm2_scale=bmm2_scale,
                     window_left=layer.sliding_window_size,
-                    sinks=attention_sink,
+                    sinks=encoder_sinks,
                     skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
                     out=native_out,
                     out_dtype=(None if uses_native_fp4 else self.q_data_type),
@@ -2037,6 +2066,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     q_len_per_req=1,
                     multi_ctas_kv_counter_buffer=self._multi_ctas_kv_counter_buffer,
                 )
+                if not self.expand_encoder_only_verify:
+                    o = (
+                        o.reshape(bs, kv_heads, window, group, layer.head_dim)
+                        .transpose(1, 2)
+                        .reshape(q.shape)
+                    )
             elif self.forward_metadata.is_ragged_verify:
                 o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
                     query=q,

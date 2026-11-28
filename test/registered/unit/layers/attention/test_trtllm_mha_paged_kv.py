@@ -18,6 +18,8 @@ CPU-only.
     python -m pytest test/registered/unit/layers/attention/test_trtllm_mha_paged_kv.py -v
 """
 
+import contextlib
+import math
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,7 +27,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention import trtllm_mha_backend
-from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+from sglang.srt.layers.attention.trtllm_mha_backend import (
+    TRTLLMHAAttnBackend,
+    TRTLLMMHAMetadata,
+)
+from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,7 +47,7 @@ def _strided_rows(num_slots, row_shape, slot_stride):
     )
 
 
-def _fake_runner(*, req_to_token_row_width):
+def _fake_runner(*, req_to_token_row_width, kv_cache_dtype=torch.bfloat16, model=None):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             context_len=64,
@@ -52,7 +58,7 @@ def _fake_runner(*, req_to_token_row_width):
         ),
         prefill_attention_backend_str="trtllm_mha",
         decode_attention_backend_str="trtllm_mha",
-        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
         dtype=torch.bfloat16,
         page_size=16,
         req_to_token_pool=SimpleNamespace(
@@ -62,14 +68,21 @@ def _fake_runner(*, req_to_token_row_width):
         device="cpu",
         is_draft_worker=False,
         max_running_requests=4,
-        model=torch.nn.Identity(),
+        model=torch.nn.Identity() if model is None else model,
     )
 
 
-def _construct_backend(runner, *, configured=0, xqa=False):
+def _construct_backend(runner, *, configured=0, xqa=False, native_fp4=False):
     """Build a TRTLLMHAAttnBackend on CPU; returns it and the mocked
     ``_init_full_attn_kv_splits``."""
-    access = SimpleNamespace(kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN)
+    access = (
+        SimpleNamespace(
+            kind=trtllm_mha_backend.KVCacheAttentionAccessKind.NATIVE_FP4,
+            scale_recipe="nvfp4",
+        )
+        if native_fp4
+        else SimpleNamespace(kind=trtllm_mha_backend.KVCacheAttentionAccessKind.PLAIN)
+    )
 
     def parent_init(backend, model_runner, *args, **kwargs):
         backend.req_to_token_pool = model_runner.req_to_token_pool
@@ -79,34 +92,97 @@ def _construct_backend(runner, *, configured=0, xqa=False):
         )
         backend.runner_ids = SimpleNamespace(is_translating=False)
 
-    with (
-        trtllm_mha_backend.envs.SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS.override(
-            configured
-        ),
-        patch.object(trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init),
-        patch.object(
-            trtllm_mha_backend,
-            "get_platform",
-            return_value=SimpleNamespace(is_sm90=xqa, is_sm120=False),
-        ),
-        patch.object(
-            trtllm_mha_backend,
-            "get_spec",
-            return_value=SimpleNamespace(
-                speculative_eagle_topk=1, speculative_num_draft_tokens=None
-            ),
-        ),
-        patch.object(
-            trtllm_mha_backend, "get_buffer", side_effect=lambda *args: torch.ones(1)
-        ),
-        patch.object(trtllm_mha_backend, "resolve_window_kv_pool", return_value=None),
-        patch.object(
-            trtllm_mha_backend,
-            "make_persistent_multi_ctas_kv_counter_buffer",
-            return_value=None,
-        ),
-        patch.object(TRTLLMHAAttnBackend, "_init_full_attn_kv_splits") as initialize,
-    ):
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            trtllm_mha_backend.envs.SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS.override(
+                configured
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                trtllm_mha_backend.FlashInferAttnBackend, "__init__", parent_init
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                trtllm_mha_backend,
+                "get_platform",
+                return_value=SimpleNamespace(is_sm90=xqa, is_sm120=False),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                trtllm_mha_backend,
+                "get_spec",
+                return_value=SimpleNamespace(
+                    speculative_eagle_topk=1, speculative_num_draft_tokens=None
+                ),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                trtllm_mha_backend,
+                "get_buffer",
+                side_effect=lambda *args: torch.ones(1),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                trtllm_mha_backend, "resolve_window_kv_pool", return_value=None
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                trtllm_mha_backend,
+                "make_persistent_multi_ctas_kv_counter_buffer",
+                return_value=None,
+            )
+        )
+        if native_fp4:
+            stack.enter_context(
+                patch.object(
+                    trtllm_mha_backend,
+                    "get_schedule",
+                    return_value=SimpleNamespace(max_prefill_tokens=64),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    trtllm_mha_backend,
+                    "max_prefill_buffer_tokens",
+                    return_value=64,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    trtllm_mha_backend,
+                    "max_speculative_num_draft_tokens",
+                    return_value=1,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    trtllm_mha_backend,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        graph=SimpleNamespace(
+                            cuda_graph_config=SimpleNamespace(
+                                decode=SimpleNamespace(max_bs=4)
+                            )
+                        )
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    trtllm_mha_backend,
+                    "get_parallel",
+                    return_value=SimpleNamespace(attn_tp_size=1),
+                )
+            )
+        initialize = stack.enter_context(
+            patch.object(TRTLLMHAAttnBackend, "_init_full_attn_kv_splits")
+        )
         return TRTLLMHAAttnBackend(runner), initialize
 
 
@@ -343,6 +419,336 @@ class TestTRTLLMHAFullAttnKVSplit(CustomTestCase):
                 with trtllm_mha_backend._trtllm_decode_sm_count(1024):
                     raise RuntimeError("kernel launch failed")
             self.assertEqual(decode.get_device_sm_count(None), self.SMS)
+
+
+class _AttnTypeModule(torch.nn.Module):
+    def __init__(self, attn_type: AttentionType):
+        super().__init__()
+        self.attn_type = attn_type
+
+
+def _paged_gqa_single_token_decode(
+    *,
+    query: torch.Tensor,
+    kv_cache: tuple[torch.Tensor, torch.Tensor],
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    bmm1_scale: float,
+    bmm2_scale: float,
+    sinks: torch.Tensor | None = None,
+    q_len_per_req: int = 1,
+    **kwargs,
+) -> torch.Tensor:
+    """Pure-PyTorch reference for ``trtllm_batch_decode_with_kv_cache`` at
+    ``q_len_per_req == 1`` with optional per-query-head attention sinks."""
+    assert q_len_per_req == 1
+    k_cache, v_cache = kv_cache
+    bs, num_q_heads, head_dim = query.shape
+    num_kv_heads = k_cache.shape[1]
+    assert num_q_heads % num_kv_heads == 0
+    gqa_group = num_q_heads // num_kv_heads
+
+    outputs = []
+    for row in range(bs):
+        seq_len = int(seq_lens[row].item())
+        pages = block_tables[row].long()
+        # [pages, kv_heads, page_size, head_dim] -> [kv_heads, tokens, head_dim]
+        k = (
+            k_cache[pages]
+            .permute(1, 0, 2, 3)
+            .reshape(num_kv_heads, -1, head_dim)[:, :seq_len]
+            .repeat_interleave(gqa_group, dim=0)
+            .float()
+        )
+        v = (
+            v_cache[pages]
+            .permute(1, 0, 2, 3)
+            .reshape(num_kv_heads, -1, head_dim)[:, :seq_len]
+            .repeat_interleave(gqa_group, dim=0)
+            .float()
+        )
+        q_row = query[row].float()
+        scores = torch.einsum("hd,htd->ht", q_row, k) * float(bmm1_scale)
+        if sinks is not None:
+            logits = torch.cat([scores, sinks.float().unsqueeze(-1)], dim=-1)
+            probs = torch.softmax(logits, dim=-1)[..., :-1]
+        else:
+            probs = torch.softmax(scores, dim=-1)
+        out_row = torch.einsum("ht,htd->hd", probs, v) * float(bmm2_scale)
+        outputs.append(out_row.to(query.dtype))
+    return torch.stack(outputs, dim=0)
+
+
+class TestTRTLLMHAEncoderOnlyVerifyFold(CustomTestCase):
+    def test_expand_encoder_only_verify_selection(self):
+        encoder_model = torch.nn.Sequential(
+            _AttnTypeModule(AttentionType.DECODER),
+            _AttnTypeModule(AttentionType.ENCODER_ONLY),
+        )
+        decoder_model = torch.nn.Sequential(_AttnTypeModule(AttentionType.DECODER))
+
+        cases = [
+            # GenMHA with BF16 or FP8 KV cache folds ENCODER_ONLY verify.
+            (encoder_model, torch.bfloat16, False, False, False),
+            (encoder_model, torch.float8_e4m3fn, False, False, False),
+            # XQA and SM100 native NVFP4 keep the expanded single-token path.
+            (encoder_model, torch.bfloat16, True, False, True),
+            (encoder_model, torch.float8_e4m3fn, True, False, True),
+            (encoder_model, torch.bfloat16, False, True, True),
+            # Models without ENCODER_ONLY layers never expand.
+            (decoder_model, torch.bfloat16, False, False, False),
+            (decoder_model, torch.float8_e4m3fn, False, False, False),
+            (decoder_model, torch.bfloat16, True, False, False),
+            (decoder_model, torch.bfloat16, False, True, False),
+        ]
+        for model, kv_dtype, xqa, native_fp4, expected in cases:
+            with self.subTest(
+                has_encoder=model is encoder_model,
+                kv_dtype=kv_dtype,
+                xqa=xqa,
+                native_fp4=native_fp4,
+            ):
+                runner = _fake_runner(
+                    req_to_token_row_width=64,
+                    kv_cache_dtype=kv_dtype,
+                    model=model,
+                )
+                backend, _ = _construct_backend(runner, xqa=xqa, native_fp4=native_fp4)
+                self.assertEqual(backend.expand_encoder_only_verify, expected)
+
+    def test_folded_path_skips_expanded_metadata_buffers(self):
+        backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+        backend.device = "cpu"
+        backend.max_num_pages = 4
+        backend.speculative_num_draft_tokens = 7
+        backend.use_sliding_window_kv_pool = False
+        backend._swa_kv_pool = None
+        backend.expand_encoder_only_verify = False
+        backend.page_size = 16
+        backend.req_to_token = torch.zeros((4, 64), dtype=torch.int32)
+        backend._swa_full_to_swa_mapping = None
+        backend.runner_ids = SimpleNamespace(is_translating=False)
+        backend.init_cuda_graph_state(4, 28)
+
+        self.assertNotIn("encoder_cache_seqlens", backend.target_verify_metadata)
+        self.assertNotIn("encoder_page_table", backend.target_verify_metadata)
+        metadata = backend._build_cuda_graph_metadata(
+            2, 14, ForwardMode.TARGET_VERIFY, None, "cpu", ragged_verify_layout=None
+        )
+        self.assertIsNone(metadata.encoder_cache_seqlens)
+        self.assertIsNone(metadata.encoder_page_table)
+        self.assertIsNone(metadata.encoder_row_map)
+        self.assertFalse(
+            backend._needs_encoder_only_expand(ForwardMode.TARGET_VERIFY, metadata)
+        )
+
+    def _run_encoder_verify(
+        self,
+        *,
+        expand: bool,
+        q: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        page_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        window: int,
+        kv_heads: int,
+        group: int,
+        head_dim: int,
+        page_size: int,
+        sinks: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, dict]:
+        bs = int(seq_lens.shape[0])
+        num_q_heads = kv_heads * group
+        backend = TRTLLMHAAttnBackend.__new__(TRTLLMHAAttnBackend)
+        backend.uses_trtllm_gen_native_fp4 = False
+        backend.prefill_uses_native_fp4 = False
+        backend.decode_uses_native_fp4 = False
+        backend.is_xqa_impl = False
+        backend.use_fmha_v2 = False
+        backend.data_type = torch.float32
+        backend.q_data_type = torch.float32
+        backend.page_size = page_size
+        backend.max_kv_len = page_table.shape[1] * page_size
+        backend.workspace_buffer = None
+        backend._multi_ctas_kv_counter_buffer = None
+        backend.expand_encoder_only_verify = expand
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(
+                read=lambda layer_id: SimpleNamespace(kv=lambda: kv_cache)
+            )
+        )
+
+        row_map = torch.arange(bs * window) // window
+        backend.forward_metadata = TRTLLMMHAMetadata(
+            cache_seqlens_int32=seq_lens,
+            max_seq_len_q=window,
+            page_table=page_table,
+            is_ragged_verify=False,
+            encoder_cache_seqlens=seq_lens[row_map] if expand else None,
+            encoder_page_table=page_table[row_map] if expand else None,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            attn_type=AttentionType.ENCODER_ONLY,
+            tp_q_head_num=num_q_heads,
+            tp_k_head_num=kv_heads,
+            tp_v_head_num=kv_heads,
+            head_dim=head_dim,
+            scaling=1.0 / math.sqrt(head_dim),
+            sliding_window_size=-1,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+        )
+
+        captured = {}
+
+        def fake_decode(**kwargs):
+            captured.update(kwargs)
+            return _paged_gqa_single_token_decode(**kwargs)
+
+        decode_ns = SimpleNamespace(trtllm_batch_decode_with_kv_cache=fake_decode)
+        with patch.object(
+            trtllm_mha_backend,
+            "flashinfer",
+            SimpleNamespace(decode=decode_ns),
+            create=True,
+        ):
+            out = backend.forward_extend(
+                q,
+                None,
+                None,
+                layer,
+                forward_batch,
+                save_kv_cache=False,
+                sinks=sinks,
+            )
+        return out, captured
+
+    def test_gqa_fold_matches_expanded_reference(self):
+        page_size = 8
+        head_dim = 16
+        cases = [
+            # (bs, window, kv_heads, group, use_sink, non_contiguous)
+            (1, 7, 1, 2, False, False),
+            (1, 7, 2, 4, True, False),
+            (1, 7, 4, 8, True, True),
+            (4, 7, 1, 2, False, False),
+            (4, 7, 2, 4, False, True),
+            (4, 7, 2, 4, True, False),
+            (4, 7, 4, 8, True, True),
+            (4, 1, 2, 4, True, False),
+        ]
+        for seed, (bs, window, kv_heads, group, use_sink, non_contiguous) in enumerate(
+            cases, start=1
+        ):
+            with self.subTest(
+                bs=bs,
+                window=window,
+                kv_heads=kv_heads,
+                group=group,
+                use_sink=use_sink,
+                non_contiguous=non_contiguous,
+            ):
+                gen = torch.Generator().manual_seed(seed)
+                num_q_heads = kv_heads * group
+                q_dim = num_q_heads * head_dim
+                seq_lens_list = [10, 23, 7, 19][:bs]
+                seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32)
+                pages_per_req = math.ceil(max(seq_lens_list) / page_size)
+                num_pages = bs * pages_per_req + 1
+
+                k_cache = torch.randn(
+                    (num_pages, kv_heads, page_size, head_dim),
+                    generator=gen,
+                    dtype=torch.float32,
+                )
+                v_cache = torch.randn(
+                    (num_pages, kv_heads, page_size, head_dim),
+                    generator=gen,
+                    dtype=torch.float32,
+                )
+                page_table = torch.arange(
+                    1, 1 + bs * pages_per_req, dtype=torch.int32
+                ).view(bs, pages_per_req)
+
+                if non_contiguous:
+                    q_backing = torch.randn(
+                        (q_dim, bs * window), generator=gen, dtype=torch.float32
+                    )
+                    q = q_backing.transpose(0, 1)
+                    self.assertFalse(q.is_contiguous())
+                else:
+                    q = torch.randn(
+                        (bs * window, q_dim), generator=gen, dtype=torch.float32
+                    )
+
+                if use_sink:
+                    if non_contiguous:
+                        sink_backing = torch.randn(
+                            (num_q_heads * 2,), generator=gen, dtype=torch.float32
+                        )
+                        sinks = sink_backing[::2]
+                        self.assertFalse(sinks.is_contiguous())
+                    else:
+                        sinks = torch.randn(
+                            (num_q_heads,), generator=gen, dtype=torch.float32
+                        )
+                else:
+                    sinks = None
+
+                folded_out, folded_call = self._run_encoder_verify(
+                    expand=False,
+                    q=q,
+                    kv_cache=(k_cache, v_cache),
+                    page_table=page_table,
+                    seq_lens=seq_lens,
+                    window=window,
+                    kv_heads=kv_heads,
+                    group=group,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                    sinks=sinks,
+                )
+                expanded_out, expanded_call = self._run_encoder_verify(
+                    expand=True,
+                    q=q,
+                    kv_cache=(k_cache, v_cache),
+                    page_table=page_table,
+                    seq_lens=seq_lens,
+                    window=window,
+                    kv_heads=kv_heads,
+                    group=group,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                    sinks=sinks,
+                )
+
+                self.assertEqual(
+                    tuple(folded_call["query"].shape),
+                    (bs, window * num_q_heads, head_dim),
+                )
+                self.assertEqual(
+                    tuple(folded_call["block_tables"].shape), (bs, pages_per_req)
+                )
+                self.assertEqual(tuple(folded_call["seq_lens"].shape), (bs,))
+                self.assertEqual(folded_call["q_len_per_req"], 1)
+                self.assertEqual(
+                    tuple(expanded_call["query"].shape),
+                    (bs * window, num_q_heads, head_dim),
+                )
+                if use_sink:
+                    self.assertEqual(
+                        tuple(folded_call["sinks"].shape), (window * num_q_heads,)
+                    )
+                else:
+                    self.assertIsNone(folded_call["sinks"])
+
+                self.assertEqual(tuple(folded_out.shape), (bs * window, q_dim))
+                torch.testing.assert_close(
+                    folded_out, expanded_out, atol=1e-6, rtol=1e-6
+                )
 
 
 if __name__ == "__main__":
