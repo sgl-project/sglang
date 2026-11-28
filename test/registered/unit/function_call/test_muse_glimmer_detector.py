@@ -80,6 +80,42 @@ class TestMuseGlimmerDetector(CustomTestCase):
                 f"streaming diverged at chunk_size={chunk_size}",
             )
 
+    # ---- incremental scanning --------------------------------------------
+
+    def test_streaming_large_argument_with_marker_lookalikes(self):
+        # Long argument full of near-miss terminators / invoke closes: the
+        # incremental scans must neither skip a split marker nor lose a match.
+        filler = "a</atem:inv<|eo</atem:invoke x<|eom" * 1500
+        text = (
+            f"<|start|>assistant to={DOUBLED}<|message|>"
+            f"{atem(DOUBLED, city=filler)}<|eom|>tail"
+        )
+        expected = self.parse(text)
+        self.assertEqual(expected[1], [("get_weather", {"city": filler})])
+        for chunk_size in (1, 3, 14, 4096):
+            self.assertEqual(self.parse_streaming(text, chunk_size), expected)
+
+    def test_streaming_markers_split_at_every_offset(self):
+        text = (
+            f"<|start|>assistant to={DOUBLED}<|message|>"
+            f"{atem(DOUBLED, city='Paris')}<|eom|>"
+            f"<|start|>assistant to={DOUBLED}<|message|>"
+            f"{atem(DOUBLED, city='Tokyo')}<|eot|>"
+        )
+        expected = self.parse(text)
+        for cut in range(1, len(text)):
+            detector = MuseGlimmerDetector()
+            first = detector.parse_streaming_increment(text[:cut], self.tools)
+            second = detector.parse_streaming_increment(text[cut:], self.tools)
+            calls = [
+                (c.name, json.loads(c.parameters))
+                for c in first.calls + second.calls
+                if c.name
+            ]
+            self.assertEqual(
+                (first.normal_text + second.normal_text, calls), expected, cut
+            )
+
     # ---- tool extraction --------------------------------------------------
 
     def test_single_tool_call(self):
