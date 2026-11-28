@@ -30,6 +30,77 @@ On the other hand, if you see `token usage` very high and you frequently see war
 `KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.
 If you see `KV cache pool is full. Retract requests.` occasionally but not frequently (~1 time per minute), it is okay.
 
+### Adjust KV admission budgets by reasoning effort
+
+`--reasoning-effort-kv-budget` is an experimental option for colocated Python
+serving. It adjusts the future decode reservation used when admitting prefill
+requests. It does not change output limits, allocate KV eagerly, change DP
+routing, or choose retraction victims. PD disaggregation and the embedded Rust
+server reject this option when it is enabled.
+
+The modes are `off` (default), `scaled`, and `adaptive`. For example, on a Linux
+CUDA host with a model that fits one GPU, replace `MODEL_PATH` with its Hugging
+Face model ID or local checkpoint directory:
+
+```bash
+python3 -m sglang.launch_server --model-path MODEL_PATH --tp 1 \
+  --reasoning-effort-kv-budget adaptive
+```
+
+Chat requests supply the hint through their resolved `reasoning_effort` or
+`chat_template_kwargs.thinking_effort`. Explicitly disabled thinking maps to
+`none`. Server template defaults and explicit DeepSeek effort environment
+defaults are honored; unrecognized or unspecified model defaults keep the existing
+budget. Native `/generate` requests can set `reasoning_effort_hint`; this is
+scheduling metadata and does not change the prompt or enable thinking. A native
+batch's scalar hint is copied to each request and parallel sample. Numeric
+DeepSeek budgets map to `low` (1–50), `high` (51–75), or `max` (76–100); normalized
+floating-point budgets in [0, 0.99] use the same conversion as DeepSeek rendering.
+
+In `scaled` mode, let `r` be the current global `new_token_ratio`, `r0` its initial
+value, and `rmin` its decay floor. The request ratio is:
+
+```text
+ratio = clamp(min(1, r0 * multiplier) - (r0 - r) / multiplier, rmin, 1)
+```
+
+| Effort | none | minimal | low | medium | high | xhigh | ultra / max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Multiplier | 0.5 | 0.625 | 0.75 | 1 | 1.25 | 1.375 | 1.5 |
+
+Higher effort starts with a larger reservation and scales down the decay;
+lower effort starts smaller and scales up the decay. These multipliers are
+heuristic defaults, not measured output-length probabilities.
+
+`adaptive` maintains the arithmetic mean of the last 256 eligible completed
+requests in each effort group. Groups are local to a scheduler/model and are
+separated by LoRA ID and weight-version label; at most 128 groups are retained.
+Histories survive idle periods but are not persisted across restarts or shared
+between DP ranks. After eight observations, let `g` be generated tokens, `M` the
+request output limit, and `mu` the group's mean:
+
+```text
+remaining = min(mu, M) - g
+demand = min(M - g, SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION)
+decay_scale = clamp(r0 * demand / remaining, 0.25, 4)
+ratio = clamp(r0 - (r0 - r) * decay_scale, rmin, 1)
+```
+
+A larger positive difference slows decay, while a smaller difference speeds it
+up. If the request has already reached the mean, its ratio becomes 1 instead of
+discarding its future demand. Until eight observations exist, use `scaled`.
+Completion recording excludes aborted, unfinished, empty-output and
+`ignore_eos` requests. Ordinary length-limit finishes are included as observed
+lengths, so a population dominated by small output caps can underestimate later
+requests with larger caps. The mean is not a conditional remaining-length
+predictor and does not guarantee that a request will end near that value.
+
+`ignore_eos` requests retain their existing full-ratio reservation. Physical
+allocation checks, output stopping conditions, and the scheduler's existing
+output-estimation cap remain in effect. Compare token utilization, retractions,
+throughput and tail latency on your workload before enabling either mode in
+production; neither mode guarantees a performance improvement.
+
 ### Tune `--mem-fraction-static` to increase KV cache pool capacity
 SGLang allocates memory as follows:
 
