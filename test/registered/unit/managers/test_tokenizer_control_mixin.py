@@ -4,6 +4,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from pydantic import TypeAdapter, ValidationError
+
 from sglang.srt.managers import tokenizer_control_mixin
 from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
@@ -72,6 +74,24 @@ class TestStartProfilePlatformDefaults(CustomTestCase):
                 self.assertFalse(sent.with_stack)
                 self.assertFalse(sent.record_shapes)
                 self.assertEqual(sent.num_steps, 2)
+
+
+class TestProfileReqFilenameComponents(CustomTestCase):
+    def test_path_separators_are_rejected(self):
+        """profile_id/profile_prefix are joined into the trace filename under
+        output_dir; '../x' or an absolute value wrote the trace outside it
+        (#44189). The HTTP body goes through the pydantic schema, which must
+        surface the same error as a validation failure (400), not a 500."""
+        adapter = TypeAdapter(ProfileReq)
+        for field in ("profile_id", "profile_prefix"):
+            for value in ("../escaped", "/tmp/elsewhere", "a\\..\\b"):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValueError):
+                        ProfileReq(**{field: value})
+                    with self.assertRaises(ValidationError):
+                        adapter.validate_python({field: value})
+        req = ProfileReq(profile_id="1763.5", profile_prefix="..run-1")
+        self.assertEqual(req.profile_prefix, "..run-1")
 
 
 if __name__ == "__main__":

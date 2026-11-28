@@ -2692,6 +2692,18 @@ class ProfileReq(BaseReq, kw_only=True):
     # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
     detailed_annotations: bool = False
 
+    def __post_init__(self):
+        # Both become part of a trace filename joined under output_dir; a path
+        # separator would let the file land outside it.
+        for name, value in (
+            ("profile_id", self.profile_id),
+            ("profile_prefix", self.profile_prefix),
+        ):
+            if value and ("/" in value or "\\" in value):
+                raise ValueError(
+                    f"{name} must not contain path separators, got {value!r}"
+                )
+
 
 class ProfileReqOutput(BaseReq, kw_only=True):
     success: bool
