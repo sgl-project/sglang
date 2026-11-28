@@ -2742,6 +2742,7 @@ multimodal_model_archs = [
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
+    "Molmo2ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
     "MossVLForConditionalGeneration",
