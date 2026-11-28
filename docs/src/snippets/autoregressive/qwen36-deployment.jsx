@@ -12,6 +12,7 @@ export const Qwen36Deployment = () => {
         { id: 'xeon', label: 'XEON', default: false },
         { id: 'rtx-spark', label: 'RTX Spark', default: false },
         { id: 'a3', label: 'A3 (NPU)', default: false },
+        { id: 'arc_b', label: 'BMG', default: false },
       ],
     },
     // Atlas 800I A3: 1 card = 2 dies, so --tp-size is twice the card count.
@@ -42,6 +43,9 @@ export const Qwen36Deployment = () => {
       // RTX Spark only has a validated NVFP4 recipe (35B-A3B).
       getDynamicItems: (values) => {
         if (values.hardware === 'a3') {
+          return [{ id: 'bf16', label: 'BF16', default: true }];
+        }
+        if (values.hardware === 'arc_b') {
           return [{ id: 'bf16', label: 'BF16', default: true }];
         }
         if (values.hardware === 'rtx-spark') {
@@ -82,11 +86,12 @@ export const Qwen36Deployment = () => {
       getDynamicItems: (values) => {
         const isXeon = values.hardware === 'xeon';
         const isSpark = values.hardware === 'rtx-spark';
-        const noSpec = isXeon || isSpark;
+        const isArcB = values.hardware === 'arc_b';
+        const noSpec = isXeon || isSpark || isArcB;
         return [
           { id: 'disabled', label: 'Disabled', default: noSpec },
           { id: 'enabled', label: 'Enabled', default: !noSpec, disabled: noSpec,
-            disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : isSpark ? 'Speculative decoding is not validated on RTX Spark' : '' },
+            disabledReason: isXeon ? 'Speculative decoding is not supported on Xeon' : isSpark ? 'Speculative decoding is not validated on RTX Spark' : isArcB ? 'Speculative decoding is not enabled for this BMG recipe' : '' },
         ];
       },
       commandRule: (value, values) => {
@@ -99,7 +104,7 @@ export const Qwen36Deployment = () => {
     mambaCache: {
       name: 'mambaCache',
       title: 'Mamba Radix Cache',
-      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'a3',
+      condition: (values) => values.hardware !== 'xeon' && values.hardware !== 'a3' && values.hardware !== 'arc_b',
       getDynamicItems: (values) => {
         const mtpEnabled = values.speculative === 'enabled';
         if (values.hardware === 'rtx-spark') {
@@ -132,6 +137,7 @@ export const Qwen36Deployment = () => {
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       xeon: { bf16: { tp: 3 },           fp8: { tp: 3 } },
+      arc_b: { bf16: { tp: 4, mem: 0.8 } },
       'rtx-spark': { nvfp4: { tp: 1, mem: 0.8 } },
     },
     '27b': {
@@ -141,6 +147,7 @@ export const Qwen36Deployment = () => {
       b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       b300: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 }, nvfp4: { tp: 1 } },
       xeon: { bf16: { tp: 6 },           fp8: { tp: 6 } },
+      arc_b: { bf16: { tp: 4, mem: 0.8 } },
     },
   };
 
@@ -195,7 +202,15 @@ export const Qwen36Deployment = () => {
   }, [values.speculative, values.hardware, values.modelSize]);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'arc_b') {
+        next.reasoning = 'disabled';
+        next.toolcall = 'disabled';
+        next.speculative = 'disabled';
+      }
+      return next;
+    });
   };
 
   const generateCommand = () => {
@@ -276,6 +291,8 @@ export const Qwen36Deployment = () => {
     let cmd = `sglang serve --model-path ${modelName}`;
     if (hardware === 'xeon') {
       cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
+    } else if (hardware === 'arc_b') {
+      cmd += ` \\\n  --device xpu \\\n  --linear-attn-backend intel_xpu \\\n  --attention-backend intel_xpu`;
     }
     if (hwConfig.tp > 1) {
       cmd += ` \\\n  --tp ${hwConfig.tp}`;
@@ -296,6 +313,9 @@ export const Qwen36Deployment = () => {
     }
     if (hwConfig.mem !== undefined) {
       cmd += ` \\\n  --mem-fraction-static ${hwConfig.mem}`;
+    }
+    if (hardware === 'arc_b') {
+      cmd += ` \\\n  --host 127.0.0.1 --port 30000`;
     }
     return cmd;
   };

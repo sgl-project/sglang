@@ -14,7 +14,7 @@ const MODES = ["balanced", "low-latency", "high-throughput"];
 const EXPORTED_PAGES = join(docs, "cookbook/autoregressive");
 // Hardware the CLI Guide cannot detect from a device name: CPU, Apple, TPU and Ascend NPU, whose
 // commands target other builds, and Vera Rubin, whose device name no cell has recorded yet.
-const UNDETECTED_HARDWARE = new Set(["xeon", "mac", "tpu7x", "a3", "a5", "vera-rubin"]);
+const UNDETECTED_HARDWARE = new Set(["xeon", "mac", "tpu7x", "a3", "a5", "vera-rubin", "arc_b"]);
 
 const engineSource = readFileSync(join(docs, "src/snippets/_deployment.jsx"), "utf8");
 const start = engineSource.indexOf("// ==== COMMAND ENGINE ====");
