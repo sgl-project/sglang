@@ -3487,7 +3487,10 @@ class RemoteModelLoader(BaseModelLoader):
                         file_path = os.path.join(root, file_name)
                         with open(file_path, encoding="utf-8") as file:
                             file_content = file.read()
-                            f_key = f"{model_name}/files/{file_name}"
+                            relative_file_path = os.path.relpath(
+                                file_path, model_path
+                            ).replace(os.sep, "/")
+                            f_key = f"{model_name}/files/{relative_file_path}"
                             client.setstr(f_key, file_content)
 
     def _load_model_from_remote_kv(
