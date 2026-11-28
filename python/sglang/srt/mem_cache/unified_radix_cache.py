@@ -381,6 +381,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
+        # Set by init_host_window_metrics once a host tier with window pools exists.
+        self._host_window_metrics = False
         # Host backups of restores whose host-to-device copies may still be in
         # flight, each with its copy's finish event; their host slots are
         # returned once the copy has finished.
@@ -1999,7 +2001,49 @@ class UnifiedRadixCache(BasePrefixCache):
             return 0
         result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._apply_eviction_result(result)
+        self._record_host_evicted_tokens(result.tracker)
         return result.tracker.get(component_type, 0)
+
+    def window_host_pools(self) -> dict[str, Any]:
+        """The host pools of the sliding-window components, by host pool name."""
+        if self.host_pool_group is None:
+            return {}
+        entry_map = self.host_pool_group.entry_map
+        return {
+            str(component.pool_name): entry_map[component.pool_name].host_pool
+            for component in self._components_tuple
+            if component.slot.family == TREE_WINDOW and component.pool_name in entry_map
+        }
+
+    def init_host_window_metrics(self) -> None:
+        """Export host-tier evictions when the host tier has window pools: an
+        evicted host window leaves its prefix's host KV unreachable."""
+        if (
+            self._host_window_metrics
+            or self.metrics_collector is None
+            or not self.window_host_pools()
+        ):
+            return
+        self.metrics_collector.init_host_window_metrics()
+        self._host_window_metrics = True
+
+    def _host_pool_label(self, component_type: ComponentType) -> str:
+        # The pool names the backup and load-back series use.
+        component = self.components[component_type]
+        if component.slot.family == TREE_WINDOW:
+            return str(component.pool_name)
+        if component_type == BASE_COMPONENT_TYPE:
+            return str(PoolName.KV)
+        return component.slot.component
+
+    def _record_host_evicted_tokens(self, tracker: dict[ComponentType, int]) -> None:
+        if not self._host_window_metrics:
+            return
+        for component_type, num_tokens in tracker.items():
+            if num_tokens > 0:
+                self.metrics_collector.increment_host_evicted_tokens(
+                    num_tokens=num_tokens, pool=self._host_pool_label(component_type)
+                )
 
     # ---- Decode retraction ----
 

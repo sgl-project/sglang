@@ -2564,6 +2564,7 @@ def _apply_stack_result(
 
     for sidecar in result.sidecars:
         cache.register_sidecar_pool(sidecar)
+    cache.init_host_window_metrics()
 
     kvcache.register_layer_transfer_counter(result.cache_controller.layer_done_counter)
     if isinstance(kvcache, PageInterleaveKVPoolMixin):
