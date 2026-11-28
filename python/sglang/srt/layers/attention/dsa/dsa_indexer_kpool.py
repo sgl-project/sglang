@@ -85,7 +85,7 @@ def _topk_v2_plan_for(
 
 
 def _slice_rows(
-    *, tensor: Optional[torch.Tensor], rows: slice
+    *, tensor: Optional[torch.Tensor], rows: slice | torch.Tensor
 ) -> Optional[torch.Tensor]:
     return None if tensor is None else tensor[rows]
 
@@ -1099,14 +1099,18 @@ class IndexerKPool(MultiPlatformOp):
         topk_row_starts: Optional[torch.Tensor],
         row_chunks: Tuple[slice, ...],
         out_rows: Optional[int],
+        use_lite_topk: bool = False,
     ) -> torch.Tensor:
         # Each row's top-k reads only its own logits row, pooled length and
         # page-table row, so row chunks select the same pages as one pass.
         single_chunk = len(row_chunks) == 1
-        topk_result = None
-        for rows in row_chunks:
+
+        def dense(
+            rows: slice | torch.Tensor, padded_rows: Optional[int]
+        ) -> torch.Tensor:
             if kv_fp8 is None:
                 # No pooled keys yet: every row scores an empty key set.
+                assert isinstance(rows, slice)
                 logits = torch.empty(
                     (rows.stop - rows.start, 0),
                     dtype=torch.float32,
@@ -1115,8 +1119,15 @@ class IndexerKPool(MultiPlatformOp):
             else:
                 assert logits_starts is not None
                 k_fp8, k_scale = kv_fp8
+                if isinstance(rows, slice):
+                    q_chunk = q_fp8[rows].contiguous()
+                else:
+                    # CUDA index_select is not implemented for fp8.
+                    q_chunk = (
+                        q_fp8.view(torch.uint8).index_select(0, rows).view(q_fp8.dtype)
+                    )
                 logits = self._fp8_mqa_logits(
-                    q_fp8=q_fp8[rows].contiguous(),
+                    q_fp8=q_chunk,
                     k_fp8=k_fp8,
                     k_scale=k_scale,
                     weights=weights[rows].contiguous(),
@@ -1124,7 +1135,7 @@ class IndexerKPool(MultiPlatformOp):
                     ends=logits_ends[rows],
                     clean_logits=True,
                 )
-            topk_chunk = self._topk_from_kpool_logits(
+            return self._topk_from_kpool_logits(
                 logits=logits,
                 pool_lens=pool_lens[rows],
                 seq_lens=_slice_rows(tensor=seq_lens, rows=rows),
@@ -1137,15 +1148,55 @@ class IndexerKPool(MultiPlatformOp):
                 ),
                 topk_offsets=_slice_rows(tensor=topk_offsets, rows=rows),
                 row_starts=_slice_rows(tensor=topk_row_starts, rows=rows),
-                out_rows=out_rows if single_chunk else None,
+                out_rows=padded_rows,
                 page_table_row_index=_slice_rows(
                     tensor=page_table_row_index, rows=rows
                 ),
             )
+
+        topk_result = None
+        for rows in row_chunks:
+            padded_rows = out_rows if single_chunk else None
+            candidate = None
+            if (
+                use_lite_topk
+                and kv_fp8 is not None
+                and logits_starts is not None
+                and seq_lens is not None
+            ):
+                from sglang.srt.layers.attention.dsa.kpool_litetopk import (
+                    try_kpool4_lite_topk,
+                )
+
+                candidate = try_kpool4_lite_topk(
+                    q_fp8[rows],
+                    weights[rows],
+                    *kv_fp8,
+                    logits_starts[rows],
+                    logits_ends[rows],
+                    pool_lens[rows],
+                    seq_lens[rows],
+                    page_table,
+                    _slice_rows(tensor=page_table_row_index, rows=rows),
+                    _slice_rows(tensor=topk_offsets, rows=rows),
+                    num_sms=deep_gemm.get_num_sms(),
+                )
+            if candidate is None:
+                topk_chunk = dense(rows, padded_rows)
+            else:
+                topk_chunk, fallback_rows = candidate
+                if fallback_rows.numel():
+                    topk_chunk.index_copy_(
+                        0, fallback_rows, dense(fallback_rows + rows.start, None)
+                    )
+                if padded_rows is not None and padded_rows > topk_chunk.shape[0]:
+                    topk_chunk = F.pad(
+                        topk_chunk,
+                        (0, 0, 0, padded_rows - topk_chunk.shape[0]),
+                        value=-1,
+                    )
             if single_chunk:
                 return topk_chunk
-            # Free this chunk's logits before the next one allocates.
-            del logits
             if topk_result is None:
                 # Rows past the last chunk are padding, matching out_rows.
                 num_out_rows = row_chunks[-1].stop if out_rows is None else out_rows
@@ -1236,6 +1287,16 @@ class IndexerKPool(MultiPlatformOp):
                 num_rows=n_real, num_cols=total_k_rows, device=device
             ),
             out_rows=total_q,
+            use_lite_topk=(
+                envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
+                and is_cuda()
+                and self.index_kpool == 4
+                and self.index_topk == 2048
+                and (page_table_all is not None or topk_offsets_all is not None)
+                and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+                and not dsa_use_prefill_cp(forward_batch)
+                and not capture_mode.is_capture_mode
+            ),
         )
 
     def _get_topk_ragged_kpool(

@@ -347,6 +347,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="attention.map_kpool4_groups",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.kpool_topk_transform:map_kpool4_groups",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.topk_transform_kpool_v2",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsv4.topk:topk_transform_kpool_v2",

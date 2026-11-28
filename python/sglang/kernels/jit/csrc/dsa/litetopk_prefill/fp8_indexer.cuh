@@ -98,7 +98,7 @@ struct Fp8IndexerParams {
   int32_t* __restrict__ cand_indices;  // [rows, cap], key - ks[row]
   int32_t* __restrict__ cand_count;    // [rows] number of scores >= T (may exceed cap)
   float* __restrict__ thresholds;      // [rows] T
-  int32_t* __restrict__ overflow;      // [rows] 1 when count > cap
+  int32_t* __restrict__ overflow;      // [rows] bit 0: count > cap, bit 1: nonfinite score when tracked
   uint32_t num_rows;
   uint32_t num_blocks;  // ceil(rows / rows per CTA)
   uint32_t num_keys;
@@ -200,36 +200,51 @@ struct WeightsSmem {  // broadcast loads from shared memory (the sample tiles)
 // Partial reduction over the 16 head columns [j0, j0 + 16) of one row (`acc`
 // holds them), accumulating the two chains of reduce_heads_lin in its order: a
 // 16-column part of the row can reduce while the next part lands.
-template <typename Weights>
+template <bool kFp32Reduction, typename Weights>
 SGL_DEVICE void reduce_part_lin(const float* acc, const Weights& w, uint32_t j0, float2& sum_0, float2& sum_1) {
 #pragma unroll
   for (uint32_t j = 0; j < 16; j += 4) {
-    const auto a_0 = make_float2(fabsf(acc[j]), fabsf(acc[j + 1]));
-    const auto a_1 = make_float2(fabsf(acc[j + 2]), fabsf(acc[j + 3]));
+    auto a_0 = make_float2(fabsf(acc[j]), fabsf(acc[j + 1]));
+    auto a_1 = make_float2(fabsf(acc[j + 2]), fabsf(acc[j + 3]));
+    if constexpr (kFp32Reduction) {
+      // Match the legacy DeepGEMM FP32 MQA epilogue's two packed FMA chains:
+      // accumulate (x + |x|) * w, then halve the sum before applying the key scale.
+      a_0 = math::add_f32x2(make_float2(acc[j], acc[j + 1]), a_0);
+      a_1 = math::add_f32x2(make_float2(acc[j + 2], acc[j + 3]), a_1);
+    }
     sum_0 = math::fma_f32x2(a_0, w.pair(j0 + j), sum_0);
     sum_1 = math::fma_f32x2(a_1, w.pair(j0 + j + 2), sum_1);
   }
 }
+
+template <bool kFp32Reduction>
+SGL_DEVICE float finish_reduction(float2 sum_0, float2 sum_1, float scale) {
+  const auto sum = math::add_f32x2(sum_0, sum_1);
+  const float reduced = sum.x + sum.y;
+  if constexpr (kFp32Reduction) return (reduced * 0.5f) * scale;
+  return reduced * scale;
+}
 // Linear-term reduction: (sum_h |s_h| w'_h + L0 + L1 + 2^-8 (L2 + L3)) * scale,
 // with w' = w / (2 s_r) and L_t = term_t(q') . k from the extra B rows; the
 // caller multiplies by s_r.
-template <uint32_t kNumHeads, typename Weights>
+template <uint32_t kNumHeads, bool kFp32Reduction, typename Weights>
 SGL_DEVICE float reduce_heads_lin(const float* acc, const float* lin, const Weights& w, float scale) {
-  float2 sum_0 = make_float2(lin[0], lin[1]);
-  float2 sum_1 = math::mul_f32x2(make_float2(lin[2], lin[3]), make_float2(0x1p-8f, 0x1p-8f));
-#pragma unroll
-  for (uint32_t j = 0; j < kNumHeads; j += 4) {
-    sum_0 = math::fma_f32x2(make_float2(fabsf(acc[j]), fabsf(acc[j + 1])), w.pair(j), sum_0);
-    sum_1 = math::fma_f32x2(make_float2(fabsf(acc[j + 2]), fabsf(acc[j + 3])), w.pair(j + 2), sum_1);
+  float2 sum_0 = make_float2(0.f, 0.f), sum_1 = sum_0;
+  if constexpr (!kFp32Reduction) {
+    sum_0 = make_float2(lin[0], lin[1]);
+    sum_1 = math::mul_f32x2(make_float2(lin[2], lin[3]), make_float2(0x1p-8f, 0x1p-8f));
   }
-  const auto sum = math::add_f32x2(sum_0, sum_1);
-  return (sum.x + sum.y) * scale;
+#pragma unroll
+  for (uint32_t j = 0; j < kNumHeads; j += 16) {
+    reduce_part_lin<kFp32Reduction>(acc + j, w, j, sum_0, sum_1);
+  }
+  return finish_reduction<kFp32Reduction>(sum_0, sum_1, scale);
 }
 
 // kNumHeads    index heads (32 or 64).
 // kNumKVStages KV pipeline depth (32 KB per stage).
 // kNumQStages  Q pipeline depth.
-template <uint32_t kNumHeads, uint32_t kNumKVStages, uint32_t kNumQStages>
+template <uint32_t kNumHeads, uint32_t kNumKVStages, uint32_t kNumQStages, bool kFp32Reduction, bool kTrackRejections>
 struct Fp8IndexerImpl {
   // 64 heads at most: a uint2 sample code holds 4 rows, a drain warp serves 4 rows (8 lanes each).
   static_assert(kNumHeads == 32 || kNumHeads == 64, "32 or 64 index heads");
@@ -485,6 +500,20 @@ struct Fp8IndexerImpl {
   // UMMA.
   SGL_DEVICE static void write_lin_rows(Smem& smem, uint32_t qs, uint32_t lane_id, uint32_t r_begin, uint32_t r_end) {
     uint8_t* const qstage = smem.q[qs];
+    if constexpr (kFp32Reduction) {
+      // Keep the existing TMA/UMMA geometry. The extra columns are unused in this variant.
+      for (uint32_t r = r_begin; r < r_end; ++r) {
+        uint8_t* const lin_rows = qstage + lin_bytes(r / kRowsPerWG);
+#pragma unroll
+        for (uint32_t t = 0; t < kLinTerms; ++t) {
+          const uint32_t n = (r % kRowsPerWG) * kLinTerms + t;
+          *reinterpret_cast<uint32_t*>(lin_rows + sw128_off(n, lane_id >> 2) + (lane_id & 3u) * 4u) = 0;
+        }
+      }
+      ptx::fence_proxy_async_shared();
+      __syncwarp();
+      return;
+    }
     const uint8_t* q = qstage + kQTmaRowOffset * kHeadDim;
     const float* const weights = smem.weights[qs];
 #pragma unroll 1
@@ -761,11 +790,21 @@ struct Fp8IndexerImpl {
 #pragma unroll
     for (uint32_t i = 0; i < kBlockQ; ++i) {
       const uint32_t row = blk * kBlockQ + i;
-      if (row < params.num_rows)
-        params.overflow[row] = static_cast<uint32_t>(__ldcg(params.cand_count + row)) > params.cap;
+      if (row < params.num_rows) {
+        store_overflow(params, row, static_cast<uint32_t>(__ldcg(params.cand_count + row)) > params.cap);
+      }
     }
     params.block_done[blk] = 0;
     params.block_ready[blk] = 0;
+  }
+
+  SGL_DEVICE static void store_overflow(const Fp8IndexerParams& params, uint32_t row, bool overflow) {
+    if constexpr (kTrackRejections) {
+      // Keep the nonfinite flag if the scan has already marked this row.
+      if (overflow) atomicOr(params.overflow + row, 1);
+    } else {
+      params.overflow[row] = overflow;
+    }
   }
 
   // One tile half's ballots of the warpgroup's rows into the drain's mask table.
@@ -842,9 +881,9 @@ struct Fp8IndexerImpl {
       float row_s[kRowsPerWG];
 #pragma unroll
       for (uint32_t i = 0; i < kRowsPerWG; ++i) {
-        row_s[i] = smem.lin_scale[qs][row0 + i];
+        row_s[i] = kFp32Reduction ? 1.f : smem.lin_scale[qs][row0 + i];
       }
-      const float* const w_src = smem.wscaled[qs] + row0 * kNumHeads;
+      const float* const w_src = (kFp32Reduction ? smem.weights[qs] : smem.wscaled[qs]) + row0 * kNumHeads;
       // The sample tiles read the weights from shared memory; the registers are loaded right before the scan (not
       // live across the sample code).
       const auto row_weights_s = [&](uint32_t i) { return WeightsSmem{&w_src[i * kNumHeads]}; };
@@ -881,14 +920,23 @@ struct Fp8IndexerImpl {
             float acc[kNumHeads];
             float lin[kLinTerms];
             tcgen05::ld_32x32b<kNumHeads>(taddr + ts * kUmmaN + heads_col + i * kNumHeads, acc);
-            tcgen05::ld_32x32b<kLinTerms>(taddr + ts * kUmmaN + lin_col + i * kLinTerms, lin);
+            if constexpr (!kFp32Reduction) {
+              tcgen05::ld_32x32b<kLinTerms>(taddr + ts * kUmmaN + lin_col + i * kLinTerms, lin);
+            }
             tcgen05::wait_ld();
             if (i == kRowsPerWG - 1) {
               tcgen05::fence_before_thread_sync();
               ptx::mbar_arrive(&smem.empty_tmem[ts]);
             }
-            const float score = reduce_heads_lin<kNumHeads>(acc, lin, row_weights_s(i), scale) * row_s[i];
-            const bool valid = ((need_t >> i) & 1u) && (key - ks[i]) < len[i] && key < slimit;
+            const float score =
+                reduce_heads_lin<kNumHeads, kFp32Reduction>(acc, lin, row_weights_s(i), scale) * row_s[i];
+            bool valid = ((need_t >> i) & 1u) && (key - ks[i]) < len[i] && key < slimit;
+            if constexpr (kTrackRejections) {
+              if (valid && !isfinite(score)) {
+                atomicOr(params.overflow + blk * kBlockQ + row0 + i, 2);
+                valid = false;
+              }
+            }
             code[i] = valid ? f16_code(ptx::cvt_rm_f16_f32(score)) : 0u;  // 0: not a sample (no real code is 0)
             if (valid) hist_add(smem.hist[row0 + i], code[i] >> 8);
           }
@@ -963,7 +1011,9 @@ struct Fp8IndexerImpl {
       // Part of a row: columns [c0, c0 + 16) of row r (the linear columns with the first part).
       const auto load_half = [&](uint32_t ts, uint32_t r, uint32_t c0, float* acc, float* lin) {
         tcgen05::ld_32x32b<16>(taddr + ts * kUmmaN + heads_col + r * kNumHeads + c0, acc);
-        if (c0 == 0) tcgen05::ld_32x32b<kLinTerms>(taddr + ts * kUmmaN + lin_col + r * kLinTerms, lin);
+        if constexpr (!kFp32Reduction) {
+          if (c0 == 0) tcgen05::ld_32x32b<kLinTerms>(taddr + ts * kUmmaN + lin_col + r * kLinTerms, lin);
+        }
       };
       const auto scan_tile = [&](uint32_t t, auto edge) {
         const uint32_t bank = emit_epoch & 1;
@@ -1010,13 +1060,16 @@ struct Fp8IndexerImpl {
           // its register scoreboard; `wait::ld` is only needed before the slot release.
 #pragma unroll
           for (uint32_t r = 0; r < kRowsPerWG; ++r) {
-            float2 s0 = make_float2(lin_a[0], lin_a[1]);
-            float2 s1 = math::mul_f32x2(make_float2(lin_a[2], lin_a[3]), make_float2(0x1p-8f, 0x1p-8f));
+            float2 s0 = make_float2(0.f, 0.f), s1 = s0;
+            if constexpr (!kFp32Reduction) {
+              s0 = make_float2(lin_a[0], lin_a[1]);
+              s1 = math::mul_f32x2(make_float2(lin_a[2], lin_a[3]), make_float2(0x1p-8f, 0x1p-8f));
+            }
             bool more = true;
 #pragma unroll
             for (uint32_t c = 0; c < kNumHeads; c += 32) {
               load_half(ts, r, c + 16, acc_b, lin_b);
-              reduce_part_lin(acc_a, row_weights(r), c, s0, s1);
+              reduce_part_lin<kFp32Reduction>(acc_a, row_weights(r), c, s0, s1);
               if (c + 32 < kNumHeads) {
                 load_half(ts, r, c + 32, acc_a, lin_a);
               } else if (r + 1 < kRowsPerWG) {
@@ -1025,12 +1078,17 @@ struct Fp8IndexerImpl {
                 tcgen05::wait_ld();  // every load of the slot landed: the slot is free
                 more = next_slot();
               }
-              reduce_part_lin(acc_b, row_weights(r), c + 16, s0, s1);
+              reduce_part_lin<kFp32Reduction>(acc_b, row_weights(r), c + 16, s0, s1);
             }
-            const auto sum = math::add_f32x2(s0, s1);
-            score[r] = ((sum.x + sum.y) * scale) * row_s[r];
+            score[r] = finish_reduction<kFp32Reduction>(s0, s1, scale) * row_s[r];
             pass[r] = score[r] >= thr[r];
             if constexpr (decltype(edge)::value) pass[r] = pass[r] && (key - ks[r]) < len[r];
+            if constexpr (kTrackRejections) {
+              if (!isfinite(score[r])) {
+                if ((key - ks[r]) < len[r]) atomicOr(params.overflow + blk * kBlockQ + row0 + r, 2);
+                pass[r] = false;
+              }
+            }
             any |= pass[r];
             if (r + 1 == kRowsPerWG && more) load_half(ts, 0, 0, acc_a, lin_a);
           }
@@ -1110,7 +1168,7 @@ struct Fp8IndexerImpl {
         if (row_owner && row < params.num_rows) {
           const uint32_t c = smem.cnt[row0 + lane_id];
           params.cand_count[row] = static_cast<int32_t>(c);
-          params.overflow[row] = c > params.cap ? 1 : 0;
+          store_overflow(params, row, c > params.cap);
           params.thresholds[row] = select_at(thr, lane_id);
         }
       } else if (kind == UnitKind::SAMPLE) {
@@ -1317,9 +1375,15 @@ __global__ void __launch_bounds__(Impl::kNumThreads, 1)
 
 }  // namespace device::fp8_indexer
 
-template <uint32_t kNumHeads, uint32_t kNumKVStages, uint32_t kNumQStages>
+template <
+    uint32_t kNumHeads,
+    uint32_t kNumKVStages,
+    uint32_t kNumQStages,
+    bool kFp32Reduction = false,
+    bool kTrackRejections = kFp32Reduction>
 struct Fp8IndexerKernel {
-  using Impl = device::fp8_indexer::Fp8IndexerImpl<kNumHeads, kNumKVStages, kNumQStages>;
+  using Impl =
+      device::fp8_indexer::Fp8IndexerImpl<kNumHeads, kNumKVStages, kNumQStages, kFp32Reduction, kTrackRejections>;
 
   static void
   run(tvm::ffi::TensorView q,
