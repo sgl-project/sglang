@@ -274,8 +274,13 @@ def _num_cus(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _tail_split_rows(rows: int, heads: int, device: torch.device) -> int | None:
+def _tail_split_rows(
+    rows: int, heads: int, head_dim: int, device: torch.device
+) -> int | None:
     """Query rows of the full waves when the last wave is mostly idle, else None."""
+    # _lse_merge_kernel spans the head dim with one tl.arange
+    if head_dim & (head_dim - 1):
+        return None
     cus = _num_cus(device.index)
     waves, rem = divmod(heads * -(-rows // _TILE_ROWS), cus)
     if not 0 < waves <= _TAIL_MAX_WAVES or rem == 0 or rem > _TAIL_MAX_TILES:
@@ -630,7 +635,9 @@ class AITerImpl(AttentionImpl):
                     causal=self.causal,
                     how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
                 )[0]
-            elif full_rows := _tail_split_rows(used, query.shape[1], query.device):
+            elif full_rows := _tail_split_rows(
+                used, query.shape[1], value.shape[-1], query.device
+            ):
                 output = query.new_empty(query.shape[0], query.shape[1], value.shape[2])
                 _tail_split_attention(
                     q, k, v, self.softmax_scale, output[:used], full_rows

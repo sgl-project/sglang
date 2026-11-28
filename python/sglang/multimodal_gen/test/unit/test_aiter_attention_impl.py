@@ -146,7 +146,7 @@ def test_tail_rows_with_split_keys_match_one_launch():
         total, heads, 3 * HEAD_SIZE, device=device, dtype=torch.bfloat16
     )
     q, k, v = packed.split(HEAD_SIZE, dim=-1)
-    assert backend._tail_split_rows(rows, heads, device) is not None
+    assert backend._tail_split_rows(rows, heads, HEAD_SIZE, device) is not None
     bounds = (0, rows, total)
     cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device=device)
     out = impl.forward_varlen(
@@ -160,6 +160,43 @@ def test_tail_rows_with_split_keys_match_one_launch():
         q, k, v, cu_seqlens=cu_seqlens, max_seqlen=rows, cu_seqlens_host=bounds
     )
     assert torch.equal(out, again)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a ROCm GPU")
+def test_tail_geometry_with_non_power_of_two_head_dim_runs_one_launch():
+    """Qwen3-VL's vision tower (16 heads x 72) reaches the tail-split geometry;
+    the LSE merge spans the head dim with one tl.arange, so those rows stay in
+    the single launch."""
+    head_dim, heads = 72, 16
+    impl = _impl_cls()(
+        num_heads=heads,
+        head_size=head_dim,
+        softmax_scale=head_dim**-0.5,
+    )
+    from sglang.multimodal_gen.runtime.layers.attention.backends import aiter as backend
+
+    if not backend.USE_AITER_GFX95:
+        pytest.skip("the key split is gfx950-only")
+    device = torch.device("cuda", torch.cuda.current_device())
+    rows = 4 * backend._num_cus(device.index) // heads * 256 + 300
+    assert backend._tail_split_rows(rows, heads, 128, device) is not None
+    assert backend._tail_split_rows(rows, heads, head_dim, device) is None
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(rows, heads, head_dim, device=device, dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    bounds = (0, rows)
+    out = impl.forward_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens=torch.tensor(bounds, dtype=torch.int32, device=device),
+        max_seqlen=rows,
+        cu_seqlens_host=bounds,
+    )
+    single = backend._flash(q[None], k[None], v[None], head_dim**-0.5)[0]
+    assert torch.equal(out, single)
 
 
 class TestBF16AttentionUnderCompile(unittest.TestCase):
