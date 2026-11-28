@@ -225,7 +225,7 @@ tensor copy at each residual site.
 | `qknorm_complex_rope_cuda` / `qknorm_complex_rope_pack_` | JIT CUDA | bit-exact vs `RMSNorm(cast_x_before_out_mul=True)` + complex64 RoPE for head_dim 128; both accept token-strided views of a packed QKV buffer; the pack variant normalizes Q and K in place behind a prefix and copies prefix K/V (and optionally V) in the same launch; Qwen-Image 2.1 verifies its first call |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
 | `fused_inplace_helios_qk_rope` | JIT CUDA | bit-exact paired in-place RoPE for Helios' transposed frequency layout |
-| `ltx2_qknorm_split_rope_cuda` | KDA (JIT CUDA) | close; **validated on B200** |
+| `ltx2_qknorm_split_rope_cuda` | KDA (default) / VibeCUDA (`backend="vibecuda"`) JIT CUDA | VibeCUDA is bit-exact to the FP32-norm/split-RoPE reference on SM100/SM103; the KDA path retains its existing contract |
 | `fused_ltx25_decoder_rope` | JIT CUDA | bit-exact paired 3D RoPE from cached compact axis tables |
 | `apply_rotary_embedding` | Triton (+fallbacks) | close; the generic entry point |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact; packs QKV and applies RoPE in one pass |

@@ -206,7 +206,8 @@ with interchangeable implementations along **two independent dimensions**:
   - `forward_torch_compile` — inherited for free as
     `torch.compile(forward_native)`.
   - `forward_triton` / `forward_jit` / `forward_aot` / `forward_cute_dsl` /
-    `forward_helion` / `forward_kda` / `forward_cake` / `forward_plugin` /
+    `forward_helion` / `forward_kda` / `forward_vibecuda` / `forward_cake` /
+    `forward_plugin` /
     `forward_flashinfer` / `forward_deepgemm` / `forward_aiter` /
     `forward_torch_npu` — opt-in overrides. A backend is *available* iff its
     method is overridden; it joins **auto-selection** only when also declared

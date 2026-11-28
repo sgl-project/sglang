@@ -37,6 +37,12 @@ _CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
 _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
+_CUDA_SM100_103 = frozenset(
+    {
+        CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0)),
+        CapabilityRequirement.cuda(min_sm=(10, 3), max_sm=(10, 3)),
+    }
+)
 
 # ---------------------------------------------------------------------------
 # Registry inventory.  Metadata only -- registering imports neither torch nor a
@@ -410,6 +416,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         KernelBackend.KDA,
         "sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit:ltx2_qknorm_split_rope_cuda",
         _CUDA_SM100_PLUS,
+    ),
+    (
+        "diffusion.ltx2_qknorm_split_rope",
+        KernelBackend.VIBECUDA,
+        "rope.ltx2_qknorm_split_rope_vibecuda_jit:ltx2_qknorm_split_rope_vibecuda",
+        _CUDA_SM100_103,
     ),
     (
         "diffusion.nomas_qk_norm_mrope",
@@ -851,6 +863,8 @@ _EXPORTS: dict[str, str] = {
     "joint_qkv_cat": "layout.joint_qkv_cat_triton",
     "can_use_ltx2_qknorm_split_rope_cuda": "sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit",
     "ltx2_qknorm_split_rope_cuda": "sglang.kernels.kda_kernels.ltx2_qknorm_split_rope_jit",
+    "can_use_ltx2_qknorm_split_rope_vibecuda": "rope.ltx2_qknorm_split_rope_vibecuda_jit",
+    "ltx2_qknorm_split_rope_vibecuda": "rope.ltx2_qknorm_split_rope_vibecuda_jit",
     "apply_ltx2_split_rotary_emb": "rope.ltx2_rotary_triton",
     "fused_ltx25_decoder_rope": "rope.ltx25_decoder_rope_jit",
     "can_use_fused_inplace_qknorm_rope": "rope.qknorm_rope_jit",

@@ -62,6 +62,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 
 _is_npu = current_platform.is_npu()
 
@@ -88,6 +89,9 @@ def _ltx2_try_fused_qknorm_split_rope(
     allow_sm90: bool,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     global _LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED
+    backend = (
+        "vibecuda" if envs.SGLANG_USE_LTX2_QKNORM_SPLIT_ROPE_VIBECUDA.get() else "kda"
+    )
 
     if (
         _LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED
@@ -96,20 +100,24 @@ def _ltx2_try_fused_qknorm_split_rope(
         or not isinstance(k_norm, nn.RMSNorm)
         or float(q_norm.eps) != float(eps)
         or float(k_norm.eps) != float(eps)
-        or not can_use_ltx2_qknorm_split_rope_cuda(
-            q,
-            q_cos,
-            q_sin,
-            q_norm.weight,
-            k,
-            k_cos,
-            k_sin,
-            k_norm.weight,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            allow_sm90=allow_sm90,
-        )
     ):
+        return None
+    if not can_use_ltx2_qknorm_split_rope_cuda(
+        q,
+        q_cos,
+        q_sin,
+        q_norm.weight,
+        k,
+        k_cos,
+        k_sin,
+        k_norm.weight,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        allow_sm90=allow_sm90,
+        backend=backend,
+    ):
+        if backend == "vibecuda":
+            raise RuntimeError("unsupported input for vibecuda LTX2 QKNorm split-RoPE")
         return None
 
     try:
@@ -126,9 +134,10 @@ def _ltx2_try_fused_qknorm_split_rope(
             num_heads=num_heads,
             head_dim=head_dim,
             allow_sm90=allow_sm90,
+            backend=backend,
         )
     except Exception as exc:
-        if torch.compiler.is_compiling():
+        if backend == "vibecuda" or torch.compiler.is_compiling():
             raise
         logger.warning_once(f"Disabling LTX2 QKNorm split-RoPE CUDA fast path: {exc}")
         _LTX2_QKNORM_SPLIT_ROPE_CUDA_DISABLED = True
