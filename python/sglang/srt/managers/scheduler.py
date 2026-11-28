@@ -397,6 +397,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.rust_server.server import (
@@ -1023,15 +1024,29 @@ class Scheduler(
                 stream_reasoning=False,
                 tokenizer=self.tokenizer,
             )
-            think_end_ids = reasoning_parser.detector.get_think_end_token_ids(
-                self.tokenizer
-            )
+            detector = reasoning_parser.detector
+            think_end_ids = detector.get_think_end_token_ids(self.tokenizer)
             if think_end_ids:
                 self.model_config.think_end_ids = think_end_ids
+                if isinstance(detector, ResponseTemplateReasoningDetector):
+                    self.model_config.think_end_lookahead_id = (
+                        detector.get_think_end_lookahead_id(self.tokenizer)
+                    )
                 self.model_config.self_opened_think_start_ids = (
                     reasoning_parser.detector.get_self_opened_think_start_token_ids(
                         self.tokenizer
                     )
+                )
+            elif (
+                isinstance(detector, ResponseTemplateReasoningDetector)
+                and detector.tool_start_token
+                and detector.get_think_end_lookahead_id(self.tokenizer) is None
+            ):
+                logger.warning(
+                    "Reasoning end lookahead %r must encode to a single added token "
+                    "for scheduler accounting. Disabling reasoning token counting "
+                    "and grammar-gated reasoning.",
+                    detector.tool_start_token,
                 )
             else:
                 logger.warning(

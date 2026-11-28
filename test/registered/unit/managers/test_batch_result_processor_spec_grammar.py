@@ -79,7 +79,9 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         is_generation=True,
         disaggregation_mode=None,
         model_config=SimpleNamespace(
-            think_end_ids=None, self_opened_think_start_ids=None
+            think_end_ids=None,
+            think_end_lookahead_id=None,
+            self_opened_think_start_ids=None,
         ),
         token_to_kv_pool_allocator=None,
         tree_cache=None,
@@ -222,6 +224,24 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
 
 class TestReasoningTokenAccounting(CustomTestCase):
+    def test_reasoning_count_stops_before_lookahead(self):
+        """The first tool token belongs to the call, including in batched decode."""
+        processor = _make_processor()
+        processor.model_config.think_end_ids = [7]
+        processor.model_config.think_end_lookahead_id = 8
+        for batches, expected in (
+            ([10, [11, 7, 8]], 3),
+            ([10, [11, 8, 12]], 2),
+            ([8, 12], 0),
+        ):
+            with self.subTest(batches=batches):
+                req = _make_req(terminate_after=99)
+                req.require_reasoning = True
+                for batch in batches:
+                    processor._maybe_update_reasoning_tokens(req, batch)
+                self.assertTrue(req._is_reasoning_over)
+                self.assertEqual(req.reasoning_tokens, expected)
+
     def test_multi_token_end_can_span_decode_steps(self):
         req = _make_req(terminate_after=99)
         req.require_reasoning = True

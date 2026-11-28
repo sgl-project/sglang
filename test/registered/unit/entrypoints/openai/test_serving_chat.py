@@ -1208,14 +1208,12 @@ class ServingChatTestCase(CustomTestCase):
             return self.chat._convert_to_internal_request(request)
 
     def test_response_template_parser_context_records_grammar_start(self):
-        """JSON-schema output starts after the reasoning only when the grammar
-        backend waits for it, which a pattern-only reasoning closer cannot; a
-        JSON answer then starts at the answer opener."""
+        """JSON output starts where the reasoning grammar releases the constraint."""
         pattern_closed = {
             **_DELIMITED_RESPONSE_TEMPLATE,
             "fields": {
                 **_DELIMITED_RESPONSE_TEMPLATE["fields"],
-                "thinking": {"open": "<think>", "close_pattern": "</think>"},
+                "thinking": {"open": "<think>", "close_pattern": r"</think>\s+"},
             },
         }
         json_object = {"response_format": {"type": "json_object"}}
@@ -1243,6 +1241,28 @@ class ServingChatTestCase(CustomTestCase):
                 self._use_delimited_response_template(reasoning_parser, *template)
                 _, request = self._convert_rendered_as("<assistant>", **fields)
                 self.assertEqual(request._response_parser_grammar_start, grammar_start)
+
+    def test_json_schema_after_reasoning_close_pattern(self):
+        """A literal regex closer defers JSON with or without a tool lookahead."""
+        template = copy.deepcopy(_DELIMITED_RESPONSE_TEMPLATE)
+        vocab = {"</think>": 248069, "<tool_call>": 248058}
+        for pattern in ("</think>", "</think>|(?=<tool_call>)"):
+            with self.subTest(pattern=pattern):
+                template["fields"]["thinking"] = {
+                    "open": "<think>",
+                    "close_pattern": pattern,
+                }
+                self._use_delimited_response_template("response_template", template)
+                self.tm.tokenizer.get_added_vocab.return_value = vocab
+                self.tm.tokenizer.encode.side_effect = lambda text, **_: (
+                    [vocab[text]] if text in vocab else []
+                )
+                _, request = self._convert_rendered_as(
+                    "<assistant><think>", response_format={"type": "json_object"}
+                )
+                self.assertEqual(
+                    request._response_parser_grammar_start, GRAMMAR_AFTER_REASONING
+                )
 
     def test_call_ended_by_another_stop_token_is_complete(self):
         """A complete call ended by a stop token other than its closer must not be

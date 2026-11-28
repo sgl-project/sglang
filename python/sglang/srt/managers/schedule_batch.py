@@ -1718,7 +1718,9 @@ class Req(ReqDllmMixin):
         self.routed_experts_start_len = 0
         self.request_finish(FINISH_ABORT(error_msg, status_code, err_type))
 
-    def update_reasoning_tokens(self, token_id, think_end_ids):
+    def update_reasoning_tokens(
+        self, token_id, think_end_ids, think_end_lookahead_id=None
+    ):
         if self._is_reasoning_over:
             return
 
@@ -1730,6 +1732,10 @@ class Req(ReqDllmMixin):
 
         matched = self._think_end_match_len
         for position, token in enumerate(token_id):
+            if token == think_end_lookahead_id:
+                self.reasoning_tokens += position
+                self._is_reasoning_over = True
+                return
             matched = self._think_end_matcher.advance(matched, token)
             if matched == len(self._think_end_matcher):
                 self.reasoning_tokens += position + 1
