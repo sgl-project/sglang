@@ -91,6 +91,10 @@ ERROR_TYPE_MAP = {
 }
 
 
+class _InvalidToolArguments(ValueError):
+    """Model output cannot be represented as an Anthropic tool input."""
+
+
 def _cached_prompt_tokens(usage) -> int:
     prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
     return getattr(prompt_tokens_details, "cached_tokens", 0) or 0
@@ -1062,7 +1066,12 @@ class AnthropicServing:
             return self._convert_openai_error_response(response)
 
         # Convert to Anthropic response
-        anthropic_response = self._convert_response(response)
+        try:
+            anthropic_response = self._convert_response(response)
+        except _InvalidToolArguments as exc:
+            return self._error_response(
+                status_code=502, error_type="api_error", message=str(exc)
+            )
         return JSONResponse(content=anthropic_response.model_dump(exclude_none=True))
 
     async def _handle_streaming(
@@ -1136,6 +1145,7 @@ class AnthropicServing:
         content_block_open = False
         content_block_type: Optional[str] = None
         captured_thinking_signature: str = ""
+        tool_arg_fragments: list[str] = []
         finish_reason: Optional[str] = None
         final_usage: Optional[AnthropicUsage] = None
         message_started = False
@@ -1190,7 +1200,26 @@ class AnthropicServing:
             content_block_type = None
             content_block_index += 1
             captured_thinking_signature = ""
+            tool_arg_fragments.clear()
             return events
+
+        def _validate_closing_tool_use() -> Optional[list[str]]:
+            if not (content_block_open and content_block_type == "tool_use"):
+                return None
+            raw_args = "".join(tool_arg_fragments)
+            if raw_args == "":
+                return None
+            try:
+                parsed = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                return _flush_on_error(
+                    "api_error", "Model emitted invalid JSON tool arguments"
+                )
+            if not isinstance(parsed, dict):
+                return _flush_on_error(
+                    "api_error", "Model emitted invalid JSON tool arguments"
+                )
+            return None
 
         def _ensure_content_block_events(
             block_type: str,
@@ -1346,6 +1375,14 @@ class AnthropicServing:
                     yield _emit(MessageStopEvent())
                     continue
 
+                # Validate any open tool_use block before closing and emitting
+                # stop_reason="tool_use".
+                err_frames = _validate_closing_tool_use()
+                if err_frames is not None:
+                    for frame in err_frames:
+                        yield frame
+                    return
+
                 # Close any open content block
                 for event in _close_content_block_events():
                     yield _emit(event)
@@ -1455,6 +1492,12 @@ class AnthropicServing:
 
             # Handle reasoning content deltas
             if delta.reasoning_content:
+                if content_block_open and content_block_type != "thinking":
+                    err_frames = _validate_closing_tool_use()
+                    if err_frames is not None:
+                        for frame in err_frames:
+                            yield frame
+                        return
                 for event in _ensure_content_block_events(
                     "thinking",
                     ThinkingBlock(thinking=""),
@@ -1479,6 +1522,11 @@ class AnthropicServing:
                     # it was also tool_use — each tool needs its own index)
                     # and start a fresh one.
                     if tc_func and tc_func.name:
+                        err_frames = _validate_closing_tool_use()
+                        if err_frames is not None:
+                            for frame in err_frames:
+                                yield frame
+                            return
                         for event in _ensure_content_block_events(
                             "tool_use",
                             ToolUseBlock(
@@ -1495,6 +1543,7 @@ class AnthropicServing:
                         had_content_delta = True
 
                         if tc_func.arguments:
+                            tool_arg_fragments.append(tc_func.arguments)
                             yield _emit(
                                 ContentBlockDeltaEvent(
                                     index=content_block_index,
@@ -1514,6 +1563,7 @@ class AnthropicServing:
                                 (tc_func.arguments or "")[:100],
                             )
                             continue
+                        tool_arg_fragments.append(tc_func.arguments)
                         yield _emit(
                             ContentBlockDeltaEvent(
                                 index=content_block_index,
@@ -1526,6 +1576,12 @@ class AnthropicServing:
 
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
+                if content_block_open and content_block_type != "text":
+                    err_frames = _validate_closing_tool_use()
+                    if err_frames is not None:
+                        for frame in err_frames:
+                            yield frame
+                        return
                 for event in _ensure_content_block_events(
                     "text",
                     TextBlock(text=""),
@@ -1569,19 +1625,19 @@ class AnthropicServing:
         if choice.message.tool_calls:
             for tool_call in choice.message.tool_calls:
                 raw_args = tool_call.function.arguments
-                try:
-                    tool_input = json.loads(raw_args)
-                except (json.JSONDecodeError, TypeError):
-                    # Surface invalid tool arguments so an empty-dict
-                    # tool call is never indistinguishable from a real
-                    # one when something downstream goes wrong.
-                    logger.warning(
-                        "Tool %r emitted invalid JSON arguments: %r — "
-                        "defaulting to empty input",
-                        tool_call.function.name,
-                        (raw_args or "")[:200],
-                    )
+                if raw_args == "":
                     tool_input = {}
+                else:
+                    try:
+                        tool_input = json.loads(raw_args)
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        raise _InvalidToolArguments(
+                            "Model emitted invalid JSON tool arguments"
+                        ) from exc
+                    if not isinstance(tool_input, dict):
+                        raise _InvalidToolArguments(
+                            "Model tool arguments must be a JSON object"
+                        )
 
                 content.append(
                     ToolUseBlock(
