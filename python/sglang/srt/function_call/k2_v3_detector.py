@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -41,6 +40,11 @@ class K2V3Detector(BaseFormatDetector):
     _TOOL_CALL_END = "</ifm|tool_call>"
 
     _ARG_KEY_START = "<ifm|arg_key>"
+    _ARG_KEY_END = "</ifm|arg_key>"
+    _ARG_TYPE_START = "<ifm|arg_type>"
+    _ARG_TYPE_END = "</ifm|arg_type>"
+    _ARG_VALUE_START = "<ifm|arg_value>"
+    _ARG_VALUE_END = "</ifm|arg_value>"
 
     _THINK_PAIRS = (
         ("<ifm|think>", "</ifm|think>"),
@@ -58,13 +62,6 @@ class K2V3Detector(BaseFormatDetector):
         "</ifm|think_fast>",
         "<ifm|think_faster>",
         "</ifm|think_faster>",
-    )
-
-    _ARG_PATTERN = re.compile(
-        r"<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*"
-        r"(?:<ifm\|arg_type>(.*?)</ifm\|arg_type>\s*)?"
-        r"<ifm\|arg_value>(.*?)</ifm\|arg_value>",
-        re.DOTALL,
     )
 
     def __init__(self) -> None:
@@ -413,28 +410,54 @@ class K2V3Detector(BaseFormatDetector):
         if first_arg == -1:
             return [(name, {})]
 
-        argument_text = block[first_arg:]
         arguments: dict[str, Any] = {}
-        cursor = 0
-        for match in self._ARG_PATTERN.finditer(argument_text):
-            if argument_text[cursor : match.start()].strip():
-                raise ValueError("Malformed K2-v3 XML argument framing")
-            key = match.group(1).strip()
+        for raw_key, raw_type, value in self._iter_xml_arguments(block[first_arg:]):
+            key = raw_key.strip()
             if not key:
                 raise ValueError("K2-v3 XML argument is missing a key")
-            inline_type = match.group(2).strip() if match.group(2) else None
+            inline_type = raw_type.strip() if raw_type else None
             arguments[key] = self._coerce_value(
-                match.group(3),
+                value,
                 name,
                 key,
                 tools,
                 inline_type=inline_type,
                 from_text=True,
             )
-            cursor = match.end()
-        if argument_text[cursor:].strip():
-            raise ValueError("Malformed K2-v3 XML argument framing")
         return [(name, arguments)]
+
+    @classmethod
+    def _iter_xml_arguments(cls, text: str) -> Iterator[tuple[str, Optional[str], str]]:
+        """Yield (key, type or None, value) for each XML argument, in order.
+
+        Scans with str.find: a regex with three lazy groups rescanned the
+        text from every unclosed tag (#52090). Only whitespace may separate
+        the tags; anything else is malformed framing.
+        """
+
+        def skip_whitespace(pos: int) -> int:
+            while pos < len(text) and text[pos].isspace():
+                pos += 1
+            return pos
+
+        def read_tag(pos: int, start_tag: str, end_tag: str) -> tuple[str, int]:
+            # Return the tag content and the position after the end tag.
+            if not text.startswith(start_tag, pos):
+                raise ValueError("Malformed K2-v3 XML argument framing")
+            content_start = pos + len(start_tag)
+            end = text.find(end_tag, content_start)
+            if end == -1:
+                raise ValueError("Malformed K2-v3 XML argument framing")
+            return text[content_start:end], skip_whitespace(end + len(end_tag))
+
+        pos = skip_whitespace(0)
+        while pos < len(text):
+            key, pos = read_tag(pos, cls._ARG_KEY_START, cls._ARG_KEY_END)
+            arg_type = None
+            if text.startswith(cls._ARG_TYPE_START, pos):
+                arg_type, pos = read_tag(pos, cls._ARG_TYPE_START, cls._ARG_TYPE_END)
+            value, pos = read_tag(pos, cls._ARG_VALUE_START, cls._ARG_VALUE_END)
+            yield key, arg_type, value
 
     def _items_from_calls(
         self,

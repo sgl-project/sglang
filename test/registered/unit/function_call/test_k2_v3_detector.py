@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -258,6 +259,33 @@ class TestK2V3Detector(CustomTestCase):
             "prefix<ifm|tool_call>get_weather"
             "<ifm|arg_key>city</ifm|arg_key>"
             "</ifm|tool_call>suffix"
+        )
+        result = K2V3Detector().detect_and_parse(wire, self.tools)
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, wire)
+
+    def test_unclosed_arg_keys_parse_in_linear_time(self):
+        # A lazy regex over the argument tags rescanned the block from every
+        # unclosed <ifm|arg_key>, so ~260 KB took seconds of CPU (#52090).
+        wire = (
+            "<ifm|tool_call>get_weather" + "<ifm|arg_key>" * 20000 + "</ifm|tool_call>"
+        )
+        started = time.perf_counter()
+        result = K2V3Detector().detect_and_parse(wire, self.tools)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, wire)
+        self.assertLess(elapsed, 1.0)
+
+    def test_closing_tag_inside_arg_key_is_forwarded_as_text(self):
+        # The regex backtracked past the first </ifm|arg_key> and returned
+        # the key "city</ifm|arg_key>x"; the tags must close in order.
+        wire = (
+            "<ifm|tool_call>get_weather"
+            "<ifm|arg_key>city</ifm|arg_key>x</ifm|arg_key>"
+            "<ifm|arg_value>Boston</ifm|arg_value>"
+            "</ifm|tool_call>"
         )
         result = K2V3Detector().detect_and_parse(wire, self.tools)
         self.assertEqual(result.calls, [])
