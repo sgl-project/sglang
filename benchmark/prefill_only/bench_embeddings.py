@@ -99,12 +99,20 @@ def build_embeddings_request(index: int, item_count: int) -> tuple:
 
 def validate_embeddings_response(response_data: dict) -> bool:
     """Validate embeddings API response."""
-    return (
-        "data" in response_data
-        and len(response_data["data"][0]["embedding"]) == MATRYOSHKA_DIMENSIONS
-        if MATRYOSHKA_DIMENSIONS
-        else True
-    )
+    data = response_data.get("data") if isinstance(response_data, dict) else None
+    if isinstance(data, list) and data:
+        return all(
+            isinstance(item, dict)
+            and isinstance(item.get("embedding"), list)
+            and item["embedding"]
+            and (
+                MATRYOSHKA_DIMENSIONS is None
+                or len(item["embedding"]) == MATRYOSHKA_DIMENSIONS
+            )
+            for item in data
+        )
+    else:
+        return False
 
 
 def build_warmup_embeddings_request() -> dict:
