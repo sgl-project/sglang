@@ -37,6 +37,7 @@ def _route_quant_a4(
     X,
     Q,
     QS,
+    LOAD,
     M: tl.constexpr,
     START: tl.constexpr,
     E: tl.constexpr,
@@ -51,7 +52,9 @@ def _route_quant_a4(
     # input rows (_prepare_a4, four 1024-column tiles a row).
     pid = tl.program_id(0)
     if pid < E:
-        _scatter_body(IDS, SORTED, EXPERT, pid, M, START, E, S, PER_E, BM, NB, NBB)
+        _scatter_body(
+            IDS, SORTED, EXPERT, LOAD, pid, M, START, E, S, PER_E, BM, NB, NBB
+        )
     elif QUANT:
         _prepare_body(X, Q, QS, pid - E)
 
@@ -80,6 +83,7 @@ def _scatter_body(
     IDS,
     SORTED,
     EXPERT,
+    LOAD,
     e,
     M: tl.constexpr,
     START: tl.constexpr,
@@ -92,7 +96,8 @@ def _scatter_body(
 ):
     # Local expert e (one program each). Counts every local expert's routes and places its blocks after the lower
     # experts' (fixed block order, nothing to clear between calls); the last also marks the unused tail blocks (-1).
-    # Its routes are ranked in token order into its blocks (sentinel M*8).
+    # Its routes are ranked in token order into its blocks (sentinel M*8). LOAD (int32 per global expert, or None)
+    # accumulates the expert's blocks over the calls.
     ee = tl.arange(0, E)
     s = tl.arange(0, S)
     ids = tl.load(IDS + s, s < M * 8, other=-1)
@@ -112,6 +117,8 @@ def _scatter_body(
     count = tl.sum(hit.to(tl.int32), axis=0)
     blocks = tl.cdiv(count, BM)
     if blocks > 0:
+        if LOAD is not None:
+            tl.store(LOAD + START + e, tl.load(LOAD + START + e) + blocks)
         eb = tl.arange(0, PER_E)
         tl.store(EXPERT + first + eb, e, eb < blocks)
         rank = tl.cumsum(hit.to(tl.int32), axis=0) - 1
@@ -269,11 +276,13 @@ def compact_a4_experts(
     shuffled=False,
     quantized=None,
     block_m=None,
+    load=None,
 ):
     """Per-(token, slot) expert outputs BF16 [M * 8, 4096] for the 32 or 64 local experts starting at ``local_start``.
 
     Weights and scales are uint8 [E, N, K] views, as stored or (``shuffled``) in the a4w4 preshuffle layout.
-    ``quantized`` = the input's per-row MXFP4 (uint8 [M, 2048], uint8 [M, 128]) in place of quantizing ``x``."""
+    ``quantized`` = the input's per-row MXFP4 (uint8 [M, 2048], uint8 [M, 128]) in place of quantizing ``x``.
+    ``load`` = int32 per global expert: each local expert's blocks of this call are added to its entry."""
     m, h = ids.shape[0], w2.shape[1]
     if not (
         compact_a4_applies(m, h, w13, w2, s13, s2)
@@ -311,6 +320,7 @@ def compact_a4_experts(
         x,
         q,
         qs,
+        load,
         m,
         local_start,
         e_local,

@@ -115,12 +115,13 @@ def _finalize_per_slot(
 
 
 def run_compact_a4(
-    x, scores, ids, experts, local_start, norm_weight, eps, gain, quantized=None
-):
-    """Compact A4 target-verify experts of this rank, finalized; partial sums before the TP reduction."""
+    x, scores, ids, experts, local_start, norm_weight, eps, gain, quantized=None, load=None
+):  # fmt: skip
+    """Compact A4 target-verify experts of this rank, finalized; partial sums before the TP reduction. ``load``:
+    the per-expert block counter of ``compact_a4_experts``."""
     y = compact_a4_experts(
         x, ids, *_compact_a4_operands(experts), local_start=local_start,
-        shuffled=experts.native_dropped, quantized=quantized,
+        shuffled=experts.native_dropped, quantized=quantized, load=load,
     )  # fmt: skip
     return _finalize_per_slot(
         y, norm_weight, scores, ids, local_start, experts.num_local_experts, eps, gain
