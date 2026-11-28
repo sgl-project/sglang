@@ -2562,6 +2562,10 @@ def hc_mix_stats_sinkhorn(
 _HC_MIX_COMPENSATED_SLICES = 16
 _HC_MIX_BF16X3_BLOCK_M = 128
 _HC_MIX_BF16X3_BLOCK_K = 64
+# Fewer split-K slices with a 64-row tile cut partial-result traffic on SM120.
+_HC_MIX_BF16X3_SM120_SLICES = 8
+_HC_MIX_BF16X3_SM120_BLOCK_M = 64
+_HC_MIX_BF16X3_SM120_BLOCK_K = 128
 _HC_PRENORM_BLOCK_M = 64
 
 
@@ -2652,13 +2656,18 @@ def hc_mix_stats_sinkhorn_bf16x3(
     mix = (2 + hc_mult) * hc_mult
     hopper_medium = get_platform().is_sm90 and 32 <= m < 4096
     if decode_grid:
-        slices, block_m = 64, 64
+        slices, block_m, block_k = 64, 64, _HC_MIX_BF16X3_BLOCK_K
+    elif get_platform().is_sm120:
+        slices = _HC_MIX_BF16X3_SM120_SLICES
+        block_m = _HC_MIX_BF16X3_SM120_BLOCK_M
+        block_k = _HC_MIX_BF16X3_SM120_BLOCK_K
     else:
         slices = _HC_MIX_COMPENSATED_SLICES
         block_m = 64 if hopper_medium else _HC_MIX_BF16X3_BLOCK_M
+        block_k = _HC_MIX_BF16X3_BLOCK_K
     assert x.is_contiguous() and x.dtype == torch.bfloat16
     assert decode_grid or hopper_medium or 4096 <= m <= 65536
-    assert k % (slices * _HC_MIX_BF16X3_BLOCK_K) == 0
+    assert k % (slices * block_k) == 0
     assert len(weight_parts) == 3
     assert all(
         w.shape == (mix, k) and w.dtype == torch.bfloat16 and w.is_contiguous()
@@ -2679,7 +2688,7 @@ def hc_mix_stats_sinkhorn_bf16x3(
         K_PER_SLICE=k // slices,
         MIX_COLS=mix,
         MIX_PAD=triton.next_power_of_2(mix),
-        BLOCK_K=_HC_MIX_BF16X3_BLOCK_K,
+        BLOCK_K=block_k,
         BLOCK_M=block_m,
         num_warps=4,
         num_stages=3,

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import triton
 
 import sglang.kernels.ops.layernorm.mhc as kernels_mhc
 from sglang.srt.utils import get_device_sm
@@ -212,6 +213,45 @@ def test_out_of_band_rows_stay_on_the_partial_path(monkeypatch, num_tokens):
     assert partial[0] is layer.attn_hc.fn
     for result, expected in zip(actual, _fp64_triplet(x, w, scale, base)):
         torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
+
+
+def test_sm120_uses_reduced_partial_traffic_tiles(monkeypatch):
+    """SM120 launches the bf16x3 projection with fewer split-K slices."""
+    launches = []
+
+    class SpyKernel:
+        def __getitem__(self, grid):
+            def run(*args, **kwargs):
+                launches.append((grid, kwargs))
+
+            return run
+
+    monkeypatch.setattr(
+        kernels_mhc, "_hc_mix_stats_bf16x3_kernel", SpyKernel()
+    )
+    rows = 4096
+    x = torch.zeros(rows, K, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(MIX, K, device="cuda", dtype=torch.float32) * 0.01
+    parts = kernels_mhc.split_bf16_hc_weight(weight)
+    scale = torch.ones(3, device="cuda")
+    base = torch.zeros(MIX, device="cuda")
+
+    kernels_mhc.hc_mix_stats_sinkhorn_bf16x3(
+        x,
+        parts,
+        scale,
+        base,
+        SINKHORN_ITERS,
+        RMS_EPS,
+        HC_EPS,
+    )
+
+    assert len(launches) == 1
+    grid, kwargs = launches[0]
+    assert grid == (triton.cdiv(rows, 64), 8)
+    assert kwargs["BLOCK_M"] == 64
+    assert kwargs["BLOCK_K"] == 128
+    assert kwargs["K_PER_SLICE"] == K // 8
 
 
 def test_split_bf16_hc_weight_recovers_the_fp32_projection():
