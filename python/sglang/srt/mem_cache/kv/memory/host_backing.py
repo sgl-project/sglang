@@ -230,23 +230,24 @@ class _SharedPageEnvelopeHostBacking:
 
     def release(self, name: str) -> None:
         with self.lock:
-            self._users.discard(name)
-            self.destroy_if_unused()
+            if name not in self._users:
+                return
+            self._users.remove(name)
+            try:
+                self.destroy_if_unused()
+            except BaseException:
+                self._users.add(name)
+                raise
 
     def destroy_if_unused(self) -> None:
         with self.lock:
             if self._users or self._destroyed:
                 return
-            self._destroyed = True
-            events = self._begin_compaction()
-            try:
-                for event in events:
-                    event.synchronize()
+            with self._quiesced_layout():
                 if self.pin_memory and (_is_cuda or _is_hip):
                     _cuda_host_unregister(self.raw)
                 self.raw = None
-            finally:
-                self._finish_compaction()
+                self._destroyed = True
 
     def page_buffer(self, name: str) -> torch.Tensor:
         side = self.sides[name]
@@ -355,22 +356,29 @@ class _SharedPageEnvelopeHostBacking:
             page_counts,
         )
 
-    def _begin_compaction(self) -> list:
+    @contextmanager
+    def _quiesced_layout(self):
+        """Drain leases and their transfer events before mutating the backing."""
         if self._layout_lease_state.depth:
             raise RuntimeError(
                 "Cannot compact a unified host pool while the current thread "
                 "holds a layout lease."
             )
-        self._compacting = True
-        while self._layout_users:
+        while self._compacting:
             self._layout_condition.wait()
-        events = list(self._pending_transfer_events.values())
-        self._pending_transfer_events = {}
-        return events
-
-    def _finish_compaction(self) -> None:
-        self._compacting = False
-        self._layout_condition.notify_all()
+        self._compacting = True
+        try:
+            while self._layout_users:
+                self._layout_condition.wait()
+            # A failed wait leaves the mapping in use. Keep the events until
+            # all have completed so the next clear, compaction or destroy waits again.
+            for event in self._pending_transfer_events.values():
+                event.synchronize()
+            self._pending_transfer_events.clear()
+            yield
+        finally:
+            self._compacting = False
+            self._layout_condition.notify_all()
 
     def acquire_layout(self) -> None:
         with self._layout_condition:
@@ -450,14 +458,9 @@ class _SharedPageEnvelopeHostBacking:
         )
 
     def _compact(self) -> None:
-        events = self._begin_compaction()
-        try:
-            for event in events:
-                event.synchronize()
+        with self._quiesced_layout():
             for side in self.sides.values():
                 self._compact_side(side)
-        finally:
-            self._finish_compaction()
 
     def _take_physical_pages(self, side: _Side, page_count: int) -> list[int]:
         reverse = side.grow_direction == "down"
@@ -652,19 +655,13 @@ class _SharedPageEnvelopeHostBacking:
             return len(indices)
 
     def clear(self, name: str) -> None:
-        with self.lock:
-            events = self._begin_compaction()
-            try:
-                for event in events:
-                    event.synchronize()
-                side = self.sides[name]
-                side.free_logical_extents = [(0, side.page_num)]
-                side.logical_to_physical.clear()
-                side.physical_to_logical.clear()
-                side.free_physical_pages.clear()
-                side.watermark = 0 if side.grow_direction == "up" else side.page_num - 1
-            finally:
-                self._finish_compaction()
+        with self.lock, self._quiesced_layout():
+            side = self.sides[name]
+            side.free_logical_extents = [(0, side.page_num)]
+            side.logical_to_physical.clear()
+            side.physical_to_logical.clear()
+            side.free_physical_pages.clear()
+            side.watermark = 0 if side.grow_direction == "up" else side.page_num - 1
 
     def translate_indices(self, name: str, indices: torch.Tensor) -> torch.Tensor:
         with self.lock:

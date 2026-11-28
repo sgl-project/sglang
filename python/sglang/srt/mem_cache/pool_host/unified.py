@@ -267,12 +267,13 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         return raw.data_ptr(), raw.nbytes, side.page_bytes
 
     def destroy(self) -> None:
-        if self._destroyed:
-            return
-        self._destroyed = True
-        self.kv_buffer = None
-        self._host_page_buffer_view = None
-        self._shared_backing.release(self.pool_label)
+        with self.lock:
+            if self._destroyed:
+                return
+            self._shared_backing.release(self.pool_label)
+            self.kv_buffer = None
+            self._host_page_buffer_view = None
+            self._destroyed = True
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
         indices = indices.to(dtype=torch.int64)
