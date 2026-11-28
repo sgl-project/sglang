@@ -15,6 +15,14 @@ from sglang.srt.layers.rotary_embedding.yarn import (
 )
 
 
+def _find_token(tokens: List[int], token_id: int, start: int) -> int:
+    """First index of token_id from start, or len(tokens) + 1 if absent."""
+    try:
+        return tokens.index(token_id, start)
+    except ValueError:
+        return len(tokens) + 1
+
+
 class BailingMRotaryEmbedding(RotaryEmbedding):
     """Bailing multimodal RoPE with centered height and width positions."""
 
@@ -271,13 +279,13 @@ class BailingMRotaryEmbedding(RotaryEmbedding):
 
         for _ in range(image_count + video_count):
             image_start = (
-                input_tokens.index(image_patch_id, start)
-                if image_patch_id in input_tokens[start:] and remaining_images > 0
+                _find_token(input_tokens, image_patch_id, start)
+                if remaining_images > 0
                 else len(input_tokens) + 1
             )
             video_start = (
-                input_tokens.index(video_patch_id, start)
-                if video_patch_id in input_tokens[start:] and remaining_videos > 0
+                _find_token(input_tokens, video_patch_id, start)
+                if remaining_videos > 0
                 else len(input_tokens) + 1
             )
             if image_start < video_start:
