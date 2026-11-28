@@ -66,6 +66,7 @@ import math
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
@@ -95,8 +96,9 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     unwrap_write_loc,
 )
-from sglang.srt.utils import ceil_div, is_cuda
+from sglang.srt.utils import is_cuda
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import get_current_device_stream_fast
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -160,6 +162,101 @@ def _view_bytes(
 ) -> torch.Tensor:
     nbytes = math.prod(shape) * dtype.itemsize
     return buf[offset : offset + nbytes].view(dtype).view(shape)
+
+
+def _to_device(array: np.ndarray, device) -> torch.Tensor:
+    tensor = torch.from_numpy(np.ascontiguousarray(array, dtype=np.int64))
+    if torch.device(device).type == "cuda":
+        # Pinned source: ordered on the current stream without a host sync.
+        return tensor.pin_memory().to(device, non_blocking=True)
+    return tensor.to(device)
+
+
+def _ragged_arange(counts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """(row, offset within row) of every element of rows sized ``counts``."""
+    rows = np.repeat(np.arange(counts.size, dtype=np.int64), counts)
+    starts = np.cumsum(counts) - counts
+    return rows, np.arange(rows.size, dtype=np.int64) - starts[rows]
+
+
+def _assign_prefix_slots(
+    samples: torch.Tensor,
+    *,
+    shard_size: int,
+    shard_rank: int,
+    sort_stride: int,
+    block_pages: int,
+    page_pos: torch.Tensor,
+    own_local: torch.Tensor,
+) -> None:
+    """Assign a batch's sampled prefix pages their scratch slots on the device.
+
+    Owner-major: unique pages sorted by (owner, local page), so rank r's pages
+    sit contiguously at ``r * block_pages`` in local-page order — the order
+    rank r packs its send block, on every rank (mirrored). A page shared by
+    several requests takes ONE slot. Every shape is the host-known sample
+    count, so nothing synchronizes. ``own_local[:block_pages]`` receives this
+    rank's local pages in slot order; ``own_local[block_pages]`` absorbs the
+    writes of pages it does not own.
+    """
+    owners = samples % shard_size
+    # The key is injective in the page, so equal keys are duplicates.
+    key, order = torch.sort(owners * sort_stride + samples // shard_size)
+    pages, owners = samples[order], owners[order]
+    first = torch.ones_like(key, dtype=torch.bool)
+    first[1:] = key[1:] != key[:-1]
+    unique_index = torch.cumsum(first, 0) - 1
+    counts = torch.zeros(shard_size, dtype=torch.int64, device=samples.device)
+    counts.scatter_add_(0, owners, first.long())
+    # The block bound sum_i ceil(K_i / N) must hold for every owner.
+    torch._assert_async(counts.max() <= block_pages)
+    within = unique_index - (torch.cumsum(counts, 0) - counts)[owners]
+    # Duplicates carry the same page and slot: the scatter is deterministic.
+    page_pos[pages] = (owners * block_pages + within).to(torch.int32)
+    owned = first & (owners == shard_rank)
+    own_local.scatter_(0, torch.where(owned, within, block_pages), pages // shard_size)
+
+
+def current_stream(device_module):
+    """``device_module.current_stream()``; CUDA skips the device lookup."""
+    if device_module is torch.cuda:
+        return get_current_device_stream_fast()
+    return device_module.current_stream()
+
+
+class on_stream:
+    """``device_module.stream(stream)`` without the per-entry device checks.
+
+    The pool's streams live on the process's single device, so CUDA switches
+    with one raw set per edge instead of ``torch.cuda.StreamContext``.
+    """
+
+    __slots__ = ("_device_module", "_stream", "_prev")
+
+    def __init__(self, device_module, stream):
+        self._device_module = device_module
+        self._stream = stream
+
+    def __enter__(self):
+        if self._device_module is not torch.cuda:
+            self._prev = self._device_module.stream(self._stream)
+            self._prev.__enter__()
+            return
+        self._prev = get_current_device_stream_fast()
+        _set_cuda_stream(self._stream)
+
+    def __exit__(self, *exc):
+        if self._device_module is not torch.cuda:
+            return self._prev.__exit__(*exc)
+        _set_cuda_stream(self._prev)
+
+
+def _set_cuda_stream(stream) -> None:
+    torch._C._cuda_setStream(
+        stream_id=stream.stream_id,
+        device_index=stream.device_index,
+        device_type=stream.device_type,
+    )
 
 
 class _ScratchSlot:
@@ -272,7 +369,7 @@ class PageInterleaveKVPoolMixin:
         self._send_pages: Optional[torch.Tensor] = None
         self._send_rows: Optional[torch.Tensor] = None
         self._write_plan_key = None
-        self._write_plan: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+        self._write_plan: Optional[torch.Tensor] = None
         self._translate_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
         scratch_bytes = sum(
@@ -402,88 +499,98 @@ class PageInterleaveKVPoolMixin:
         # ONE cyclic rotation run (graft-declined inserts + per-request
         # bases), so a rank owns at most ceil(K_i / N) of its pages, and the
         # cross-request dedup below only shrinks per-rank counts.
-        empty = torch.empty((0,), dtype=torch.int64, device=self.device)
-        prefix_parts = []
-        chunk_parts = []
-        block_pages = 0
-        for i in range(len(prefix_lens_cpu)):
-            prefix_len, seq_len = int(prefix_lens_cpu[i]), int(seq_lens_cpu[i])
-            assert prefix_len % ps == 0, (
+        #
+        # This runs on the forward stream behind the previous forward (and,
+        # under PP, the upstream proxy receive), so the plan never reads page
+        # values back: the host derives every output size from the lengths
+        # and the device fills in the values.
+        prefix_lens = np.asarray(prefix_lens_cpu, dtype=np.int64).reshape(-1)
+        seq_lens = np.asarray(seq_lens_cpu, dtype=np.int64).reshape(-1)
+        unaligned = prefix_lens % ps != 0
+        if unaligned.any():
+            bad_len = int(prefix_lens[unaligned][0])
+            raise AssertionError(
                 f"sharded prefill requires physical-page-aligned prefixes "
                 f"(the radix-tree match quantum), got prefix_len="
-                f"{prefix_len}, page_size={ps}"
+                f"{bad_len}, page_size={ps}"
             )
-            row = req_to_token[req_pool_indices[i]]
-            if prefix_len:
-                pages_i = row[:prefix_len:ps].long() // ps
-                prefix_parts.append(pages_i)
-                block_pages += ceil_div(prefix_len // ps, shard_size)
-                if self._debug_plan_checks:
-                    # Owner-congruence: each request's prefix owners must be
-                    # exactly cyclic — the block bound above relies on it. A
-                    # broken rotation would overflow a rank's block and the
-                    # translation would silently address the wrong scratch
-                    # rows. Fail loud instead (debug mode syncs).
-                    owners = pages_i % shard_size
-                    expected = (
-                        int(owners[0])
-                        + torch.arange(
-                            owners.numel(), dtype=torch.int64, device=self.device
-                        )
-                    ) % shard_size
-                    assert torch.equal(owners, expected), (
-                        f"sharded prefix owners of request {i} are not "
-                        f"cyclic — rotation base out of sync "
-                        f"(owners[:16]={owners[:16].tolist()})"
-                    )
-            if seq_len > prefix_len:
-                chunk_parts.append(row[prefix_len:seq_len:ps].long() // ps)
+        n_prefix_pages = prefix_lens // ps
+        n_chunk_pages = np.where(
+            seq_lens > prefix_lens, -(-(seq_lens - prefix_lens) // ps), 0
+        )
+        block_pages = int((-(-n_prefix_pages // shard_size)).sum())
 
-        # A prefix page shared by several requests gathers into ONE scratch
-        # slot (torch.unique sorts — deterministic, mirrored); chunk pages
-        # are per-request fresh allocations, disjoint by construction.
-        prefix_pages = torch.unique(torch.cat(prefix_parts)) if prefix_parts else empty
-        chunk_pages = torch.cat(chunk_parts) if chunk_parts else empty
-        n_prefix = prefix_pages.numel()
-        n_chunk = chunk_pages.numel()
+        prefix_rows, prefix_offsets = _ragged_arange(n_prefix_pages)
+        chunk_rows, chunk_offsets = _ragged_arange(n_chunk_pages)
+        sizes = [prefix_rows.size, chunk_rows.size]
+        n_samples, n_chunk = sizes
         n_prefix_slots = shard_size * block_pages
         assert n_prefix_slots * ps <= spec.max_prefix_tokens, (
-            f"prefix ({n_prefix} pages, padded gather span "
-            f"{n_prefix_slots * ps} tokens) exceeds the scratch prefix "
-            f"capacity ({spec.max_prefix_tokens}) — the PrefillAdder scratch "
-            f"reservation should have deferred this batch"
+            f"prefix (padded gather span {n_prefix_slots * ps} tokens) exceeds "
+            f"the scratch prefix capacity ({spec.max_prefix_tokens}) — the "
+            f"PrefillAdder scratch reservation should have deferred this batch"
         )
         assert n_chunk * ps <= spec.chunk_tokens, (
             f"chunk ({n_chunk * ps} tokens) exceeds the scratch chunk "
             f"capacity ({spec.chunk_tokens})"
         )
 
-        self._page_pos.fill_(self._trash_base // ps)
-        if n_prefix:
-            # Owner-major slot assignment: sort the batch's unique pages by
-            # (owner, local page) so rank r's pages are contiguous at
-            # r * block_pages in local-page order — the same order rank r
-            # packs its send block below, on every rank (mirrored).
-            owners = prefix_pages % shard_size
-            local_pages = prefix_pages // shard_size
-            order = torch.argsort(owners * self._local_page_stride + local_pages)
-            sorted_pages = prefix_pages[order]
-            sorted_owners = owners[order]
-            counts = torch.bincount(sorted_owners, minlength=shard_size)
-            starts = torch.cumsum(counts, 0) - counts
-            within = (
-                torch.arange(n_prefix, dtype=torch.int64, device=self.device)
-                - starts[sorted_owners]
+        device = req_to_token.device
+        if sum(sizes):
+            rows = np.concatenate([prefix_rows, chunk_rows])
+            cols = np.concatenate(
+                [
+                    prefix_offsets * ps,
+                    prefix_lens[chunk_rows] + chunk_offsets * ps,
+                ]
             )
-            self._page_pos[sorted_pages] = (sorted_owners * block_pages + within).to(
-                torch.int32
+            index = _to_device(np.stack([rows, cols]), device)
+            req_rows = req_pool_indices.to(device, non_blocking=True)[index[0]]
+            samples = req_to_token[req_rows, index[1]].long() // ps
+        else:
+            samples = torch.empty(0, dtype=torch.int64, device=device)
+        prefix_samples, chunk_pages = torch.split(samples, sizes)
+
+        if self._debug_plan_checks and n_samples:
+            # Owner-congruence: each request's prefix owners must be exactly
+            # cyclic — the block bound above relies on it. A broken rotation
+            # would overflow a rank's block and the translation would
+            # silently address the wrong scratch rows. Fail loud instead
+            # (debug mode accepts the readback).
+            per_request = np.split(
+                prefix_samples.cpu().numpy(), np.cumsum(n_prefix_pages)[:-1]
+            )
+            for i, pages_i in enumerate(per_request):
+                if not pages_i.size:
+                    continue
+                owners = pages_i % shard_size
+                expected = (owners[0] + np.arange(owners.size)) % shard_size
+                assert np.array_equal(owners, expected), (
+                    f"sharded prefix owners of request {i} are not "
+                    f"cyclic — rotation base out of sync "
+                    f"(owners[:16]={owners[:16].tolist()})"
+                )
+
+        self._page_pos.fill_(self._trash_base // ps)
+        # This rank's owned pages in slot order, padded to the regular
+        # allgather block with the reserved trash page (local page 0), whose
+        # rows the plan never references. The extra entry absorbs the writes
+        # of pages this rank does not own.
+        own_local = torch.zeros(block_pages + 1, dtype=torch.int64, device=device)
+        if n_samples:
+            _assign_prefix_slots(
+                prefix_samples,
+                shard_size=shard_size,
+                shard_rank=self.shard_rank,
+                sort_stride=self._local_page_stride,
+                block_pages=block_pages,
+                page_pos=self._page_pos,
+                own_local=own_local,
             )
         if n_chunk:
+            chunk_base = self._chunk_base // ps
             self._page_pos[chunk_pages] = torch.arange(
-                self._chunk_base // ps,
-                self._chunk_base // ps + n_chunk,
-                dtype=torch.int32,
-                device=self.device,
+                chunk_base, chunk_base + n_chunk, dtype=torch.int32, device=device
             )
 
         self._epoch += 1
@@ -491,23 +598,10 @@ class PageInterleaveKVPoolMixin:
         self._shard_extend_active = True
         self._translate_cache.clear()
         if block_pages:
-            # This rank's owned pages in slot order (already local-sorted) —
-            # logical page l is its local physical page l // N — padded to
-            # the regular allgather block with the reserved trash page
-            # (local page 0), whose rows the plan never references.
-            own_local = sorted_pages[sorted_owners == self.shard_rank] // shard_size
-            n_pad = block_pages - own_local.numel()
-            if n_pad:
-                own_local = torch.cat(
-                    [
-                        own_local,
-                        torch.zeros((n_pad,), dtype=torch.int64, device=self.device),
-                    ]
-                )
-            self._send_pages = own_local
+            self._send_pages = own_local[:block_pages]
             self._send_rows = (
-                own_local[:, None] * ps
-                + torch.arange(ps, dtype=torch.int64, device=self.device)
+                self._send_pages[:, None] * ps
+                + torch.arange(ps, dtype=torch.int64, device=device)
             ).reshape(-1)
             self._prefetch_layer(self.start_layer)
         else:
@@ -549,8 +643,8 @@ class PageInterleaveKVPoolMixin:
         # Order the gather after all prior compute-stream work: the
         # previous tenant's reads (attention of layer_id - 2) and the pool
         # writes that produced the prefix rows.
-        self.kv_gather_stream.wait_stream(self.device_module.current_stream())
-        with self.device_module.stream(self.kv_gather_stream):
+        self.kv_gather_stream.wait_stream(current_stream(self.device_module))
+        with on_stream(self.device_module, self.kv_gather_stream):
             if self.layer_transfer_counter is not None:
                 # HiCache loads this layer's rows on its own stream, and the gather
                 # bypasses the waiting base getters.
@@ -590,7 +684,7 @@ class PageInterleaveKVPoolMixin:
                 f"prefix scratch miss for layer {layer_id} "
                 f"(resident={slot.resident_key}, epoch={self._epoch})"
             )
-            current = self.device_module.current_stream()
+            current = current_stream(self.device_module)
             if self._multicast_gather is not None:
                 # The slot's last run lands after every earlier one, once
                 # every rank's copies have arrived (its exit barrier).
@@ -617,22 +711,31 @@ class PageInterleaveKVPoolMixin:
 
     # ---- write plan (owner filter), cached per (loc tensor, epoch) --------------
 
-    def _get_write_plan(self, loc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(owned positions into ``loc``, their local physical rows).
+    def _get_write_plan(self, loc: torch.Tensor) -> torch.Tensor:
+        """This rank's local physical row for every token of ``loc``.
 
-        The same ``out_cache_loc`` tensor is passed for every layer of a
-        forward, so the owner filter is computed once per batch, not per
-        layer.
+        Tokens another rank owns target the reserved trash page (local page
+        0), which is never allocated, gathered or transferred. Writing every
+        token keeps the shape fixed: an owner filter (nonzero) would
+        synchronize the forward stream mid-forward. The same ``out_cache_loc``
+        arrives at every layer of a forward, so this runs once per batch.
         """
+        if not self._shard_extend_active:
+            # The epoch only advances per sharded extend; outside one a reused
+            # buffer could carry different locations.
+            return self._local_rows_or_trash(loc)
         key = (loc.data_ptr(), loc.numel(), self._epoch)
         if self._write_plan_key != key:
-            owned_idx = torch.nonzero(
-                self.placement.local_mask(loc, self.shard_rank)
-            ).squeeze(1)
-            local_rows = self.placement.local_index(loc[owned_idx])
+            self._write_plan = self._local_rows_or_trash(loc)
             self._write_plan_key = key
-            self._write_plan = (owned_idx, local_rows)
         return self._write_plan
+
+    def _local_rows_or_trash(self, loc: torch.Tensor) -> torch.Tensor:
+        return torch.where(
+            self.placement.local_mask(loc, self.shard_rank),
+            self.placement.local_index(loc),
+            loc % self.shard_spec.page_size,
+        )
 
 
 class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool):
@@ -654,9 +757,9 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
     ):
         super().__init__(*args, **kwargs)
         assert not self.use_hnd, "KV sharding supports the NHD layout only"
-        assert self.kv_cache_layout == "nhd", (
-            f"KV sharding supports the NHD layout only, got {self.kv_cache_layout}"
-        )
+        assert (
+            self.kv_cache_layout == "nhd"
+        ), f"KV sharding supports the NHD layout only, got {self.kv_cache_layout}"
         assert not self.post_capture_active
         self._init_page_shard_state(shard_spec, shard_group)
 
@@ -710,13 +813,12 @@ class PageInterleaveMHATokenToKVPool(PageInterleaveKVPoolMixin, MHATokenToKVPool
             slot.tensors["k"][rows] = cache_k
             slot.tensors["v"][rows] = cache_v
 
-        owned_idx, local_rows = self._get_write_plan(loc)
-        if owned_idx.numel() > 0:
+        if loc.numel() > 0:
             self._store_kv_layer(
                 layer_id - self.start_layer,
-                local_rows,
-                cache_k.index_select(0, owned_idx),
-                cache_v.index_select(0, owned_idx),
+                self._get_write_plan(loc),
+                cache_k,
+                cache_v,
             )
 
     def get_key_buffer(self, layer_id: int):
@@ -795,13 +897,12 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             if staged_k.dtype != self.dtype:
                 staged_k = staged_k.to(self.dtype)
             self._scratch_kv(slot)[rows] = staged_k
-        owned_idx, local_rows = self._get_write_plan(loc)
-        if owned_idx.numel() == 0:
+        if loc.numel() == 0:
             return
         super().set_kv_buffer(
             layer,
-            local_rows,
-            cache_k.index_select(0, owned_idx),
+            self._get_write_plan(loc),
+            cache_k,
             cache_v,
             layer_id_override=layer_id_override,
         )
@@ -824,14 +925,13 @@ class PageInterleaveMLATokenToKVPool(PageInterleaveKVPoolMixin, MLATokenToKVPool
             self._write_mla_kv_buffer(
                 slot.tensors["kv"], rows, cache_k_nope, cache_k_rope
             )
-        owned_idx, local_rows = self._get_write_plan(loc)
-        if owned_idx.numel() == 0:
+        if loc.numel() == 0:
             return
         super().set_mla_kv_buffer(
             layer,
-            local_rows,
-            cache_k_nope.index_select(0, owned_idx),
-            cache_k_rope.index_select(0, owned_idx),
+            self._get_write_plan(loc),
+            cache_k_nope,
+            cache_k_rope,
             layer_id_override=layer_id_override,
         )
 
@@ -901,12 +1001,12 @@ class _PageInterleaveIndexKeyCache(IndexKeyCache):
         return local
 
     def _scratch_pages(self, layer_id: int, page_indices: torch.Tensor) -> torch.Tensor:
-        assert self.pool._shard_extend_active, (
-            "logical indexer page reads require begin_shard_extend"
-        )
-        assert self.buffer[layer_id - self.pool.start_layer].shape[0], (
-            "cannot read indexer keys for a skip-topk layer"
-        )
+        assert (
+            self.pool._shard_extend_active
+        ), "logical indexer page reads require begin_shard_extend"
+        assert self.buffer[layer_id - self.pool.start_layer].shape[
+            0
+        ], "cannot read indexer keys for a skip-topk layer"
         return self.pool._page_pos[page_indices.long()]
 
     def get_k_and_scale(
@@ -1015,14 +1115,14 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
         # Initialize both DSA buffers before allocating their shared scratch;
         # the ordinary sharded MLA constructor deliberately rejects use_dsa.
         DSATokenToKVPool.__init__(self, *args, **kwargs)
-        assert self.index_buf_size == self.size, (
-            "page-interleave DSA requires equal latent and indexer capacities"
-        )
+        assert (
+            self.index_buf_size == self.size
+        ), "page-interleave DSA requires equal latent and indexer capacities"
         # Indexer locations are translated in token units, which equal k-pool
         # slots only when every page keeps all of its tokens.
-        assert self.index_kpool == 1, (
-            f"page-interleave DSA does not support index_kpool={self.index_kpool}"
-        )
+        assert (
+            self.index_kpool == 1
+        ), f"page-interleave DSA does not support index_kpool={self.index_kpool}"
         self._init_page_shard_state(shard_spec, shard_group)
 
     def _create_index_key_cache(self) -> IndexKeyCache:
