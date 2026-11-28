@@ -6,6 +6,9 @@ on:
       jit_kernel:
         required: true
         type: string
+      diffusion_kernel_only:
+        type: boolean
+        default: false
       sgl_kernel:
         required: true
         type: string
@@ -49,29 +52,22 @@ jobs:
   jit-kernel-test:
     # The job name is the suite it runs, with the stage prefix swapped for this
     # workflow's, so a row declares a (suite, runner) pair and nothing else.
-    name: jit-kernel-${{ matrix.suite }}${{ matrix.shard }}
+    name: jit-kernel-${{ matrix.suite }}${{ matrix.suite == 'unit-test-1-gpu-small' && format(' ({0})', matrix.shard) || '' }}
     # Runs whenever call-jit-kernel-tests dispatches this workflow. That caller is the
     # single gate (PR jit_kernel changes, or scheduled/parallel-dispatch full runs), so
     # the sub-jobs no longer re-exclude schedule/parallel-dispatch here.
     strategy:
       fail-fast: false
       matrix:
+        suite: [unit-test-1-gpu-small]
+        shard: ${{ fromJSON(inputs.diffusion_kernel_only && '[0]' || '[0, 1, 2]') }}
         include:
+          - suite: unit-test-1-gpu-small
+            runner_config: 1-gpu-small
+            suite_args: --fork-worker-batch-size 20
           - suite: unit-test-1-gpu-large
             runner_config: 1-gpu-large
             suite_args: --fork-worker-batch-size 20
-          - suite: unit-test-1-gpu-small
-            runner_config: 1-gpu-small
-            shard: " (0)"
-            suite_args: --auto-partition-id 0 --auto-partition-size 3 --fork-worker-batch-size 20
-          - suite: unit-test-1-gpu-small
-            runner_config: 1-gpu-small
-            shard: " (1)"
-            suite_args: --auto-partition-id 1 --auto-partition-size 3 --fork-worker-batch-size 20
-          - suite: unit-test-1-gpu-small
-            runner_config: 1-gpu-small
-            shard: " (2)"
-            suite_args: --auto-partition-id 2 --auto-partition-size 3 --fork-worker-batch-size 20
           - suite: unit-test-4-gpu-b200
             runner_config: 4-gpu-b200
           - suite: benchmark-test-1-gpu-large
@@ -126,6 +122,9 @@ jobs:
         timeout-minutes: 90
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          SUITE: ${{ matrix.suite }}
+          SHARD: ${{ matrix.shard }}
+          DIFFUSION_KERNEL_ONLY: ${{ inputs.diffusion_kernel_only }}
           KERNEL_BENCH: ${{ matrix.kernel_bench && 'true' || 'false' }}
           KERNEL_BENCH_RUN_KIND: ${{ github.event_name == 'pull_request' && 'pr' || github.event_name == 'schedule' && 'main' || 'manual' }}
         run: |
@@ -133,8 +132,18 @@ jobs:
             export SGLANG_JIT_BENCHMARK_OUTPUT="$GITHUB_WORKSPACE/kernel-bench-out"
             export SGLANG_JIT_BENCHMARK_RUN_KIND="$KERNEL_BENCH_RUN_KIND"
           fi
+          suite_args=(${{ matrix.suite_args }})
+          if [[ "$DIFFUSION_KERNEL_ONLY" == true ]]; then
+            files="$RUNNER_TEMP/diffusion-kernel-tests.txt"
+            git ls-files 'test/registered/*diffusion*.py' 'test/registered/*multimodal_gen*.py' > "$files"
+            # Some tests live alongside shared attention/GEMM operators but exercise the diffusion runtime.
+            git grep -l -w -e multimodal_gen -e diffusion -- 'test/registered/*.py' >> "$files"
+            suite_args+=(--only-file-list "$files")
+          elif [[ "$SUITE" == unit-test-1-gpu-small ]]; then
+            suite_args+=(--auto-partition-id "$SHARD" --auto-partition-size 3)
+          fi
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-${{ matrix.suite }} ${{ matrix.suite_args }} $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite "base-b-kernel-$SUITE" "${suite_args[@]}" $CONTINUE_ON_ERROR_FLAG
 
       - name: Upload kernel benchmark records
         if: ${{ always() && matrix.kernel_bench }}

@@ -331,6 +331,7 @@ jobs:
     with:
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
+      diffusion_kernel_only: ${{ needs.check-changes.outputs.diffusion_kernel_only == 'true' && !inputs.test_parallel_dispatch && !inputs.run_all_tests }}
       # On scheduled/parallel-dispatch runs sgl-kernel-build-wheels is skipped, so the wheel
       # artifact does not exist. Force sgl_kernel='false' there so the jit-kernel jobs skip the
       # wheel download and run against the released/pinned sgl-kernel instead of a fresh build.

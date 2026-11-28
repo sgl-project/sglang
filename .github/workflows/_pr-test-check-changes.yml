@@ -29,6 +29,8 @@ on:
         value: ${{ jobs.run.outputs.sgl_kernel }}
       jit_kernel:
         value: ${{ jobs.run.outputs.jit_kernel }}
+      diffusion_kernel_only:
+        value: ${{ jobs.run.outputs.diffusion_kernel_only }}
       multimodal_gen:
         value: ${{ jobs.run.outputs.multimodal_gen }}
       multimodal_gen_server:
@@ -70,6 +72,7 @@ jobs:
       simulator: ${{ steps.changes.outputs.simulator }}
       sgl_kernel: ${{ steps.changes.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.changes.outputs.jit_kernel }}
+      diffusion_kernel_only: ${{ steps.changes.outputs.diffusion_kernel_only }}
       multimodal_gen: ${{ steps.changes.outputs.multimodal_gen }}
       multimodal_gen_server: ${{ steps.changes.outputs.multimodal_gen_server }}
       diffusion_sm103: ${{ steps.changes.outputs.diffusion_sm103 }}
