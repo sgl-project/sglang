@@ -3,6 +3,10 @@ from transformers import PretrainedConfig
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
 
+PLE_EMBEDDING_MODE_NGRAM = "ngram"
+PLE_EMBEDDING_MODE_PER_TOKEN = "per_token"
+PLE_EMBEDDING_MODES = (PLE_EMBEDDING_MODE_NGRAM, PLE_EMBEDDING_MODE_PER_TOKEN)
+
 
 class Qwen4ExpVisionConfig(Qwen3VLVisionConfig):
     model_type = "qwen4_exp"
@@ -34,6 +38,7 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         ple_offload_backend="pinned",
         ple_offload_dir=None,
         ple_embedding_dtype=None,
+        ple_embedding_mode=None,
         index_share_for_mtp_iteration=True,
         rope_parameters=None,
         layer_types=None,
@@ -76,6 +81,24 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
         self.ple_offload_dir = ple_offload_dir
         # "float8_e4m3fn" keeps fp8 PLE tables fp8-resident; text_config-scoped.
         self.ple_embedding_dtype = ple_embedding_dtype
+        # "ngram": the hashed n-gram table.
+        # "per_token": a [vocab_size, ple_embed_dim] table indexed by token id instead.
+        if ple_embedding_mode is None:
+            ple_embedding_mode = PLE_EMBEDDING_MODE_NGRAM
+        self.ple_embedding_mode = ple_embedding_mode
+        if self.ple_embedding_mode not in PLE_EMBEDDING_MODES:
+            raise ValueError(
+                f"Invalid ple_embedding_mode {self.ple_embedding_mode!r}; "
+                f"expected one of {PLE_EMBEDDING_MODES}"
+            )
+        if (
+            self.ple_embedding_mode == PLE_EMBEDDING_MODE_PER_TOKEN
+            and len(set(self.ple_layer_ids)) > 1
+        ):
+            raise ValueError(
+                "ple_embedding_mode='per_token' supports a single PLE layer, got "
+                f"ple_layer_ids={self.ple_layer_ids}"
+            )
         # Draft decode steps reuse the draft-extend indexer top-k (IndexShare).
         self.index_share_for_mtp_iteration = index_share_for_mtp_iteration
 
@@ -109,7 +132,11 @@ class Qwen4ExpTextConfig(Qwen3NextConfig):
 
     @property
     def ngram_context_len(self):
-        if not self.ple_layer_ids:
+        # The per-token lookup keeps no n-gram history.
+        if (
+            not self.ple_layer_ids
+            or self.ple_embedding_mode == PLE_EMBEDDING_MODE_PER_TOKEN
+        ):
             return 0
         return max(int(self.ngram_size) - 1, 0)
 
