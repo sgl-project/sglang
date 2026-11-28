@@ -536,8 +536,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
         If continue_final_message is enabled and the last message is from assistant,
         extract its content and remove it from the message list.
-        If continue_final_message is False and the last message is from assistant,
-        convert it to a user message to ensure the last message is always from user.
+        Otherwise, convert a final text reply to a user message only when
+        it has no reasoning_content for the template to render.
 
         Only processes text-based content (strings), ignoring multimodal content (lists).
 
@@ -559,7 +559,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     # Extract content and remove the assistant message
                     assistant_prefix = last_content
                     messages = messages[:-1]
-                else:
+                elif messages[-1].get("reasoning_content") is None:
                     # Convert the last assistant message to user message
                     messages[-1] = {"role": "user", "content": last_content}
         return messages, assistant_prefix
@@ -3516,10 +3516,11 @@ class OpenAIServingChat(OpenAIServingBase):
     def supports_native_reasoning_history(self) -> bool:
         """Whether the chat encoder or template takes history as ``reasoning_content``
         rather than via :meth:`wrap_reasoning_history`; see
-        :func:`chat_encoding.spec_owns_reasoning_history` for why.
+        :func:`chat_encoding.spec_owns_reasoning_history` for why. Rewrapping
+        can change whitespace at the end marker and break prefix-cache reuse.
         """
         return chat_encoding.spec_owns_reasoning_history(self.chat_encoding_spec) or (
-            isinstance(self._reasoning_detector, ResponseTemplateReasoningDetector)
+            self._reasoning_detector is not None
             and self.template_manager.chat_template_name is None
             and self._template_reads_reasoning_content
         )
