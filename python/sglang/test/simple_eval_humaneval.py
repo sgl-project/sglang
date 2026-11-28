@@ -6,18 +6,12 @@ Mark Chen and Jerry Tworek and Heewoo Jun and Qiming Yuan and Henrique Ponde de 
 https://arxiv.org/abs/2107.03374 https://github.com/openai/human-eval/
 """
 
+import ast
 import random
 import re
+import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional
-
-try:
-    from human_eval.data import read_problems
-    from human_eval.evaluation import estimate_pass_at_k
-    from human_eval.execution import check_correctness  # , unsafe_execute
-except (ImportError, ModuleNotFoundError):
-    print("\nPlease install human-eval at https://github.com/openai/human-eval.\n")
-    raise
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
@@ -27,6 +21,32 @@ from sglang.test.simple_eval_common import (
     SamplerBase,
     SingleEvalResult,
 )
+
+
+def _extract_completion(completion):
+    completion = completion or ""
+    pattern = re.compile(r"```python\n(.*?)```", re.DOTALL)
+    matches = pattern.findall(completion)
+    extracted_answer = matches[0] if len(matches) >= 1 else completion
+    try:
+        module = ast.parse(extracted_answer)
+    except SyntaxError:
+        # Body-only completions may be indented without a function header.
+        return extracted_answer
+    function = next(
+        (node for node in module.body if isinstance(node, ast.FunctionDef)),
+        None,
+    )
+    if function is None:
+        return extracted_answer
+    first_statement = function.body[0]
+    lines = extracted_answer.splitlines(keepends=True)
+    body = lines[first_statement.lineno - 1 : function.end_lineno]
+    if first_statement.lineno == function.lineno:
+        # AST column offsets are UTF-8 byte offsets, not character offsets.
+        body[0] = body[0].encode()[first_statement.col_offset :].decode()
+    extracted_answer = textwrap.indent(textwrap.dedent("".join(body)), "    ")
+    return extracted_answer + "".join(lines[function.end_lineno :])
 
 
 def evaluate_functional_correctness(
@@ -39,6 +59,8 @@ def evaluate_functional_correctness(
     Evaluates the functional correctness of generated samples, and writes
     results to f"{sample_file}_results.jsonl.gz"
     """
+
+    from human_eval.execution import check_correctness
 
     # Check the generated samples against test suites.
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
@@ -64,6 +86,8 @@ class HumanEval(Eval):
         ks_passes: List[int] = [1, 2, 5],
         timeout: int = 120,
     ):
+        from human_eval.data import read_problems
+
         self.seed = 0
         self.examples = read_problems()
         self.examples = list(self.examples.values())
@@ -77,17 +101,9 @@ class HumanEval(Eval):
         self._num_threads = num_threads
 
     def __call__(self, sampler: SamplerBase) -> EvalResult:
-        instruction = "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\n"
+        from human_eval.evaluation import estimate_pass_at_k
 
-        def find_code(completion):
-            completion = completion or ""
-            pattern = re.compile(r"```python\n(.*?)```", re.DOTALL)
-            matches = pattern.findall(completion)
-            extracted_answer = matches[0] if len(matches) >= 1 else completion
-            extracted_answer = extracted_answer[
-                extracted_answer.find(":\n    ") + 2 :
-            ]  # remove signature
-            return extracted_answer
+        instruction = "Read the following function signature and docstring, and fully implement the function described. Your response should only contain the code for this function.\n"
 
         def fn(sample: Dict[str, str]):
             prompt_messages = [
@@ -96,7 +112,7 @@ class HumanEval(Eval):
                 )
             ]
             completions = [
-                find_code(sampler(prompt_messages))
+                _extract_completion(sampler(prompt_messages))
                 for _ in range(self._num_samples_per_task)
             ]
             results = evaluate_functional_correctness(sample, completions)
