@@ -174,6 +174,14 @@ class AttentionBackend(ABC):
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
+    def snapshot_forward_metadata(self):
+        """The python-side state a metadata prep leaves behind, which the metadata
+        glue graph re-installs with :py:meth:`restore_forward_metadata` on replay."""
+        return self.forward_metadata
+
+    def restore_forward_metadata(self, snapshot) -> None:
+        self.forward_metadata = snapshot
+
     @property
     def requires_eager_metadata(self) -> bool:
         """Whether metadata preparation has host work required on every replay."""

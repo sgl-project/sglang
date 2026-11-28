@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner_components import (
     attention_backend_setup,
 )
@@ -22,6 +23,10 @@ class _FakeBackend:
         self.name = name
         # Real backends always carry this (AttentionBackend class attribute).
         self.needs_cpu_seq_lens = True
+        self.forward_metadata = None
+
+    def init_forward_metadata(self, forward_batch):
+        self.forward_metadata = (self.name, forward_batch.forward_mode)
 
 
 def test_split_full_attention_applies_model_wrapper_once():
@@ -120,6 +125,44 @@ def test_equal_resolved_backends_ignore_stale_global_backend():
         )
 
     assert result.name == "resolved"
+
+
+def test_split_backend_forward_metadata_follows_serving_child():
+    # Model code reads get_attn_backend().forward_metadata, the idle path resets it
+    # and a metadata glue replay restores it without re-running init; behind a
+    # prefill/decode split all three must reach the child that served the forward.
+    from sglang.srt.runtime_context import get_context
+
+    override = get_context().override_server_args(speculative_attention_mode="prefill")
+    override.install()
+    try:
+        runner = SimpleNamespace(
+            model_config=SimpleNamespace(context_len=2048),
+            kv_cache_dtype=None,
+            token_to_kv_pool=object(),
+            req_to_token_pool=object(),
+            runner_ids=None,
+        )
+        prefill, decode = _FakeBackend("prefill"), _FakeBackend("decode")
+        split = HybridAttnBackend(
+            model_runner=runner, prefill_backend=prefill, decode_backend=decode
+        )
+
+        split.init_forward_metadata(SimpleNamespace(forward_mode=ForwardMode.EXTEND))
+        assert split.forward_metadata == ("prefill", ForwardMode.EXTEND)
+        split.init_forward_metadata(SimpleNamespace(forward_mode=ForwardMode.DECODE))
+        assert split.forward_metadata == ("decode", ForwardMode.DECODE)
+        snapshot = split.snapshot_forward_metadata()
+
+        split.forward_metadata = None
+        assert decode.forward_metadata is None
+
+        split.init_forward_metadata(SimpleNamespace(forward_mode=ForwardMode.EXTEND))
+        split.restore_forward_metadata(snapshot)
+        assert split.forward_metadata == ("decode", ForwardMode.DECODE)
+        assert prefill.forward_metadata == ("prefill", ForwardMode.EXTEND)
+    finally:
+        override.restore()
 
 
 if __name__ == "__main__":
