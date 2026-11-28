@@ -244,6 +244,7 @@ tensor copy at each residual site.
 |---|---|---|
 | `minimax_h3_vae_temporal_blend_write` | JIT CUDA | bit-exact vs `blend(overlap, part, frame_overlap, dim=-3)` followed by the slice copy, written straight into the destination frames |
 | `minimax_h3_vae_denorm_clamp` | JIT CUDA | bit-exact vs torchvision `Normalize` + `clamp_(0, 1)`, NaN preserved |
+| `h3_vae_assemble_tiles` | Triton | bit-exact vs `AutoencoderKL._assemble_tiles_eager`: each canvas pixel blends with the tile above, then with the tile to the left (both as decoded), as separate FP32 products and sums (`enable_fp_fusion=False`); CUDA and HIP, mounted by the VAE on ROCm only |
 
 The blend write spells klvae's `a * (1 - w) + b * w` with one fp32 rounding
 per op and `w = k * (1 / n)` rounded the way aten evaluates a tensor divided

@@ -18,6 +18,7 @@ from PIL import Image
 
 from sglang.kernels.ops.diffusion import (
     can_use_minimax_h3_vae_temporal_blend_write,
+    h3_vae_assemble_tiles,
     minimax_h3_vae_temporal_blend_write,
 )
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .batching import decode_windows, forward_many
 from .processor import (
@@ -49,6 +51,13 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 # a plain copy cannot vouch for a blend.
 _TEMPORAL_BLEND_FUSION = BitExactFusionGate(
     "MiniMax-H3 VAE temporal blend write", per_signature=True
+)
+
+# A window's tiles are blended, cropped and placed by about eight launches a
+# tile; one kernel runs the same FP32 arithmetic per canvas pixel. Verified on
+# first sight per layout, like the temporal blend write.
+_TILE_ASSEMBLE_FUSION = BitExactFusionGate(
+    "MiniMax-H3 VAE tile assembly", per_signature=True
 )
 
 
@@ -320,6 +329,33 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return 1, 1
 
     def _assemble_tiles(self, rows, y_overlap, x_overlap):
+        # the kernel is measured on gfx950 only; CUDA keeps the eager chain
+        if not current_platform.is_rocm():
+            return self._assemble_tiles_eager(rows, y_overlap, x_overlap)
+        first = rows[0][0]
+        sig = (
+            tuple(first.shape),
+            len(rows),
+            len(rows[0]),
+            tuple(y_overlap),
+            tuple(x_overlap),
+        )
+        if not (
+            _output_kernel_candidate(first, _TILE_ASSEMBLE_FUSION, sig)
+            and all(tile.shape == first.shape for row in rows for tile in row)
+        ):
+            return self._assemble_tiles_eager(rows, y_overlap, x_overlap)
+        tiles = torch.stack([tile for row in rows for tile in row])
+        return _TILE_ASSEMBLE_FUSION.run(
+            lambda: h3_vae_assemble_tiles(
+                tiles, len(rows), len(rows[0]), sig[3], sig[4]
+            ),
+            lambda: self._assemble_tiles_eager(rows, y_overlap, x_overlap),
+            sig=sig,
+            logger=logger,
+        )
+
+    def _assemble_tiles_eager(self, rows, y_overlap, x_overlap):
         output_height = sum(
             row[0].shape[-2] - (y_overlap[i] if i < len(rows) - 1 else 0)
             for i, row in enumerate(rows)
