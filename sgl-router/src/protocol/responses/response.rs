@@ -58,12 +58,6 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
     }
     let calls = tool_calls.map_or(&[][..], Vec::as_slice);
     for (i, tc) in calls.iter().enumerate() {
-        // Only the last call can have been cut off.
-        let status = if i + 1 == calls.len() {
-            item_status
-        } else {
-            "completed"
-        };
         let call_id = tc
             .get("id")
             .and_then(Value::as_str)
@@ -77,6 +71,7 @@ pub fn chat_to_response(chat: &Value, echo: &EchoContext) -> Value {
             .pointer("/function/arguments")
             .and_then(Value::as_str)
             .unwrap_or("");
+        let status = finish.call_status(args, i + 1 == calls.len());
         output.push(call_item(
             &new_id("fc"),
             &call_id,
@@ -251,6 +246,17 @@ mod tests {
             statuses(json!({"role": "assistant", "reasoning_content": "think"})),
             ["incomplete"]
         );
+    }
+
+    #[test]
+    fn truncated_parallel_arguments_are_incomplete() {
+        let call = |args: &str| json!({"function":{"name":"f","arguments":args}});
+        let chat = json!({"choices":[{"finish_reason":"length","message":{
+            "tool_calls":[call("{"),call("{}"),call("{")]}}]});
+        let output = &chat_to_response(&chat, &echo())["output"];
+        assert_eq!(output[0]["status"], "incomplete");
+        assert_eq!(output[1]["status"], "completed");
+        assert_eq!(output[2]["status"], "incomplete");
     }
 
     #[test]
