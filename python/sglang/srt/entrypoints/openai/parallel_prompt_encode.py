@@ -25,28 +25,23 @@ added tokens, pre-tokenizers that treat the first piece of a sequence
 differently (Metaspace), split_special_tokens, and truncation or padding left
 enabled on the backend.
 
-``encode_prompt_segments`` serves renderers that hand over the prompt as
-segments with their special tokens on their own. Those are the cut points, so
-the prompt is not scanned and no length threshold applies, and the ids of the
-text between them are cached per tokenizer: text that recurs across requests,
-like the system prompt, the tool list and earlier turns, is encoded once.
+The ids of the text between added tokens are cached per tokenizer: text that
+recurs across requests, like the system prompt, the tool list and earlier
+turns, is encoded once. ``encode_prompt_segments`` serves renderers that hand
+over the prompt as segments with their special tokens on their own. Those are
+the cut points, so the prompt is not scanned and no length threshold applies.
 
 Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.
 """
 
 import json
-import logging
-import os
 import re
 import threading
-import time
 import weakref
 from collections import OrderedDict
 from itertools import chain
 
 from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
 
 # Adjacent pieces are merged up to this size; tiny inputs only add per-input
 # overhead in encode_batch.
@@ -54,8 +49,10 @@ _MIN_CHUNK_CHARS = 2048
 _MAX_CHUNKS = 64
 
 # Per tokenizer; a text longer than the entry limit is encoded but not kept.
+# Measured: ids ~36 B/token, an entry ~0.5 KB; 177 tools render to ~142K tokens.
 _SEGMENT_CACHE_MAX_TOKENS = 1 << 20
-_SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 8
+_SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 4
+_SEGMENT_CACHE_MAX_ENTRIES = 1 << 16
 
 # Pre-tokenizers that act on each piece independently of its position in the
 # sequence. Metaspace (prepend_scheme="first") and anything unknown are not.
@@ -87,10 +84,6 @@ _INTRA_CUT = re.compile(r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z])")
 
 _plans = weakref.WeakKeyDictionary()
 _segment_encoders = weakref.WeakKeyDictionary()
-# None: not yet checked; False: encode_batch consumed only one CPU (rayon
-# disabled, e.g. after a fork). The PID prevents inheriting the parent's result.
-_parallel_pid = os.getpid()
-_parallel_ok = None
 
 
 def _pre_tokenizer_safe(cfg):
@@ -256,54 +249,34 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
     return chunks
 
 
+def _split_at_added_tokens(text, pattern, npattern):
+    pieces, pos = [], 0
+    for start, end in _added_spans(text, pattern, npattern):
+        if start > pos:
+            pieces.append(text[pos:start])
+        pieces.append(text[start:end])
+        pos = end
+    if pos < len(text):
+        pieces.append(text[pos:])
+    return pieces
+
+
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
-    global _parallel_ok, _parallel_pid
-    pid = os.getpid()
-    if pid != _parallel_pid:
-        _parallel_pid = pid
-        _parallel_ok = None
     encode_kwargs = encode_kwargs or {}
     if (
-        _parallel_ok is False
-        or not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
+        not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get()
         or not isinstance(text, str)
         or len(text) < envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
         or set(encode_kwargs) - {"add_special_tokens"}
     ):
         return tokenizer.encode(text, **encode_kwargs)
-    plan = _plan_for(tokenizer)
-    if plan is None:
+    encoder = _segment_encoder_for(tokenizer)
+    if encoder is None or not encoder.applies(encode_kwargs):
         return tokenizer.encode(text, **encode_kwargs)
-    backend, specials_added, pattern, npattern, intra = plan
-    if encode_kwargs.get("add_special_tokens", True) and specials_added:
-        return tokenizer.encode(text, **encode_kwargs)
-    if (
-        backend.truncation is not None
-        or backend.padding is not None
-        or backend.encode_special_tokens
-    ):
-        return tokenizer.encode(text, **encode_kwargs)
-    chunks = split_prompt(text, pattern, npattern, intra)
-    if len(chunks) < 2:
-        return tokenizer.encode(text, **encode_kwargs)
-
-    check = _parallel_ok is None
-    if check:
-        w0, c0 = time.perf_counter(), time.process_time()
-    encodings = backend.encode_batch(chunks, add_special_tokens=False)
-    if check:
-        wall, cpu = time.perf_counter() - w0, time.process_time() - c0
-        # Rayon worker CPU adds up well beyond wall time. Serial stays near 1.0;
-        # 1.5 leaves headroom for scheduler and measurement noise.
-        _parallel_ok = not (wall > 0.005 and cpu < 1.5 * wall)
-        if not _parallel_ok:
-            logger.warning(
-                "parallel_prompt_encode: tokenizers encode_batch runs serially in "
-                "this process (TOKENIZERS_PARALLELISM off or process forked after "
-                "tokenizers used its pool); using the original encode."
-            )
-    return list(chain.from_iterable(e.ids for e in encodings))
+    return encoder.encode_layout(
+        _split_at_added_tokens(text, encoder.pattern, encoder.npattern)
+    )
 
 
 def _cuts_at(token, added_tokens):
@@ -337,6 +310,14 @@ class _SegmentEncoder:
         self.cache = OrderedDict()
         self.cached_tokens = 0
 
+    def applies(self, encode_kwargs):
+        return not (
+            (encode_kwargs.get("add_special_tokens", True) and self.specials_added)
+            or self.backend.truncation is not None
+            or self.backend.padding is not None
+            or self.backend.encode_special_tokens
+        )
+
     def cut_id(self, segment):
         token_id = self.raw_ids.get(segment)
         if token_id is None:
@@ -361,7 +342,10 @@ class _SegmentEncoder:
                 run.append(segment)
         if run:
             layout.append("".join(run))
+        return self.encode_layout(layout)
 
+    def encode_layout(self, layout):
+        """Ids of token ids and texts that each begin and end at a cut point."""
         texts = [item for item in layout if isinstance(item, str)]
         known = {}
         with self.lock:
@@ -409,7 +393,10 @@ class _SegmentEncoder:
                 ):
                     self.cache[text] = ids
                     self.cached_tokens += len(ids)
-            while self.cached_tokens > _SEGMENT_CACHE_MAX_TOKENS:
+            while (
+                self.cached_tokens > _SEGMENT_CACHE_MAX_TOKENS
+                or len(self.cache) > _SEGMENT_CACHE_MAX_ENTRIES
+            ):
                 self.cached_tokens -= len(self.cache.popitem(last=False)[1])
         return encoded
 
@@ -436,12 +423,6 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
         set(encode_kwargs) - {"add_special_tokens"}
     ):
         encoder = _segment_encoder_for(tokenizer)
-    if (
-        encoder is None
-        or (encode_kwargs.get("add_special_tokens", True) and encoder.specials_added)
-        or encoder.backend.truncation is not None
-        or encoder.backend.padding is not None
-        or encoder.backend.encode_special_tokens
-    ):
+    if encoder is None or not encoder.applies(encode_kwargs):
         return parallel_prompt_encode(tokenizer, "".join(segments), encode_kwargs)
     return encoder.encode(segments)

@@ -1,19 +1,16 @@
 """Chunked prompt encoding must produce the ids the single encode produces.
 
-`parallel_prompt_encode` cuts a rendered prompt and sends the pieces through
-`backend.encode_batch`, so its whole contract is that the concatenated ids are
-identical to `tokenizer.encode(text, **encode_kwargs)` — an off-by-one cut
-point is not a crash, it is a silently different prompt. These cases pin the
-identity on a ByteLevel-BPE tokenizer built in memory with the exact
+`parallel_prompt_encode` cuts a rendered prompt, sends the pieces through
+`backend.encode_batch` and caches the ids of the text between added tokens, so
+its whole contract is that the concatenated ids are identical to
+`tokenizer.encode(text, **encode_kwargs)` — an off-by-one cut point or a stale
+cache entry is not a crash, it is a silently different prompt. These cases pin
+the identity on a ByteLevel-BPE tokenizer built in memory with the exact
 Split-regex + ByteLevel + BPE pipeline the intra-gap cuts were verified for,
 and pin the refusals: every tokenizer configuration outside that pipeline, and
 every gate, must reach the original encode instead.
 
-The tests never assert that the rayon pool actually ran the chunks in
-parallel. The helper probes for a serial `encode_batch` once and then disables
-itself for the process, which is a correctness-preserving decision a CPU
-runner is free to make; `_parallel_ok` is pinned per test so the id
-comparisons do not depend on it.
+The tests never assert that the rayon pool actually ran the chunks in parallel.
 """
 
 import random
@@ -186,13 +183,12 @@ def _fuzz_texts():
 class _EncodeCase(CustomTestCase):
     def setUp(self):
         super().setUp()
-        # `_plans` and `_parallel_ok` are process-wide and sticky: a plan
-        # cached for a mutated tokenizer, or a probe that fell back, would
-        # leak into whatever case runs next.
+        # Plans and segment caches are process-wide and sticky: a plan cached
+        # for a mutated tokenizer would leak into whatever case runs next.
         self.addCleanup(setattr, ppe, "_plans", ppe._plans)
         ppe._plans = weakref.WeakKeyDictionary()
-        self.addCleanup(setattr, ppe, "_parallel_ok", ppe._parallel_ok)
-        ppe._parallel_ok = True
+        self.addCleanup(setattr, ppe, "_segment_encoders", ppe._segment_encoders)
+        ppe._segment_encoders = weakref.WeakKeyDictionary()
 
     def _set_min_chars(self, value):
         override = envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(value)
@@ -209,6 +205,13 @@ class _EncodeCase(CustomTestCase):
                 tokenizer.encode(text, **encode_kwargs),
                 f"{encode_kwargs} on {text[:60]!r}",
             )
+
+    def _no_cached_path(self):
+        return unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "encode_layout",
+            side_effect=AssertionError("cached path taken"),
+        )
 
 
 class TestSafePipelineIdsAreIdentical(_EncodeCase):
@@ -255,9 +258,11 @@ class TestSafePipelineIdsAreIdentical(_EncodeCase):
                 reference,
                 repr(text[:80]),
             )
-            self.assertEqual(
-                ppe.parallel_prompt_encode(self.tokenizer, text, {}), reference
-            )
+            # The second call reads the ids the first one cached.
+            for _ in range(2):
+                self.assertEqual(
+                    ppe.parallel_prompt_encode(self.tokenizer, text, {}), reference
+                )
 
     def test_a_long_prompt_uses_the_default_chunking(self):
         text = (
@@ -268,62 +273,6 @@ class TestSafePipelineIdsAreIdentical(_EncodeCase):
         self.assertLessEqual(len(chunks), ppe._MAX_CHUNKS + 1)
         self.assertEqual(ids, self.tokenizer.encode(text))
         self._assert_matches_encode(self.tokenizer, text)
-
-    def test_the_serial_probe_leaves_the_ids_unchanged(self):
-        """The first call times `encode_batch`; whichever way that goes, the
-        ids are the ones `encode` returns."""
-        ppe._parallel_ok = None
-        text = "hello world, this is a test\n" * 4000
-        self.assertEqual(
-            ppe.parallel_prompt_encode(self.tokenizer, text, {}),
-            self.tokenizer.encode(text),
-        )
-        self.assertIn(ppe._parallel_ok, (True, False))
-
-    def _run_probe(self, process_cpu, thread_cpu):
-        ppe._parallel_ok = None
-        text = "hello world, this is a test\n" * 4000
-        with (
-            unittest.mock.patch.object(
-                ppe.time, "perf_counter", side_effect=(1.0, 1.01)
-            ),
-            unittest.mock.patch.object(
-                ppe.time, "thread_time", side_effect=(1.0, 1.0 + thread_cpu)
-            ),
-            unittest.mock.patch.object(
-                ppe.time,
-                "process_time",
-                side_effect=(1.0, 1.0 + process_cpu),
-                create=True,
-            ),
-        ):
-            ppe.parallel_prompt_encode(self.tokenizer, text, {})
-        return ppe._parallel_ok
-
-    def test_the_probe_counts_rayon_worker_cpu(self):
-        self.assertTrue(self._run_probe(process_cpu=0.04, thread_cpu=0.006))
-
-    def test_the_probe_rejects_one_cpu(self):
-        self.assertFalse(self._run_probe(process_cpu=0.01, thread_cpu=0.0))
-
-    def test_a_forked_process_rechecks_parallelism(self):
-        old_pid = getattr(ppe, "_parallel_pid", None)
-        self.addCleanup(setattr, ppe, "_parallel_pid", old_pid)
-        ppe._parallel_ok = False
-        ppe._parallel_pid = 100
-        text = "hello world, this is a test\n" * 4000
-        with (
-            unittest.mock.patch.object(ppe.os, "getpid", return_value=101),
-            unittest.mock.patch.object(
-                ppe.time, "perf_counter", side_effect=(1.0, 1.01)
-            ),
-            unittest.mock.patch.object(
-                ppe.time, "process_time", side_effect=(1.0, 1.04)
-            ),
-        ):
-            ppe.parallel_prompt_encode(self.tokenizer, text, {})
-        self.assertEqual(ppe._parallel_pid, 101)
-        self.assertTrue(ppe._parallel_ok)
 
 
 def _metaspace(backend):
@@ -419,9 +368,7 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
         )
 
     def _assert_original_encode(self, tokenizer, kwargs_variants=_ALL_KWARGS):
-        with unittest.mock.patch.object(
-            ppe, "split_prompt", side_effect=AssertionError("chunked path taken")
-        ):
+        with self._no_cached_path():
             self._assert_matches_encode(tokenizer, self.text, kwargs_variants)
 
     def test_configurations_without_a_plan(self):
@@ -477,9 +424,7 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
         plan = ppe._plan_for(tokenizer)
         self.assertIsNotNone(plan)
         self.assertEqual(plan[1], 1)
-        with unittest.mock.patch.object(
-            ppe, "split_prompt", side_effect=AssertionError("chunked path taken")
-        ):
+        with self._no_cached_path():
             for encode_kwargs in ({}, {"add_special_tokens": True}):
                 self.assertEqual(
                     ppe.parallel_prompt_encode(tokenizer, self.text, encode_kwargs),
@@ -500,9 +445,7 @@ class TestUnsafeTokenizersFallBack(_EncodeCase):
         tok = _tokenizer(_post_processor_duplicates_sequence)
         text = "hello world " + "<think>hello world</think> " * 2000
         self.assertIsNone(ppe._plan_for(tok))
-        with unittest.mock.patch.object(
-            ppe, "split_prompt", side_effect=AssertionError("chunked path taken")
-        ):
+        with self._no_cached_path():
             assert ppe.parallel_prompt_encode(
                 tok, text, {"add_special_tokens": False}
             ) == tok.encode(text, add_special_tokens=False)
@@ -551,16 +494,17 @@ class TestGatesAndArgumentAllowlist(_EncodeCase):
 
     def _assert_chunked(self, encode_kwargs):
         with unittest.mock.patch.object(
-            ppe, "split_prompt", wraps=ppe.split_prompt
-        ) as split:
+            ppe._SegmentEncoder,
+            "encode_layout",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder.encode_layout,
+        ) as encode:
             ids = ppe.parallel_prompt_encode(self.tokenizer, self.text, encode_kwargs)
-        self.assertEqual(split.call_count, 1)
+        self.assertEqual(encode.call_count, 1)
         self.assertEqual(ids, self.tokenizer.encode(self.text, **(encode_kwargs or {})))
 
     def _assert_original(self, text, encode_kwargs):
-        with unittest.mock.patch.object(
-            ppe, "split_prompt", side_effect=AssertionError("chunked path taken")
-        ):
+        with self._no_cached_path():
             ids = ppe.parallel_prompt_encode(self.tokenizer, text, encode_kwargs)
         self.assertEqual(ids, self.tokenizer.encode(text, **(encode_kwargs or {})))
 
@@ -584,9 +528,27 @@ class TestGatesAndArgumentAllowlist(_EncodeCase):
             self.text, {"add_special_tokens": False, "truncation": False}
         )
 
-    def test_a_process_with_serial_encode_batch_stays_on_the_original_encode(self):
-        ppe._parallel_ok = False
-        self._assert_original(self.text, None)
+    def test_a_rendered_prompt_encodes_only_text_it_does_not_share(self):
+        """A chat-template render arrives as one string; the text between its
+        added tokens is looked up in the cache the segment path fills."""
+        tools = "<tool_call>" + "the quick brown fox jumps over the lazy dog\n" * 120
+        first = "[gMASK]<sop>" + tools + "<|user|>hello world<|assistant|>"
+        second = first + "answer<|user|>fresh text<|assistant|>"
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "_encode",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder._encode,
+        ) as encode:
+            for text in (first, second):
+                self.assertEqual(
+                    ppe.parallel_prompt_encode(self.tokenizer, text, {}),
+                    self.tokenizer.encode(text),
+                )
+        calls = [call.args[1] for call in encode.call_args_list]
+        self.assertEqual(len(calls), 2)
+        self.assertIn(tools[len("<tool_call>") :], calls[0])
+        self.assertEqual(calls[1], ["answer", "fresh text"])
 
 
 def _fuzz_segments():
@@ -612,8 +574,6 @@ def _fuzz_segments():
 class TestPromptSegments(_EncodeCase):
     def setUp(self):
         super().setUp()
-        self.addCleanup(setattr, ppe, "_segment_encoders", ppe._segment_encoders)
-        ppe._segment_encoders = weakref.WeakKeyDictionary()
         self.tokenizer = _tokenizer()
 
     def _assert_segments_match_encode(
@@ -734,6 +694,7 @@ class TestPromptSegments(_EncodeCase):
         with (
             unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_TOKENS", 40),
             unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_TOKENS", 20),
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRIES", 1 << 20),
         ):
             for i in range(30):
                 self._assert_segments_match_encode(
@@ -746,6 +707,18 @@ class TestPromptSegments(_EncodeCase):
         self.assertLessEqual(encoder.cached_tokens, 40)
         self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
         self.assertNotIn("hello world " * 30, encoder.cache)
+
+    def test_the_cache_keeps_to_its_entry_budget(self):
+        """Tiny entries cost far more memory than their tokens; the token budget
+        alone would keep a million of them."""
+        with unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRIES", 8):
+            for i in range(30):
+                self._assert_segments_match_encode(
+                    self.tokenizer, ["<|user|>", f"turn {i}"], ({},)
+                )
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        self.assertEqual(list(encoder.cache), [f"turn {i}" for i in range(22, 30)])
+        self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
 
 
 if __name__ == "__main__":
