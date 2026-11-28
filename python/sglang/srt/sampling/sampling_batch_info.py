@@ -14,13 +14,13 @@ from sglang.srt.sampling.custom_logit_processor import (
     UOCR_PAGE_GUARD_PROCESSOR,
     CustomLogitProcessor,
 )
-from sglang.srt.sampling.logit_bias import build_logit_bias
 from sglang.srt.sampling.penalties import StepPenalties
 from sglang.srt.sampling.watermarking.interface import WatermarkRows
 from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.sampling.logit_bias import LogitBiasRows
     from sglang.srt.sampling.sampling_params_pool import SamplingRows
 
 
@@ -98,9 +98,10 @@ class SamplingBatchInfo:
     step_penalties: Optional[StepPenalties] = None
     # Per-row watermark policy, None unless some row is a watermark candidate.
     watermark: Optional[WatermarkRows] = None
+    # The rows' logit_bias entries, None unless some row has a logit_bias.
+    logit_bias: Optional[LogitBiasRows] = None
 
     # The stages' inputs, built from the step's requests.
-    logit_bias: Optional[torch.Tensor] = None
     # The step's grammar objects, None when no request has one (see grammar_mask.py).
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
     custom_params: Optional[List[Optional[Dict[str, Any]]]] = None
@@ -126,9 +127,6 @@ class SamplingBatchInfo:
         for name, value in zip(rows._fields, rows):
             setattr(self, name, value)
 
-        self.logit_bias = build_logit_bias(
-            reqs, vocab_size=self.vocab_size, device=self.device
-        )
         grammars = [r.grammar for r in reqs]
         self.grammars = grammars if any(grammars) else None
 

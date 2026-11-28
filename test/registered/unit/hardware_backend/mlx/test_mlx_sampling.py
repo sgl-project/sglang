@@ -615,6 +615,8 @@ class TestWorkerSamplingExtras(CustomTestCase):
 
         import torch
 
+        from sglang.srt.sampling.logit_bias import LogitBiasRows
+
         class FakeGrammar:
             finished = False
 
@@ -635,8 +637,10 @@ class TestWorkerSamplingExtras(CustomTestCase):
 
         sinfo = SimpleNamespace(
             grammars=[FakeGrammar(), None],
-            logit_bias=torch.zeros(2, self.VOCAB).index_put_(
-                (torch.tensor([1]), torch.tensor([5])), torch.tensor([2.5])
+            logit_bias=LogitBiasRows(
+                rows=torch.tensor([1]),
+                token_ids=torch.tensor([5]),
+                values=torch.tensor([2.5]),
             ),
             vocab_size=self.VOCAB,
             device="cpu",

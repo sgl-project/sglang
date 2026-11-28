@@ -42,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
 )
 from sglang.srt.sampling.grammar_mask import build_grammar_mask
+from sglang.srt.sampling.logit_bias import apply_logit_bias
 
 logger = logging.getLogger(__name__)
 
@@ -250,16 +251,8 @@ class MlxTpModelWorker(TpModelWorker):
         has_grammar = bool(sinfo.grammars)
         if not has_grammar and sinfo.logit_bias is None:
             return None
-        if not has_grammar:
-            # logit_bias alone is already the dense [B, vocab] additive row we
-            # want; converting it directly skips a second [B, vocab] float32
-            # allocation and an add on every step (~6 MB of churn per step at
-            # vocab 200k, batch 8).  Not mutated below, so no clone is needed.
-            combined = sinfo.logit_bias.to(device="cpu", dtype=torch.float32)
-        else:
-            combined = torch.zeros(
-                len(batch.reqs), sinfo.vocab_size, dtype=torch.float32
-            )
+        combined = torch.zeros(len(batch.reqs), sinfo.vocab_size, dtype=torch.float32)
+        if has_grammar:
             grammar_mask = build_grammar_mask(
                 sinfo.grammars, vocab_size=sinfo.vocab_size, device=sinfo.device
             )
@@ -267,8 +260,8 @@ class MlxTpModelWorker(TpModelWorker):
                 logits=combined,
                 vocab_mask=grammar_mask.vocab_mask.to("cpu"),
             )
-            if sinfo.logit_bias is not None:
-                combined += sinfo.logit_bias.to("cpu")
+        if sinfo.logit_bias is not None:
+            apply_logit_bias(combined, sinfo)
         rows = mx.array(combined.numpy())
         return {req.rid: rows[i] for i, req in enumerate(batch.reqs)}
 

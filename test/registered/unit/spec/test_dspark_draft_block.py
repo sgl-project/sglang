@@ -275,9 +275,11 @@ def _admit(pool, slot, *, temperature, top_k):
                         top_k=top_k,
                         min_p=0.0,
                         sampling_seed=None,
+                        logit_bias=None,
                     ),
                     filler_seed=0,
                     penalty_index=None,
+                    logit_bias_entries=None,
                 )
             ]
         )

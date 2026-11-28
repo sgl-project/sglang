@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.sampling.logit_bias import LogitBiasEntries, apply_logit_bias
 from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -31,6 +32,7 @@ def _req(
     filler_seed=0,
     penalty_index=None,
     watermark=None,
+    logit_bias=None,
 ):
     return SimpleNamespace(
         kv=SimpleNamespace(req_pool_idx=slot),
@@ -41,9 +43,13 @@ def _req(
             min_p=min_p,
             sampling_seed=seed,
             watermark=watermark,
+            logit_bias=logit_bias,
         ),
         filler_seed=filler_seed,
         penalty_index=penalty_index,
+        logit_bias_entries=(
+            None if logit_bias is None else LogitBiasEntries.parse(logit_bias)
+        ),
     )
 
 
@@ -320,6 +326,100 @@ class TestSlotLifecycle(_PoolTestCase):
         self.assertIsNone(rows.watermark)
         self.assertEqual(pool.table.values[pool.table.PENALTY_INDEX, 3].item(), -1)
         self.assertEqual(pool.table.values[pool.table.WATERMARK, 3].item(), 0)
+
+
+VOCAB_SIZE = 16
+
+
+def _applied_bias(rows: SamplingRows) -> torch.Tensor:
+    """The gathered logit_bias added to zero logits, one row per batch row."""
+    logits = torch.zeros(len(rows.top_ks), VOCAB_SIZE)
+    apply_logit_bias(logits, SimpleNamespace(logit_bias=rows.logit_bias))
+    return logits
+
+
+def _dense(*row_biases) -> torch.Tensor:
+    expected = torch.zeros(len(row_biases), VOCAB_SIZE)
+    for row, bias in enumerate(row_biases):
+        for token_id, value in bias.items():
+            expected[row, int(token_id)] = value
+    return expected
+
+
+class TestLogitBias(_PoolTestCase):
+    def test_gather_reads_each_rows_entries_in_batch_order(self):
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        a, c = {"1": 2.0, "15": -1.5}, {"0": -100.0, "7": 0.25, "8": 3.0}
+        pool.write([_req(5, logit_bias=a), _req(2), _req(4, logit_bias=c)])
+
+        rows = _gather(pool, [4, 2, 5])
+
+        self.assertTrue(torch.equal(_applied_bias(rows), _dense(c, {}, a)))
+        self.assertEqual(rows.logit_bias.rows.tolist(), [0, 0, 0, 2, 2])
+
+    def test_no_row_with_logit_bias_gathers_none(self):
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool.write([_req(1, logit_bias={"3": 1.0}), _req(2)])
+
+        self.assertIsNone(_gather(pool, [2]).logit_bias)
+        self.assertIsNotNone(_gather(pool, [1, 2]).logit_bias)
+
+    def test_empty_logit_bias_runs_the_stage_with_no_entries(self):
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool.write([_req(1, logit_bias={})])
+
+        rows = _gather(pool, [1])
+
+        self.assertEqual(rows.logit_bias.rows.numel(), 0)
+        self.assertTrue(torch.equal(_applied_bias(rows), torch.zeros(1, VOCAB_SIZE)))
+
+    def test_reused_slot_applies_the_new_entries(self):
+        """A slot rewritten by a request with a different logit_bias reads only
+        the new request's entries; one without any reads none."""
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        pool.write([_req(3, logit_bias={"1": 1.0, "4": 2.0}), _req(6, logit_bias={})])
+        pool.write([_req(3, logit_bias={"7": -3.0, "9": 0.5, "10": 1.0})])
+
+        rows = _gather(pool, [3])
+        self.assertTrue(
+            torch.equal(_applied_bias(rows), _dense({"7": -3.0, "9": 0.5, "10": 1.0}))
+        )
+
+        pool.write([_req(3)])
+        self.assertIsNone(_gather(pool, [3]).logit_bias)
+
+    def test_compaction_keeps_every_live_run(self):
+        """Admissions of one to three requests past the store's capacity compact
+        and grow it; every slot still reads its latest request's entries."""
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
+        generator = torch.Generator().manual_seed(0)
+        latest = [{} for _ in range(NUM_ROWS)]
+        for _ in range(40):
+            num_reqs = int(torch.randint(1, 4, (1,), generator=generator))
+            admitted = (1 + torch.randperm(NUM_ROWS - 1, generator=generator))[
+                :num_reqs
+            ]
+            for slot in admitted.tolist():
+                num_entries = int(
+                    torch.randint(0, VOCAB_SIZE, (1,), generator=generator)
+                )
+                token_ids = torch.randperm(VOCAB_SIZE, generator=generator)[
+                    :num_entries
+                ]
+                values = torch.randn(num_entries, generator=generator)
+                latest[slot] = dict(zip(map(str, token_ids.tolist()), values.tolist()))
+            pool.write([_req(s, logit_bias=latest[s]) for s in admitted.tolist()])
+
+            slots = list(range(1, NUM_ROWS))
+            rows = _gather(pool, slots)
+            self.assertTrue(
+                torch.equal(_applied_bias(rows), _dense(*(latest[s] for s in slots)))
+            )
+        # Compaction drops rewritten runs, so the buffer stays within twice the
+        # largest live total.
+        self.assertLessEqual(
+            pool.logit_bias_store.entries.shape[1], 2 * VOCAB_SIZE * NUM_ROWS
+        )
 
 
 class TestWatermarkFields(_PoolTestCase):

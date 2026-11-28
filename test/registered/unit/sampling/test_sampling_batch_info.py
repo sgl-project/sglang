@@ -27,6 +27,7 @@ from sglang.srt.sampling.sampling_pipeline import (
     VerifyStep,
     _adjust_before_watermark,
 )
+from sglang.test.sampling_test_utils import dense_logit_bias_rows
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -314,7 +315,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
         info = _make_info()
         info.step_penalties = _tables_step(torch.ones(1, VOCAB_SIZE))
         info.grammars = [grammar]
-        info.logit_bias = torch.full((1, VOCAB_SIZE), 2.0)
+        info.logit_bias = dense_logit_bias_rows(torch.full((1, VOCAB_SIZE), 2.0))
         logits = torch.zeros(1, VOCAB_SIZE)
 
         state = _adjust_before_watermark(logits, info, observer=Observer())
@@ -341,7 +342,9 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 torch.linspace(1.0, 1.5, VOCAB_SIZE).unsqueeze(0),
             )
             info.grammars = [grammar]
-            info.logit_bias = torch.linspace(0.0, 1.0, VOCAB_SIZE).unsqueeze(0)
+            info.logit_bias = dense_logit_bias_rows(
+                torch.linspace(0.0, 1.0, VOCAB_SIZE).unsqueeze(0)
+            )
             return info
 
         ordinary = make_info()
