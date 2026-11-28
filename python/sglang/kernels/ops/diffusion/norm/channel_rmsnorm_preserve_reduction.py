@@ -37,7 +37,7 @@ def _channel_rmsnorm_finish_kernel(
 
 def can_use_channel_rmsnorm(x, weight):
     return (
-        x.is_cuda
+        (x.is_cuda or x.is_xpu)
         and torch.version.hip is None
         and x.dtype in (torch.bfloat16, torch.float16)
         and x.ndim in (4, 5)
@@ -66,7 +66,8 @@ def channel_rmsnorm_preserve_reduction(
     # Keep F.normalize's input dtype, shape and native reduction dispatch.
     norm = x.float().norm(p=2, dim=1, keepdim=True)
     out = torch.empty_like(x)
-    with torch.cuda.device(x.device):
+    device_module = torch.get_device_module(x.device.type)
+    with device_module.device(x.device):
         _channel_rmsnorm_finish_kernel[(triton.cdiv(x.numel(), 512),)](
             x,
             norm,
