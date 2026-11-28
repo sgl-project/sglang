@@ -258,25 +258,39 @@ class LRUFileEvictor:
         free = st.f_bavail * st.f_frsize
         return total, free
 
+    def _pending_bytes_locked(self) -> int:
+        """Bytes reserved by in-flight writes whose files are not committed yet."""
+        return sum(self._lru.get(stem, 0) for stem in self._pending_writes)
+
     def _enforce_free_space_locked(self, value_bytes: int) -> bool:
         """Evict until writing value_bytes still leaves min_free_bytes free.
-        Caller holds _lock. Returns False if the write can't be satisfied."""
+
+        Caller holds _lock. Accounts for bytes already reserved by in-flight
+        writes that have not yet committed to disk. Returns False if the write
+        can't be satisfied.
+        """
         if self.min_free_bytes <= 0:
             return True
         fs = self._fs_stats()
         if fs is None:
             return True  # cannot probe -> permissive, fall back to OS errors
+        # Conservatively reserve space for both in-flight writes and this write:
+        # statvfs may not yet reflect reserved-but-unwritten bytes. Worst case
+        # double-counts in-flight bytes right before commit, which bounds extra
+        # eviction to at most the in-flight bytes while keeping min_free_space
+        # fail-closed.
+        fill_in_bytes = value_bytes + self._pending_bytes_locked()
         # tmpfs frees space on unlink, so credit reclaimed bytes back to the
         # estimate rather than re-probing statvfs on every eviction.
         free = fs[1]
         self._evict_while(
-            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
+            lambda reclaimed: (free + reclaimed) - fill_in_bytes < self.min_free_bytes
         )
         # Re-probe: external writers may have changed free space meanwhile.
         fs = self._fs_stats()
         if fs is None:
             return True
-        return fs[1] - value_bytes >= self.min_free_bytes
+        return fs[1] - fill_in_bytes >= self.min_free_bytes
 
     def _scan_existing_files(self) -> None:
         """Seed LRU index from disk on startup (oldest mtime first)."""
