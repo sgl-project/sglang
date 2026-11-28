@@ -20,6 +20,9 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.communication.dcp_a2a_lse_hip import (
+    maybe_dcp_a2a_lse_reduce_hip,
+)
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -572,6 +575,33 @@ def _fused_bmm_rope_cat_and_cache(
         k_scale=attn.attn_mqa.k_scale,
         is_neox=attn.rotary_emb.is_neox_style,
         q_out_dtype=kv_cache_dtype,
+    )
+
+
+def _dcp_a2a_lse_reduce_rocm(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group,
+    *,
+    is_lse_base_on_e: bool,
+    comm_backend: str,
+) -> torch.Tensor:
+    """Use fused XGMI push A2A + LSE on gfx950 for --dcp-comm-backend a2a; else fall back."""
+    if comm_backend == "a2a":
+        merged = maybe_dcp_a2a_lse_reduce_hip(
+            cp_attn_out,
+            cp_attn_lse,
+            cp_group,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
+        if merged is not None:
+            return merged
+    return dcp_a2a_lse_reduce(
+        cp_attn_out,
+        cp_attn_lse,
+        cp_group,
+        is_lse_base_on_e=is_lse_base_on_e,
+        comm_backend=comm_backend,
     )
 
 
@@ -1163,7 +1193,7 @@ class DeepseekMLARocmForwardMixin:
                     # Project-before-merge: the LSE merge is linear in the
                     # partial output, so V-project every group head first and
                     # exchange v_head_dim instead of kv_lora_rank per head.
-                    attn_bmm_output = dcp_a2a_lse_reduce(
+                    attn_bmm_output = _dcp_a2a_lse_reduce_rocm(
                         self._dcp_project_partials(attn_output),
                         lse.contiguous(),
                         get_parallel().dcp_group,
@@ -1178,7 +1208,7 @@ class DeepseekMLARocmForwardMixin:
                     return output, topk_indices
                 if dcp_comm_backend in ("a2a", "fi_a2a"):
                     # A2A exchange of head partials + LSE, then local Triton combine.
-                    attn_output = dcp_a2a_lse_reduce(
+                    attn_output = _dcp_a2a_lse_reduce_rocm(
                         attn_output.contiguous(),
                         lse.contiguous(),
                         get_parallel().dcp_group,

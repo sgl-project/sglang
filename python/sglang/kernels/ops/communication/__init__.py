@@ -112,3 +112,12 @@ for _fn in ("all_gather_matmul", "matmul_reduce_scatter"):
         )
     )
 del _fn
+
+register_kernel(
+    KernelSpec(
+        op="communication.dcp_a2a_lse_hip",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.communication.dcp_a2a_lse_hip:dcp_a2a_lse_hip",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
