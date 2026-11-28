@@ -3,6 +3,7 @@
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 
 
@@ -51,7 +52,7 @@ class DisaggMetrics:
         self._max_latency = 0.0
         self._total_latency = 0.0
 
-        self._completion_times: list[float] = []
+        self._completion_times: deque[float] = deque()
         self._throughput_window_s = 60.0
 
         self._queue_depth = 0
@@ -115,4 +116,4 @@ class DisaggMetrics:
     def _prune_completion_times(self, now: float) -> None:
         cutoff = now - self._throughput_window_s
         while self._completion_times and self._completion_times[0] < cutoff:
-            self._completion_times.pop(0)
+            self._completion_times.popleft()
