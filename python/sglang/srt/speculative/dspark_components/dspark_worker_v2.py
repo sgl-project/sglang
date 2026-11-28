@@ -1281,7 +1281,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     bs, simulate_bonus_sampling_info.temperatures[:bs]
                 )
             region_accept = self._sampling_accept_graph.run(
-                bs=bs, target_logits=target_logits
+                bs=bs,
+                target_logits=target_logits,
+                target_hidden=logits_output.hidden_states,
             )
         # The accept and its commits ran in a graph: the verify graph's fold or the
         # sampling-accept region replayed right after it.
