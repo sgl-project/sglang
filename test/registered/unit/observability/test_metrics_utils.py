@@ -1,5 +1,8 @@
+import asyncio
 import unittest
+from unittest.mock import MagicMock, patch
 
+from sglang.srt.observability import cpu_monitor, func_timer
 from sglang.srt.observability.utils import (
     generate_buckets,
     two_sides_exponential_buckets,
@@ -61,6 +64,58 @@ class TestMetricsUtils(unittest.TestCase):
         # All values should be floats
         for value in result:
             self.assertIsInstance(value, float)
+
+
+class TestFuncTimerAndCpuMonitor(unittest.TestCase):
+    """Test cases for func_timer and cpu_monitor observability utilities."""
+
+    def test_reused_time_func_latency_decorator_preserves_distinct_names(self):
+        """Reusing a time_func_latency() decorator instance should not overwrite subsequent function labels."""
+        decorator = func_timer.time_func_latency()
+
+        @decorator
+        def first_fn():
+            return "first"
+
+        @decorator
+        def second_fn():
+            return "second"
+
+        @decorator
+        async def third_fn():
+            return "third"
+
+        mock_histogram = MagicMock()
+        with patch.object(func_timer, "enable_metrics", True), patch.object(
+            func_timer, "FUNC_LATENCY", mock_histogram
+        ):
+            self.assertEqual(first_fn(), "first")
+            self.assertEqual(second_fn(), "second")
+            self.assertEqual(asyncio.run(third_fn()), "third")
+
+        observed_names = [
+            call.kwargs["name"] for call in mock_histogram.labels.call_args_list
+        ]
+        self.assertEqual(observed_names, ["first_fn", "second_fn", "third_fn"])
+
+    def test_enable_func_timer_is_idempotent(self):
+        """Calling enable_func_timer() multiple times in the same process should not duplicate registration."""
+        func_timer.enable_func_timer()
+        first_hist = func_timer.FUNC_LATENCY
+        self.assertIsNotNone(first_hist)
+        func_timer.enable_func_timer()
+        self.assertIs(func_timer.FUNC_LATENCY, first_hist)
+
+    def test_start_cpu_monitor_thread_is_idempotent(self):
+        """Calling start_cpu_monitor_thread() multiple times in the same process should reuse the Counter."""
+        with patch("threading.Thread") as mock_thread_cls:
+            cpu_monitor.start_cpu_monitor_thread("scheduler", interval=60.0)
+            first_counter = cpu_monitor._CPU_SECONDS_TOTAL
+            self.assertIsNotNone(first_counter)
+            cpu_monitor.start_cpu_monitor_thread("detokenizer", interval=60.0)
+            self.assertIs(cpu_monitor._CPU_SECONDS_TOTAL, first_counter)
+            self.assertEqual(mock_thread_cls.call_count, 2)
+            self.assertEqual(mock_thread_cls.return_value.start.call_count, 2)
 
 
 if __name__ == "__main__":
