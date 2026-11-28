@@ -144,7 +144,10 @@ def run_sgl_eval(args):
             **chat_kwargs,
         }
     if getattr(args, "top_k", None) is not None:
-        overrides["extra_body"] = {"top_k": args.top_k}
+        overrides["extra_body"] = {
+            **(default_gen.extra_body or {}),
+            "top_k": args.top_k,
+        }
     gen = replace(default_gen, **overrides)
     generation = {
         key: getattr(gen, key)
