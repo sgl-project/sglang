@@ -1,5 +1,6 @@
 import json
 import logging
+import unittest
 
 import pytest
 
@@ -26,6 +27,46 @@ class DummyDetector(BaseFormatDetector):
 
     def structure_info(self):
         pass
+
+
+class TestInternlmUnknownToolForwarding(unittest.TestCase):
+    def setUp(self):
+        self.tools = [
+            Tool(
+                function=Function(
+                    name="known_tool",
+                    parameters={"type": "object", "properties": {}},
+                )
+            )
+        ]
+        self.unknown_call = (
+            '<|action_start|> <|plugin|>{"name":"unknown_tool",'
+            '"parameters":{"value":1}}<|action_end|>'
+        )
+
+    def test_non_streaming_forwards_unknown_tool(self):
+        """The forwarding opt-in must preserve an unknown InternLM tool call."""
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            result = InternlmDetector().detect_and_parse(self.unknown_call, self.tools)
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].tool_index, -1)
+        self.assertEqual(result.calls[0].name, "unknown_tool")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"value": 1})
+
+    def test_streaming_forwards_unknown_tool(self):
+        """Streaming InternLM parsing must not discard an opted-in unknown call."""
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            result = InternlmDetector().parse_streaming_increment(
+                self.unknown_call, self.tools
+            )
+
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].tool_index, 0)
+        self.assertEqual(result.calls[0].name, "unknown_tool")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"value": 1})
 
 
 def test_unknown_tool_name_dropped_default(caplog):
