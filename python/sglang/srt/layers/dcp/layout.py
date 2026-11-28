@@ -21,8 +21,9 @@ import torch
 
 from sglang.srt.runtime_context import get_exec, get_parallel
 
-# NOTE(yhyang201): under DCP, Kimi-K3.1 shards the DSA index-K cache by token like
-# the MLA KV instead of replicating it; the indexer merges per-rank top-k exactly.
+# NOTE(yhyang201): under DCP, Kimi-K3.1 and GLM-5 DSA on SM90 shard the DSA
+# index-K cache by token like the MLA KV instead of replicating it. The indexer
+# merges per-rank top-k exactly.
 _dsa_shards_index_k = False
 
 

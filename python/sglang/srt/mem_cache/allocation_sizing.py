@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
@@ -39,14 +41,32 @@ def get_decode_ahead() -> int:
     spec = get_spec()
     if spec.speculative_algorithm is None:
         return 1
-    spec_steps = spec.speculative_num_steps or 1
-    spec_topk = spec.speculative_eagle_topk or 1
-    spec_tokens = max_speculative_num_draft_tokens()
-    page_size = get_alloc_page_size()
+    return decode_ahead(
+        speculative_algorithm=spec.speculative_algorithm,
+        num_steps=spec.speculative_num_steps,
+        eagle_topk=spec.speculative_eagle_topk,
+        num_draft_tokens=max_speculative_num_draft_tokens(),
+        page_size=get_alloc_page_size(),
+    )
+
+
+def decode_ahead(
+    *,
+    speculative_algorithm: Optional[str],
+    num_steps: Optional[int],
+    eagle_topk: Optional[int],
+    num_draft_tokens: Optional[int],
+    page_size: int,
+) -> int:
+    if speculative_algorithm is None:
+        return 1
+    spec_steps = num_steps or 1
+    spec_topk = eagle_topk or 1
+    spec_tokens = num_draft_tokens
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-    spec_algo = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    spec_algo = SpeculativeAlgorithm.from_string(speculative_algorithm)
     if spec_algo.is_uno():
         if spec_tokens is None:
             raise RuntimeError("UNO requires speculative_num_draft_tokens")
