@@ -68,6 +68,14 @@ This section explains how to configure the request tracing and export the trace 
 
     **Note**: You must set the parameter `--enable-trace`; otherwise, the trace capability will not be enabled regardless of any dynamic adjustments to the trace level.
 
+7. Set the trace level of one request
+    A caller can record one request at its own level by adding `sglang=<level>` to the `tracestate` header of the request's W3C trace context; other requests keep the level above. For example, to record per-step slices for a few requests only:
+    ```
+    traceparent: 00-<trace id>-<span id>-01
+    tracestate: sglang=3
+    ```
+    The value travels with the trace, so every server that handles the request (for example prefill and decode in PD disaggregation) uses it.
+
 ## Async Tracing (Reducing Performance Overhead)
 
 When batch sizes are large, synchronous OTel span creation can degrade inference throughput due to thread-safe locking and background export threads. Async tracing moves all span creation to a dedicated exporter process via ZMQ, keeping the scheduler and tokenizer hot paths free of OTel overhead.

@@ -541,7 +541,7 @@ class TraceReqContextAsync:
         external_trace_header: Optional[Dict[str, str]] = None,
     ):
         self.rid: str = str(rid)
-        self.trace_level = _trace_mod.get_global_trace_level()
+        self.trace_level = _trace_mod.get_request_trace_level(external_trace_header)
         self.tracing_enable: bool = (
             is_async_tracing_available()
             and _trace_mod.opentelemetry_initialized
