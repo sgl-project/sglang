@@ -183,6 +183,7 @@ if HAS_TILELANG:
             Logits: T.Tensor([rows, keys], T.float32),  # type: ignore
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
+            Scale: T.float32,
         ):
             with T.Kernel(T.ceildiv(rows, block_q), threads=threads) as bx:
                 q_shared = T.alloc_shared([block_q * heads, head_dim], dtype)
@@ -216,9 +217,9 @@ if HAS_TILELANG:
                         scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
                     T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
                     for qi, n in T.Parallel(block_q, block_n):
-                        Logits[row_base + qi, start_min + ni * block_n + n] = reduced[
-                            n, qi
-                        ]
+                        Logits[row_base + qi, start_min + ni * block_n + n] = (
+                            reduced[n, qi] / Scale
+                        )
 
         return kernel
 
@@ -237,13 +238,15 @@ if HAS_TILELANG:
         num_stages: int = 3,
         threads: int = 512,
         key_splits: int = 1,
+        min_scored_len: int = 0,
         dtype: str = "bfloat16",
     ):
         """The packed prefill kernel with request-relative columns: row r's score
         for key ``Starts[r] + j`` lands in ``Logits[r, j]``, so the workspace is
         [rows, longest request] instead of [rows, all keys of the batch]. A
         second grid dimension splits each row block's key range, which keeps the
-        grid full when few rows are scored."""
+        grid full when few rows are scored. With ``min_scored_len`` > 0, row
+        blocks whose rows all fit ``min_scored_len`` skip scoring entirely."""
         rows = T.dynamic("rows")
         keys = T.dynamic("keys")
         width = T.dynamic("width")
@@ -255,6 +258,7 @@ if HAS_TILELANG:
             Logits: T.Tensor([rows, width], T.float32),  # type: ignore
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
+            Scale: T.float32,
         ):
             with T.Kernel(T.ceildiv(rows, block_q), key_splits, threads=threads) as (
                 bx,
@@ -268,17 +272,26 @@ if HAS_TILELANG:
                 row_base = bx * block_q
                 start_min = T.alloc_var(T.int32)
                 end_max = T.alloc_var(T.int32)
+                max_row_len = T.alloc_var(T.int32)
                 start_min = 2147483647
                 end_max = -2147483648
+                max_row_len = 0
                 for qi in T.serial(block_q):
-                    start_min = T.min(start_min, T.min(Starts[row_base + qi], keys))
-                    end_max = T.max(end_max, T.min(Ends[row_base + qi], keys))
-                num_tiles = T.ceildiv(end_max - start_min, block_n)
+                    row_start = T.min(Starts[row_base + qi], keys)
+                    row_end = T.min(Ends[row_base + qi], keys)
+                    start_min = T.min(start_min, row_start)
+                    end_max = T.max(end_max, row_end)
+                    max_row_len = T.max(max_row_len, row_end - row_start)
+                num_tiles = T.alloc_var(T.int32)
+                num_tiles = 0
+                if max_row_len > min_scored_len:
+                    num_tiles = T.ceildiv(end_max - start_min, block_n)
                 tiles_per_split = T.ceildiv(num_tiles, key_splits)
                 tile_begin = by * tiles_per_split
                 tile_count = T.max(T.min(num_tiles - tile_begin, tiles_per_split), 0)
 
-                T.copy(Q[row_base * heads, 0], q_shared)
+                if tile_count > 0:
+                    T.copy(Q[row_base * heads, 0], q_shared)
                 for ti in T.Pipelined(tile_count, num_stages=num_stages):
                     key_base = start_min + (tile_begin + ti) * block_n
                     T.copy(K[key_base, 0], k_shared)
@@ -299,7 +312,7 @@ if HAS_TILELANG:
                         # its own window.
                         if column >= 0:
                             if column < width:
-                                Logits[row_base + qi, column] = reduced[n, qi]
+                                Logits[row_base + qi, column] = reduced[n, qi] / Scale
 
         return kernel
 
@@ -478,11 +491,11 @@ def tilelang_qsa_mqa_prefill(
         logits,
         starts,
         ends,
+        float(score_scale or math.sqrt(head_dim)),
     )
     # A leading-dimension slice that retains every column is already
     # contiguous, so do not copy this large matrix again when removing padding.
     logits = logits[:rows]
-    logits.div_(score_scale or math.sqrt(head_dim))
     _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
     return logits
 
@@ -509,10 +522,12 @@ def torch_qsa_mqa_prefill_relative(
     row_ends: torch.Tensor,
     width: int,
     score_scale: Optional[float] = None,
+    min_scored_len: int = 0,
 ) -> torch.Tensor:
     """Reference for the request-relative layout: ``out[r, j]`` is row r's
     score for key ``row_starts[r] + j`` for ``j < row_ends[r] - row_starts[r]``,
     and -inf elsewhere."""
+    del min_scored_len
     full = torch_qsa_mqa_prefill(q, k, row_starts, row_ends, score_scale)
     columns = row_starts.to(q.device).long().reshape(-1, 1) + torch.arange(
         width, device=q.device
@@ -529,6 +544,7 @@ def tilelang_qsa_mqa_prefill_relative(
     row_ends: torch.Tensor,
     width: int,
     score_scale: Optional[float] = None,
+    min_scored_len: int = 0,
 ) -> torch.Tensor:
     """Packed prefill scoring into request-relative columns.
 
@@ -536,8 +552,11 @@ def tilelang_qsa_mqa_prefill_relative(
     the same values ``tilelang_qsa_mqa_prefill`` puts at
     ``[r, row_starts[r]:row_ends[r]]``. Columns past a row's length are left
     undefined: callers must read only each row's own section (the fast top-k
-    reads ``[start, start + length)``). ``width`` must cover the longest row
-    and comes from host lengths, so no device sync is needed to size it."""
+    reads ``[start, start + length)``). With ``min_scored_len`` > 0, row blocks
+    whose rows all fit ``min_scored_len`` are left unscored (only for a top-k
+    that selects every block of a row that fits k without reading its scores).
+    ``width`` must cover the longest row and comes from host lengths, so no
+    device sync is needed to size it."""
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
@@ -572,6 +591,7 @@ def tilelang_qsa_mqa_prefill_relative(
         key_splits=_prefill_key_splits(
             padded_rows // block_q, width, block_n, q.device
         ),
+        min_scored_len=min_scored_len,
         num_stages=_prefill_num_stages(
             block_q, heads, block_n, head_dim, scoring_dtype
         ),
@@ -582,10 +602,9 @@ def tilelang_qsa_mqa_prefill_relative(
         logits,
         starts,
         ends,
+        float(score_scale or math.sqrt(head_dim)),
     )
-    logits = logits[:rows]
-    logits.div_(score_scale or math.sqrt(head_dim))
-    return logits
+    return logits[:rows]
 
 
 # CTAs per decode row: few enough levels to bound the TileLang specializations, and
@@ -725,14 +744,15 @@ def qsa_mqa_prefill_relative(
     row_ends: torch.Tensor,
     width: int,
     score_scale: Optional[float] = None,
+    min_scored_len: int = 0,
 ) -> torch.Tensor:
     """Request-relative prefill scoring; see ``tilelang_qsa_mqa_prefill_relative``."""
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_prefill_relative(
-            q, k, row_starts, row_ends, width, score_scale
+            q, k, row_starts, row_ends, width, score_scale, min_scored_len
         )
     return torch_qsa_mqa_prefill_relative(
-        q, k, row_starts, row_ends, width, score_scale
+        q, k, row_starts, row_ends, width, score_scale, min_scored_len
     )
 
 

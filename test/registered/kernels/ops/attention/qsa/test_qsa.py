@@ -2311,5 +2311,392 @@ def test_qsa_large_fp8_prefill_float_reference(head_dim, heads):
         torch.testing.assert_close(actual[row].double(), expected, rtol=2e-2, atol=2e-2)
 
 
+def test_qsa_paged_fp8_prefill_matches_gathered_without_sync():
+    """Direct paged FP8 prefill matches gathered prefill with zero host syncs."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9):
+        pytest.skip("FP8-capable CUDA GPU required")
+    torch.manual_seed(23)
+    device = torch.device("cuda")
+    prefix_lens, extend_lens = [128, 0, 64], [513, 1025, 257]
+    seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+    max_seq, max_q = max(seq_lens), max(extend_lens)
+    num_q_heads, num_kv_heads, head_dim, topk = 6, 1, 128, 64
+    scale = head_dim**-0.5
+
+    total_slots = sum(seq_lens) + 64
+    perm = torch.randperm(total_slots, device=device, dtype=torch.int32)
+    slot_table = torch.zeros(len(seq_lens), max_seq, device=device, dtype=torch.int32)
+    offset = 0
+    for i, sl in enumerate(seq_lens):
+        slot_table[i, :sl] = perm[offset : offset + sl]
+        offset += sl
+
+    k_pool = torch.randn(
+        total_slots, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    v_pool = torch.randn(
+        total_slots, num_kv_heads, head_dim, device=device, dtype=torch.bfloat16
+    ).to(torch.float8_e4m3fn)
+    q = torch.randn(
+        sum(extend_lens), num_q_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    topk_indices = torch.cat(
+        [
+            (
+                (
+                    torch.arange(topk, device=device)[None, :]
+                    + torch.arange(e, device=device)[:, None] * 5
+                )
+                % (torch.arange(e, device=device) + p + 1)[:, None]
+            ).to(torch.int32)
+            for p, e in zip(prefix_lens, extend_lens)
+        ],
+        dim=0,
+    )
+    cu_q = torch.tensor([0, *accumulate(extend_lens)], device=device, dtype=torch.int32)
+    seq_lens_t = torch.tensor(seq_lens, device=device, dtype=torch.int32)
+
+    sparse_gqa_paged_prefill_triton(
+        q,
+        k_pool,
+        v_pool,
+        slot_table,
+        topk_indices,
+        cu_q,
+        seq_lens_t,
+        scale,
+        max_q=max_q,
+    )
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        paged_out = sparse_gqa_paged_prefill_triton(
+            q,
+            k_pool,
+            v_pool,
+            slot_table,
+            topk_indices,
+            cu_q,
+            seq_lens_t,
+            scale,
+            max_q=max_q,
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    gathered_k = torch.cat(
+        [
+            k_pool.index_select(0, slot_table[i, :sl].long())
+            for i, sl in enumerate(seq_lens)
+        ]
+    )
+    gathered_v = torch.cat(
+        [
+            v_pool.index_select(0, slot_table[i, :sl].long())
+            for i, sl in enumerate(seq_lens)
+        ]
+    )
+    cu_k = torch.tensor([0, *accumulate(seq_lens)], device=device, dtype=torch.int32)
+    ref_out = sparse_gqa_fwd_interface_triton_ck(
+        q,
+        gathered_k,
+        gathered_v,
+        topk_indices,
+        cu_q,
+        cu_k,
+        seq_lens_t,
+        scale,
+        max_q=max_q,
+    )
+    torch.testing.assert_close(paged_out, ref_out, rtol=1e-2, atol=1e-2)
+
+
+def test_qsa_prefill_config_preserves_h200_bf16_and_uses_sm100_fp8_stages(monkeypatch):
+    from sglang.srt.layers.attention.qsa import sparse_attn as sa_mod
+
+    sa_mod._prefill_config_table.cache_clear()
+    try:
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.version, "hip", None)
+
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda _: "NVIDIA H200")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (9, 0))
+        sa_mod._prefill_config_table.cache_clear()
+        assert sa_mod._get_best_config(96, is_fp8=False) == (32, 4, 2)
+        assert sa_mod._get_best_config(2048, is_fp8=True) == (16, 1, 2)
+
+        monkeypatch.setattr(torch.cuda, "get_device_name", lambda _: "NVIDIA B300")
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 3))
+        sa_mod._prefill_config_table.cache_clear()
+        assert sa_mod._get_best_config(96, is_fp8=False) == (64, 4, 2)
+        assert sa_mod._get_best_config(2048, is_fp8=False) == (16, 1, 2)
+        assert sa_mod._get_best_config(2048, is_fp8=True) == (16, 1, 3)
+    finally:
+        sa_mod._prefill_config_table.cache_clear()
+
+
+def test_qsa_mixed_chunk_unaligned_prefix_ring_slots():
+    """ForwardMode.MIXED unaligned decode rows keep their ring slots and
+    populate fixed-size mixed ring metadata alongside cached prefill metadata."""
+    runner, pool, req_pool = _make_qsa_runner_and_pool()
+    backend = QwenSparseAttnBackend(runner)
+    forward_batch = SimpleNamespace(
+        token_to_kv_pool=routed(pool),
+        req_to_token_pool=req_pool,
+        req_pool_indices=torch.tensor([1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([8, 12], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([8, 12], dtype=torch.int32),
+        forward_mode=ForwardMode.MIXED,
+        extend_seq_lens=torch.tensor([1, 8], dtype=torch.int32),
+        extend_seq_lens_cpu=[1, 8],
+        extend_prefix_lens=torch.tensor([7, 4], dtype=torch.int32),
+        extend_prefix_lens_cpu=[7, 4],
+        positions=torch.tensor([7, 4, 5, 6, 7, 8, 9, 10, 11], dtype=torch.int64),
+        mrope_positions=None,
+        input_ids=torch.zeros(9, dtype=torch.int32),
+        out_cache_loc=torch.arange(9, dtype=torch.int32),
+        _original_forward_mode=None,
+    )
+    backend.init_forward_metadata(forward_batch)
+    idx_meta = backend.forward_metadata.indexer_metadata
+    expected_write_slot = int(req_pool.req_to_token[1, 7].item()) // COMPRESS_RATIO
+    assert idx_meta.mixed_ring_write_locs.tolist() == [expected_write_slot, 0]
+    assert idx_meta.mixed_ring_group_locs[0].tolist() == [4, 5, 6, 7]
+    assert int(idx_meta.pending_ring_slots[0].item()) == COMPRESS_RATIO + (
+        7 % COMPRESS_RATIO
+    )
+    assert (
+        idx_meta.prefill_row_starts is not None
+        and idx_meta.prefill_row_lengths is not None
+    )
+
+
+def test_qsa_expand_block_indices_out_zero_copy():
+    """triton_expand_qsa_block_indices(out=...) writes in place and matches ref."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    torch.manual_seed(31)
+    device = torch.device("cuda")
+    rows, block_topk, token_topk = 16, 8, 32
+    query_positions = torch.randint(4, 128, (rows,), dtype=torch.int32, device=device)
+    sequence_lengths = query_positions + 4
+    block_indices = torch.full((rows, block_topk), -1, dtype=torch.int32, device=device)
+    for r in range(rows):
+        k = min(block_topk, int(sequence_lengths[r]) // COMPRESS_RATIO)
+        block_indices[r, :k] = torch.arange(k, dtype=torch.int32, device=device)
+
+    bridge = torch.full(
+        (rows + 4, token_topk + COMPRESS_RATIO - 1),
+        99,
+        dtype=torch.int32,
+        device=device,
+    )
+    out = triton_expand_qsa_block_indices(
+        block_indices,
+        query_positions,
+        sequence_lengths,
+        COMPRESS_RATIO,
+        token_topk,
+        out=bridge[:rows],
+    )
+    assert out.data_ptr() == bridge.data_ptr()
+    ref = torch_expand_qsa_block_indices(
+        block_indices.cpu(),
+        query_positions.cpu(),
+        sequence_lengths.cpu(),
+        COMPRESS_RATIO,
+        token_topk,
+    )
+    assert torch.equal(out.cpu(), ref) and torch.all(bridge[rows:] == 99)
+
+
+def test_qsa_rejects_hnd_kv_cache_early_and_in_paged_prefill(monkeypatch):
+    """KV pool layout is validated once on binding (not per eager layer), during
+    prewarm, and by rank inside sparse_gqa_paged_prefill_triton."""
+    from sglang.srt.layers.attention.qsa.sparse_attn import (
+        sparse_gqa_paged_prefill_triton,
+    )
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        prewarm_qsa_prefill_kernels,
+    )
+
+    q = torch.zeros((2, 4, 32), dtype=torch.bfloat16)
+    k_4d = torch.zeros((4, 1, 16, 32), dtype=torch.bfloat16)
+    indices = torch.zeros((2, 8), dtype=torch.int32)
+    with pytest.raises(ValueError, match="3D NHD KV cache"):
+        sparse_gqa_paged_prefill_triton(
+            q,
+            k_4d,
+            k_4d,
+            torch.zeros((1, 16), dtype=torch.int32),
+            indices,
+            torch.tensor([0, 2], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            1.0,
+            max_q=2,
+        )
+
+    bad_pools = [
+        (SimpleNamespace(full_kv_pool=SimpleNamespace(use_hnd=True)), "HND"),
+        (SimpleNamespace(kv_cache_layout="hnd"), "HND"),
+        (
+            SimpleNamespace(
+                full_kv_pool=SimpleNamespace(
+                    use_hnd=False, kv_cache_layout="vectorized_5d"
+                ),
+                qsa_token_topk=64,
+            ),
+            "vectorized_5d",
+        ),
+        (
+            SimpleNamespace(
+                full_kv_pool=SimpleNamespace(
+                    use_hnd=False, kv_cache_layout="page_major_layer_major"
+                ),
+                qsa_token_topk=64,
+            ),
+            "page_major_layer_major",
+        ),
+    ]
+    for bad_pool, pattern in bad_pools:
+        with pytest.raises(ValueError, match=pattern):
+            QwenSparseAttnBackend(SimpleNamespace(token_to_kv_pool=bad_pool))
+        backend = QwenSparseAttnBackend()
+        with pytest.raises(ValueError, match=pattern):
+            backend.token_to_kv_pool = bad_pool
+        assert backend.token_to_kv_pool is None
+
+    # Lazy bind in _capture_cuda_graph_metadata and prewarm also reject bad layouts.
+    vec5d_pool = bad_pools[2][0]
+    lazy_runner = SimpleNamespace(token_to_kv_pool=None)
+    lazy_backend = QwenSparseAttnBackend(lazy_runner)
+    lazy_runner.token_to_kv_pool = vec5d_pool
+    with pytest.raises(ValueError, match="vectorized_5d"):
+        lazy_backend._capture_cuda_graph_metadata(
+            bs=1,
+            num_tokens=1,
+            req_pool_indices=torch.zeros(1, dtype=torch.int32),
+            seq_lens=torch.ones(1, dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            spec_info=None,
+        )
+    prewarm_backend = object.__new__(QwenSparseAttnBackend)
+    prewarm_backend._token_to_kv_pool = vec5d_pool
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    with pytest.raises(ValueError, match="vectorized_5d"):
+        prewarm_qsa_prefill_kernels(
+            attn_backend=prewarm_backend, model=torch.nn.Module()
+        )
+
+    # Valid layouts bind once and are not re-checked on eager init/extend/decode.
+    orig_check = qsa_backend_module._require_supported_kv_pool_layout
+    calls = []
+    monkeypatch.setattr(
+        qsa_backend_module,
+        "_require_supported_kv_pool_layout",
+        lambda p: (calls.append(p), orig_check(p))[1],
+    )
+    nhd_pool = SimpleNamespace(
+        full_kv_pool=SimpleNamespace(use_hnd=False, kv_cache_layout="nhd")
+    )
+    pm_pool = SimpleNamespace(
+        full_kv_pool=SimpleNamespace(use_hnd=False, kv_cache_layout="page_major")
+    )
+    eager = QwenSparseAttnBackend(SimpleNamespace(token_to_kv_pool=nhd_pool))
+    eager.init_forward_metadata(SimpleNamespace(forward_mode=ForwardMode.IDLE))
+    monkeypatch.setattr(eager, "_forward_extend_cp", lambda *_a, **_kw: q)
+    monkeypatch.setattr(eager, "_forward_paged_attention", lambda *_a, **_kw: q)
+    monkeypatch.setattr(qsa_backend_module, "is_cp_active", lambda _fb: True)
+    fb = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND, attn_cp_metadata=SimpleNamespace()
+    )
+    layer = SimpleNamespace(layer_id=0, tp_q_head_num=4, head_dim=32)
+    for _ in range(3):
+        eager.forward_extend(
+            q, k_4d, k_4d, layer, fb, save_kv_cache=False, topk_indices=indices
+        )
+        eager.forward_decode(
+            q, k_4d, k_4d, layer, fb, save_kv_cache=False, topk_indices=indices
+        )
+    assert calls == [nhd_pool]
+    eager.token_to_kv_pool = pm_pool
+    assert calls == [nhd_pool, pm_pool]
+
+
+def test_qsa_prewarm_uses_two_slot_scratch_without_dequantizing_fp4_pool(monkeypatch):
+    """Prewarm derives layer geometry from RadixAttention and passes 2-slot NHD
+    scratch buffers without calling layer_router.read()."""
+    from sglang.srt.layers.attention.qsa import sparse_attn as sa_mod
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+        prewarm_qsa_prefill_kernels,
+    )
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    def _no_read(_layer_id):
+        raise AssertionError("prewarm must not call layer_router.read()")
+
+    pool = SimpleNamespace(
+        full_kv_pool=SimpleNamespace(
+            use_hnd=False,
+            kv_cache_layout="nhd",
+            is_quantized_kv_cache=True,
+            quant_method=SimpleNamespace(
+                needs_plain_kv_dequant_read=lambda: True,
+                plain_attention_kv_dtype=lambda: None,
+            ),
+            dtype=torch.uint8,
+        ),
+        layer_router=SimpleNamespace(layer_ids=lambda: (0,), read=_no_read),
+        qsa_token_topk=64,
+        qsa_compress_ratio=4,
+        qsa_compressed_dtype=torch.bfloat16,
+    )
+    fake_attn = object.__new__(RadixAttention)
+    torch.nn.Module.__init__(fake_attn)
+    (
+        fake_attn.layer_id,
+        fake_attn.tp_q_head_num,
+        fake_attn.tp_k_head_num,
+        fake_attn.head_dim,
+    ) = 0, 6, 1, 256
+
+    backend = object.__new__(QwenSparseAttnBackend)
+    backend.device, backend.dtype = torch.device("cpu"), torch.float16
+    backend.token_to_kv_pool = pool
+    backend.req_to_token = torch.zeros((2, 64), dtype=torch.int32)
+    backend.req_to_token_pool = SimpleNamespace(req_to_token=backend.req_to_token)
+
+    captured_paged = []
+    sa_mod._prefill_config_table.cache_clear()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _: "NVIDIA B300")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (10, 3))
+    monkeypatch.setattr(
+        qsa_backend_module, "sparse_gqa_fwd_interface_triton", lambda q, *_a, **_kw: q
+    )
+    monkeypatch.setattr(
+        qsa_backend_module,
+        "sparse_gqa_paged_prefill_triton",
+        lambda q, k_c, v_c, *_a, **_kw: (
+            captured_paged.append(
+                (q.dtype, tuple(k_c.shape), k_c.dtype, tuple(v_c.shape), v_c.dtype)
+            )
+            or q
+        ),
+    )
+    try:
+        prewarm_qsa_prefill_kernels(
+            attn_backend=backend, model=torch.nn.ModuleList([fake_attn])
+        )
+    finally:
+        sa_mod._prefill_config_table.cache_clear()
+
+    assert captured_paged and all(
+        item
+        == (torch.float16, (2, 1, 256), torch.bfloat16, (2, 1, 256), torch.bfloat16)
+        for item in captured_paged
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
