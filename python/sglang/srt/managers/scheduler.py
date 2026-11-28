@@ -260,6 +260,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
+    mark_shared_prompt_checkpoints,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -5112,6 +5113,21 @@ class Scheduler(
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
         self.sampling_params_pool.write(new_batch.reqs)
+
+        shared_prompt_grid = self.tree_cache.shared_prompt_checkpoint_grid()
+        if shared_prompt_grid is not None:
+            # The batch's requests already sit in the launched and chunked lists.
+            mark_shared_prompt_checkpoints(
+                can_run_list,
+                (
+                    self.waiting_queue,
+                    self.chunked_reqs,
+                    self.prefill_launched_reqs,
+                    self.running_reqs,
+                ),
+                shared_prompt_grid,
+                self.tree_cache.chunk_checkpoint_len,
+            )
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
