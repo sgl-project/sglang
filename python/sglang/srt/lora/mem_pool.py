@@ -869,6 +869,9 @@ class LoRAMemoryPool:
             for tensor in buffers:
                 if tensor is not None:
                     tensor[buffer_id].zero_()
+        self._clear_embedding_slot(buffer_id)
+
+    def _clear_embedding_slot(self, buffer_id: int) -> None:
         for buffers in (
             self.embedding_A_buffer,
             self.embedding_B_buffer,
@@ -960,6 +963,9 @@ class LoRAMemoryPool:
             # The kernels contract over the full max_lora_rank, so rank tails left
             # by an evicted higher-rank adapter must not survive into this slot.
             self._clear_buffer_slot_for_base(buffer_id)
+        else:
+            # Skipped embedding and lm_head weights leave no copy to clear their slot.
+            self._clear_embedding_slot(buffer_id)
 
         for layer_id in range(self.num_layer):
             layer = lora_adapter.layers[layer_id]
@@ -988,6 +994,8 @@ class LoRAMemoryPool:
             }
 
             for name, weights in layer_weights.items():
+                if name in skipped_weight_names:
+                    continue
                 target_module = get_target_module_name(name, self.target_modules)
 
                 # Check if this is an MoE weight (has expert index in name)
@@ -1430,6 +1438,8 @@ class LoRAMemoryPool:
 
             # load vocab_emb and lm_head
             for name, weights in lora_adapter.embedding_layers.items():
+                if name in skipped_weight_names:
+                    continue
                 target_module = get_target_module_name(name, self.target_modules)
                 if (
                     target_module == "embed_tokens"
@@ -1534,22 +1544,6 @@ class LoRAMemoryPool:
                         f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
                     )
                     continue
-        else:
-            # Zero out embedding/lm_head buffers for adapters without embedding LoRA
-            # to avoid using garbage values from uninitialized memory
-            for k in self.embedding_A_buffer.keys():
-                self.embedding_A_buffer[k][buffer_id].zero_()
-            for k in self.embedding_B_buffer.keys():
-                self.embedding_B_buffer[k][buffer_id].zero_()
-            for k in self.lm_head_A_buffer.keys():
-                self.lm_head_A_buffer[k][buffer_id].zero_()
-            for k in self.lm_head_B_buffer.keys():
-                self.lm_head_B_buffer[k][buffer_id].zero_()
-            if (
-                self.lora_added_tokens_size > 0
-                and "input_embeddings" in self.new_embeddings_buffer
-            ):
-                self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType

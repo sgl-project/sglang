@@ -1091,7 +1091,17 @@ class LoRAManager:
 
         from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
 
+        backend = getattr(self, "moe_lora_runner_backend", None)
+        use_lora_moe_runner = backend is not None and backend.is_lora()
+        base_only_moe = use_lora_moe_runner and self.target_modules.isdisjoint(
+            {"gate_up_proj", "down_proj"}
+        )
+
         for module_name, module in self.base_model.named_modules():
+            if base_only_moe and isinstance(module, FusedMoE):
+                # This layer needs a runner, but has no adapter weights to register.
+                self.set_lora_module(module_name, module)
+                continue
             # Handle embed_tokens and lm_head before the should_apply_lora gate,
             # since VL models' should_apply_lora patterns only match language
             # model layers and would incorrectly skip these.
@@ -1192,10 +1202,7 @@ class LoRAManager:
                     lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
                 self.lora_modules[layer_id][module_name] = lora_module
 
-        # lora_* quant methods leave execution to the LoRA wrapper; reject
-        # target sets that leave every MoE layer without one.
-        backend = getattr(self, "moe_lora_runner_backend", None)
-        if backend is not None and backend.is_lora():
+        if use_lora_moe_runner:
             modules = list(self.base_model.modules())
             if any(isinstance(module, FusedMoE) for module in modules) and not any(
                 isinstance(module, FusedMoEWithLoRA) for module in modules
