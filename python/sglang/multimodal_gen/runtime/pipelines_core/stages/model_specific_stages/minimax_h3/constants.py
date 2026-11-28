@@ -21,6 +21,11 @@ MINIMAX_H3_SIGMAS_EXTRA_KEY = "minimax_h3_sigmas"
 # Direct denoise state: {"initial_video_rows", "initial_audio_rows",
 #   "latent_t", "latent_h", "latent_w", "audio_t"}
 MINIMAX_H3_DENOISE_STATE_EXTRA_KEY = "minimax_h3_denoise_state"
+# DWD releases: the last step's pixel-head features of the generated video rows,
+# then the frames the pixel head decodes from them (ImageNet-normalized
+# [B, 3, F, H, W], as the video VAE's decode_base returns)
+MINIMAX_H3_DWD_FEATURES_EXTRA_KEY = "minimax_h3_dwd_features"
+MINIMAX_H3_DWD_PIXELS_EXTRA_KEY = "minimax_h3_dwd_pixels"
 # ref2va direct reference encodes.
 MINIMAX_H3_REFERENCE_IMAGE_ROWS_EXTRA_KEY = "minimax_h3_reference_image_rows"
 MINIMAX_H3_REFERENCE_AUDIO_ROWS_EXTRA_KEY = "minimax_h3_reference_audio_rows"
