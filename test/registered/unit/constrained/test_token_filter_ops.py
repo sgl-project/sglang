@@ -5,8 +5,11 @@ Verifies that both implementations produce identical bitmask output
 for the same inputs, ensuring parity across GPU and CPU paths.
 """
 
+import sys
 import unittest
+from unittest.mock import patch
 
+import pytest
 import torch
 
 from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
@@ -93,5 +96,52 @@ class TestSetTokenFilterTorch(unittest.TestCase):
         self.assertEqual(_get_allowed_tokens(vocab_mask, 2, 64), [3])
 
 
+@pytest.mark.parametrize(
+    "width,token_ids", [(1, []), (2, [0, 31, 32, 32, 63]), (3, [0, 31, 32, 32, 63])]
+)
+@pytest.mark.parametrize("is_allowed", [False, True])
+def test_cached_reset_matches_uncached_and_isolates_rows(width, token_ids, is_allowed):
+    expected = torch.full((1, width), 0 if is_allowed else -1, dtype=torch.int32)
+    set_token_filter_torch(expected, token_ids, 0, is_allowed, reset_vocab_mask=False)
+    mask = torch.full((3, width * 2), 123, dtype=torch.int32)[:, ::2]
+    for idx in (0, 1):
+        set_token_filter_torch(mask, token_ids, idx, is_allowed)
+        assert torch.equal(mask[idx], expected[0])
+    mask[0].zero_()
+    mask[1].fill_(17)
+    set_token_filter_torch(mask, token_ids, 2, is_allowed)
+    assert torch.equal(mask[2], expected[0])
+    assert torch.all(mask[0] == 0)
+    assert torch.all(mask[1] == 17)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_partial_filters_preserve_existing_bits(dtype):
+    mask = torch.zeros((1, 2), dtype=dtype)
+    set_token_filter_torch(mask, [0, 31, 32, 63], 0)
+    set_token_filter_torch(mask, [31, 32, 32], 0, False, reset_vocab_mask=False)
+    assert _get_allowed_tokens(mask, 0, 64) == [0, 63]
+    set_token_filter_torch(mask, [1, 1], 0, reset_vocab_mask=False)
+    assert _get_allowed_tokens(mask, 0, 64) == [0, 1, 63]
+    before = mask.clone()
+    set_token_filter_torch(mask, [], 0, False, reset_vocab_mask=False)
+    assert torch.equal(mask, before)
+    set_token_filter_torch(mask, [31, 32], 0, False)
+    assert _get_allowed_tokens(mask, 0, 64) == [
+        i for i in range(64) if i not in (31, 32)
+    ]
+
+
+def test_non_cpu_filter_does_not_use_cpu_cache():
+    mask = torch.empty((1, 2), dtype=torch.int32, device="meta")
+    with patch(
+        "sglang.srt.constrained.torch_ops.token_filter_torch_ops._cached_cpu_filter",
+        side_effect=AssertionError("non-CPU mask entered CPU cache"),
+    ):
+        for is_allowed in (False, True):
+            set_token_filter_torch(mask, [0, 31, 32], 0, is_allowed)
+    assert mask.device.type == "meta"
+
+
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))
