@@ -36,6 +36,8 @@ class DcpPageTableCache(msgspec.Struct):
     topk_indices: Optional[torch.Tensor] = None
     page_table: Optional[torch.Tensor] = None
     counts: Optional[torch.Tensor] = None
+    csr_indptr: Optional[torch.Tensor] = None
+    csr_indices: Optional[torch.Tensor] = None
 
 
 def localize_dcp_page_table(
@@ -61,8 +63,21 @@ def localize_dcp_page_table(
         cache.page_table, cache.counts = transform_index_page_table_dcp(
             page_table, dcp_size, dcp_rank
         )
+        cache.csr_indptr = cache.csr_indices = None
     cache.layer_id = layer_id
     return cache.page_table, cache.counts
+
+
+def dcp_owned_csr(cache: DcpPageTableCache) -> tuple[torch.Tensor, torch.Tensor]:
+    """CSR form of the owned slots last localized into ``cache``, built once
+    per fresh top-k like the page table itself."""
+    if cache.csr_indptr is None:
+        from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import build_dcp_csr
+
+        cache.csr_indptr, cache.csr_indices = build_dcp_csr(
+            cache.page_table, cache.counts
+        )
+    return cache.csr_indptr, cache.csr_indices
 
 
 def dcp_trtllm_sparse_attention(
@@ -140,4 +155,7 @@ def dcp_all_gather_rows_(buf: torch.Tensor, per: int, slot: int) -> None:
     ``buf``. Rows at and past the real row count are left unspecified."""
     group = get_parallel().dcp_group
     out = buf[: group.world_size * per]
+    if out.dtype == torch.int32:
+        # Bit copy: lets the int32 top-k take the float-only custom all-gather.
+        out = out.view(torch.float32)
     group.all_gather_into_tensor(out, out[slot : slot + per])
