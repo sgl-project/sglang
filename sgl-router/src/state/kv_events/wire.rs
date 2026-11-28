@@ -1201,4 +1201,19 @@ mod tests {
             other => panic!("expected PayloadTooLarge, got {other:?}"),
         }
     }
+
+    #[test]
+    fn decodes_base_block_stored_with_empty_token_ids() {
+        let event = build_block_stored_bytes(&[111, 222], None, &[], 2, None, Some("GPU"));
+        let bytes = build_batch_bytes(1.5, &[event], Some(0), true);
+        let batch = decode_event_batch(&bytes).expect("decode empty base token IDs");
+        match &batch.events[0] {
+            KvCacheEvent::BlockStored(stored) => {
+                assert_eq!(stored.token_ids, Vec::<u32>::new());
+                assert_eq!(stored.block_hashes, vec![111, 222]);
+                assert_eq!(stored.block_size, 2);
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
+    }
 }
