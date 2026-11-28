@@ -41,6 +41,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
     graph_pool_capture_scope,
     graph_pool_replay_scope,
+    set_global_graph_memory_pool,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.foundry_adapter import get_foundry_adapter
@@ -271,3 +272,4 @@ class FullCudaGraphBackend(BaseGraphBackend):
         self._capture_inputs.clear()
         self._output_buffer = None
         self._pool = None
+        set_global_graph_memory_pool(None)

@@ -51,6 +51,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
     graph_pool_capture_scope,
     graph_pool_replay_scope,
+    set_global_graph_memory_pool,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_npu, is_xpu
@@ -318,8 +319,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
 
     def cleanup(self) -> None:
         self.close()
+        for graph in self._graphs.values():
+            if hasattr(graph, "reset"):
+                graph.reset()
         self._graphs.clear()
         self._outputs.clear()
         self._capture_inputs.clear()
         self._pool = None
         self._shared_output_buffer = None
+        set_global_graph_memory_pool(None)
