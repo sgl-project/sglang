@@ -8,6 +8,8 @@ on a side stream while the previous forward runs; the layer only dequantizes the
 
 from __future__ import annotations
 
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Optional
 
@@ -25,6 +27,8 @@ from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+logger = logging.getLogger(__name__)
 
 # Per engram layer: device table rows (fp8, or packed MXFP4), device e8m0 scales,
 # and the event of their copy.
@@ -80,10 +84,25 @@ class EngramRowStager:
         lookup to the forward."""
         if not batch.forward_mode.is_extend_without_speculative():
             return None
+        debug = envs.SGLANG_DEBUG_ENGRAM_STAGING.get()
+        t0 = time.perf_counter() if debug else 0.0
         windows = self._windows(batch)
         if windows is None:
             return None
         ids, _ = self.hasher.hash_windows(*windows)
+        if debug:
+            t1 = time.perf_counter()
+            staged = self._stage_ids(ids)
+            logger.info(
+                "engram staging: %d tokens, hash %.1f ms, gather + copy issue %.1f ms",
+                ids.shape[0],
+                (t1 - t0) * 1e3,
+                (time.perf_counter() - t1) * 1e3,
+            )
+            return staged
+        return self._stage_ids(ids)
+
+    def _stage_ids(self, ids: torch.Tensor) -> StagedRows:
         staged = []
         for layer, (weight, scale) in enumerate(self.tables):
             layer_ids = ids[:, layer].reshape(-1)

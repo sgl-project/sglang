@@ -1426,8 +1426,10 @@ class EngramEmbedding(nn.Module):
 
     @property
     def shared_host_table_without_ats(self) -> bool:
-        """The shared host layout (every row mapped here) on a GPU without ATS."""
-        return self._shared and self._sort_host_reads
+        """The shared host layout (every row mapped here) on a GPU without ATS. HIP
+        maps registered host memory in the GPU's own page tables, where the forward's
+        random host reads stall concurrent kernels."""
+        return self._shared and (self._sort_host_reads or _is_hip)
 
     def enable_scheduler_staging(self) -> None:
         """Read the rows the scheduler stages (EngramRowStager) instead of
@@ -1895,10 +1897,27 @@ class Engram(nn.Module):
         """The rows the scheduler staged for this batch, else the table lookup."""
         staged = None if forward_batch is None else forward_batch.engram_staged_rows
         if staged is not None:
-            return self.embed.dequant_staged(
+            rows = self.embed.dequant_staged(
                 *staged[self.layer_hash_index], hash_ids.shape
             )
+            if envs.SGLANG_DEBUG_ENGRAM_STAGING.get():
+                self._check_staged(rows, hash_ids, forward_batch, cp_all_tokens)
+            return rows
         return self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+
+    def _check_staged(self, rows, hash_ids, forward_batch, cp_all_tokens) -> None:
+        """Debug: the staged rows against the table lookup of the forward's hash ids."""
+        ref = self.embed(hash_ids, forward_batch, cp_all_tokens=cp_all_tokens)
+        bad = int(
+            (rows.view(torch.int16) != ref.view(torch.int16)).any(-1).any(-1).sum()
+        )
+        log = logger.warning if bad else logger.info
+        log(
+            "engram staging check, layer %d: %d of %d rows differ",
+            self.layer_hash_index,
+            bad,
+            hash_ids.shape[0],
+        )
 
 
 @eager_on_graph
