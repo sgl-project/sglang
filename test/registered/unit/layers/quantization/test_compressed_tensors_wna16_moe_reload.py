@@ -200,6 +200,23 @@ class TestWNA16MoEMarlinReload(CustomTestCase):
                 cos_ab, 0.9, "the two checkpoints must give different outputs"
             )
 
+    def test_session_keeps_experts_it_does_not_reload(self):
+        """Experts a session does not reload (an empty session, a partial refit) must
+        come back unchanged, not repacked into Marlin layout a second time."""
+        with self._runtime():
+            ckpt_a, ckpt_b = _random_checkpoint(1), _random_checkpoint(2)
+            fresh_a = self._fresh_model(ckpt_a)
+            model = self._fresh_model(ckpt_a)
+
+            # a session that loads nothing
+            self._refit(model, {})
+            self._assert_same_weights(model, fresh_a)
+
+            # a session that reloads one expert
+            partial = {k: v for k, v in ckpt_b.items() if k[0] == 0}
+            self._refit(model, partial)
+            self._assert_same_weights(model, self._fresh_model({**ckpt_a, **partial}))
+
 
 if __name__ == "__main__":
     unittest.main()
