@@ -3864,16 +3864,28 @@ class DeepseekV4AscendAttnBackend(
             attn_seq_lens = torch.where(
                 valid_verify_rows, final_seq_lens, ctx.live_seq_lens
             )
-            fm.seq_lens_cpu_int = self._seq_lens_cpu_int_view(
-                int(ctx.final_seq_lens_cpu.numel())
-            )
-            fm.seq_lens_cpu_int.copy_(
-                torch.where(
-                    ctx.live_seq_lens_cpu > 0,
-                    ctx.final_seq_lens_cpu,
-                    ctx.live_seq_lens_cpu,
+            # The static DSpark draft has no indexer or compressed layers.
+            # Its device-length ABI only consumes actual_seq_lengths_kv below.
+            if (
+                self._is_dspark_draft_worker
+                and self._dsv4_is_v41_model
+                and ctx.mirrorless
+                and ctx.ragged_layout is None
+                and not self.needs_cpu_seq_lens
+                and is_npu_arch35()
+            ):
+                fm.seq_lens_cpu_int = None
+            else:
+                fm.seq_lens_cpu_int = self._seq_lens_cpu_int_view(
+                    int(ctx.final_seq_lens_cpu.numel())
                 )
-            )
+                fm.seq_lens_cpu_int.copy_(
+                    torch.where(
+                        ctx.live_seq_lens_cpu > 0,
+                        ctx.final_seq_lens_cpu,
+                        ctx.live_seq_lens_cpu,
+                    )
+                )
         else:
             # CPU mirror of the kv buffer written below, so the host metadata op
             # reads it instead of syncing D2H.
