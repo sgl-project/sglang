@@ -18,6 +18,9 @@ maybe_stub_sgl_kernel()
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX  # noqa: E402
 from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.managers.scheduler_components import dp_attn  # noqa: E402
+from sglang.srt.managers.scheduler_components.gc_freezer import (  # noqa: E402
+    GCFreezer,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend  # noqa: E402
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.observability.metrics_collector import DPBalanceStats  # noqa: E402
@@ -692,7 +695,7 @@ class TestDPShutdownVote(CustomTestCase):
             (2, True, False),
         ):
             with (
-                envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip_gather),
+                envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
                 patch.object(
                     dp_attn,
                     "get_parallel",
@@ -718,6 +721,7 @@ class TestDPShutdownVote(CustomTestCase):
         scheduler.require_mlp_sync = True
         scheduler.gracefully_exit = False
         scheduler.rust_server = None
+        scheduler.gc_freezer = GCFreezer(freeze_on_idle_secs=0.0)
         Scheduler.init_dp_attn_adapter(scheduler)
         adapter = scheduler.dp_attn_adapter
         adapter.on_peer_shutdown()
@@ -786,7 +790,7 @@ class TestDPDrainColumn(CustomTestCase):
             on_drain_rows=on_drain_rows,
         )
         with (
-            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip_gather),
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
             patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
             patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
             patch.object(
@@ -847,6 +851,138 @@ class TestDPDrainColumn(CustomTestCase):
         info.drain_state = 5
         info.finalize_local()
         self.assertEqual(info.tp0_info_cpu[:, 12].tolist(), [5])
+
+
+class TestGCLockstepGather(CustomTestCase):
+    """Every rank receives the longest GC pause and whether any rank has tokens."""
+
+    def _gather(
+        self,
+        *,
+        peer_pauses,
+        local_pause=0,
+        attn_tp_size=1,
+        local_idle=False,
+        peer_tokens=None,
+    ):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=lambda: 1,
+            spec_info=None,
+            reqs=[SimpleNamespace(rid="req-0", seqlen=1)],
+            seq_lens_cpu=None,
+            dp_balance_stats=None,
+        )
+        tbo_preparer = Mock()
+        tbo_preparer.prepare_all_gather.return_value = (True, ForwardMode.DECODE.value)
+        tbo_preparer.compute_output.return_value = (None, ForwardMode.DECODE)
+        after_gather = Mock()
+
+        def fake_exchange(output, local, group, **_):
+            rows = [local]
+            for k, pause in enumerate(peer_pauses):
+                peer = local.clone()
+                peer[13] = pause
+                if peer_tokens is not None:
+                    peer[0] = peer_tokens[k]
+                rows.append(peer)
+            output.copy_(torch.stack(rows).flatten())
+
+        num_ranks = 1 + len(peer_pauses)
+        adapter = dp_attn.SchedulerDPAttnAdapter(
+            model_runner=SimpleNamespace(
+                prefill_cuda_graph_runner=None,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=object(),
+            ),
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            offload_tags=set(),
+            model_config=None,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            get_require_mlp_sync=lambda: True,
+            get_gc_pause_us=lambda: local_pause,
+            after_gather=after_gather,
+        )
+        with (
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False),
+            patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
+            patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    num_dp_ranks=num_ranks // attn_tp_size,
+                    attn_tp_size=attn_tp_size,
+                    attn_cp_size=1,
+                    dwdp_size=1,
+                    tp_group=SimpleNamespace(
+                        device_group=object(),
+                        device="cpu",
+                        cpu_group=object(),
+                        active_ranks_cpu=torch.ones(num_ranks, dtype=torch.int64),
+                    ),
+                ),
+            ),
+            patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(dp_attn, "cuda_graph_fully_disabled", return_value=True),
+            patch.object(dp_attn, "require_mlp_tp_gather", return_value=True),
+            patch.object(
+                dp_attn,
+                "get_schedule",
+                return_value=SimpleNamespace(disable_overlap_schedule=True),
+            ),
+            patch.object(dp_attn, "exchange_sync_rows", side_effect=fake_exchange),
+            # An idle rank whose peers have tokens runs an idle batch.
+            patch.object(
+                dp_attn.SchedulerDPAttnAdapter, "get_idle_batch", return_value=None
+            ),
+        ):
+            adapter.maybe_prepare_mlp_sync_batch(None if local_idle else batch)
+        return after_gather
+
+    def test_longest_pause_and_any_tokens_reach_every_rank(self):
+        # Two DP groups of two attention-TP ranks: the longest pause is on a
+        # rank that does not lead its group.
+        after_gather = self._gather(
+            local_pause=3000, peer_pauses=[7000, 1000, 2000], attn_tp_size=2
+        )
+        after_gather.assert_called_once_with(7000, True)
+        after_gather = self._gather(peer_pauses=[0], local_idle=True)
+        after_gather.assert_called_once_with(0, False)
+        after_gather = self._gather(
+            peer_pauses=[0, 0], local_idle=True, peer_tokens=[0, 3]
+        )
+        after_gather.assert_called_once_with(0, True)
+
+    def test_scheduler_wires_the_gc_lockstep_callbacks(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        for dp_lockstep in (False, True):
+            scheduler = Scheduler.__new__(Scheduler)
+            scheduler.tp_worker = SimpleNamespace(model_runner=Mock())
+            scheduler.req_to_token_pool = Mock()
+            scheduler.token_to_kv_pool_allocator = Mock()
+            scheduler.tree_cache = Mock()
+            scheduler.weight_updater = SimpleNamespace(offload_tags=set())
+            scheduler.model_config = Mock()
+            scheduler.enable_overlap = False
+            scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
+            scheduler.require_mlp_sync = True
+            scheduler.gracefully_exit = False
+            scheduler.rust_server = None
+            scheduler.gc_freezer = GCFreezer(
+                freeze_on_idle_secs=0.0, dp_lockstep=dp_lockstep
+            )
+            Scheduler.init_dp_attn_adapter(scheduler)
+            adapter = scheduler.dp_attn_adapter
+            with self.subTest(dp_lockstep=dp_lockstep):
+                callbacks = scheduler.gc_freezer.dp_gather_callbacks()
+                self.assertEqual(bool(callbacks), dp_lockstep)
+                self.assertEqual(adapter.before_gather, callbacks.get("before_gather"))
+                self.assertEqual(adapter.after_gather, callbacks.get("after_gather"))
 
 
 _EXCHANGE_WORLDS = (2, 3, 4, 5, 6, 8)

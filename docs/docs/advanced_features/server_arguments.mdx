@@ -3186,7 +3186,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--gc-threshold`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers. With attention DP, the schedulers otherwise run full (generation-2) collections in lockstep across ranks; a third value turns that off and leaves full collections to each rank's collector.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int (one or more)</td>
     </tr>
