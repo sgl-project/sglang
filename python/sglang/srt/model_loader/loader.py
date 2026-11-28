@@ -1687,6 +1687,8 @@ class ShardedStateLoader(BaseModelLoader):
     ) -> nn.Module:
         from safetensors.torch import safe_open
 
+        from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8MoEMethod
+
         local_model_path = self._prepare_weights(
             model_config.model_path, model_config.revision
         )
@@ -1696,10 +1698,39 @@ class ShardedStateLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config, quant_config)
-                for _, module in model.named_modules():
+                padded_weights = {}
+                for module_name, module in model.named_modules():
                     quant_method = getattr(module, "quant_method", None)
-                    if quant_method is not None:
-                        quant_method.process_weights_after_loading(module)
+                    if quant_method is None:
+                        continue
+                    modelopt_fp8_triton = (
+                        isinstance(quant_method, ModelOptFp8MoEMethod)
+                        and quant_method.get_moe_runner_backend(module).is_triton()
+                    )
+                    if modelopt_fp8_triton:
+                        original_shapes = {
+                            name: module.get_parameter(name).shape
+                            for name in ("w13_weight", "w2_weight")
+                        }
+                    quant_method.process_weights_after_loading(module)
+                    if modelopt_fp8_triton:
+                        # Old Triton shards have no intermediate padding. Only
+                        # record weights whose physical layout actually changed.
+                        num_parts = 2 if module.moe_runner_config.is_gated else 1
+                        for name, split_dim, parts in (
+                            ("w13_weight", 1, num_parts),
+                            ("w2_weight", 2, 1),
+                        ):
+                            if (
+                                module.get_parameter(name).shape
+                                != original_shapes[name]
+                            ):
+                                key = f"{module_name}.{name}" if module_name else name
+                                padded_weights[key] = (
+                                    original_shapes[name],
+                                    split_dim,
+                                    parts,
+                                )
             rank = _checkpoint_shard_rank()
             pattern = os.path.join(
                 local_model_path,
@@ -1717,6 +1748,20 @@ class ShardedStateLoader(BaseModelLoader):
                 with safe_open(path, framework="pt") as f:
                     for key in f.keys():  # noqa: SIM118
                         tensor = f.get_tensor(key)
+                        if (
+                            key in padded_weights
+                            and tensor.shape != state_dict[key].shape
+                        ):
+                            original_shape, split_dim, num_parts = padded_weights[key]
+                            self._copy_padded_shard(
+                                destination=state_dict[key],
+                                source=tensor,
+                                original_shape=original_shape,
+                                split_dim=split_dim,
+                                num_parts=num_parts,
+                            )
+                            state_dict.pop(key)
+                            continue
                         # If loading with LoRA enabled, additional padding may
                         # be added to certain parameters. We only load into a
                         # narrowed view of the parameter data.
@@ -1741,6 +1786,28 @@ class ShardedStateLoader(BaseModelLoader):
             post_load_weights(model)
 
         return model.eval()
+
+    @staticmethod
+    def _copy_padded_shard(
+        destination: torch.Tensor,
+        source: torch.Tensor,
+        *,
+        original_shape: torch.Size,
+        split_dim: int,
+        num_parts: int,
+    ) -> None:
+        """Restore projections independently into a post-load-padded buffer."""
+        if source.shape != original_shape:
+            raise ValueError(
+                f"Unexpected processed shard shape {tuple(source.shape)}; "
+                f"expected {tuple(original_shape)} or {tuple(destination.shape)}"
+            )
+        destination.zero_()
+        for src, dst in zip(
+            source.chunk(num_parts, dim=split_dim),
+            destination.chunk(num_parts, dim=split_dim),
+        ):
+            dst.narrow(split_dim, 0, src.shape[split_dim]).copy_(src)
 
     @staticmethod
     def save_model(
@@ -1897,6 +1964,10 @@ class PreshardedModelLoader(DefaultModelLoader):
             ),
             "structural_signature": self._compute_structural_signature(model_config),
         }
+        if model_config.quantization in ("modelopt", "modelopt_fp8", "modelopt_mixed"):
+            # The meta-model signature precedes post-load padding. Include the
+            # layout revision even when Triton is selected via a backend fallback.
+            shard_config["modelopt_fp8_moe_layout_version"] = 1
         a2a_backend = get_moe_a2a_backend()
         if get_moe_runner_backend().is_flashinfer_cutedsl() and (
             a2a_backend.is_none() or a2a_backend.is_flashinfer()
@@ -4285,8 +4356,18 @@ def get_model_loader(
         or model_config.quantization
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
-        logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
-        return ModelOptModelLoader(load_config)
+        # Only serialized checkpoints can bypass ModelOpt for a shard loader.
+        # Raw checkpoints still need calibration/checkpoint restore/export, even
+        # when the caller specifies a shard load format.
+        is_processed_shard = (
+            load_config.load_format in (LoadFormat.SHARDED_STATE, LoadFormat.PRESHARDED)
+            and model_config._is_already_quantized()
+        )
+        if not is_processed_shard:
+            logger.info(
+                "Using ModelOptModelLoader due to ModelOpt quantization config."
+            )
+            return ModelOptModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
         return ShardedStateLoader(load_config)

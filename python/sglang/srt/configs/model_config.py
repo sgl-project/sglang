@@ -2226,20 +2226,15 @@ class ModelConfig:
             return None
 
     def _is_already_quantized(self) -> bool:
-        """Check if the model is already quantized based on config files."""
-        # Check for quantization in hf_config (config.json)
-        if getattr(self.hf_config, "quantization_config", None) or getattr(
-            self.hf_config, "compression_config", None
-        ):
+        """Check checkpoint metadata using the same lookup as the weight loader."""
+        from sglang.srt.configs.quant_utils import has_hf_quant_config
+        from sglang.srt.model_loader.checkpoint_quantization import (
+            resolve_checkpoint_quant_spec,
+        )
+
+        if resolve_checkpoint_quant_spec(self.hf_config) is not None:
             return True
-
-        # Check for HuggingFace quantization config
-        quant_cfg = getattr(self.hf_config, "quantization_config", None)
-        if quant_cfg is None:
-            from sglang.srt.configs.quant_utils import has_hf_quant_config
-
-            return has_hf_quant_config(self.model_path)
-        return True
+        return has_hf_quant_config(self.model_path, revision=self.revision)
 
     def _get_modelopt_quant_type(self) -> str:
         """Extract ModelOpt quantization type from unified quantization flag."""

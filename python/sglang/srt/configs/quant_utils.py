@@ -8,11 +8,12 @@ import os
 LOADER_RESOLVED_QUANT_METHODS = frozenset({"awq", "gptq"})
 
 
-def has_hf_quant_config(model_path: str) -> bool:
+def has_hf_quant_config(model_path: str, revision: str | None = None) -> bool:
     """Check if the model path contains hf_quant_config.json file.
 
     Args:
         model_path: Path to the model, can be local path or remote URL.
+        revision: Model revision (branch, tag, or commit) to check on the Hub.
 
     Returns:
         True if hf_quant_config.json exists, False otherwise.
@@ -25,7 +26,9 @@ def has_hf_quant_config(model_path: str) -> bool:
     from huggingface_hub import try_to_load_from_cache
 
     # Check if the model_path is a HuggingFace model ID and exists locally
-    result = try_to_load_from_cache(model_path, "hf_quant_config.json")
+    result = try_to_load_from_cache(
+        model_path, "hf_quant_config.json", revision=revision
+    )
     if isinstance(result, str):
         return True
 
@@ -34,7 +37,7 @@ def has_hf_quant_config(model_path: str) -> bool:
         from huggingface_hub import HfApi
 
         hf_api = HfApi()
-        return hf_api.file_exists(model_path, "hf_quant_config.json")
+        return hf_api.file_exists(model_path, "hf_quant_config.json", revision=revision)
     except Exception:
         return False
 
