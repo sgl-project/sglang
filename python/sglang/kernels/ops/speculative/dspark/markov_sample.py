@@ -4,11 +4,13 @@ argmax at temperature 0 and a Gumbel-max sample otherwise."""
 import functools
 from typing import Callable, Optional
 
+import msgspec
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.srt.utils import is_hip, is_npu
 
@@ -19,6 +21,9 @@ _is_npu = is_npu()
 _BLOCK = 1024
 # block width when the kernel computes the step bias (fold): the fold weight dominates
 _FOLD_BLOCK = 128
+_FOLD_BLOCK_R = 64
+_FOLD_MAX_ROWS = 16
+_FOLD_L2_SHARE = 0.8
 _NO_INDEX = tl.constexpr(2147483647)
 # 2**-32: maps a 32-bit Philox word to a uniform in (0, 1].
 _UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
@@ -190,6 +195,87 @@ def _markov_sample_finish_kernel(
     tl.store(OUT + row, result.to(tl.int64))
 
 
+@triton.jit
+def _markov_fold_partial_kernel(
+    Latent,
+    W,
+    FoldBias,
+    X,
+    T,
+    OFFSET,
+    L,
+    P,
+    LS,
+    XS,
+    OS,
+    WIDTH,
+    PARTS,
+    resident_parts,
+    KEY,
+    STEP,
+    softcap,
+    vocab_limit,
+    ROWS: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    ROUND: tl.constexpr,
+    STORE: tl.constexpr,
+    SAMPLE: tl.constexpr,
+    PHILOX_ROUNDS: tl.constexpr,
+    SOFTCAP: tl.constexpr,
+    LIMIT: tl.constexpr,
+    KEEP: tl.constexpr,
+):
+    part = tl.program_id(0)
+    i = part * BLOCK + tl.arange(0, BLOCK)
+    valid = i < WIDTH
+    rows = tl.arange(0, 16)
+    acc = tl.zeros((16, BLOCK), tl.float32)
+    for r0 in tl.static_range(0, RANK, BLOCK_R):
+        r = r0 + tl.arange(0, BLOCK_R)
+        latent = tl.load(
+            Latent + rows[:, None] * LS + r[None, :], rows[:, None] < ROWS, other=0
+        )
+        w_ptr = W + i[None, :].to(tl.int64) * RANK + r[:, None]
+        if KEEP and part < resident_parts:
+            w = tl.load(w_ptr, valid[None, :], other=0, eviction_policy="evict_last")
+        else:
+            w = tl.load(w_ptr, valid[None, :], other=0, eviction_policy="evict_first")
+        acc = tl.dot(latent, w, acc)
+    bias = acc + tl.load(FoldBias + i, valid, other=0).to(tl.float32)[None, :]
+    bias = bias.to(tl.bfloat16).to(tl.float32)
+    for row in tl.static_range(ROWS):
+        value = tl.load(X + row * XS + i, valid, 0).to(tl.float32)
+        value += tl.sum(tl.where(rows[:, None] == row, bias, 0.0), 0)
+        value = _round_to_step_dtype(value, ROUND)
+        if SOFTCAP:
+            value = _round_to_step_dtype(
+                libdevice.tanh(value / softcap) * softcap, ROUND
+            )
+        if LIMIT:
+            value = tl.where(i < vocab_limit, value, -float("inf"))
+        if STORE:
+            tl.store(L + row * OS + i, value.to(L.dtype.element_ty), valid)
+        _select_block(
+            value,
+            T,
+            OFFSET,
+            P,
+            row,
+            part,
+            i,
+            valid,
+            PARTS,
+            KEY,
+            STEP,
+            0,
+            BLOCK,
+            SAMPLE,
+            PHILOX_ROUNDS,
+        )
+
+
 def _mul32(a: torch.Tensor, b: int) -> tuple[torch.Tensor, torch.Tensor]:
     # (high, low) 32-bit words of a * b; b splits in halves so int64 never overflows.
     product_lo = a * (b & 0xFFFF)
@@ -279,6 +365,141 @@ def _launch_partial(
         num_warps=4,
     )
     return partial.view(rows, parts * 2)
+
+
+class MarkovFold(msgspec.Struct, frozen=True):
+    """A step bias addmm(bias, latent, weight^T) for the step kernel to compute:
+    BF16 latent [rows, rank], weight [>= width, rank] and bias [>= width]."""
+
+    latent: torch.Tensor
+    weight: torch.Tensor
+    bias: torch.Tensor
+
+
+def use_fold(rows: int, weight: torch.Tensor) -> bool:
+    if rows > _FOLD_MAX_ROWS or weight.shape[1] % _FOLD_BLOCK_R:
+        return False
+    return rows <= 2 or weight.nbytes > _FOLD_L2_SHARE * current_arch().l2_cache_bytes
+
+
+def _launch_fold_partial(
+    base_logits,
+    fold,
+    *,
+    store,
+    temperatures,
+    key,
+    offset,
+    step,
+    step_dtype,
+    has_sampled_rows,
+    softcap,
+    vocab_limit,
+    keep_in_l2,
+):
+    rows, width = base_logits.shape
+    rank = fold.weight.shape[1]
+    parts = triton.cdiv(width, _FOLD_BLOCK)
+    partial = torch.empty(
+        (rows, parts, 2), device=base_logits.device, dtype=torch.float32
+    )
+    block_bytes = _FOLD_BLOCK * rank * fold.weight.element_size()
+    resident_parts = int(_FOLD_L2_SHARE * current_arch().l2_cache_bytes) // block_bytes
+    _markov_fold_partial_kernel[(parts,)](
+        fold.latent,
+        fold.weight,
+        fold.bias,
+        base_logits,
+        temperatures,
+        offset,
+        base_logits if store is None else store,
+        partial,
+        fold.latent.stride(0),
+        base_logits.stride(0),
+        0 if store is None else store.stride(0),
+        width,
+        parts,
+        resident_parts,
+        key,
+        step,
+        float(softcap or 0.0),
+        int(vocab_limit or 0),
+        rows,
+        rank,
+        _FOLD_BLOCK,
+        _FOLD_BLOCK_R,
+        _ROUND_CODE[step_dtype],
+        store is not None,
+        has_sampled_rows is not False,
+        _PHILOX_ROUNDS,
+        softcap is not None,
+        vocab_limit is not None,
+        keep_in_l2,
+        num_warps=4,
+    )
+    return partial.view(rows, parts * 2)
+
+
+def markov_fold_step(
+    *,
+    base_logits: torch.Tensor,
+    fold: MarkovFold,
+    temperatures: torch.Tensor,
+    key: int,
+    offset: torch.Tensor,
+    step: int,
+    step_dtype: torch.dtype,
+    logits_out: Optional[torch.Tensor] = None,
+    has_sampled_rows: Optional[bool] = None,
+    softcap: Optional[float] = None,
+    vocab_limit: Optional[int] = None,
+    keep_in_l2: bool = False,
+) -> torch.Tensor:
+    """MarkovSampleStep.triton with an unsharded fold in place of the bias, for at
+    most _FOLD_MAX_ROWS rows; keep_in_l2 keeps the fold weight in L2 for a later
+    step."""
+    rows, width = base_logits.shape
+    assert base_logits.stride(1) == 1 and rows <= _FOLD_MAX_ROWS
+    assert fold.latent.shape == (rows, fold.weight.shape[1])
+    assert fold.weight.dtype == fold.latent.dtype == torch.bfloat16
+    assert fold.weight.is_contiguous() and fold.weight.shape[0] >= width
+    assert fold.weight.shape[1] % _FOLD_BLOCK_R == 0
+    assert fold.latent.stride(1) == 1 and fold.bias.stride(0) == 1
+    assert fold.bias.ndim == 1 and fold.bias.dtype == torch.bfloat16
+    assert fold.bias.shape[0] >= width
+    assert temperatures.shape == (rows,)
+    assert temperatures.dtype == torch.float32 and temperatures.stride(0) == 1
+    assert offset.dtype == torch.int64 and offset.numel() == 1
+    assert step_dtype in _ROUND_CODE, step_dtype
+    if logits_out is not None:
+        assert logits_out.dtype == step_dtype and logits_out.stride(1) == 1
+        assert logits_out.shape == base_logits.shape
+    partial = _launch_fold_partial(
+        base_logits,
+        fold,
+        store=logits_out,
+        temperatures=temperatures,
+        key=key,
+        offset=offset,
+        step=step,
+        step_dtype=step_dtype,
+        has_sampled_rows=has_sampled_rows,
+        softcap=softcap,
+        vocab_limit=vocab_limit,
+        keep_in_l2=keep_in_l2,
+    )
+    parts = partial.shape[1] // 2
+    result = torch.empty(rows, device=base_logits.device, dtype=torch.int64)
+    _markov_sample_finish_kernel[(rows,)](
+        partial,
+        result,
+        rows,
+        parts,
+        1,
+        triton.next_power_of_2(parts),
+        num_warps=4,
+    )
+    return result
 
 
 class MarkovSampleStep:
