@@ -43,6 +43,14 @@ for _mod, _fn in _HC_NORM_KERNELS:
     )
 del _mod, _fn
 
+register_kernel(
+    KernelSpec(
+        op="layernorm.rmsnorm_cast_before_mul",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.rmsnorm_cast_before_mul:rmsnorm_cast_before_mul",
+    )
+)
+
 for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
     register_kernel(
         KernelSpec(
