@@ -211,8 +211,8 @@ class TargetVerifyExecutor:
             block_verification=self._block_verification,
             rejection_noise=self._rejection_noise,
         )
-        greedy_bonus = simulate_bonus_sampling_info is None and (
-            sampling_info is None or sampling_info.facts.all_greedy
+        greedy_bonus = (
+            simulate_bonus_sampling_info is None and sampling_info.facts.all_greedy
         )
         sync_site = (
             SpecTpSyncSite.DSPARK_ACCEPT_GREEDY
@@ -1346,8 +1346,7 @@ def accept_draft_tokens(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
-    all_greedy = sampling_info is None or sampling_info.facts.all_greedy
-    if all_greedy:
+    if sampling_info.facts.all_greedy:
         return AcceptGreedy.execute(
             candidates=candidates,
             target_logits=target_logits,

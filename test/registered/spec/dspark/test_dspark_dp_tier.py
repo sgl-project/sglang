@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     dp_global_verify_tier_num_tokens,
@@ -85,6 +86,7 @@ class TestDraftDpSyncMetadata(CustomTestCase):
                 verify_window=window,
                 bs=1,
                 embed_module=torch.nn.Embedding(16, 2),
+                sampling_info=SamplingBatchInfo.greedy(1, vocab_size=16, device="cpu"),
             )
             torch.testing.assert_close(result.raw_hidden, hidden[1:])
 

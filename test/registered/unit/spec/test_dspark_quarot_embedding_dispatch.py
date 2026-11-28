@@ -16,6 +16,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockProposer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -62,7 +63,7 @@ class TestDSparkQuaRotEmbeddingDispatch(CustomTestCase):
                 bs=1,
                 device="cpu",
                 target_model=target_model,
-                sampling_info=None,
+                sampling_info=SamplingBatchInfo.greedy(1, vocab_size=8, device="cpu"),
             )
 
         proposer._run_forward.assert_called_once()
@@ -175,7 +176,9 @@ class TestDSparkQuaRotEmbeddingDispatch(CustomTestCase):
                         bs=2,
                         device="cpu",
                         target_model=target,
-                        sampling_info=None,
+                        sampling_info=SamplingBatchInfo.greedy(
+                            2, vocab_size=8, device="cpu"
+                        ),
                     )
 
                 target.get_input_embeddings.assert_not_called()

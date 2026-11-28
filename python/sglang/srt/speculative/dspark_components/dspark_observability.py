@@ -869,17 +869,11 @@ class DsparkStepObservers:
                 draft_temperatures=draft_block.temperatures,
                 greedy_mask=draft_block.greedy_mask,
                 target_logits=target_logits,
-                target_temperatures=(
-                    sampling_info.temperatures
-                    if sampling_info is not None
-                    else draft_block.temperatures
-                ),
+                target_temperatures=sampling_info.temperatures,
                 truncated_sampling_mask=(
                     (sampling_info.top_ks != TOP_K_ALL)
                     | (sampling_info.top_ps != 1.0)
                     | (sampling_info.min_ps > 0)
-                    if sampling_info is not None
-                    else None
                 ),
                 logits_adjustments_are_noop=not facts.edits_logits,
                 correct_len=correct_len,

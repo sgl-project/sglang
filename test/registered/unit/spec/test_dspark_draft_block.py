@@ -12,7 +12,7 @@ from sglang.srt.models.dspark import (
     VanillaMarkov,
 )
 from sglang.srt.sampling import sampling_params_pool as sp_pool
-from sglang.srt.sampling.sampling_batch_info import SamplingFacts
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.sampling.sampling_params_pool import (
     SamplingParamsPool,
     SamplingParamsTable,
@@ -141,7 +141,9 @@ class TestSampleDraftBlock(CustomTestCase):
                     base_logits=logits.expand(1, GAMMA, VOCAB).to(torch.bfloat16),
                     anchor_tokens=torch.zeros(1, dtype=torch.long),
                     draft_hidden=None,
-                    sampling_info=None,
+                    sampling_info=SamplingBatchInfo.greedy(
+                        1, vocab_size=VOCAB, device="cpu"
+                    ),
                     markov_head=head,
                     noise=DraftNoise(key=3, offset=torch.zeros(1, dtype=torch.int64)),
                     device="cpu",

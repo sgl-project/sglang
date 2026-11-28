@@ -295,10 +295,6 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
     return target_model.get_input_embeddings()
 
 
-def _is_all_greedy(sampling_info) -> bool:
-    return sampling_info is None or sampling_info.facts.all_greedy
-
-
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Row 0 is the anchor, unless shift_label: then row i drafts token i + 1.
     pred_hidden = pred_hidden[:, :-1] if draft_model.shift_label else pred_hidden[:, 1:]
@@ -907,8 +903,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if verify.batch.return_logprob or verify.facts.edits_logits:
             return False
         sampling_info = verify.batch.sampling_info
-        if sampling_info is None:
-            return self._selector_sample is None
         # A sampling mask is captured from the full target distribution.
         if sampling_info.sampling_mask_batch_indices is not None:
             return False
@@ -1089,7 +1083,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=1,
             lm_head=unwrap_lora_layer(self._target_worker.model_runner.model.lm_head),
             anchor_token_ids=torch.zeros((1,), dtype=torch.int64, device=self.device),
-            sampling_info=None,
+            sampling_info=SamplingBatchInfo.greedy(
+                1,
+                vocab_size=self._target_worker.model_runner.model_config.vocab_size,
+                device=self.device,
+            ),
         )
 
     def _install_draft_l2_prefetch(self) -> None:
@@ -1225,7 +1223,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if sampler is None:
             return
         if self._draft_sampler_reads_slots:
-            sampler.force_greedy.set(sampling_info is None)
+            sampler.force_greedy.set(sampling_info.facts.all_greedy)
         elif sampler.max_bs is None or bs <= sampler.max_bs:
             # A bound runtime's sampler stages its rows. A batch past the sampler's static buffers has no captured bucket,
             # so its draft runs eager and the eager head reads none of them.
@@ -1889,13 +1887,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
             torch.ones(bs, dtype=torch.float32, device=device)
-            if sampling_info is None or not self._selector_sampling_enabled
+            if not self._selector_sampling_enabled
             else sampling_info.temperatures.view(-1).float().clamp_min(1e-5)
         )
         greedy_mask = (
             torch.ones(bs, dtype=torch.bool, device=device)
             if not self._selector_sampling_enabled
-            else resolve_greedy_mask(bs=bs, sampling_info=sampling_info, device=device)
+            else resolve_greedy_mask(sampling_info)
         )
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
@@ -1904,7 +1902,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             temperatures=temperatures,
             greedy_mask=greedy_mask,
         )
-        if self._selector_sampling_enabled and not _is_all_greedy(sampling_info):
+        if self._selector_sampling_enabled and not sampling_info.facts.all_greedy:
             self._selector_sample = (candidate_ids, q_rows)
         if self._acceptance_estimator is not None:
             self._draft_feature, self._draft_confidence = _walked_confidence(
@@ -2830,7 +2828,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, cap_trim_lens)
         elif target_predict is None and (
-            not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
+            not sampling_info.facts.all_greedy and is_dflash_sampling_verify_available()
         ):
             # Ragged modes require a selector draft (_init_verify_planner); this
             # kernel cannot stop at a planned verify length.
@@ -2933,7 +2931,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
-        if sampling_info is None or sampling_info.facts.all_greedy:
+        if sampling_info.facts.all_greedy:
             return
 
         if self.selector is not None:
@@ -3445,7 +3443,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._draft_confidence = self._draft_sampler.confidence_out[:bs]
             if (
                 self.selector is not None
-                and not _is_all_greedy(batch.sampling_info)
+                and not batch.sampling_info.facts.all_greedy
                 and self._selector_sampling_enabled
             ):
                 self._selector_sample = (
@@ -3455,7 +3453,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             elif (
                 self.lilicorr is not None
                 and self._lilicorr_sampling_enabled
-                and not _is_all_greedy(batch.sampling_info)
+                and not batch.sampling_info.facts.all_greedy
             ):
                 self._selector_sample = (
                     self._draft_sampler.candidate_out[:bs],
@@ -3502,7 +3500,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         sampling_enabled=self._lilicorr_sampling_enabled,
                     )
                 )
-            if lilicorr_q_rows is not None and not _is_all_greedy(batch.sampling_info):
+            if lilicorr_q_rows is not None and not batch.sampling_info.facts.all_greedy:
                 self._selector_sample = (lilicorr_candidate_ids, lilicorr_q_rows)
         else:
             draft_hidden = draft_logits_output.hidden_states
@@ -3634,7 +3632,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify.build_grammar_mask(
             grammar_tree, logits_output=logits_output, barrier=grammar_barrier
         )
-        if sampling_info is not None and target_predict is None:
+        if target_predict is None:
             # In place: DFlash refuses the watermark, the one stage that returns
             # new logits.
             verify.adjust(logits_output.next_token_logits, draft_tokens)

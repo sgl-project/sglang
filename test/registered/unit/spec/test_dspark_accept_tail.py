@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import msgspec
 import torch
 
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DsparkVerifyEpilogue,
@@ -98,7 +99,7 @@ class TestAcceptTailParity(CustomTestCase):
                 temperatures=torch.ones(BS),
                 greedy_draft=True,
             ),
-            sampling_info=None,
+            sampling_info=SamplingBatchInfo.greedy(BS, vocab_size=VOCAB, device="cpu"),
             draft_input=None,
             layout=None
             if verify_lens is None

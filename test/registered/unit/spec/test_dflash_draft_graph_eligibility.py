@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative import dflash_worker_v2
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
@@ -64,7 +65,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             is_extend_in_batch=False,
-            sampling_info=None,
+            sampling_info=SamplingBatchInfo.greedy(1, vocab_size=8, device="cpu"),
             spec_info=draft_input,
             seq_lens=torch.tensor([3]),
             seq_lens_cpu=torch.tensor([3]),

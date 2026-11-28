@@ -11,7 +11,7 @@ from sglang.srt.models.dflash import (
     _grouped_conv,
     candidate_topk,
 )
-from sglang.srt.sampling.sampling_batch_info import SamplingFacts
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -91,7 +91,7 @@ def test_selector_prediction_rows_follow_shift_label(path, shift_label, position
             bs=2,
             lm_head=object(),
             anchor_token_ids=block_ids[:, 0],
-            sampling_info=None,
+            sampling_info=SamplingBatchInfo.greedy(2, vocab_size=8, device="cpu"),
         )
     else:
         sampler = worker_mod._SelectorDraftSampler(
@@ -540,7 +540,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     temperatures, greedy_mask = run_sampler()
     assert greedy_mask == [False]
     torch.testing.assert_close(torch.tensor(temperatures), torch.tensor([0.7]))
-    # No sampling info: every row drafts greedily at temperature 1.
+    # An all-greedy info: every row drafts greedily at temperature 1.
     sampler.force_greedy.set(True)
     assert run_sampler() == ([1.0], [True])
 

@@ -107,14 +107,7 @@ def make_next_draft_input(
     return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
 
-def resolve_greedy_mask(
-    *,
-    bs: int,
-    sampling_info,
-    device: torch.device,
-) -> torch.Tensor:
-    if sampling_info is None:
-        return torch.ones(bs, dtype=torch.bool, device=device)
+def resolve_greedy_mask(sampling_info) -> torch.Tensor:
     return (sampling_info.top_ks <= 1).view(-1)
 
 
@@ -148,18 +141,13 @@ def resolve_draft_params(
             step_temperatures=torch.empty(bs, dtype=torch.float32, device=device),
         )
     temperatures, greedy_mask, step_temperatures = (buf[:bs] for buf in out)
-    if sampling_info is None:
-        temperatures.fill_(1.0)
-        greedy_mask.fill_(True)
-        step_temperatures.zero_()
-    else:
-        torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
-            out=temperatures,
-        )
-        torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=greedy_mask)
-        torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
+    torch.clamp(
+        sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
+        min=1e-5,
+        out=temperatures,
+    )
+    torch.le(sampling_info.top_ks.view(-1)[:bs], 1, out=greedy_mask)
+    torch.where(greedy_mask, _zero(device), temperatures, out=step_temperatures)
     return DraftParams(temperatures, greedy_mask, step_temperatures)
 
 
@@ -172,8 +160,10 @@ def resolve_greedy_rows_by_slot(
     greedy_mask: torch.Tensor,
 ) -> None:
     """The batch's clamped temperatures and greedy rows, read from its slots of the
-    sampling table so a graph captures it; ``force_greedy`` ([1] bool) stands for
-    no sampling info."""
+    sampling table so a graph captures it; ``force_greedy`` ([1] bool) makes every
+    row greedy at temperature 1. It is set for an all-greedy info: a greedy
+    stand-in's rows are not in the table, and nothing reads a greedy row's
+    temperature."""
     torch.clamp(table.temperatures(slots), min=1e-5, out=temperatures)
     temperatures.masked_fill_(force_greedy, 1.0)
     torch.le(table.top_ks(slots), 1, out=greedy_mask)
@@ -204,8 +194,8 @@ def resolve_draft_params_by_slot(
 
 
 class ForceGreedy:
-    """A draft graph's switch to draft every row greedily at temperature 1, as for
-    a step with no sampling info; written only when it flips."""
+    """A draft graph's switch to draft every row greedily at temperature 1, set for
+    an all-greedy sampling info; written only when it flips."""
 
     def __init__(self, device):
         self.flag = torch.zeros((1,), dtype=torch.bool, device=device)
@@ -622,7 +612,7 @@ class DraftBlockProposer:
         bs: int,
         embed_module,
         draft_sampler=None,
-        sampling_info=None,
+        sampling_info,
         anchor_prepared: bool = False,
     ) -> DraftForwardResult:
         gamma = self.gamma
@@ -686,7 +676,7 @@ class DraftBlockProposer:
             draft_forward_batch
         )
         if draft_sampler is not None and runs_graph:
-            draft_sampler.force_greedy.set(sampling_info is None)
+            draft_sampler.force_greedy.set(sampling_info.facts.all_greedy)
         deferred_draft_kv = self.deferred_draft_kv
         if deferred_draft_kv is not None:
             deferred_draft_kv.before_draft_forward(
