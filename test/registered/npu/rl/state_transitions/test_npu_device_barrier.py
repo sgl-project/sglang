@@ -70,7 +70,10 @@ _TP_GROUP = SimpleNamespace(cpu_group=object())
 def _make_manager(events):
     with get_parallel().override(tp_group=_TP_GROUP, tp_rank=0, tp_size=1):
         return SchedulerWeightUpdaterManager(
-            tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=object())),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(model=object()),
+                weight_update_runners=lambda: [],
+            ),
             draft_worker=None,
             memory_saver_adapter=SimpleNamespace(
                 pause=lambda tag: events.append(("pause", tag)),
