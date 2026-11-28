@@ -1,7 +1,7 @@
 ---
 title: "SGLang HiCache Best Practices"
 metatags:
-    description: "HiCache configuration guide: memory layout, prefetch policies, PD disaggregation, HF3FS and Mooncake deployment, custom storage backends."
+    description: "HiCache configuration guide: memory layout, prefetch policies, PD disaggregation, HF3FS, Mooncake and EGM deployment, custom storage backends."
 ---
 ## Why HiCache Matters
 
@@ -227,6 +227,47 @@ python3 -m sglang.launch_server \
   --hicache-write-policy write_through \
   --hicache-storage-prefetch-policy timeout
 ```
+
+### Deployment with EGM (host memory over NVLink)
+
+The `egm` backend keeps L3 pages in host memory that another machine exports over NVLink. It is for systems whose GPUs share an NVLink domain with fabric handles supported. A provider process on the memory machine allocates host memory on its host NUMA nodes through the CUDA Virtual Memory Management API (`CU_MEM_LOCATION_TYPE_HOST_NUMA`, exported as `CU_MEM_HANDLE_TYPE_FABRIC`). Each SGLang tensor-parallel rank imports one such segment and copies pages between its L2 host pool and the segment. The page index lives in the rank's memory, so the tier starts empty on every server start. Pages are checksummed on write and verified on read; a page counts as a hit only after it is in L2 and verified.
+
+1. Start one provider per segment, one segment per rank:
+
+```bash Command
+python3 -m sglang.srt.mem_cache.storage.egm.provider run <OUT_DIR> \
+  --node-index 0 --gib-per-numa 256 --numas 0,1 --dev 0 --ttl 86400 --detach
+```
+
+The provider writes `<OUT_DIR>/handle_<node-index>.json` (the fabric handles, sizes, data area, epoch and deadline), `provider_status.log` and `provider_result.json`. It heartbeats until the file `<OUT_DIR>/STOP` exists or `--ttl` runs out, then waits up to `--grace-s` seconds for the ranks to detach before it frees the memory. Make the handle files readable from the SGLang machines, for example on a shared filesystem.
+
+2. Once every handle file exists, start SGLang. The backend needs `--hicache-mem-layout page_first` or `page_first_direct`; it refuses rank-replicated (MLA) pools, heterogeneous-TP head splitting, pipeline parallelism and context parallelism at startup.
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path $MODEL_PATH \
+  --tp 8 \
+  --page-size 64 \
+  --enable-hierarchical-cache \
+  --hicache-mem-layout page_first \
+  --hicache-storage-backend egm \
+  --hicache-storage-backend-extra-config '{"egm_handles": "<OUT_DIR>/handle_{rank}.json", "egm_status_dir": "<STATUS_DIR>"}'
+```
+
+| Extra-config key | Default | Meaning |
+| --- | --- | --- |
+| `egm_handles` | required | Handle file path template; `{rank}` is the TP rank, `{node}` the node index |
+| `egm_rank_map` | node index = rank | List of node indices, one per TP rank |
+| `egm_streams` | `2` | Copy streams per direction |
+| `egm_hb_timeout_s` | `5` | Seconds without a provider heartbeat before the tier is switched off |
+| `egm_max_mismatch` | `0` | Checksum mismatches tolerated before the tier is switched off |
+| `egm_crc_threads` | `4` | Checksum worker threads per rank |
+| `egm_region_shares` | by host pool bytes | `{pool name: fraction}` of the data area per host pool |
+| `egm_status_dir` | unset | Directory for per-rank `status_rank<N>.json` files, written every 10 s |
+
+3. Check that it serves. Each rank logs `EGM rank <N>: regions ...` at its first storage call, and the provider's status log lists the attached ranks (`PROVIDER ranks {0: 1, ...}`, state 1 is attached). In `status_rank<N>.json`, `refused` stays `null` while `counters.set_pages_new`, `counters.exists_hit_pages` and `counters.get_pages_ok` grow under repeated prompts, and `counters.mismatch_pages` and `counters.copy_errors` stay 0. A copy error, a checksum mismatch over the limit, a lost heartbeat or a provider stop switches the tier off for the rest of the run; the rank logs `tier off for this run (...)`, sets `refused`, and keeps serving from L1 and L2.
+
+To stop, create `<OUT_DIR>/STOP`. The ranks detach and the provider frees the memory; SGLang keeps serving without L3.
 
 
 ## Custom Storage Backend Integration
