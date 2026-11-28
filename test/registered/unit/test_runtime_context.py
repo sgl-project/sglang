@@ -1064,6 +1064,27 @@ class TestMoeFlagsGroup(_IsolatedServerArgs):
         self.assertFalse(get_flags().moe.disable_fp4_allgather)
         self.assertFalse(get_flags().moe.speculative_context)
 
+    def test_speculative_swap_carries_backend_explicitness(self):
+        # NVFP4 MoE layers check only a backend the user did not pass, so the
+        # draft must see its own answer and the target get its own back.
+        from sglang.srt.layers.moe.utils import (
+            MoeRunnerBackend,
+            is_moe_runner_backend_explicit,
+            speculative_moe_backend_context,
+        )
+
+        self._init(
+            moe_runner_backend="flashinfer_cutlass",
+            _moe_runner_backend_explicitly_set=True,
+            speculative_moe_runner_backend="auto",
+            _speculative_moe_runner_backend_explicitly_set=False,
+        )
+        cutlass = MoeRunnerBackend.FLASHINFER_CUTLASS
+        self.assertTrue(is_moe_runner_backend_explicit(backend=cutlass))
+        with speculative_moe_backend_context():
+            self.assertFalse(is_moe_runner_backend_explicit(backend=cutlass))
+        self.assertTrue(is_moe_runner_backend_explicit(backend=cutlass))
+
     def test_flashinfer_megamoe_speculative_defaults(self):
         self._init(
             moe_a2a_backend="flashinfer_megamoe",

@@ -31,13 +31,13 @@ from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
     fused_post_expert_norm_weighted_sum,
 )
 from sglang.srt.distributed import moe_tensor_model_parallel_all_reduce
-from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
     MuseSparkNvFp4FusedMoEMethod,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils.device import get_device_capability, is_cuda
+from sglang.srt.layers.quantization.modelopt_quant import _worker_device_capability
+from sglang.srt.utils.device import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.communication.muse_spark_finalize_workspace import (
@@ -53,15 +53,6 @@ _NVFP4_PER_TOKEN_SCALE_INV = 1.0 / (448.0 * 6.0)
 
 _MARLIN_SHAPE_ALIGNMENT = 64
 _MARLIN_BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
-
-
-def _resolve_moe_runner_backend():
-    backend = get_moe_runner_backend()
-    if not backend.is_auto():
-        return backend
-    if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-        return MoeRunnerBackend.MARLIN
-    return MoeRunnerBackend.FLASHINFER_TRTLLM
 
 
 class _DirectDispatcher:
@@ -113,7 +104,8 @@ class MuseSpark1xFp4Experts(nn.Module):
         self.expert_tp_size = expert_tp_size
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.quant_config = quant_config
-        self.moe_runner_backend = _resolve_moe_runner_backend()
+        self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)
+        self.moe_runner_backend = self.quant_method.get_moe_runner_backend(self)
         # SwiGLU, and no routed_scaling here -- Muse folds its route_scale into
         # the topk weights before they reach us.
         self.moe_runner_config = MoeRunnerConfig(
@@ -133,17 +125,9 @@ class MuseSpark1xFp4Experts(nn.Module):
         )
         self.dispatcher = _DirectDispatcher()
 
-        capability = get_device_capability() if is_cuda() else None
+        capability = _worker_device_capability() if is_cuda() else None
         self.use_marlin = self.moe_runner_backend.is_marlin()
         self._sm_major = capability[0] if capability is not None else 0
-        if not self.use_marlin and capability is not None and capability < (10, 0):
-            raise ValueError(
-                f"--moe-runner-backend {self.moe_runner_backend.value} needs a "
-                f"Blackwell (SM100+) device for packed NVFP4 experts, but this "
-                f"device reports SM{capability[0]}{capability[1]}. Launch with "
-                "--moe-runner-backend marlin, or with auto, which selects marlin "
-                "on SM80-SM90."
-            )
         if self.use_marlin:
             assert hidden_size % _MARLIN_SHAPE_ALIGNMENT == 0, (
                 f"NVFP4 Marlin MoE needs expert hidden_size divisible by "
@@ -180,14 +164,13 @@ class MuseSpark1xFp4Experts(nn.Module):
             )
         self.register_buffer("_expert_map", expert_map, persistent=False)
 
-        self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)
         if not self.use_marlin and not self.quant_method.enable_flashinfer_trtllm_moe:
             raise ValueError(
                 "Packed NVFP4 experts need the FlashInfer TRT-LLM MoE backend, "
-                "which prepares the shuffled FP4 weights this forward reads. "
-                "Launch with --moe-runner-backend flashinfer_trtllm."
+                "which prepares the shuffled FP4 weights this forward reads, or "
+                "Marlin. Launch with --moe-runner-backend flashinfer_trtllm on "
+                "SM100-family GPUs, or marlin."
             )
-        self.quant_method._moe_runner_backend = self.moe_runner_backend
         self.quant_method.create_weights(
             layer=self,
             num_experts=num_local_experts,

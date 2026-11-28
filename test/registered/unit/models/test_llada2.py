@@ -86,6 +86,14 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
 
     @patch("sglang.srt.layers.quantization.modelopt_quant.MoeRunner")
     @patch(
+        "sglang.srt.layers.quantization.modelopt_quant.torch.cuda.current_device",
+        return_value=0,
+    )
+    @patch(
+        "sglang.srt.layers.quantization.modelopt_quant.get_cuda_version",
+        return_value=(12, 8),
+    )
+    @patch(
         "sglang.srt.layers.quantization.modelopt_quant.get_device_capability",
         return_value=(10, 0),
     )
@@ -94,10 +102,14 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
         self,
         _is_cuda,
         _capability,
+        _cuda_version,
+        _current_device,
         runner,
     ):
-        quant_method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)
         with get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO):
+            quant_method = ModelOptNvFp4FusedMoEMethod(
+                SimpleNamespace(is_w4a16=False, use_per_token_activation=False)
+            )
             experts = self._build_experts(quant_method)
         self.assertIs(experts.runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM)
         runner.assert_called_once_with(

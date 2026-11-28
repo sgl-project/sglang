@@ -597,5 +597,7 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_tool_call_author_name_mode",
     "disaggregation_decode_first_token_stream",
     "allow_private_media_hosts",
+    "_moe_runner_backend_explicitly_set",
+    "_speculative_moe_runner_backend_explicitly_set",
 )
 # fmt: on
