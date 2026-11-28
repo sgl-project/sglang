@@ -22,6 +22,13 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
     loaded. Read completion, failure coordination and scheduling stay outside.
     """
 
+    @classmethod
+    def build(cls, device_pool, tp_group, attn_tp_group):
+        # Match the linker's load-plan group even without attention DP: CP
+        # ranks can own different pages and must not broadcast to each other.
+        group = attn_tp_group if attn_tp_group is not None else tp_group
+        return super().build(device_pool, group, attn_tp_group=None)
+
     def __init__(self, pool_group, group, src_global_rank):
         if not pool_group.rank_replicated:
             raise ValueError("Linker broadcasts require rank-replicated pools.")
@@ -52,6 +59,7 @@ class LinkerMLADedupBroadcaster(MLAHostDedupBroadcaster):
             group,
             src_global_rank,
         )
+        self.is_src = torch.distributed.get_rank(group) == 0
         # A physical page cannot be split into smaller rows by _bcast_layer.
         max_row_bytes = max(
             buf.shape[1]

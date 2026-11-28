@@ -1,9 +1,15 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     _storage_sharing,
+)
+from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
+    LinkerMLADedupBroadcaster,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -33,6 +39,61 @@ def _sharing(dcp_size=1, **kwargs):
     return _storage_sharing(
         pools, dcp_size=dcp_size, dcp_rank=args["tp_rank"] % dcp_size, **args
     )
+
+
+class TestBroadcastGroup(CustomTestCase):
+    def test_broadcast_stays_within_the_load_plan_group(self):
+        """CP stripes need separate readers even when attention DP is disabled."""
+        tp_group = (0, 1, 2, 3)
+        pool = SimpleNamespace(
+            components=[[torch.empty((4, 2), dtype=torch.uint8)]],
+            buffer_meta=[[(0, 2, 2)]],
+            page_size=1,
+        )
+        pool_group = SimpleNamespace(
+            rank_replicated=True, entry_map={PoolName.KV: pool}, num_layers=1
+        )
+        for dp_enabled in (False, True):
+            for rank in tp_group:
+                for attn_tp_group in (
+                    tp_group[rank // 2 * 2 : rank // 2 * 2 + 2],
+                    None,
+                ):
+                    with (
+                        self.subTest(dp=dp_enabled, rank=rank, attn_tp=attn_tp_group),
+                        patch(
+                            "sglang.srt.mem_cache.mla_host_dedup.is_dp_attention_enabled",
+                            return_value=dp_enabled,
+                        ),
+                        patch(
+                            "sglang.srt.mem_cache.mla_host_dedup.mla_dedup_rank_and_size",
+                            return_value=(rank % 2, 2) if dp_enabled else (rank, 4),
+                        ),
+                        patch.object(
+                            torch.distributed,
+                            "get_rank",
+                            side_effect=lambda group: group.index(rank),
+                        ),
+                        patch.object(
+                            torch.distributed,
+                            "get_process_group_ranks",
+                            side_effect=list,
+                        ),
+                        patch(
+                            "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                            side_effect=lambda *, group_ranks, backend: tuple(
+                                group_ranks
+                            ),
+                        ),
+                        patch.object(LinkerMLADedupBroadcaster, "_warmup_group"),
+                    ):
+                        broadcaster = LinkerMLADedupBroadcaster.build(
+                            pool_group, tp_group, attn_tp_group
+                        )
+                    expected = attn_tp_group if attn_tp_group is not None else tp_group
+                    self.assertEqual(broadcaster.group, expected)
+                    self.assertEqual(broadcaster.src_global_rank, expected[0])
+                    self.assertEqual(broadcaster.is_src, rank == expected[0])
 
 
 class TestStorageSharing(CustomTestCase):
