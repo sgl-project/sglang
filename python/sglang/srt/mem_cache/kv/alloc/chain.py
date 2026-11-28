@@ -285,6 +285,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def size(self, value) -> None:
         pass
 
+    def register_cpu_retraction_draft_pools(self, pools) -> None:
+        # Draft pools are indexed by physical rows, but this chain hands out virtual ids.
+        raise NotImplementedError(
+            "CPU retraction of separate draft KV pools is not supported with the "
+            "unified memory pool"
+        )
+
     def __init__(
         self,
         *,

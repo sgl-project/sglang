@@ -32,6 +32,10 @@ if TYPE_CHECKING:
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Some composite allocators do not call the base constructor. Keep the
+    # default immutable and register the separate pools after draft allocation.
+    cpu_retraction_draft_pools: tuple[KVCache, ...] = ()
+
     # alloc_decode accepts req_to_token_write (one-launch alloc + req_to_token write).
     supports_fused_decode_write = False
     # Whether every pool takes its rows from one shared memory, so the prefix
@@ -87,6 +91,22 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @property
     def size_full(self):
         return self.size
+
+    def register_cpu_retraction_draft_pools(self, pools: tuple[KVCache, ...]) -> None:
+        """Separate EAGLE/MTP pools using this allocator's logical token ids.
+
+        Each pool owns its CPU-copy layout, including MLA DCP localization and
+        DSA index keys/scales. Shared target storage must not be copied twice.
+        """
+        seen = {id(self.get_kvcache())}
+        unique = []
+        for pool in pools:
+            if id(pool) in seen:
+                continue
+            seen.add(id(pool))
+            _check_cpu_copy_support(pool)
+            unique.append(pool)
+        self.cpu_retraction_draft_pools = tuple(unique)
 
     @property
     def has_window_pool(self) -> bool:
@@ -430,3 +450,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             )
             prev_end = start_pos + n
             yield free_index, start_pos
+
+
+def _check_cpu_copy_support(pool: KVCache) -> None:
+    # Fail at startup rather than on the first CPU retraction.
+    from sglang.srt.mem_cache.memory_pool import KVCache
+
+    cls = type(pool)
+    if (
+        cls.get_cpu_copy is KVCache.get_cpu_copy
+        or cls.load_cpu_copy is KVCache.load_cpu_copy
+    ):
+        raise NotImplementedError(
+            f"{cls.__name__} has no CPU copy, so its draft KV cannot survive "
+            "CPU retraction"
+        )
