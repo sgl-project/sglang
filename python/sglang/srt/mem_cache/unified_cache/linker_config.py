@@ -21,10 +21,13 @@ def parse_linker_load_options(
     backend_config = dict(config or {})
     load_mode = backend_config.pop("load_mode", "layer_wise")
     prefetch_policy = backend_config.pop("prefetch_policy", "timeout")
+    decode_prefetch = backend_config.pop("decode_prefetch", False)
     if load_mode not in ("layer_wise", "prefetch"):
         raise ValueError(f"Invalid linker load_mode: {load_mode!r}.")
     if prefetch_policy not in ("best_effort", "wait_complete", "timeout"):
         raise ValueError(f"Invalid linker prefetch_policy: {prefetch_policy!r}.")
+    if not isinstance(decode_prefetch, bool):
+        raise ValueError(f"Invalid linker decode_prefetch: {decode_prefetch!r}.")
     return load_mode, prefetch_policy, backend_config
 
 

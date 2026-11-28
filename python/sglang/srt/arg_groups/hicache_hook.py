@@ -28,7 +28,18 @@ def handle_hicache(server_args: Any):
     )
 
     config = cfg.unified_cache_external_linker_config
-    _, _, backend_config = parse_linker_load_options(config)
+    load_mode, _, backend_config = parse_linker_load_options(config)
+    if (config or {}).get("decode_prefetch", False) and not (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.enable_unified_cache_external_linker
+        and load_mode == "prefetch"
+    ):
+        raise ValueError(
+            "Linker decode_prefetch requires "
+            "--disaggregation-mode decode, --disaggregation-decode-enable-radix-cache, "
+            "and --enable-unified-cache-external-linker with load_mode=prefetch."
+        )
     if cfg.unified_cache_external_linker_backend == "dynamic" and (
         cfg.enable_unified_cache_external_linker or config is not None
     ):

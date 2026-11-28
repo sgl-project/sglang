@@ -1982,7 +1982,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
-            if prefix_match is not None:
+            if (
+                prefix_match is not None
+                and not self.scheduler.enable_decode_linker_prefetch
+            ):
                 reserved_restore_tokens += prefix_match.restore_token_count
             full_allocatable_tokens = self._allocatable_token_budgets(
                 retractable_tokens=retractable_tokens,
@@ -3010,9 +3013,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # awareness, a retracted request should re-match the tree here
         # instead of re-allocating from scratch. See move_resumed.
         delta_len = fill_len - total_prefix_len
-        required_alloc_tokens = self._required_alloc_tokens(
-            fill_len=fill_len, prefix_len=prefix_len
-        )
+        if self.scheduler.enable_decode_linker_prefetch:
+            # Linker prefetch already owns device slots for the restoring prefix.
+            required_alloc_tokens = self._required_alloc_tokens(
+                fill_len=fill_len, prefix_len=total_prefix_len
+            )
+        else:
+            required_alloc_tokens = self._required_alloc_tokens(
+                fill_len=fill_len, prefix_len=prefix_len
+            )
 
         allocator = self.token_to_kv_pool_allocator
         uses_swa_tail = self._uses_swa_tail_prealloc()
