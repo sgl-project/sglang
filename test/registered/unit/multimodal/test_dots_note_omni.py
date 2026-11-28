@@ -202,7 +202,6 @@ class TestDotsNoteOmniProcessMmDataAsync(CustomTestCase):
                 self.processor.process_mm_data_async(
                     request_obj.text,
                     request_obj,
-                    max_req_input_len=4096,
                     **kwargs,
                 )
             )

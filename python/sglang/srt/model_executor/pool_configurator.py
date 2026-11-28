@@ -38,7 +38,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_shards_index_k
-from sglang.srt.mem_cache.allocation_sizing import get_spec_decode_reach
+from sglang.srt.mem_cache.allocation_sizing import get_max_decode_ahead
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     collect_sources_by_ratio,
     get_compress_state_write_pad,
@@ -1175,11 +1175,7 @@ def compute_swa_request_cap(
     # __________[padding][eviction_interval][window]
     # Padding to make sure eviction point is page-aligned.
     trailing_tokens = window + eviction_interval * draft_tokens + page_size
-    if get_spec().speculative_algorithm is None:
-        decode_alloc = page_size
-    else:
-        decode_alloc = get_spec_decode_reach(page_size)
-    per_request = trailing_tokens + decode_alloc
+    per_request = trailing_tokens + get_max_decode_ahead(page_size)
 
     if max_running_requests is None:
         max_running_requests = get_schedule().max_running_requests
