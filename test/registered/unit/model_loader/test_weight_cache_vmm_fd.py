@@ -46,7 +46,7 @@ from torch.multiprocessing.reductions import StorageWeakRef
 from sglang.srt.utils import cuda_vmm_utils
 from sglang.srt.weight_cache import ipc_loader, transport
 from sglang.srt.weight_cache.daemon import WeightCacheDaemon
-from sglang.srt.weight_cache.protocol import CacheConfig, recv_msg, send_msg
+from sglang.srt.weight_cache.protocol import recv_msg, send_msg
 from sglang.srt.weight_cache.transport import (
     TORCH_IPC_BACKEND,
     VMM_FD_BACKEND,
@@ -197,31 +197,8 @@ class _TinyModel(torch.nn.Module):
         )
 
 
-def _cache_config() -> CacheConfig:
-    return CacheConfig(
-        model_path="tiny",
-        model_arch="TinyModel",
-        tp_size=1,
-        tp_rank=0,
-        pp_size=1,
-        pp_rank=0,
-        dp_size=1,
-        ep_size=1,
-        moe_dp_size=1,
-        moe_dp_rank=0,
-        moe_ep_rank=0,
-        attn_dp_size=1,
-        enable_dp_lm_head=False,
-        attn_cp_size=1,
-        moe_dense_tp_size=None,
-        moe_a2a_backend="none",
-        quant_method="",
-        quant_config_hash="",
-        dtype="torch.float32",
-        revision="",
-        device_capability="",
-        torch_version="2.0.0",
-    )
+# The daemon serves a request whose LoadSpec dict equals its own.
+_CACHE_CONFIG = {"checkpoint_id": "tiny", "tp_rank": 0}
 
 
 def _make_daemon(model, backend) -> WeightCacheDaemon:
@@ -232,7 +209,7 @@ def _make_daemon(model, backend) -> WeightCacheDaemon:
     daemon.transport_name = backend.name
     daemon.transport_backend = backend
     daemon.state_entries = {}
-    daemon.config = _cache_config()
+    daemon.config = _CACHE_CONFIG
     daemon.preloaded_weights_bytes = 0
     return daemon
 
@@ -1061,7 +1038,7 @@ class TestAttachAfterAFailedAttach(CustomTestCase):
                     raise AssertionError("the client did not close its socket")
             send_fd(sock, fd, index)
 
-        request = {"type": "fetch_state", "config": _cache_config().to_dict()}
+        request = {"type": "fetch_state", "config": _CACHE_CONFIG}
         send_msg(client_sock, request)
         if break_off == "after_request":
             client_sock.close()

@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Data contracts of weight caching and snapshot loading.
+
+msgspec types only, importing nothing from sglang: load-diff and the validator
+share this module and nothing else.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from typing import Any, Literal, Optional
+
+import msgspec
+
+
+class LoadSpec(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+    """Everything that decides the weights one rank loads; see build_load_spec.
+
+    A cache daemon serves an engine only with an equal spec. A snapshot is looked
+    up by digest(), and the ranks of one load agree on digest(include_rank=False).
+    """
+
+    # Model config: the checkpoint and how it is read. Equal on every rank.
+    # A content digest or pinned commit; the cache daemon passes path[@revision].
+    checkpoint_id: str
+    model_arch: str
+    # The class the model is built from ("module.QualName"): one model_arch can
+    # resolve to several, for example with --model-impl transformers.
+    model_class: str
+    hf_config_hash: str  # effective HF config after model overrides, without paths
+    dtype: str
+    # "draft" for a speculative-decoding draft model. It can have its target's
+    # checkpoint and config and still load other weights, for example from
+    # another weight file format of the same checkpoint.
+    role: Literal["target", "draft"]
+    draft_model_idx: Optional[int]  # layer selected from a multi-layer draft checkpoint
+
+    # Quantization config. Equal on every rank.
+    quant_method: str  # "" for unquantized
+    quant_config_hash: str
+    # The quantization config files in a local checkpoint directory, such as
+    # ModelOpt's hf_quant_config.json with its per-layer recipe; "" if there is none.
+    quant_files_hash: str
+
+    # Parallel config: the layout. Equal on every rank.
+    tp_size: int
+    pp_size: int
+    dp_size: int
+    ep_size: int
+    moe_dp_size: int
+    attn_dp_size: int
+    attn_cp_size: int
+    moe_cp_size: int
+    moe_dense_tp_size: Optional[int]
+    enable_dp_lm_head: bool
+    # SGLANG_PP_LAYER_PARTITION as get_pp_indices reads it: the layer count of each
+    # pipeline stage, e.g. "1,3". None if it is unset or there is a single stage.
+    pp_layer_partition: Optional[str]
+
+    # Parallel config: this rank's shard. The only fields that differ across ranks.
+    tp_rank: int
+    pp_rank: int
+    moe_dp_rank: int
+    moe_ep_rank: int
+
+    # Expert placement config.
+    ep_num_redundant_experts: int
+    enable_eplb: bool
+    init_expert_location: Optional[str]
+
+    # Kernel config: backends and features that post-process the weights differently.
+    moe_a2a_backend: str
+    moe_runner_backend: str
+    fp4_gemm_runner_backend: str
+    fp8_gemm_runner_backend: str
+    bf16_gemm_backend: str
+    flashinfer_cutedsl_swap_ab: Optional[bool]
+    enable_fp32_lm_head: bool
+
+    # Environment: the process that post-processes the weights.
+    device_capability: str
+    torch_version: str
+
+    def __post_init__(self):
+        if not self.checkpoint_id:
+            raise ValueError("A load spec requires a checkpoint ID")
+        # Direct construction and structs.replace skip msgspec's Literal check.
+        if self.role not in ("target", "draft"):
+            raise ValueError(f"Unknown model role {self.role!r}")
+
+    def digest(self, *, include_rank: bool = True) -> str:
+        """Identify this rank's shard, or without the rank what all ranks share."""
+        fields = msgspec.to_builtins(self)
+        if not include_rank:
+            for name in ("tp_rank", "pp_rank", "moe_dp_rank", "moe_ep_rank"):
+                del fields[name]
+        return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+
+class StorageMeta(msgspec.Struct, frozen=True, kw_only=True):
+    """One allocation of the owner's model, moved as raw bytes."""
+
+    nbytes: int
+    device: str  # "cuda" or "cpu"
+
+
+class SnapshotManifest(msgspec.Struct, frozen=True, kw_only=True):
+    """What an owner published for one rank; each part reads only its own fields."""
+
+    # Minted by the owners' publish vote; equal on every rank of one publish.
+    version: str
+    # Filled by load-diff, moved by the transport, digested by the validator.
+    storages: dict[str, StorageMeta]
+    # Tensors, changed values and the expert map; only load-diff decodes it.
+    load_diff: bytes
+    # The owner's raw load as the validator described it; only the validator reads it.
+    attestation: bytes
+    # Where the bytes are; only the transport reads it.
+    source: dict[str, Any]
