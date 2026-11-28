@@ -8,13 +8,13 @@ import torch
 import torch.nn.functional as F
 from prometheus_client import CollectorRegistry
 from safetensors.torch import save_file
+from torch.multiprocessing.reductions import StorageWeakRef
 
 import sglang.multimodal_gen.runtime.layers.linear as linear
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     BaseLayerWithLoRA,
-    _use_owned_base_snapshot,
     wrap_with_lora_layer,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
@@ -262,9 +262,7 @@ def test_merge_cache_only_accepts_cpu_backed_weights(tmp_path, monkeypatch):
     )
     assert cache_root() != before
 
-    resident_layer = BaseLayerWithLoRA(
-        torch.nn.Linear(2, 2, bias=False, device="meta"), snapshot_base=False
-    )
+    resident_layer = BaseLayerWithLoRA(torch.nn.Linear(2, 2, bias=False, device="meta"))
     resident_cache = pipeline._merge_cache_for(
         "transformer",
         {"linear": resident_layer},
@@ -275,24 +273,57 @@ def test_merge_cache_only_accepts_cpu_backed_weights(tmp_path, monkeypatch):
     assert resident_cache is None
 
 
-def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
-    assert not _use_owned_base_snapshot(False, "cpu")
-    assert not _use_owned_base_snapshot(False, "meta")
-    assert _use_owned_base_snapshot(False, "cuda")
-    assert not _use_owned_base_snapshot(False, "cuda", numel=1)
-    assert _use_owned_base_snapshot(True, "cpu")
+@pytest.mark.parametrize("column_parallel", [False, True])
+def test_dynamic_lora_releases_rebound_base_storage(column_parallel):
+    if column_parallel:
+        group = SimpleNamespace(world_size=1, rank_in_group=0)
+        base = linear.ColumnParallelLinear(4, 4, bias=False, tp_group=group)
+    else:
+        base = torch.nn.Linear(4, 4, bias=False)
+    old_storage = StorageWeakRef(base.weight.untyped_storage())
+    layer = wrap_with_lora_layer(base, lora_rank=1, lora_alpha=1)
+    layer.set_lora_weights(torch.ones(1, 4), torch.ones(4, 1), merge_weights=False)
+    # Offload and IPC can rebind the parameter after the wrapper was installed.
+    base.weight.data = torch.full_like(base.weight, 2)
+    assert layer.cpu_weight is None
+    assert old_storage.expired()
 
-    cpu_layer = wrap_with_lora_layer(
-        torch.nn.Linear(2, 2, bias=False), snapshot_base=False
-    )
-    assert cpu_layer is not None
-    assert cpu_layer._base_is_view
 
-    meta_layer = wrap_with_lora_layer(
-        torch.nn.Linear(2, 2, bias=False, device="meta"), snapshot_base=False
-    )
-    assert meta_layer is not None
-    assert meta_layer._base_is_view
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires CUDA"
+            ),
+        ),
+    ],
+)
+def test_set_lora_dynamic_merge_dynamic_roundtrip(device):
+    layer = wrap_with_lora_layer(torch.nn.Linear(2, 2, bias=False, device=device))
+    pipeline = _make_pipeline(layer)
+    pipeline._temporarily_disable_offload = lambda *args, **kwargs: nullcontext([])
+    original = layer.weight.detach().clone()
+    x = torch.tensor([[1.0, 2.0]], device=device)
+    pipeline.lora_adapters["adapter"] = {
+        name: tensor.to(device)
+        for name, tensor in pipeline.lora_adapters["adapter"].items()
+    }
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", strength=0.5)
+        assert layer.cpu_weight is None
+        expected = x @ original.T + 1.5
+        torch.testing.assert_close(layer(x), expected)
+        pipeline.set_lora("adapter", strength=0.5, merge_mode="merge")
+        assert layer.merged
+        torch.testing.assert_close(layer.cpu_weight, original.cpu(), rtol=0, atol=0)
+        torch.testing.assert_close(layer(x), expected)
+        pipeline.set_lora("adapter", strength=0.5, merge_mode="dynamic")
+        assert not layer.merged and layer.cpu_weight is None
+        torch.testing.assert_close(layer.weight, original, rtol=0, atol=0)
+        torch.testing.assert_close(layer(x), expected)
 
 
 def test_quantized_base_uses_dynamic_lora_in_auto_mode():
@@ -690,13 +721,13 @@ def test_lora_exact_file_url_needs_no_weight_name(tmp_path):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("offloaded", [False, True])
-def test_view_merge_restores_exact_base_after_strength_changes(dtype, offloaded):
+def test_merge_restores_exact_base_after_strength_changes(dtype, offloaded):
     torch.manual_seed(0)
     base = torch.nn.Linear(4, 4, bias=False, dtype=dtype)
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2)
+    assert layer.cpu_weight is None
+    base.weight.data = torch.randn_like(base.weight)
     original = base.weight.detach().clone()
-    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
-    assert layer is not None
-    assert layer._base_is_view
     stored = base.weight.detach()
     if offloaded:
         base._packed_weight_cpu = stored
@@ -704,13 +735,12 @@ def test_view_merge_restores_exact_base_after_strength_changes(dtype, offloaded)
     A = torch.randn(2, 4)
     B = torch.randn(4, 2)
     layer.set_lora_weights(A, B, clear_existing=True, merge_weights=False)
-    assert layer._base_is_view
+    assert layer.cpu_weight is None
     for strength in (1.0, 0.0, 0.5, 1.0):
         layer.set_lora_weights(
             A, B, strength=strength, clear_existing=True, merge_weights=True
         )
         assert layer.merged
-        assert not layer._base_is_view
         torch.testing.assert_close(layer.cpu_weight, original, rtol=0, atol=0)
         if strength == 0:
             torch.testing.assert_close(stored, original, rtol=0, atol=0)
@@ -724,10 +754,11 @@ def test_view_merge_restores_exact_base_after_strength_changes(dtype, offloaded)
 def test_cached_merge_restores_untouched_base_view():
     base = torch.nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
     original = base.weight.detach().clone()
-    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2, snapshot_base=False)
+    layer = wrap_with_lora_layer(base, lora_rank=2, lora_alpha=2)
     layer.set_lora_weights(torch.ones(2, 4), torch.ones(4, 2), merge_weights=False)
-    layer.install_merged_weight(original + 2, base.weight.detach())
-    assert layer._base_is_view
+    base_view = base.weight.detach()
+    layer.install_merged_weight(original + 2, base_view)
+    assert layer.cpu_weight.data_ptr() == base_view.data_ptr()
     torch.testing.assert_close(layer.cpu_weight, original, rtol=0, atol=0)
     layer.unmerge_lora_weights()
     torch.testing.assert_close(base.weight, original, rtol=0, atol=0)

@@ -52,12 +52,13 @@ from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftMode,
     HiCacheDraftPlan,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-amd")
 
 
 class TestDecodeRetractionBackup(CustomTestCase):
@@ -165,7 +166,7 @@ class TestDecodeRetractionBackup(CustomTestCase):
 
         req_to_token_pool = ReqToTokenPool(
             size=2,
-            max_context_len=self.pool_size,
+            row_width=self.pool_size,
             device=self.device,
             enable_memory_saver=False,
         )

@@ -32,6 +32,7 @@ from sglang.srt.managers.io_struct import (
     DetachHiCacheStorageReqOutput,
     DumperControlReqInput,
     DumperControlReqOutput,
+    ElasticControlOutput,
     EndWeightUpdateReqInput,
     EndWeightUpdateReqOutput,
     ExpertDistributionReq,
@@ -90,6 +91,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
+    unwrap_from_pickle,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.platforms import current_platform
@@ -194,6 +196,7 @@ class TokenizerControlMixin:
 
     def init_communicators(self: TokenizerManager):
         dispatch_pairs = []
+        self._control_communicator_by_type = {}
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
@@ -204,9 +207,27 @@ class TokenizerControlMixin:
             )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
+            self._control_communicator_by_type[resp_type] = comm
+        dispatch_pairs.append(
+            (ElasticControlOutput, self._handle_elastic_control_reply)
+        )
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
 
-    def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
+    def _handle_elastic_control_reply(
+        self: TokenizerManager, reply: ElasticControlOutput
+    ):
+        payload = unwrap_from_pickle(reply.payload)
+        comm = self._control_communicator_by_type.get(type(payload))
+        if comm is None:
+            self._result_dispatcher(payload)
+        else:
+            comm.handle_recv(payload, sender=reply.sender_dp_rank)
+
+    def update_control_communicator_fan_out(
+        self: TokenizerManager, worker_count: int, *, keep_scale_fan_out: bool = False
+    ):
+        """``keep_scale_fan_out``: leave scale_elastic_ep wide, as it still needs the
+        retirees' acks while every other control call stops waiting on them."""
         primary_group_control = (
             get_parallel().attn_dp_enabled and not is_control_broadcast_local()
         )
@@ -218,9 +239,15 @@ class TokenizerControlMixin:
             control_fan_out = worker_count
 
         for spec in _COMMUNICATOR_SPECS:
-            getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
+            if keep_scale_fan_out and spec[0] == "scale_elastic_ep":
+                continue
+            getattr(self, f"{spec[0]}_communicator").set_fan_out(
+                worker_count, live_senders=worker_count
+            )
 
-        self.get_internal_state_communicator.set_fan_out(control_fan_out)
+        self.get_internal_state_communicator.set_fan_out(
+            control_fan_out, live_senders=worker_count
+        )
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -234,8 +261,6 @@ class TokenizerControlMixin:
         truncated = False
         try:
             if not obj.corpus_id:
-                import uuid
-
                 obj.corpus_id = uuid.uuid4().hex
             if obj.file_path is not None:
                 from sglang.srt.speculative.cpp_ngram.external_corpus import (
@@ -334,9 +359,10 @@ class TokenizerControlMixin:
         self: TokenizerManager, timeout_s: Optional[float] = None
     ) -> FlushCacheReqOutput:
         self.auto_create_handle_loop()
-        result = (
-            await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
-        )[0]
+        results = await self.flush_cache_communicator(
+            FlushCacheReqInput(timeout_s=timeout_s)
+        )
+        result = next((reply for reply in results if not reply.success), results[0])
         if result.success and self.mm_processor is not None:
             self.mm_processor.clear_preprocess_cache()
         return result
@@ -687,6 +713,69 @@ class TokenizerControlMixin:
             self.pending_lora_unloads.pop(obj.lora_name)
         return result
 
+    async def _load_lora_adapter_locked(
+        self: TokenizerManager,
+        obj: LoadLoRAAdapterReqInput | LoadLoRAAdapterFromTensorsReqInput,
+        *,
+        lora_path: str,
+    ) -> LoRAUpdateOutput:
+        """Load one adapter on every rank and evict LRU adapters over the limit;
+        the caller holds lora_update_lock."""
+        if obj.lora_name in self.pending_lora_unloads:
+            raise ValueError(
+                f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
+                "Retry the unload before loading it again."
+            )
+
+        # Generate new uniquely identifiable LoRARef object.
+        new_adapter = LoRARef(
+            lora_name=obj.lora_name,
+            lora_path=lora_path,
+            pinned=obj.pinned,
+        )
+
+        # Trigger the actual loading operation at the backend processes.
+        obj.lora_id = new_adapter.lora_id
+        rank_results = await self.update_lora_adapter_communicator(obj)
+        result = _merge_lora_update_results(rank_results)
+        if result.success:
+            await self.lora_registry.register(new_adapter)
+            self.lora_ref_cache[obj.lora_name] = new_adapter
+        elif (
+            obj.lora_name not in self.lora_registry.get_all_adapters()
+            and _lora_load_needs_cleanup(rank_results, obj.lora_name)
+        ):
+            self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
+
+        if get_lora().max_loaded_loras is not None:
+            while self.lora_registry.num_registered_loras > get_lora().max_loaded_loras:
+                lru_lora_name = await self.lora_registry.lru_lora_name(
+                    exclude_pinned=True
+                )
+                if lru_lora_name is None:
+                    raise ValueError(
+                        "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
+                        f"LoRA registry is: {self.lora_registry._registry}"
+                    )
+
+                logger.info(
+                    f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
+                    f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
+                    f"max allowed: {get_lora().max_loaded_loras})"
+                )
+
+                unload_result = await self._unload_lora_adapter_locked(
+                    UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
+                )
+                if not unload_result.success:
+                    raise ValueError(
+                        f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
+                        f"{unload_result.error_message}"
+                    )
+                del result.loaded_adapters[lru_lora_name]
+
+        return result
+
     async def load_lora_adapter(
         self: TokenizerManager,
         obj: LoadLoRAAdapterReqInput,
@@ -710,63 +799,9 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
-                if obj.lora_name in self.pending_lora_unloads:
-                    raise ValueError(
-                        f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
-                        "Retry the unload before loading it again."
-                    )
-
-                # Generate new uniquely identifiable LoRARef object.
-                new_adapter = LoRARef(
-                    lora_name=obj.lora_name,
-                    lora_path=obj.lora_path,
-                    pinned=obj.pinned,
+                return await self._load_lora_adapter_locked(
+                    obj, lora_path=obj.lora_path
                 )
-
-                # Trigger the actual loading operation at the backend processes.
-                obj.lora_id = new_adapter.lora_id
-                rank_results = await self.update_lora_adapter_communicator(obj)
-                result = _merge_lora_update_results(rank_results)
-                if result.success:
-                    await self.lora_registry.register(new_adapter)
-                    self.lora_ref_cache[obj.lora_name] = new_adapter
-                elif (
-                    obj.lora_name not in self.lora_registry.get_all_adapters()
-                    and _lora_load_needs_cleanup(rank_results, obj.lora_name)
-                ):
-                    self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
-
-                if get_lora().max_loaded_loras is not None:
-                    while (
-                        self.lora_registry.num_registered_loras
-                        > get_lora().max_loaded_loras
-                    ):
-                        lru_lora_name = await self.lora_registry.lru_lora_name(
-                            exclude_pinned=True
-                        )
-                        if lru_lora_name is None:
-                            raise ValueError(
-                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
-                                f"LoRA registry is: {self.lora_registry._registry}"
-                            )
-
-                        logger.info(
-                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
-                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {get_lora().max_loaded_loras})"
-                        )
-
-                        unload_result = await self._unload_lora_adapter_locked(
-                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
-                        )
-                        if not unload_result.success:
-                            raise ValueError(
-                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
-                                f"{unload_result.error_message}"
-                            )
-                        del result.loaded_adapters[lru_lora_name]
-
-                return result
         except ValueError as e:
             return LoadLoRAAdapterReqOutput(
                 success=False,
@@ -799,60 +834,7 @@ class TokenizerControlMixin:
             )
 
             async with self.lora_update_lock:
-                if obj.lora_name in self.pending_lora_unloads:
-                    raise ValueError(
-                        f"LoRA adapter '{obj.lora_name}' has an incomplete unload. "
-                        "Retry the unload before loading it again."
-                    )
-
-                new_adapter = LoRARef(
-                    lora_name=obj.lora_name,
-                    lora_path="__tensor__",
-                    pinned=obj.pinned,
-                )
-                obj.lora_id = new_adapter.lora_id
-                rank_results = await self.update_lora_adapter_communicator(obj)
-                result = _merge_lora_update_results(rank_results)
-                if result.success:
-                    await self.lora_registry.register(new_adapter)
-                    self.lora_ref_cache[obj.lora_name] = new_adapter
-                elif (
-                    obj.lora_name not in self.lora_registry.get_all_adapters()
-                    and _lora_load_needs_cleanup(rank_results, obj.lora_name)
-                ):
-                    self.pending_lora_unloads[obj.lora_name] = new_adapter.lora_id
-
-                if get_lora().max_loaded_loras is not None:
-                    while (
-                        self.lora_registry.num_registered_loras
-                        > get_lora().max_loaded_loras
-                    ):
-                        lru_lora_name = await self.lora_registry.lru_lora_name(
-                            exclude_pinned=True
-                        )
-                        if lru_lora_name is None:
-                            raise ValueError(
-                                "Didn't find any LoRA adapters when trying to evict LRU LoRA adapter. "
-                                f"LoRA registry is: {self.lora_registry._registry}"
-                            )
-
-                        logger.info(
-                            f"Unloading least recently used LoRA adapter '{lru_lora_name}' "
-                            f"(current number of adapters: {self.lora_registry.num_registered_loras}, "
-                            f"max allowed: {get_lora().max_loaded_loras})"
-                        )
-
-                        unload_result = await self._unload_lora_adapter_locked(
-                            UnloadLoRAAdapterReqInput(lora_name=lru_lora_name)
-                        )
-                        if not unload_result.success:
-                            raise ValueError(
-                                f"Error while unloading LRU LoRA adapter '{lru_lora_name}': "
-                                f"{unload_result.error_message}"
-                            )
-                        del result.loaded_adapters[lru_lora_name]
-
-                return result
+                return await self._load_lora_adapter_locked(obj, lora_path="__tensor__")
         except ValueError as e:
             return LoadLoRAAdapterFromTensorsReqOutput(
                 success=False,

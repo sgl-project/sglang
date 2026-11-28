@@ -610,7 +610,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 is_write_back=False,
                 enable_hicache=False,
                 write_through_threshold=256,
-                device=str(self.device),
+                empty_device_indices=torch.empty(
+                    0, dtype=torch.int64, device=self.device
+                ),
                 # The window slot's history, as SWAComponent keeps it, the
                 # fused draft's front rows included.
                 swa_sliding_window_size=window,
@@ -1033,6 +1035,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()
 
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        self._binding.set_mamba_path_cap_counts_host(enabled)
+
     @property
     def is_host_memory_buffer_only(self) -> bool:
         return self._binding.is_host_memory_buffer_only()
@@ -1291,6 +1296,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def rotation_base_of(self, node_id: NodeId) -> Optional[int]:
         return self._binding.rotation_base_of(node_id)
+
+    def rotation_phase_of(self, node_id: NodeId) -> Optional[int]:
+        return self._binding.rotation_phase_of(node_id)
 
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         return self._binding.dfs_weight_order(list(node_ids))

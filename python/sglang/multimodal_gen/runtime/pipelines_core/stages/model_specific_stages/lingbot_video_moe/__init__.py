@@ -1,6 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
+
 """LingBot-Video MoE model-specific pipeline stages."""
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (  # noqa: F401
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.denoising import (
+    LingBotVideoDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.image_conditioning import (
+    LingBotVideoImageConditioningStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.refiner_stages import (
+    LingBotVideoRefinementStage,
+    LingBotVideoRefinerUpscaleStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.lingbot_video_moe.text_encoding import (
     LingBotVideoTextEncodingStage,
 )
+
+__all__ = [
+    "LingBotVideoDenoisingStage",
+    "LingBotVideoImageConditioningStage",
+    "LingBotVideoRefinementStage",
+    "LingBotVideoRefinerUpscaleStage",
+    "LingBotVideoTextEncodingStage",
+]

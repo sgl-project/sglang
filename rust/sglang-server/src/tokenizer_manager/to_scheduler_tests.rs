@@ -198,7 +198,7 @@ fn request_abort_keeps_the_sink_and_queues_behind_the_request() {
 }
 
 /// A context ceiling high enough that only a test which sets one on purpose
-/// can reach it. `context_len` is mandatory now, so "no ceiling" has to be a
+/// can reach it. The length limits are mandatory, so "no ceiling" has to be a
 /// large number rather than `None`; kept well below `u64::MAX` so the
 /// `as i64` in the auto-truncate clamp cannot go negative if a future test
 /// does reach this path.
@@ -206,13 +206,14 @@ const NO_CONTEXT_CEILING: u64 = 1 << 40;
 
 /// The default test limits: a real tokenizer, vocab 1000, no context ceiling.
 /// Spelled out rather than `..Default::default()` — `Limits` deliberately has
-/// no `Default`, because a zero `vocab_size`/`context_len` would reject every
+/// no `Default`, because a zero `vocab_size`/`max_req_len` would reject every
 /// request instead of behaving like "unset".
 fn test_limits() -> Limits {
     Limits {
         skip_tokenizer_init: false,
         vocab_size: 1000,
-        context_len: NO_CONTEXT_CEILING,
+        max_req_len: NO_CONTEXT_CEILING,
+        max_req_input_len: NO_CONTEXT_CEILING,
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
         return_hidden_states_mode: HiddenStatesMode::Null,
@@ -240,7 +241,7 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
 #[test]
 fn total_tokens_over_context_is_rejected() {
     let limits = Limits {
-        context_len: 10,
+        max_req_len: 10,
         ..test_limits()
     };
     let mut g = GenerateRequest {
@@ -271,7 +272,7 @@ fn total_tokens_over_context_is_rejected() {
 #[test]
 fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
     let limits = Limits {
-        context_len: 1000,
+        max_req_len: 1000,
         ..test_limits()
     };
     let request = |max_new_tokens| GenerateRequest {
@@ -305,7 +306,7 @@ fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
 #[test]
 fn reserved_tokens_count_toward_the_limit() {
     let limits = Limits {
-        context_len: 10,
+        max_req_len: 10,
         num_reserved_tokens: 5,
         ..test_limits()
     };
@@ -335,7 +336,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
         ..Default::default()
     };
     let truncating = Limits {
-        context_len: 10,
+        max_req_len: 10,
         allow_auto_truncate: true,
         ..test_limits()
     };
@@ -351,7 +352,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
     // itself is still checked (see `input_length_is_checked_unconditionally`).
     g.sampling_params = sp(None);
     let roomy = Limits {
-        context_len: 100,
+        max_req_len: 100,
         ..test_limits()
     };
     assert!(check_total_tokens(&mut g, &roomy).is_ok());
@@ -364,7 +365,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
 fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
     for allow_auto_truncate in [false, true] {
         let limits = Limits {
-            context_len: 10,
+            max_req_len: 10,
             allow_auto_truncate,
             ..test_limits()
         };
@@ -387,26 +388,28 @@ fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
         ..Default::default()
     };
     let limits = Limits {
-        context_len: 10,
+        max_req_input_len: 9,
         ..test_limits()
     };
     let err = check_total_tokens(&mut g, &limits).unwrap_err();
-    assert!(err.to_string().contains("longer than the model's context"));
+    assert!(
+        err.to_string()
+            .contains("exceeds the maximum allowed length")
+    );
 }
 
 /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
 /// alone must still fit. Gating the whole function on `max_new_tokens` let an
 /// over-long prompt through to the scheduler with no error at all.
-/// Python compares with `>=`: a prompt that exactly fills the window leaves no
-/// room to generate.
+/// The limit is inclusive: a prompt of exactly `max_req_input_len` tokens fits.
 #[test]
 fn input_length_is_checked_unconditionally() {
     let limits = Limits {
-        context_len: 3,
+        max_req_input_len: 2,
         ..test_limits()
     };
     let req = |max_new_tokens| GenerateRequest {
-        input_ids: Some(vec![1, 2, 3]), // exactly fills a 3-token window
+        input_ids: Some(vec![1, 2, 3]), // one past a 2-token limit
         sampling_params: SamplingParams {
             max_new_tokens,
             ..Default::default()
@@ -415,9 +418,15 @@ fn input_length_is_checked_unconditionally() {
     };
     for max_new_tokens in [None, Some(1)] {
         let err = check_total_tokens(&mut req(max_new_tokens), &limits)
-            .expect_err("input == context_len must be rejected (Python uses >=)");
+            .expect_err("input > max_req_input_len must be rejected");
         assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("longer than the model's context"));
+        // Python's `get_input_length_error` text, byte for byte.
+        assert_eq!(
+            err.to_string(),
+            "Input length (3 tokens) exceeds the maximum allowed length (2 tokens). \
+             This model's maximum context length is 2 tokens on this server. \
+             Use a shorter input or enable --allow-auto-truncate."
+        );
     }
     // One token shorter fits, with or without a cap.
     let mut g = GenerateRequest {
@@ -436,9 +445,20 @@ fn input_length_is_checked_unconditionally() {
     assert!(check_total_tokens(&mut g, &truncating).is_ok());
     assert_eq!(
         g.input_ids.as_deref(),
-        Some(&[1, 2, 3][..]),
-        "fits at the cap"
+        Some(&[1, 2][..]),
+        "cut to the limit"
     );
+    let reserving = Limits {
+        num_reserved_tokens: 1,
+        ..truncating
+    };
+    // Reserved slots are already out of `max_req_input_len`.
+    let mut g = GenerateRequest {
+        input_ids: Some(vec![1, 2]),
+        ..Default::default()
+    };
+    assert!(check_total_tokens(&mut g, &reserving).is_ok());
+    assert_eq!(g.input_ids.as_deref(), Some(&[1, 2][..]), "not cut");
 }
 
 /// The clamp runs AFTER `verify` (which happens in `Normalizing`), so lowering
@@ -448,7 +468,7 @@ fn input_length_is_checked_unconditionally() {
 #[test]
 fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     let limits = Limits {
-        context_len: 10,
+        max_req_len: 10,
         allow_auto_truncate: true,
         ..test_limits()
     };
@@ -544,7 +564,7 @@ fn limits_resolve_the_hidden_states_mode() {
 #[test]
 fn over_context_request_deregisters_unless_its_cap_is_defaulted() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
-        context_len: 4,
+        max_req_len: 4,
         ..test_limits()
     });
     let sampling_params = SamplingParams {
@@ -1403,11 +1423,14 @@ fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffe
 
 /// An abort while the request is out in the mm pool cancels it: the sink is
 /// deregistered at once, no AbortReq is sent (the scheduler never saw the
-/// rid), and the returning request is dropped instead of pushed -- releasing
-/// the shm its buffers carry -- so no GPU time or KV memory goes to a client
-/// that left.
+/// rid), the request's `MmCancellation` runs its callbacks for the processor,
+/// and the returning request is dropped instead of pushed -- releasing the shm
+/// its buffers carry -- so no GPU time or KV memory goes to a client that left.
 #[test]
 fn abort_while_in_mm_pool_drops_on_return() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
     let (tx, mut rx) = mpsc::channel(8);
     let mut req = mm_pretokenized_req("mm-gone");
@@ -1415,8 +1438,26 @@ fn abort_while_in_mm_pool_drops_on_return() {
     intake.drive(req);
     let mut req = mm_rx.try_recv().expect("sent to the mm pool");
     assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    let RequestKind::Generate(g) = &req.kind else {
+        panic!("a generate request");
+    };
+    let cancellation = g.mm.as_ref().unwrap().cancellation.clone();
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let count = |cancels: &Arc<AtomicUsize>| {
+        let cancels = cancels.clone();
+        move || {
+            cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    cancellation.on_cancel(count(&cancels));
+    assert!(!cancellation.is_cancelled());
 
     intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
+    assert!(cancellation.is_cancelled());
+    assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    // A processor that registers after the abort is told at once.
+    cancellation.on_cancel(count(&cancels));
+    assert_eq!(cancels.load(Ordering::SeqCst), 2);
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "mm-gone")
     );
@@ -1614,7 +1655,7 @@ fn tokenizer_pool_return_leaves_fitted_prompt_ids() {
         let case = format!("aborted={aborted} truncating={truncating}");
         let (mut intake, tok_rx, _mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(false);
         if truncating {
-            intake.limits.context_len = 2;
+            intake.limits.max_req_input_len = 2;
             intake.limits.allow_auto_truncate = true;
         }
         let (tx, _rx) = mpsc::channel(8);
