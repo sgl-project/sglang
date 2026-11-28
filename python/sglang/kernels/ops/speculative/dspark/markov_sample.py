@@ -283,7 +283,8 @@ def _launch_partial(
 
 class MarkovSampleStep:
     """Returns global token ids. ``bias`` covers the first ``width`` columns of
-    the rank's padded shard ``base_logits``. Sharded, ``gather`` exchanges
+    the rank's padded shard ``base_logits``, or adds nothing when None (CUDA and CPU
+    only; ``vocab_limit`` still masks the tail). Sharded, ``gather`` exchanges
     per-block candidates, or ``gather_logits`` the kept ``logits_out`` whole;
     without ``gather_logits`` the kept logits stay on the shard.
     ``has_sampled_rows=False`` argmaxes every row. ``fold=(weight, bias)``:
@@ -295,6 +296,11 @@ class MarkovSampleStep:
     def execute(cls, **kwargs) -> torch.Tensor:
         if inputs_on_cuda(**kwargs):
             if _is_npu:
+                if kwargs.get("bias") is None:
+                    raise NotImplementedError(
+                        "MarkovSampleStep on NPU needs a bias; bias=None is CUDA and "
+                        "CPU only."
+                    )
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton
 
                 return markov_sample_step_triton(**kwargs)
@@ -314,18 +320,21 @@ class MarkovSampleStep:
         logits_out,
         fold=None,
     ):
-        assert base_logits.ndim == bias.ndim == 2
-        assert bias.shape[0] == base_logits.shape[0]
-        assert bias.stride(1) == base_logits.stride(1) == 1
-        if fold is None:
-            assert bias.shape[1] <= base_logits.shape[1]
+        assert base_logits.ndim == 2 and base_logits.stride(1) == 1
+        if bias is None:
+            assert fold is None, "fold computes the bias from the rows' latents"
         else:
-            assert gather_logits is None
-            weight, fold_bias = fold
-            assert weight.is_contiguous() and fold_bias.is_contiguous()
-            assert weight.shape == (fold_bias.shape[0], bias.shape[1])
-            assert weight.shape[0] <= base_logits.shape[1]
-            assert triton.next_power_of_2(weight.shape[1]) == weight.shape[1]
+            assert bias.ndim == 2 and bias.stride(1) == 1
+            assert bias.shape[0] == base_logits.shape[0]
+            if fold is None:
+                assert bias.shape[1] <= base_logits.shape[1]
+            else:
+                assert gather_logits is None
+                weight, fold_bias = fold
+                assert weight.is_contiguous() and fold_bias.is_contiguous()
+                assert weight.shape == (fold_bias.shape[0], bias.shape[1])
+                assert weight.shape[0] <= base_logits.shape[1]
+                assert triton.next_power_of_2(weight.shape[1]) == weight.shape[1]
         assert temperatures.shape == (base_logits.shape[0],)
         assert temperatures.dtype == torch.float32 and temperatures.stride(0) == 1
         assert offset.dtype == torch.int64 and offset.numel() == 1
@@ -345,7 +354,7 @@ class MarkovSampleStep:
         cls,
         *,
         base_logits: torch.Tensor,
-        bias: torch.Tensor,
+        bias: Optional[torch.Tensor],
         temperatures: torch.Tensor,
         key: int,
         offset: torch.Tensor,
@@ -372,7 +381,12 @@ class MarkovSampleStep:
             logits_out,
             fold,
         )
-        rows, width = bias.shape if fold is None else (bias.shape[0], fold[0].shape[0])
+        if bias is None:
+            rows, width = base_logits.shape
+        elif fold is None:
+            rows, width = bias.shape
+        else:
+            rows, width = bias.shape[0], fold[0].shape[0]
         launch = functools.partial(
             _launch_partial,
             temperatures=temperatures,
@@ -433,7 +447,7 @@ class MarkovSampleStep:
         cls,
         *,
         base_logits: torch.Tensor,
-        bias: torch.Tensor,
+        bias: Optional[torch.Tensor],
         temperatures: torch.Tensor,
         key: int,
         offset: torch.Tensor,
@@ -460,9 +474,10 @@ class MarkovSampleStep:
             gather_logits,
             logits_out,
         )
-        rows, width = bias.shape
+        rows, width = (base_logits if bias is None else bias).shape
         value = base_logits.to(torch.float32, copy=True)
-        value[:, :width] += bias.float()
+        if bias is not None:
+            value[:, :width] += bias.float()
         value = value.to(step_dtype).float()
         if softcap is not None:
             value = (torch.tanh(value / softcap) * softcap).to(step_dtype).float()
