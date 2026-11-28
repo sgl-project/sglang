@@ -235,10 +235,7 @@ impl TokenizerRegistry {
                 .and_then(|config| config.as_object().cloned())
                 .unwrap_or_default(),
             // Read from the chat formatter below.
-            always_thinks: false,
-            reasoning_toggle: None,
-            chat_encoding_spec: None,
-            deepseek: None,
+            ..ChatModel::default()
         };
         me.inner.insert(m.id.clone(), t);
         me.stats = stats;

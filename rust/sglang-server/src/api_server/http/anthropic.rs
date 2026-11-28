@@ -158,6 +158,52 @@ mod tests {
         assert_eq!(json["error"]["type"], "invalid_request_error");
     }
 
+    /// `/v1/messages` decodes on its own, so Gemma 4's markers must survive
+    /// for its reasoning parser to split the thinking block from the text.
+    #[tokio::test]
+    async fn gemma4_messages_keep_reasoning_markers() {
+        use crate::api_server::http::openai::test_utils::{GEMMA4_STRIPPED, gemma4_marker_state};
+
+        for (model_type, expected) in [
+            (
+                "gemma4",
+                serde_json::json!([
+                    {"type": "thinking", "thinking": "Check the calculation."},
+                    {"type": "text", "text": "The answer is 4."},
+                ]),
+            ),
+            (
+                "llama",
+                serde_json::json!([{"type": "text", "text": GEMMA4_STRIPPED}]),
+            ),
+        ] {
+            let state = gemma4_marker_state(model_type, Some("gemma4"), |_| {});
+            let (status, body) = post(
+                state,
+                "/v1/messages",
+                r#"{"model": "model", "max_tokens": 8, "messages": [{"role": "user", "content": "What is 2 + 2?"}]}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let content: Vec<serde_json::Value> = json["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|block| {
+                    let mut block = block.clone();
+                    block.as_object_mut().unwrap().remove("signature");
+                    block
+                })
+                .collect();
+            assert_eq!(
+                serde_json::Value::from(content),
+                expected,
+                "{model_type}: {body}"
+            );
+        }
+    }
+
     /// The streamed form is SSE with the event name on each frame, in the
     /// Anthropic order.
     #[tokio::test]

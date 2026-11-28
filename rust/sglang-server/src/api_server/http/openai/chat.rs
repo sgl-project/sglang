@@ -203,11 +203,7 @@ async fn chat_completions(
 
     // Python's chat-layer facts for the served template, and whether the
     // reply starts in reasoning, as Python decides it from the request.
-    let chat_model = state
-        .chat_formatter
-        .as_ref()
-        .map(ChatModel::for_formatter)
-        .unwrap_or_default();
+    let chat_model = served_chat_model(state.chat_formatter.as_ref(), &state.server_args);
     let force_reasoning = chat_model.request_thinking(
         reasoning_parser.as_deref(),
         &raw,
@@ -1230,6 +1226,17 @@ pub(super) fn chat_logprobs(extras: Option<&ChunkExtras>) -> ChatChoiceLogprobs 
     }
 }
 
+/// Python's chat-layer facts for the served template and checkpoint.
+pub(crate) fn served_chat_model(
+    formatter: Option<&super::ChatFormatter>,
+    server_args: &ServerArgs,
+) -> ChatModel {
+    ChatModel {
+        model_type: server_args.model_config.model_type.clone(),
+        ..formatter.map(ChatModel::for_formatter).unwrap_or_default()
+    }
+}
+
 /// V4, GLM-5.3 and Qwen3.8 prefill `<think>` (Qwen3.8 with a newline) when
 /// thinking, so the generated stream has no opening marker.
 pub(crate) fn starts_in_reasoning(reasoning_parser: Option<&str>, prompt: &str) -> bool {
@@ -1245,8 +1252,8 @@ mod tests {
 
     use super::super::ChatFormatter;
     use super::super::test_utils::{
-        answering_app_state_with, answering_app_state_with_item, body_json, chat_submitted, chunk,
-        post_json, with_cached_tokens,
+        GEMMA4_MARKED, GEMMA4_STRIPPED, answering_app_state_with, answering_app_state_with_item,
+        body_json, chat_submitted, chunk, gemma4_marker_state, post_json, with_cached_tokens,
     };
     use super::{
         OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
@@ -1516,6 +1523,101 @@ mod tests {
         let app = super::routes().with_state(state);
         let response = post_json(app, "/v1/chat/completions", body).await;
         body_json(response).await["choices"][0]["message"].clone()
+    }
+
+    /// Dropping Gemma 4's channel markers makes reasoning indistinguishable from content.
+    #[tokio::test]
+    async fn gemma4_chat_keeps_reasoning_markers() {
+        for (model_type, parser, stream, expected_content) in [
+            ("gemma4", Some("gemma4"), false, "The answer is 4."),
+            ("gemma4", Some("gemma4"), true, "The answer is 4."),
+            ("gemma4_unified", None, false, GEMMA4_MARKED),
+            ("llama", None, false, GEMMA4_STRIPPED),
+        ] {
+            let state = gemma4_marker_state(model_type, parser, move |generate| {
+                assert_eq!(generate.chat_prompt.is_some(), parser.is_some());
+            });
+            let response = post_json(
+                super::routes().with_state(state),
+                "/v1/chat/completions",
+                serde_json::json!({
+                    "model": "model", "stream": stream, "skip_special_tokens": true,
+                    "messages": [{"role": "user", "content": "What is 2 + 2?"}],
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                let bytes = axum::body::to_bytes(response.into_body(), 65536)
+                    .await
+                    .unwrap();
+                let frames: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                let field = |name: &str| -> String {
+                    frames
+                        .iter()
+                        .filter_map(|frame| frame["choices"][0]["delta"][name].as_str())
+                        .collect()
+                };
+                assert_eq!(field("reasoning_content"), "Check the calculation.");
+                assert_eq!(field("content"), expected_content);
+            } else {
+                let body = body_json(response).await;
+                let message = &body["choices"][0]["message"];
+                assert_eq!(message["content"], expected_content, "{model_type}: {body}");
+                if parser.is_some() {
+                    assert_eq!(message["reasoning_content"], "Check the calculation.");
+                }
+            }
+        }
+    }
+
+    /// gRPC Responses renders and submits on its own, so it must keep Gemma 4's
+    /// markers as the chat route does for its reasoning parser to split them.
+    #[tokio::test]
+    async fn gemma4_grpc_responses_keeps_reasoning_markers() {
+        use crate::api_server::responses::Responses;
+        use sglang_api_types::api::v1 as api;
+
+        for (model_type, reasoning, answer) in [
+            ("gemma4", Some("Check the calculation."), "The answer is 4."),
+            ("llama", None, GEMMA4_STRIPPED),
+        ] {
+            let state = gemma4_marker_state(model_type, Some("gemma4"), |_| {});
+            let adapter = Responses {
+                core: &state.core,
+                chat_formatter: state.chat_formatter.as_ref(),
+                server_args: &state.server_args,
+            };
+            let request = api::OpenAiResponsesRequest {
+                model: Some("model".into()),
+                input: Some(r#""What is 2 + 2?""#.into()),
+                ..Default::default()
+            };
+            let response = adapter.create(&request).await.unwrap();
+            let output = response["output"].as_array().unwrap();
+            let text_of = |kind: &str| {
+                output
+                    .iter()
+                    .find(|item| item["type"] == kind)
+                    .map(|item| item["content"][0]["text"].as_str().unwrap().to_owned())
+            };
+            assert_eq!(
+                text_of("reasoning").as_deref(),
+                reasoning,
+                "{model_type}: {response}"
+            );
+            assert_eq!(
+                text_of("message").as_deref(),
+                Some(answer),
+                "{model_type}: {response}"
+            );
+        }
     }
 
     /// The DeepSeek-V4.1 checkpoint the processor's `openai_parity` fixture

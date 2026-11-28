@@ -23,6 +23,7 @@ use super::{indexed_decode_stream, model_error, openai_error, routes};
 use crate::api_server::core::CoreEvent;
 use crate::api_server::handlers::{CoreCall, CoreHandle};
 use crate::message::config::ServerArgs;
+use crate::message::request::Request as IntakeRequest;
 use crate::message::response::{ChunkEvent, ResponseItem};
 use crate::tokenizer_manager::wiring::TmEvent;
 
@@ -68,7 +69,7 @@ pub(crate) fn core_handle() -> CoreHandle {
     )
 }
 
-pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
+pub(crate) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     let output = ChunkEvent {
         rid: rid.into(),
         text: text.into(),
@@ -197,7 +198,7 @@ fn answering_app_state_logged(
         server_args(),
         formatter.unwrap(),
         None,
-        |rid| chunk(rid, "ok", true),
+        |request| chunk(request.rid.as_str(), "ok", true),
         Some(request_log),
     )
 }
@@ -221,6 +222,18 @@ pub(super) fn answering_app_state_with_item(
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
     answer: impl Fn(&str) -> ResponseItem + Send + 'static,
 ) -> Arc<super::AppState> {
+    answering_app_state_with_request(server_args, formatter, tokenizer, move |request| {
+        answer(request.rid.as_str())
+    })
+}
+
+/// Answer a generation based on the request submitted to the core.
+pub(in crate::api_server::http) fn answering_app_state_with_request(
+    server_args: Arc<ServerArgs>,
+    formatter: super::ChatFormatter,
+    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
+    answer: impl Fn(&IntakeRequest) -> ResponseItem + Send + 'static,
+) -> Arc<super::AppState> {
     answering_app_state_built(server_args, formatter, tokenizer, answer, None)
 }
 
@@ -228,7 +241,7 @@ fn answering_app_state_built(
     server_args: Arc<ServerArgs>,
     formatter: super::ChatFormatter,
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
-    answer: impl Fn(&str) -> ResponseItem + Send + 'static,
+    answer: impl Fn(&IntakeRequest) -> ResponseItem + Send + 'static,
     request_log: Option<Arc<crate::api_server::core::RequestLog>>,
 ) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
@@ -237,7 +250,7 @@ fn answering_app_state_built(
         let mut open = Vec::new();
         while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
             assert!(admission.try_accept());
-            request.sink.try_send(answer(request.rid.as_str())).unwrap();
+            request.sink.try_send(answer(&request)).unwrap();
             open.push(request);
         }
     });
@@ -273,6 +286,52 @@ fn answering_app_state_built(
         server_args,
         chat_formatter: Some(formatter),
         generate_hook: None,
+    })
+}
+
+/// Gemma 4 output with its channel markers, and the same tokens decoded with
+/// `skip_special_tokens`.
+pub(in crate::api_server::http) const GEMMA4_MARKED: &str =
+    "<|channel>thought\nCheck the calculation.<channel|>The answer is 4.";
+pub(in crate::api_server::http) const GEMMA4_STRIPPED: &str =
+    "thought\nCheck the calculation.The answer is 4.";
+
+/// App state for `model_type` whose engine replays [`GEMMA4_MARKED`] at the
+/// decoder boundary, or [`GEMMA4_STRIPPED`] when the request skips special
+/// tokens. `inspect` sees each submitted generation.
+pub(in crate::api_server::http) fn gemma4_marker_state(
+    model_type: &str,
+    reasoning_parser: Option<&str>,
+    inspect: impl Fn(&crate::message::request::GenerateRequest) + Send + 'static,
+) -> Arc<super::AppState> {
+    use crate::message::config::ModelConfig;
+    use crate::message::request::RequestKind;
+
+    let tokenizer = sglang_processor::dynamo_tokenizers::Tokenizer::from_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/testdata/special_token_tokenizer.json"
+    ))
+    .unwrap();
+    let args = Arc::new(ServerArgs {
+        served_model_name: "model".into(),
+        reasoning_parser: reasoning_parser.map(str::to_owned),
+        model_config: ModelConfig {
+            model_type: Some(model_type.into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    answering_app_state_with_request(args, chatml_formatter(), Some(tokenizer), move |request| {
+        let RequestKind::Generate(generate) = &request.kind else {
+            panic!("expected generation");
+        };
+        inspect(generate);
+        let text = if generate.sampling_params.skip_special_tokens {
+            GEMMA4_STRIPPED
+        } else {
+            GEMMA4_MARKED
+        };
+        chunk(request.rid.as_str(), text, true)
     })
 }
 
