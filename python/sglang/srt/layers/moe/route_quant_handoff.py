@@ -78,7 +78,10 @@ def bind_select_experts(
 
 def take_padded_rows_masked() -> bool:
     masked = _handoff.padded_rows_masked
-    _handoff.padded_rows_masked = False
+    # Writing only a set flag keeps the common unstaged call free of a
+    # msgspec.Struct.__setattr__, which graph capture cannot trace.
+    if masked:
+        _handoff.padded_rows_masked = False
     return masked
 
 
