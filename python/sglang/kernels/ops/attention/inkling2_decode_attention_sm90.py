@@ -1,12 +1,17 @@
 """Paged decode attention with a compact relative bias for Hopper and SM120: the
 split-KV partials of paged_rel_bias_decode (unnormalized o, max, sum), reduced by
 combine_gate_sink, for one query per sequence or a causal block of queries per
-sequence (MTP verify). Each split takes an equal share of the sequence's own keys."""
+sequence (MTP verify). Each split takes an equal share of the sequence's own keys.
+On Hopper with a 16-bit cache, a global layer's verify of a block that pads to 32 or
+64 rows gathers each masked tile's bias a tile ahead; at 64 rows the keys at least
+the bias extent behind every query row also run as larger unmasked tiles, and a
+split takes an equal share of the tiles."""
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.kvcache.mxfp8_dequant_paged import (
     MXFP8_PAGE,
     mxfp8_dequant_rows,
@@ -14,6 +19,76 @@ from sglang.kernels.ops.kvcache.mxfp8_dequant_paged import (
 )
 
 MAX_SPLITS = 64
+
+
+@triton.jit
+def _interior_tile(
+    q,
+    m,
+    l,
+    acc,
+    start,
+    b,
+    hk,
+    d,
+    scale,
+    K,
+    V,
+    PageTable,
+    SK0: tl.constexpr,
+    SK1: tl.constexpr,
+    SK2: tl.constexpr,
+    SP: tl.constexpr,
+    PAGE: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    # Every key is valid and at least EXTENT behind every query row: bias 0, no mask.
+    cols = tl.arange(0, TILE)
+    if PAGE % TILE == 0:
+        page = tl.load(PageTable + b * SP + start // PAGE).to(tl.int64)
+        slot = start % PAGE + cols
+        kv_offset = page * SK0 + slot[:, None] * SK1 + hk * SK2 + d[None, :]
+    else:
+        pos = start + cols
+        page = tl.load(PageTable + b * SP + pos // PAGE)
+        kv_offset = (
+            page.to(tl.int64)[:, None] * SK0
+            + (pos % PAGE)[:, None] * SK1
+            + hk * SK2
+            + d[None, :]
+        )
+    k = tl.load(K + kv_offset)
+    s = tl.dot(q, tl.trans(k)) * scale
+    # Real keys, no mask: s is finite (padded rows have q = 0), so m_new is never -inf.
+    m_new = tl.maximum(m, tl.max(s, 1))
+    alpha = tl.exp2((m - m_new) * 1.4426950408889634)
+    p = tl.exp2((s - m_new[:, None]) * 1.4426950408889634)
+    l = l * alpha + tl.sum(p, 1)
+    v = tl.load(V + kv_offset)
+    acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+    return m_new, l, acc
+
+
+@triton.jit
+def _bias_tile(
+    Bias,
+    token,
+    qh,
+    head_mask,
+    q_pos,
+    start,
+    end,
+    SB0: tl.constexpr,
+    SB1: tl.constexpr,
+    EXTENT: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    # The bias of keys [start, start + TILE) below end, as the masked loop adds it.
+    pos = start + tl.arange(0, TILE)
+    dist = q_pos[:, None] - pos[None, :]
+    keep = (pos < end)[None, :] & (dist >= 0) & (dist < EXTENT)
+    bias = Bias + token[:, None] * SB0 + qh[:, None] * SB1 + dist
+    return tl.load(bias, head_mask[:, None] & keep, other=0)
 
 
 @triton.jit
@@ -51,6 +126,8 @@ def _decode_partials(
     WINDOW: tl.constexpr,
     BLOCK_N: tl.constexpr,
     MXFP8: tl.constexpr,
+    INTERIOR: tl.constexpr,
+    PREFETCH_BIAS: tl.constexpr,
 ):
     tl.extra.cuda.gdc_wait()
     tl.extra.cuda.gdc_launch_dependents()
@@ -62,10 +139,29 @@ def _decode_partials(
     first = 0
     if WINDOW >= 0:
         first = tl.maximum(seqlen - QLEN - WINDOW, 0)
-    tiles = tl.cdiv(seqlen - first // BLOCK_N * BLOCK_N, BLOCK_N)
-    per_split = tl.cdiv(tiles, splits)
-    tile_lo = first // BLOCK_N + split * per_split
-    tile_hi = tl.minimum(tile_lo + per_split, first // BLOCK_N + tiles)
+    if INTERIOR == 0:
+        tiles = tl.cdiv(seqlen - first // BLOCK_N * BLOCK_N, BLOCK_N)
+        per_split = tl.cdiv(tiles, splits)
+        tile_lo = first // BLOCK_N + split * per_split
+        tile_hi = tl.minimum(tile_lo + per_split, first // BLOCK_N + tiles)
+    else:
+        # No window: keys [0, inner) are at least EXTENT behind every query row; whole
+        # INTERIOR-key tiles of them run unmasked, the rest as BLOCK_N-key masked tiles.
+        # A split takes an equal share of the tiles of both kinds, interior ones first,
+        # so a sequence with no interior tile is split as main splits it.
+        tl.static_assert(WINDOW < 0)
+        tl.static_assert(INTERIOR % BLOCK_N == 0)
+        inner = tl.maximum(seqlen - QLEN - EXTENT + 1, 0)
+        big = inner // INTERIOR
+        small_lo = big * (INTERIOR // BLOCK_N)
+        tiles = big + tl.cdiv(seqlen, BLOCK_N) - small_lo
+        per_split = tl.cdiv(tiles, splits)
+        lo = tl.minimum(split * per_split, tiles)
+        hi = tl.minimum(lo + per_split, tiles)
+        big_lo = tl.minimum(lo, big)
+        big_hi = tl.minimum(hi, big)
+        tile_lo = small_lo + tl.maximum(lo - big, 0)
+        tile_hi = small_lo + tl.maximum(hi - big, 0)
 
     rows = tl.arange(0, ROWS)
     head_mask = rows < QLEN * GROUP
@@ -82,7 +178,24 @@ def _decode_partials(
     l = tl.zeros((ROWS,), tl.float32)
     acc = tl.zeros((ROWS, D), tl.float32)
     cols = tl.arange(0, BLOCK_N)
+    if PREFETCH_BIAS:
+        # A bias gathered one tile ahead overlaps the previous tile and keeps the scores
+        # in the MMA layout; gathered in-tile, 64-1024 keys ran 1.09-1.4x slower (H200).
+        tl.static_assert(WINDOW < 0)
+        end = tl.minimum(seqlen, tile_hi * BLOCK_N)
+        bias_next = _bias_tile(
+            Bias, token, qh, head_mask, q_pos, tile_lo * BLOCK_N, end,
+            SB0, SB1, EXTENT, BLOCK_N,
+        )  # fmt: skip
+    # Keep inline rather than share a helper with _interior_tile:
+    # a helper changes the sliding-window verify SASS (1.7% slower at qlen 5 on H200).
     for tile in range(tile_lo, tile_hi):
+        if PREFETCH_BIAS:
+            bias_now = bias_next
+            bias_next = _bias_tile(
+                Bias, token, qh, head_mask, q_pos, (tile + 1) * BLOCK_N, end,
+                SB0, SB1, EXTENT, BLOCK_N,
+            )  # fmt: skip
         pos = tile * BLOCK_N + cols
         valid = (pos < seqlen) & (pos >= first)
         if PAGE % BLOCK_N == 0:
@@ -108,11 +221,14 @@ def _decode_partials(
         keep = valid[None, :] & (dist >= 0)
         if WINDOW >= 0:
             keep &= dist <= WINDOW
-        bias = tl.load(
-            Bias + token[:, None] * SB0 + qh[:, None] * SB1 + dist,
-            head_mask[:, None] & keep & (dist < EXTENT),
-            other=0,
-        ).to(tl.float32)
+        if PREFETCH_BIAS:
+            bias = bias_now.to(tl.float32)
+        else:
+            bias = tl.load(
+                Bias + token[:, None] * SB0 + qh[:, None] * SB1 + dist,
+                head_mask[:, None] & keep & (dist < EXTENT),
+                other=0,
+            ).to(tl.float32)
         s = tl.where(keep, s + bias, float("-inf"))
         m_new = tl.maximum(m, tl.max(s, 1))
         m_ref = tl.where(m_new == float("-inf"), 0.0, m_new)
@@ -124,6 +240,15 @@ def _decode_partials(
             v = mxfp8_dequant_rows(v, VScale + scale_offset, slot, valid, D)
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         m = m_new
+    if INTERIOR > 0:
+        # After the masked loop, so its first loads issue as early as main's. Pipelined:
+        # 1.05-1.3x from 32K keys (H200); skipped in splits with no interior tile.
+        if big_hi > big_lo:
+            for tile in tl.range(big_lo, big_hi, num_stages=2):
+                m, l, acc = _interior_tile(
+                    q, m, l, acc, tile * INTERIOR, b, hk, d, scale, K, V, PageTable,
+                    SK0, SK1, SK2, SP, PAGE, INTERIOR,
+                )  # fmt: skip
     stat = (split * batch * QLEN + token) * (HEADS_K * GROUP) + qh
     tl.store(MPartial + stat, m, head_mask)
     tl.store(LPartial + stat, l, head_mask)
@@ -161,7 +286,7 @@ def decode_partials(
         if window_size_left is not None
         else page_table.shape[1] * page_size
     )
-    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    sms = current_arch().num_sms
     max_splits = max(1, min(2 * sms // max(1, batch * heads_k), MAX_SPLITS))
     block_n = 128 if qlen == 1 and span >= 128 * max_splits else 32
     splits = min(triton.cdiv(span, block_n), max_splits)
@@ -178,6 +303,7 @@ def decode_partials(
         assert k_words.stride() == v_words.stride()
     else:
         k_words = v_words = k_cache
+    interior, prefetch = _verify_path(qlen, group, window_size_left, mxfp8)
     o = torch.empty(
         (splits, tokens, 1, heads_q, head_dim), dtype=torch.float32, device=q.device
     )
@@ -217,8 +343,28 @@ def decode_partials(
         -1 if window_size_left is None else window_size_left,
         block_n,
         mxfp8,
+        interior,
+        prefetch,
         num_warps=4,
-        num_stages=2 if qlen == 1 else 3,
+        num_stages=2 if qlen == 1 or prefetch else 3,
+        # 64-row launches: 203-204 registers (212-217 uncapped), and up to 2.8% faster
+        # at 1 sequence x KV head, 4.9% slower at 16 (H200); 32 rows were timed capped.
+        maxnreg=232 if prefetch else None,
         launch_pdl=True,
     )
     return o, m, l
+
+
+def _verify_path(qlen, group, window_size_left, mxfp8):
+    """(keys per unmasked interior tile or 0, bias gathered a tile ahead) for a global
+    layer's verify; (0, False) keeps main's path. Measured on H200 at 6 heads per KV
+    head: interior tiles pay off at 64 rows (6 to 10 tokens) but ran up to 1.4% slower
+    than main at 32 rows (3 to 5 tokens) on 1536 keys, and 128-key ones spilled at 128
+    rows; at 16 rows (2 tokens) the bias prefetch alone ran up to 4% slower than
+    main."""
+    if qlen == 1 or window_size_left is not None or not 16 < qlen * group <= 64:
+        return 0, False
+    # The interior tiles read no MXFP8 scales; SM120 and MXFP8 caches were not timed.
+    if mxfp8 or not current_arch().is_sm(9):
+        return 0, False
+    return (64 if qlen * group > 32 else 0), True
