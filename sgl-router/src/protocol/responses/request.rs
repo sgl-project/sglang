@@ -260,11 +260,21 @@ struct PendingAssistant {
     reasoning: Option<String>,
     content: Option<String>,
     tool_calls: Vec<Value>,
+    /// The `phase` (`commentary` or `final_answer`) of the last message merged in.
+    phase: Option<String>,
 }
 
 impl PendingAssistant {
     fn is_empty(&self) -> bool {
         self.reasoning.is_none() && self.content.is_none() && self.tool_calls.is_empty()
+    }
+
+    /// The first text supplies the phase for pending reasoning or calls. A
+    /// worker can stream a call before its accompanying text, and its tool
+    /// result must still follow the assistant turn that made the call.
+    /// Once text is present, a change of phase starts another message.
+    fn continues_with(&self, phase: Option<&str>) -> bool {
+        self.content.is_none() || self.phase.as_deref() == phase
     }
 
     fn flush(&mut self, messages: &mut Vec<Value>) {
@@ -287,6 +297,9 @@ impl PendingAssistant {
         }
         if !p.tool_calls.is_empty() {
             m.insert("tool_calls".into(), Value::Array(p.tool_calls));
+        }
+        if let Some(phase) = p.phase {
+            m.insert("phase".into(), Value::String(phase));
         }
         messages.push(Value::Object(m));
     }
@@ -320,6 +333,13 @@ fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), Str
                     // emits text that arrived during a call after the call.
                     "assistant" => {
                         let text = content_text(&content, i)?;
+                        let phase = obj.get("phase").and_then(Value::as_str);
+                        if !pending.continues_with(phase) {
+                            pending.flush(messages);
+                        }
+                        if let Some(phase) = phase {
+                            pending.phase = Some(phase.to_owned());
+                        }
                         match &mut pending.content {
                             Some(c) => {
                                 c.push('\n');
@@ -372,6 +392,14 @@ fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), Str
                     (_, Some(v @ Value::Object(_)), _) => v.to_string(),
                     _ => "{}".into(),
                 };
+                // A call belongs with its commentary or with an unphased turn.
+                if pending
+                    .phase
+                    .as_deref()
+                    .is_some_and(|phase| phase != "commentary")
+                {
+                    pending.flush(messages);
+                }
                 pending.tool_calls.push(json!({
                     "id": call_id,
                     "type": "function",
@@ -399,7 +427,9 @@ fn convert_items(items: Vec<Value>, messages: &mut Vec<Value>) -> Result<(), Str
             "reasoning" => {
                 // Reasoning starts the next turn, unless the open one still
                 // awaits call outputs.
-                if pending.content.is_some() && pending.tool_calls.is_empty() {
+                if pending.phase.is_some()
+                    || (pending.content.is_some() && pending.tool_calls.is_empty())
+                {
                     pending.flush(messages);
                 }
                 let text = reasoning_text(&obj);
@@ -1063,6 +1093,87 @@ mod tests {
                 {"type": "image_url", "image_url": {"url": "https://x/a.png", "detail": "low"}},
             ])
         );
+    }
+
+    /// Adjacent assistant messages merge only within one phase, as the engine's
+    /// own `/v1/responses` merges them, and the phase reaches the chat request.
+    #[test]
+    fn assistant_phase_changes_start_a_new_message() {
+        let c = chat(json!({"model": "m", "input": [
+            {"role": "user", "content": "go"},
+            {"type": "message", "role": "assistant", "phase": "commentary",
+             "content": [{"type": "output_text", "text": "looking"}]},
+            {"type": "message", "role": "assistant", "phase": "final_answer",
+             "content": [{"type": "output_text", "text": "done"}]},
+            {"type": "message", "role": "assistant", "phase": "final_answer",
+             "content": [{"type": "output_text", "text": "really"}]},
+        ]}));
+        assert_eq!(
+            c["messages"],
+            json!([
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "looking", "phase": "commentary"},
+                {"role": "assistant", "content": "done\nreally", "phase": "final_answer"},
+            ])
+        );
+        // Without phases, adjacent assistant messages still merge.
+        let c = chat(json!({"model": "m", "input": [
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "a"},
+            {"role": "assistant", "content": "b"},
+        ]}));
+        assert_eq!(
+            c["messages"][1],
+            json!({"role": "assistant", "content": "a\nb"})
+        );
+        // A turn that holds only reasoning takes the message's phase.
+        let c = chat(json!({"model": "m", "input": [
+            {"role": "user", "content": "go"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]},
+            {"type": "message", "role": "assistant", "phase": "final_answer",
+             "content": [{"type": "output_text", "text": "done"}]},
+        ]}));
+        assert_eq!(
+            c["messages"][1],
+            json!({"role": "assistant", "content": "done", "reasoning_content": "think",
+                   "phase": "final_answer"})
+        );
+    }
+
+    #[test]
+    fn phased_text_after_a_call_preserves_tool_result_pairing() {
+        for phase in ["commentary", "final_answer"] {
+            let c = chat(json!({"model":"m","input":[
+                {"type":"function_call","call_id":"a","name":"f","arguments":"{}"},
+                {"role":"assistant","phase":phase,"content":"text"},
+                {"type":"function_call_output","call_id":"a","output":"ok"}
+            ]}));
+            let messages = c["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0]["phase"], phase);
+            assert_eq!(
+                messages[0]["tool_calls"][0]["id"],
+                messages[1]["tool_call_id"]
+            );
+        }
+    }
+
+    #[test]
+    fn calls_join_commentary_but_start_a_turn_after_a_final_answer() {
+        for (phase, count) in [("commentary", 2), ("final_answer", 3)] {
+            let c = chat(json!({"model":"m","input":[
+                {"role":"assistant","phase":phase,"content":"text"},
+                {"type":"function_call","call_id":"call_a","name":"work","arguments":"{}"},
+                {"type":"function_call_output","call_id":"call_a","output":"ok"}
+            ]}));
+            let messages = c["messages"].as_array().unwrap();
+            assert_eq!(messages.len(), count);
+            assert_eq!(messages[0]["phase"], phase);
+            assert_eq!(messages[count - 2]["tool_calls"][0]["id"], "call_a");
+            if phase == "final_answer" {
+                assert!(messages[1].get("phase").is_none());
+            }
+        }
     }
 
     #[test]
