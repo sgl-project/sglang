@@ -836,6 +836,9 @@ class Req(ReqDllmMixin):
         # that forward's output is dropped and the request finishes with it.
         self.discard_output_reason: Optional[FINISH_ABORT] = None
         self.disagg_kv_sender: Optional[BaseKVSender] = None
+        # A request abort ended the in-flight KV send,
+        # so its failure is not counted as a transfer failure.
+        self.disagg_transfer_aborted = False
 
         self.routed_dp_rank: Optional[int] = routed_dp_rank
         self.disagg_prefill_dp_rank: Optional[int] = disagg_prefill_dp_rank
