@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .autotune import autotune_cache_kwargs, prune_oversized_tiles
+from .autotune import autotune_cache_kwargs, prune_oversized_tiles, unused_index
 from .mamba_ssm import softplus
 
 
@@ -363,6 +363,21 @@ def _chunk_state_fwd_kernel(
     tl.store(states_ptrs, states, mask=c_mask)
 
 
+# In pool mode a row may read its initial state from the slot it overwrites, so each
+# autotuning trial must start from the original slots, not the last trial's.
+def _snapshot_out_slots(nargs, reset_only=False):
+    if reset_only or not nargs.get("OUT_TO_POOL"):
+        return
+    slots = nargs["out_idx_ptr"].clamp(min=0).long()
+    nargs["_out_slots"] = (slots, nargs["states_ptr"].index_select(0, slots))
+
+
+def _restore_out_slots(nargs, exception):
+    saved = nargs.pop("_out_slots", None)
+    if saved is not None:
+        nargs["states_ptr"].index_copy_(0, saved[0], saved[1])
+
+
 @triton.autotune(
     configs=[
         # Small headdim/dstate configs (hdim<=64, dstate<=128) - increased parallelism
@@ -449,6 +464,8 @@ def _chunk_state_fwd_kernel(
             }
         )
     },
+    pre_hook=_snapshot_out_slots,
+    post_hook=_restore_out_slots,
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -462,6 +479,10 @@ def _chunk_state_varlen_kernel(
     cu_seqlens_ptr,
     states_ptr,
     initstates_ptr,
+    init_idx_ptr,
+    init_has_ptr,
+    out_idx_ptr,
+    out2_idx_ptr,
     # Matrix dimensions
     hdim,
     dstate,
@@ -495,6 +516,9 @@ def _chunk_state_varlen_kernel(
     stride_init_states_dstate,
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
+    INIT_FROM_POOL: tl.constexpr = False,
+    OUT_TO_POOL: tl.constexpr = False,
+    HAS_OUT2: tl.constexpr = False,
     BLOCK_SIZE_M: tl.constexpr = 16,
     BLOCK_SIZE_N: tl.constexpr = 16,
     BLOCK_SIZE_K: tl.constexpr = 16,
@@ -583,6 +607,8 @@ def _chunk_state_varlen_kernel(
     # - if state_idx >= pid * chunk_size, then we need to insert initstates
     if (start_idx < pid_c * chunk_size) or (HAS_INITSTATES):  # first chunk
         dA_cs_boundary = 0.0  # default
+        if INIT_FROM_POOL:
+            past_valid = tl.full([], 1, tl.int32) != 0
 
         if not HAS_INITSTATES:
             past_states_ptrs = chunk_states_ptr + (
@@ -597,8 +623,13 @@ def _chunk_state_varlen_kernel(
                     + offs_n[None, :] * stride_chunk_states_dstate
                 )
             else:
+                if INIT_FROM_POOL:
+                    init_row = tl.load(init_idx_ptr + pid_b).to(tl.int64)
+                    past_valid = tl.load(init_has_ptr + pid_b).to(tl.int32) != 0
+                else:
+                    init_row = pid_b
                 past_states_ptrs = initstates_ptr + (
-                    pid_b * stride_init_states_batch
+                    init_row * stride_init_states_batch
                     + offs_m[:, None] * stride_init_states_hdim
                     + offs_n[None, :] * stride_init_states_dstate
                 )
@@ -610,25 +641,54 @@ def _chunk_state_varlen_kernel(
                         + (start_idx - pid_c * chunk_size - 1) * stride_dA_cs_csize
                     ).to(tl.float32)
 
+        past_mask = (offs_m[:, None] < hdim) & (offs_n[None, :] < dstate)
+        if INIT_FROM_POOL:
+            past_mask = past_mask & past_valid
         past_states = tl.load(
             past_states_ptrs,
-            mask=(offs_m[:, None] < hdim) & (offs_n[None, :] < dstate),
+            mask=past_mask,
             other=0.0,
         ).to(tl.float32)
 
         scale = tl.exp(dA_cs_last - dA_cs_boundary)
         acc += past_states * scale
 
-    states = acc.to(states_ptr.dtype.element_ty)
-
-    states_ptr += pid_b * stride_states_batch + pid_h * stride_states_head
+    if OUT_TO_POOL:
+        # same rounding as writing chunk_states' dtype, then index_put into the pool
+        states = acc.to(chunk_states_ptr.dtype.element_ty).to(
+            states_ptr.dtype.element_ty
+        )
+        out_row = tl.load(out_idx_ptr + pid_b).to(tl.int64)
+    else:
+        states = acc.to(states_ptr.dtype.element_ty)
+        out_row = pid_b
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    states_ptrs = states_ptr + (
-        offs_m[:, None] * stride_states_hdim + offs_n[None, :] * stride_states_dstate
+    offs_st = (
+        pid_h * stride_states_head
+        + offs_m[:, None] * stride_states_hdim
+        + offs_n[None, :] * stride_states_dstate
     )
     c_mask = (offs_m[:, None] < hdim) & (offs_n[None, :] < dstate)
-    tl.store(states_ptrs, states, mask=c_mask)
+    if OUT_TO_POOL:
+        # a negative slot means this row is not stored (odd rows of the track call)
+        tl.store(
+            states_ptr + out_row * stride_states_batch + offs_st,
+            states,
+            mask=c_mask & (out_row >= 0),
+        )
+        if HAS_OUT2:
+            # second copy, e.g. the final state into its prefix-cache track slot
+            out2_row = tl.load(out2_idx_ptr + pid_b).to(tl.int64)
+            tl.store(
+                states_ptr + out2_row * stride_states_batch + offs_st,
+                states,
+                mask=c_mask & (out2_row >= 0),
+            )
+    else:
+        tl.store(
+            states_ptr + out_row * stride_states_batch + offs_st, states, mask=c_mask
+        )
 
 
 def _chunk_cumsum_fwd(
@@ -756,7 +816,18 @@ def _chunk_state_fwd(
 
 
 def chunk_state_varlen(
-    B, x, dt, dA_cumsum, cu_seqlens, chunk_states, initial_states=None
+    B,
+    x,
+    dt,
+    dA_cumsum,
+    cu_seqlens,
+    chunk_states,
+    initial_states=None,
+    init_idx=None,
+    init_has=None,
+    out_pool=None,
+    out_idx=None,
+    out2_idx=None,
 ):
     total_seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
@@ -769,17 +840,20 @@ def chunk_state_varlen(
     assert dA_cumsum.shape == dt.shape
     assert chunk_states.shape == (nchunks, nheads, headdim, dstate)
 
-    if initial_states is not None:
+    if initial_states is not None and init_idx is None:
         assert initial_states.shape == (batch, nheads, headdim, dstate)
 
-    states = torch.empty(
-        batch,
-        nheads,
-        headdim,
-        dstate,
-        dtype=chunk_states.dtype,
-        device=chunk_states.device,
-    )
+    if out_pool is not None:
+        states = out_pool
+    else:
+        states = torch.empty(
+            batch,
+            nheads,
+            headdim,
+            dstate,
+            dtype=chunk_states.dtype,
+            device=chunk_states.device,
+        )
     grid = lambda META: (
         triton.cdiv(headdim, META["BLOCK_SIZE_M"])
         * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
@@ -796,6 +870,10 @@ def chunk_state_varlen(
             cu_seqlens,
             states,
             initial_states,
+            init_idx if init_idx is not None else unused_index(x.device, torch.int32),
+            init_has if init_has is not None else unused_index(x.device, torch.bool),
+            out_idx if out_idx is not None else unused_index(x.device, torch.int32),
+            out2_idx if out2_idx is not None else unused_index(x.device, torch.int32),
             headdim,
             dstate,
             chunk_size,
@@ -832,5 +910,8 @@ def chunk_state_varlen(
                 else (0, 0, 0, 0)
             ),
             HAS_INITSTATES=initial_states is not None,
+            INIT_FROM_POOL=init_idx is not None,
+            OUT_TO_POOL=out_pool is not None,
+            HAS_OUT2=out2_idx is not None,
         )
-    return states
+    return None if out_pool is not None else states

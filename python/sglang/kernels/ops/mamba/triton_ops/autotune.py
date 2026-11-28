@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Callable, Mapping, Sequence
 
+import torch
 import triton
 
 from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 
-__all__ = ["autotune_cache_kwargs", "prune_oversized_tiles"]
+__all__ = ["autotune_cache_kwargs", "prune_oversized_tiles", "unused_index"]
+
+
+@lru_cache(maxsize=None)
+def unused_index(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """
+    the autotune key holds every tensor argument's dtype
+    so passing None would tune pool mode diff from the old path.
+    """
+    return torch.zeros(1, dtype=dtype, device=device)
 
 
 def _tile_footprint(config: triton.Config) -> tuple[int, int, int]:

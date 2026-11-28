@@ -35,21 +35,36 @@ def _track_states_at(
     initial_states,
     track_seq_idx,
     track_end_locs,
+    init_idx=None,
+    init_has=None,
+    state_pool=None,
+    track_out_slots=None,
 ):
     starts = cu_seqlens[track_seq_idx]
     ends = track_end_locs.to(device=starts.device, dtype=starts.dtype)
     bounds = torch.stack([starts, ends], dim=1).flatten().contiguous()
-    if initial_states is not None:
+    if init_idx is not None:
+        # pool mode: initial_states is the pool; gather only the slot ids and flags
+        init_idx = init_idx[track_seq_idx].repeat_interleave(2, dim=0)[:-1]
+        init_has = init_has[track_seq_idx].repeat_interleave(2, dim=0)[:-1]
+    elif initial_states is not None:
         initial_states = initial_states[track_seq_idx].repeat_interleave(2, dim=0)[:-1]
-    return chunk_state_varlen(
+    kw = dict(initial_states=initial_states, init_idx=init_idx, init_has=init_has)
+    if track_out_slots is not None:
+        # rows alternate (track position, gap); only the even rows are stored
+        out_idx = torch.full_like(bounds[:-1], -1)
+        out_idx[::2] = track_out_slots
+        kw.update(out_pool=state_pool, out_idx=out_idx)
+    res = chunk_state_varlen(
         B.squeeze(0),
         x.squeeze(0),
         dt.squeeze(0),
         dA_cumsum.squeeze(0),
         bounds,
         states.squeeze(0),
-        initial_states=initial_states,
-    )[::2].unsqueeze(0)
+        **kw,
+    )
+    return None if track_out_slots is not None else res[::2].unsqueeze(0)
 
 
 def _mamba_chunk_scan_combined_fwd(
@@ -73,7 +88,21 @@ def _mamba_chunk_scan_combined_fwd(
     out=None,
     track_seq_idx=None,
     track_end_locs=None,
+    state_pool=None,
+    state_indices=None,
+    has_initial_state=None,
+    final_track_slots=None,
+    track_out_slots=None,
 ):
+    # Pool mode: initial states are read from state_pool[state_indices] (zero where
+    # has_initial_state is False) and final states are written back in place.
+    pool_mode = state_pool is not None
+    init_idx = init_has = None
+    if pool_mode:
+        assert initial_states is None and cu_seqlens is not None
+        if has_initial_state is not None:
+            initial_states = state_pool
+            init_idx, init_has = state_indices, has_initial_state
     assert is_int_pow_2(chunk_size), "chunk_size must be integer power of 2"
     batch, seqlen, nheads, headdim = x.shape
     _, _, ngroups, dstate = B.shape
@@ -102,7 +131,7 @@ def _mamba_chunk_scan_combined_fwd(
         z = z.contiguous()
     if D is not None and D.stride(-1) != 1:
         D = D.contiguous()
-    if initial_states is not None:
+    if initial_states is not None and not pool_mode:
         if cu_seqlens is None:
             assert initial_states.shape == (batch, nheads, headdim, dstate)
         else:
@@ -156,6 +185,8 @@ def _mamba_chunk_scan_combined_fwd(
         out_dtype=state_dtype if state_dtype is not None else C.dtype,
         is_cont_batched=cu_seqlens is not None,
         chunk_offsets=chunk_offsets,
+        init_idx=init_idx,
+        init_has=init_has,
     )
     states, final_states = (
         rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
@@ -188,6 +219,8 @@ def _mamba_chunk_scan_combined_fwd(
         chunk_offsets=chunk_offsets,
         initial_states=initial_states,
         out=out,
+        init_idx=init_idx,
+        init_has=init_has,
     )
     if cu_seqlens is None:
         return out_x, dt, dA_cumsum, states, final_states
@@ -195,21 +228,13 @@ def _mamba_chunk_scan_combined_fwd(
         assert batch == 1, (
             "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
         )
-        varlen_states = chunk_state_varlen(
-            B.squeeze(0),
-            x.squeeze(0),
-            dt.squeeze(0),
-            dA_cumsum.squeeze(0),
-            cu_seqlens,
-            states.squeeze(0),
-            initial_states=initial_states,
-        )
         track_states = None
         if (
             track_seq_idx is not None
             and track_end_locs is not None
             and track_end_locs.numel() > 0
         ):
+            # Before the final write: in pool mode it overwrites the initial states.
             track_states = _track_states_at(
                 B,
                 x,
@@ -220,7 +245,25 @@ def _mamba_chunk_scan_combined_fwd(
                 initial_states,
                 track_seq_idx,
                 track_end_locs,
+                init_idx=init_idx,
+                init_has=init_has,
+                state_pool=state_pool,
+                track_out_slots=track_out_slots if pool_mode else None,
             )
+        varlen_states = chunk_state_varlen(
+            B.squeeze(0),
+            x.squeeze(0),
+            dt.squeeze(0),
+            dA_cumsum.squeeze(0),
+            cu_seqlens,
+            states.squeeze(0),
+            initial_states=initial_states,
+            init_idx=init_idx,
+            init_has=init_has,
+            out_pool=state_pool,
+            out_idx=state_indices,
+            out2_idx=final_track_slots if pool_mode else None,
+        )
         return out_x, dt, dA_cumsum, states, final_states, varlen_states, track_states
 
 
@@ -249,6 +292,11 @@ def mamba_chunk_scan_combined(
     return_track_states=False,
     track_seq_idx=None,
     track_end_locs=None,
+    state_pool=None,
+    state_indices=None,
+    has_initial_state=None,
+    final_track_slots=None,
+    track_out_slots=None,
 ):
     """
     Argument:
@@ -297,6 +345,11 @@ def mamba_chunk_scan_combined(
             state_dtype=state_dtype,
             track_seq_idx=track_seq_idx,
             track_end_locs=track_end_locs,
+            state_pool=state_pool,
+            state_indices=state_indices,
+            has_initial_state=has_initial_state,
+            final_track_slots=final_track_slots,
+            track_out_slots=track_out_slots,
         )
     )
     if return_track_states:

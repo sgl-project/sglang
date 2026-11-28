@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 from packaging import version
 
-from .autotune import autotune_cache_kwargs, prune_oversized_tiles
+from .autotune import autotune_cache_kwargs, prune_oversized_tiles, unused_index
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
@@ -176,6 +176,8 @@ def _chunk_scan_fwd_kernel(
     chunk_indices_ptr,
     chunk_offsets_ptr,
     chunk_meta_num,
+    init_idx_ptr,
+    init_has_ptr,
     # Matrix dimensions
     chunk_size,
     hdim,
@@ -234,6 +236,7 @@ def _chunk_scan_fwd_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
     IS_TRITON_22: tl.constexpr,
     HAS_INITSTATES: tl.constexpr,
+    INIT_FROM_POOL: tl.constexpr = False,
     BLOCK_SIZE_M: tl.constexpr = 16,
     BLOCK_SIZE_N: tl.constexpr = 16,
     BLOCK_SIZE_K: tl.constexpr = 16,
@@ -287,6 +290,11 @@ def _chunk_scan_fwd_kernel(
     )
     prev_states_hdim = stride_states_hdim
     prev_states_dstate = stride_states_dstate
+    # False only for a pool-read init state of a sequence without a prefix (reads 0)
+    if INIT_FROM_POOL:
+        prev_states_valid = tl.full([], 1, tl.int32) != 0
+    else:
+        prev_states_valid = True
 
     chunk_size_limit = min(chunk_size, seqlen - c_idx * chunk_size)
     if HAS_SEQ_IDX:
@@ -321,9 +329,16 @@ def _chunk_scan_fwd_kernel(
                     or (c_off > 0)  # implies a new example (pseudo chunk)
                 ):
                     # - replace prev_states_ptr with init_states
+                    if INIT_FROM_POOL:
+                        init_row = tl.load(init_idx_ptr + seq_idx_m).to(tl.int64)
+                        prev_states_valid = (
+                            tl.load(init_has_ptr + seq_idx_m).to(tl.int32) != 0
+                        )
+                    else:
+                        init_row = seq_idx_m
                     prev_states_ptr = (
                         initstates_ptr
-                        + seq_idx_m * stride_init_states_batch
+                        + init_row * stride_init_states_batch
                         + pid_h * stride_init_states_head
                     )
                     prev_states_hdim = stride_init_states_hdim  # override strides
@@ -425,7 +440,9 @@ def _chunk_scan_fwd_kernel(
 
             prev_states = tl.load(
                 prev_states_ptrs,
-                mask=(offs_k_dstate[:, None] < dstate) & (offs_n[None, :] < hdim),
+                mask=(offs_k_dstate[:, None] < dstate)
+                & (offs_n[None, :] < hdim)
+                & prev_states_valid,
                 other=0.0,
             )
             prev_states = prev_states.to(C_ptr.dtype.element_ty)
@@ -442,7 +459,8 @@ def _chunk_scan_fwd_kernel(
                 prev_states = tl.load(
                     prev_states_ptrs,
                     mask=(offs_k_dstate[:, None] < dstate - k)
-                    & (offs_n[None, :] < hdim),
+                    & (offs_n[None, :] < hdim)
+                    & prev_states_valid,
                     other=0.0,
                 )
                 prev_states = prev_states.to(C_ptr.dtype.element_ty)
@@ -573,6 +591,8 @@ def _chunk_scan_fwd(
     chunk_offsets=None,
     initial_states=None,
     out=None,
+    init_idx=None,
+    init_has=None,
 ):
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
@@ -638,6 +658,8 @@ def _chunk_scan_fwd(
         chunk_indices,
         chunk_offsets,
         len(chunk_indices) if chunk_indices is not None else 0,
+        init_idx if init_idx is not None else unused_index(x.device, torch.int32),
+        init_has if init_has is not None else unused_index(x.device, torch.bool),
         chunk_size,
         headdim,
         dstate,
@@ -698,5 +720,6 @@ def _chunk_scan_fwd(
         HAS_SEQ_IDX=seq_idx is not None,
         IS_TRITON_22=TRITON_22,
         HAS_INITSTATES=initial_states is not None,
+        INIT_FROM_POOL=init_idx is not None,
     )
     return out_x

@@ -88,6 +88,9 @@ class ForwardMetadata:
     track_ssm_seq_idx: Optional[torch.Tensor] = None
     track_ssm_end_locs: Optional[torch.Tensor] = None
     track_ssm_recompute_dst: Optional[torch.Tensor] = None
+    # Mamba2: per batch row, the track slot that receives the row's final state,
+    # -1 for rows not tracked at their final state. The SSD kernel writes it.
+    track_ssm_final_dst_per_row: Optional[torch.Tensor] = None
 
     is_target_verify: bool = False
     draft_token_num: int = 1
@@ -337,6 +340,7 @@ class Mamba2Metadata(ForwardMetadata):
             track_ssm_seq_idx=forward_metadata.track_ssm_seq_idx,
             track_ssm_end_locs=forward_metadata.track_ssm_end_locs,
             track_ssm_recompute_dst=forward_metadata.track_ssm_recompute_dst,
+            track_ssm_final_dst_per_row=forward_metadata.track_ssm_final_dst_per_row,
             has_mamba_track_mask=forward_metadata.has_mamba_track_mask,
             mamba_track_mask_indices=mamba_track_mask_indices,
             conv_states_mask_indices=conv_states_mask_indices,

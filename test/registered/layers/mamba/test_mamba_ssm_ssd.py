@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=17, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=34, suite="base-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
@@ -15,7 +15,17 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from sglang.kernels.ops.mamba.triton_ops import mamba_chunk_scan_combined
+from sglang.kernels.ops.mamba.triton_ops.ssd_chunk_state import (
+    _chunk_state_varlen_kernel,
+)
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    _ssm_slots_contiguous,
+)
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
+from sglang.srt.mem_cache.layout.token_major import (
+    build_mamba_entry_views,
+    mamba_entry_bytes,
+)
 from sglang.srt.utils import get_device
 from sglang.srt.utils.device import is_hip
 from sglang.utils import is_in_ci
@@ -780,6 +790,266 @@ def test_mamba_chunk_scan_track_states_at_request_boundary(chunk_size, seqlens):
             rtol=5e-3,
             msg=lambda m, i=i, n=n: f"request {i} snapshot at {n} tokens: " + m,
         )
+
+
+# ===== Pool mode: SSD kernels read and write states in the state pool =====
+
+
+POOL_N_HEADS, POOL_N_GROUPS = 8, 2
+
+
+def _pool_inputs(seqlens, d_head, d_state, gen, device):
+    T = sum(seqlens)
+    x = torch.randn(1, T, POOL_N_HEADS, d_head, generator=gen, device=device)
+    dt = torch.randn(1, T, POOL_N_HEADS, generator=gen, device=device)
+    B = torch.randn(1, T, POOL_N_GROUPS, d_state, generator=gen, device=device)
+    C = torch.randn(1, T, POOL_N_GROUPS, d_state, generator=gen, device=device)
+    A = -torch.exp(torch.rand(POOL_N_HEADS, generator=gen, device=device))
+    D = torch.ones(POOL_N_HEADS, device=device, dtype=torch.bfloat16)
+    dt_bias = (torch.rand(POOL_N_HEADS, generator=gen, device=device) - 2).bfloat16()
+    bf = lambda t: t.to(torch.bfloat16)
+    return bf(x), bf(dt), A, bf(B), bf(C), D, dt_bias
+
+
+# A prefill batch over a shuffled state pool, with final-state and recompute
+# tracking rows, laid out as the Mamba2 backend builds them.
+def _pool_case(seqlens, chunk_size, d_head, d_state, pool_dtype, has_init, seed):
+    device = get_device()
+    gen = torch.Generator(device=device).manual_seed(seed)
+    n = len(seqlens)
+    num_slots = 3 * n + 4
+    perm = torch.randperm(num_slots, generator=gen, device=device)
+    slots, track_slots = perm[:n].to(torch.int32), perm[n : 2 * n]
+    pool = (
+        torch.randn(
+            num_slots, POOL_N_HEADS, d_head, d_state, generator=gen, device=device
+        )
+        * 0.1
+    ).to(pool_dtype)
+
+    starts = [sum(seqlens[:i]) for i in range(n + 1)]
+    cu = torch.tensor(starts, dtype=torch.int32, device=device)
+    seq_idx = torch.repeat_interleave(
+        torch.arange(n, dtype=torch.int32, device=device),
+        torch.tensor(seqlens, device=device),
+    ).unsqueeze(0)
+    has = torch.tensor(has_init, dtype=torch.bool, device=device)
+    chunk_indices = chunk_offsets = None
+    if any(has_init):
+        chunk_indices, chunk_offsets = (
+            Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
+                cu, chunk_size, starts[-1]
+            )
+        )
+
+    # Rows whose tracked position is off the chunk grid are recomputed; every
+    # other row is tracked at its final state.
+    recompute_rows, end_locs = [], []
+    for i, ln in enumerate(seqlens):
+        aligned = (ln // chunk_size) * chunk_size
+        if aligned and aligned != ln and (starts[i] + aligned) % chunk_size:
+            recompute_rows.append(i)
+            end_locs.append(starts[i] + aligned)
+    final_rows = [i for i in range(n) if i not in recompute_rows]
+    final_dst_per_row = torch.full((n,), -1, dtype=torch.int32, device=device)
+    final_dst_per_row[final_rows] = track_slots[final_rows].to(torch.int32)
+    as_dev = lambda v: torch.tensor(v, dtype=torch.int64, device=device)
+    return dict(
+        args=_pool_inputs(seqlens, d_head, d_state, gen, device),
+        chunk_size=chunk_size,
+        pool=pool,
+        slots=slots,
+        has=has,
+        cu=cu,
+        seq_idx=seq_idx,
+        chunk_indices=chunk_indices,
+        chunk_offsets=chunk_offsets,
+        recompute_rows=as_dev(recompute_rows),
+        end_locs=torch.tensor(end_locs, dtype=torch.int32, device=device),
+        recompute_dst=track_slots[recompute_rows],
+        final_src=slots[final_rows].long(),
+        final_dst=track_slots[final_rows],
+        final_dst_per_row=final_dst_per_row,
+    )
+
+
+def _run_pool_case(c, pool, in_pool):
+    x, dt, A, B, C, D, dt_bias = c["args"]
+    has_prefix = bool(c["has"].any())
+    kwargs = {}
+    initial_states = None
+    if in_pool:
+        kwargs = dict(
+            state_pool=pool,
+            state_indices=c["slots"],
+            has_initial_state=c["has"] if has_prefix else None,
+            final_track_slots=c["final_dst_per_row"],
+            track_out_slots=c["recompute_dst"],
+        )
+    elif has_prefix:
+        initial_states = torch.where(c["has"][:, None, None, None], pool[c["slots"]], 0)
+    out = torch.empty_like(x)
+    states, varlen, track = mamba_chunk_scan_combined(
+        x,
+        dt,
+        A,
+        B,
+        C,
+        c["chunk_size"],
+        D=D,
+        dt_bias=dt_bias,
+        seq_idx=c["seq_idx"],
+        chunk_indices=c["chunk_indices"],
+        chunk_offsets=c["chunk_offsets"],
+        cu_seqlens=c["cu"],
+        initial_states=initial_states,
+        return_varlen_states=True,
+        return_track_states=True,
+        track_seq_idx=c["recompute_rows"],
+        track_end_locs=c["end_locs"],
+        dt_softplus=True,
+        out=out,
+        state_dtype=pool.dtype,
+        **kwargs,
+    )
+    if in_pool:
+        assert varlen is None and (track is None or c["recompute_rows"].numel() == 0)
+    else:
+        # What MambaMixer2 and _track_mamba_state_extend do with the results.
+        pool[c["slots"]] = varlen
+        if c["recompute_rows"].numel():
+            pool[c["recompute_dst"]] = track.squeeze(0).to(pool.dtype)
+        pool[c["final_dst"]] = pool[c["final_src"]]
+    return out, states
+
+
+def _assert_pool_mode_matches(c):
+    ref_pool, new_pool = c["pool"].clone(), c["pool"].clone()
+    ref_out, ref_states = _run_pool_case(c, ref_pool, in_pool=False)
+    new_out, new_states = _run_pool_case(c, new_pool, in_pool=True)
+    assert not torch.equal(ref_pool, c["pool"]), "the case must update the pool"
+    assert torch.equal(new_out, ref_out)
+    assert torch.equal(new_states, ref_states)
+    assert torch.equal(new_pool, ref_pool)
+
+
+POOL_SEQLENS = [
+    (64,) * 8,  # every sequence starts and ends inside a chunk
+    (300, 500, 128, 1000),
+    (17, 256, 1, 700, 129),
+]
+
+
+@pytest.mark.parametrize("seqlens", POOL_SEQLENS)
+@pytest.mark.parametrize("prefix", ["all", "some", "none"])
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_pool_mode_matches_gather_where_and_index_put(seqlens, prefix, pool_dtype):
+    if get_device() != "cuda" or is_hip():
+        pytest.skip("Pool-mode cases are verified on CUDA only")
+    has_init = {
+        "all": [True] * len(seqlens),
+        "some": [i % 2 == 0 for i in range(len(seqlens))],
+        "none": [False] * len(seqlens),
+    }[prefix]
+    c = _pool_case(seqlens, 128, 64, 128, pool_dtype, has_init, seed=len(seqlens))
+    _assert_pool_mode_matches(c)
+
+
+def test_pool_mode_survives_autotuning_its_first_call():
+    """The final-state kernel may read a row's initial state from the slot it then
+    overwrites; autotuning that first pool-mode call must not chain its trials."""
+    if get_device() != "cuda" or is_hip():
+        pytest.skip("Pool-mode cases are verified on CUDA only")
+    c = _pool_case((64,) * 8, 64, 32, 64, torch.float32, [True] * 8, seed=7)
+    tuner = _chunk_state_varlen_kernel
+    saved_cache, saved_disk = dict(tuner.cache), tuner.cache_results
+    tuner.cache.clear()
+    tuner.cache_results = False
+    try:
+        new_pool = c["pool"].clone()
+        new_out, _ = _run_pool_case(c, new_pool, in_pool=True)  # tunes, in pool mode
+        ref_pool = c["pool"].clone()
+        ref_out, _ = _run_pool_case(c, ref_pool, in_pool=False)  # reuses that config
+    finally:
+        tuner.cache.clear()
+        tuner.cache.update(saved_cache)
+        tuner.cache_results = saved_disk
+    assert torch.equal(new_out, ref_out)
+    assert torch.equal(new_pool, ref_pool)
+
+
+def test_pool_mode_needs_contiguous_slots():
+    pool = torch.zeros(4, POOL_N_HEADS, 64, 128)
+    assert _ssm_slots_contiguous(pool)
+    assert _ssm_slots_contiguous(torch.zeros(2, 4, POOL_N_HEADS, 64, 128)[1])
+    # The page-major envelope pads between slots, not inside one.
+    _, envelope_pool = _page_major_layer_pool(pool, torch.float32, device="cpu")
+    assert _ssm_slots_contiguous(envelope_pool)
+    assert not _ssm_slots_contiguous(pool.transpose(2, 3))
+    assert not _ssm_slots_contiguous(torch.zeros(4, POOL_N_HEADS, 64, 256)[..., :128])
+
+
+# Conv rows of one Mamba layer in the envelope; any shape that keeps itemsizes aligned.
+ENVELOPE_CONV_SHAPE = (96, 3)
+
+
+def _page_major_layer_pool(pool, view_dtype, device, seed=0):
+    """Layer 1 of a 2-layer page-major envelope (``--enable-page-major-kv-layout``),
+    holding ``pool``'s values; every other envelope byte is random."""
+    shape = dict(
+        layer_num=2,
+        conv_state_shapes=[ENVELOPE_CONV_SHAPE],
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=tuple(pool.shape[1:]),
+    )
+    entry = mamba_entry_bytes(**shape, temporal_dtype=pool.dtype)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    raw = torch.randint(
+        0,
+        256,
+        (pool.shape[0] * entry,),
+        dtype=torch.uint8,
+        generator=gen,
+        device=device,
+    )
+    _, temporal = build_mamba_entry_views(
+        raw, **shape, temporal_dtype=view_dtype, max_slots=pool.shape[0]
+    )
+    if view_dtype == pool.dtype:
+        temporal[1].copy_(pool)
+    return raw, temporal[1]
+
+
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_pool_mode_on_page_major_envelope_writes_only_its_slots(pool_dtype):
+    """The page-major envelope selects pool mode; the SSD kernels must then write the
+    same bytes as the old path, and no envelope byte outside the written slots."""
+    if get_device() != "cuda" or is_hip():
+        pytest.skip("Pool-mode cases are verified on CUDA only")
+    c = _pool_case(
+        (300, 500, 128, 1000), 128, 64, 128, pool_dtype, [True, False] * 2, seed=5
+    )
+    raws = {}
+    for in_pool in (False, True):
+        raw, layer_pool = _page_major_layer_pool(c["pool"], pool_dtype, get_device())
+        assert _ssm_slots_contiguous(layer_pool)
+        before = raw.clone()
+        _run_pool_case(c, layer_pool, in_pool=in_pool)
+        raws[in_pool] = raw
+    assert torch.equal(raws[True], raws[False])
+
+    # Mark the bytes of every slot either path writes, through a same-width integer view.
+    written = torch.cat(
+        [c["slots"].long(), c["recompute_dst"].long(), c["final_dst"].long()]
+    )
+    mark, mark_pool = _page_major_layer_pool(
+        c["pool"], {4: torch.int32, 2: torch.int16}[pool_dtype.itemsize], get_device()
+    )
+    mark.zero_()
+    mark_pool[written] = -1
+    untouched = mark == 0
+    assert not torch.equal(raws[True], before)
+    assert torch.equal(raws[True][untouched], before[untouched])
 
 
 if __name__ == "__main__":

@@ -240,6 +240,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_seq_idx = None
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
+        track_ssm_final_dst_per_row = None
         logical_num_tokens = None
         track_mask_indices = None
 
@@ -401,6 +402,7 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_seq_idx,
                         track_ssm_end_locs,
                         track_ssm_recompute_dst,
+                        track_ssm_final_dst_per_row,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
@@ -427,6 +429,7 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_seq_idx=track_ssm_seq_idx,
             track_ssm_end_locs=track_ssm_end_locs,
             track_ssm_recompute_dst=track_ssm_recompute_dst,
+            track_ssm_final_dst_per_row=track_ssm_final_dst_per_row,
             has_mamba_track_mask=has_mamba_track_mask,
             replayssm_write_pos=replayssm_write_pos,
             replayssm_force_flush=replayssm_force_flush,
@@ -548,8 +551,16 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_seq_idx = None
         track_ssm_end_locs = None
         track_ssm_recompute_dst = None
+        track_ssm_final_dst_per_row = None
 
         if isinstance(self, Mamba2AttnBackend):
+            final_rows = torch.nonzero(mamba_track_mask, as_tuple=True)[0][is_aligned]
+            track_ssm_final_dst_per_row = torch.full_like(
+                mamba_track_indices, -1, dtype=torch.int32
+            )
+            track_ssm_final_dst_per_row[final_rows] = mamba_track_indices[
+                final_rows
+            ].to(torch.int32)
             # `h` is one chunk grid over the whole flattened batch, so the wanted
             # state is in it only when query_start_loc[i] is chunk-aligned.
             query_start_loc = torch.zeros_like(extend_seq_lens)
@@ -596,6 +607,7 @@ class MambaAttnBackendBase(AttentionBackend):
             to_device(track_ssm_seq_idx),
             to_device(track_ssm_end_locs),
             to_device(track_ssm_recompute_dst),
+            to_device(track_ssm_final_dst_per_row),
         )
 
     def _track_indices_to_device(self, values, dtype=torch.int64):
@@ -618,16 +630,23 @@ class MambaAttnBackendBase(AttentionBackend):
         h_rows = to_device(plan.h_rows)
         recompute_rows = to_device(plan.recompute_rows) if is_mamba2 else None
         destinations = forward_batch.mamba_track_indices
+        final_dst = destinations.index_select(0, final_rows)
+        final_dst_per_row = None
+        if is_mamba2:
+            final_dst_per_row = torch.full_like(
+                destinations, -1, dtype=torch.int32
+            ).index_copy_(0, final_rows, final_dst.to(torch.int32))
         return (
             to_device(plan.chunk_indices, torch.int32),
             to_device(plan.h_src),
             destinations.index_select(0, h_rows),
             to_device(plan.unaligned_rows),
             mamba_cache_indices.index_select(0, final_rows),
-            destinations.index_select(0, final_rows),
+            final_dst,
             recompute_rows,
             to_device(plan.recompute_end_locs) if is_mamba2 else None,
             destinations.index_select(0, recompute_rows) if is_mamba2 else None,
+            final_dst_per_row,
         )
 
     def init_forward_metadata_capture_cpu_graph(
@@ -1140,6 +1159,7 @@ class MambaAttnBackendBase(AttentionBackend):
         track_states: Optional[torch.Tensor] = None,
         *,
         h_track_buf: Optional[torch.Tensor] = None,
+        final_and_recompute_written: bool = False,
     ):
         """Copy extend SSM state at the last chunk boundary to track slots (source
         depends on chunk alignment; see `_init_track_ssm_indices`).
@@ -1164,6 +1184,9 @@ class MambaAttnBackendBase(AttentionBackend):
                     ssm_states[forward_metadata.track_ssm_h_dst] = h[
                         forward_metadata.track_ssm_h_src
                     ].to(ssm_states.dtype, copy=False)
+            if final_and_recompute_written:
+                # The Mamba2 SSD kernel stored these rows into the pool directly.
+                return
             if (
                 forward_metadata.track_ssm_recompute_dst is not None
                 and forward_metadata.track_ssm_recompute_dst.numel() > 0
@@ -1176,6 +1199,13 @@ class MambaAttnBackendBase(AttentionBackend):
                 ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
                     forward_metadata.track_ssm_final_src
                 ]
+
+
+# The SSD kernels' in-pool reads and writes need each slot's [nheads, headdim, dstate]
+# state contiguous, page-major pools also use it.
+def _ssm_slots_contiguous(ssm_state: torch.Tensor) -> bool:
+    _, _, headdim, dstate = ssm_state.shape
+    return ssm_state.stride()[1:] == (headdim * dstate, dstate, 1)
 
 
 class Mamba2AttnBackend(MambaAttnBackendBase):
@@ -1251,6 +1281,20 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             use_triton_causal_conv or get_memory().enable_page_major_kv_layout
         )
         layer_cache = self.state_layer_cache(layer_id)
+        # MambaMixer1 (Falcon-Mamba) also runs here; its 3-D state and forward()
+        # have no pool mode.
+        pool_kwargs = {}
+        track_states_in_pool = False
+        if isinstance(mixer, MambaMixer2):
+            ssm_state_in_pool = _ssm_slots_contiguous(layer_cache.temporal)
+            track_states_in_pool = (
+                ssm_state_in_pool
+                and self.forward_metadata.track_ssm_final_dst_per_row is not None
+            )
+            pool_kwargs = dict(
+                ssm_state_in_pool=ssm_state_in_pool,
+                track_states_in_pool=track_states_in_pool,
+            )
         mixer_out, intermediate_states, track_states = mixer.forward(
             hidden_states=hidden_states,
             output=output,
@@ -1258,6 +1302,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             metadata=self.forward_metadata,
             mup_vector=mup_vector,
             use_triton_causal_conv=use_triton_causal_conv,
+            **pool_kwargs,
         )
 
         if forward_batch.mamba_track_mask is not None:
@@ -1268,6 +1313,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                     layer_cache.temporal,
                     self.forward_metadata,
                     track_states=track_states,
+                    final_and_recompute_written=track_states_in_pool,
                 )
 
             if self.forward_metadata.num_decodes > 0:
