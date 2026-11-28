@@ -1,6 +1,7 @@
 """Unit tests for the Nano Nemotron VL processor."""
 
 import asyncio
+import re
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -176,6 +177,36 @@ class TestNanoNemotronVLProcessor(CustomTestCase):
                     list(padded), expected + [30, 1_000_002, 1_000_002, 31]
                 )
                 self.assertEqual(mm.data_offsets, [start - 1, len(text)])
+
+    def test_text_prompt_expands_each_image_at_its_placeholder(self):
+        """A text prompt with two images must not leave a bare <image> token behind."""
+        processor = self._tokenized_processor()
+        specials = {"<img>": 19, "<image>": 18, "</img>": 20}
+
+        def tokenize(text, add_special_tokens, return_tensors=None):
+            pieces = re.findall(r"</img>|<img>|<image>|.", text, re.S)
+            ids = [specials.get(piece, 7) for piece in pieces]
+            return {"input_ids": torch.tensor([ids]) if return_tensors else ids}
+
+        processor.tokenizer.side_effect = tokenize
+        module = "sglang.srt.multimodal.processors.nano_nemotron_vl"
+        with (
+            patch(
+                f"{module}.compute_budgeted_image_sizes", return_value=[(32, 32, 2)] * 2
+            ),
+            patch(
+                f"{module}.resize_image_to_pixels", return_value=torch.zeros(3, 32, 32)
+            ),
+        ):
+            result = asyncio.run(
+                processor.process_mm_data_async(
+                    [object(), object()],
+                    [],
+                    "a<image>b<image>c",
+                    SimpleNamespace(video_data=[]),
+                )
+            )
+        self.assertEqual(result.input_ids, [7, 19, 18, 18, 20, 7, 19, 18, 18, 20, 7])
 
     def test_tubelet_label_matches_hf_reference(self):
         """Multi-frame tubelet labels must match the HF processor's prompt format."""
