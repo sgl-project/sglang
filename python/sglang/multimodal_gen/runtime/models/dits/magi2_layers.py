@@ -53,22 +53,35 @@ class Magi2FourierRope(nn.Module):
         super().__init__()
         self.num_bands = num_bands
         self.bands = nn.Parameter(freq_bands(num_bands))
+        self._cache = WeakTensorKeyDictionary()
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
-        positions = coords[:, 0:3]
-        sizes = coords[:, 3:6]
-        refs = coords[:, 6:9]
+        # Coords are per branch and per request, reused by every step of both passes.
+        # Bands are not: a reload or a park swap swaps the storage under them.
+        if torch.is_grad_enabled():
+            return _fourier_rope(coords=coords, bands=self.bands)
+        fingerprint = (id(self.bands), self.bands.data_ptr(), self.bands._version)
+        entry = self._cache.get(coords)
+        if entry is not None and entry[0] == fingerprint:
+            return entry[1]
+        rope = _fourier_rope(coords=coords, bands=self.bands)
+        self._cache[coords] = (fingerprint, rope)
+        return rope
 
-        scales = (refs - 1) / (sizes - 1)
-        scales = torch.where(
-            (refs == 1) & (sizes == 1), torch.ones_like(scales), scales
-        )
 
-        centers = (sizes - 1) / 2
-        centers = torch.cat([torch.zeros_like(centers[:, :1]), centers[:, 1:]], dim=1)
+def _fourier_rope(*, coords: torch.Tensor, bands: torch.Tensor) -> torch.Tensor:
+    positions = coords[:, 0:3]
+    sizes = coords[:, 3:6]
+    refs = coords[:, 6:9]
 
-        proj = (positions - centers).unsqueeze(-1) * scales.unsqueeze(-1) * self.bands
-        return torch.cat((proj.sin(), proj.cos()), dim=1).flatten(1)
+    scales = (refs - 1) / (sizes - 1)
+    scales = torch.where((refs == 1) & (sizes == 1), torch.ones_like(scales), scales)
+
+    centers = (sizes - 1) / 2
+    centers = torch.cat([torch.zeros_like(centers[:, :1]), centers[:, 1:]], dim=1)
+
+    proj = (positions - centers).unsqueeze(-1) * scales.unsqueeze(-1) * bands
+    return torch.cat((proj.sin(), proj.cos()), dim=1).flatten(1)
 
 
 def apply_partial_rope(
@@ -226,7 +239,8 @@ class Magi2ModalityLinear(nn.Module):
         self, x: torch.Tensor, modality_ids: torch.Tensor | None = None
     ) -> torch.Tensor:
         # Precision boundary: callers pass fp32, cross-dtype matmul raises.
-        x = x.to(self.weight.dtype)
+        if x.dtype != self.weight.dtype:
+            x = x.to(self.weight.dtype)
 
         if self.num_modality == 1:
             return torch.nn.functional.linear(x, self.weight)
@@ -237,8 +251,14 @@ class Magi2ModalityLinear(nn.Module):
         if modality_ids.numel() == 1:
             return torch.nn.functional.linear(x, weight[int(modality_ids[0])])
 
+        runs = modality_runs(modality_ids)
+        if len(runs) == 1:
+            # A single run spans every row, so its slice is x itself.
+            _, _, modality = runs[0]
+            return torch.nn.functional.linear(x, weight[modality])
+
         out = x.new_empty(x.shape[:-1] + (self.out_features,))
-        for start, count, modality in modality_runs(modality_ids):
+        for start, count, modality in runs:
             # Slice assignment, not linear(out=...), which rejects grad inputs.
             out[start : start + count] = torch.nn.functional.linear(
                 x.narrow(0, start, count), weight[modality]
