@@ -131,11 +131,9 @@ cp pyproject_cpu.toml pyproject.toml
 uv pip install .
 ```
 
-4. Set the required environment variables
+4. Configure the shared library paths
 
 ```bash Command
-export SGLANG_USE_CPU_ENGINE=1
-
 # Set 'LD_LIBRARY_PATH' and 'LD_PRELOAD' to ensure the libs can be loaded by sglang processes
 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu
 export LD_PRELOAD=${LD_PRELOAD}:/opt/.venv/lib/libiomp5.so:${LD_LIBRARY_PATH}/libtcmalloc.so.4:${LD_LIBRARY_PATH}/libtbbmalloc.so.2
@@ -143,8 +141,8 @@ export LD_PRELOAD=${LD_PRELOAD}:/opt/.venv/lib/libiomp5.so:${LD_LIBRARY_PATH}/li
 
 Notes:
 
-- Note that the environment variable `SGLANG_USE_CPU_ENGINE=1`
-    is required to enable the SGLang service with the CPU engine.
+- The `sglang-cpu` installation enables the CPU engine automatically. It does
+    not require `SGLANG_USE_CPU_ENGINE=1`.
 
 - If you encounter code compilation issues during the `sgl-kernel` building process,
     please check your `gcc` and `g++` versions and upgrade them if they are outdated.
@@ -161,7 +159,6 @@ Notes:
 
     ```bash Command
     source .venv/bin/activate
-    export SGLANG_USE_CPU_ENGINE=1
     export LD_LIBRARY_PATH=<YOUR-SYSTEM-LIBRARY-FOLDER>
     export LD_PRELOAD=<YOUR-LIBS-PATHS>
     ```

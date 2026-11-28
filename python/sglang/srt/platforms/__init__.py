@@ -13,13 +13,14 @@ Usage:
 import logging
 import os
 import pkgutil
-from importlib.metadata import entry_points
+from importlib.metadata import PackageNotFoundError, distribution, entry_points
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
+from sglang.srt.platforms.device_mixin import CpuArchEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
@@ -44,7 +45,22 @@ def _is_rocm_available() -> bool:
 
 
 def _is_cpu_available() -> bool:
-    return os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1"
+    if (
+        CpuSRTPlatform.get_cpu_architecture()
+        not in (
+            CpuArchEnum.X86,
+            CpuArchEnum.ARM,
+        )
+        or not torch.cpu.is_available()
+    ):
+        return False
+    if os.getenv("SGLANG_USE_CPU_ENGINE", "0") == "1":
+        return True
+    try:
+        distribution("sglang-cpu")
+    except PackageNotFoundError:
+        return False
+    return True
 
 
 def _is_npu_available() -> bool:
@@ -89,9 +105,8 @@ def _resolve_platform() -> SRTPlatform:
 
        SGLANG_PLATFORM unset (auto-discover):
          - Import and activate all discovered plugins
-         - 0 activated + SGLANG_USE_CPU_ENGINE=1 → fallback CpuSRTPlatform
-           (checked first; an explicit opt-in wins over CUDA/ROCm availability,
-           so developers on GPU hosts can intentionally exercise the CPU path)
+         - 0 activated + supported CPU + (sglang-cpu installed or SGLANG_USE_CPU_ENGINE=1)
+           → fallback CpuSRTPlatform (checked before CUDA/ROCm)
          - 0 activated + SAIL available → fallback SailSRTPlatform
            (checked before CUDA; SAIL also reports torch.cuda.is_available())
          - 0 activated + CUDA available → fallback CudaSRTPlatform
@@ -153,7 +168,7 @@ def _resolve_platform() -> SRTPlatform:
 
     if len(activated) == 0:
         if _is_cpu_available():
-            logger.debug("SGLANG_USE_CPU_ENGINE=1. Using CPU SRTPlatform defaults.")
+            logger.debug("Using CPU SRTPlatform defaults.")
             return CpuSRTPlatform()
         if is_sail_available():
             logger.debug(
