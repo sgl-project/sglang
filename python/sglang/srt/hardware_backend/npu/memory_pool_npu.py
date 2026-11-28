@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
@@ -28,6 +28,9 @@ from sglang.srt.utils.device import is_npu
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_pool import (
+        HostKVPool,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
 
 if is_npu():
@@ -719,6 +722,7 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
     rows_are_dcp_collapsed = False
+    pd_host_pool: Optional["HostKVPool"] = None
 
     # Quantization tile of the packed one-byte DSA record, under the name the
     # CUDA DSATokenToKVPool exposes (pool wrappers forward it). The packer,
@@ -796,6 +800,28 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
         )
+        disaggregation_mode = None
+        if (
+            self.enable_sparsity_driven_kv_offload
+            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+        ):
+            if is_draft_worker:
+                self.enable_sparsity_driven_kv_offload = False
+            else:
+                disaggregation_mode = get_disagg().disaggregation_mode
+                self.enable_sparsity_driven_kv_offload = (
+                    disaggregation_mode != "prefill"
+                )
+        if disaggregation_mode == "decode":
+            if modelslim_cache_layout is not None or self.use_fia_nz:
+                raise ValueError("Ascend PD split KV requires row-major MLA caches.")
+            from sgl_kernel_npu.operators.attention.fused_scatter_copy_sparse_flash_attention_split import (
+                validate_pd_split_copy_sfa_layout,
+            )
+
+            validate_pd_split_copy_sfa_layout(
+                kv_lora_rank, qk_rope_head_dim, page_size, dtype
+            )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
         if index_head_dim is None:
@@ -1308,23 +1334,35 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
 
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots, layer_id) entries in PD transfer order."""
-        self._raise_if_native_kv_cache_disabled()
-        global_kv = self.is_draft_worker
         kv_layer_ids = self._kv_buffer_layer_ids()
-        if self.use_combined_kv_buffer:
-            return [
-                (buffer, global_kv, layer_id)
-                for buffer, layer_id in zip(self.kv_buffer, kv_layer_ids, strict=True)
+        if self.pd_host_pool is not None:
+            # Host CKV and KPE precede the native indexer buffers.
+            entries = [
+                (buffer, True, layer_id)
+                for component in self.pd_host_pool.buffers
+                for buffer, layer_id in zip(component, kv_layer_ids, strict=True)
             ]
-        entries = [
-            (buffer, global_kv, layer_id)
-            for buffer, layer_id in zip(self.k_buffer, kv_layer_ids, strict=True)
-        ]
-        if not self.dsa_kv_cache_store_c8:
-            entries += [
+        else:
+            self._raise_if_native_kv_cache_disabled()
+            global_kv = self.is_draft_worker
+            if self.use_combined_kv_buffer:
+                return [
+                    (buffer, global_kv, layer_id)
+                    for buffer, layer_id in zip(
+                        self.kv_buffer, kv_layer_ids, strict=True
+                    )
+                ]
+            entries = [
                 (buffer, global_kv, layer_id)
-                for buffer, layer_id in zip(self.v_buffer, kv_layer_ids, strict=True)
+                for buffer, layer_id in zip(self.k_buffer, kv_layer_ids, strict=True)
             ]
+            if not self.dsa_kv_cache_store_c8:
+                entries += [
+                    (buffer, global_kv, layer_id)
+                    for buffer, layer_id in zip(
+                        self.v_buffer, kv_layer_ids, strict=True
+                    )
+                ]
         if self.index_head_dim is not None:
             entries += [
                 (buffer, True, layer_id)
