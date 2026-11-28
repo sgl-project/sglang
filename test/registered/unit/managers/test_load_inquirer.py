@@ -85,6 +85,54 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
             get_waiting_storage_span=Mock(return_value=storage_span),
         )
 
+    def test_load_report_carries_the_storage_counters(self):
+        collector = SimpleNamespace(
+            total_storage_prefetch_hit_tokens=500,
+            total_storage_prefetch_unfulfilled_tokens={"storage_transfer": 20},
+            total_backuped_tokens=900,
+            total_backup_dropped_tokens=70,
+        )
+        for storage, expected in [
+            (collector, (500, {"storage_transfer": 20}, 900, 70)),
+            (None, (None, None, None, None)),
+        ]:
+            inquirer = replace(
+                self.make_inquirer(),
+                spec_algorithm=SimpleNamespace(is_none=lambda: True),
+                pool_stats_observer=SimpleNamespace(
+                    get_pool_stats=lambda: SimpleNamespace(
+                        get_kv_token_stats=lambda: (0, 0.0)
+                    )
+                ),
+                get_running_batch=lambda: SimpleNamespace(reqs=[]),
+                get_stats=lambda: SchedulerStats(),
+                get_request_lists=lambda: {},
+                get_total_prefill_uncached_tokens=lambda: 0,
+                get_total_prefill_busy_us=lambda: 0,
+                get_decode_moment_totals=lambda: [0.0] * 6,
+                get_storage_metrics_collector=lambda storage=storage: storage,
+            )
+            with (
+                patch(
+                    "sglang.srt.managers.scheduler_components.load_inquirer.get_lora",
+                    return_value=SimpleNamespace(enable_lora=False),
+                ),
+                patch(
+                    "sglang.srt.managers.scheduler_components.load_inquirer.get_parallel",
+                    return_value=SimpleNamespace(dp_rank=0),
+                ),
+            ):
+                load = inquirer.get_loads()
+            self.assertEqual(
+                (
+                    load.total_storage_prefetch_hit_tokens,
+                    load.total_storage_prefetch_unfulfilled_tokens,
+                    load.total_backuped_tokens,
+                    load.total_backup_dropped_tokens,
+                ),
+                expected,
+            )
+
     def test_waiting_tokens_are_estimated_when_prefix_matching_is_skipped(self):
         inquirer = self.make_inquirer(waiting_queue_prefix_matched=False)
 

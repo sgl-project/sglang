@@ -418,7 +418,7 @@ def test_lora_merge_mode_is_redirected_to_dynamic_on_int8_base():
     layer, weight = _quantized_layer(
         config, 3072, 3072, "transformer_blocks.0.attn.to_q", seed=4
     )
-    lora = wrap_with_lora_layer(layer, lora_rank=16, lora_alpha=16, snapshot_base=True)
+    lora = wrap_with_lora_layer(layer, lora_rank=16, lora_alpha=16)
     layers = {"transformer_blocks.0.attn.to_q": lora}
     # The rotated, per-channel scaled INT8 matrix cannot take a merged delta.
     assert lora.can_merge_base_weight is False

@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
@@ -43,7 +44,11 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.utils import GenerationBatchResult
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    compute_num_reserved_tokens,
+    get_request_length_limits,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -195,12 +200,15 @@ class BaseTpWorker(ABC):
         return success, message
 
     def deserialize_own_rank(self, serialized_named_tensors):
-        """Each rank deserializes only its own payload (index tp_rank);
-        deserializing another rank's copy would break producer-side CUDA-IPC
-        refcounting."""
+        """Each rank deserializes only its own payload, at its engine world rank
+        (tp_size * pp_rank + tp_rank); deserializing another rank's copy would
+        break producer-side CUDA-IPC refcounting."""
+        parallel = get_parallel()
         monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(
-            serialized_named_tensors[get_parallel().tp_rank]
+            serialized_named_tensors[
+                parallel.tp_size * parallel.pp_rank + parallel.tp_rank
+            ]
         )
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -421,11 +429,13 @@ class TpModelWorker(BaseTpWorker):
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            self.model_runner.effective_logical_max_total_num_tokens - 1,
-        )
-        assert max_req_len > 0, "Memory pool size is too small"
+        assert (
+            min(
+                self.model_config.context_len,
+                self.model_runner.effective_logical_max_total_num_tokens,
+            )
+            > 1
+        ), "Memory pool size is too small"
 
     def init_attention_backends(self):
         """Initialize attention backends for all model runners."""
@@ -567,13 +577,19 @@ class TpModelWorker(BaseTpWorker):
                 kv_capacity,
                 self.model_config.context_len,
             )
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            kv_capacity - 1,
+        max_req_len, max_req_input_len = get_request_length_limits(
+            self.model_config.context_len,
+            kv_capacity,
+            dllm_block_size=(
+                self.dllm_algorithm.block_size if self.dllm_algorithm is not None else 0
+            ),
+            num_reserved_tokens=compute_num_reserved_tokens(),
         )
-        max_req_input_len = max_req_len - 5
-        if self.dllm_algorithm is not None:
-            max_req_input_len -= self.dllm_algorithm.block_size
+        assert max_req_input_len >= 1, (
+            f"No prompt fits: max_req_input_len={max_req_input_len} from "
+            f"context_len={self.model_config.context_len} and "
+            f"kv_capacity={kv_capacity}; raise the context length or the KV pool size."
+        )
         return (
             self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,
@@ -740,6 +756,16 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
+                return batch_result
+
+            if batch is not None and is_beam_only_batch(batch):
+                # The beam coordinator selects the tokens. The placeholder sets
+                # has_sampled_token_ids, which gates the scheduler's relay, CPU
+                # copy and result processing; beam reqs never read its values.
+                batch_result.next_token_ids = torch.zeros(
+                    len(batch.reqs), dtype=torch.int64
+                )
+                self._maybe_finalize_elastic_cuda_graph_scale()
                 return batch_result
 
             # Delay sampling only for normal generation requests.

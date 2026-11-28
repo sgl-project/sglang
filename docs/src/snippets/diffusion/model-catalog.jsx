@@ -134,10 +134,12 @@ export const DiffusionModelCatalog = ({ category }) => {
         "FireRedTeam/FireRed-Image-Edit-1.0",
         "FireRedTeam/FireRed-Image-Edit-1.1",
       ],
+      cookbook: "/cookbook/diffusion/FireRed/FireRed-Image-Edit",
     },
     {
       name: "JoyAI-Image",
       modelIds: ["jdopensource/JoyAI-Image-Edit-Diffusers"],
+      cookbook: "/cookbook/diffusion/JoyAI-Image/JoyAI-Image-Edit",
     },
     {
       name: "SenseNova-U1.5",
@@ -158,6 +160,7 @@ export const DiffusionModelCatalog = ({ category }) => {
     {
       name: "Hunyuan3D 2",
       modelIds: ["tencent/Hunyuan3D-2"],
+      cookbook: "/cookbook/diffusion/Tencent/Hunyuan3D-2",
     },
   ],
   video: [
@@ -197,6 +200,7 @@ export const DiffusionModelCatalog = ({ category }) => {
         "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4",
         "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
+        "Wan-AI/Wan2.2-S2V-14B",
       ],
       cookbook: "/cookbook/diffusion/Wan/Wan2.2",
     },
@@ -267,6 +271,11 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "Pika H3 Flex",
       modelIds: ["Pika-Labs/Pika-H3-Flex"],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#pika-h3-flex-six-step-adapters",
+    },
+    {
+      name: "pi-H3",
+      modelIds: ["Lakonik/pi-H3"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3#pi-h3-2-and-4-step-adapters-decoder-free-video",
     },
     {
       name: "VDN-H3",

@@ -12,6 +12,7 @@ import torch
 from safetensors import safe_open
 
 _ADAPTER_SLOT = re.compile(r"(\.lora_[AB])\.([^.]+)\.weight$")
+_KOHYA_DOWN_SLOT = re.compile(r"\.(lora_down|lora\.down)\.[^.]+\.weight$")
 _WRAPPER_PREFIXES = ("peft_model.base_model.model.", "base_model.model.")
 _UNSUPPORTED_CONFIG_FIELDS = (
     "alora_invocation_tokens",
@@ -41,7 +42,10 @@ def _has_unambiguous_global_alpha(file: Any) -> bool:
 
     ranks = set()
     for name in keys:
-        if not name.endswith(_NATIVE_LORA_A_SUFFIXES):
+        # Kohya keys can name the adapter slot too (`.lora_down.default.weight`).
+        if not _KOHYA_DOWN_SLOT.sub(r".\1.weight", name).endswith(
+            _NATIVE_LORA_A_SUFFIXES
+        ):
             continue
         shape = file.get_slice(name).get_shape()
         if len(shape) >= 2:
@@ -228,12 +232,10 @@ def _validate_peft_features(
         )
 
 
-def apply_peft_config(
-    state_dict: dict[str, torch.Tensor], config: Mapping[str, Any]
-) -> dict[str, torch.Tensor]:
-    """Represent PEFT scaling variants with native LoRA tensors and alpha."""
-    _validate_peft_features(state_dict, config)
-    normalized = dict(state_dict)
+def compile_peft_alpha_patterns(
+    config: Mapping[str, Any],
+) -> list[tuple[re.Pattern[str], int]]:
+    """Validate PEFT `alpha_pattern` and compile each entry to a module-name matcher."""
     patterns = config.get("alpha_pattern", {})
     if not isinstance(patterns, dict):
         raise ValueError("PEFT alpha_pattern must be an object")
@@ -253,15 +255,32 @@ def apply_peft_config(
                 f"PEFT alpha_pattern value for {pattern!r} must be a positive integer"
             )
         compiled_patterns.append((expression, alpha))
+    return compiled_patterns
+
+
+def match_peft_alpha_pattern(
+    module_name: str, compiled_patterns: list[tuple[re.Pattern[str], int]]
+) -> int | None:
+    return next(
+        (alpha for pattern, alpha in compiled_patterns if pattern.match(module_name)),
+        None,
+    )
+
+
+def apply_peft_config(
+    state_dict: dict[str, torch.Tensor], config: Mapping[str, Any]
+) -> dict[str, torch.Tensor]:
+    """Represent PEFT scaling variants with native LoRA tensors and alpha."""
+    _validate_peft_features(state_dict, config)
+    normalized = dict(state_dict)
+    compiled_patterns = compile_peft_alpha_patterns(config)
 
     for name in state_dict:
         base = name.removesuffix(".weight")
         if not base.endswith(".lora_A"):
             continue
         base = base.removesuffix(".lora_A")
-        alpha = next(
-            (alpha for pattern, alpha in compiled_patterns if pattern.match(base)), None
-        )
+        alpha = match_peft_alpha_pattern(base, compiled_patterns)
         if alpha is None:
             continue
         alpha_key = f"{base}.alpha"

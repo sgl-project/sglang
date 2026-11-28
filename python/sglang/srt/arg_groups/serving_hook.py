@@ -222,6 +222,7 @@ def handle_media_url_security(server_args: Any):
             cfg.media_url_max_file_size_mb,
             cfg.media_url_timeout,
             cfg.allow_local_media_files,
+            cfg.allow_private_media_hosts,
         ),
     )
 
@@ -267,14 +268,8 @@ def handle_debug_utils(server_args: Any):
 
 def handle_grpc_args(server_args: Any):
     cfg = resolving_view(server_args)
-    # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
-    # native server, falling back to SGLANG_GRPC_PORT.
-    declare_resolution(
-        server_args,
-        "_handle_grpc_args",
-        grpc_worker_threads=envs.SGLANG_GRPC_WORKER_THREADS.get(),
-    )
-
+    # --grpc-port (CLI) enables the native server, falling back to
+    # SGLANG_GRPC_PORT.
     grpc_port_env = envs.SGLANG_GRPC_PORT.get()
     if cfg.grpc_port is None and grpc_port_env is not None:
         declare_resolution(
@@ -297,10 +292,6 @@ def handle_grpc_args(server_args: Any):
             raise ValueError(
                 "--grpc-port / SGLANG_GRPC_PORT "
                 f"({cfg.grpc_port}) must be between 1 and 65535"
-            )
-        if cfg.grpc_worker_threads is not None and cfg.grpc_worker_threads < 1:
-            raise ValueError(
-                f"SGLANG_GRPC_WORKER_THREADS ({cfg.grpc_worker_threads}) must be >= 1"
             )
 
     if cfg.sidecar_args is not None:
@@ -327,18 +318,18 @@ def handle_grpc_args(server_args: Any):
                 "--grpc-port is not supported with --encoder-only: "
                 "encoder disaggregation uses its own server."
             )
-        # The Rust server serves gRPC itself and sizes its tokenizer thread
-        # pool from --tokenizer-worker-num; only the Python bridge is limited.
-        if cfg.tokenizer_worker_num > 1 and not envs.SGLANG_RUST_SERVER.get():
-            raise ValueError(
-                "Native gRPC does not yet support --tokenizer-worker-num > 1. "
-                "Unset --grpc-port or set --tokenizer-worker-num 1."
-            )
         if cfg.api_key or cfg.admin_api_key:
             raise ValueError(
                 "--grpc-port is incompatible with --api-key/--admin-api-key "
                 "(or SGLANG_ADMIN_API_KEY): "
                 "the native gRPC listener bypasses HTTP auth middleware."
+            )
+        # Only the Rust server serves native gRPC (sglang.api.v1); the Python
+        # server's sglang.runtime.v1 bridge was removed.
+        if not envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "--grpc-port / SGLANG_GRPC_PORT requires the Rust server: set "
+                "SGLANG_RUST_SERVER=1. The Python server no longer serves gRPC."
             )
 
 

@@ -968,7 +968,7 @@ class DeepseekSparseAttnBackend(
                 (
                     self.dsa_prefill_impl,
                     self.local_num_q_heads,
-                    _prims_ts_prefill_max_rows(self.max_context_len),
+                    _prims_ts_prefill_max_rows(model_runner.model_config.context_len),
                 ),
                 (
                     self.dsa_decode_impl,
@@ -1092,7 +1092,7 @@ class DeepseekSparseAttnBackend(
                     max_rows,
                     self.dsa_index_topk,
                     self.physical_page_size,
-                    model_runner.model_config.context_len,
+                    self.max_kv_len,
                 )
 
         if _is_xpu:
@@ -5117,7 +5117,7 @@ class DeepseekSparseAttnBackend(
         ):
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
-            max_kv_len = forward_batch.seq_lens_cpu.max().item()
+            batch_max_kv_len = forward_batch.seq_lens_cpu.max().item()
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
@@ -5129,7 +5129,7 @@ class DeepseekSparseAttnBackend(
                     or (device_sm >= 100 and device_sm < 110)
                     or _IS_GFX95
                 )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
-                and max_kv_len
+                and batch_max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens

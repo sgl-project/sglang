@@ -35,14 +35,14 @@ class DsaGraphVariants:
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
             # Plain decode maintains this host mirror without a D2H sync.
-            max_kv_len = int(seq_lens_cpu.max().item())
+            batch_max_kv_len = int(seq_lens_cpu.max().item())
         elif forward_batch.seq_lens is not None and forward_batch.seq_lens.numel() > 0:
             # Fallback: a single scalar reduction d2h (cheap, per-step).
-            max_kv_len = int(forward_batch.seq_lens.max().item())
+            batch_max_kv_len = int(forward_batch.seq_lens.max().item())
         else:
             # No length info: be safe and use the correct-for-all sparse graph.
             return DSA_SPARSE
-        return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
+        return DSA_DENSE if batch_max_kv_len <= self.index_topk else DSA_SPARSE
 
 
 class SeqLenBucketGraphVariants(msgspec.Struct, frozen=True):
@@ -86,7 +86,7 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
         logger.info(
             "[dense-decode] DSA dual-graph enabled: capturing "
             "dense (k-only) + sparse (full indexer) decode graphs; "
-            "dispatch on max_kv_len vs index_topk=%d.",
+            "dispatch on batch_max_kv_len vs index_topk=%d.",
             index_topk,
         )
         return DsaGraphVariants(index_topk)

@@ -905,8 +905,8 @@ class ExecComm(msgspec.Struct):
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
                 "Requires SM90 or SM10X NVIDIA GPUs. "
-                "When unspecified, supported MiMo configurations use cutedsl; "
-                "other supported models use auto. "
+                "When unspecified, it can be enabled automatically only on "
+                "SM10X for supported models; on SM90, fusion is opt-in. "
                 "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
                 "(single- and multi-node) and trtllm on SM90 single-node systems. "
                 "'trtllm': available on single-node systems only. "
@@ -960,6 +960,10 @@ class ExecMoe(msgspec.Struct):
     is_ep_scale_joiner = Derived(
         fn="sglang.srt.arg_groups.model_override_base.ep_scale_joiner_of",
         doc="Whether it is a scale-up joiner specifically.",
+    )
+    is_ep_offset_joiner = Derived(
+        fn="sglang.srt.arg_groups.model_override_base.ep_offset_joiner_of",
+        doc="Whether it takes a specific global rank (scale, or recover at offset > 0).",
     )
     enable_fused_moe_sum_all_reduce: A[
         bool,
@@ -1122,6 +1126,19 @@ class ExecMoe(msgspec.Struct):
     elastic_ep_scale_timeout: A[
         float, "Timeout in seconds for a pending elastic EP scale operation."
     ] = 600
+    elastic_ep_retiree_lifecycle: A[
+        Literal["self_exit", "external"],
+        "Who ends a retired rank's process. 'self_exit' exits it once local cleanup "
+        "finishes. 'external' parks it instead, so an orchestrator can terminate it "
+        "after /is_scaling_elastic_ep reports the survivors committed.",
+    ] = "self_exit"
+    elastic_ep_reuse_cuda_graph: A[
+        bool,
+        "Keep the decode CUDA graphs across an elastic EP scale-down instead of "
+        "recapturing them. NIXL a2a only. The dispatch keeps the width it was "
+        "captured at, and the transport masks the retired ranks. A scale-up "
+        "still recaptures.",
+    ] = False
     disable_flashinfer_cutlass_moe_fp4_allgather: A[
         bool, "Disables quantize before all-gather for flashinfer cutlass moe."
     ] = False

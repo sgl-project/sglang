@@ -56,7 +56,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 - To enable fp8 weight quantization, add `--quantization fp8` on a fp16 checkpoint or directly load a fp8 checkpoint without specifying any arguments.
 - To enable fp8 kv cache quantization, add `--kv-cache-dtype fp8_e4m3` or `--kv-cache-dtype fp8_e5m2`.
 - To enable deterministic inference and batch invariant operations, add `--enable-deterministic-inference`. More details can be found in [deterministic inference document](./deterministic_inference).
-- If a multimodal server accepts requests from untrusted clients, restrict remote image, video, and audio URLs with `--allowed-media-domains`. SGLang checks the initial URL and every redirect destination against the exact-hostname allowlist. Remote media downloads are limited to 64 MiB by default; adjust `--media-url-max-file-size-mb` when larger trusted media is required. Local media files named by a request are held to the same size limit; pass `--no-allow-local-media-files` to reject them.
+- If a multimodal server accepts requests from untrusted clients, restrict remote image, video, and audio URLs with `--allowed-media-domains`. SGLang checks the initial URL and every redirect destination against the exact-hostname allowlist. Remote media downloads are limited to 64 MiB by default; adjust `--media-url-max-file-size-mb` when larger trusted media is required. Local media files named by a request are held to the same size limit; pass `--no-allow-local-media-files` to reject them. Media downloads connect directly to the approved origin address. If the server environment uses an HTTP proxy, include trusted media origins in `NO_PROXY`.
 
   ```bash Command
   python -m sglang.launch_server \
@@ -64,7 +64,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
     --allowed-media-domains upload.wikimedia.org raw.githubusercontent.com
   ```
 
-  Without `--allowed-media-domains`, HTTP(S) media from any domain remains allowed for backward compatibility. Do not expose that configuration to untrusted users. Local paths and `data:` URLs are not governed by the domain allowlist.
+  By default, HTTP(S) media URLs can reach only hosts that resolve to public addresses: a host that resolves to a private, loopback, or link-local address (such as the cloud metadata endpoint `169.254.169.254`) is rejected, on the first URL and on every redirect, and the download connects only to an address that passed the check. Pass `--allow-private-media-hosts` to fetch media from a private network; a host listed in `--allowed-media-domains` may also resolve to a private address. Local paths and `data:` URLs are not governed by the domain allowlist.
 - To enable decode context parallelism for MLA models, add `--dcp-size N`. See [Decode Context Parallelism](./dcp).
 - If the model does not have a chat template in the Hugging Face tokenizer, you can specify a [custom chat template](../references/custom_chat_template). If the tokenizer has multiple named templates (e.g., 'default', 'tool_use'), you can select one using `--hf-chat-template-name tool_use`.
 - To run tensor parallelism on multiple nodes, add `--nnodes 2`. If you have two nodes with two GPUs on each node and want to run TP=4, let `sgl-dev-0` be the hostname of the first node and `50000` be an available port, you can use the following commands. If you meet deadlock, please try to add `--disable-decode-cuda-graph --disable-prefill-cuda-graph`
@@ -2080,6 +2080,18 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>none</code>, <code>mooncake</code>, <code>nixl</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--elastic-ep-retiree-lifecycle`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Who ends a retired rank's process. 'self_exit' exits it once local cleanup finishes. 'external' parks it instead, so an orchestrator can terminate it after /is_scaling_elastic_ep reports the survivors committed.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`self_exit`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>self_exit</code>, <code>external</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--elastic-ep-reuse-cuda-graph`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep the decode CUDA graphs across an elastic EP scale-down instead of recapturing them. NIXL a2a only. The dispatch keeps the width it was captured at, and the transport masks the retired ranks. A scale-up still recaptures.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-elastic-expert-backup`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable elastic EP backend to backup expert weights in DRAM feature. Currently supports 'mooncake'.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -2099,9 +2111,9 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--flashinfer-allreduce-fusion-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer allreduce fusion and choose backend. Defaults to auto. 'auto': choose mnnvl on SM90 single-node systems and SM100/SM103 single-node or multi-node systems; choose trtllm otherwise. 'trtllm': available on single-node systems only. 'mnnvl': available on SM90 single-node systems and SM100/SM103 single-node or multi-node systems via MNNVL fabric. Fuses allreduce with Residual + RMSNorm for supported MoE models.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer allreduce fusion and choose backend. Requires SM90 or SM10X NVIDIA GPUs. When unspecified, it can be enabled automatically only on SM10X for supported models; on SM90, fusion is opt-in. 'auto': choose mnnvl on Blackwell (SM100/SM103) systems (single- and multi-node) and trtllm on SM90 single-node systems. 'trtllm': available on single-node systems only. 'mnnvl': available on SM90 single-node systems and SM100/SM103 single-node or multi-node systems via MNNVL fabric. 'cutedsl': Blackwell-only bf16 MNNVL CuTe DSL backend; also fuses the MoE finalize and the shared-expert add into the collective when the MoE runner can defer them. Fuses allreduce with Residual + RMSNorm for supported MoE models.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>trtllm</code>, <code>mnnvl</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>trtllm</code>, <code>mnnvl</code>, <code>cutedsl</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enforce-disable-flashinfer-allreduce-fusion`</td>
@@ -3335,6 +3347,12 @@ This option does not disable required attention or MoE collectives, including ex
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>early</code>, <code>prefill_complete</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-first-token-stream`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>When a PD decode server streams a request's first output token, which prefill sampled: <code>admission</code> sends it as soon as decode admits the request; <code>first_decode</code> holds it to go out with the request's first decode output. No token arrives earlier in either mode. The choice only moves when the first token is sent, so TTFT trades against TPOT measured as (e2e latency - TTFT) / (output tokens - 1): <code>admission</code> has the lower TTFT, by about one decode step; <code>first_decode</code> counts the wait for the second token in TTFT instead of that TPOT. Default: <code>first_decode</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>None</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>admission</code>, <code>first_decode</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--disaggregation-decode-enable-offload-kvcache`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable async KV cache offloading on decode server (PD mode).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -3591,9 +3609,15 @@ This option does not disable required attention or MoE collectives, including ex
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--allowed-media-domains`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Restrict client-supplied HTTP(S) media URLs and redirect destinations to these exact hostnames.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unrestricted</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Restrict client-supplied HTTP(S) media URLs and redirect destinations to these exact hostnames. An allowlisted host may resolve to a private address.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Any host that resolves to public addresses</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Space-separated hostnames</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--allow-private-media-hosts`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Permit remote media downloads from hosts that resolve to private, loopback, or link-local addresses, in trusted deployments.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--media-url-max-file-size-mb`</td>
@@ -3603,7 +3627,7 @@ This option does not disable required attention or MoE collectives, including ex
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--media-url-timeout`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Seconds to download one remote media URL, redirects and body included, for every media type. When unset, <code>REQUEST_TIMEOUT</code> applies, else each loader's own default.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Seconds to download one remote media URL, redirects and body included, for every media type; a server that sends the body slowly is cut off when the budget runs out. When unset, <code>REQUEST_TIMEOUT</code> applies, else each loader's own default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
