@@ -1,3 +1,4 @@
+import math
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -100,6 +101,7 @@ class TestDCPMatchesFullAttention(CustomTestCase):
             value_cache[rows] = v[b][rank:p:dcp_size]
 
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.use_mla = False
         backend.dcp_size = dcp_size
         backend.dcp_rank = rank
         backend.dcp_group = group
@@ -240,6 +242,166 @@ class TestDCPMatchesFullAttention(CustomTestCase):
         )
 
 
+@unittest.skipIf(not torch.xpu.is_available(), "Intel XPU not available")
+class TestMlaDCPMatchesFullAttention(CustomTestCase):
+    KV_LORA = 512
+    ROPE = 64
+    PAGE_SIZE = 64
+    MAX_TOKENS = 256
+    DIM = KV_LORA + ROPE
+
+    def _reference(self, q, latent, seq_len):
+        scores = (q.float() @ latent[:seq_len].float().T) * self.DIM**-0.5
+        return scores.softmax(-1) @ latent[:seq_len, : self.KV_LORA].float()
+
+    def _rank_forward(self, rank, group, *, q, latent, seq_lens, heads):
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        group._rank.value = rank
+        device, dcp_size, bs = "xpu", group.world_size, len(seq_lens)
+        rows_per_req = self.MAX_TOKENS // dcp_size
+        kv = torch.zeros(
+            bs * rows_per_req + self.PAGE_SIZE,
+            1,
+            self.DIM,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        for b, n in enumerate(seq_lens):
+            mine = latent[b][rank:n:dcp_size]
+            kv[b * rows_per_req : b * rows_per_req + len(mine), 0] = mine
+        req_to_token = torch.arange(
+            bs * self.MAX_TOKENS, dtype=torch.int32, device=device
+        ).view(bs, self.MAX_TOKENS)
+
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.use_mla = True
+        backend.dcp_size = dcp_size
+        backend.dcp_rank = rank
+        backend.dcp_group = group
+        backend.page_size = self.PAGE_SIZE
+        backend.num_local_heads = heads // dcp_size
+        backend.max_kv_len = self.MAX_TOKENS
+        backend.device = device
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
+        # kv_layers is a property over token_to_kv_pool.layer_router.
+        backend.token_to_kv_pool = SimpleNamespace(
+            layer_router=SimpleNamespace(read=lambda _: SimpleNamespace(key=lambda: kv))
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            req_pool_indices=torch.arange(bs, device=device),
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
+            seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32),
+            out_cache_loc=None,
+        )
+        backend._init_forward_metadata_dcp(batch)
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=heads,
+            v_head_dim=self.KV_LORA,
+            head_dim=self.DIM,
+            scaling=self.DIM**-0.5,
+        )
+        return backend._forward_decode_dcp_mla(q.flatten(1), None, layer)
+
+    def _assert_matches(self, *, dcp_size, seq_lens, heads=8):
+        torch.manual_seed(0)
+        device, bs = "xpu", len(seq_lens)
+        latent = [
+            torch.randn(n, self.DIM, device=device, dtype=torch.bfloat16) * 0.1
+            for n in seq_lens
+        ]
+        q = torch.randn(bs, heads, self.DIM, device=device, dtype=torch.bfloat16) * 0.1
+
+        group = _ThreadGroup(dcp_size)
+        with ThreadPoolExecutor(dcp_size) as pool:
+            futures = [
+                pool.submit(
+                    self._rank_forward,
+                    rank,
+                    group,
+                    q=q,
+                    latent=latent,
+                    seq_lens=seq_lens,
+                    heads=heads,
+                )
+                for rank in range(dcp_size)
+            ]
+            parts = [f.result() for f in futures]
+
+        # The model owns this merge; flash_mla_decode returns a base-2 LSE.
+        lses = torch.stack([lse.float() for _, lse in parts])
+        global_lse = torch.logsumexp(lses * math.log(2), dim=0) / math.log(2)
+        merged = torch.zeros(bs, heads, self.KV_LORA, device=device)
+        for out, lse in parts:
+            weight = torch.exp2(lse.float() - global_lse)
+            weight = torch.nan_to_num(weight, nan=0.0, posinf=0.0, neginf=0.0)
+            merged += out.float().view(bs, heads, self.KV_LORA) * weight.unsqueeze(-1)
+
+        expected = torch.stack(
+            [self._reference(q[b], latent[b], n) for b, n in enumerate(seq_lens)]
+        )
+        torch.testing.assert_close(merged, expected, atol=2e-2, rtol=2e-2)
+
+    def test_decode(self):
+        for dcp_size, seq_lens in (
+            (2, [36, 1, 89]),
+            (4, [36, 2, 89]),
+            # Shorter than dcp_size: the top ranks own nothing and get no page table.
+            (4, [2, 3]),
+        ):
+            with self.subTest(dcp_size=dcp_size, seq_lens=seq_lens):
+                self._assert_matches(dcp_size=dcp_size, seq_lens=seq_lens)
+
+    def test_zero_length_prefix_row_is_neutralized(self):
+        from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+        from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
+
+        torch.manual_seed(0)
+        device, heads, head_dim, v_dim = "xpu", 8, 192, 128
+        q_lens, k_lens = [3, 5], [0, 7]
+        q = torch.randn(8, heads, head_dim, device=device, dtype=torch.bfloat16)
+        k = torch.randn(7, heads, head_dim, device=device, dtype=torch.bfloat16)
+        v = torch.randn(7, heads, v_dim, device=device, dtype=torch.bfloat16)
+        out, lse, *_ = flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=torch.tensor([0, 3, 8], dtype=torch.int32, device=device),
+            cu_seqlens_k=torch.tensor([0, 0, 7], dtype=torch.int32, device=device),
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(k_lens),
+            softmax_scale=head_dim**-0.5,
+            causal=False,
+            return_softmax_lse=True,
+        )
+        batch = SimpleNamespace(
+            prefix_chunk_has_zero_kv=[True],
+            prefix_chunk_seq_lens=torch.tensor(
+                [k_lens], dtype=torch.int32, device=device
+            ),
+            extend_seq_lens=torch.tensor(q_lens, dtype=torch.int32, device=device),
+        )
+        out, lse = XPUAttentionBackend._neutralize_empty_prefix_rows(
+            out, lse.transpose(0, 1).contiguous(), batch, 0
+        )
+
+        self.assertTrue(bool((out[:3] == 0).all()))
+        self.assertTrue(bool(torch.isneginf(lse[:3]).all()))
+        scores = torch.einsum("qhd,khd->hqk", q[3:].float(), k.float())
+        probs = (scores * head_dim**-0.5).softmax(-1)
+        torch.testing.assert_close(
+            out[3:].float(),
+            torch.einsum("hqk,khd->qhd", probs, v.float()),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+
+
 class TestXPUDCPStartupChecks(CustomTestCase):
     @staticmethod
     def _build(model_path=DEFAULT_HYBRID_GDN_SMALL_MODEL_NAME_FOR_TEST, **kwargs):
@@ -271,8 +433,27 @@ class TestXPUDCPStartupChecks(CustomTestCase):
             with self.subTest(backend=backend):
                 self._assert_rejected("intel_xpu", **{backend: "triton"})
 
-    def test_mla_model_rejected(self):
-        self._assert_rejected("MLA models", model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST)
+    def test_dense_mla_model_admitted(self):
+        self.assertEqual(
+            self._build(model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST).dcp_size, 2
+        )
+
+    def test_mla_arch_without_dcp_path_rejected(self):
+        self._assert_rejected("MiniCPM3ForCausalLM", model_path="openbmb/MiniCPM3-4B")
+
+    def test_mla_disabled_chunked_prefix_cache_rejected(self):
+        self._assert_rejected(
+            "chunked prefix cache",
+            model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+            disable_chunked_prefix_cache=True,
+        )
+
+    def test_mla_speculative_decoding_rejected(self):
+        self._assert_rejected(
+            "speculative decoding",
+            model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST,
+            speculative_algorithm="EAGLE",
+        )
 
     def test_unshared_kv_heads_rejected(self):
         self._assert_rejected(

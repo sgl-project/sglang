@@ -331,6 +331,57 @@ class XPUAttentionBackend(AttentionBackend):
             layer.v_scale,
         )
 
+    @staticmethod
+    def _neutralize_empty_prefix_rows(
+        output: torch.Tensor,
+        lse: torch.Tensor,
+        forward_batch: ForwardBatch,
+        chunk_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Zero the rows of a prefix chunk that attended no keys.
+
+        A batch mixing requests with and without a prefix in this chunk gives the
+        varlen kernel a zero k length for some rows, and it returns NaN there.
+        merge_state would then poison the whole request; -inf weighs it 0 instead.
+        """
+        if not forward_batch.prefix_chunk_has_zero_kv[chunk_idx]:
+            return output, lse
+        rows = (forward_batch.prefix_chunk_seq_lens[chunk_idx] == 0).repeat_interleave(
+            forward_batch.extend_seq_lens, output_size=output.shape[0]
+        )
+        return (
+            output.masked_fill_(rows.view(-1, 1, 1), 0.0),
+            lse.masked_fill_(rows.unsqueeze(-1), -float("inf")),
+        )
+
+    def _ensure_mla_workspaces(self, batch_size: int) -> None:
+        # Sized for the split count every flash_mla_decode call here pins; the
+        # -1 heuristic would reserve a split buffer nobody reads.
+        workspace_kwargs = dict(
+            max_seq_len=self.max_kv_len,
+            num_batches=batch_size,
+            num_heads=self.num_local_heads * self.dcp_size,
+            page_size=self.page_size,
+            num_kv_splits=1,
+        )
+        decode_size = flash_mla_decode_get_workspace_size(**workspace_kwargs)
+        if (
+            not hasattr(self, "workspace_decode")
+            or self.workspace_decode.numel() < decode_size
+        ):
+            self.workspace_decode = torch.empty(
+                decode_size, device=self.device, dtype=torch.uint8
+            )
+
+        prefill_size = flash_mla_prefill_get_workspace_size(**workspace_kwargs)
+        if (
+            not hasattr(self, "workspace_prefill")
+            or self.workspace_prefill.numel() < prefill_size
+        ):
+            self.workspace_prefill = torch.empty(
+                prefill_size, device=self.device, dtype=torch.uint8
+            )
+
     def _init_forward_metadata_dcp(self, forward_batch: ForwardBatch):
         metadata = FlashAttentionMetadata()
         dcp_metadata = XPUDCPMetadata()
@@ -384,6 +435,18 @@ class XPUAttentionBackend(AttentionBackend):
             dcp_metadata.local_cache_loc = torch.where(
                 owned, forward_batch.out_cache_loc // self.dcp_size, -1
             )
+
+        if self.use_mla:
+            self._ensure_mla_workspaces(forward_batch.batch_size)
+            # flash_mla_decode wants block_num % (128 / page_size) == 0, which a
+            # short per-rank shard misses. cache_seqlens bounds the reads.
+            align = max(1, 128 // self.page_size)
+            table = dcp_metadata.page_table
+            if table is not None and table.shape[1] % align:
+                pad = align - table.shape[1] % align
+                dcp_metadata.page_table = torch.cat(
+                    [table, table[:, -1:].expand(-1, pad)], dim=1
+                ).contiguous()
 
         self.forward_metadata = metadata
         self.dcp_metadata = dcp_metadata
@@ -699,35 +762,7 @@ class XPUAttentionBackend(AttentionBackend):
                 )
 
         if self.use_mla:
-            workspace_kwargs = dict(
-                max_seq_len=self.max_kv_len,
-                num_batches=batch_size,
-                num_heads=self.num_local_heads,
-                page_size=self.page_size,
-                num_kv_splits=-1,
-            )
-
-            workspace_decode_size = flash_mla_decode_get_workspace_size(
-                **workspace_kwargs
-            )
-            if (
-                not hasattr(self, "workspace_decode")
-                or self.workspace_decode.numel() < workspace_decode_size
-            ):
-                self.workspace_decode = torch.empty(
-                    workspace_decode_size, device=self.device, dtype=torch.uint8
-                )
-
-            workspace_prefill_size = flash_mla_prefill_get_workspace_size(
-                **workspace_kwargs
-            )
-            if (
-                not hasattr(self, "workspace_prefill")
-                or self.workspace_prefill.numel() < workspace_prefill_size
-            ):
-                self.workspace_prefill = torch.empty(
-                    workspace_prefill_size, device=self.device, dtype=torch.uint8
-                )
+            self._ensure_mla_workspaces(batch_size)
 
         # Convert the page table to a strided format which is needed by FA3 API.
         # Encoder-decoder page_table holds token-slot indices for the varlen
@@ -816,10 +851,19 @@ class XPUAttentionBackend(AttentionBackend):
             in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
         )
 
-        if self.dcp_size > 1:
+        if self.dcp_size > 1 and not self.use_mla:
             assert not is_hybrid_swa, _DCP_SWA_MSG
             return self._forward_extend_dcp(
                 q, k, v, layer, forward_batch, causal, sinks
+            )
+        if self.dcp_size > 1:
+            # The model gathers the prefix latent itself, so each rank already
+            # attends the whole sequence and needs no DCP stage here. The branch
+            # below reads only cu_seqlens_q / max_seq_len_q, never the page table.
+            assert not is_hybrid_swa, _DCP_SWA_MSG
+            assert forward_batch.attn_attend_prefix_cache is not None, (
+                "DCP on intel_xpu needs the chunked-prefix MLA prefill path; "
+                "absorbed MLA extend has no cross-rank merge"
             )
 
         # Check if we should use local attention
@@ -1066,6 +1110,10 @@ class XPUAttentionBackend(AttentionBackend):
                 if forward_batch.mha_return_lse:
                     output, lse, *rest = output
                     lse = torch.transpose(lse, 0, 1).contiguous()
+                    if forward_batch.attn_attend_prefix_cache:
+                        output, lse = self._neutralize_empty_prefix_rows(
+                            output, lse, forward_batch, chunk_idx
+                        )
                     return output, lse
                 return output
             else:
@@ -1335,6 +1383,62 @@ class XPUAttentionBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(out.float(), lse, self.dcp_group)
         return o.to(q.dtype).view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _forward_decode_dcp_mla(
+        self,
+        q: torch.Tensor,
+        q_rope: Optional[torch.Tensor],
+        layer: RadixAttention,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """This rank's absorbed-MLA decode partial and its base-2 LSE.
+
+        Unlike the MHA path, the MLA model owns both the Q all-gather and the
+        cross-rank merge (deepseek_common/attention_forward_methods/forward_mla.py),
+        so q already carries every rank's heads and the merge wants the partial
+        state rather than a finished output.
+        """
+        dcp = self.dcp_metadata
+        num_tokens = q.shape[0]
+        if dcp.page_table is None:
+            # This rank owns no position of any request in the batch, so there is
+            # no page table to read. Contribute a neutral state to the merge.
+            return (
+                q.new_zeros((num_tokens, layer.tp_q_head_num * layer.v_head_dim)),
+                q.new_full(
+                    (num_tokens, layer.tp_q_head_num),
+                    -float("inf"),
+                    dtype=torch.float32,
+                ),
+            )
+        kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
+        if q_rope is not None:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+        else:
+            q_all = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_nope = q_all[:, :, : layer.v_head_dim]
+            q_rope = q_all[:, :, layer.v_head_dim :]
+
+        out, lse = flash_mla_decode(
+            q_nope,
+            q_rope,
+            kv_cache.view(-1, self.page_size, layer.head_dim),
+            dcp.cache_seqlens_int32,
+            dcp.page_table,
+            self.workspace_decode,
+            layer.scaling,
+            # Pinned for the same batch-invariance reason as the non-DCP call.
+            num_kv_splits=1,
+            return_lse=True,
+        )
+        # A rank owning no position of a request gets NaN out and -inf lse back.
+        # The merge weights it 0, but 0 * NaN stays NaN.
+        empty = dcp.empty_lse_rows
+        out = out.masked_fill(empty.view(-1, 1, 1), 0.0)
+        lse = lse.masked_fill(empty.unsqueeze(-1), -float("inf"))
+        return out.flatten(1), lse
+
     @staticmethod
     def _single_token_self_attn(
         q: torch.Tensor,
@@ -1491,6 +1595,8 @@ class XPUAttentionBackend(AttentionBackend):
 
         if self.dcp_size > 1:
             assert window_size == (-1, -1), _DCP_SWA_MSG
+            if self.use_mla:
+                return self._forward_decode_dcp_mla(q, q_rope, layer)
             return self._forward_decode_dcp(q, layer, sinks)
 
         # For fa3 interface version compatibility, we put new fields into conditional keyword args
