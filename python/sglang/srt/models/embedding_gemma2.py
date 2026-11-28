@@ -48,7 +48,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.gemma4_audio import Gemma4AudioEncoder
 from sglang.srt.models.gemma4_causal import Gemma4MLP
 from sglang.srt.models.gemma4_mm import (
@@ -863,6 +866,12 @@ class EmbeddingGemma2Model(nn.Module):
                 )
 
             # Persistent buffer loading (e.g. layer_scalar)
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
             if name in buffers_dict:
                 buffers_dict[name].copy_(loaded_weight)
                 loaded_params.add(name)
