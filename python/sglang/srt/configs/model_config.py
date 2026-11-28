@@ -931,6 +931,15 @@ class ModelConfig:
             if n_group is not None:
                 self.hf_config.topk_group = n_group
 
+        # ERNIE 5.5 mxfp4 ckpts may declare the routed-expert layout via expert_dtype.
+        if (
+            not self.is_fp4_experts
+            and is_ernie5_5(self.hf_config)
+            and str(quantization_config.get("expert_dtype") or "").lower() == "mxfp4"
+        ):
+            self.is_fp4_experts = True
+            logger.info("Detected ERNIE 5.5 mxfp4 routed-expert layout.")
+
         # Handle hybrid NVFP4 moe (nvidia/DeepSeek-V4-Pro-NVFP4)
         self.nvfp4_moe_meta: Optional[dict] = None
         hybrid_quant_cfg = _quant_config_to_dict(

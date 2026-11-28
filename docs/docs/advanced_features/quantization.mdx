@@ -264,7 +264,7 @@ Backend selection applies to **blockwise FP8**, **MXFP8** (dense linear), and **
 **MXFP8 dense linear, HALOps (opt-in):** `--fp8-gemm-backend halops` routes MXFP8 (group-32) dense linear GEMM through [HALOps](https://github.com/PaddlePaddle/HALOps) w8a8 kernels on SM100. The package is published on PaddlePaddle's CUDA 13.2 package page rather than PyPI; the official Docker image installs it, and outside Docker install it explicitly:
 
 ```bash Command
-uv pip install halops==0.1.0 \
+uv pip install halops==0.2.0 \
   -f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/
 ```
 

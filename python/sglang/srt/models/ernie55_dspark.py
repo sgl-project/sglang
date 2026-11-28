@@ -30,7 +30,6 @@ from torch import nn
 
 from sglang.kernels.ops.activation.multimax import multimax
 from sglang.kernels.ops.attention.dsv4 import fused_rope_inplace
-from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import CommitKvProj
 from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
@@ -53,6 +52,7 @@ from sglang.srt.models.deepseek_v4_dspark import (
     _resolve_dspark_pool,
     build_dspark_v4_confidence_head,
 )
+from sglang.srt.models.deepseek_v4_mhc import AttnOutput
 from sglang.srt.models.dspark import gather_and_crop_vocab, project_through_lm_head
 from sglang.srt.models.ernie55 import (
     Ernie5_5DecoderLayer,
@@ -62,6 +62,7 @@ from sglang.srt.models.ernie55 import (
     VhaPostMix,
     check_supported_deployment,
 )
+from sglang.srt.models.ernie55_low_latency_mhc import Ernie5_5LowLatencyMhcChain
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
@@ -85,14 +86,8 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
             prefix=prefix,
             alt_streams=alt_streams,
         )
-        # compress_ratio 0 selected the main rope, but the stages were trained on
-        # the compressed YaRN rope of the HCA layers.
-        self.rope_base = config.compress_rope_theta
-        self.rope_kwargs.update(
-            base=self.rope_base,
-            original_seq_len=self.rope_scaling["original_max_position_embeddings"],
-        )
-        self.freqs_cis = precompute_freqs_cis(**self.rope_kwargs)
+        # The stages keep the base's plain rope (rope_theta, no YaRN), as they are
+        # trained; not the HCA layers' compressed YaRN rope.
         self._init_gated_wq_b(quant_config, prefix)
         self.postmix = VhaPostMix(self.n_local_heads, self.n_heads)
 
@@ -101,7 +96,12 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
         return self._gated_q_norm_rope(self.q_norm(q), positions, q_out)
 
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        x_quant=None,
+        defer_all_reduce: bool = False,
     ) -> torch.Tensor:
         """The HCA attention's signature, so ``Ernie5_5DecoderLayer`` drives it."""
         # Idle ranks have no draft KV rows but still join the MoE collectives.
@@ -109,7 +109,8 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
             return torch.zeros_like(x)
         pool = _resolve_dspark_pool()
         attn_backend = get_attn_backend()
-        kv = self.kv_proj_only(x)
+        x_linear = x if x_quant is None else x_quant
+        kv = self.kv_proj_only(x_linear)
         self._store_block_kv(
             kv=kv,
             positions=positions,
@@ -121,7 +122,7 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
         if self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = x.new_empty(x.shape[0], _PAD_NUM_HEADS, self.head_dim)
             q_out = q_padded[:, : self.n_local_heads]
-        q = self._compute_q(x, positions, q_out=q_out)
+        q = self._compute_q(x_linear, positions, q_out=q_out)
         o = attn_backend.forward(
             q=q if q_padded is None else q_padded,
             k=kv,
@@ -150,8 +151,8 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
         o = fused_sigmoid_mul(
             o.reshape(o.shape[0], -1), self._take_gate(), round_sigmoid=True
         )
-        out, _ = self.wo_b(o)
-        return out
+        out, _ = self.wo_b(o, skip_all_reduce=defer_all_reduce)
+        return AttnOutput(out) if defer_all_reduce else out
 
 
 class Ernie5_5DSparkStage(Ernie5_5DecoderLayer):
@@ -166,12 +167,12 @@ class Ernie5_5DSparkStage(Ernie5_5DecoderLayer):
     ):
         super().__init__(config, stage_id, quant_config, prefix, alt_streams)
         if stage_id == 0:
-            # Shipped in bf16, so it takes no quant config.
+            # An older export ships this in bf16; the weight loader quantizes it.
             self.main_proj = ReplicatedLinear(
                 config.hidden_size * num_target_layers,
                 config.hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=add_prefix("main_proj", prefix),
             )
             self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -230,6 +231,14 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
                 for stage_id in range(self.num_stages)
             ]
         )
+        self.mhc_chain = None
+        if (
+            envs.SGLANG_ERNIE55_LOW_LATENCY_DECODE.get()
+            and Ernie5_5LowLatencyMhcChain.supported()
+        ):
+            self.mhc_chain = Ernie5_5LowLatencyMhcChain(
+                self.stages, range(self.num_stages), draft=True
+            )
         self.hc_head = Ernie5_5HcHead(config)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.markov_head = DSparkV4MarkovHead(
@@ -239,9 +248,11 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
         self.confidence_head = build_dspark_v4_confidence_head(
             config=config, markov_rank=int(dspark_config.markov_rank)
         )
-        # The target's multimax, applied to the draft logits as in training.
+        # The target's multimax. Training applies it to the Markov-refined draft
+        # logits, so it runs on each step's base + bias, not on the base logits.
         self.multimax_ranges = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
         self.multimax_ts = nn.Parameter(torch.zeros(4, dtype=torch.bfloat16))
+        self.markov_head.step_logits_activation = self._multimax
         self.embed_tokens: Optional[nn.Module] = None
         self.lm_head: Optional[nn.Module] = None
         self._use_fp32_lm_head = envs.SGLANG_DSPARK_FP32_LM_HEAD.get()
@@ -343,7 +354,11 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
             x = input_embeds
         # The draft stages are not the target's layers the recorder counts.
         with get_global_expert_distribution_recorder().disable_this_region():
-            for stage in self.stages:
+            stages = self.stages
+            if self.mhc_chain is not None:
+                x = self.mhc_chain.forward(positions, x, forward_batch, None)
+                stages = ()
+            for stage in stages:
                 x = stage(positions, x, forward_batch, None)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
@@ -355,10 +370,12 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
             local_logits = torch.nn.functional.linear(x_normed.float(), weight.float())
         else:
             local_logits = project_through_lm_head(x_normed, self.lm_head)
-        local_logits = multimax(local_logits, self.multimax_ranges, self.multimax_ts)
         if not self._opt_markov_w2_tp_shard:
             local_logits = gather_and_crop_vocab(local_logits, self.lm_head)
         return local_logits, x_post_hc
+
+    def _multimax(self, logits: torch.Tensor) -> torch.Tensor:
+        return multimax(logits, self.multimax_ranges, self.multimax_ts)
 
     def compute_confidence(
         self,
@@ -387,7 +404,9 @@ class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
     # The draft attention keeps wq_a and wkv apart, which _HCA_UNFUSED_QKV_A loads.
     _HCA_STACKED = {}
     _DRAFT_RENAMES = {
-        "model.mtp.feature_projection.weight": "stages.0.main_proj.weight",
+        "model.mtp.feature_projection.weight_scale_inv": (
+            "stages.0.main_proj.weight_scale_inv"
+        ),
         "model.mtp.feature_norm.weight": "stages.0.main_norm.weight",
         "model.mtp.norm.weight": "norm.weight",
         "model.mtp.mhc_contract.hc_head_fn": "hc_head.fn",
@@ -411,7 +430,25 @@ class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
             () if model.confidence_head is not None else ("confidence_head.",)
         )
 
+    def _load_main_proj(self, tensor: torch.Tensor) -> None:
+        name = "stages.0.main_proj.weight"
+        param = self.params[name]
+        if param.dtype != torch.float8_e4m3fn or tensor.dtype == torch.float8_e4m3fn:
+            self._load(name, tensor)
+            return
+        from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
+
+        # A bf16 export meets an fp8 module: quantize it as the fp8 export would.
+        quantized, scale = per_block_cast_to_fp8(
+            tensor.to(device=param.device, dtype=torch.bfloat16)
+        )
+        self._load(name, quantized)
+        self._load("stages.0.main_proj.weight_scale_inv", scale)
+
     def load(self, name: str, tensor: torch.Tensor) -> None:
+        if name == "model.mtp.feature_projection.weight":
+            self._load_main_proj(tensor)
+            return
         if name in self._DRAFT_TRANSPOSED:
             target = self._DRAFT_TRANSPOSED[name]
             self.params[target].data.copy_(tensor.t())

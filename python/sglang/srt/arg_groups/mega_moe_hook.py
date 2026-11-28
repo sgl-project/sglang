@@ -10,7 +10,12 @@ from sglang.srt.arg_groups.model_override_base import model_config_of, resolving
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    attn_tp_size_of,
+    get_platform,
+    num_dp_ranks_of,
+)
 from sglang.srt.utils.common import ceil_align, parse_connector_type
 
 logger = logging.getLogger(__name__)
@@ -49,6 +54,7 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
 MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
     {
         "DeepseekV4ForCausalLM",
+        "Ernie5_5_MoeForCausalLM",
         "KimiK31ForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MellumForCausalLM",
@@ -156,6 +162,73 @@ def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
         )
 
 
+def _gathered_buffer_required_of(cfg) -> bool:
+    """Config-time mirror of dp_attention.require_gathered_buffer under the
+    megamoe backend: the runner shards the attn-TP sequence iff this holds."""
+    attn_dp = attn_dp_enabled_of(cfg)
+    num_dp_ranks = num_dp_ranks_of(cfg)
+    mlp_gather = attn_dp and (
+        cfg.moe_dense_tp_size is None
+        or not cfg.enable_dp_lm_head
+        or cfg.moe_dense_tp_size > cfg.tp_size // num_dp_ranks
+    )
+    attn_gather = not cfg.disable_attn_tp_gather and (
+        not attn_dp or num_dp_ranks < cfg.tp_size
+    )
+    return mlp_gather or attn_gather
+
+
+def _ernie_moe_rows_per_rank(cfg, rows: int, *, sharded: bool) -> int:
+    """Rows one rank's MegaMoE call routes when its DP group runs ``rows`` rows
+    (Ernie5_5DecoderLayer._forward_ffn)."""
+    attn_tp_size = attn_tp_size_of(cfg)
+    if attn_tp_size == 1:
+        return rows
+    if sharded:
+        # _forward_moe_attn_tp_shard routes this rank's rows / attn_tp_size slice.
+        return -(-rows // attn_tp_size)
+    if attn_dp_enabled_of(cfg):
+        # Unsharded split heads gather every DP group's rows before the MoE.
+        return rows * cfg.attn_dp_size
+    return rows
+
+
+def _eagle_draft_extend_graph_rows(cfg) -> int:
+    """Rows of the largest EAGLE draft-extend graph, 0 when none is captured
+    (EAGLEWorkerV2 init_cuda_graphs, get_batch_sizes_to_capture)."""
+    decode = cfg.cuda_graph_config.decode if cfg.cuda_graph_config else None
+    if (
+        decode is None
+        or decode.backend == "disabled"
+        or not decode.bs
+        or envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
+    ):
+        return 0
+    largest_bs = max(decode.bs)
+    if cfg.max_running_requests is not None:
+        largest_bs = min(
+            largest_bs,
+            ceil_align(
+                cfg.max_running_requests // cfg.attn_dp_size,
+                cfg.tp_size // cfg.attn_dp_size,
+            ),
+        )
+    return largest_bs * (cfg.speculative_num_draft_tokens or 1)
+
+
+def _ernie_moe_decode_rows_per_rank(cfg, decode_tokens: int) -> int:
+    rows = _ernie_moe_rows_per_rank(
+        cfg, decode_tokens, sharded=_gathered_buffer_required_of(cfg)
+    )
+    if cfg.speculative_algorithm in ("EAGLE", "NEXTN"):
+        # The draft-extend graph leaves its batch unsharded; eager draft extend shards.
+        draft_extend_rows = _ernie_moe_rows_per_rank(
+            cfg, _eagle_draft_extend_graph_rows(cfg), sharded=False
+        )
+        rows = max(rows, draft_extend_rows)
+    return rows
+
+
 def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) -> None:
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe":
@@ -169,10 +242,12 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
         if (
-            model_label == "KimiK31ForConditionalGeneration"
+            model_label
+            in ("KimiK31ForConditionalGeneration", "Ernie5_5_MoeForCausalLM")
             and cfg.max_running_requests is not None
         ):
-            # Kimi repacks its experts at load and has no oversized eager fallback.
+            # Kimi and ERNIE run every batch through MegaMoE: an eager decode or
+            # verify past the largest graph bucket has no fallback either.
             eager_requests = ceil_align(
                 cfg.max_running_requests // cfg.attn_dp_size,
                 cfg.tp_size // cfg.attn_dp_size,
@@ -183,6 +258,8 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
                 else 1
             )
             decode_tokens = max(decode_tokens, eager_requests * tokens_per_request)
+        if model_label == "Ernie5_5_MoeForCausalLM":
+            decode_tokens = _ernie_moe_decode_rows_per_rank(cfg, decode_tokens)
         if max_tokens_per_rank < decode_tokens:
             raise ValueError(
                 f"{model_label} with MegaMoE requires "

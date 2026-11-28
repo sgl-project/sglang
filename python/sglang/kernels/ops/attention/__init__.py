@@ -799,3 +799,33 @@ for _op, _module in (
         )
     )
 del _op, _module
+
+# ERNIE 5.5 low-latency decode attention.
+register_kernel(
+    KernelSpec(
+        op="attention.hca_qkv_prep",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.ernie55.hca_qkv_prep:hca_qkv_prep",
+        capabilities=CUDA_ONLY,
+    )
+)
+for _fn in ("swapab_partial", "swapab_partial_mla"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.ernie55.swapab_attention:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+            ),
+        )
+    )
+del _fn
+register_kernel(
+    KernelSpec(
+        op="attention.swapab_combine_local",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.ernie55.swapab_attention:swapab_combine_local",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+    )
+)

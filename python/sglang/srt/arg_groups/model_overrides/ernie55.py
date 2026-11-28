@@ -26,8 +26,9 @@ from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
     DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO,
     DSV4_PAGE_SIZE,
 )
-from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
+from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH, check_megamoe_situ_betas
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,8 @@ logger = logging.getLogger(__name__)
 # and the memory budget follows the same choice, so no other KV dtype is servable.
 _SUPPORTED_KV_CACHE_DTYPES = ("auto", "fp8_e4m3", "bfloat16")
 
-# DSpark with DP attention is validated on DeepEP here; MegaMoE is rejected below.
-register_dspark_dp_a2a_backends(ERNIE5_5_MOE_ARCH, ("none", "deepep"))
+# DSpark with DP attention is validated on DeepEP and MegaMoE here.
+register_dspark_dp_a2a_backends(ERNIE5_5_MOE_ARCH, ("none", "deepep", "megamoe"))
 
 
 def _validate_features(cfg: Any) -> None:
@@ -68,15 +69,15 @@ def _validate_features(cfg: Any) -> None:
         # while the MLA layers keep none.
         if enabled:
             raise ValueError(f"ERNIE 5.5 Flash does not support {flag}")
+    if cfg.moe_a2a_backend == "megamoe" and not is_sm100_supported():
+        # The SM90 FP8 and ROCm MegaMoE kernels compute SwiGLU; these experts use
+        # SiTU, which only the SM100 DeepGEMM kernel implements.
+        raise ValueError(
+            "ERNIE 5.5 Flash runs --moe-a2a-backend megamoe on SM100 GPUs only"
+        )
     if cfg.enable_hisparse:
         # HiSparse knows the compressed-KV sub-pools, not the MLA layers' latent one.
         raise ValueError("ERNIE 5.5 Flash does not support --enable-hisparse")
-    if cfg.moe_a2a_backend == "megamoe":
-        # The MegaMoE kernel hardcodes SwiGLU; these experts use SiTU.
-        raise ValueError(
-            "ERNIE 5.5 Flash does not support --moe-a2a-backend megamoe; "
-            "use deepep or none"
-        )
     for flag, value in (
         ("--dsa-prefill-backend", cfg.dsa_prefill_backend),
         ("--dsa-decode-backend", cfg.dsa_decode_backend),
@@ -139,11 +140,27 @@ def _validate_speculative(cfg: Any) -> None:
         )
 
 
+def _imply_low_latency_decode_envs() -> None:
+    if not envs.SGLANG_ERNIE55_LOW_LATENCY_DECODE.get():
+        return
+    for env, value in (
+        (envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION, True),
+        (envs.SGLANG_SPEC_TP_SYNC, "rng"),
+    ):
+        if not env.is_set():
+            env.set(value)
+
+
 @_register_for(ERNIE5_5_MOE_ARCH)
 def _ernie55_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
     _validate_features(cfg)
     _validate_speculative(cfg)
+    if cfg.moe_a2a_backend == "megamoe" and hf_config is not None:
+        # Fail before weights load; the MoE layer checks again where it builds
+        # the kernel.
+        check_megamoe_situ_betas(hf_config)
+    _imply_low_latency_decode_envs()
     overrides: Dict[str, Any] = {
         "attention_backend": "ernie55",
         "page_size": DSV4_PAGE_SIZE,

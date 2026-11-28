@@ -40,7 +40,7 @@ from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
 from sglang.kernels.ops.layernorm.mhc import mhc_post, mhc_pre
 from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 from sglang.kernels.ops.moe.multi_router import multi_router_topk
-from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
+from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig, check_megamoe_situ_betas
 from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SituAndMul
@@ -73,6 +73,7 @@ from sglang.srt.layers.logits_processor import (
     extend_reads_input_logprobs,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.ernie55_low_latency_moe import Ernie5_5LowLatencyMoE
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -497,6 +498,8 @@ class Ernie5_5Moe(nn.Module):
         super().__init__()
         self.alt_stream = alt_stream
         self.layer_id = layer_id
+        self.config = config
+        self._shared_sharded = Ernie5_5LowLatencyMoE.enabled(quant_config)
         self.num_experts = config.n_routed_experts
         latent_size = config.moe_latent_size
         self.latent_size = latent_size
@@ -541,7 +544,7 @@ class Ernie5_5Moe(nn.Module):
             config.moe_intermediate_size * config.n_shared_experts,
             quant_config,
             add_prefix("shared_experts", prefix),
-            parallel_group="replicated",
+            parallel_group=None if self._shared_sharded else "replicated",
             reduce_results=False,
         )
         self.fc1_latent_proj = ReplicatedLinear(
@@ -559,6 +562,12 @@ class Ernie5_5Moe(nn.Module):
             prefix=add_prefix("fc2_latent_proj", prefix),
         )
         self.latent_norm = RMSNorm(latent_size, eps=config.rms_norm_eps)
+        self.top_k = config.num_experts_per_tok
+        self.intermediate_size = config.moe_intermediate_size
+        self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        if self._use_mega_moe:
+            check_megamoe_situ_betas(config)
+        self._low_latency_moe = Ernie5_5LowLatencyMoE(self)
 
     def _route(self, hidden_states, gating_output, topk, renormalize):
         # gating_output is the raw [T, 2E] gate|gate_1 GEMM output.
@@ -571,19 +580,68 @@ class Ernie5_5Moe(nn.Module):
             num_routers=2,
         )
 
+    def mega_moe_buffer(self):
+        from sglang.srt.layers.moe.mega_moe import (
+            _get_mega_moe_symm_buffer,
+            _mega_moe_mma_type,
+        )
+
+        return _get_mega_moe_symm_buffer(
+            get_parallel().moe_ep_group.device_group,
+            num_experts=self.experts.num_experts,
+            num_max_tokens_per_rank=(
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+            ),
+            num_topk=self.top_k,
+            hidden=self.latent_size,
+            intermediate_hidden=self.intermediate_size,
+            mma_type=_mega_moe_mma_type(self.experts),
+            activation="situ",
+        )
+
+    def _run_experts(self, latent: torch.Tensor, topk_output) -> torch.Tensor:
+        if not self._use_mega_moe:
+            return self.experts(latent, topk_output)
+        from sglang.srt.layers.moe.mega_moe import (
+            is_mega_moe_experts_ready,
+            run_mega_routed_experts,
+        )
+
+        if not is_mega_moe_experts_ready(self.experts):
+            raise RuntimeError(
+                "--moe-a2a-backend megamoe needs MXFP4 routed experts on an SM100 "
+                "GPU; load an FP4-expert checkpoint."
+            )
+        # The router weights already carry per_expert_scale: no routed scaling here.
+        return run_mega_routed_experts(
+            self.experts,
+            latent,
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            hidden_size=self.latent_size,
+            intermediate_size=self.intermediate_size,
+            top_k=self.top_k,
+            num_tokens=latent.shape[0],
+            # The kernel bakes SiTU beta=4.0/linear_beta=25.0, checked in __init__.
+            activation="situ",
+            buf=self.mega_moe_buffer(),
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             if get_moe_a2a_backend().is_none():
                 # Every TP rank sees the same (DP-gathered) tokens: all skip together.
                 return hidden_states
             # An all-to-all dispatch still needs this rank, tokens or not.
-            self.experts(
+            self._run_experts(
                 hidden_states.new_empty((0, self.latent_size)),
                 self.topk.empty_topk_output(
                     hidden_states.device, layer_id=self.layer_id
                 ),
             )
             return hidden_states
+        if self._low_latency_moe.should_run(hidden_states.shape[0]):
+            return self._low_latency_moe.run(hidden_states)
         shared = None
         in_dispatch = None
         # A breakable graph's eager break inside the routed experts would leave one
@@ -607,7 +665,7 @@ class Ernie5_5Moe(nn.Module):
             hidden_states, linear_bf16_fp32(hidden_states, self.gate_weight)
         )
         latent, _ = self.fc1_latent_proj(hidden_states)
-        routed = self.experts(latent, topk_output)
+        routed = self._run_experts(latent, topk_output)
         # An all-to-all combine already returns the complete sum, so all-reducing
         # it again would multiply by tp_size.
         if get_parallel().tp_size > 1 and get_moe_a2a_backend().is_none():
@@ -621,6 +679,8 @@ class Ernie5_5Moe(nn.Module):
             torch.cuda.current_stream().wait_stream(self.alt_stream)
             # Allocated on alt_stream, consumed on the main one.
             shared.record_stream(torch.cuda.current_stream())
+        if self._shared_sharded:
+            shared = tensor_model_parallel_all_reduce(shared)
         return routed + shared
 
     def _shared_experts_in_dispatch(self, hidden_states: torch.Tensor) -> list:
@@ -694,6 +754,14 @@ class Ernie5_5DecoderLayer(nn.Module):
 
     @staticmethod
     def _build_self_attn(config, layer_id, quant_config, prefix, alt_streams):
+        if envs.SGLANG_ERNIE55_LOW_LATENCY_DECODE.get():
+            from sglang.srt.models import ernie55_low_latency_attention as low_latency
+
+            if layer_id in config.mla_layer_ids:
+                cls = low_latency.Ernie5_5LowLatencyMlaAttention
+            else:
+                cls = low_latency.Ernie5_5LowLatencyHcaAttention
+            return cls(config, layer_id, quant_config, prefix, alt_streams)
         if layer_id in config.mla_layer_ids:
             return Ernie5_5MlaAttention(config, layer_id, quant_config, prefix)
         return Ernie5_5HcaAttention(config, layer_id, quant_config, prefix, alt_streams)
@@ -875,6 +943,20 @@ class Ernie5_5Model(nn.Module):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.hc_head = Ernie5_5HcHead(config)
         self.dspark_layers_to_capture: Optional[list[int]] = None
+        self.mhc_chain = None
+        if envs.SGLANG_ERNIE55_LOW_LATENCY_DECODE.get():
+            from sglang.srt.layers.quantization.ernie55_low_latency_gemm import (
+                Ernie5_5LowLatencyGemm,
+            )
+            from sglang.srt.models.ernie55_low_latency_mhc import (
+                Ernie5_5LowLatencyMhcChain,
+            )
+
+            Ernie5_5LowLatencyGemm.register_hooks()
+            if Ernie5_5LowLatencyMhcChain.supported():
+                self.mhc_chain = Ernie5_5LowLatencyMhcChain(
+                    self.layers, range(self.start_layer, self.end_layer)
+                )
 
     def forward(
         self,
@@ -907,7 +989,18 @@ class Ernie5_5Model(nn.Module):
         )
         captures = self.dspark_layers_to_capture or ()
         aux_hidden_states = []
-        for layer_id in range(self.start_layer, self.end_layer):
+        layers = range(self.start_layer, self.end_layer)
+        if self.mhc_chain is not None:
+            hidden_states = self.mhc_chain.forward(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                captures,
+                aux_hidden_states,
+            )
+            layers = ()
+        for layer_id in layers:
             hidden_states = self.layers[layer_id](
                 positions, hidden_states, forward_batch, zero_allocator
             )

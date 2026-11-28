@@ -32,23 +32,27 @@ def _reference(x, r, t):
     return out
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("shape", [(1, 50304), (37, 201216), (3, 5)])
-def test_multimax_matches_eager_bit_for_bit(shape):
+def test_multimax_matches_eager_bit_for_bit(shape, dtype):
     from sglang.kernels.ops.activation.multimax import multimax
 
     torch.manual_seed(0)
-    x = (torch.randn(shape, device="cuda") * 8).bfloat16()
+    x = (torch.randn(shape, device="cuda") * 8).to(dtype)
     r = torch.tensor([-3.0, 4.0, -6.0, 7.0], device="cuda").bfloat16()
     t = torch.tensor([0.3, -0.2, 0.05, -0.04], device="cuda").bfloat16()
     assert torch.equal(multimax(x, r, t), _reference(x, r, t))
 
 
-def test_multimax_keeps_non_finite_logits():
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_multimax_keeps_non_finite_logits(dtype):
     from sglang.kernels.ops.activation.multimax import multimax
 
     x = torch.tensor(
-        [float("nan"), float("inf"), -float("inf"), 0.0, -5.0, 9.0], device="cuda"
-    ).bfloat16()
+        [float("nan"), float("inf"), -float("inf"), 0.0, -5.0, 9.0],
+        device="cuda",
+        dtype=dtype,
+    )
     r = torch.tensor([-3.0, 4.0, -6.0, 7.0], device="cuda").bfloat16()
     t = torch.tensor([0.3, -0.2, 0.05, -0.04], device="cuda").bfloat16()
     got, want = multimax(x, r, t), _reference(x, r, t)

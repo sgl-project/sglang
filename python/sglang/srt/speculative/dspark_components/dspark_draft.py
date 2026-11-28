@@ -206,9 +206,11 @@ def _draft_step(
     logits_out: Optional[torch.Tensor],
     sharded_accept: bool,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    activation = markov_head.step_logits_activation
     # The fused kernel has no vocab mask, and softcap rounding can tie its argmax.
     if (
-        logits_out is None
+        activation is None
+        and logits_out is None
         and len(prev_tokens) == 1
         and markov_head.step_vocab_limit is None
         and markov_head.step_softcap is None
@@ -226,6 +228,14 @@ def _draft_step(
     bias, state = markov_head.step_bias(
         prev_tokens, hidden_states=hidden_states, state=state
     )
+    step_dtype = markov_head.step_logits_dtype(base_logits.dtype)
+    if activation is not None:
+        # The sampler adds the bias itself; activate the sum, rounded to the step
+        # dtype as the sampler would round it, and add nothing.
+        refined = base_logits.to(torch.float32, copy=True)
+        refined[:, : bias.shape[1]] += bias.float()
+        base_logits = activation(refined.to(step_dtype))
+        bias = torch.zeros_like(bias)
     shard = markov_head.vocab_shard
     sharded = (
         {}
@@ -243,7 +253,7 @@ def _draft_step(
         key=noise.key,
         offset=noise.offset,
         step=step,
-        step_dtype=markov_head.step_logits_dtype(base_logits.dtype),
+        step_dtype=step_dtype,
         logits_out=logits_out,
         # Rows sample at their temperatures only when the step logits are kept.
         has_sampled_rows=None if logits_out is not None else False,
