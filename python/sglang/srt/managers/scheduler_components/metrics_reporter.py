@@ -282,6 +282,24 @@ class SchedulerMetricsReporter:
             self.last_gen_throughput = 0.0
         return self.last_gen_throughput
 
+    def _calc_avg_request_queue_latency(self, waiting_queue=None) -> float:
+        """Calculate average wait time for requests currently in the waiting queue."""
+        if waiting_queue is None:
+            waiting_queue = getattr(self.scheduler, "waiting_queue", None)
+        if not waiting_queue:
+            return 0.0
+        now = time.perf_counter()
+        total_wait = 0.0
+        count = 0
+        for r in waiting_queue:
+            time_stats = getattr(r, "time_stats", None)
+            if time_stats is not None:
+                entry_time = getattr(time_stats, "wait_queue_entry_time", 0.0)
+                if entry_time > 0:
+                    total_wait += max(0.0, now - entry_time)
+                    count += 1
+        return (total_wait / count) if count > 0 else 0.0
+
     def _init_metrics(self):
         # Basic stats
         self.forward_ct_decode = 0
@@ -1477,6 +1495,9 @@ class SchedulerMetricsReporter:
         )
         self.stats.num_grammar_queue_reqs = len(lists[ListKind.GRAMMAR])
         self._update_shortest_prefill_load_stats(bool(lists[ListKind.WAITING]))
+        self.stats.avg_request_queue_latency = self._calc_avg_request_queue_latency(
+            lists[ListKind.WAITING]
+        )
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                 lists[ListKind.PD_BOOTSTRAP], priority_enabled
