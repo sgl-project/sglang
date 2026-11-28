@@ -120,6 +120,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>16</code></td>
     </tr>
+<tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PREFETCH_PACE_LEAD_GB</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How many GiB of checkpoint files prefetch on Lustre may read ahead of the loader; one file per prefetch thread on the node is always allowed. A Lustre client drops the cached pages of files whose locks it has not used for its <code>lru_max_age</code>, so prefetch far ahead of the loader can be lost. Other filesystems are not paced. <code>0</code> disables pacing</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>64</code></td>
+    </tr>
 </tbody>
 </table>
 

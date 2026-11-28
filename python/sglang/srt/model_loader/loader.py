@@ -9,6 +9,7 @@ import collections
 import concurrent.futures
 import dataclasses
 import fnmatch
+import functools
 import gc
 import glob
 import hashlib
@@ -27,6 +28,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -103,16 +105,18 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.device import is_cuda_alike
+from sglang.srt.utils.device import is_cuda, is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.layers.utils.common import get_layer_id, set_weight_attrs
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
+    CheckpointTensorReaders,
+    _node_local_peers,
     _prefetch_all_checkpoints,
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
@@ -402,6 +406,12 @@ def _validate_default_loader_extra_config(
     ):
         # Only the buffered multithreaded safetensors iterator honors it.
         allowed_keys.add("max_inflight_bytes")
+    if load_format in (LoadFormat.AUTO, LoadFormat.SAFETENSORS):
+        allowed_keys.add("gpu_staging")
+        if not isinstance(extra_config.get("gpu_staging", False), bool):
+            raise ValueError(
+                "gpu_staging in --model-loader-extra-config must be a boolean"
+            )
     if load_format == LoadFormat.FASTSAFETENSORS:
         allowed_keys.add("enable_gds")
         if "enable_gds" in extra_config and not isinstance(
@@ -428,6 +438,80 @@ def _validate_default_loader_extra_config(
             f"{load_format}: "
             f"{unexpected_keys}"
         )
+
+
+@functools.cache
+def _log_gpu_staging_off(reason: str) -> None:
+    rank0_log(f"gpu_staging in --model-loader-extra-config has no effect: {reason}.")
+
+
+_EXPERT_ID_RE = re.compile(r"\bexperts\.(\d+)\.")
+
+
+def _checkpoint_tensor_readers(
+    model: Optional[nn.Module],
+) -> Optional[CheckpointTensorReaders]:
+    """Map checkpoint tensors to the node's ranks that read them: under EP a
+    rank reads only its own experts. Ranks skip the tensors they do not read."""
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    if model is None or not torch.distributed.is_initialized():
+        return None
+    moe_layers = collections.defaultdict(list)
+    for name, module in model.named_modules():
+        # Only where checkpoint layer ids match the module's.
+        if (
+            isinstance(module, FusedMoE)
+            and module.moe_ep_size > 1
+            and get_layer_id(name + ".") == module.layer_id
+        ):
+            moe_layers[module.layer_id].append(module)
+    # Several MoE modules in a layer may renumber the checkpoint's experts.
+    moe_layers = {i: m[0] for i, m in moe_layers.items() if len(m) == 1}
+    if not moe_layers:
+        return None
+
+    node_peers = _node_local_peers(get_parallel().world_group.ranks)
+    expert_peers = _node_local_peers(get_parallel().moe_tp_group.ranks)
+
+    @functools.lru_cache(maxsize=None)
+    def is_local_expert(layer_id: int, expert_id: int) -> bool:
+        moe = moe_layers[layer_id]
+        if expert_id >= moe._num_global_routed:  # Not one of its routed experts.
+            return True
+        return moe.loads_checkpoint_expert(expert_id)
+
+    def rank_of(name: str, nbytes: int) -> Optional[Tuple[int, int]]:
+        match = _EXPERT_ID_RE.search(name)
+        layer_id = get_layer_id(name)
+        # Some backends read per-expert scalars, e.g. input scales, on every rank.
+        if match is None or layer_id not in moe_layers or nbytes <= 8:
+            return node_peers
+        if is_local_expert(layer_id, int(match.group(1))):
+            return expert_peers
+        return None
+
+    # With experts placed in order, the node's EP ranks hold one block of them.
+    index, count = _node_local_peers(get_parallel().moe_ep_group.ranks)
+    location = get_global_expert_location_metadata()
+    m = None if location is None else location.physical_to_logical_map_cpu
+    node_reads: Optional[Callable[[str, int], bool]] = None
+    if (m is None or torch.equal(m, torch.arange(m.shape[-1]).expand_as(m))) and all(
+        moe._expert_storage_rank == moe.moe_ep_rank for moe in moe_layers.values()
+    ):
+
+        def in_node_share(name: str, nbytes: int) -> bool:
+            match = _EXPERT_ID_RE.search(name)
+            layer_id = get_layer_id(name)
+            if match is None or layer_id not in moe_layers or nbytes <= 8:
+                return True
+            moe, expert_id = moe_layers[layer_id], int(match.group(1))
+            block = expert_id // moe._num_local_routed - moe.moe_ep_rank + index
+            return expert_id >= moe._num_global_routed or 0 <= block < count
+
+        node_reads = in_node_share
+    return CheckpointTensorReaders(rank_of=rank_of, node_reads=node_reads)
 
 
 class DefaultModelLoader(BaseModelLoader):
@@ -496,6 +580,34 @@ class DefaultModelLoader(BaseModelLoader):
             extra_config=load_config.model_loader_extra_config,
             load_format=load_config.load_format,
         )
+
+    def _use_gpu_staging(self, source: Source, disable_mmap: bool) -> bool:
+        """Whether to read the safetensors tensors of ``source`` to the GPU
+        before the weight loaders see them (see ``gpu_staging.py``).
+
+        Pays off when the weight loaders slice tensors for tensor parallelism:
+        the slicing then runs on the GPU instead of on mapped CPU views. Only a
+        model's own checkpoint is staged, not sources without a model config
+        (e.g. LoRA adapters) and not a speculative draft model, which uses few
+        of the tensors in the files it iterates (a mapping reads none of the
+        others)."""
+        if not self.load_config.model_loader_extra_config.get("gpu_staging", False):
+            return False
+        model_config = source.model_config
+        if model_config is None or model_config.is_draft_model:
+            return False
+        if not is_cuda():
+            reason = "it needs CUDA"
+        elif disable_mmap:
+            reason = "--weight-loader-disable-mmap is set"
+        elif get_parallel().tp_size == 1:
+            reason = "without tensor parallelism weights are not sliced"
+        elif get_parallel().moe_ep_size > 1:
+            reason = "with expert parallelism ranks read only their own experts"
+        else:
+            return True
+        _log_gpu_staging_off(reason)
+        return False
 
     def _maybe_download_from_modelscope(
         self, model: str, revision: Optional[str]
@@ -655,6 +767,7 @@ class DefaultModelLoader(BaseModelLoader):
         resolved_source: Optional[ResolvedSource] = None,
         startup_prefetch_started: bool = False,
         startup_prefetch_active: bool = False,
+        model: Optional[nn.Module] = None,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -709,9 +822,11 @@ class DefaultModelLoader(BaseModelLoader):
                 startup_prefetch_active or start_iterator_prefetch
             )
             prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
+            readers = _checkpoint_tensor_readers(model)
             weight_loader_drop_cache_after_load = (
                 get_model().weight_loader_drop_cache_after_load
             )
+            gpu_staging = self._use_gpu_staging(source, weight_loader_disable_mmap)
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -748,7 +863,8 @@ class DefaultModelLoader(BaseModelLoader):
                     enable_gds=enable_gds,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
-            elif use_multithread:
+            elif use_multithread and not gpu_staging:
+                # GPU staging reads with its own threads, one file at a time.
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
                     hf_weights_files,
                     max_workers=extra_config.get(
@@ -758,6 +874,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    readers=readers,
                     max_inflight_bytes=extra_config.get("max_inflight_bytes"),
                 )
             else:
@@ -772,6 +889,8 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=start_iterator_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    readers=readers,
+                    gpu_staging=gpu_staging,
                 )
 
         else:
@@ -825,7 +944,7 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        yield from self._get_weights_iterator(primary_weights, model=model)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())

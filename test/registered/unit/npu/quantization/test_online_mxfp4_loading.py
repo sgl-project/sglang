@@ -374,7 +374,14 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
         self,
     ):
         layer, _ = self.moe()
-        param = layer.w13_weight
+
+        def destinations(expert_id, require_global_experts=False):
+            return list(
+                layer._weight_loader_expert_ids(
+                    expert_id, require_global_experts=require_global_experts
+                )
+            )
+
         metadata = SimpleNamespace(
             num_logical_experts=4, logical_to_all_physical=Mock(return_value=[0, 2, 3])
         )
@@ -382,23 +389,19 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
             moe_layer, "get_global_expert_location_metadata", return_value=metadata
         ):
             # Explicitly disabled location metadata must not be consulted.
-            self.assertEqual(list(layer._weight_loader_expert_ids(param, 2)), [0])
+            self.assertEqual(destinations(2), [0])
             metadata.logical_to_all_physical.assert_not_called()
             layer.uses_expert_location = True
-            self.assertEqual(list(layer._weight_loader_expert_ids(param, 1)), [0, 1])
-            param._sglang_require_global_experts = True
-            self.assertEqual(list(layer._weight_loader_expert_ids(param, 1)), [0, 2, 3])
+            self.assertEqual(destinations(1), [0, 1])
+            self.assertEqual(destinations(1, True), [0, 2, 3])
             layer._has_fused_shared = True
             layer.num_fused_shared_experts = 1
             layer.num_local_experts = 3
             with patch.object(
                 moe_layer, "uses_per_rank_fused_shared_slots", return_value=True
             ):
-                self.assertEqual(
-                    list(layer._weight_loader_expert_ids(param, 4)), [2, 5]
-                )
-            param._sglang_require_global_experts = False
-            self.assertEqual(list(layer._weight_loader_expert_ids(param, 4)), [2])
+                self.assertEqual(destinations(4, True), [2, 5])
+            self.assertEqual(destinations(4), [2])
 
 
 if __name__ == "__main__":
