@@ -64,6 +64,18 @@ _JOY_IMAGE_QK_ROPE = BitExactFusionGate("Joy strided image QK RoPE", per_signatu
 _JOY_RESIDUAL_GATE = BitExactFusionGate("Joy image residual gate", per_signature=True)
 
 
+def _joy_qk_rope_arches_measured(device: torch.device) -> bool:
+    """Arches where the strided out-of-place QK RMSNorm+RoPE has been measured.
+
+    SM90 and SM103 are the original targets. SM120 (GeForce RTX 50) was
+    measured on the packed image stride at 32 heads x 128 against exactly what
+    ``reference()`` does -- two contiguous copies of q and k followed by the
+    in-place fused kernel: 746.9 us -> 417.5 us, bitwise identical. An arch is
+    admitted only after it has been measured, so SM100 stays off this list.
+    """
+    return torch.cuda.get_device_capability(device) in ((9, 0), (10, 3), (12, 0))
+
+
 def _joy_image_qk_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -87,7 +99,7 @@ def _joy_image_qk_rope(
 
     # Read the packed projection directly, using the same CUDA arithmetic as
     # the original contiguous in-place operation; apply_qk_norm_rope only fuses
-    # in place, so it needs the contiguous copies. Keep unmeasured paths native.
+    # in place, so it needs the contiguous copies. Keep unmeasured arches native.
     if (
         not q.is_cuda
         or torch.version.hip
@@ -99,7 +111,7 @@ def _joy_image_qk_rope(
         or q.dtype != torch.bfloat16
         or k.dtype != q.dtype
         or k.device != q.device
-        or torch.cuda.get_device_capability(q.device) not in ((9, 0), (10, 3))
+        or not _joy_qk_rope_arches_measured(q.device)
         or any(x.stride() != (q.shape[1] * 12288, 12288, 128, 1) for x in (q, k))
         or cache.ndim != 2
         or cache.shape[1] != 128
