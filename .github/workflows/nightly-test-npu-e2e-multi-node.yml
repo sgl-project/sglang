@@ -390,13 +390,23 @@ jobs:
           tc_name="${tc_name##*/}"
           tc_name="${tc_name%.*}"
 
+          run_tag="-${{ github.run_id }}-${{ github.run_attempt }}"
+          log_root=/root/.cache/tests/logs/log
+
+          # Pod-side logs are ${log_root}/<run_label>/<tc_name>/<pod>/<tc_name>.log,
+          # where run_label is two path segments in the nightly layout and one in
+          # the legacy layout. Match on the run id instead of hard-coding the
+          # depth so a layout change cannot silently collect nothing.
+          matched_logs="$(mktemp)"
+          find "${log_root}" -maxdepth 6 -type f -name "${tc_name}.log" \
+            -path "*${run_tag}/*" 2>/dev/null > "${matched_logs}" || true
+
           collected=0
-          for out_dir in /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/${tc_name}; do
+          for out_dir in /root/.cache/tests/output/*${run_tag}/*/${{ inputs.test_type }}/${tc_name}; do
             [ -d "${out_dir}" ] || continue
-            for src_dir in /root/.cache/tests/logs/log/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${tc_name}/*; do
-              [ -d "${src_dir}" ] || continue
-              [ -f "${src_dir}/${tc_name}.log" ] || continue
-              pod_name="$(basename "${src_dir}")"
+            while IFS= read -r src_file; do
+              [ -n "${src_file}" ] || continue
+              pod_name="$(basename "$(dirname "${src_file}")")"
               dest_dir="${out_dir}/node_logs/${pod_name}"
               # Same name as the pod-side copy and dump_pod_logs: keep whichever
               # archive landed first so each pod ends up with a single log.
@@ -404,14 +414,23 @@ jobs:
                 continue
               fi
               mkdir -p "${dest_dir}"
-              cp -a "${src_dir}/${tc_name}.log" "${dest_dir}/${pod_name}.log"
+              cp -a "${src_file}" "${dest_dir}/${pod_name}.log"
               collected=$((collected + 1))
-            done
+            done < "${matched_logs}"
           done
+          rm -f "${matched_logs}"
           echo "Collected ${collected} pod log dir(s)"
           if [ "${collected}" -eq 0 ]; then
-            echo "No pod-side log dir matched; entries under /root/.cache/tests/logs/log:"
-            ls -1 /root/.cache/tests/logs/log 2>/dev/null | head -n 20 || true
+            echo "No pod-side log matched; matched log files:"
+            find "${log_root}" -maxdepth 6 -type f -name "${tc_name}.log" \
+              -path "*${run_tag}/*" 2>/dev/null || true
+            # Pods write this tree on the shared PVC exactly like output/, so a
+            # differing device id or a missing run-label directory points at the
+            # mount rather than at the filter above.
+            echo "output device: $(stat -c %d /root/.cache/tests/output 2>/dev/null || echo n/a)"
+            echo "log device: $(stat -c %d "${log_root}" 2>/dev/null || echo n/a)"
+            echo "recent entries under ${log_root}:"
+            ls -1t "${log_root}" 2>/dev/null | head -n 20 || true
           fi
 
       - name: Upload metrics artifact
