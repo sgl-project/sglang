@@ -3,7 +3,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
+from sglang.srt.layers.attention.dsv4.late_layer_tail import LateLayerTail
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.models import deepseek_v4
 from sglang.srt.models.deepseek_v4 import (

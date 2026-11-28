@@ -7,15 +7,15 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
-    late_layer_tail_layout,
-)
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import Mxfp8Activation
 from sglang.srt.layers.attention import deepseek_v4_backend
 from sglang.srt.layers.attention.deepseek_v4_backend import (
-    SWA_WINDOW,
     DeepseekV4AttnBackend,
     DSV4Metadata,
+)
+from sglang.srt.layers.attention.dsv4.late_layer_tail import (
+    SWA_WINDOW,
+    late_layer_tail_layout,
     late_layer_whole_extend,
 )
 from sglang.srt.model_executor import forward_batch_info

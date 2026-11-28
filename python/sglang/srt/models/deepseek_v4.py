@@ -787,13 +787,11 @@ if TYPE_CHECKING:
         Fp8GridActivation,
         Mxfp8Activation,
     )
-    from sglang.srt.layers.attention.deepseek_v4_backend import (
-        DeepseekV4AttnBackend,
-        LateLayerTail,
-    )
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
         DeepseekV4HipRadixBackend,
     )
+    from sglang.srt.layers.attention.dsv4.late_layer_tail import LateLayerTail
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -4213,8 +4211,12 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
-            self._check_late_layer_tail_readers(forward_batch, tail)
+            # Without a request window and with a non-zero floor the backend
+            # falls back to a full extend: no tail metadata, every late row runs.
+            tail_metadata = attn_backend.tail_forward_metadata
+            if tail_metadata is not None:
+                tail = tail_metadata.late_layer_tail
+                self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
             tail is not None
             and tail.scatter_indices is not None
@@ -5126,9 +5128,11 @@ class DeepseekV4ForCausalLM(
         ):
             return CPLogitsInputs(input_ids, forward_batch)
 
-        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        tail_metadata = get_attn_backend().tail_forward_metadata
+        tail = None if tail_metadata is None else tail_metadata.late_layer_tail
         if tail is None:
-            raise RuntimeError("CP bounded-tail logits require prepared tail metadata")
+            # Full-extend fallback: every row is already in the logits layout.
+            return CPLogitsInputs(input_ids, forward_batch)
         logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
         logits_metadata.extend_seq_lens = tail.extend_seq_lens
         logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
@@ -5194,7 +5198,12 @@ class DeepseekV4ForCausalLM(
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
-            return get_attn_backend().tail_forward_metadata.late_layer_tail
+            # A full-extend fallback publishes no tail metadata: hidden states
+            # are already in the plain row layout.
+            tail_metadata = get_attn_backend().tail_forward_metadata
+            if tail_metadata is None:
+                return None
+            return tail_metadata.late_layer_tail
         return None
 
     def postprocess_cp_output(self, hidden_states, forward_batch):

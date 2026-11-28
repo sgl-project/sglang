@@ -335,16 +335,22 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     if cfg.enable_encoder_swa_bounded_replay:
         incompatible = (
             (
-                "hardware other than CUDA or gfx950",
+                "hardware other than CUDA, gfx950 or NPU",
                 not (
                     get_platform().is_cuda
                     or (get_platform().is_hip and is_gfx95_supported())
+                    or get_platform().is_npu
                 ),
             ),
             (
                 "prefill CUDA graphs other than breakable",
                 cfg.cuda_graph_config.prefill.backend
                 not in (Backend.DISABLED, Backend.BREAKABLE),
+            ),
+            (
+                "the NPU breakable prefill graph",
+                get_platform().is_npu
+                and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE,
             ),
             # ROCm replays hits in a forward of their own, outside the graph.
             (
@@ -437,13 +443,22 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             not in (Backend.DISABLED, Backend.BREAKABLE),
         ),
         (
+            "the NPU breakable prefill graph",
+            get_platform().is_npu
+            and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE,
+        ),
+        (
             "DP attention other than attention TP 1 with supported MoE backends",
             attn_dp_enabled_of(cfg)
             and not (
                 cfg.attn_dp_size == cfg.tp_size
                 and cfg.attn_cp_size == 1
                 and (
-                    (get_platform().is_hip and cfg.moe_a2a_backend == "none")
+                    (
+                        get_platform().is_npu
+                        and cfg.moe_a2a_backend in ("none", "deepep", "ascend_ops")
+                    )
+                    or (get_platform().is_hip and cfg.moe_a2a_backend == "none")
                     or (
                         get_platform().is_cuda
                         and cfg.moe_a2a_backend in ("none", "megamoe")

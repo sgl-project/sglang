@@ -805,11 +805,13 @@ class TestSparseAttentionMetadata(unittest.TestCase):
             backend._dsv4_head_dim = 512
             backend._dsv4_has_c4 = False
             backend._dsv4_has_c128 = False
+            backend.token_to_kv_pool = SimpleNamespace(swa_valid_from=None)
 
             forward_batch = SimpleNamespace(
                 spec_info=SimpleNamespace(draft_token_num=2),
                 seq_lens=seqused_kv,
                 out_cache_loc=torch.zeros(4, dtype=torch.int64),
+                req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
             )
             backend._init_dspark_sparse_metadata(forward_batch)
             backend._kernel_metadata_from_parts(

@@ -8,7 +8,7 @@ from unittest import mock
 import torch
 
 from sglang.srt.arg_groups import deepseek_v4_hook
-from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
+from sglang.srt.layers.attention.dsv4.late_layer_tail import LateLayerTail
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import eager_runner
@@ -428,7 +428,13 @@ class TestCpBoundedReplayConfiguration(CustomTestCase):
                     deepseek_v4_hook,
                     "model_config_of",
                     return_value=SimpleNamespace(
-                        hf_config=SimpleNamespace(model_type="deepseek_v41")
+                        hf_config=SimpleNamespace(
+                            model_type="deepseek_v41",
+                            kv_source_layer_ids=[3],
+                            index_source_layer_ids=[3],
+                            candidate_source_layer_id=-1,
+                            compress_ratios=[0, 0, 0, 1],
+                        )
                     ),
                 ),
                 mock.patch(

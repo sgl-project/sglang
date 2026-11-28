@@ -295,6 +295,24 @@ class SRTPlatform(DeviceMixin):
         """Whether this platform supports a draft backend for an algorithm."""
         return False
 
+    # DeepSeek-V4.1 SWA bounded replay (safe conservative defaults)
+
+    def request_window_nbytes(
+        self,
+        *,
+        num_slots: int,
+        layers: int,
+        page_size: int,
+        capacity: int,
+        workspace_rows: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        draft_ring_size: int,
+        draft_ring_layers: int,
+    ) -> Optional[int]:
+        """Exact request-window bytes for this platform's row format, or None."""
+        return None
+
     def support_mamba_cache_extra_buffer(self) -> bool:
         """Whether this out-of-tree platform supports Mamba cache snapshots."""
         return False

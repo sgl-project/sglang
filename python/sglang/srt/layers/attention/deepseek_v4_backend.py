@@ -26,8 +26,6 @@ from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
     ExpandPrefillCausally,
-    late_layer_tail_layout,
-    late_layer_tail_lens,
 )
 from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
     can_use_swapab_attention,
@@ -74,6 +72,17 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     token_req_indices,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
+from sglang.srt.layers.attention.dsv4.late_layer_tail import (
+    SWA_WINDOW,
+    LateLayerTail,
+    _late_layer_whole_extend,
+    _pad_rows,
+    _tail_rows,
+    late_layer_num_tokens,
+    late_layer_tail_layout,
+    late_layer_tail_lens,
+    late_layer_whole_extend,
+)
 from sglang.srt.layers.attention.dsv4.metadata import (
     _LARGE_INDEXER_QUERY_THRESHOLD,
     PagedIndexerMetadata,
@@ -172,7 +181,6 @@ _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
 
-SWA_WINDOW = 128
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 DSV4_CUTEDSL_H16_PREFILL_BACKEND = "cutedsl_h16"
@@ -1016,107 +1024,6 @@ class DSV4AttnMetadata:
                 self.c2_topk_lengths_clamp1, self.index_topk, is_prefill
             )
             self.c2_flashmla_metadata = _create_flashmla_metadata()
-
-
-class LateLayerTail(msgspec.Struct, frozen=True):
-    """Rows the layers from late_layer_start on run over under decoder SWA bounded
-    replay: the last tail tokens of each request in the extend."""
-
-    token_indices: torch.Tensor
-    positions: torch.Tensor
-    extend_seq_lens: torch.Tensor
-    extend_seq_lens_cpu: List[int]
-    swa_out_cache_loc: torch.Tensor
-    # Set when the tail is the extend's last rows (one request): a view, not a gather.
-    contiguous_start: Optional[int] = None
-    # prefill CP: this rank's tail rows padded to the largest share; cp_metadata is that layout
-    pad_rows: int = 0
-    cp_metadata: Optional[InterleaveContextParallelMetadata] = None
-    local_lens_cpu: Optional[List[int]] = None
-    # Original extend rows in global request order; token_indices is rank-local under CP.
-    global_token_indices: Optional[torch.Tensor] = None
-    req_global: Optional[torch.Tensor] = None
-    pos_global: Optional[torch.Tensor] = None
-    # Prefill CUDA graph: token_indices/positions are persistent buffers of a fixed
-    # capacity (real rows first, padding after); scatter_indices maps every row back
-    # into the extend, padding rows to a dummy row past the end.
-    scatter_indices: Optional[torch.Tensor] = None
-    real_rows_count: Optional[int] = None
-
-    def rows(self, t: torch.Tensor) -> torch.Tensor:
-        rows = self.real_rows(t)
-        if self.pad_rows:
-            rows = torch.cat([rows, rows.new_zeros((self.pad_rows, *rows.shape[1:]))])
-        return rows
-
-    def real_rows(self, t: torch.Tensor) -> torch.Tensor:
-        return _tail_rows(
-            t, token_indices=self.token_indices, contiguous_start=self.contiguous_start
-        )
-
-
-def _tail_rows(
-    t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
-) -> torch.Tensor:
-    if contiguous_start is not None:
-        # Same rows as t[token_indices]; t may carry MLP-sync padding past the extend.
-        return t[contiguous_start : contiguous_start + token_indices.shape[0]]
-    return t[token_indices]
-
-
-def _late_layer_whole_extend(
-    *,
-    extend_lens: List[int],
-    logprob_start_lens: Optional[List[int]],
-    full_hidden_states: bool,
-) -> Optional[List[bool]]:
-    """Requests that run their whole extend with plain windows under decoder SWA
-    bounded replay: those that read prompt rows (prompt logprobs, or every hidden
-    state outside DSpark, whose draft reads tail rows only). None when no request
-    in the batch does."""
-    if full_hidden_states:
-        return [True] * len(extend_lens)
-    if logprob_start_lens is None:
-        return None
-    whole = [start < n for start, n in zip(logprob_start_lens, extend_lens)]
-    return whole if any(whole) else None
-
-
-def late_layer_whole_extend(
-    forward_batch: ForwardBatch, *, dspark: bool
-) -> Optional[List[bool]]:
-    """`_late_layer_whole_extend` of a forward batch. dspark comes from the server:
-    a capture batch carries DSpark's FULL capture mode without its spec_algorithm."""
-    return _late_layer_whole_extend(
-        extend_lens=forward_batch.extend_seq_lens_cpu,
-        logprob_start_lens=(
-            forward_batch.extend_logprob_start_lens_cpu
-            if forward_batch.return_logprob
-            else None
-        ),
-        full_hidden_states=forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
-        and not dspark,
-    )
-
-
-def late_layer_num_tokens(forward_batch: ForwardBatch, *, dspark: bool) -> int:
-    """Rows a rank runs from late_layer_start on: an extend's tail rows, as
-    late_layer_tail_layout picks them, and every row otherwise."""
-    if not forward_batch.forward_mode.is_extend_without_speculative():
-        return forward_batch.input_ids.shape[0]
-    whole_extend = late_layer_whole_extend(forward_batch, dspark=dspark)
-    return sum(
-        late_layer_tail_lens(
-            forward_batch.extend_seq_lens_cpu, SWA_WINDOW, whole_extend
-        )
-    )
-
-
-def _pad_rows(t: torch.Tensor, *, num_rows: int) -> torch.Tensor:
-    assert t.shape[0] <= num_rows, (t.shape[0], num_rows)
-    if t.shape[0] == num_rows:
-        return t
-    return torch.nn.functional.pad(t, (0, num_rows - t.shape[0]))
 
 
 # Arbitrary floor: below it the dense scores are short enough that the

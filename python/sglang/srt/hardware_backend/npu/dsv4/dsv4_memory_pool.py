@@ -31,6 +31,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
     NPUDSV4KVLayout,
     get_a3_c2_state_bank_count,
 )
+from sglang.srt.hardware_backend.npu.dsv4.ring_layout import sink_dead_rows
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
@@ -453,6 +454,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 f"{npu_window_generation!r}"
             )
         self._npu_window_generation = npu_window_generation
+        # The shared base sets this only for a draft ring; default it so the
+        # SWA sink selection can tell a ring from a paged pool.
+        self.swa_req_ring_size = None
         super().__init__(*args, **kwargs)
 
     def _is_v41_model(self) -> bool:
@@ -487,6 +491,48 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 else NPUDSV4KVLayout.V41_BF16
             )
         return NPUDSV4KVLayout.V4_FP8 if is_npu_arch35() else NPUDSV4KVLayout.V4_BF16
+
+    def _build_request_window(
+        self,
+        *,
+        layers: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        enable_memory_saver: bool,
+        draft_tokens: int,
+    ):
+        """Row-style window: A3 rows are 1024 B BF16, so the packed-page window
+        cannot be reused; NPURequestWindow keeps the same WindowLayout math."""
+        from sglang.srt.hardware_backend.npu.dsv4.npu_request_window import (
+            NPURequestWindowMemory,
+            dsv41_request_window_spec,
+        )
+        from sglang.srt.mem_cache.dsv41_request_window import (
+            request_window_workspace_rows,
+        )
+
+        layout = self._window_kv_layout()
+        row_dim, row_dtype = layout.kv_info(
+            self.qk_nope_head_dim, self.qk_rope_head_dim
+        )
+        spec = dsv41_request_window_spec(
+            num_slots=self.num_req_slots,
+            layers=layers,
+            page_size=page_size,
+            capacity=self.sliding_window + draft_tokens,
+            workspace_rows=request_window_workspace_rows(
+                self.num_req_slots, self.sliding_window, draft_tokens
+            ),
+            row_dim=row_dim,
+            row_dtype=row_dtype,
+        )
+        memory = NPURequestWindowMemory(
+            spec,
+            device=torch.device(device),
+            enable_memory_saver=enable_memory_saver,
+        )
+        return memory.view, memory
 
     def _make_kv_pool(
         self,
@@ -726,10 +772,23 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """SWA KV, C4 attention state, then C4 indexer state, all SWA-page indexed."""
-        buffers = self.swa_kv_pool.kv_buffer
-        data_ptrs = [buf.data_ptr() for buf in buffers]
-        data_lens = [buf.nbytes for buf in buffers]
-        item_lens = [buf[0].nbytes for buf in buffers]
+        if self.request_window is not None:
+            # Encoder replay keeps SWA in the per-request row window. Its pages
+            # pair with decode's paged SWA pages; one item is one window page.
+            window = self.request_window
+            data_ptrs: List[int] = []
+            data_lens: List[int] = []
+            item_lens: List[int] = []
+            for layer in range(window.state.shape[0]):
+                buf = window.state[layer]
+                data_ptrs.append(buf.data_ptr())
+                data_lens.append(buf.nbytes)
+                item_lens.append(buf[0].nbytes * window.page_size)
+        else:
+            buffers = self.swa_kv_pool.kv_buffer
+            data_ptrs = [buf.data_ptr() for buf in buffers]
+            data_lens = [buf.nbytes for buf in buffers]
+            item_lens = [buf[0].nbytes for buf in buffers]
 
         for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
             for pool in pools:
@@ -824,6 +883,18 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         flatten across (num_pages, page_size) and gather the matching tokens,
         so the shape becomes (num_tokens, 1, dim).
         """
+        if self.request_window is not None:
+            window = self.request_window
+            local = self._swa_local_layer_id(layer_id)
+            if window.prefill:
+                kv = window.buffer(local)
+                if loc is not None:
+                    return kv[loc.to(torch.int64)].unsqueeze(1)
+                return kv.view(-1, window.page_size, 1, kv.shape[-1])
+            kv = window.state_view(local)
+            if loc is not None:
+                return kv.flatten(0, 1)[loc]
+            return kv
         self.wait_layer_transfer(layer_id)
         # Index by PP-stage-local layer_id, not compress_layer_id (a per-bucket
         # counter that would collide across ratios). swa_kv_pool is sized
@@ -882,20 +953,93 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             kv = kv.flatten(0, 1)[loc]
         return kv
 
+    def _swa_sink_row(self, pool) -> int:
+        """Row a dead SWA store lands on.
+
+        The paged target pools reserve page 0 for padding writes; the draft
+        ring owns rows [0, size) and has one spare page.
+        """
+        if self.swa_req_ring_size is not None:
+            return int(pool.size) if pool is not None else int(self.size)
+        return 0
+
+    @staticmethod
+    def _dead_rows_to_sink(
+        cache: torch.Tensor, loc: torch.Tensor, sink: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Map -1 rows to ``sink`` and zero their payload, without a host sync."""
+        dead = loc.reshape(-1) < 0
+        loc = sink_dead_rows(loc, int(sink))
+        rows = dead.view(-1, *([1] * (cache.dim() - 1)))
+        return torch.where(rows, cache.new_zeros(()), cache), loc
+
     def set_swa_buffer(
         self,
         layer_id: int,
         loc: torch.Tensor,
         cache: torch.Tensor,
+        *,
+        all_valid: bool = False,
     ) -> None:
         """Write ``cache`` into the SWA pool at flat token positions ``loc``.
 
         ``cache`` shape: (num_tokens, num_kv_heads=1, dim). The buffer view is
         (num_pages, page_size, 1, dim) so we flatten the first two dims and
-        index_put.
+        index_put. ``all_valid`` skips the dead-row sink mapping when metadata
+        guarantees one real slot per KV row.
         """
+        if self.request_window is not None:
+            window = self.request_window
+            local = self._swa_local_layer_id(layer_id)
+            if cache.ndim == 3:
+                cache = cache.squeeze(1)
+            if all_valid and loc.numel() != cache.shape[0]:
+                all_valid = False
+            # MLP-sync padding can extend the model's KV rows past the
+            # layout's valid slots; park those rows on the sink.
+            if not all_valid:
+                if loc.numel() < cache.shape[0]:
+                    loc = torch.cat(
+                        [
+                            loc.reshape(-1),
+                            torch.full(
+                                (cache.shape[0] - loc.numel(),),
+                                -1,
+                                dtype=loc.dtype,
+                                device=loc.device,
+                            ),
+                        ]
+                    )
+                elif loc.numel() > cache.shape[0]:
+                    raise ValueError(
+                        "request-window SWA write has more slots than KV rows: "
+                        f"{loc.numel()} > {cache.shape[0]}"
+                    )
+            if window.prefill:
+                buf = window.buffer(local)
+                # The workspace has no request-ring sink; its last row absorbs
+                # dead rows (the graph layouts use the same scratch row).
+                sink = buf.shape[0] - 1
+            else:
+                buf = window.state[local]
+                sink = window.sink_row
+            if not all_valid:
+                cache, loc = self._dead_rows_to_sink(cache, loc, sink)
+            layout = self._window_kv_layout()
+            if layout is NPUDSV4KVLayout.V41_SWA_FP8:
+                # Packed V4.1 window rows (FP8 + BF16 scales) need the epilog
+                # writer, not a plain bf16 copy.
+                self._write_dsv41_packed_kv(
+                    buf=buf, loc=loc, cache=cache, layout=layout
+                )
+            else:
+                buf[loc.to(torch.int64)] = cache.to(buf.dtype)
+            return
         # Index by PP-stage-local layer_id (see get_swa_buffer).
         pool = self.swa_kv_pool
+        # Dead rows (loc -1) go to a ring's spare row or the paged pool's page 0;
+        # the paged pool's last row is live KV.
+        cache, loc = self._dead_rows_to_sink(cache, loc, self._swa_sink_row(pool))
         buf = pool.kv_buffer[self._swa_local_layer_id(layer_id)]
         if isinstance(pool, DSV41NPUSingleKVPool):
             if not is_npu_arch35():
@@ -1020,10 +1164,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             qk_nope_dim=kv_out.shape[-1] - rope_dim,
         )
 
-        safe_swa_loc = swa_loc.clamp_min(0).to(torch.int64)
+        # -1 rows (uncommitted verify tokens, or rows outside the draft ring
+        # window) are mapped to this pool's sink inside set_swa_buffer.
         self.set_swa_buffer(
             layer_id,
-            safe_swa_loc,
+            swa_loc.to(torch.int64),
             kv_out,
         )
 

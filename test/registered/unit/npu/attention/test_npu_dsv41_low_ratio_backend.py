@@ -1827,19 +1827,24 @@ class TestV41PoolWriteDispatch(unittest.TestCase):
     def test_swa_buffer_routes_a_v41_pool_to_the_fp8_writer(self):
         pool = _dsv41_llm_pool(544, torch.float8_e4m3fn, NPUDSV4KVLayout.V41_SWA_FP8)
         ns = SimpleNamespace(
-            swa_kv_pool=pool, _swa_local_layer_id=lambda layer_id: layer_id
+            swa_kv_pool=pool,
+            _swa_local_layer_id=lambda layer_id: layer_id,
+            request_window=None,
+            _dead_rows_to_sink=DSV4NPUTokenToKVPool._dead_rows_to_sink,
+            _swa_sink_row=lambda pool: 0,
         )
         writer = MagicMock()
         ns._write_dsv41_packed_kv = writer
         loc = torch.tensor([3], dtype=torch.int64)
         cache = torch.zeros(1, 1, 512, dtype=torch.bfloat16)
         DSV4NPUTokenToKVPool.set_swa_buffer(ns, 0, loc, cache)
-        writer.assert_called_once_with(
-            buf=pool.kv_buffer[0],
-            loc=loc,
-            cache=cache,
-            layout=NPUDSV4KVLayout.V41_SWA_FP8,
-        )
+        writer.assert_called_once()
+        kwargs = writer.call_args.kwargs
+        self.assertIs(kwargs["buf"], pool.kv_buffer[0])
+        torch.testing.assert_close(kwargs["loc"], loc)
+        # The dead-row filter rebuilds the payload tensor; compare contents.
+        torch.testing.assert_close(kwargs["cache"], cache)
+        self.assertEqual(kwargs["layout"], NPUDSV4KVLayout.V41_SWA_FP8)
 
 
 def _metadata_recorder(shape):

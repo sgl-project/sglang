@@ -715,7 +715,9 @@ class AscendAttnBackend(AttentionBackend):
                 ][:, :: self.page_size]
                 // self.page_size
             )
-            if self.is_hybrid_swa:
+            # Encoder replay keeps SWA in the request window, so the paged
+            # full-to-SWA mapping does not exist.
+            if self.is_hybrid_swa and self.full_to_swa_index_mapping is not None:
                 self.forward_metadata.block_tables_swa = (
                     (
                         self.full_to_swa_index_mapping[
@@ -1306,7 +1308,7 @@ class AscendAttnBackend(AttentionBackend):
             max_len = attention_kv_lens_cpu.max().item()
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
 
-            if self.is_hybrid_swa:
+            if self.is_hybrid_swa and self.full_to_swa_index_mapping is not None:
                 full_page_locs = self.req_to_token[
                     req_pool_indices[:bs],
                     0 : max_len : self.page_size,
