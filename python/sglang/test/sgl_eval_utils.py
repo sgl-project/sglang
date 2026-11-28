@@ -143,8 +143,10 @@ def run_sgl_eval(args):
             **(default_gen.chat_template_kwargs or {}),
             **chat_kwargs,
         }
-    if getattr(args, "top_k", None) is not None:
-        overrides["extra_body"] = {"top_k": args.top_k}
+    for key in ("top_k", "presence_penalty"):
+        value = getattr(args, key, None)
+        if value is not None:
+            overrides.setdefault("extra_body", {})[key] = value
     gen = replace(default_gen, **overrides)
     generation = {
         key: getattr(gen, key)

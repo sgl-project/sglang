@@ -10,10 +10,7 @@ from msgspec.msgpack import Decoder
 
 from sglang.srt.disaggregation.kv_events import BlockStored, KVEventBatch
 from sglang.test.ci.ci_register import register_cuda_ci
-
-# This eval harness applies the chat_template, which is critical for qwen3.5
-# to get good accuracy on gsm8k
-from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -101,19 +98,20 @@ class TestQwen35WithHiCache(CustomTestCase):
         args = SimpleNamespace(
             model=self.model,
             eval_name="gsm8k",
-            num_shots=5,
             num_examples=100,
             max_tokens=16000,
             num_threads=50,
             repeat=1,
-            temperature=0.6,
+            temperature=1.0,
+            presence_penalty=1.5,
             top_p=0.95,
             top_k=20,
+            chat_template_kwargs={"enable_thinking": True},
             base_url=self.base_url,
             host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
-        return run_eval(args)
+        return run_sgl_eval(args)
 
     def test_gsm8k(self):
         first_metrics = self._run_gsm8k()
