@@ -1697,6 +1697,12 @@
                     ]
                   },
                   {
+                    "group": "Ovis",
+                    "pages": [
+                      "cookbook/diffusion/Ovis/Ovis-Image"
+                    ]
+                  },
+                  {
                     "group": "Qwen",
                     "pages": [
                       "cookbook/diffusion/Qwen-Image/Qwen-Image-2.1",
