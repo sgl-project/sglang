@@ -28,7 +28,8 @@ if TYPE_CHECKING:
 
 
 class StockVerifyBatch(msgspec.Struct, frozen=True):
-    """The ScheduleBatch fields eagle_sample reads, and no others."""
+    """The ScheduleBatch fields eagle_sample and VerifyStep.adjust read, and no
+    others."""
 
     device: torch.device
     forward_mode: ForwardMode
@@ -40,14 +41,7 @@ class StockVerifyBatch(msgspec.Struct, frozen=True):
 
 def default_local_keys(view: ShardedLogitsView) -> torch.Tensor | None:
     """Build local keys, or decline before any fallback RNG is consumed."""
-    try:
-        from sglang.srt.speculative.sharded_verify import shard_keys
-    except ModuleNotFoundError as exc:
-        if exc.name != "sglang.srt.speculative.sharded_verify":
-            raise
-        # The sharded verifier is a separate runtime optimization. Binding can
-        # land first and must preserve the stock gathered path until it exists.
-        return None
+    from sglang.srt.speculative.sharded_verify import shard_keys
 
     # Temperature sampling is an explicit provider numeric policy.  The stock
     # default never selects the distribution-equivalent Gumbel path, even if a
@@ -69,6 +63,7 @@ def default_post_verify(
 ) -> PostVerifyOutput:
     """Run the existing verifier and preserve its outputs and mutation order."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
     from sglang.srt.speculative import eagle_utils
 
     batch = StockVerifyBatch(
@@ -79,21 +74,26 @@ def default_post_verify(
         req_pool_indices=io.req_pool_indices,
         return_logprob=io.return_logprob,
     )
-    kwargs = dict(
-        uno_target_max_top_k=io.sparse_target_max_top_k,
+    verify = VerifyStep(
+        batch=batch,
+        route=VerifyRoute.derive(
+            batch.sampling_info,
+            has_grammar=io.grammar_mask is not None,
+            has_watermark=io.watermark is not None,
+        ),
         watermark=io.watermark,
+        watermark_full_mask=io.watermark_full_mask,
+        grammar_mask=io.grammar_mask,
+    )
+    token_ids, accepted_lengths, accepted_indices = eagle_utils.eagle_sample(
+        io.verify_tree,
+        verify,
+        io.logits,
+        uno_target_max_top_k=io.sparse_target_max_top_k,
         simulated_acc_len=io.simulated_accept_length,
         simulated_acc_len_rng=io.simulated_accept_length_rng,
         sparse_bonus_argmax=io.sparse_bonus_argmax,
-    )
-    if getattr(eagle_utils, "LOCAL_KEYS_SUPPORTED", False):
-        kwargs["local_keys"] = local_keys
-    token_ids, accepted_lengths, accepted_indices = eagle_utils.eagle_sample(
-        io.verify_tree,
-        batch,
-        io.logits,
-        io.grammar_mask,
-        **kwargs,
+        local_keys=local_keys,
     )
     return PostVerifyOutput(
         token_ids=token_ids,

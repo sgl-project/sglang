@@ -181,7 +181,8 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
             shape_key,
             SimpleNamespace(
                 forward_mode=SimpleNamespace(
-                    is_target_verify=mock.Mock(return_value=False)
+                    is_target_verify=mock.Mock(return_value=False),
+                    is_idle=mock.Mock(return_value=False),
                 ),
                 seq_lens_cpu=torch.tensor([5, 3]),
             ),
