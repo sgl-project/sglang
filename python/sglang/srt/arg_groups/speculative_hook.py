@@ -1473,7 +1473,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
     # topk > 1 + page_size > 1 needs the two-pass cascade draft-decode (shared prefix
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
     # it; flashmla / trtllm_mla can't express the per-branch tree, so reject.
-    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
+    # intel_xpu's expand pass reads branch KV by slot id, so it needs no tail dup.
+    _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton", "intel_xpu")
     view = resolved_view(server_args)
     if (
         cfg.speculative_eagle_topk > 1
@@ -1557,17 +1558,20 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         "using ngram speculative decoding."
     )
 
+    # intel_xpu's tree verify reads each draft token's KV slot by id, so the
+    # page layout of the verify window does not matter to it.
+    _NGRAM_PAGE_TREE_BACKENDS = ("flashinfer", "intel_xpu")
     view = resolved_view(server_args)
     if (
         cfg.speculative_eagle_topk > 1
         and view.page_size > 1
-        and view.attention_backend != "flashinfer"
+        and view.attention_backend not in _NGRAM_PAGE_TREE_BACKENDS
     ):
         raise ValueError(
             f"speculative_eagle_topk({cfg.speculative_eagle_topk}) > 1 "
             f"with page_size({view.page_size}) > 1 is unstable "
             "and produces incorrect results for paged attention backends. "
-            "This combination is only supported for the 'flashinfer' backend."
+            f"This combination is only supported on {_NGRAM_PAGE_TREE_BACKENDS}."
         )
     if attn_dp_enabled_of(view):
         # TODO: support dp attention for ngram speculative decoding
