@@ -71,10 +71,23 @@ def _is_non_persistent_buffer_name(name: str) -> bool:
     return any(pat in name for pat in _NON_PERSISTENT_BUFFER_PATTERNS)
 
 
-def _is_skip_weight_check(name, param, skip_tensor_list=None) -> bool:
+def _non_persistent_buffer_names(model: torch.nn.Module) -> Set[str]:
+    # Not in the state dict, so a weight update never restores them;
+    # e.g. MRotaryEmbedding.axis_map, which kernels use as row indices.
+    names = set()
+    for module_name, module in model.named_modules(remove_duplicate=False):
+        prefix = f"{module_name}." if module_name else ""
+        names.update(prefix + name for name in module._non_persistent_buffers_set)
+    return names
+
+
+def _is_skip_weight_check(
+    name, param, skip_tensor_list=None, non_persistent_names=frozenset()
+) -> bool:
     # one skip set shared by reset / compare / checksum
     return (
-        _is_non_persistent_buffer_name(name)
+        name in non_persistent_names
+        or _is_non_persistent_buffer_name(name)
         or getattr(param, "_skip_weight_check", False)
         or any(pat in name for pat in (skip_tensor_list or ()))
     )
@@ -172,16 +185,22 @@ class WeightChecker:
     def _skip_compare_names(
         self, skip_tensor_list: Optional[List[str]] = None
     ) -> Set[str]:
+        non_persistent_names = _non_persistent_buffer_names(self._get_model())
         return {
             name
             for name, param in self._model_state()
-            if _is_skip_weight_check(name, param, skip_tensor_list)
+            if _is_skip_weight_check(
+                name, param, skip_tensor_list, non_persistent_names
+            )
         }
 
     def _reset_tensors(self, skip_tensor_list: Optional[List[str]] = None):
+        non_persistent_names = _non_persistent_buffer_names(self._get_model())
         for name, param in self._model_state():
             # reset must skip exactly what compare skips
-            if _is_skip_weight_check(name, param, skip_tensor_list):
+            if _is_skip_weight_check(
+                name, param, skip_tensor_list, non_persistent_names
+            ):
                 continue
             param.copy_(_random_like(param))
 
