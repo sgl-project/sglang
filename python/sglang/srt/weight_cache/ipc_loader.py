@@ -15,6 +15,7 @@ import threading
 import time
 from typing import List, Optional
 
+import msgspec
 import torch
 import torch.nn as nn
 
@@ -24,16 +25,14 @@ from sglang.srt.model_loader.loader import (
     _initialize_model,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel
 
+from .config import build_load_spec, path_checkpoint_id
 from .protocol import (
-    CacheConfig,
     check_ipc_quant_support,
-    compute_env_stamp,
-    get_quant_method_name,
     get_socket_path,
-    hash_quant_config,
+    load_spec_mismatches,
     recv_msg,
+    resolve_cache_quantization,
     send_msg,
 )
 from .transport import (
@@ -77,8 +76,8 @@ def _daemon_alive(pid: int) -> bool:
     return not fields or fields[0] not in (b"Z", b"X")
 
 
-# Transport backends of loaded models, kept until the process exits. For
-# vmm_fd, a mapping keeps the daemon's memory alive, but the imported tensors
+# Keep transport backends that may have produced tensors until process exit.
+# For vmm_fd, a mapping keeps the daemon's memory alive, but the imported tensors
 # sit on non-owning storages and a parameter or view can outlive the model
 # object, so a loaded model's mappings must never be unmapped while this process
 # runs. Keeping the backends here keeps the owner of those mappings reachable;
@@ -104,7 +103,7 @@ class WeightCacheModelLoader(BaseModelLoader):
 
     - socket file missing            -> fall back to disk load
     - connection refused             -> raise (daemon crashed after binding)
-    - CacheConfig mismatch           -> raise (do NOT disk-load on a shared GPU
+    - config mismatch                -> raise (do NOT disk-load on a shared GPU
                                         holding a different config's weights;
                                         also surfaces fingerprint drift bugs)
     - any protocol / transfer error  -> raise
@@ -149,7 +148,7 @@ class WeightCacheModelLoader(BaseModelLoader):
         # unsupported model fails explicitly instead of silently disk-loading
         # (client mode) or serving wrong-numerics IPC weights. Checked here so
         # it applies regardless of whether the daemon is reachable.
-        quant_method, engine_quant_config = self._resolve_engine_quant(model_config)
+        quant_method, engine_quant_config = resolve_cache_quantization(model_config)
         check_ipc_quant_support(quant_method, engine_quant_config, where="client")
 
         # Try to fetch state from daemon
@@ -205,9 +204,8 @@ class WeightCacheModelLoader(BaseModelLoader):
                 quant_config,
             )
         except BaseException:
-            # Drop whatever the transport mapped for the failed load. A model
-            # that did load keeps its mappings until the process exits.
-            self._transport_backend.close()
+            if self._transport_backend not in _LOADED_MODEL_TRANSPORTS:
+                self._transport_backend.close()
             raise
         self.preloaded_weights_bytes = preloaded_weights_bytes
 
@@ -292,20 +290,6 @@ class WeightCacheModelLoader(BaseModelLoader):
             f"[WeightCacheModelLoader] Started daemon-liveness watchdog for "
             f"pid={daemon_pid}"
         )
-
-    def _resolve_engine_quant(self, model_config):
-        """Return (quant_method, quant_config) matching the daemon's fingerprint.
-
-        Shared by the IPC allowlist gate and the CacheConfig fingerprint so the
-        two can never drift apart. ModelConfig always exposes
-        hf_config/quantization directly; quantization_config is the only
-        genuinely-optional attribute.
-        """
-        quant_config = getattr(model_config.hf_config, "quantization_config", None)
-        quant_method = get_quant_method_name(model_config.quantization)
-        if not quant_method and quant_config is not None:
-            quant_method = get_quant_method_name(quant_config)
-        return quant_method, quant_config
 
     @staticmethod
     def _rebuild_stale_views(model):
@@ -422,6 +406,11 @@ class WeightCacheModelLoader(BaseModelLoader):
         new_params_count = 0
         map_tic = time.perf_counter()
 
+        # Importing can expose a tensor to the exception traceback or model
+        # hooks even if installation subsequently fails.
+        if entries:
+            _LOADED_MODEL_TRANSPORTS.append(self._transport_backend)
+
         # Iterate over ALL daemon entries (not just model params/buffers).
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
@@ -513,7 +502,6 @@ class WeightCacheModelLoader(BaseModelLoader):
         # can outlive the model object, so the mappings are not released with
         # the model: they stay until the process exits.
         model._weight_cache_transport_backend = self._transport_backend
-        _LOADED_MODEL_TRANSPORTS.append(self._transport_backend)
 
         logger.info(
             f"[WeightCacheModelLoader] Zero-copy: mapped {imported_count} tensors "
@@ -575,70 +563,39 @@ class WeightCacheModelLoader(BaseModelLoader):
             ) from e
 
         try:
-            # Build engine's config fingerprint
-            parallel = get_parallel()
-            tp_size = parallel.tp_size
-            tp_rank = parallel.tp_rank
-
-            pp_size = parallel.pp_size
-            pp_rank = parallel.pp_rank
-
-            ep_size = parallel.moe_ep_size
-            # The configured width, as the daemon states it: the MoE
-            # communicator is wider when it aliases attention CP.
-            moe_dp_size = parallel.moe_dp_size
-            moe_dp_rank = parallel.moe_dp_rank
-            moe_ep_rank = parallel.moe_ep_rank
-
-            quant_method, quant_config = self._resolve_engine_quant(model_config)
-
-            engine_config = CacheConfig(
-                model_path=model_config.model_path,
-                model_arch=(
-                    model_config.hf_config.architectures[0]
-                    if model_config.hf_config.architectures
-                    else ""
-                ),
-                tp_size=tp_size,
-                tp_rank=tp_rank,
-                pp_size=pp_size,
-                pp_rank=pp_rank,
-                dp_size=parallel.dp_size,
-                ep_size=ep_size,
-                moe_dp_size=moe_dp_size,
-                moe_dp_rank=moe_dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_dp_size=parallel.attn_dp_size,
-                enable_dp_lm_head=parallel.enable_dp_lm_head,
-                attn_cp_size=parallel.attn_cp_size,
-                moe_dense_tp_size=parallel.moe_dense_tp_size,
-                moe_a2a_backend=get_exec().moe.moe_a2a_backend,
-                quant_method=quant_method,
-                quant_config_hash=hash_quant_config(quant_config),
-                dtype=str(model_config.dtype),
-                revision=model_config.revision or "",
-                **compute_env_stamp(),
+            spec = build_load_spec(
+                model_config,
+                checkpoint_id=path_checkpoint_id(),
+                device=device_config.device,
+                draft_model_idx=self.load_config.draft_model_idx,
             )
 
             logger.info(
                 f"[WeightCacheModelLoader] Requesting weights from daemon at "
                 f"{self.socket_path} with config: "
-                f"model={engine_config.model_path}, "
-                f"arch={engine_config.model_arch}, "
-                f"tp={engine_config.tp_size}/{engine_config.tp_rank}, "
-                f"quant={engine_config.quant_method}, "
-                f"dtype={engine_config.dtype}"
+                f"model={spec.checkpoint_id}, "
+                f"arch={spec.model_arch}, "
+                f"tp={spec.tp_size}/{spec.tp_rank}, "
+                f"quant={spec.quant_method}, "
+                f"dtype={spec.dtype}"
             )
 
-            send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})
+            engine_config = msgspec.to_builtins(spec)
+            send_msg(sock, {"type": "fetch_state", "config": engine_config})
             result = recv_msg(sock)
 
-            if result.get("status") != "ok":
-                daemon_config = result.get("daemon_config", {})
+            status = result.get("status")
+            if status not in ("ok", "mismatch"):
                 raise RuntimeError(
-                    f"[WeightCacheModelLoader] Daemon config mismatch!\n"
-                    f"  Engine config: {engine_config.to_dict()}\n"
-                    f"  Daemon config: {daemon_config}"
+                    f"[WeightCacheModelLoader] Daemon error: {result.get('message')}"
+                )
+            # An "ok" reply carries the daemon's spec too: check it before mapping.
+            config_key = "daemon_config" if status == "mismatch" else "config"
+            mismatches = load_spec_mismatches(result.get(config_key, {}), engine_config)
+            if status == "mismatch" or mismatches:
+                raise RuntimeError(
+                    f"[WeightCacheModelLoader] Daemon config mismatch, "
+                    f"field: (daemon, engine): {mismatches}"
                 )
 
             backend_name = result.get("transport_backend", TORCH_IPC_BACKEND)

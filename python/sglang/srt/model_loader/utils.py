@@ -6,8 +6,9 @@
 
 import concurrent.futures
 import contextlib
+import contextvars
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Type
 
 import torch
 import transformers
@@ -19,6 +20,27 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.utils import get_device_sm
 
 logger = logging.getLogger(__name__)
+
+_construction_callback: contextvars.ContextVar[
+    Optional[Callable[[nn.Module], None]]
+] = contextvars.ContextVar("on_model_constructed", default=None)
+
+
+@contextlib.contextmanager
+def on_model_constructed(callback: Callable[[nn.Module], None]) -> Iterator[None]:
+    """Observe each model constructed in this scope before any weights load."""
+    token = _construction_callback.set(callback)
+    try:
+        yield
+    finally:
+        _construction_callback.reset(token)
+
+
+def notify_model_constructed(model: nn.Module) -> None:
+    """Notify the active construction callback, if one is registered."""
+    callback = _construction_callback.get()
+    if callback is not None:
+        callback(model)
 
 
 @contextlib.contextmanager
