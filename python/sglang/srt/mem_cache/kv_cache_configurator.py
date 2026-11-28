@@ -992,7 +992,8 @@ class KVCacheConfigurator:
                 "--prefill-only-disable-kv-cache expected NoOpMHATokenToKVPool but the "
                 f"runtime pool is {type(token_to_kv_pool).__name__}. This pool "
                 "family is not yet supported by --prefill-only-disable-kv-cache. "
-                "Supported configurations today: plain MHA models on CUDA with the FA "
+                "Supported configurations today: plain MHA models on CUDA (or on an "
+                "out-of-tree platform declaring prefill_only_noop_kv_pool) with the FA "
                 "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
                 "and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
@@ -1580,7 +1581,11 @@ class KVCacheConfigurator:
         unsupported_pool_family = None
         if is_compressed_kv_model:
             unsupported_pool_family = "DeepSeekV4TokenToKVPool"
-        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+        elif (
+            current_platform.is_out_of_tree()
+            and not self.mambaish_config
+            and not current_platform.capabilities.prefill_only_noop_kv_pool
+        ):
             unsupported_pool_family = "out-of-tree platform KV pool"
         elif (
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
@@ -1603,9 +1608,11 @@ class KVCacheConfigurator:
             raise RuntimeError(
                 "--prefill-only-disable-kv-cache is not supported for "
                 f"{unsupported_pool_family}. Supported configurations today: plain MHA "
-                "models on CUDA with the FA (fa3/fa4) prefill backend, --is-embedding, "
-                "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
-                "attention, no HiSparse, and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
+                "models on CUDA (or on an out-of-tree platform declaring "
+                "prefill_only_noop_kv_pool) with the FA (fa3/fa4) prefill backend, "
+                "--is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, no "
+                "context-parallel attention, no HiSparse, and --kv-cache-dtype not in "
+                "{nvfp4, fp4_mx_block16}."
             )
 
     def _req_pool_rows(self, max_running_requests: int) -> int:

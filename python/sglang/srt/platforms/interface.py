@@ -69,6 +69,10 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     ``supports_pynccl``: model-parallel groups create a PyNccl communicator
     when the caller does not choose. Read for out-of-tree platforms; in-tree
     devices decide in ``parallel_state``.
+    ``prefill_only_noop_kv_pool``: the platform builds its plain MHA KV pool
+    through core's ``_build_mha_kv_pool``, so ``--prefill-only-disable-kv-cache``
+    can swap in ``NoOpMHATokenToKVPool``. Read for out-of-tree platforms;
+    in-tree devices qualify by construction.
     """
 
     supports_triton: bool = False
@@ -76,6 +80,7 @@ class PlatformCapabilities(msgspec.Struct, frozen=True, kw_only=True):
     piecewise_graph: bool = False
     hicache_device_kernels: bool = False
     supports_pynccl: bool = False
+    prefill_only_noop_kv_pool: bool = False
 
 
 class SRTPlatform(DeviceMixin):
