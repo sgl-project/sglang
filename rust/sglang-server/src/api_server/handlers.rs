@@ -12,6 +12,7 @@ mod health;
 mod hicache;
 mod info;
 mod parsers;
+mod retirement;
 #[cfg(test)]
 mod test_utils;
 mod tokenize;

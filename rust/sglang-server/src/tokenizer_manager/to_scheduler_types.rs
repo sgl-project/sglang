@@ -18,6 +18,8 @@ pub struct MmDispatch {
 /// Resolved once at boot from the scheduler's `server_args`.
 #[derive(Clone, Debug)]
 pub struct Limits {
+    /// Disaggregated retirement requires scheduler evidence.
+    pub is_disaggregation: bool,
     /// Token-ids-in mode: a generate request must arrive already tokenized.
     pub skip_tokenizer_init: bool,
     /// `model_config.vocab_size`; bounds client-supplied token ids. A required
@@ -39,6 +41,7 @@ pub struct Limits {
 impl From<&ServerArgs> for Limits {
     fn from(sa: &ServerArgs) -> Self {
         Self {
+            is_disaggregation: sa.is_disaggregation(),
             skip_tokenizer_init: sa.skip_tokenizer_init,
             vocab_size: sa.model_config.vocab_size,
             max_req_len: sa.max_req_len,

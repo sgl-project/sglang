@@ -498,9 +498,12 @@ class Req(ReqDllmMixin):
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
         filler_seed: Optional[int] = None,
+        request_instance_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
+        self.request_instance_id = request_instance_id
+        self.decode_retirement_drained = False
         self.cache_request_handle = CacheRequestHandle(rid=rid, attempt_id=0)
         self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
@@ -613,6 +616,8 @@ class Req(ReqDllmMixin):
         self.ignored_stop_token_len: Optional[int] = None
         # Whether this request has finished output
         self.finished_output = None
+        # Retraction aborts leave finished_reason unset for already launched steps.
+        self.retraction_aborted = False
         # Set by exit_ledger (CI only).
         self.exit_via: Optional[str] = None
         self.send_via: Optional[str] = None

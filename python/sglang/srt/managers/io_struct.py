@@ -1329,6 +1329,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Internal: the scheduler overwrites it on receipt; see Req.filler_seed.
     filler_seed: Optional[int] = None
 
+    # Internal identity for an opt-in cancellation retirement receipt. Append-only
+    # so existing positional IPC senders continue to decode with None here.
+    request_instance_id: Optional[str] = None
+
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
         self.positional_embed_overrides = wrap_object_fields_as_pickle(
@@ -2563,6 +2567,11 @@ class AbortReq(BaseReq, kw_only=True):
     weight_versions: Optional[WeightVersionSpans] = None
     prefill_weight_versions: Optional[WeightVersionSpans] = None
 
+    # HTTP-only opt-in; legacy cancellation still returns without a receipt.
+    wait_for_retirement: bool = False
+    cancellation_id: Optional[str] = None
+    timeout_seconds: float = 1.0
+
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
@@ -2571,6 +2580,21 @@ class AbortReq(BaseReq, kw_only=True):
     def matches(self, rid: str) -> bool:
         """Whether this abort targets the request `rid`."""
         return self.abort_all or rid.startswith(self.rid)
+
+
+class CancellationRetirementReq(BaseReq, kw_only=True):
+    cancellation_id: str
+    request_instance_id: str
+    # Append-only IPC field: native callers route replies on a separate rid.
+    # HTTP callers leave this unset and use rid as the generation target.
+    target_rid: Optional[str] = None
+
+
+class CancellationRetirementOutput(BaseReq, kw_only=True):
+    cancellation_id: str
+    request_instance_id: str
+    status: Literal["retired", "unknown", "unsupported"]
+    reason: str = ""
 
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):

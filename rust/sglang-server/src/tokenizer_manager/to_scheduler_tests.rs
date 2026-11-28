@@ -210,6 +210,7 @@ const NO_CONTEXT_CEILING: u64 = 1 << 40;
 /// request instead of behaving like "unset".
 fn test_limits() -> Limits {
     Limits {
+        is_disaggregation: false,
         skip_tokenizer_init: false,
         vocab_size: 1000,
         max_req_len: NO_CONTEXT_CEILING,
@@ -1836,6 +1837,103 @@ fn mm_text_prompt_under_skip_tokenizer_init_is_a_400() {
     intake.drive(req);
     assert!(rx.try_recv().is_err(), "no error frame");
     assert!(mm_rx.try_recv().is_ok(), "submitted to the mm pool");
+}
+
+fn retirement_control(target: &Rid) -> (Request, mpsc::Receiver<ResponseItem>) {
+    let (tx, rx) = mpsc::channel(8);
+    let control = Request {
+        rid: Rid::from("corr"),
+        state: RequestState::Queued,
+        sink: ResponseSink::Local(tx),
+        kind: RequestKind::Control(Box::new(ControlRequest::CancellationRetirementReq(
+            crate::message::io_struct::CancellationRetirementReq::new(
+                "corr".into(),
+                "rust-op".into(),
+                target.as_str().into(),
+                Some(target.as_str().into()),
+            ),
+        ))),
+    };
+    (control, rx)
+}
+
+/// A generation still in Intake preprocessing is fenced locally: the delayed
+/// return cannot reach the scheduler, and the retirement control gets a
+/// positive local receipt without a ring push.
+#[test]
+fn retirement_control_fences_delayed_intake_request_locally() {
+    let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let target = Rid::from("internal-target");
+    intake.request_states.insert(
+        target.clone(),
+        RequestState::Tokenizing {
+            then: AfterTokenize::PreSend,
+        },
+    );
+    let (control, mut rx) = retirement_control(&target);
+    intake.push_control_to_channel(control);
+
+    let Ok(ResponseItem::Control(payload)) = rx.try_recv() else {
+        panic!("expected local retirement control reply");
+    };
+    let decoded =
+        crate::message::io_struct::CancellationRetirementOutput::decode(&payload).unwrap();
+    assert_eq!(
+        decoded.status,
+        crate::message::io_struct::CancellationRetirementStatus::Retired
+    );
+    assert_eq!(decoded.cancellation_id, "rust-op");
+    assert_eq!(decoded.rid, "corr");
+    assert!(consumer.drain(8).is_empty(), "must not reach the scheduler");
+    assert!(matches!(
+        intake.request_states.get(&target),
+        Some(RequestState::Aborted)
+    ));
+
+    // Delayed return of the fenced generation is dropped, not forwarded.
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut delayed = generate_req(7, SamplingParams::default());
+    delayed.rid = target.clone();
+    delayed.state = RequestState::PreSendValidating;
+    delayed.sink = ResponseSink::Local(tx);
+    if let RequestKind::Generate(g) = &mut delayed.kind {
+        g.rid = target.clone();
+    }
+    intake.drive(delayed);
+    assert!(rx.try_recv().is_err(), "dropped fenced generation");
+    assert!(
+        consumer.drain(8).is_empty(),
+        "still never reaches scheduler"
+    );
+
+    // Local cleanup after positive proof: detok deregister only, never AbortReq.
+    intake.on_abort(AbortSource::Local(target.clone()));
+    assert!(consumer.drain(8).is_empty(), "Local must not emit AbortReq");
+    let _ = detok_rx;
+}
+
+#[test]
+fn retirement_control_requires_scheduler_proof_on_decode() {
+    let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
+        is_disaggregation: true,
+        ..test_limits()
+    });
+    let target = Rid::from("internal-decode-target");
+    intake.request_states.insert(
+        target.clone(),
+        RequestState::Tokenizing {
+            then: AfterTokenize::PreSend,
+        },
+    );
+    let (control, mut rx) = retirement_control(&target);
+    intake.push_control_to_channel(control);
+
+    assert!(rx.try_recv().is_err(), "no local receipt on Decode");
+    assert_eq!(consumer.drain(8).len(), 1, "control goes to the scheduler");
+    assert!(matches!(
+        intake.request_states.get(&target),
+        Some(RequestState::Tokenizing { .. })
+    ));
 }
 
 /// The detok shard learns about stop strings at `Register`, which runs before

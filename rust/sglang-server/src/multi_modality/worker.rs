@@ -1643,6 +1643,7 @@ mod tests {
         for (allow_auto_truncate, max_req_input_len) in [(true, 8), (true, 12)] {
             let processor = Arc::new(Observing(Mutex::new(Vec::new())));
             let ctx = MmContext::with_processor(processor.clone(), false).with_limits(Limits {
+                is_disaggregation: false,
                 skip_tokenizer_init: false,
                 vocab_size: 1000,
                 max_req_len: 18,
