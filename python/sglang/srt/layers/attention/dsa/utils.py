@@ -11,7 +11,10 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_static_budget_bytes,
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode, dp_slot_in
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -313,28 +316,26 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
 
 
 def _dsa_split_row_bound(forward_batch: "ForwardBatch") -> Optional[int]:
-    """Row-space broadcast bound: the highest first-row of the batch's
-    request chunks (pool ROWS, not prefix tokens).
+    """Exclusive physical-row bound covering every actual cached prefix row.
+
+    Even without radix, the paged allocator can merge/sort its free list and
+    allocate a later chunk below earlier prefix rows. New-row starts do not
+    prove an upper bound for the prefix.
     """
-    bound = getattr(forward_batch, "_dsa_split_row_bound", None)
-    if bound is not None:
-        return bound
-    loc = getattr(forward_batch, "out_cache_loc", None)
-    lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    if loc is None or not lens:
+    cached = getattr(forward_batch, "_dsa_split_row_bound", None)
+    if cached is not None:
+        return cached
+    lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    if not lens or not any(n > 0 for n in lens):
         return None
-    starts = []
-    acc = 0
-    for n in lens:
-        starts.append(acc)
-        acc += int(n)
-    if acc <= 0 or acc > loc.shape[0]:
-        return None
-    bound = int(loc[starts].max())
-    try:
-        forward_batch._dsa_split_row_bound = bound
-    except Exception:
-        pass
+    mapping = get_req_to_token_pool().req_to_token
+    maxima = [
+        mapping[forward_batch.req_pool_indices[i], : int(n)].amax()
+        for i, n in enumerate(lens)
+        if n > 0
+    ]
+    bound = int(torch.stack(maxima).amax()) + 1
+    forward_batch._dsa_split_row_bound = bound
     return bound
 
 
@@ -362,11 +363,9 @@ def maybe_prefetch_next_full_attention_kv(
         prefix_lens = forward_batch.extend_prefix_lens_cpu
         if prefix_lens is not None and all(n == 0 for n in prefix_lens):
             return
-        # Radix-cache prefixes are inherited from other requests and can live
-        # at arbitrary pool rows, so the row-space slice — which assumes a
-        # contiguous prefix below the new rows — is only valid without radix.
-        # Under radix, fall back to the full-capacity broadcast so every
-        # inherited prefix row is covered.
+        # Keep radix-cache prefixes on the conservative full-pool path.
+        # Without radix, derive the bound from actual prefix rows: recycled
+        # pages may still put the new chunk below its cached prefix.
         used_bound = (
             None
             if not get_memory().disable_radix_cache
@@ -384,6 +383,41 @@ def maybe_prefetch_next_full_attention_kv(
         prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
         if prefetch_kv_buffer is not None:
             prefetch_kv_buffer(next_full_attention_layer_id)
+
+
+def maybe_prefetch_next_kimi_full_attention_kv(
+    forward_batch: "ForwardBatch",
+    next_full_attention_layer_id: Optional[int],
+) -> None:
+    """Prefetch Kimi's next Full Attention layer through its hybrid NPU pool."""
+    if (
+        next_full_attention_layer_id is None
+        or not is_npu()
+        or not dsa_use_prefill_cp(forward_batch)
+    ):
+        return
+
+    pool = get_token_to_kv_pool()
+    full_pool = getattr(pool, "full_kv_pool", None)
+    if not getattr(full_pool, "layer_shard_enabled", False):
+        return
+    prefix_lens = forward_batch.extend_prefix_lens_cpu
+    if prefix_lens is not None and all(n == 0 for n in prefix_lens):
+        return
+
+    used_bound = (
+        None
+        if not get_memory().disable_radix_cache
+        else _dsa_split_row_bound(forward_batch)
+    )
+    # Transfer completion uses model layer ids; the child addresses only the
+    # densely numbered Full Attention layers. Wait before either broadcast.
+    pool._wait_for_layer(next_full_attention_layer_id)
+    layer_id = pool._transfer_full_attention_id(next_full_attention_layer_id)
+    full_pool.prefetch_kv_buffer(layer_id, used_bound=used_bound)
+    prefetch_index = getattr(full_pool, "prefetch_index_k_buffer", None)
+    if prefetch_index is not None:
+        prefetch_index(layer_id, used_bound=used_bound)
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
