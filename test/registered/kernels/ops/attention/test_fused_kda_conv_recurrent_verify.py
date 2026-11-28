@@ -4,15 +4,20 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang.kernels.ops.attention.linear.kda_verify_gfx950_flydsl as flydsl_verify
 from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
     fused_kda_conv_gating_verify,
 )
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from sglang.kernels.ops.attention.linear.kda_verify_gfx950_flydsl import (
+    kda_verify_gfx950_supported,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
+from sglang.srt.layers.attention.linear.kda_backend import KDAAttnBackend
 from sglang.srt.layers.attention.linear.kda_backend_hip import kda_chain_verify_gfx950
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -57,10 +62,9 @@ _RING_CASES += [
 _RING_LEN = 16
 
 
-def _make_ring_buffers(H, HV, K, V):
+def _make_ring_buffers(H, HV, K, V, slots=8):
     # Garbage-filled so a full-tensor bitwise compare proves both that written
     # positions match and that neither kernel scribbles outside them.
-    slots = 8
     return {
         "rawv": torch.randn(
             slots, HV, _RING_LEN, V, device=_DEVICE, dtype=torch.bfloat16
@@ -235,7 +239,7 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
     B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
     inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, weight_dtype)
     if use_ring:
-        template = _make_ring_buffers(H, HV, K, V)
+        template = _make_ring_buffers(H, HV, K, V, slots=max(8, B + 2))
         rings_ref = {name: buf.clone() for name, buf in template.items()}
         rings_fus = {name: buf.clone() for name, buf in template.items()}
     else:
@@ -321,6 +325,188 @@ def test_output_does_not_depend_on_cta_scheduling():
 @pytest.mark.parametrize("case", _RING_CASES)
 def test_replayssm_ring_matches_unfused(case):
     _compare_case(case, num_warps=4, use_ring=True)
+
+
+def _is_gfx950():
+    return bool(torch.version.hip) and torch.cuda.get_device_properties(
+        0
+    ).gcnArchName.startswith("gfx950")
+
+
+# Shapes the gfx950 FlyDSL kernel (kda_verify_gfx950_flydsl) takes: fp32 conv
+# weights, safe gate, no conv bias, T in (6, 8). B 1-4 use the 32-wide V tile, larger
+# batches the 64-wide one.
+_GFX950_RING_CASES = [
+    (1, 6, 16, 16, 128, 128, 4, False, -5.0, False, 30),
+    (6, 6, 16, 16, 128, 128, 4, False, -5.0, True, 31),
+    (16, 6, 16, 16, 128, 128, 4, False, -5.0, True, 32),
+    (3, 8, 16, 16, 128, 128, 4, False, -5.0, False, 33),
+    (9, 8, 16, 16, 128, 128, 4, False, -5.0, True, 34),
+    (5, 6, 4, 8, 128, 128, 4, False, -5.0, True, 35),
+]
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+@pytest.mark.parametrize("case", _GFX950_RING_CASES)
+def test_gfx950_ring_matches_unfused(case):
+    B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
+    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, torch.float32)
+    assert kda_verify_gfx950_supported(
+        mixed_qkv=inp["mixed"],
+        conv_weight=inp["w"],
+        conv_bias=None,
+        conv_state=inp["conv_pool"].transpose(-1, -2),
+        intermediate_conv_window=inp["win_pool"].transpose(-1, -2),
+        a=inp["a"],
+        b=inp["b"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        ssm_states=inp["ssm"],
+        T=T,
+        num_q_heads=H,
+        num_v_heads=HV,
+        head_k_dim=K,
+        head_v_dim=V,
+        lower_bound=lower_bound,
+        use_qk_l2norm_in_kernel=True,
+    )
+    _compare_case(case, use_ring=True, weight_dtype=torch.float32)
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+@pytest.mark.parametrize("case", _GFX950_RING_CASES)
+def test_gfx950_ring_bf16_state_matches_fp32(case):
+    # A bf16 pool is widened on load, so it must match the fp32 pool holding the
+    # same values bit for bit.
+    B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
+    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, torch.float32)
+    inp_bf16 = dict(inp, ssm=inp["ssm"].to(torch.bfloat16))
+    inp["ssm"] = inp_bf16["ssm"].float()
+    assert kda_verify_gfx950_supported(
+        mixed_qkv=inp["mixed"],
+        conv_weight=inp["w"],
+        conv_bias=None,
+        conv_state=inp["conv_pool"].transpose(-1, -2),
+        intermediate_conv_window=inp["win_pool"].transpose(-1, -2),
+        a=inp["a"],
+        b=inp["b"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        ssm_states=inp_bf16["ssm"],
+        T=T,
+        num_q_heads=H,
+        num_v_heads=HV,
+        head_k_dim=K,
+        head_v_dim=V,
+        lower_bound=lower_bound,
+        use_qk_l2norm_in_kernel=True,
+    )
+    template = _make_ring_buffers(H, HV, K, V, slots=max(8, B + 2))
+    rings32 = {name: buf.clone() for name, buf in template.items()}
+    rings16 = {name: buf.clone() for name, buf in template.items()}
+    o32, _, win32, _ = _run_fused(
+        inp, B, T, H, HV, K, V, lower_bound, None, rings=rings32
+    )
+    o16, _, win16, _ = _run_fused(
+        inp_bf16, B, T, H, HV, K, V, lower_bound, None, rings=rings16
+    )
+    valid = [i for i, slot in enumerate(inp["idx_vals"]) if slot >= 0]
+    assert torch.equal(o16.reshape(B, T, HV, V)[valid], o32.reshape(B, T, HV, V)[valid])
+    assert torch.equal(win16, win32)
+    for name in template:
+        assert torch.equal(rings16[name], rings32[name]), name
+
+
+def _verify_layer(inp, H, HV, K, V, lower_bound, bias=None):
+    return SimpleNamespace(
+        conv_weights=inp["w"],
+        bias=bias,
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        num_q_heads=H,
+        num_k_heads=H,
+        num_v_heads=HV,
+        head_q_dim=K,
+        head_k_dim=K,
+        head_v_dim=V,
+        lower_bound=lower_bound,
+    )
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+def test_gfx950_flydsl_gate_matches_kernel_support():
+    # kda_backend lifts the gfx950 batch cap, allows a bf16 state and skips the HIP
+    # kernel only when the FlyDSL kernel takes the call.
+    B, T, H, HV, K, V = 16, 6, 16, 16, 128, 128
+    inp = _make_inputs(B, T, H, HV, K, V, 4, True, False, 40, torch.float32)
+
+    def gate(lower_bound=-5.0, bias=None, inter_ssm=None, replayssm_on=True):
+        return KDAAttnBackend._flydsl_ring_verify_ok(
+            layer=_verify_layer(inp, H, HV, K, V, lower_bound, bias),
+            mixed_qkv=inp["mixed"],
+            a=inp["a"],
+            b=inp["b"],
+            draft_token_num=T,
+            conv_states=inp["conv_pool"],
+            ssm_states=inp["ssm"],
+            intermediate_state_cache=inter_ssm,
+            intermediate_conv_window_cache=inp["win_pool"],
+            replayssm_on=replayssm_on,
+        )
+
+    assert gate()
+    assert not gate(lower_bound=None)
+    assert not gate(bias=inp["bias"])
+    assert not gate(inter_ssm=inp["inter_ssm"])
+    assert not gate(replayssm_on=False)
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+@pytest.mark.parametrize("lower_bound, expected", [(-5.0, True), (None, False)])
+def test_gfx950_large_batch_ring_verify_needs_flydsl(lower_bound, expected):
+    # Past 16 requests the Triton fused kernel is slower than the unfused pair, so the
+    # fused path is taken only when the FlyDSL kernel supports the call.
+    B, T, H, HV, K, V = 64, 6, 16, 16, 128, 128
+    inp = _make_inputs(B, T, H, HV, K, V, 4, False, False, 41, torch.float32)
+    rings = _make_ring_buffers(H, HV, K, V, slots=B + 2)
+    backend = KDAAttnBackend.__new__(KDAAttnBackend)
+    backend._fused_chain_verify_fn = fused_kda_conv_gating_verify
+    ok = backend._can_run_fused_chain_verify(
+        layer=_verify_layer(inp, H, HV, K, V, lower_bound),
+        mixed_qkv=inp["mixed"],
+        a=inp["a"],
+        b=inp["b"],
+        draft_token_num=T,
+        conv_states=inp["conv_pool"],
+        ssm_states=inp["ssm"],
+        intermediate_state_cache=None,
+        intermediate_conv_window_cache=inp["win_pool"],
+        cache_indices=inp["cache_indices"],
+        intermediate_state_indices=inp["inter_indices"],
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
+        retrieve_parent_token=None,
+        replayssm_rawv=rings["rawv"],
+        replayssm_rawk=rings["rawk"],
+        replayssm_g=rings["g"],
+        replayssm_beta=rings["beta"],
+    )
+    assert ok is expected
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+def test_gfx950_flydsl_build_failure_falls_back_to_triton(monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("simulated FlyDSL build failure")
+
+    monkeypatch.setattr(flydsl_verify, "create_kda_verify_kernel", broken)
+    monkeypatch.setattr(flydsl_verify, "_disabled", False)
+    _compare_case(
+        (6, 6, 16, 16, 128, 128, 4, False, -5.0, True, 42),
+        use_ring=True,
+        weight_dtype=torch.float32,
+    )
+    assert not flydsl_verify.kda_verify_gfx950_available()
 
 
 def _gfx950_case(slots, seed, H=12, T=8):
