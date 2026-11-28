@@ -19,7 +19,6 @@ import torch
 
 # The quantization package must load before the MoE runner (circular import otherwise).
 import sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe as mxfp4
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
@@ -68,7 +67,6 @@ class TestMxfp4AutotuneKey(CustomTestCase):
             return (out,)
 
         with (
-            envs.SGLANG_OPT_MXFP4_DEFERRED_FINALIZED_SHAPE.override(True),
             get_parallel().override(tp_group=None),
             patch.object(
                 mxfp4, "trtllm_fp4_block_scale_routed_moe", moe_call, create=True
