@@ -14,6 +14,10 @@
       "destination": "/cookbook/autoregressive/Baidu/:slug*"
     },
     {
+      "source": "/cookbook/diffusion/LingBot-Video/LingBot-Video",
+      "destination": "/cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
+    },
+    {
       "source": "/cookbook/autoregressive/Reflection/Beam-1.0",
       "destination": "/cookbook/autoregressive/Reflection/Beam-1_0"
     },
@@ -1592,7 +1596,6 @@
                   },
                   {
                     "group": "Black Forest Labs",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/FLUX/FLUX.3",
                       "cookbook/diffusion/FLUX/FLUX"
@@ -1638,7 +1641,6 @@
                   },
                   {
                     "group": "Kandinsky",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Kandinsky/Kandinsky6",
                       "cookbook/diffusion/Kandinsky/Kandinsky6-SR"
@@ -1672,6 +1674,7 @@
                   },
                   {
                     "group": "MiniMax",
+                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/MiniMax/MiniMax-H3",
                       "cookbook/diffusion/MiniMax/MiniMax-H3-Image"
@@ -1731,7 +1734,6 @@
                   },
                   {
                     "group": "Wan",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
                       "cookbook/diffusion/Wan/Wan2.2",
@@ -1741,19 +1743,17 @@
                 ]
               },
               {
-                "group": "VLA (Vision-Language-Action) Models",
+                "group": "Action Models",
                 "pages": [
                   "cookbook/vla/intro",
                   {
                     "group": "Black Forest Labs",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/vla/FLUX/FLUX-3-Action"
                     ]
                   },
                   {
                     "group": "OpenPI",
-                    "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
                     ]
@@ -1765,6 +1765,12 @@
                       "cookbook/vla/Runway/Praxis-1"
                     ]
                   }
+                ]
+              },
+              {
+                "group": "Use Cases",
+                "pages": [
+                  "cookbook/use-cases/robotics-physical-ai"
                 ]
               },
               {
@@ -1795,7 +1801,14 @@
               "docs/sglang-diffusion/index",
               "docs/sglang-diffusion/installation",
               "docs/sglang-diffusion/compatibility_matrix",
-              "docs/sglang-diffusion/disaggregation",
+              {
+                "group": "Disaggregated serving",
+                "pages": [
+                  "docs/sglang-diffusion/disaggregation",
+                  "docs/sglang-diffusion/disaggregation/stage-deployments",
+                  "docs/sglang-diffusion/disaggregation/stage-contracts"
+                ]
+              },
               {
                 "group": "Usage",
                 "pages": [

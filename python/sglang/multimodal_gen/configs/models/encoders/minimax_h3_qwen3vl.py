@@ -35,6 +35,8 @@ class MiniMaxH3Qwen3VLConfig(Qwen3VLConfig):
     arch_config: MiniMaxH3Qwen3VLArchConfig = field(
         default_factory=MiniMaxH3Qwen3VLArchConfig
     )
+    # video releases use the native single-rank vision math at every encoder TP width
+    vision_replicated: bool = True
 
     def post_diffusers_config_update(self) -> None:
         """Select the in-tree extractor after loading the HF architecture."""
