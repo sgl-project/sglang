@@ -96,13 +96,13 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
                 "KV and page size 64."
             )
         if (
-            cfg.disaggregation_transfer_backend != "mooncake"
+            cfg.disaggregation_transfer_backend not in ("mooncake", "nixl")
             or cfg.enable_dsa_cache_layer_split
             or get_dsa_index_kpool(hf_config) != 1
             or get_dsa_index_kpool_compress(hf_config)
         ):
             raise ValueError(
-                "DSA KV sharding requires Mooncake, uncompressed index_kpool=1 "
+                "DSA KV sharding requires Mooncake or NIXL, uncompressed index_kpool=1 "
                 "and no DSA cache layer splitting."
             )
         return
@@ -171,19 +171,6 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "UnifiedRadixCache with a rotation-aware UnifiedTreeCore and does "
             "not support "
             f"--radix-cache-backend={cfg.radix_cache_backend!r}."
-        )
-    # KV sharding defaults to Python even when the general tree default is Rust.
-    # Preserve an explicit backend choice for validation below.
-    if not envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set():
-        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.set("python")
-    tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
-    # A disabled radix cache never matches or inserts, so its tree core never
-    # sees a rotation base; chunked continuations keep the base on the request.
-    if not cfg.disable_radix_cache and tree_core_backend != "python":
-        raise ValueError(
-            "--enable-kv-cache-sharding requires the Python UnifiedTreeCore: "
-            f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={tree_core_backend!r} is "
-            "not supported for sharded KV."
         )
     if cfg.enable_unified_cache_external_linker:
         raise ValueError(

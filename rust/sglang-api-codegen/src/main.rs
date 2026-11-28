@@ -4,8 +4,6 @@
 //! - `sglang.api.v1`: prost structs, tonic services, schema-driven serde in
 //!   `rust/sglang-api-types/src/generated/`, plus
 //!   `python/sglang/api/v1/api_types.py`.
-//! - `sglang.runtime.v1` (deprecated): prost structs and tonic services only, in
-//!   `rust/sglang-runtime-v1-types/src/generated/`.
 //!
 //! Pass 1 (prost-build + tonic-prost-build) emits the prost structs and tonic
 //! service code, plus a `FileDescriptorSet`. For targets with a JSON contract
@@ -45,30 +43,20 @@ struct Target {
     /// prost `boxed` paths (message fields stored as `Box<T>`).
     boxed: &'static [&'static str],
     /// Emit every service method with an UNIMPLEMENTED default body, so a
-    /// server may implement a subset (the runtime.v1 follower metadata
-    /// service). Off for a contract every server implements in full.
+    /// server may implement a subset. Off for a contract every server
+    /// implements in full.
     default_stubs: bool,
 }
 
-const TARGETS: &[Target] = &[
-    Target {
-        root: "sglang/api/v1/service.proto",
-        package: "sglang.api.v1",
-        rust_out: "rust/sglang-api-types/src/generated",
-        python_out: Some("python/sglang/api/v1/api_types.py"),
-        // Boxed abort payload won't set the size of every ChunkEvent.
-        boxed: &[".sglang.api.v1.FinishReason.kind.abort"],
-        default_stubs: false,
-    },
-    Target {
-        root: "sglang/runtime/v1/sglang.proto",
-        package: "sglang.runtime.v1",
-        rust_out: "rust/sglang-runtime-v1-types/src/generated",
-        python_out: None,
-        boxed: &[],
-        default_stubs: true,
-    },
-];
+const TARGETS: &[Target] = &[Target {
+    root: "sglang/api/v1/service.proto",
+    package: "sglang.api.v1",
+    rust_out: "rust/sglang-api-types/src/generated",
+    python_out: Some("python/sglang/api/v1/api_types.py"),
+    // Boxed abort payload won't set the size of every ChunkEvent.
+    boxed: &[".sglang.api.v1.FinishReason.kind.abort"],
+    default_stubs: false,
+}];
 
 fn main() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");

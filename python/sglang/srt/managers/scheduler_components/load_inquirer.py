@@ -15,6 +15,7 @@ from sglang.srt.managers.load_snapshot import (
     SpeculativeMetrics,
 )
 from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.mem_cache.common import prefill_load_tokens
 from sglang.srt.runtime_context import get_lora, get_parallel
 
 if TYPE_CHECKING:
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+    from sglang.srt.observability.metrics_collector import StorageMetricsCollector
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -55,6 +57,9 @@ class SchedulerLoadInquirer:
     get_waiting_storage_span: (
         Callable[[CacheRequestHandle], tuple[int, int] | None] | None
     ) = None
+    get_storage_metrics_collector: (
+        Callable[[], StorageMetricsCollector | None] | None
+    ) = None
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -85,15 +90,12 @@ class SchedulerLoadInquirer:
         num_tokens = 0
         for req in self.get_waiting_queue():
             if waiting_queue_prefix_matched:
-                matched = req.num_matched_prefix_tokens
-                uncached = max(0, req.seqlen - matched)
+                span = None
                 if self.get_waiting_storage_span is not None:
                     span = self.get_waiting_storage_span(req.cache_request_handle)
-                    if span is not None:
-                        storage_tokens = max(
-                            0, min(span[1], req.seqlen) - max(span[0], matched)
-                        )
-                        uncached -= storage_tokens
+                uncached = prefill_load_tokens(
+                    req.seqlen, req.num_matched_prefix_tokens, span
+                )
             else:
                 # The historical hit rate already includes admitted storage hits.
                 uncached = int(req.seqlen * cache_miss_rate)
@@ -236,6 +238,21 @@ class SchedulerLoadInquirer:
         totals = self.get_decode_moment_totals()
         decode_moments = list(totals) if totals[0] > 0 else None
 
+        storage_hit_tokens = storage_unfulfilled_tokens = None
+        backuped_tokens = backup_dropped_tokens = None
+        storage = (
+            self.get_storage_metrics_collector()
+            if self.get_storage_metrics_collector is not None
+            else None
+        )
+        if storage is not None:
+            storage_hit_tokens = storage.total_storage_prefetch_hit_tokens
+            storage_unfulfilled_tokens = dict(
+                storage.total_storage_prefetch_unfulfilled_tokens
+            )
+            backuped_tokens = storage.total_backuped_tokens
+            backup_dropped_tokens = storage.total_backup_dropped_tokens
+
         return LoadSnapshot(
             dp_rank=int(get_parallel().dp_rank)
             if get_parallel().dp_rank is not None
@@ -261,5 +278,9 @@ class SchedulerLoadInquirer:
             queues=queues,
             total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
             total_prefill_busy_us=self.get_total_prefill_busy_us(),
+            total_storage_prefetch_hit_tokens=storage_hit_tokens,
+            total_storage_prefetch_unfulfilled_tokens=storage_unfulfilled_tokens,
+            total_backuped_tokens=backuped_tokens,
+            total_backup_dropped_tokens=backup_dropped_tokens,
             decode_moments=decode_moments,
         )

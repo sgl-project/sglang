@@ -10,9 +10,9 @@ import torch
 
 # Load Transformers before mocking torch_npu so package discovery sees a real spec.
 import sglang.srt.hf_transformers  # noqa: F401
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_npu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_npu_ci(est_time=3, suite="extra-a-test-npu")
 
 for name in (
     "torch_npu",
