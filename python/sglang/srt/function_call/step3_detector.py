@@ -178,7 +178,7 @@ class Step3Detector(BaseFormatDetector):
         self._buffer += new_text
 
         # Build tool indices for validation
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
 
         # If we've finished the tool block, everything is normal text

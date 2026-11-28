@@ -91,7 +91,7 @@ class Apertus2509Detector(BaseFormatDetector):
         out_normal = ""
         out_calls: List[ToolCallItem] = []
 
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
 
         while True:
@@ -221,7 +221,7 @@ class Apertus2509Detector(BaseFormatDetector):
         self, arr: Any, tools: List[Tool], tool_index_offset: int = 0
     ) -> List[ToolCallItem]:
 
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
 
         calls: List[ToolCallItem] = []

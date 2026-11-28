@@ -363,7 +363,7 @@ class HunyuanDetector(BaseFormatDetector):
     def _parse_streaming_increment_impl(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
 
         # Not yet inside <tool_calls>: emit normal text or buffer partial bot_token.

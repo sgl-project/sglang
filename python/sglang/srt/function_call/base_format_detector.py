@@ -39,6 +39,7 @@ class BaseFormatDetector(ABC):
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
         self._buffer = ""
+        self._tool_indices: Optional[Dict[str, int]] = None
         # Stores complete tool call info (name and arguments) for each tool being parsed.
         # Used by serving layer for completion handling when streaming ends.
         # Format: [{"name": str, "arguments": dict}, ...]
@@ -168,7 +169,7 @@ class BaseFormatDetector(ABC):
                 return StreamingParseResult()
 
         # Build tool indices if not already built
-        if not hasattr(self, "_tool_indices"):
+        if self._tool_indices is None:
             self._tool_indices = self._get_tool_indices(tools)
 
         flags = Allow.ALL if self.current_tool_name_sent else Allow.ALL & ~Allow.STR
