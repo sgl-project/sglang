@@ -69,7 +69,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.engram_region import (
     STORE_ALIGN,
+    engram_region_offsets,
     engram_table_offsets,
+    engram_total_bytes,
     max_shard_rows,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -799,8 +801,9 @@ def _store_offsets(dim: int, block_size: int, mxfp4: bool) -> dict[int, int]:
     parallel = get_parallel()
     config = get_exec().offload.engram_config
     replicated = config is not None and config.replication == EngramReplication.PER_NODE
+    counts = [rows[lid] for lid in layer_ids]
     offsets = engram_table_offsets(
-        [rows[lid] for lid in layer_ids],
+        counts,
         dim,
         block_size,
         parallel.tp_rank,
@@ -809,6 +812,26 @@ def _store_offsets(dim: int, block_size: int, mxfp4: bool) -> dict[int, int]:
         mxfp4=mxfp4,
         replicated=replicated,
     )
+    # Logged once, on rank 0: the total size the backing file or dev-dax region has to
+    # have, which is what an operator sizing the store needs before the first run and
+    # what the per-layer offsets alone do not say.
+    if parallel.tp_rank == 0:
+        regions = engram_region_offsets(
+            counts,
+            dim,
+            block_size,
+            STORE_ALIGN,
+            mxfp4=mxfp4,
+            replicas=None if replicated else [parallel.tp_size] * len(counts),
+        )
+        logger.info(
+            "engram store layout: %d table(s), %s, %.1f GiB total",
+            len(counts),
+            "replicated"
+            if replicated
+            else f"one region per rank over {parallel.tp_size}",
+            engram_total_bytes(regions) / 2**30,
+        )
     return dict(zip(layer_ids, offsets))
 
 
@@ -1547,7 +1570,6 @@ class EngramEmbedding(nn.Module):
                 dim,
                 layer_id,
                 config.replication,
-                column_bounds,
                 config.table_path,
             )
         else:
@@ -1577,7 +1599,6 @@ class EngramEmbedding(nn.Module):
         dim: int,
         layer_id: int,
         replication: str,
-        column_bounds: tuple[int, ...],
         table_path: str = "",
     ):
         per_node = replication == EngramReplication.PER_NODE

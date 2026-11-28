@@ -26,8 +26,14 @@ pages far more readily than arbitrary ones, so one value is used everywhere.
 
 
 def align_up(n: int, align: int) -> int:
-    """Round ``n`` up to a multiple of ``align`` (``align`` must be a power of two)."""
-    assert align > 0 and align & (align - 1) == 0, align
+    """Round ``n`` up to a multiple of ``align`` (``align`` must be a power of two).
+
+    Raises rather than asserting: this guards the layout, and an ``assert`` is
+    stripped under ``python -O``, which would let a misaligned offset reach the
+    kernel and fail later with an opaque EINVAL.
+    """
+    if align <= 0 or align & (align - 1):
+        raise ValueError(f"align must be a positive power of two, got {align}")
     return (n + align - 1) & ~(align - 1)
 
 

@@ -39,7 +39,7 @@ class TestAlignUp(CustomTestCase):
 
     def test_rejects_a_non_power_of_two(self):
         for align in (0, -1, 3, 6):
-            with self.subTest(align=align), self.assertRaises(AssertionError):
+            with self.subTest(align=align), self.assertRaises(ValueError):
                 align_up(1, align)
 
 
