@@ -45,6 +45,14 @@ class TestTrimMatchedStop(unittest.TestCase):
             _trim("ans\n\nQuestion: A", "Question", True), "ans\n\nQuestion"
         )
 
+    def test_str_quoted_earlier_trims_at_actual_hit(self):
+        # The reasoning section quotes the stop string; the hit that ended the
+        # request is the last occurrence, so the answer survives.
+        self.assertEqual(
+            _trim('think "Question" </think>ans\n\nQuestion: A', "Question", False),
+            'think "Question" </think>ans\n\n',
+        )
+
     # --- stop token ---
     def test_token_trim_drops_last(self):
         self.assertEqual(_trim([1, 2, 3], 3, False), [1, 2])
