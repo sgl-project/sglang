@@ -310,6 +310,8 @@ class LRUFileEvictor:
             except OSError:
                 return
         with self._lock:
+            if suffixed_key in self._pending_writes:
+                return
             previous = self._lru.pop(suffixed_key, None)
             if previous is not None:
                 self._total_bytes -= previous
@@ -418,11 +420,17 @@ class LRUFileEvictor:
             return None
         return st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize
 
+    def _pending_bytes_locked(self) -> int:
+        """Bytes reserved by in-flight writes whose files are not committed yet."""
+        return sum(self._lru.get(stem, 0) for stem in self._pending_writes)
+
     def _enforce_free_space_locked(self, value_bytes: int) -> bool:
         """Evict until writing ``value_bytes`` still leaves ``min_free_bytes``.
 
-        Caller holds ``_lock``. Returns False if the floor cannot be met, or
-        if filesystem statistics are unavailable (fail closed).
+        Caller holds ``_lock``. Accounts for bytes already reserved by
+        in-flight writes that have not yet committed to disk. Returns False if
+        the floor cannot be met, or if filesystem statistics are unavailable
+        (fail closed).
         """
         if self.min_free_bytes <= 0:
             return True
@@ -434,18 +442,24 @@ class LRUFileEvictor:
                 self.file_path,
             )
             return False
+        # Conservatively reserve space for both in-flight writes and this write:
+        # statvfs may not yet reflect reserved-but-unwritten bytes. Worst case
+        # double-counts in-flight bytes right before commit, which bounds extra
+        # eviction to at most the in-flight bytes while keeping min_free_space
+        # fail-closed.
+        fill_in_bytes = value_bytes + self._pending_bytes_locked()
         # Credit reclaimed bytes instead of re-probing statvfs per victim;
         # the final probe below catches filesystems that free space lazily.
         free = fs[1]
         before_entries = len(self._lru)
         self._evict_while(
-            lambda reclaimed: (free + reclaimed) - value_bytes < self.min_free_bytes
+            lambda reclaimed: (free + reclaimed) - fill_in_bytes < self.min_free_bytes
         )
         self._foreground_evicted_entries += before_entries - len(self._lru)
         fs = self._fs_stats()
         if fs is None:
             return False
-        return fs[1] - value_bytes >= self.min_free_bytes
+        return fs[1] - fill_in_bytes >= self.min_free_bytes
 
     def _scan_existing_files(self, *, track_entries: bool) -> None:
         """Remove stale temp files and optionally seed the LRU (oldest first)."""
