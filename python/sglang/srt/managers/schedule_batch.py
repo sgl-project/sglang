@@ -1840,8 +1840,10 @@ def set_mamba_track_indices_from_reqs(
     )
 
 
-def unresumable_abort_message() -> str:
-    if get_disagg().disaggregation_mode == "decode":
+def unresumable_abort_message(req: Req) -> str:
+    # A request the decode server prefilled itself resumes by re-prefill, like
+    # an aggregated one, not by a rebootstrap.
+    if get_disagg().disaggregation_mode == "decode" and not req.disagg_local_prefill:
         return (
             "Retracted request aborted: the rebootstrap recomputes the KV from "
             "token ids, which cannot rebuild multimodal inputs or embeds. Retry later."
@@ -1921,7 +1923,7 @@ def retract_all(
         ):
             req.request_finish(
                 FINISH_ABORT(
-                    unresumable_abort_message(),
+                    unresumable_abort_message(req),
                     status_code=HTTPStatus.SERVICE_UNAVAILABLE,
                 )
             )
@@ -3067,8 +3069,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 retracted_reqs.append(req)
             else:
                 # No backup or rebuild exists and the device KV is already freed.
-                if get_disagg().disaggregation_mode != "decode":
-                    message = unresumable_abort_message()
+                if (
+                    get_disagg().disaggregation_mode != "decode"
+                    or req.disagg_local_prefill
+                ):
+                    message = unresumable_abort_message(req)
                     status_code = HTTPStatus.SERVICE_UNAVAILABLE
                 elif (
                     get_disagg().disaggregation_decode_retraction_backup == "host_pool"
