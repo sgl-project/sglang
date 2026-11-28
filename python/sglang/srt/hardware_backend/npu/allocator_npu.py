@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+_ALLOC_EXTEND_MIN_JIT_BOUND = 2048
+
+
 class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     def __init__(
         self,
@@ -63,7 +66,11 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 dtype=torch.int64,
                 device=self.device,
             )
-            max_num_extend_tokens = next_power_of_2(extend_num_tokens)
+            # The NPU Triton backend covers 2048 slots per iteration. Reuse
+            # one specialization for all extends that fit in that iteration.
+            max_num_extend_tokens = max(
+                _ALLOC_EXTEND_MIN_JIT_BOUND, next_power_of_2(extend_num_tokens)
+            )
             alloc_extend_indices(
                 prefix_lens,
                 seq_lens,
