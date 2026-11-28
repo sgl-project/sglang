@@ -25,6 +25,7 @@ from typing import Dict, List, Optional
 import torch
 from torch import nn
 
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS, INKLING2_QKVR_PROJECTIONS
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.layers.utils import get_layer_id
@@ -38,6 +39,56 @@ from sglang.srt.model_loader.loader import DefaultModelLoader
 _ROUTED_EXPERT_PATTERN = re.compile(r"\.experts\.")
 
 logger = logging.getLogger(__name__)
+
+
+def _inkling2_qkvr_member_rows(text_config, *, is_local: bool) -> tuple[int, ...]:
+    """Unsharded output rows of each qkvr member, in INKLING2_QKVR_PROJECTIONS order."""
+    # Local layers take the swa_* geometry, as Inkling2Attention does.
+    if is_local:
+        heads = text_config.swa_num_attention_heads
+        kv_heads = text_config.swa_num_key_value_heads
+        head_dim = text_config.swa_head_dim
+    else:
+        heads = text_config.num_attention_heads
+        kv_heads = text_config.num_key_value_heads
+        head_dim = text_config.head_dim
+    return (
+        heads * head_dim,
+        kv_heads * head_dim,
+        kv_heads * head_dim,
+        heads * text_config.d_rel,
+        heads * head_dim,
+        heads,
+    )
+
+
+def _inkling2_qkvr_member_parts(
+    weights: Dict[str, torch.Tensor], *, prefix: str, member_rows: tuple[int, ...]
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Pop each member's lora_A / lora_B under prefix; zeros stand in for absent members."""
+    present = [
+        m for m in INKLING2_QKVR_PROJECTIONS if f"{prefix}.{m}.lora_A.weight" in weights
+    ]
+    reference_a = weights[f"{prefix}.{present[0]}.lora_A.weight"]
+    reference_b = weights[f"{prefix}.{present[0]}.lora_B.weight"]
+    a_parts, b_parts = [], []
+    for member, rows in zip(INKLING2_QKVR_PROJECTIONS, member_rows):
+        a = weights.pop(f"{prefix}.{member}.lora_A.weight", None)
+        b = weights.pop(f"{prefix}.{member}.lora_B.weight", None)
+        if (a is None) != (b is None):
+            raise ValueError(
+                f"LoRA adapter carries only one factor of {prefix}.{member}"
+            )
+        if a is None:
+            a = reference_a.new_zeros(reference_a.shape)
+            b = reference_b.new_zeros((rows, reference_b.shape[-1]))
+        elif b.shape[-2] != rows:
+            raise ValueError(
+                f"{prefix}.{member}.lora_B has {b.shape[-2]} rows; the model expects {rows}"
+            )
+        a_parts.append(a)
+        b_parts.append(b)
+    return a_parts, b_parts
 
 
 class LoRALayer(nn.Module):
@@ -181,6 +232,9 @@ class LoRAAdapter(nn.Module):
         # recognized and loaded into the correct buffer.
         if "unembed_tokens" in name:
             name = name.replace("unembed_tokens", "lm_head")
+        # Inkling2 names its output head "unembed" (model.llm.unembed).
+        elif ".unembed." in name:
+            name = name.replace(".unembed.", ".lm_head.")
 
         layer_id = get_layer_id(name)
         if layer_id is not None:
@@ -233,6 +287,10 @@ class LoRAAdapter(nn.Module):
         (wq_du/wk_dv/wv_dv/wr_du), while the serving model uses a single
         MergedColumnParallelLinear named qkvr with those slices in that order.
         """
+        if self._is_inkling2():
+            self._normalize_inkling2_qkvr_proj(weights)
+            self._repeat_shared_qkvr_lora_a(weights, len(INKLING2_QKVR_PROJECTIONS))
+            return
         for weight_name in weight_names:
             if "wq_du" not in weight_name:
                 continue
@@ -261,14 +319,49 @@ class LoRAAdapter(nn.Module):
             weights.pop(v_name)
             weights.pop(r_name)
 
+        self._repeat_shared_qkvr_lora_a(weights, 4)
+
+    def _repeat_shared_qkvr_lora_a(
+        self, weights: Dict[str, torch.Tensor], num_members: int
+    ):
+        """A fused qkvr adapter may carry one lora_A for every slice; give each slice a copy."""
         for weight_name in list(weights.keys()):
             if "qkvr" not in weight_name or "lora_A" not in weight_name:
                 continue
             if weights[weight_name].shape[-2] != self.config.r:
                 continue
             repeat_dims = [1] * weights[weight_name].dim()
-            repeat_dims[-2] = 4
+            repeat_dims[-2] = num_members
             weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
+
+    def _is_inkling2(self) -> bool:
+        # Unit tests pass bare config stubs; real HF configs always carry architectures.
+        architectures = getattr(self.base_hf_config, "architectures", None) or []
+        return any(arch in INKLING2_ARCHS for arch in architectures)
+
+    def _normalize_inkling2_qkvr_proj(self, weights: Dict[str, torch.Tensor]):
+        """Fuse Inkling2's six attention projections into qkvr, member by member.
+
+        An untrained member (Tinker adapters skip attn_sink_proj) loads as zeros, so
+        its qkvr slice gets no delta.
+        """
+        text_config = self.base_hf_config.get_text_config()
+        prefixes = {
+            name[: name.index(f".{member}.lora_A.")]
+            for name in weights
+            for member in INKLING2_QKVR_PROJECTIONS
+            if f".{member}.lora_A." in name
+        }
+        for prefix in prefixes:
+            member_rows = _inkling2_qkvr_member_rows(
+                text_config,
+                is_local=get_layer_id(prefix) in text_config.local_layer_ids,
+            )
+            a_parts, b_parts = _inkling2_qkvr_member_parts(
+                weights, prefix=prefix, member_rows=member_rows
+            )
+            weights[f"{prefix}.qkvr.lora_A.weight"] = torch.cat(a_parts, dim=-2)
+            weights[f"{prefix}.qkvr.lora_B.weight"] = torch.cat(b_parts, dim=-2)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]

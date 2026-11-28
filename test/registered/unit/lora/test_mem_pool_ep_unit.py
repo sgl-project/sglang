@@ -41,6 +41,8 @@ class _FakeFusedMoEWithLoRA(_FakeBaseLayerWithLoRA):
 _LORA_LAYERS_STUB = types.ModuleType("sglang.srt.lora.layers")
 _LORA_LAYERS_STUB.BaseLayerWithLoRA = _FakeBaseLayerWithLoRA
 _LORA_LAYERS_STUB.FusedMoEWithLoRA = _FakeFusedMoEWithLoRA
+_LORA_LAYERS_STUB.moe_lora_layer_types = lambda: (_FakeFusedMoEWithLoRA,)
+_LORA_LAYERS_STUB.shared_outer_expert_layer_types = lambda: ()
 _LORA_LAYERS_STUB.unwrap_lora_layer = lambda module: (
     module.base_layer if isinstance(module, _FakeBaseLayerWithLoRA) else module
 )

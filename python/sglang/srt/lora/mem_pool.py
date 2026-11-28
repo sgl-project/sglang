@@ -372,8 +372,10 @@ class LoRAMemoryPool:
         # Walk the loaded model for an actual FusedMoE instance before we
         # commit to allocating 4D per-expert LoRA buffers.
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.lora.layers import shared_outer_expert_layer_types
 
-        return any(isinstance(m, FusedMoE) for m in base_model.modules())
+        moe_types = (FusedMoE, *shared_outer_expert_layer_types())
+        return any(isinstance(m, moe_types) for m in base_model.modules())
 
     def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
         """Resident factor count; new MoE LoRA providers use EP-local factors."""
@@ -1071,10 +1073,10 @@ class LoRAMemoryPool:
             # redundant zero-fills on slots no `update_lora_info` ever points
             # a forward-time module at.
             active_target_modules: Set[str] = set()
-            from sglang.srt.lora.layers import FusedMoEWithLoRA
+            from sglang.srt.lora.layers import moe_lora_layer_types
 
             for module_name, module in cur_layer_modules.items():
-                if isinstance(module, FusedMoEWithLoRA) or getattr(
+                if isinstance(module, moe_lora_layer_types()) or getattr(
                     module, "is_shared_fused_moe", False
                 ):
                     base_layer = getattr(module, "base_layer", module)

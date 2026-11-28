@@ -25,6 +25,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.inkling_common.attn import (
     RelLogitsProj,
@@ -421,7 +422,10 @@ class Inkling2Attention(nn.Module):
         return projected.split(self.split_sizes, dim=-1)[:6]
 
     def _project_sources(self, sources):
-        if len({id(sources.q), id(sources.k), id(sources.v)}) == 3:
+        # LoRA's per-token batch metadata covers one source, not three stacked ones.
+        if len({id(sources.q), id(sources.k), id(sources.v)}) == 3 and not isinstance(
+            self.qkvr, BaseLayerWithLoRA
+        ):
             q_proj, k_proj, v_proj = (
                 projected.split(self.split_sizes, dim=-1)[:6]
                 for projected in self.qkvr(_stacked(sources))[0].chunk(3)

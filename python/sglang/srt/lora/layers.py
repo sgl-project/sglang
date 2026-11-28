@@ -1420,6 +1420,24 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         return B
 
 
+# Routed-expert layers outside FusedMoE, mapped to their shared-outer LoRA wrapper.
+# Models register at import, so the LoRA runtime never imports model code.
+_SHARED_OUTER_EXPERT_LORA: Dict[type, type] = {}
+
+
+def register_shared_outer_expert_lora(layer_type: type, wrapper_type: type) -> None:
+    _SHARED_OUTER_EXPERT_LORA[layer_type] = wrapper_type
+
+
+def shared_outer_expert_layer_types() -> tuple[type, ...]:
+    return tuple(_SHARED_OUTER_EXPERT_LORA)
+
+
+def moe_lora_layer_types() -> tuple[type, ...]:
+    """LoRA wrappers of routed-expert layers, which the pool feeds MoE buffers."""
+    return (FusedMoEWithLoRA, *_SHARED_OUTER_EXPERT_LORA.values())
+
+
 def get_lora_layer(
     layer: nn.Module,
     lora_backend: BaseLoRABackend,
@@ -1427,6 +1445,14 @@ def get_lora_layer(
     experts_shared_outer_loras: bool = False,
     max_lora_rank: Optional[int] = None,
 ) -> BaseLayerWithLoRA:
+    shared_outer_wrapper = _SHARED_OUTER_EXPERT_LORA.get(type(layer))
+    if shared_outer_wrapper is not None:
+        if not experts_shared_outer_loras:
+            raise ValueError(
+                f"{type(layer).__name__} LoRA serves shared-outer adapters only "
+                "(gate/up lora_A and down lora_B shared by all experts)"
+            )
+        return shared_outer_wrapper(layer, lora_backend)
     if isinstance(layer, FusedMoE):
         return FusedMoEWithLoRA(
             layer,

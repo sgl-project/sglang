@@ -334,6 +334,14 @@ def get_normalized_target_modules(
         "lm_head": "lm_head",
         "output": "lm_head",
         "unembed_tokens": "lm_head",
+        "unembed": "lm_head",
+        # Inkling's attention projections are served as slices of one fused qkvr.
+        "wq_du": "qkvr",
+        "wk_dv": "qkvr",
+        "wv_dv": "qkvr",
+        "wr_du": "qkvr",
+        "gate_attn": "qkvr",
+        "attn_sink_proj": "qkvr",
         "q_a_proj": "fused_qkv_a_proj_with_mqa",
         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
         # DSA indexer projections are qualified with their parent module name

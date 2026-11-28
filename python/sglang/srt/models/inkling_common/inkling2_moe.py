@@ -160,9 +160,13 @@ class Inkling2Experts(nn.Module):
         super().__init__()
         parallel = get_parallel()
         self.tp_rank, self.tp_size = parallel.moe_tp_rank, parallel.moe_tp_size
+        # Read by the LoRA memory pool, which slices factors like a FusedMoE's.
+        self.moe_tp_rank = self.tp_rank
+        self.is_shared_fused_moe = False
         self.ep_rank = parallel.moe_ep_rank
         self.ep_size = parallel.moe_ep_size
         self.num_global_experts = num_experts
+        self.num_experts = num_experts
         if num_experts % self.ep_size:
             raise ValueError("The expert count must be divisible by expert parallelism")
         num_experts //= self.ep_size
@@ -365,6 +369,18 @@ class Inkling2Experts(nn.Module):
         prefill_tokens = min(cutedsl_moe_max_num_tokens(), PREFILL_EXCHANGE_MAX_TOKENS)
         if not self._mega_covers(routed_tokens + 1, prefill_tokens):
             prepare_prefill_exchange(group, prefill_tokens, self.top_k, hidden)
+
+    def prepare_lora_prefill_exchange(self):
+        """LoRA batches skip MegaMoE, so they need the prefill exchange it covers
+        (collective; called when the LoRA wrapper is built, outside graph capture)."""
+        if self.ep_size == 1 or self.use_marlin:
+            return
+        prepare_prefill_exchange(
+            get_parallel().moe_ep_group,
+            min(cutedsl_moe_max_num_tokens(), PREFILL_EXCHANGE_MAX_TOKENS),
+            self.top_k,
+            self.w2_weight.shape[1],
+        )
 
     def prepare_mxfp8_cutlass_scales(self):
         """CUTLASS-layout copies of the MXFP8 weight scales for MegaMoE,
@@ -622,9 +638,16 @@ class Inkling2Experts(nn.Module):
                 self.w2_scale, out=self.w2_cute_scale
             )
 
-    def forward(self, x, weights, ids, combine=True):
+    def forward(self, x, weights, ids, combine=True, lora=None):
+        """lora (Inkling2ExpertsWithLoRA) adds its gate/up delta after the W13 GEMM;
+        the wrapper adds the down delta to the returned output."""
         if x.shape[0] == 0:
             return x
+        if lora is not None and (self.native_sm120 or self._marlin):
+            raise NotImplementedError(
+                "Inkling2 expert LoRA runs on the SM100 routed kernels and the BF16 "
+                "path; the SM120 and Marlin expert kernels have no LoRA hook"
+            )
         if self.native_sm120:
             return self._forward_sm120(x, weights, ids, combine)
         if self._marlin:
@@ -637,20 +660,25 @@ class Inkling2Experts(nn.Module):
                 f"w13 {tuple(self.w13_weight.shape)} {self.w13_weight.dtype}, "
                 f"w2 {tuple(self.w2_weight.shape)} {self.w2_weight.dtype}"
             )
-        if self.mega is not None and self.mega.min_tokens <= x.shape[0]:
+        # MegaMoE never materializes the gate/up or down rows LoRA adds to.
+        if (
+            lora is None
+            and self.mega is not None
+            and self.mega.min_tokens <= x.shape[0]
+        ):
             return self._forward_mega(x, weights, ids, combine)
         local = self.ep_size == 1 and self._routed_kernels is not None
         if (self.ep_size > 1 or local) and ids.numel() <= self.max_routed_ids:
-            return self._forward_routed(x, weights, ids, combine)
+            return self._forward_routed(x, weights, ids, combine, lora=lora)
         if local:
-            return self._forward_prefill(x, weights, ids, None)
+            return self._forward_prefill(x, weights, ids, None, lora=lora)
         exchange = (
             prefill_exchange(get_parallel().moe_ep_group, ids.numel(), x.shape[1])
             if self.ep_size > 1 and x.dtype == torch.bfloat16
             else None
         )
         if exchange is not None and self._routed_kernels is not None:
-            return self._forward_prefill(x, weights, ids, exchange)
+            return self._forward_prefill(x, weights, ids, exchange, lora=lora)
         if self._routed_kernels is not None:
             raise ValueError(
                 f"Inkling2 quantized experts got a {x.shape[0]}-token MoE forward, "
@@ -679,6 +707,16 @@ class Inkling2Experts(nn.Module):
             outside = (rows < offsets[0]) | (rows >= offsets[-1])
             gate_up.masked_fill_(outside[:, None], 0)
         gammas = pre_reorder(weights.reshape(-1, 1), src2dst, 1).flatten()
+        if lora is not None:
+            lora.gate_up_delta(
+                x=x,
+                acc=gate_up,
+                dst2src=permutation,
+                src2dst=src2dst,
+                top_k=ids.shape[1],
+                gammas=gammas,
+                offsets=offsets,
+            )
         activated = _capped_swiglu(gate_up, gammas, self.gate_cap, self.up_cap)
         down = self._bf16_matmul("w2", activated, metadata, block_offsets)
         if self.ep_size > 1:
@@ -686,7 +724,19 @@ class Inkling2Experts(nn.Module):
             down = get_parallel().moe_ep_group.all_reduce(down)
         return post_reorder(down, src2dst, torch.ones_like(weights))
 
-    def _nvfp4_routed(self, x, dst2src, top_k, gammas, counts, offsets, schedule):
+    def _nvfp4_routed(
+        self,
+        x,
+        dst2src,
+        top_k,
+        gammas,
+        counts,
+        offsets,
+        schedule,
+        *,
+        src2dst=None,
+        lora=None,
+    ):
         accumulator, x_amax = routed_expert_matmul(
             x.contiguous(),
             dst2src,
@@ -697,6 +747,17 @@ class Inkling2Experts(nn.Module):
             offsets,
             schedule,
         )
+        if lora is not None:
+            lora.gate_up_delta(
+                x=x,
+                acc=accumulator,
+                dst2src=dst2src,
+                src2dst=src2dst,
+                top_k=top_k,
+                gammas=gammas,
+                offsets=offsets,
+                nvfp4_scales=(x_amax, self.w13_amax, self.w13_outer_scale_denominator),
+            )
         accumulator, x_amax = routed_swiglu_expert_matmul(
             accumulator,
             x_amax,
@@ -714,7 +775,7 @@ class Inkling2Experts(nn.Module):
         )
         return accumulator, (x_amax, self.w2_amax, self.w2_outer_scale_denominator)
 
-    def _forward_prefill(self, x, weights, ids, exchange):
+    def _forward_prefill(self, x, weights, ids, exchange, lora=None):
         """The grouped path for this rank's expert rows only: token rows are
         gathered into the quantized GEMM inputs, and the exchange combines rows
         across ranks instead of an all-reduce of every routed row (without an
@@ -735,11 +796,26 @@ class Inkling2Experts(nn.Module):
         )
         if self._routed_kernels == torch.uint8:
             accumulator, nvfp4_scales = self._nvfp4_routed(
-                x, dst2src, top_k, gammas, counts, offsets, schedule
+                x,
+                dst2src,
+                top_k,
+                gammas,
+                counts,
+                offsets,
+                schedule,
+                src2dst=src2dst,
+                lora=lora,
             )
         else:
             accumulator = self._mxfp8_routed(
-                x, dst2src, top_k, gammas, (counts, offsets, schedule), x.shape[0]
+                x,
+                dst2src,
+                top_k,
+                gammas,
+                (counts, offsets, schedule),
+                x.shape[0],
+                src2dst=src2dst,
+                lora=lora,
             )
             nvfp4_scales = None
         if exchange is None:
@@ -849,10 +925,22 @@ class Inkling2Experts(nn.Module):
             return RoutedOutput(combined, self._identity[:tokens], 1)
         return combined.to(x.dtype)
 
-    def _mxfp8_routed(self, x, dst2src, top_k, gammas, metadata, tokens):
+    def _mxfp8_routed(
+        self, x, dst2src, top_k, gammas, metadata, tokens, *, src2dst=None, lora=None
+    ):
         gate_up = mxfp8_routed_matmul(
             x, dst2src, top_k, self.w13_weight, self.w13_scale, metadata
         )
+        if lora is not None:
+            lora.gate_up_delta(
+                x=x,
+                acc=gate_up,
+                dst2src=dst2src,
+                src2dst=src2dst,
+                top_k=top_k,
+                gammas=gammas,
+                offsets=metadata[1],
+            )
         return mxfp8_routed_swiglu_matmul(
             gate_up,
             gammas,
@@ -1056,7 +1144,7 @@ class Inkling2Experts(nn.Module):
             block_size_m=128,
         )
 
-    def _forward_routed(self, x, weights, ids, combine):
+    def _forward_routed(self, x, weights, ids, combine, lora=None):
         num_local = self.w13_weight.shape[0]
         (
             src2dst,
@@ -1082,7 +1170,15 @@ class Inkling2Experts(nn.Module):
         route = (src2dst, sorted_ids, num_local, exchange)
         if self._routed_kernels == torch.uint8:
             accumulator, scales = self._nvfp4_routed(
-                x, dst2src, ids.shape[1], gammas, counts, offsets, schedule
+                x,
+                dst2src,
+                ids.shape[1],
+                gammas,
+                counts,
+                offsets,
+                schedule,
+                src2dst=src2dst,
+                lora=lora,
             )
             return self._routed_output(
                 accumulator,
@@ -1097,11 +1193,28 @@ class Inkling2Experts(nn.Module):
         metadata = (counts, offsets, schedule)
         if self._routed_kernels == torch.float8_e4m3fn:
             down = self._mxfp8_routed(
-                x, dst2src, ids.shape[1], gammas, metadata, ids.shape[0]
+                x,
+                dst2src,
+                ids.shape[1],
+                gammas,
+                metadata,
+                ids.shape[0],
+                src2dst=src2dst,
+                lora=lora,
             )
         else:
             inputs = pre_reorder(x, src2dst, ids.shape[1])
             gate_up = self._bf16_matmul("w13", inputs, metadata, block_offsets)
+            if lora is not None:
+                lora.gate_up_delta(
+                    x=x,
+                    acc=gate_up,
+                    dst2src=dst2src,
+                    src2dst=src2dst,
+                    top_k=ids.shape[1],
+                    gammas=gammas,
+                    offsets=offsets,
+                )
             activated = _capped_swiglu(
                 gate_up, gammas, self.gate_cap, self.up_cap, offsets
             )
@@ -1301,9 +1414,14 @@ class Inkling2MoE(nn.Module):
             config, config.n_routed_experts, checkpoint_prefix, quant_config
         )
 
+    def _has_lora(self):
+        # The LoRA wrapper replaces self.experts after loading.
+        return not isinstance(self.experts, Inkling2Experts)
+
     def local_input_rows(self, tokens, combine):
         """(start, count) of the MoE-input rows this rank needs, or None for all."""
-        if not combine or get_parallel().moe_tp_size > 1:
+        # LoRA batches skip MegaMoE, which is what takes a rank's local rows only.
+        if not combine or get_parallel().moe_tp_size > 1 or self._has_lora():
             return None
         return self.experts.mega_local_input_rows(tokens)
 
@@ -1313,7 +1431,8 @@ class Inkling2MoE(nn.Module):
         if x.shape[0] == 0:
             return x
         if (
-            self.experts.native_sm120
+            not self._has_lora()
+            and self.experts.native_sm120
             and total_tokens is None
             and get_parallel().moe_tp_size == 1
             and x.shape[0] <= moe_lowm_sm120.LOWM_FUSED_ROUTE_MAX_TOKENS

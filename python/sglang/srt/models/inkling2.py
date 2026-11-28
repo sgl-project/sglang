@@ -7,7 +7,11 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
-from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
+from sglang.srt.configs.inkling2 import (
+    INKLING2_QKVR_PROJECTIONS,
+    Inkling2MMConfig,
+    Inkling2ModelConfig,
+)
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     MultimemAllGatherer,
 )
@@ -19,6 +23,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.lora.layers import BaseLayerWithLoRA, ParallelLMHeadWithLoRA
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -26,6 +31,9 @@ from sglang.srt.managers.mm_utils import (
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+# Registers the expert LoRA wrapper with the LoRA runtime.
+from sglang.srt.models.inkling_common import inkling2_lora  # noqa: F401
 from sglang.srt.models.inkling_common.inkling2_attn import (
     AttentionSources,
     Inkling2Attention,
@@ -207,6 +215,10 @@ class Inkling2DecoderLayer(nn.Module):
         state.finalize_layer(self.layer_id, attention, mlp)
 
 
+def _base_layer(module: nn.Module) -> nn.Module:
+    return module.base_layer if isinstance(module, BaseLayerWithLoRA) else module
+
+
 class _Fp32AsBf16Gather:
     """Last-dim all-gather of FP32 rows as bfloat16 pairs (pure data movement)."""
 
@@ -246,9 +258,19 @@ class Inkling2LogitsProcessor(LogitsProcessor):
     def _compute_lm_head(
         self, hidden_states, lm_head, embedding_bias=None, *, out=None
     ):
+        # The LoRA head's own GEMM runs in the weight dtype; keep the base head's
+        # FP32 logits and add only the adapter delta.
+        lora_head = lm_head if isinstance(lm_head, ParallelLMHeadWithLoRA) else None
         logits = super()._compute_lm_head(
-            hidden_states, lm_head, embedding_bias, out=out
+            hidden_states,
+            lm_head if lora_head is None else lora_head.base_layer,
+            embedding_bias,
+            out=out,
         )
+        if lora_head is not None and lora_head.lora_active:
+            hidden = hidden_states.to(lora_head.weight.dtype)
+            zeros = torch.zeros(logits.shape, dtype=hidden.dtype, device=hidden.device)
+            logits += lora_head.apply_lora(zeros, hidden)
         if self.shard_softcap:
             if logits.is_cuda:
                 fused_softcap(logits, self.shard_softcap)
@@ -425,6 +447,8 @@ class Inkling2CausalLLM(nn.Module):
 class Inkling2ForConditionalGeneration(nn.Module):
     fall_back_to_pt_during_load = False
     allow_patterns_overrides = ["model*.safetensors"]
+    # Tinker's Inkling layout: fused attention, wo_ud, shared-outer routed experts, unembed.
+    supported_lora_modules = ["qkvr", "wo_ud", "gate_up_proj", "down_proj", "lm_head"]
 
     def __init__(self, config: Inkling2MMConfig, quant_config=None, prefix: str = ""):
         super().__init__()
@@ -586,17 +610,35 @@ class Inkling2ForConditionalGeneration(nn.Module):
             aux_hidden_states=auxiliary,
         )
 
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> tuple[int, int]:
+        attn = self.llm.layers[layer_idx].attn
+        if module_name == "qkvr":
+            qkvr = _base_layer(attn.qkvr)
+            # The trailing pad slice, when present, carries no adapter.
+            members = qkvr.output_sizes[: len(INKLING2_QKVR_PROJECTIONS)]
+            return qkvr.input_size, sum(members)
+        if module_name == "wo_ud":
+            wo_ud = _base_layer(attn.wo_ud)
+            return wo_ud.input_size, wo_ud.output_size
+        text = self.text_config
+        if module_name == "lm_head":
+            # The head and its LoRA B span the padded vocab, as the checkpoint's unembed.
+            return text.hidden_size, text.padded_vocab_size
+        if module_name in ("gate_up_proj", "gate_up_proj_moe"):
+            return text.hidden_size, 2 * text.intermediate_size
+        if module_name in ("down_proj", "down_proj_moe"):
+            return text.intermediate_size, text.hidden_size
+        raise NotImplementedError(f"Inkling2 has no LoRA module {module_name}")
+
+    def get_stacked_multiply(self, module_name: str) -> int:
+        if module_name == "qkvr":
+            return len(INKLING2_QKVR_PROJECTIONS)
+        return 2 if module_name.startswith("gate_up_proj") else 1
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
         loaded = set()
-        projections = (
-            "wq_du",
-            "wk_dv",
-            "wv_dv",
-            "wr_du",
-            "gate_attn",
-            "attn_sink_proj",
-        )
+        projections = INKLING2_QKVR_PROJECTIONS
         packed_shards: dict[str, set[int]] = {}
         for checkpoint_name, weight in weights:
             name = checkpoint_name.removeprefix("model.")
