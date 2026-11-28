@@ -1139,9 +1139,9 @@ class TestRenderedPrompt(_EncodeCase):
             ),
             unittest.mock.patch.object(
                 ppe._SegmentEncoder,
-                "encode",
+                "encode_text",
                 autospec=True,
-                side_effect=ppe._SegmentEncoder.encode,
+                side_effect=ppe._SegmentEncoder.encode_text,
             ) as split,
         ):
             ids = ppe.encode_rendered_prompt(tokenizer, text)
@@ -1154,31 +1154,35 @@ class TestRenderedPrompt(_EncodeCase):
         text = "<|user|>hello world<|assistant|>"
         expected = self.tokenizer.encode(text)
         with (
-            unittest.mock.patch.object(ppe._SegmentEncoder, "encode", return_value=[0]),
+            unittest.mock.patch.object(
+                ppe._SegmentEncoder, "encode_text", return_value=[0]
+            ),
             self.assertLogs(ppe.logger, "ERROR"),
         ):
             self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
         self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
         with unittest.mock.patch.object(
-            ppe._SegmentEncoder, "encode", side_effect=AssertionError("split taken")
+            ppe._SegmentEncoder,
+            "encode_text",
+            side_effect=AssertionError("split taken"),
         ):
             self.assertEqual(ppe.encode_rendered_prompt(self.tokenizer, text), expected)
 
     def _split_returning_wrong_ids_for(self, wrong, entered=None, proceed=None):
         """A segment encoder that returns [0] for the prompt `wrong`, after
         signalling `entered` and waiting for `proceed`."""
-        split = ppe._SegmentEncoder.encode
+        split = ppe._SegmentEncoder.encode_text
 
-        def fake(encoder, segments, *args):
-            if "".join(segments) != wrong:
-                return split(encoder, segments, *args)
+        def fake(encoder, text, *args):
+            if text != wrong:
+                return split(encoder, text, *args)
             if entered is not None:
                 entered.set()
                 self.assertTrue(proceed.wait(10))
             return [0]
 
         return unittest.mock.patch.object(
-            ppe._SegmentEncoder, "encode", autospec=True, side_effect=fake
+            ppe._SegmentEncoder, "encode_text", autospec=True, side_effect=fake
         )
 
     def test_a_concurrent_pass_does_not_overwrite_a_mismatch(self):
@@ -1215,7 +1219,9 @@ class TestRenderedPrompt(_EncodeCase):
         self.assertEqual(results, {"good": whole(good), "bad": whole(bad)})
         self.assertTrue(ppe._rendered_checks(self.tokenizer).failed)
         with unittest.mock.patch.object(
-            ppe._SegmentEncoder, "encode", side_effect=AssertionError("split taken")
+            ppe._SegmentEncoder,
+            "encode_text",
+            side_effect=AssertionError("split taken"),
         ):
             self.assertEqual(
                 ppe.encode_rendered_prompt(self.tokenizer, good), whole(good)
@@ -1366,7 +1372,9 @@ class TestRenderedPrompt(_EncodeCase):
                 envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.override(min_chars),
                 envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(enabled),
                 unittest.mock.patch.object(
-                    ppe._SegmentEncoder, "encode", side_effect=AssertionError("split")
+                    ppe._SegmentEncoder,
+                    "encode_text",
+                    side_effect=AssertionError("split"),
                 ),
                 unittest.mock.patch.object(
                     ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
@@ -1381,7 +1389,7 @@ class TestRenderedPrompt(_EncodeCase):
         text = "<|user|>" + "the quick brown fox " * 20 + "<|assistant|>"
         with (
             unittest.mock.patch.object(
-                ppe._SegmentEncoder, "encode", side_effect=AssertionError("split")
+                ppe._SegmentEncoder, "encode_text", side_effect=AssertionError("split")
             ),
             unittest.mock.patch.object(
                 ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode

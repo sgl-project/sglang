@@ -390,7 +390,26 @@ class _SegmentEncoder:
                 run.append(segment)
         if run:
             layout.append("".join(run))
+        return self._encode_layout(layout, cache_salt)
 
+    def encode_text(self, text, cache_salt=None):
+        """``encode`` of a whole rendered prompt, cut at its added tokens in one
+        pass: the text between two cut points cannot hold a whole added token,
+        or the scan would have matched it there."""
+        layout, start = [], 0
+        for m in self.pattern.finditer(text):
+            token_id = self.cut_id(m.group())
+            if token_id is None:
+                continue
+            if m.start() > start:
+                layout.append(text[start : m.start()])
+            layout.append(token_id)
+            start = m.end()
+        if start < len(text):
+            layout.append(text[start:])
+        return self._encode_layout(layout, cache_salt)
+
+    def _encode_layout(self, layout, cache_salt):
         known = {}
         texts = [item for item in layout if isinstance(item, str)]
         while texts:
@@ -629,13 +648,7 @@ def encode_rendered_prompt(tokenizer, text, encode_kwargs=None, cache_salt=None)
     # The encoder gated here encodes them, so none can fall back after this.
     if encoder is None or encoder.pattern is None:
         return parallel_prompt_encode(tokenizer, text, encode_kwargs)
-    segments, pos = [], 0
-    for m in encoder.pattern.finditer(text):
-        segments.append(text[pos : m.start()])
-        segments.append(m.group())
-        pos = m.end()
-    segments.append(text[pos:])
-    ids = encoder.encode(segments, cache_salt)
+    ids = encoder.encode_text(text, cache_salt)
     with _rendered_prompt_checks_lock:
         state = _rendered_checks(tokenizer)
         check = not state.failed and state.passed < _RENDERED_PROMPT_CHECKS
