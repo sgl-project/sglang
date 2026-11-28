@@ -1,6 +1,7 @@
 """Unit tests for HunyuanDetector - no server, no model loading."""
 
 import json
+import time
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
@@ -121,6 +122,19 @@ class TestHunyuanDetectorDetectAndParse(CustomTestCase):
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(len(result.calls), 0)
         self.assertEqual(result.normal_text, text)
+
+    def test_unclosed_tool_calls_parse_in_linear_time(self):
+        """Regression for #52090: unclosed "<tool_call>f<tool_sep>" blocks
+        made the old tool call regex backtrack cubically (about 2 s for
+        11 KB, 16 s for 22 KB)."""
+        text = "<tool_calls>" + "<tool_call>f<tool_sep>" * 1000
+
+        start = time.perf_counter()
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertEqual(result.calls, [])
+        self.assertLess(elapsed, 1.0)
 
     def test_hy4_format_without_tool_separator(self):
         detector = HunyuanDetector(_Hy4Tokenizer())
