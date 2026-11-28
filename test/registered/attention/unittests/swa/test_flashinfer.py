@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 
 import torch
 
@@ -19,6 +20,7 @@ from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner i
     run_dense_cuda_graph_decode_case,
 )
 from sglang.test.kits.attention_unittest.runner_modes.speculative_target_verify_runner import (
+    _prepare_spec_verify_batch,
     run_dense_spec_verify_case,
     run_dense_spec_verify_cuda_graph_case,
 )
@@ -334,6 +336,119 @@ class TestFlashInferSWAAttentionBackendCorrectness(CustomTestCase):
                     head_dim=self.HEAD_DIM,
                     hidden_size=self.HIDDEN_SIZE,
                 )
+
+    def test_cuda_graph_verify_without_custom_mask_does_not_allocate_mask_buffers(self):
+        """Mask-free DFlash verify should leave the CUDA graph mask buffers empty."""
+        case, topk, spec_kind = self.SPEC_VERIFY_CUDA_GRAPH_CASES[0]
+        fixture = build_dense_attention_fixture(
+            self, case, head_dim=self.HEAD_DIM, disable_cuda_graph=False
+        )
+        self.addCleanup(fixture.runner._server_args_override.restore)
+        backend = fixture.backend
+        batch = fixture.forward_batch
+
+        backend.init_cuda_graph_state(case.batch_size, case.num_input_tokens)
+        self.assertEqual(len(backend.cuda_graph_custom_mask), 0)
+        _prepare_spec_verify_batch(
+            case, batch, topk=topk, spec_kind=spec_kind, device="cuda"
+        )
+        with forward_context(ForwardContext(attn_backend=backend)):
+            backend.init_forward_metadata_out_graph(batch, in_capture=True)
+
+        self.assertEqual(len(backend.cuda_graph_custom_mask), 0)
+        for wrapper in backend.prefill_cuda_graph_metadata[case.batch_size]:
+            self.assertIsNone(wrapper._custom_mask_buf)
+        self.assertIsNotNone(backend.forward_metadata)
+        backend.init_cuda_graph_state(case.batch_size, case.num_input_tokens)
+        self.assertIsNone(backend.forward_metadata)
+
+    def test_cuda_graph_verify_keeps_swa_and_full_masks_separate(self):
+        """Full attention's verify plan must preserve each SWA query's window."""
+        case = DenseAttentionCase(
+            name="ngram_verify_swa_and_full",
+            backend="flashinfer",
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(8,),
+            extend_lens=(3,),
+            sliding_window_size=4,
+        )
+        fixture = build_dense_attention_fixture(
+            self, case, head_dim=self.HEAD_DIM, disable_cuda_graph=False
+        )
+        self.addCleanup(fixture.runner._server_args_override.restore)
+        backend = fixture.backend
+        batch = fixture.forward_batch
+        swa = fixture.actual_module.attn
+        full = RadixAttention(
+            num_heads=case.num_heads,
+            head_dim=self.HEAD_DIM,
+            scaling=swa.scaling,
+            num_kv_heads=case.num_kv_heads,
+            layer_id=swa.layer_id,
+            sliding_window_size=-1,
+        )
+
+        (seq_len,) = case.seq_lens
+        k = torch.zeros(
+            seq_len,
+            case.num_kv_heads,
+            self.HEAD_DIM,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        v = torch.zeros_like(k)
+        # These two prefix tokens leave the SWA window as the queries advance.
+        v[4:6] = 20
+        q = torch.zeros_like(k[: case.num_input_tokens])
+        locs = fixture.runner.req_to_token_pool.req_to_token[0, :seq_len].long()
+        fixture.runner.token_to_kv_pool.set_kv_buffer(swa, locs, k, v)
+
+        def run_attention():
+            return (
+                swa(q, None, None, batch, save_kv_cache=False),
+                full(q, None, None, batch, save_kv_cache=False),
+            )
+
+        capture_case = replace(case, prefix_lens=(1,))
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with (
+            torch.no_grad(),
+            torch.cuda.stream(stream),
+            forward_context(ForwardContext(attn_backend=backend)),
+        ):
+            backend.init_cuda_graph_state(case.batch_size, case.num_input_tokens)
+            _prepare_spec_verify_batch(
+                capture_case, batch, topk=1, spec_kind="ngram", device="cuda"
+            )
+            backend.init_forward_metadata_out_graph(batch, in_capture=True)
+            mask_ptrs = [mask.data_ptr() for mask in backend.cuda_graph_custom_mask]
+            self.assertEqual(len(mask_ptrs), backend.num_wrappers)
+            self.assertEqual(len(set(mask_ptrs)), backend.num_wrappers)
+            run_attention()
+            with torch.cuda.graph(graph, stream=stream):
+                swa_output, full_output = run_attention()
+
+            _prepare_spec_verify_batch(
+                case, batch, topk=1, spec_kind="ngram", device="cuda"
+            )
+            backend.init_forward_metadata_out_graph(batch)
+            self.assertEqual(
+                [mask.data_ptr() for mask in backend.cuda_graph_custom_mask], mask_ptrs
+            )
+            graph.replay()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        # Zero Q/K makes each row the mean of its visible values. SWA sees
+        # two, one, then zero poisoned tokens among five keys per query.
+        expected_full = (40 / q.new_tensor([9, 10, 11]))[:, None].expand_as(full_output)
+        expected_swa = q.new_tensor([8, 4, 0])[:, None].expand_as(swa_output)
+        torch.testing.assert_close(full_output, expected_full, atol=0.01, rtol=0)
+        torch.testing.assert_close(swa_output, expected_swa, atol=0.01, rtol=0)
 
 
 if __name__ == "__main__":
