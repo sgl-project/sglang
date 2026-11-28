@@ -1924,6 +1924,13 @@ class Scheduler(
             if self.write_back_overlap is not None:
                 self.tree_cache.write_back_overlap = self.write_back_overlap
                 logger.info("HiCache write-back/decode overlap enabled")
+            else:
+                logger.warning(
+                    "HiCache write-back/decode overlap is unavailable for this "
+                    "configuration. It requires NVIDIA CUDA, a compatible "
+                    "Triton KV writer, the Python TreeCore, and direct "
+                    "page_first_direct write_back without L3. Using stock HiCache."
+                )
 
     def maybe_init_ngram_embedding(self):
         self.ngram_embedding_manager = (
@@ -2333,15 +2340,19 @@ class Scheduler(
                 if (
                     overlap is not None
                     and not TEST_RETRACT
-                    and batch is self.running_batch
                     and batch.forward_mode.is_decode()
-                    and batch_result.delay_sample_func is None
-                    and not self.waiting_queue
-                    and self.chunked_req is None
-                    and not self.grammar_manager.has_waiting_grammars()
-                    and not self._reqs_finishing_inflight(batch)
                 ):
-                    overlap.prepare_lookahead(batch)
+                    overlap.prepare_lookahead(
+                        batch,
+                        allow_new_overlap=(
+                            batch is self.running_batch
+                            and batch_result.delay_sample_func is None
+                            and not self.waiting_queue
+                            and self.chunked_req is None
+                            and not self.grammar_manager.has_waiting_grammars()
+                            and not self._reqs_finishing_inflight(batch)
+                        ),
+                    )
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -5678,7 +5689,9 @@ class Scheduler(
                         # FIXME: pp is not compatible with overlap
                         overlap = self.write_back_overlap
                         overlap_ctx = (
-                            overlap.forward(batch) if overlap is not None else nullcontext()
+                            overlap.forward(batch)
+                            if overlap is not None
+                            else nullcontext()
                         )
                         with overlap_ctx:
                             batch_result = self.model_worker.forward_batch_generation(

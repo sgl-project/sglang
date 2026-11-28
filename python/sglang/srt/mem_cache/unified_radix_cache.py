@@ -5052,9 +5052,13 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def full_protected_size(self) -> int:
         overlap = self.write_back_overlap
-        leased = overlap.protected_size(ComponentType.FULL) if overlap is not None else 0
-        return leased + self.tree_core.full_protected_size() + (
-            self.linker.prefetch_size(PoolName.KV) if self.linker is not None else 0
+        leased = (
+            overlap.protected_size(ComponentType.FULL) if overlap is not None else 0
+        )
+        return (
+            leased
+            + self.tree_core.full_protected_size()
+            + (self.linker.prefetch_size(PoolName.KV) if self.linker is not None else 0)
         )
 
     def window_evictable_size(self, sub_pool: str) -> int:
@@ -5080,9 +5084,19 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def mamba_protected_size(self) -> int:
         overlap = self.write_back_overlap
-        leased = overlap.protected_size(self.slot_id(TREE_STATE)) if overlap is not None else 0
-        return leased + self.tree_core.mamba_protected_size() + (
-            self.linker.prefetch_size(PoolName.MAMBA) if self.linker is not None else 0
+        leased = (
+            overlap.protected_size(self.slot_id(TREE_STATE))
+            if overlap is not None
+            else 0
+        )
+        return (
+            leased
+            + self.tree_core.mamba_protected_size()
+            + (
+                self.linker.prefetch_size(PoolName.MAMBA)
+                if self.linker is not None
+                else 0
+            )
         )
 
     def total_size(self) -> tuple[int, int]:

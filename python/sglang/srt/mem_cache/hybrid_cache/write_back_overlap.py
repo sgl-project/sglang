@@ -103,7 +103,11 @@ class WriteBackOverlap:
         from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 
         cache = scheduler.tree_cache
-        if not isinstance(cache, UnifiedRadixCache) or not cache.is_write_back:
+        if (
+            not isinstance(cache, UnifiedRadixCache)
+            or cache._tree_core_backend != "python"
+            or not cache.is_write_back
+        ):
             return None
         parallel = get_parallel()
         if (
@@ -178,15 +182,19 @@ class WriteBackOverlap:
         return self.streams
 
     def _is_cold_leaf(self, node):
+        # create() only enables overlap on the Python TreeCore. The Rust
+        # inspection bindings are not available in production builds.
         tree = self.cache.tree_core
-        inspect = getattr(tree, "inspect_is_device_evictable_leaf", None)
-        if inspect is not None:
-            return inspect(node)
         return tree._is_device_leaf(tree.node_by_id(node))
 
     def stage(self, node):
         tree = self.cache.tree_core
-        if node in self.staged or not self._is_cold_leaf(node):
+        if (
+            not self.cache.is_write_back
+            or self.cache.enable_storage
+            or node in self.staged
+            or not self._is_cold_leaf(node)
+        ):
             return
         value, pools = tree.build_backup_spec(node)
         if value.numel() == 0 or any(
@@ -295,6 +303,17 @@ class WriteBackOverlap:
         self.cache._all_reduce(vote, torch.distributed.ReduceOp.MIN)
         return bool(vote.item())
 
+    def _agree(self, *values):
+        if self.cache.tp_world_size == 1:
+            return True
+        # MIN of the values and of their negatives gives both extrema.
+        vote = torch.tensor(
+            (*values, *(-v for v in values)), dtype=torch.int64, device="cpu"
+        )
+        self.cache._all_reduce(vote, torch.distributed.ReduceOp.MIN)
+        low, neg_high = vote.view(2, -1).tolist()
+        return all(a == -b for a, b in zip(low, neg_high, strict=True))
+
     def _first_retract_can_fit(self, batch, required):
         if len(batch.reqs) < 2:
             return False
@@ -312,23 +331,31 @@ class WriteBackOverlap:
 
     def _supports_batch(self, batch):
         return (
-            self.scheduler.uocr_runtime is None
+            self.cache.is_write_back
+            and not self.cache.enable_storage
+            and self.scheduler.uocr_runtime is None
             and self.scheduler.decode_offload_manager is None
             and not any(r.beam_group is not None for r in batch.reqs)
         )
 
-    def _shortfall(self, batch):
-        return batch.new_tokens_required_next_decode() - self.allocator.available_size()
+    def _shortfall(self, batch, *, eligible):
+        required = batch.new_tokens_required_next_decode()
+        # The logical batch is shared by TP ranks. Only a page boundary
+        # can need a vote about rank-local allocator or transfer state.
+        if not required:
+            return 0 if eligible else None
+        shortfall = max(0, required - self.allocator.available_size())
+        if not self._agree(shortfall, int(eligible), int(self.lookahead is not None)):
+            return None
+        return shortfall if eligible else None
 
     def _busy(self):
         return self.background or self.pending or self.cache.ongoing_write_through
 
-    def _select_transfers(self, batch, shortfall, *, lookahead=False):
-        evictable = self.cache.full_evictable_size()
-        if not evictable:
-            return False, None
+    def _select_transfers(self, batch, shortfall, *, enabled):
+        evictable = self.cache.full_evictable_size() if enabled else 0
         enough = evictable >= shortfall
-        leaves = self._pick_leaves(min(evictable, shortfall))
+        leaves = self._pick_leaves(min(evictable, shortfall)) if evictable else None
         ready = bool(leaves) and self._can_stage(leaves)
         if ready:
             selected = sum(item[1].numel() for item in leaves)
@@ -340,18 +367,35 @@ class WriteBackOverlap:
                     and self._first_retract_can_fit(batch, shortfall)
                 )
             )
-        if not self._unanimous(ready):
-            return enough, None
-        return enough, self._allocate_transfers(leaves, lookahead=lookahead)
+        mode = (1 if enough else 2) if ready else 0
+        # Node handles and backup shapes must also match so all ranks publish
+        # the same leaves and process the asynchronous ACKs in the same order.
+        signature = 0
+        if ready and self.cache.tp_world_size > 1:
+            signature = hash(
+                tuple(
+                    (
+                        node,
+                        value.numel(),
+                        tuple(t.cpu.numel() for t in staged.state.values()),
+                    )
+                    for node, value, _, staged in leaves
+                )
+            ) & ((1 << 63) - 1)
+        if not self._agree(mode, signature) or not mode:
+            return False, None
+        return enough, self._allocate_transfers(leaves)
 
-    def prepare_lookahead(self, batch):
+    def prepare_lookahead(self, batch, *, allow_new_overlap=True):
         """Read only cold pages while the just-submitted decode is in flight."""
-        if self._busy() or not self._supports_batch(batch):
+        shortfall = self._shortfall(
+            batch, eligible=allow_new_overlap and self._supports_batch(batch)
+        )
+        if not shortfall:
             return
-        shortfall = self._shortfall(batch)
-        if shortfall <= 0:
-            return
-        enough, indexed = self._select_transfers(batch, shortfall, lookahead=True)
+        enough, indexed = self._select_transfers(
+            batch, shortfall, enabled=not self._busy()
+        )
         if indexed is None:
             return
         # Pin the source until the next scheduling decision. The destinations
@@ -413,10 +457,13 @@ class WriteBackOverlap:
 
     def prepare_decode(self, batch, *, allow_new_overlap=True):
         """Return None for stock, True for a page handoff, False for retract-first."""
-        if not self._supports_batch(batch):
+        shortfall = self._shortfall(batch, eligible=self._supports_batch(batch))
+        if not shortfall:
             self.cancel_lookahead()
+            if shortfall == 0:
+                # Do not evict pages that this step does not actually need.
+                batch.write_back_overlap_pages = ()
             return None
-        shortfall = self._shortfall(batch)
         can_overlap = allow_new_overlap and not self._busy()
         plan, self.lookahead = self.lookahead, None
         if plan is not None:
@@ -435,13 +482,7 @@ class WriteBackOverlap:
                 )
             self._discard_lookahead(plan)
 
-        if shortfall <= 0:
-            # Do not evict pages that this step does not actually need.
-            batch.write_back_overlap_pages = ()
-            return None
-        if not can_overlap:
-            return None
-        enough, indexed = self._select_transfers(batch, shortfall)
+        enough, indexed = self._select_transfers(batch, shortfall, enabled=can_overlap)
         if indexed is None:
             return None
         return self._apply_plan(batch, shortfall, enough, indexed)
@@ -466,10 +507,10 @@ class WriteBackOverlap:
         )
         return True
 
-    def _allocate_transfers(self, leaves, *, lookahead=False):
+    def _allocate_transfers(self, leaves):
         # Prepare host destinations, but do not alter tree ownership until
         # each rank has reserved all its destinations.
-        cc, tree = self.controller, self.cache.tree_core
+        cc = self.controller
         indexed = []
         for node, value, pools, staged in leaves:
             if self.cache._execute_kv_backup(node, value, pools, []) is None:
@@ -483,17 +524,9 @@ class WriteBackOverlap:
             indexed.append((node, value, pools, staged, op, transfers))
 
         if not self._unanimous(len(indexed) == len(leaves)):
-            if lookahead:
-                self._release_previews(indexed)
-                return None
-            # Nothing was detached; let the ordinary writer settle any host
-            # allocations that did succeed. Cache metadata remains native.
-            for node, _, pools, _, op, _ in indexed:
-                tree.commit_backup(node, op.host_indices, pools)
-                publish = self.cache._backup_publish_node_ids(node, pools)
-                self.cache._track_write_through_node(node, None, publish)
-                cc.write_queue.append(op)
-            self.cache.writing_check(write_back=True)
+            # No DMA or tree mutation has occurred. Roll back even on ranks
+            # that succeeded, instead of publishing a partial TP backup.
+            self._release_previews(indexed)
             return None
         return indexed
 
@@ -505,7 +538,9 @@ class WriteBackOverlap:
         device_indices = torch.cat(
             [transfers[0].device_indices for *_, transfers in indexed]
         )
-        host_indices = torch.cat([transfers[0].host_indices for *_, transfers in indexed])
+        host_indices = torch.cat(
+            [transfers[0].host_indices for *_, transfers in indexed]
+        )
 
         # Launch Full D2H before the next forward. Only the corresponding
         # layer's store waits on each event, not the whole graph.
@@ -516,7 +551,9 @@ class WriteBackOverlap:
                 layer = anchor.layer_mapper(layer_id)
                 if layer is None:
                     continue
-                pool.backup_from_device_layer_direct(layer, host_indices, device_indices)
+                pool.backup_from_device_layer_direct(
+                    layer, host_indices, device_indices
+                )
                 self.fences.event_for(layer_id).record(stream)
             full_done = torch.cuda.Event()
             full_done.record(stream)
@@ -539,7 +576,7 @@ class WriteBackOverlap:
             tree.commit_backup(node, op.host_indices, pools)
             host_lock = self.cache.inc_host_lock_ref(node).to_dec_params()
             result = tree.demote(node)
-            delayed = dict(result.device_frees)
+            delayed, result.device_frees = result.device_frees, {}
             del delayed[ComponentType.FULL]
             if take * self.page_size < value.numel():
                 delayed[ComponentType.FULL] = [value[take * self.page_size :]]

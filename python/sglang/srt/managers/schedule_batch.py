@@ -3034,6 +3034,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         retracted_reqs = []
         reqs_to_abort: List[Req] = []
+
         def fits():
             if defer_extra_eviction:
                 needed = self.new_tokens_required_next_decode(sorted_indices)

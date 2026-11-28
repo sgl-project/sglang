@@ -46,7 +46,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_exec, get_memory, get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.speculative.eagle_utils import draft_step_writes
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -357,10 +363,16 @@ class TritonAttnBackend(AttentionBackend):
         self.write_back_fences = None
         if (
             envs.SGLANG_HICACHE_WRITE_BACK_OVERLAP.get()
+            and _is_cuda
             and not self.use_mla
+            and envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get() == "python"
             and get_memory().enable_hierarchical_cache
             and get_memory().hicache_write_policy == "write_back"
-            and torch.device(self.device).type == "cuda"
+            and get_memory().hicache_io_backend == "direct"
+            and get_memory().hicache_mem_layout == "page_first_direct"
+            and getattr(
+                model_runner.model, "supports_hicache_write_back_overlap", False
+            )
         ):
             from sglang.srt.mem_cache.hybrid_cache.write_back_overlap import (
                 WriteBackFences,
