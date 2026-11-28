@@ -18,7 +18,9 @@ from sglang.srt.lora.moe.base_gemm_provider.pair_row_domain import (
 )
 from sglang.srt.lora.moe.quant_info import (
     MoeLoraBf16QuantInfo,
+    MoeLoraFp8ChannelQuantInfo,
     MoeLoraFp8QuantInfo,
+    MoeLoraFp8TensorQuantInfo,
     StandardLayoutQuantInfo,
 )
 
@@ -247,3 +249,56 @@ class TritonFp8PairProvider(_TritonFp8Provider):
             ),
         )
         return (*row_state.act_quant, _QUANT_GROUP)
+
+
+class TritonFp8ChannelPairProvider(_TritonFp8Provider):
+    contract = MoeBaseProviderContract(
+        key="triton_fp8_channel_contiguous", quant_info_cls=MoeLoraFp8ChannelQuantInfo
+    )
+
+    _config_per_channel_quant = True
+
+
+def _routed_rows_scale(rows: torch.Tensor, pair_to_row: torch.Tensor) -> torch.Tensor:
+    """Exclude unwritten rows (pair_to_row == -1) from the dynamic FP8 scale."""
+    row_amax = torch.linalg.vector_norm(rows, float("inf"), dim=1, dtype=torch.float32)
+    amax = torch.where(pair_to_row >= 0, row_amax, 0.0).amax()
+    return (amax.clamp(min=1e-12) / torch.finfo(torch.float8_e4m3fn).max).reshape(1)
+
+
+class TritonFp8TensorPairProvider(_TritonFp8Provider):
+    contract = MoeBaseProviderContract(
+        key="triton_fp8_tensor_contiguous", quant_info_cls=MoeLoraFp8TensorQuantInfo
+    )
+
+    def gateup(self, row_state: TritonRowState, out: torch.Tensor) -> None:
+        self._invoke(
+            row_state.hidden_states,
+            self.quant_info.w13_weight,
+            out,
+            row_state,
+            top_k=row_state.top_k,
+            config=row_state.config,
+            b_scale=self.quant_info.w13_scale,
+            a_scale=self.quant_info.w13_input_scale,
+        )
+
+    def down(
+        self,
+        row_state: TritonRowState,
+        act_out: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        a_scale = self.quant_info.w2_input_scale
+        if a_scale is None:
+            a_scale = _routed_rows_scale(act_out, row_state.pair_to_row)
+        self._invoke(
+            act_out,
+            self.quant_info.w2_weight,
+            out,
+            row_state,
+            top_k=1,
+            config=row_state.down_config,
+            b_scale=self.quant_info.w2_scale,
+            a_scale=a_scale,
+        )

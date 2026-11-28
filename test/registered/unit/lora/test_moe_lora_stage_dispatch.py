@@ -122,10 +122,47 @@ class TestActQuantReadiness(CustomTestCase):
             )
             return fused_b_act.call_args.kwargs["act_quant"]
 
+    def test_block_scaled_down_uses_only_rows_written_by_the_last_activation(self):
+        from sglang.srt.lora.moe.base_gemm_provider import cutedsl_blockscaled as bs
+
+        for per_token in (False, True):
+            with self.subTest(per_token=per_token):
+                provider = self._provider(
+                    bs.CuteDslNvFp4ContiguousProvider,
+                    _per_row=per_token,
+                    _rows_spec=mock.Mock(return_value=object()),
+                    act_out_shape=lambda state: (8, 128),
+                    _quantize_rows=mock.Mock(),
+                )
+                state = self._row_state(
+                    bs.CuteDslBlockScaledContiguousRowState,
+                    act_q="act_q",
+                    act_sf="act_sf",
+                    act_rs="act_rs" if per_token else None,
+                    pair_to_row="pair_to_row",
+                )
+                act_out = torch.zeros((8, 128), dtype=torch.bfloat16)
+                for fused, width, ready in (
+                    (False, 32, True),
+                    (True, 24, False),
+                    (True, 32, not per_token),
+                ):
+                    target = self._activate(
+                        provider, state, fused=fused, tile_width=width
+                    )
+                    self.assertEqual(target is not None, ready)
+                    self.assertEqual(state.act_quant_ready, ready)
+                    provider._quantize_rows.reset_mock()
+                    provider.down(state, act_out, "out")
+                    self.assertEqual(provider._quantize_rows.called, not ready)
+
     def test_fp8_down_quantizes_after_fused_activation(self):
         from sglang.srt.lora.moe.base_gemm_provider import cutedsl_fp8
 
-        for cls, group in ((cutedsl_fp8.CuteDslFp8ContiguousProvider, 128),):
+        for cls, group in (
+            (cutedsl_fp8.CuteDslFp8ContiguousProvider, 128),
+            (cutedsl_fp8.CuteDslFp8ChannelContiguousProvider, 256),
+        ):
             with (
                 self.subTest(provider=cls.__name__),
                 mock.patch.object(
