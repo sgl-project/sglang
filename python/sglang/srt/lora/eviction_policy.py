@@ -70,6 +70,12 @@ class LRUEvictionPolicy(EvictionPolicy):
                 self.eviction_count += 1
                 return uid
 
+        # Fallback for untracked non-None candidates in deterministic order
+        for uid in sorted(c for c in candidates if c is not None):
+            logger.debug(f"Selected untracked LoRA {uid} for eviction (LRU)")
+            self.eviction_count += 1
+            return uid
+
         # If no tracked UID found in candidates, check if None is available
         # This happens when the batch consists entirely of LoRA requests
         # and None (base model) is the only eviction candidate
@@ -112,6 +118,12 @@ class FIFOEvictionPolicy(EvictionPolicy):
                 self.eviction_count += 1
                 return uid
 
+        # Fallback for untracked non-None candidates in deterministic order
+        for uid in sorted(c for c in candidates if c is not None):
+            logger.debug(f"Selected untracked LoRA {uid} for eviction (FIFO)")
+            self.eviction_count += 1
+            return uid
+
         # If no tracked UID found in candidates, check if None is available
         # This happens when the batch consists entirely of LoRA requests
         # and None (base model) is the only eviction candidate
@@ -134,6 +146,7 @@ def get_eviction_policy(policy_name: str) -> EvictionPolicy:
         "fifo": FIFOEvictionPolicy,
         "lru": LRUEvictionPolicy,
     }
-    if policy_name not in policies:
+    normalized = policy_name.lower() if isinstance(policy_name, str) else policy_name
+    if normalized not in policies:
         raise ValueError(f"Unknown eviction policy: {policy_name}")
-    return policies[policy_name]()
+    return policies[normalized]()
