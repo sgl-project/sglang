@@ -188,7 +188,7 @@ def _validate_custom_placement_group(pg: PlacementGroup, world_size: int) -> Non
 
 
 def _prewarm_scheduler_nodes(
-    pg, bundle_for_node, world_size, tokenizer_opts, processor_opts, has_python_frontend
+    pg, bundle_for_node, world_size, scheduler_args, frontend_args
 ):
     """Warm each scheduler node once and include the driver's Python frontend."""
     indices = (
@@ -197,10 +197,8 @@ def _prewarm_scheduler_nodes(
         else _resolve_bundle_indices(pg, world_size)
     )
     nodes = ray.util.placement_group_table(pg)["bundles_to_node_id"]
-    driver = ray.get_runtime_context().get_node_id()
     # Several bundles can share one physical node and its HF cache.
     bundles_by_node = {nodes[i]: i for i in indices}
-    driver_hosts_scheduler = bundles_by_node.pop(driver, None) is not None
     remote_prewarm = ray.remote(num_cpus=0, max_retries=0)(prewarm_hf_modules_on_node)
     pending = []
     try:
@@ -210,15 +208,10 @@ def _prewarm_scheduler_nodes(
                     placement_group=pg, placement_group_bundle_index=bundle
                 )
             )
-            pending.append(
-                task.remote(tokenizer_opts, processor_opts, processor_opts is None)
-            )
-        if driver_hosts_scheduler or has_python_frontend:
-            prewarm_hf_modules_on_node(
-                tokenizer_opts,
-                processor_opts,
-                processor_opts is None or has_python_frontend,
-            )
+            # Even on the driver node, actors inherit the Ray worker runtime_env.
+            pending.append(task.remote(*scheduler_args))
+        if frontend_args is not None:
+            prewarm_hf_modules_on_node(*frontend_args)
     finally:
         if pending:
             # Wait for every node even if one task failed.

@@ -103,7 +103,7 @@ def load_scheduler_tokenizer(*, is_multimodal: bool):
 
 
 def _prewarm_in_subprocess(
-    staging_dir, tokenizer_opts, processor_opts, load_standalone_tokenizer
+    staging_dir, tokenizer_opts, processor_loads, load_standalone_tokenizer
 ):
     kill_itself_when_parent_died()
     # The parent may already have died before the watchdog was installed.
@@ -114,8 +114,8 @@ def _prewarm_in_subprocess(
     dynamic_module_utils.HF_MODULES_CACHE = staging_dir
     sys.path.insert(0, staging_dir)
     load_plugins()
-    if processor_opts is not None:
-        get_processor(**tokenizer_opts, **processor_opts)
+    for options in processor_loads:
+        get_processor(**options)
     if load_standalone_tokenizer:
         # Python detokenizers load a standalone tokenizer even for MM models.
         get_tokenizer(**tokenizer_opts)
@@ -129,42 +129,79 @@ def maybe_prewarm_local_hf_modules(*, prewarm_scheduler_nodes=None):
         serving = get_serving()
         parallel = get_parallel()
         skip_tokenizer = serving.skip_tokenizer_init
-        warm_remote_nodes = prewarm_scheduler_nodes is not None and not skip_tokenizer
+        disagg = get_disagg()
+        # Scheduler.init_disaggregation and TokenizerManager both create receivers.
+        receiver_loads_processor = (
+            disagg.language_only
+            and disagg.encoder_transfer_backend in ("zmq_to_scheduler", "mooncake")
+        )
+        warm_ray_workers = prewarm_scheduler_nodes is not None and (
+            not skip_tokenizer or receiver_loads_processor
+        )
         has_python_frontend = (
             parallel.node_rank == 0 and not envs.SGLANG_RUST_SERVER.get()
         )
-        if skip_tokenizer:
-            # Only concurrent Python MM tokenizer workers still load a processor.
-            if (
-                not has_python_frontend
-                or serving.tokenizer_worker_num <= 1
-                or get_disagg().language_model_only
-            ):
-                return
-        elif (
-            not warm_remote_nodes
+        frontend_loads_processor = (
+            has_python_frontend and not disagg.language_model_only
+        )
+        if (
+            skip_tokenizer
+            and not receiver_loads_processor
+            and (not frontend_loads_processor or serving.tokenizer_worker_num <= 1)
+        ):
+            return
+        if (
+            not warm_ray_workers
             and not has_python_frontend
             and parallel.tp_size * parallel.pp_size * parallel.dp_size
             <= parallel.nnodes
         ):
             return
 
-        # A Ray scheduler can see an absolute checkpoint mount absent on the driver.
-        path = Path(serving.tokenizer_path)
-        if not path.is_dir() and not (warm_remote_nodes and path.is_absolute()):
+        # Relative paths are resolved in the Ray worker's working directory.
+        if not warm_ray_workers and not Path(serving.tokenizer_path).is_dir():
             return
-        is_multimodal = process_model_config().is_multimodal
-        if skip_tokenizer and not is_multimodal:
+        is_multimodal = (
+            not skip_tokenizer or frontend_loads_processor
+        ) and process_model_config().is_multimodal
+        if skip_tokenizer and not (receiver_loads_processor or is_multimodal):
             return
         tokenizer_opts, processor_opts = _tokenizer_load_options(is_multimodal)
-        if warm_remote_nodes:
-            prewarm_scheduler_nodes(tokenizer_opts, processor_opts, has_python_frontend)
-        else:
-            # At TP=1 the Python frontend and scheduler can still race.
-            load_standalone = not skip_tokenizer and (
-                processor_opts is None or has_python_frontend
+
+        def loader_args(*, scheduler, frontend):
+            processors = []
+            if processor_opts is not None and (
+                (scheduler and not skip_tokenizer)
+                or (frontend and frontend_loads_processor)
+            ):
+                processors.append({**tokenizer_opts, **processor_opts})
+            if receiver_loads_processor and (
+                not processors
+                or get_model().model_path != serving.tokenizer_path
+                or serving.tokenizer_backend is None
+            ):
+                # MMReceiver resolves AutoConfig from tokenizer_path, without model_name.
+                options = dict(
+                    tokenizer_opts,
+                    image_processor_backend=get_mm().image_processor_backend,
+                )
+                if options["tokenizer_backend"] is None:
+                    del options["tokenizer_backend"]
+                processors.append(options)
+            standalone = not skip_tokenizer and (frontend or not is_multimodal)
+            return tokenizer_opts, processors, standalone
+
+        if warm_ray_workers:
+            prewarm_scheduler_nodes(
+                loader_args(scheduler=True, frontend=False),
+                loader_args(scheduler=False, frontend=True)
+                if has_python_frontend
+                else None,
             )
-            prewarm_hf_modules_on_node(tokenizer_opts, processor_opts, load_standalone)
+        else:
+            prewarm_hf_modules_on_node(
+                *loader_args(scheduler=True, frontend=has_python_frontend)
+            )
     except Exception:
         logger.warning(
             "Could not prewarm the HF modules cache. Continuing with scheduler startup.",
@@ -173,9 +210,11 @@ def maybe_prewarm_local_hf_modules(*, prewarm_scheduler_nodes=None):
 
 
 def prewarm_hf_modules_on_node(
-    tokenizer_opts, processor_opts, load_standalone_tokenizer
+    tokenizer_opts, processor_loads, load_standalone_tokenizer
 ):
     """Stage imports on this node before publishing complete files to its HF cache."""
+    if not processor_loads and not load_standalone_tokenizer:
+        return
     if not Path(tokenizer_opts["tokenizer_name"]).is_dir():
         return
     cache = Path(dynamic_module_utils.HF_MODULES_CACHE)
@@ -185,7 +224,7 @@ def prewarm_hf_modules_on_node(
         # could import a custom config before staging is active.
         proc = multiprocessing.get_context("spawn").Process(
             target=_prewarm_in_subprocess,
-            args=(staging, tokenizer_opts, processor_opts, load_standalone_tokenizer),
+            args=(staging, tokenizer_opts, processor_loads, load_standalone_tokenizer),
         )
         proc.start()
         try:
