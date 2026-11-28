@@ -63,7 +63,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_progress import (
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    log_generation_failure,
+)
 from sglang.srt.observability.trace import extract_trace_headers
 
 logger = init_logger(__name__)
@@ -418,7 +421,7 @@ async def _dispatch_job_async(
             # DELETE removed the job and stopped its generation
             logger.info("Video job %s was deleted", job_id)
             return
-        logger.error("Video job %s failed (%s)", job_id, type(e).__name__)
+        log_generation_failure(logger, "Video", job_id, e)
         await VIDEO_STORE.update_fields(
             job_id,
             {

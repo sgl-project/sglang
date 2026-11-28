@@ -55,6 +55,7 @@ from sglang.multimodal_gen.test.test_utils import (
     get_expected_image_format,
     get_video_frame_count,
     is_image_url,
+    is_in_ci,
     prepare_perf_log,
     validate_audio_output,
     validate_image,
@@ -424,6 +425,8 @@ class ServerManager:
             # The admin routes (weights, LoRA, profiling) refuse a server without one.
             *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
+        if is_in_ci():
+            command.extend(["--log-requests", "--log-requests-level", "3"])
         if self.extra_args.strip():
             command.extend(shlex.split(self.extra_args))
         access_log_exclude_flag = "--uvicorn-access-log-exclude-prefixes"
@@ -432,6 +435,8 @@ class ServerManager:
 
         env = os.environ.copy()
         env["SGLANG_DIFFUSION_STAGE_LOGGING"] = "1"
+        if is_in_ci():
+            env["SGLANG_DIFFUSION_CI_DIAGNOSTICS"] = "1"
         env["SGLANG_PERF_LOG_DIR"] = log_dir.as_posix()
 
         # Apply custom environment variables

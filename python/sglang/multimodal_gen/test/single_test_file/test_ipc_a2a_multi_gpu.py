@@ -527,9 +527,9 @@ def _run_ranks(test, world: int, port: int, marker: str, *worker_args: str, **en
         timeout=1200,
         env={**os.environ, **env},
     )
-    print(proc.stdout[-4000:])
+    print(proc.stdout if proc.returncode else proc.stdout[-4000:])
     if proc.returncode != 0:
-        print(proc.stderr[-4000:], file=sys.stderr)
+        print(proc.stderr, file=sys.stderr)
     test.assertEqual(proc.returncode, 0, "copy-engine all-to-all diverged")
     if "SKIP" not in proc.stdout:
         test.assertIn(f"{marker} PASS world={world}", proc.stdout)

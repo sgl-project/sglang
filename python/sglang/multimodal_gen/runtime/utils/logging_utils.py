@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 from contextlib import contextmanager
 from enum import Enum
 from functools import lru_cache
@@ -19,6 +20,7 @@ from logging import Logger
 from types import MethodType
 from typing import Any, cast
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
 )
@@ -212,6 +214,30 @@ class _SGLDiffusionLogger(Logger):
         local_main_process_only: bool = False,
         **kwargs: Any,
     ) -> None: ...
+
+
+def log_saved_output(logger: Logger, path: str, *, last: bool = True) -> None:
+    if envs.SGLANG_DIFFUSION_CI_DIAGNOSTICS:
+        logger.info("Output saved to %r", path)
+    elif last:
+        logger.info("Output saved")
+
+
+def failure_locations(exc: BaseException) -> str:
+    return " -> ".join(
+        f"{os.path.basename(frame.f_code.co_filename)}:{line} in {frame.f_code.co_name}"
+        for frame, line in traceback.walk_tb(exc.__traceback__)
+    )
+
+
+def log_generation_failure(
+    logger: Logger, kind: str, job_id: str, exc: Exception
+) -> None:
+    logger.error("%s job %s failed (%s)", kind, job_id, type(exc).__name__)
+    if envs.SGLANG_DIFFUSION_CI_DIAGNOSTICS:
+        logger.error(
+            "%s job %s failure stack: %s", kind, job_id, failure_locations(exc)
+        )
 
 
 def init_logger(name: str) -> _SGLDiffusionLogger:

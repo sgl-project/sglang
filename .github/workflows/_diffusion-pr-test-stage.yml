@@ -179,6 +179,7 @@ jobs:
           DIFFUSION_PARTITION_ID: ${{ inputs.partition_plan != '' && format('{0}', matrix.part) || '' }}
           DIFFUSION_TOTAL_PARTITIONS: ${{ inputs.partition_plan != '' && format('{0}', fromJson(inputs.partition_plan).partition_count) || '' }}
           DIFFUSION_PARTITION_PLAN_JSON: ${{ inputs.partition_plan }}
+          GITHUB_JOB_URL: ${{ job.check_run_id && format('{0}/{1}/actions/runs/{2}/job/{3}', github.server_url, github.repository, github.run_id, job.check_run_id) || '' }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
           python3 test/run_suite.py \
@@ -198,6 +199,7 @@ jobs:
           retention-days: 7
 
       - name: Upload diffusion failure artifacts
+        id: failure_artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -205,6 +207,12 @@ jobs:
           path: diffusion-failures/
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Link diffusion diagnostics
+        if: always() && steps.failure_artifacts.outputs.artifact-url != ''
+        env:
+          ARTIFACT_URL: ${{ steps.failure_artifacts.outputs.artifact-url }}
+        run: echo "[Download diffusion diagnostics]($ARTIFACT_URL)" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()

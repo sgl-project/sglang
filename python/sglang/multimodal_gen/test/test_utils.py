@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 import base64
+import hashlib
 import html
 import io
 import json
@@ -309,11 +310,44 @@ def wait_for_server_health(
     )
 
 
+def run_logged_command(
+    command: list[str],
+    log_path: Path,
+    *,
+    timeout: int,
+    env: dict[str, str] | None = None,
+) -> str:
+    # Write as the child runs so an interrupted test also leaves an artifact.
+    with log_path.open("wb") as stream:
+        try:
+            result = subprocess.run(
+                command,
+                stdout=stream,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = log_path.read_text(encoding="utf-8", errors="replace")
+            raise AssertionError(
+                f"Command timed out after {timeout}s. Log: {log_path}\n{output}"
+            ) from exc
+    output = log_path.read_text(encoding="utf-8", errors="replace")
+    if result.returncode:
+        raise AssertionError(
+            f"Command exited {result.returncode}. Log: {log_path}\n{output}"
+        )
+    return output
+
+
 def run_command(command: list[str]) -> bool:
     """Run a CLI command and return whether it succeeded."""
     print(f"Running command: {' '.join(command)}", flush=True)
     with subprocess.Popen(
         command,
+        env={**os.environ, "SGLANG_DIFFUSION_CI_DIAGNOSTICS": "1"}
+        if is_in_ci()
+        else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -2125,6 +2159,38 @@ def compare_with_gt(
 
 def _safe_artifact_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+
+
+def save_failed_generation(case_id: str, request_index: int, content: bytes) -> None:
+    artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
+    if not artifact_dir or not content:
+        return
+    if is_mp4(content):
+        ext = "mp4"
+    elif is_png(content):
+        ext = "png"
+    elif is_jpeg(content):
+        ext = "jpg"
+    elif is_webp(content):
+        ext = "webp"
+    else:
+        return
+    digest = hashlib.sha256(content).hexdigest()[:16]
+    path = (
+        Path(artifact_dir)
+        / "generated"
+        / (f"{_safe_artifact_name(case_id)}-request-{request_index}-{digest}.{ext}")
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_bytes(content)
+        print(
+            f"[diffusion] Failure artifact: {path.relative_to(artifact_dir)}",
+            flush=True,
+        )
+    except OSError as exc:
+        print(f"::warning:: Cannot save generated output for {case_id}: {exc}")
 
 
 def _format_metric_value(value: float) -> str:

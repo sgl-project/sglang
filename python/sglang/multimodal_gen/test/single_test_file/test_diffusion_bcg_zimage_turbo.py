@@ -1,6 +1,5 @@
 import json
 import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +10,7 @@ from sglang.multimodal_gen.test.server.test_server_utils import ServerManager
 from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     get_dynamic_server_port,
+    run_logged_command,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,27 +71,14 @@ class TestDiffusionBCGZImageTurbo(CustomTestCase):
             str(perf_path),
         ]
 
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=300,
-        )
-        log_path.write_text(result.stdout, encoding="utf-8")
+        output = run_logged_command(cmd, log_path, timeout=300)
 
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"Z-Image-Turbo BCG command failed. Log: {log_path}\n"
-            f"{result.stdout[-4000:]}",
-        )
-        self.assertNotIn("Falling back to diffusers backend", result.stdout)
-        self.assertNotIn("Using diffusers backend", result.stdout)
-        self.assertNotIn("Loaded diffusers pipeline", result.stdout)
-        self.assertNotIn("[Diffusion BCG] capture failed", result.stdout)
-        self.assertIn("[Diffusion BCG] captured", result.stdout)
-        self.assertIn("Pixel data generated successfully", result.stdout)
+        self.assertNotIn("Falling back to diffusers backend", output)
+        self.assertNotIn("Using diffusers backend", output)
+        self.assertNotIn("Loaded diffusers pipeline", output)
+        self.assertNotIn("[Diffusion BCG] capture failed", output)
+        self.assertIn("[Diffusion BCG] captured", output)
+        self.assertIn("Pixel data generated successfully", output)
 
         self.assertTrue(perf_path.exists(), f"perf dump not found: {perf_path}")
         perf = json.loads(perf_path.read_text(encoding="utf-8"))

@@ -25,7 +25,10 @@ from openai import OpenAI
 from PIL import ImageOps
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    failure_locations,
+    init_logger,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestPerfRecord
 from sglang.multimodal_gen.runtime.utils.vision import load_image
 from sglang.multimodal_gen.test.server.realtime_consistency import (
@@ -79,12 +82,12 @@ from sglang.multimodal_gen.test.test_utils import (
     get_dynamic_server_port,
     gt_exists,
     image_bytes_to_numpy,
-    is_in_ci,
     load_action_consistency_gt,
     load_audio_consistency_gt,
     load_consistency_gt,
     save_audio_gt_artifact,
     save_consistency_failure_artifact,
+    save_failed_generation,
     save_generated_artifact_images,
     save_missing_consistency_gt_artifact,
     wait_for_req_perf_record,
@@ -167,9 +170,6 @@ def diffusion_server(
     default_port = get_dynamic_server_port()
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     extra_args = "--model-type diffusion"
-    if is_in_ci():
-        # Capture the seed for reproducibility without emitting prompt text.
-        extra_args += " --log-requests --log-requests-level 1"
     if overrides := os.environ.get("SGLANG_TEST_SERVE_ARGS"):
         extra_args += f" {overrides}"
 
@@ -419,6 +419,9 @@ class DiffusionServerBase:
             ctx, case_id, generate_fn, client
         )
 
+        logger.info(
+            "Generated output for %s: request=%s, bytes=%d", case_id, rid, len(content)
+        )
         if not collect_perf:
             return None, content
 
@@ -960,7 +963,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
             if artifact_dir:
                 try:
-                    save_generated_artifact_images(
+                    paths = save_generated_artifact_images(
                         out_dir=Path(artifact_dir) / "consistency_failures",
                         case_id=case.id,
                         num_gpus=num_gpus,
@@ -968,6 +971,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                         is_video=is_video,
                         output_format="png",
                     )
+                    logger.info("Generated frames in consistency_failures: %s", paths)
                 except (OSError, ValueError):
                     logger.exception("Could not save generated frames for %s", case.id)
             raise
@@ -1795,7 +1799,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 failures.append(f"[{label}] Required request skipped: {exc}")
                 _print_case_log_separator(case.id, f"FAILED {label}")
             except (Exception, pytest.fail.Exception) as exc:
-                failures.append(f"[{label}] {exc}")
+                failures.append(f"[{label}] {exc}\n{failure_locations(exc)}")
                 _print_case_log_separator(case.id, f"FAILED {label}")
             else:
                 _print_case_log_separator(case.id, f"PASSED {label}")
@@ -1844,7 +1848,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 _print_case_log_separator(case.id, f"FAILED {label}")
                 break
             except (Exception, pytest.fail.Exception) as exc:
-                failures.append(f"[{label}] {exc}")
+                failures.append(f"[{label}] {exc}\n{failure_locations(exc)}")
                 _print_case_log_separator(case.id, f"FAILED {label}")
             else:
                 _print_case_log_separator(case.id, f"PASSED {label}")
@@ -1909,8 +1913,9 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                 if name == "performance" and isinstance(
                     exc, (AssertionError, pytest.fail.Exception)
                 ):
+                    save_failed_generation(case.id, request_index, content)
                     raise PerformanceValidationError(f"[performance] {exc}") from exc
-                failures.append((name, str(exc)))
+                failures.append((name, f"{exc}\n{failure_locations(exc)}"))
 
         if is_realtime_case:
             chunk_stats = pop_realtime_perf_stats(case.id)
@@ -2021,6 +2026,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             )
 
         if failures:
+            save_failed_generation(case.id, request_index, content)
             formatted_failures = []
             for name, message in failures:
                 if "\n" in message:

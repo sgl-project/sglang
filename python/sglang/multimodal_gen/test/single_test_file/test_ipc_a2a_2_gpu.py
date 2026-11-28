@@ -397,9 +397,9 @@ class TestIpcA2ATwoGpu(CustomTestCase):
             text=True,
             timeout=1200,
         )
-        print(proc.stdout[-4000:])
+        print(proc.stdout if proc.returncode else proc.stdout[-4000:])
         if proc.returncode != 0:
-            print(proc.stderr[-4000:], file=sys.stderr)
+            print(proc.stderr, file=sys.stderr)
         self.assertEqual(proc.returncode, 0, "IPC all-to-all diverged from NCCL")
         self.assertIn("IPC_A2A_PARITY PASS", proc.stdout)
 
@@ -422,9 +422,9 @@ class TestIpcA2ATwoGpu(CustomTestCase):
             text=True,
             timeout=1200,
         )
-        print(proc.stdout[-4000:])
+        print(proc.stdout if proc.returncode else proc.stdout[-4000:])
         if proc.returncode != 0:
-            print(proc.stderr[-4000:], file=sys.stderr)
+            print(proc.stderr, file=sys.stderr)
         self.assertEqual(proc.returncode, 0, "peer partials diverged from all-reduce")
         self.assertIn("TP_PEER_PARTIALS_PARITY PASS", proc.stdout)
 

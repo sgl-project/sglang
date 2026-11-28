@@ -5,6 +5,9 @@ on:
     paths:
       - "scripts/ci/**"
       - ".github/workflows/pr-test.yml"
+      - ".github/workflows/_pr-test-check-changes.yml"
+      - ".github/workflows/_pr-test-detect-changes.yml"
+      - ".github/workflows/pr-test-jit-kernel.yml"
       - ".github/workflows/pr-gate.yml"
       - ".github/workflows/ci-scripts-test.yml"
 
@@ -29,4 +32,4 @@ jobs:
 
       - name: Run tests
         run: |
-          python -m unittest discover -s scripts/ci -p 'test_diffusion_rust_gate.py' -v
+          python -m unittest discover -s scripts/ci -p 'test_diffusion_*.py' -v

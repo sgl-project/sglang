@@ -22,6 +22,8 @@ on:
         value: ${{ jobs.detect.outputs.sgl_kernel }}
       jit_kernel:
         value: ${{ jobs.detect.outputs.jit_kernel }}
+      diffusion_kernel_only:
+        value: ${{ jobs.detect.outputs.diffusion_kernel_only }}
       multimodal_gen:
         value: ${{ jobs.detect.outputs.multimodal_gen }}
       multimodal_gen_server:
@@ -39,12 +41,15 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run_all_tests: ${{ steps.run-mode.outputs.run_all_tests }}
-      main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      main_package: ${{ steps.scope.outputs.diffusion_kernel_only != 'true' && steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
+      diffusion_kernel_only: ${{ steps.scope.outputs.diffusion_kernel_only }}
       simulator: ${{ steps.filter.outputs.simulator || steps.run-mode.outputs.run_all_tests }}
       sgl_kernel: ${{ steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
-      multimodal_gen_server: ${{ steps.filter.outputs.multimodal_gen_server || steps.run-mode.outputs.run_all_tests }}
+      multimodal_gen_server: >-
+        ${{ (steps.scope.outputs.diffusion_kernel_only != 'true' || steps.filter.outputs.diffusion_kernel_source == 'true') &&
+            steps.filter.outputs.multimodal_gen_server || steps.run-mode.outputs.run_all_tests }}
       diffusion_sm103: ${{ steps.filter.outputs.diffusion_sm103 || steps.run-mode.outputs.run_all_tests }}
       processor: ${{ steps.filter.outputs.processor || steps.run-mode.outputs.run_all_tests }}
       server_args_docs: ${{ steps.filter.outputs.server_args_docs || steps.run-mode.outputs.run_all_tests }}
@@ -76,6 +81,19 @@ jobs:
         if: steps.run-mode.outputs.run_all_tests != 'true'
         with:
           filters: |
+            all_paths: ["**"]
+            diffusion_kernel_source: &diffusion_kernel_source
+              - "python/sglang/kernels/{ops,jit/csrc,kda_kernels/csrc}/diffusion/**"
+              # KDA also houses LLM kernels. Only these implementations belong to the diffusion facade.
+              - "python/sglang/kernels/kda_kernels/{causal_conv3d_cat_pad_jit,flux2_qkv_epilogue_jit,flux2_token_cat_fp8_triton,layernorm_modulate_triton,ltx2_qknorm_split_rope_jit,norm_scale_shift_jit,residual_gate_add_jit,sana_depthwise_glu_triton,silu_temporal_pad}.py"
+            diffusion_kernel_paths: &diffusion_kernel_paths
+              - *diffusion_kernel_source
+              - "test/registered/kernels/{ops,benchmark}/diffusion/**"
+            shared_diffusion_kernel: &shared_diffusion_kernel
+              - "python/sglang/kernels/ops/diffusion/common/**/!(*.md)"
+              # SRT imports this operator in beam.py and models/utils.py.
+              - "python/sglang/kernels/ops/diffusion/{__init__,rope/__init__,rope/qknorm_rope_jit}.py"
+              - "python/sglang/kernels/jit/csrc/diffusion/qknorm_rope.cuh"
             main_package:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/_pr-test-*.yml"
@@ -84,12 +102,11 @@ jobs:
               - "python/pyproject.toml"
               - "python/setup.py"
               - "python/sglang/!(multimodal_gen|kernels)/**/!(*.md)"
-              # ops/diffusion/common stays since kda_kernels (an srt path) imports it.
               - "python/sglang/kernels/{,ops/,jit/,jit/csrc/}!(*.md)"
               - "python/sglang/kernels/!(aot|ops|jit)/**/!(*.md)"
               - "python/sglang/kernels/jit/!(csrc)/**/!(*.md)"
               - "python/sglang/kernels/{ops,jit/csrc}/!(diffusion)/**/!(*.md)"
-              - "python/sglang/kernels/ops/diffusion/common/**/!(*.md)"
+              - *shared_diffusion_kernel
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/{,registered/,registered/kernels/}!(*.md)"
@@ -132,10 +149,7 @@ jobs:
               - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
               - "python/sglang/srt/observability/**"
-              - "python/sglang/kernels/ops/diffusion/**"
-              - "python/sglang/kernels/jit/csrc/diffusion/**"
-              - "test/registered/kernels/ops/diffusion/**"
-              - "test/registered/kernels/benchmark/diffusion/**"
+              - *diffusion_kernel_paths
               - "test/registered/unit/diffusion/**"
               - "test/registered/e2e/diffusion/**"
               - "python/sglang/cli/**"
@@ -161,10 +175,7 @@ jobs:
               - "python/sglang/multimodal_gen/test/unit/**/*/!(*.md|*.ipynb)"
               - "python/sglang/srt/model_executor/runner_backend_utils/breakable_cuda_graph/**"
               - "python/sglang/srt/observability/**"
-              - "python/sglang/kernels/ops/diffusion/**"
-              - "python/sglang/kernels/jit/csrc/diffusion/**"
-              - "test/registered/kernels/ops/diffusion/**"
-              - "test/registered/kernels/benchmark/diffusion/**"
+              - *diffusion_kernel_paths
               - "test/registered/unit/diffusion/**"
               - "test/registered/e2e/diffusion/**"
               - "python/sglang/cli/**"
@@ -191,3 +202,24 @@ jobs:
             sgl_kernel:
               # Excludes pr-test-sgl-kernel.yml: an edit there would force a 20-30 min wheel rebuild.
               - "python/sglang/kernels/aot/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
+
+      # paths-filter counts both sides of renames and reads the current PR on reruns
+      - name: Scope kernel suite to diffusion
+        id: scope
+        if: >-
+          github.event_name == 'pull_request_target' && !inputs.git_ref &&
+          steps.filter.outputs.diffusion_kernel_paths == 'true' &&
+          steps.filter.outputs.shared_diffusion_kernel == 'false' &&
+          steps.filter.outputs.diffusion_kernel_paths_count == steps.filter.outputs.all_paths_count
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          if gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" |
+            jq -e --arg base "$BASE_SHA" --arg head "$HEAD_SHA" \
+              '.base.sha == $base and .head.sha == $head and (.changed_files > 0 and .changed_files < 3000)' >/dev/null; then
+            echo "diffusion_kernel_only=true" >> "$GITHUB_OUTPUT"
+          fi

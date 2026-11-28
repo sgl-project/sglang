@@ -16,7 +16,10 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    log_saved_output,
+)
 
 logger = init_logger(__name__)
 
@@ -133,7 +136,7 @@ class EncodeWhileDecoding:
         except Exception:
             self._fail()
             return None
-        logger.info("Output saved")
+        log_saved_output(logger, self.save_file_path)
         return [self.save_file_path]
 
     def abort(self) -> None:

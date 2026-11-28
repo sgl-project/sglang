@@ -310,6 +310,32 @@ def test_request_logger_requires_opt_in_for_reproduction_inputs():
         assert "secret-text" not in str(logger._result_view(result))
 
 
+def test_ci_request_logger_records_full_prompts_once(monkeypatch):
+    from sglang.multimodal_gen.runtime.utils.request_logger import (
+        DiffusionRequestLogger,
+    )
+
+    monkeypatch.setenv("SGLANG_DIFFUSION_CI_DIAGNOSTICS", "1")
+    logger = DiffusionRequestLogger(True, 3, "text", None)
+    target = Mock()
+    logger.targets = [target]
+    prompt = "synthetic positive " * 160
+    negative = "synthetic negative " * 160
+    req = SimpleNamespace(
+        request_id="test",
+        sampling_params=SimpleNamespace(
+            prompt=prompt, negative_prompt=negative, seed=42
+        ),
+    )
+    logger.log_received_request(req)
+    logger.log_finished_request(req, SimpleNamespace(error=None))
+    received, finished = (call.args[0] for call in target.info.call_args_list)
+    assert prompt in received and negative in received
+    assert "'prompt':" not in finished and "'negative_prompt':" not in finished
+    assert "synthetic" not in finished
+    assert "'seed': 42" in finished and "e2e_latency" in finished
+
+
 @pytest.mark.parametrize("success", [True, False])
 def test_ephemeral_mesh_upload_lives_exactly_as_long_as_job(
     monkeypatch, tmp_path, success, gateway_key
@@ -374,3 +400,26 @@ def test_ephemeral_mesh_upload_lives_exactly_as_long_as_job(
             assert job["status"] == ("completed" if success else "failed")
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("diagnostics", [False, True])
+def test_saved_layer_paths_are_only_logged_for_fixture_diagnostics(
+    tmp_path, monkeypatch, caplog, diagnostics
+):
+    import numpy as np
+
+    from sglang.multimodal_gen.configs.task_type import DataType
+    from sglang.multimodal_gen.runtime.entrypoints import utils
+
+    monkeypatch.setenv("SGLANG_DIFFUSION_CI_DIAGNOSTICS", "1" if diagnostics else "0")
+    frame = np.zeros((2, 2, 3), dtype=np.uint8)
+    output = utils.MaterializedOutput(sample=None, frames=[frame, frame])
+    with caplog.at_level(logging.INFO, logger=utils.logger.name):
+        utils.save_materialized_output(
+            output, DataType.IMAGE, str(tmp_path / "fixture.png")
+        )
+    for i in range(2):
+        path = tmp_path / f"fixture_{i}.png"
+        assert path.is_file()
+        assert (str(path) in caplog.text) is diagnostics
+    assert str(tmp_path / "fixture.png") not in caplog.text
