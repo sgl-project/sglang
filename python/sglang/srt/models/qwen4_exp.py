@@ -626,7 +626,10 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
         if self.group_size is None:
             variance = x_float.pow(2).mean(dim=-1, keepdim=True)
         else:
-            group_shape = x_float.shape[:-1] + (-1, self.group_size)
+            group_shape = x_float.shape[:-1] + (
+                x_float.shape[-1] // self.group_size,
+                self.group_size,
+            )
             variance = x_float.reshape(group_shape).pow(2).mean(dim=-1, keepdim=True)
             variance = variance.expand(group_shape).reshape_as(x_float)
         x_norm = x_float * torch.rsqrt(variance + self.eps)
@@ -2223,7 +2226,7 @@ class Qwen4ExpAttentionDecoderLayer(
                 # gate reshape copy disappears along with the sigmoid + mul.
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
-                gate = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+                gate = gate.flatten(1) if gate.ndim == 3 else gate
                 attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
         return output

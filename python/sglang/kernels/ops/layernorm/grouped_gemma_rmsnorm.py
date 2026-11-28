@@ -15,17 +15,21 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-@cache_once
-def _jit_grouped_gemma_rmsnorm_module(group_size: int, dtype: torch.dtype) -> Module:
-    """Compile and cache the JIT grouped Gemma RMSNorm module."""
-    # Validation sits under `cache_once`: once per (group_size, dtype) specialisation,
-    # not once per call.
+def _validate_grouped_gemma_rmsnorm_args(group_size: int, dtype: torch.dtype) -> None:
     if dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"Unsupported dtype {dtype}. Supported: bfloat16, float16")
     if group_size <= 0 or group_size % 512 != 0:
         raise RuntimeError(
             f"Unsupported group_size {group_size}. Must be a multiple of 512."
         )
+
+
+@cache_once
+def _jit_grouped_gemma_rmsnorm_module(group_size: int, dtype: torch.dtype) -> Module:
+    """Compile and cache the JIT grouped Gemma RMSNorm module."""
+    # Validation sits under `cache_once`: once per (group_size, dtype) specialisation,
+    # not once per call.
+    _validate_grouped_gemma_rmsnorm_args(group_size, dtype)
     args = make_cpp_args(group_size, is_arch_support_pdl(), dtype)
     return load_jit(
         "grouped_gemma_rmsnorm",
@@ -66,6 +70,16 @@ def grouped_gemma_rmsnorm(
     Normalized tensor, same shape/dtype as input.
     """
     hidden_size = input.size(-1)
+    if hidden_size % group_size != 0:
+        raise ValueError(
+            f"hidden_size ({hidden_size}) must be divisible by group_size ({group_size})"
+        )
+    if out is not None and out.shape != input.shape:
+        raise ValueError(f"out.shape {out.shape} must match input.shape {input.shape}")
+    if input.numel() == 0:
+        _validate_grouped_gemma_rmsnorm_args(group_size, input.dtype)
+        return torch.empty_like(input) if out is None else out
+
     x = input.reshape(-1, hidden_size)
     if out is None:
         out = torch.empty_like(x)
