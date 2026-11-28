@@ -12,10 +12,11 @@ import requests
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
+    configure_nixl_pd_backend,
 )
 from sglang.test.test_utils import ADMIN_LAUNCH_ARGS_FOR_TEST, admin_post
 
-register_cuda_ci(est_time=168, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=336, stage="extra-a", runner_config="2-gpu-large")
 
 
 class _PrefillCompleteServer(PDDisaggregationServerBase):
@@ -24,10 +25,13 @@ class _PrefillCompleteServer(PDDisaggregationServerBase):
     model_revision = "c1899de289a04d12100db370d81485cdf75e47ca"
 
     policy = "prefill_complete"
+    use_nixl = False
 
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
+        if cls.use_nixl:
+            configure_nixl_pd_backend(cls)
         common = [
             "--revision",
             cls.model_revision,
@@ -397,6 +401,18 @@ class TestPrefillCompleteTimeout(_PrefillCompleteServer):
         # the source as well as the destination before cache flush can succeed.
         self._flush_when_idle()
         self.generate("The capital of France is")
+
+
+class TestNixlPrefillCompleteAllocation(TestPrefillCompleteAllocation):
+    use_nixl = True
+
+
+class TestNixlPrefillCompleteRetry(TestPrefillCompleteRetry):
+    use_nixl = True
+
+
+class TestNixlPrefillCompleteTimeout(TestPrefillCompleteTimeout):
+    use_nixl = True
 
 
 if __name__ == "__main__":
