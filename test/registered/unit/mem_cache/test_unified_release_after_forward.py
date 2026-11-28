@@ -1012,15 +1012,18 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         self.assertEqual(owner._pending_until_retire_pages, 0)
 
 
-def _own_table_cache(*, window):
-    """A full + window cache over the pool's own request table."""
-    bundle, allocator = build_tri_pool(page_size=1)
+def _own_table_cache(*, window, bundle=None):
+    """A full + window cache over the pool's own request table (by default a
+    full + window + state pool of one-token pages)."""
+    if bundle is None:
+        bundle, _ = build_tri_pool(page_size=1)
+    allocator = bundle.token_to_kv_pool_allocator
     cache = UnifiedRadixCache(
         CacheInitParams(
             disable=False,
             req_to_token_pool=bundle.req_to_token_pool,
             token_to_kv_pool_allocator=allocator,
-            page_size=1,
+            page_size=allocator.page_size,
             sliding_window_size=window,
             tree_slots=storage_tree_slots(
                 allocator.storage,
@@ -1137,6 +1140,41 @@ class TestCacheOperationsOverPendingFrees(CustomTestCase):
         steps.forward_processed(launch)
         self.assertEqual(_pending(window), set())
         cache.unlock(lock)
+
+    def test_window_rows_retired_under_a_running_chunk_stay_pending(self):
+        """A chunk's checkpoint retires window rows its forward's earlier queries
+        still read: their ids go back at once, their pages wait for that forward."""
+        bundle = build_unified_bundle(
+            UnifiedGeometry(
+                chain="swa",
+                full_layer_ids=(0,),
+                swa_layer_ids=(1,),
+                page_size=4,
+                window=4,
+            )
+        )
+        allocator, cache, steps = _own_table_cache(window=4, bundle=bundle)
+        window = allocator.swa_attn_allocator
+        req = _request(cache, list(range(5000, 5016)), committed=16, allocated=16)
+        # Frontier 15, window 4: rows [0, 8) retire though the query at 7 reads [4, 7].
+        rows = cache.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :8].clone()
+        retired = set(_physical(window, rows).tolist())
+        chunk_done = mock.Mock(spec=["query"])
+        chunk_done.query.return_value = False  # the chunk's forward still runs
+        launch = _launch(steps, chunk_done)
+
+        checkpoint_kv_cache(req, cache)
+
+        self.assertTrue(bool((_physical(window, rows) < 0).all()))
+        self.assertEqual(_pending(window), retired)
+        self.assertFalse(retired & set(window._free_phys_pages.tolist()))
+        with mock.patch.object(band_module, "wait_signals") as wait:
+            taken = allocator.alloc(8)
+        wait.assert_called_once_with((chunk_done,))
+        self.assertEqual(set(_physical(window, taken).tolist()), retired)
+        steps.forward_processed(launch)
+        self.assertFalse(retired & set(window._free_phys_pages.tolist()))
+        self.assertEqual(window._byte_accounting_violations(), [])
 
 
 if __name__ == "__main__":
