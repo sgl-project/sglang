@@ -341,6 +341,9 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    # Prefill holds the device prefix lock and can initialize a working copy
+    # from that prefix if the host hit cannot be materialized.
+    cow_mamba_on_fallback: bool = False
 
 
 class MatchResult(NamedTuple):

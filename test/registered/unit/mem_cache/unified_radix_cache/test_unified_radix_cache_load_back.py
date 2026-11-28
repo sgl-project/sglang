@@ -1,14 +1,16 @@
 import unittest
 from array import array
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 from sglang.srt.managers.schedule_batch import (
     Req,
+    ScheduleBatch,
 )
-from sglang.srt.managers.schedule_policy import PrefillAdder
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InitLoadBackParams,
@@ -633,6 +635,177 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), avail_before
         )
+
+    @requires_full_mamba_ps1
+    def test_prefill_fallback_stages_mamba_cow_from_device_prefix(self):
+        cache, allocator, pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, pool, 3)
+        device_prefix, host_prefix = chain[-2:]
+        tokens = self._match_tokens_for_chain(cache, chain)
+        self._backup_node(cache, host_prefix)
+        cache.evict(EvictParams(num_tokens=node_key_length(cache, host_prefix)))
+
+        req = Req(
+            rid="mamba-load-back-fallback",
+            origin_input_text="",
+            origin_input_ids=array("q", [*tokens, tokens[-1] + 1]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.init_next_round_input(cache)
+        self.assertEqual(req.last_node, device_prefix)
+        self.assertEqual(req.best_match_node, host_prefix)
+        self.assertGreater(req.prefix_len, 0)
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        prefix_len = req.prefix_len
+        expected_src = node_device_value(cache, device_prefix, ComponentType.MAMBA)
+        self.assertIsNotNone(expected_src)
+        available = pool.mamba_allocator.available_size()
+
+        adder = PrefillAdder(
+            page_size=1,
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=100,
+            rem_chunk_tokens=None,
+        )
+        with mock.patch.object(
+            cache.cache_controller, "load", return_value=None
+        ) as load:
+            adder.add_one_req(req, False, None)
+
+        dst = None
+        try:
+            load.assert_called_once()
+            self.assertEqual(adder.can_run_list, [req])
+            self.assertEqual(req.prefix_len, prefix_len)
+            self.assertEqual(req.last_node, device_prefix)
+            self.assertEqual(req.host_loaded_length, 0)
+            self.assertIsNone(req.kv.mamba_pool_idx)
+            self.assertEqual(pool.mamba_allocator.available_size(), available)
+            self.assertIsNotNone(req.kv.mamba_cow_src_index)
+            self.assertTrue(torch.equal(req.kv.mamba_cow_src_index, expected_src))
+
+            # StateStorage.acquire binds a fresh working slot and marks it for
+            # clearing; the staged fallback CoW must take precedence over clear.
+            dst = pool.mamba_allocator.alloc(1)
+            self.assertIsNotNone(dst)
+            req.kv.mamba_pool_idx = dst[0]
+            req.kv.mamba_needs_clear = True
+            batch = SimpleNamespace()
+            ScheduleBatch._collect_deferred_mamba_cow_and_clear(batch, [req])
+            self.assertIsNotNone(batch.mamba_cow_src_indices)
+            self.assertTrue(torch.equal(batch.mamba_cow_src_indices, expected_src))
+            self.assertTrue(torch.equal(batch.mamba_cow_dst_indices, dst))
+            self.assertIsNone(batch.mamba_clear_indices)
+        finally:
+            if dst is not None:
+                pool.mamba_allocator.free(dst)
+                req.kv.mamba_pool_idx = None
+            cache.unlock(req.lock)
+
+    @requires_full_mamba_ps1
+    def test_prefill_fallback_clears_stale_mamba_cow_at_zero_prefix(self):
+        cache, allocator, pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, pool, 2)
+        host_prefix = chain[-1]
+        tokens = self._match_tokens_for_chain(cache, chain)
+        self._backup_node(cache, host_prefix)
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+
+        req = Req(
+            rid="mamba-load-back-zero-prefix-fallback",
+            origin_input_text="",
+            origin_input_ids=array("q", [*tokens, tokens[-1] + 1]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.init_next_round_input(cache)
+        self.assertEqual(req.prefix_len, 0)
+        self.assertEqual(req.best_match_node, host_prefix)
+        self.assertGreater(req.host_hit_length, 0)
+
+        dst = pool.mamba_allocator.alloc(1)
+        self.assertIsNotNone(dst)
+        req.kv.mamba_pool_idx = dst[0]
+        req.kv.mamba_cow_src_index = torch.tensor([0], dtype=torch.int64)
+
+        adder = PrefillAdder(
+            page_size=1,
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=100,
+            rem_chunk_tokens=None,
+        )
+        with mock.patch.object(
+            cache.cache_controller, "load", return_value=None
+        ) as load:
+            adder.add_one_req(req, False, None)
+
+        try:
+            load.assert_called_once()
+            self.assertEqual(adder.can_run_list, [req])
+            self.assertEqual(req.prefix_len, 0)
+            self.assertEqual(req.host_loaded_length, 0)
+            self.assertIsNone(req.kv.mamba_cow_src_index)
+            self.assertTrue(req.kv.mamba_needs_clear)
+
+            batch = SimpleNamespace()
+            ScheduleBatch._collect_deferred_mamba_cow_and_clear(batch, [req])
+            self.assertIsNone(batch.mamba_cow_src_indices)
+            self.assertIsNotNone(batch.mamba_clear_indices)
+            self.assertTrue(torch.equal(batch.mamba_clear_indices, dst))
+        finally:
+            pool.mamba_allocator.free(dst)
+            req.kv.mamba_pool_idx = None
+            cache.unlock(req.lock)
+
+    @requires_full_mamba_ps1
+    def test_prefill_fallback_defers_when_device_prefix_lacks_mamba_state(self):
+        cache, allocator, pool = self._build_hicache_fixture()
+        chain = self._build_chain_pages(cache, allocator, pool, 3)
+        device_prefix, host_prefix = chain[-2:]
+        tokens = self._match_tokens_for_chain(cache, chain)
+        self._backup_node(cache, host_prefix)
+        cache.evict(EvictParams(num_tokens=node_key_length(cache, host_prefix)))
+
+        req = Req(
+            rid="mamba-load-back-missing-device-state",
+            origin_input_text="",
+            origin_input_ids=array("q", [*tokens, tokens[-1] + 1]),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        req.init_next_round_input(cache)
+        self.assertEqual(req.last_node, device_prefix)
+        self.assertEqual(req.best_match_node, host_prefix)
+        self.assertGreater(req.prefix_len, 0)
+
+        adder = PrefillAdder(
+            page_size=1,
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            running_batch=None,
+            new_token_ratio=1.0,
+            rem_input_tokens=100,
+            rem_chunk_tokens=None,
+        )
+        with (
+            mock.patch.object(
+                cache.cache_controller, "load", return_value=None
+            ) as load,
+            mock.patch.object(
+                cache.tree_core, "get_component_device_value", return_value=None
+            ),
+        ):
+            result = adder.add_one_req(req, False, None)
+
+        load.assert_called_once()
+        self.assertEqual(result, AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertIsNone(req.kv.mamba_cow_src_index)
 
     @requires_full_mamba_ps1
     def test_scheduler_hicache_load_back_rolls_back_mamba_on_load_failure(self):
