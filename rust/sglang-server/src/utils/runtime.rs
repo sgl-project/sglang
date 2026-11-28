@@ -157,17 +157,40 @@ impl Runtime {
         self.spawn_mm_pool(workers, ctx);
     }
 
+    /// The workers, and the processor's feature publishers
+    /// (`mm-publisher-{i}`, see `MmProcessor::feature_publishers`), likewise
+    /// unpinned.
     fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::MmContext>) {
+        use crate::multi_modality::worker::{MmPublisher, MmWorker};
         if !self.core.set_mm_processor(ctx.processor.clone()) {
             tracing::warn!("MM workers started again; admission keeps the first processor");
         }
+        let workers = workers.max(1);
         let mut threads = self.threads.lock().unwrap();
-        spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
-            crate::multi_modality::worker::MmWorker::new(
+        let publishers = ctx.processor.feature_publishers();
+        let publish_tx = (publishers > 0).then(|| {
+            // A worker hands a request on without waiting unless each
+            // worker's last one still waits for a publisher.
+            let (publish_tx, publish_rx) = flume::bounded(workers);
+            spawn_pool("mm-publisher", None, publishers, &mut threads, |_| {
+                MmPublisher::new(
+                    publish_rx.clone(),
+                    self.mm_wiring.tm_tx.clone(),
+                    ctx.clone(),
+                )
+            });
+            publish_tx
+        });
+        spawn_pool("mm-worker", None, workers, &mut threads, |_| {
+            let worker = MmWorker::new(
                 self.mm_wiring.mm_rx.clone(),
                 self.mm_wiring.tm_tx.clone(),
                 ctx.clone(),
-            )
+            );
+            match &publish_tx {
+                Some(publish_tx) => worker.publishing_to(publish_tx.clone()),
+                None => worker,
+            }
         });
     }
 
@@ -377,6 +400,16 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         detokenizer_rx.push(rx);
     }
 
+    if let Some(metrics) = &metrics {
+        use crate::api_server::core::queue_len;
+        metrics.watch_queues(vec![
+            ("intake", queue_len(tok_manager_tx.downgrade())),
+            ("tokenizer", queue_len(tokenizer_tx.downgrade())),
+            ("mm", queue_len(mm_worker_tx.downgrade())),
+            ("scheduler", queue_len(to_scheduler_tx.downgrade())),
+        ]);
+    }
+
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
     let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::wiring::AbortSource>();
@@ -403,6 +436,20 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     )?
     .map(Arc::new);
     let dyn_tokenizer = tokenizer.as_ref().map(|t| t.tokenizer().clone());
+    // Default: a real tokenizer decodes to text, with byte tables when they pass
+    // their startup check, which is slow too, so it also runs before the ports
+    // are bound. `None` (→ `Skip`, raw `output_ids`) only happens under
+    // `skip_tokenizer_init` — `load_tokenizer` rejects a non-skip server with no
+    // tokenizer.
+    let detokenizer_backend = match &dyn_tokenizer {
+        Some(t) => detokenizer::DetokenizerBackend::for_tokenizer(
+            t.clone(),
+            &cfg.server_args.tokenizer_path,
+            cfg.server_args.revision.as_deref(),
+            crate::tokenizer_manager::byte_tables::enabled(),
+        ),
+        None => detokenizer::DetokenizerBackend::Skip,
+    };
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
@@ -422,13 +469,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
-        // Default: a real tokenizer decodes to text. `None` (→ `Skip`, raw
-        // `output_ids`) only happens under `skip_tokenizer_init` —
-        // `load_tokenizer` rejects a non-skip server with no tokenizer.
-        let backend = match &dyn_tokenizer {
-            Some(t) => detokenizer::DetokenizerBackend::Dynamo(t.clone()),
-            None => detokenizer::DetokenizerBackend::Skip,
-        };
+        let backend = detokenizer_backend;
         // Each shard owns its receiver outright (one consumer per shard), so the
         // owned `detok_rx` Vec is moved out element-by-element via the iterator.
         let count = detokenizer_rx.len();
@@ -572,7 +613,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let grpc_server = grpc_listener.map(|listener| {
             let service = api_server::grpc::service::GrpcService::new(
                 core.clone(),
-                &cfg.server_args,
+                cfg.server_args.clone(),
                 hicache_manager.clone(),
             );
             (listener, service)
@@ -2224,6 +2265,42 @@ mod tests {
         assert!(std::net::TcpStream::connect(grpc_addr).is_err());
     }
 
+    /// With metrics on, the runtime exports each stage queue's depth from the
+    /// start.
+    #[test]
+    fn runtime_exports_its_queue_depths() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("runtime-queues-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            metrics: Some(crate::message::config::MetricsConfig::for_dir(&dir)),
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let metrics = Arc::clone(rt.core.metrics().unwrap());
+        let depths = || {
+            ["intake", "tokenizer", "mm", "scheduler"].map(|stage| {
+                metrics.exported(&format!(
+                    r#"sglang:frontend_queue_depth{{stage="{stage}"}}"#
+                ))
+            })
+        };
+        assert_eq!(depths(), [Some(0.0); 4]);
+        // No scheduler drains the ring here, so the request stays queued.
+        let _waiting = send_http(addr, "POST", "/generate", r#"{"input_ids":[1,2,3]}"#);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while depths()[3] != Some(1.0) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(depths(), [Some(0.0), Some(0.0), Some(0.0), Some(1.0)]);
+        rt.request_shutdown();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// Every abort by rid reaches the package's abort hook, from each entry:
     /// `/abort_request`, an abort another DP rank's listener relays
     /// (`/internal/peer`), and the gRPC `Abort`. An `abort_all` or an empty
@@ -2244,8 +2321,18 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let named = Arc::new(Named::default());
+        let mut server_args = test_server_args();
+        // The listener table names this listener, so its relay route serves
+        // the requests that present its token.
+        server_args.deployment_info.rust_server_endpoints =
+            vec![crate::message::config::RustServerEndpoint {
+                dp_rank: 0,
+                endpoint: format!("http://{http_addr}"),
+                peer_token: Some("own-token".into()),
+            }];
         let cfg = RuntimeConfig {
             abort_hook: Some(named.clone()),
+            server_args: Arc::new(server_args),
             ..test_config(http_addr, Some(grpc_addr))
         };
         let rt = start(cfg, None).expect("start runtime");
@@ -2266,7 +2353,7 @@ mod tests {
             write!(
                 conn,
                 "POST /internal/peer HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\
-                 Connection: close\r\n\r\n",
+                 x-sglang-peer-token: own-token\r\nConnection: close\r\n\r\n",
                 body.len()
             )
             .unwrap();

@@ -62,12 +62,11 @@ from sglang.srt.layers.moe import post_experts_output_is_complete
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptMixedPrecisionConfig,
-)
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptMixedPrecisionConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.mem_cache.engram.embedding import HiCacheVocabParallelEmbedding
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
@@ -107,13 +106,18 @@ from sglang.srt.models.qwen4_exp_ple_table import (
 )
 from sglang.srt.runtime_context import (
     get_forward,
+    get_memory,
     get_parallel,
     linear_attn_parallel_group,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, is_npu, logger
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+
+if _is_npu:
+    from sgl_kernel_npu.operators.mamba import short_conv as ple_short_conv
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -187,7 +191,7 @@ class _PLEBatch(msgspec.Struct, frozen=True):
     physical_tokens: int
     processed_tokens: int
     lengths: torch.Tensor
-    row_width: int
+    tokens_per_seq: int
     req_indices: torch.Tensor
     token_offsets: torch.Tensor
     valid_tokens: torch.Tensor
@@ -292,13 +296,13 @@ def _prepare_ple_batch(
 
     if mode.is_target_verify():
         assert forward_batch.spec_info is not None
-        row_width = int(forward_batch.spec_info.draft_token_num)
-        if row_width <= 0 or processed_tokens % row_width != 0:
+        tokens_per_seq = int(forward_batch.spec_info.draft_token_num)
+        if tokens_per_seq <= 0 or processed_tokens % tokens_per_seq != 0:
             raise RuntimeError(
                 "target verify rows must contain complete draft strides: "
-                f"{processed_tokens=} {row_width=}"
+                f"{processed_tokens=} {tokens_per_seq=}"
             )
-        sequence_count = processed_tokens // row_width
+        sequence_count = processed_tokens // tokens_per_seq
         # Eager verify rows can be shorter than the row stride;
         # ignore the synthetic one-token lengths from DP attention's verify-as-EXTEND.
         lengths = (
@@ -307,7 +311,7 @@ def _prepare_ple_batch(
             and forward_batch.extend_seq_lens is not None
             else torch.full(
                 (sequence_count,),
-                row_width,
+                tokens_per_seq,
                 dtype=torch.long,
                 device=tokens.device,
             )
@@ -317,11 +321,11 @@ def _prepare_ple_batch(
                 "target verify length metadata does not match its fixed rows: "
                 f"{lengths.shape[0]=} {sequence_count=}"
             )
-        req_indices = torch.div(positions, row_width, rounding_mode="floor")
-        token_offsets = positions - req_indices * row_width
+        req_indices = torch.div(positions, tokens_per_seq, rounding_mode="floor")
+        token_offsets = positions - req_indices * tokens_per_seq
     elif mode.is_decode():
         lengths = torch.ones(processed_tokens, dtype=torch.long, device=tokens.device)
-        row_width = 1
+        tokens_per_seq = 1
         req_indices = positions
         token_offsets = torch.zeros_like(positions)
     else:
@@ -329,7 +333,7 @@ def _prepare_ple_batch(
             raise RuntimeError(f"PLE requires sequence lengths in {mode!r}")
         lengths = forward_batch.extend_seq_lens.long()
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
-        row_width = (
+        tokens_per_seq = (
             max(extend_seq_lens_cpu, default=0)
             if extend_seq_lens_cpu is not None
             else processed_tokens
@@ -382,7 +386,7 @@ def _prepare_ple_batch(
             valid = valid & out_cache_loc[:sequence_count].ne(0)
         elif out_cache_loc is not None and mode.is_target_verify():
             valid = valid & out_cache_loc[:processed_tokens].reshape(
-                sequence_count, row_width
+                sequence_count, tokens_per_seq
             ).ne(0).any(dim=1)
         state_indices = torch.where(
             valid, state_indices, torch.zeros_like(state_indices)
@@ -396,7 +400,9 @@ def _prepare_ple_batch(
             # this view is the padded tensor the general path would materialize.
             padded = tokens.unsqueeze(1)
         else:
-            padded = tokens.new_full((sequence_count, row_width), ngram_eos_token_id)
+            padded = tokens.new_full(
+                (sequence_count, tokens_per_seq), ngram_eos_token_id
+            )
             if processed_tokens:
                 padded[req_indices, token_offsets] = torch.where(
                     valid_tokens,
@@ -421,7 +427,7 @@ def _prepare_ple_batch(
         physical_tokens=physical_tokens,
         processed_tokens=processed_tokens,
         lengths=lengths,
-        row_width=row_width,
+        tokens_per_seq=tokens_per_seq,
         req_indices=req_indices,
         token_offsets=token_offsets,
         valid_tokens=valid_tokens,
@@ -441,11 +447,11 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
     pool = get_req_to_token_pool()
     ngram = get_token_to_kv_pool().layer_router.part_view(NGRAM_PART)
     context = batch.ngram_context
-    context_len = context.shape[1] - batch.row_width
+    context_len = context.shape[1] - batch.tokens_per_seq
     if batch.mode.is_target_verify():
         step_contexts = context.unfold(1, context_len, 1)[:, 1:]
         valid_steps = batch.valid_tokens.reshape(
-            batch.lengths.shape[0], batch.row_width
+            batch.lengths.shape[0], batch.tokens_per_seq
         )
         dst_indices_raw = select_verify_intermediate_state_indices(
             None,
@@ -466,7 +472,7 @@ def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -
     if batch.use_decode_fast_path:
         # Decode advances every two-token history by exactly one column.  Slicing
         # preserves the int64 values while avoiding arange + gather launches.
-        next_context = context[:, batch.row_width :]
+        next_context = context[:, batch.tokens_per_seq :]
         ngram.set_context(batch.state_indices, next_context)
         track = _ple_track_targets(forward_batch, batch)
         if track is not None:
@@ -605,8 +611,9 @@ class Qwen4ExpPLEGroupedNorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
-            self._jit_group_size is not None
+            not _is_npu
             and x.is_cuda
+            and self._jit_group_size is not None
             and x.dtype in (torch.bfloat16, torch.float16)
         ):
             from sglang.kernels.ops.layernorm.grouped_gemma_rmsnorm import (
@@ -699,10 +706,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
         offload_embedding = bool(config.ple_offload_embedding)
+        if get_memory().enable_hi_engram:
+            embedding_cls = HiCacheVocabParallelEmbedding
+        else:
+            embedding_cls = VocabParallelEmbedding
         # Offload only needs this embedding's metadata: build it on meta so the
         # shard is never allocated on the device.
         with torch.device("meta") if offload_embedding else nullcontext():
-            ngram_embedding = VocabParallelEmbedding(
+            ngram_embedding = embedding_cls(
                 padded_vocab_size,
                 self.head_dim_per_ngram,
                 params_dtype=(
@@ -717,7 +728,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
-        if offload_embedding:
+        if offload_embedding and not get_memory().enable_hi_engram:
             ngram_embedding = Qwen4ExpPinnedHostEmbedding(
                 ngram_embedding,
                 backend=getattr(config, "ple_offload_backend", "pinned"),
@@ -1291,7 +1302,7 @@ class Qwen4ExpPLELayer(nn.Module):
             return F.silu(conv_output)
 
         if batch.use_decode_fast_path:
-            # With row_width=1 the padded/transpose path is x.unsqueeze(-1),
+            # With tokens_per_seq=1 the padded/transpose path is x.unsqueeze(-1),
             # and each state boundary is a one-column shift; conv and SiLU stay native.
             from sglang.kernels.ops.mamba.qwen4_short_conv import (
                 can_fuse_qwen4_short_conv_state,
@@ -1310,14 +1321,23 @@ class Qwen4ExpPLELayer(nn.Module):
                     dtype=x.dtype
                 )
                 conv_input = torch.cat([state, x.unsqueeze(-1)], dim=-1)
-            conv_output = F.conv1d(
-                conv_input,
-                self.conv1d.weight.to(dtype=x.dtype),
-                bias=None,
-                dilation=self.short_conv_dilation,
-                groups=self.conv_channels,
-            ).squeeze(-1)
-            next_state = conv_input[:, :, batch.row_width :]
+            # The NPU kernel is graph-capturable and returns [B, C] directly.
+            if _is_npu:
+                conv_output = ple_short_conv(
+                    conv_input,
+                    self.conv1d.weight.to(dtype=x.dtype),
+                    self.short_conv_dilation,
+                    single_token=True,
+                )
+            else:
+                conv_output = F.conv1d(
+                    conv_input,
+                    self.conv1d.weight.to(dtype=x.dtype),
+                    bias=None,
+                    dilation=self.short_conv_dilation,
+                    groups=self.conv_channels,
+                ).squeeze(-1)
+            next_state = conv_input[:, :, batch.tokens_per_seq :]
             if not fused_state:
                 conv_state[batch.state_indices] = next_state.to(dtype=conv_state.dtype)
 
@@ -1329,17 +1349,26 @@ class Qwen4ExpPLELayer(nn.Module):
 
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
         padded_seq = x.new_zeros(
-            (batch.lengths.shape[0], batch.row_width, self.conv_channels)
+            (batch.lengths.shape[0], batch.tokens_per_seq, self.conv_channels)
         )
         padded_seq[batch.req_indices, batch.token_offsets] = x
         conv_input = torch.cat([state, padded_seq.transpose(1, 2)], dim=-1)
-        conv_output = F.conv1d(
-            conv_input,
-            self.conv1d.weight.to(dtype=x.dtype),
-            bias=None,
-            dilation=self.short_conv_dilation,
-            groups=self.conv_channels,
-        ).transpose(1, 2)
+        # Decode/verify use the graph-capturable NPU kernel. Its output is
+        # already [B, W, C]; ordinary prefill retains native convolution.
+        if _is_npu and (batch.mode.is_target_verify() or batch.mode.is_decode()):
+            conv_output = ple_short_conv(
+                conv_input,
+                self.conv1d.weight.to(dtype=x.dtype),
+                self.short_conv_dilation,
+            )
+        else:
+            conv_output = F.conv1d(
+                conv_input,
+                self.conv1d.weight.to(dtype=x.dtype),
+                bias=None,
+                dilation=self.short_conv_dilation,
+                groups=self.conv_channels,
+            ).transpose(1, 2)
 
         if batch.mode.is_target_verify():
             intermediate_cache = short_conv.view.layer_intermediate_cache(
@@ -1349,7 +1378,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 if self.short_conv_state_len:
                     intermediate_state = (
                         conv_input.unfold(2, self.short_conv_state_len, 1)[
-                            :, :, 1 : batch.row_width + 1
+                            :, :, 1 : batch.tokens_per_seq + 1
                         ]
                         .permute(0, 2, 1, 3)
                         .contiguous()
@@ -1358,13 +1387,13 @@ class Qwen4ExpPLELayer(nn.Module):
                     intermediate_state = x.new_empty(
                         (
                             batch.lengths.shape[0],
-                            batch.row_width,
+                            batch.tokens_per_seq,
                             self.conv_channels,
                             0,
                         )
                     )
                 valid_steps = batch.valid_tokens.reshape(
-                    batch.lengths.shape[0], batch.row_width, 1, 1
+                    batch.lengths.shape[0], batch.tokens_per_seq, 1, 1
                 )
                 intermediate_state = torch.where(
                     valid_steps,
@@ -1382,11 +1411,11 @@ class Qwen4ExpPLELayer(nn.Module):
                 )
                 if dst_indices_raw is None:
                     intermediate_cache[
-                        : batch.lengths.shape[0], : batch.row_width
+                        : batch.lengths.shape[0], : batch.tokens_per_seq
                     ].copy_(intermediate_state)
                 else:
                     intermediate_cache[
-                        dst_indices_raw.to(dtype=torch.long), : batch.row_width
+                        dst_indices_raw.to(dtype=torch.long), : batch.tokens_per_seq
                     ] = intermediate_state
         else:
             state_cols = torch.arange(
@@ -1566,7 +1595,11 @@ class Qwen4ExpPLELayer(nn.Module):
         gated_value_normed = self._apply_ple_norm(self.norm_conv, gated_value)
         gated_value = gated_value.flatten(-2)
         gated_value_normed = gated_value_normed.flatten(-2)
-        if self.ple_embedding.enable_ple_fusion and batch.mode.is_target_verify():
+        if (
+            not _is_npu
+            and self.ple_embedding.enable_ple_fusion
+            and batch.mode.is_target_verify()
+        ):
             from sglang.kernels.ops.mamba.qwen4_short_conv import (
                 can_fuse_qwen4_verify_conv,
                 fused_qwen4_verify_conv,
@@ -1582,7 +1615,7 @@ class Qwen4ExpPLELayer(nn.Module):
                 short_conv.view.layer_cache(short_conv.view_layer_id),
                 batch.state_indices,
                 batch.valid_tokens,
-                batch.row_width,
+                batch.tokens_per_seq,
                 self.short_conv_dilation,
                 short_conv.view.layer_intermediate_cache(short_conv.view_layer_id),
             )

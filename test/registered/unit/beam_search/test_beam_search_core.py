@@ -219,7 +219,9 @@ class TestBeamGroup(CustomTestCase):
             T([[12, 13], [14, 15]], torch.int64),
             2,
         )
-        self.assertTrue(group.advance_final(fsel))
+        group.advance_final_frontier(fsel)
+        self.assertTrue(group.launch_complete())
+        self.assertTrue(group.commit_pending())
 
         results = group.finalize()
         self.assertEqual(len(results), 2)

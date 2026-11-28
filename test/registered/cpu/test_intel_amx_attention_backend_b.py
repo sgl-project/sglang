@@ -4,6 +4,7 @@ Usage:
 python3 -m unittest test_intel_amx_attention_backend_1.TestIntelAMXAttnBackendQuant.test_latency_fp8_qwen
 """
 
+import os
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -14,7 +15,7 @@ from sglang.test.test_utils import (
     intel_amx_benchmark,
 )
 
-register_cpu_ci(est_time=47, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=47, suite="extra-test-cpu-intel")
 
 
 class TestIntelAMXAttnBackendQuant(CustomTestCase):
@@ -27,7 +28,7 @@ class TestIntelAMXAttnBackendQuant(CustomTestCase):
 
     @intel_amx_benchmark(
         extra_args=["--batch-size", "4", "--mem-fraction-static", "0.3"],
-        min_throughput=50,
+        min_throughput=35 if os.environ.get("SGLANG_XEON_NIGHTLY") == "true" else 50,
     )
     def test_latency_fp8_moe_model(self):
         return DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE

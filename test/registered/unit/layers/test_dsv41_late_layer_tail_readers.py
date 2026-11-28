@@ -190,8 +190,7 @@ class TestLateLayerRowsUnderDpAttention(CustomTestCase):
     def setUp(self):
         override = get_context().override_server_args(
             tp_size=2,
-            dp_size=2,
-            enable_dp_attention=True,
+            attn_dp_size=2,
             cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
         )
         override.install()
@@ -283,7 +282,7 @@ def _prefill_graph_replay(*, ratios, seq_len):
         seen["tail"] = max_seq_len
 
     backend = object.__new__(DeepseekV4AttnBackend)
-    backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+    backend.max_kv_len = 4096
     backend.low_ratios = tuple(ratio for ratio in ratios if ratio in (1, 2))
     backend.has_c4 = 4 in ratios
     backend.has_c128 = 128 in ratios
