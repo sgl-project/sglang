@@ -84,7 +84,11 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    check_lora_marlin_fp8_moe_layer,
+    prepare_fp8_layer_for_marlin,
+    repack_moe_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.mxfp8_block_convert import (
     mxfp8_block_convert_required,
 )
@@ -327,6 +331,11 @@ class Fp8Config(QuantizationConfig):
         # TODO: torch.xpu.get_device_capability
         if self.use_mxfp8 and is_xpu():
             return 20
+        if self.use_mxfp8 and _is_cuda and get_moe_runner_backend().is_lora_marlin():
+            # SM90 support covers the MXFP8 MoE experts, which lora_marlin
+            # serves as W8A16. Dense MXFP8 layers with (1, 32) block scales
+            # are outside it: they still need an SM100 MXFP8 GEMM.
+            return 90
 
         return 100 if self.use_mxfp8 else 80
 
@@ -444,7 +453,11 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUW4A8MXFP4FusedMoEMethod(prefix=prefix)
 
-            if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
+            backend = get_moe_runner_backend()
+            # With lora_marlin, the LoRA MoE runner owns the expert forward.
+            if self.is_fp4_experts and (
+                backend.is_marlin() or backend.is_lora_marlin()
+            ):
                 from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
                     Mxfp4MarlinMoEMethod,
                 )
@@ -1659,11 +1672,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
+        # lora_marlin: the LoRA MoE runner serves the experts W8A16 from Marlin tiles.
+        backend = get_moe_runner_backend()
+        self.use_marlin = (
+            backend.is_lora_marlin() and self.block_quant and not self.is_fp4_expert
+        )
         # The MxFP4 wrapper methods borrow this instance for weight loading;
         # they never call create_moe_runner, so moe_runner_config is unset.
         self._owns_moe_runner = False
         self._moe_runner_backend = None
-        if get_moe_runner_backend().is_cutlass():
+        if backend.is_cutlass():
             assert cutlass_fp8_supported(), (
                 "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
             )
@@ -2063,11 +2081,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        if self.use_marlin:
+            check_lora_marlin_fp8_moe_layer(params_dtype, with_bias=with_bias)
+
         self.weight_block_size, self.w2_weight_block_size = self._tp_weight_block_sizes(
             layer=layer,
             hidden_size=hidden_size,
             intermediate_size_per_partition=intermediate_size_per_partition,
         )
+        if self.is_fp4_expert and get_moe_runner_backend().is_lora():
+            extra_weight_attrs["fp4_scale_dtype"] = torch.float8_e8m0fnu
         Fp8MoEMethod.create_fp8_moe_weight_(
             layer=layer,
             num_experts=num_experts,
@@ -2786,6 +2809,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif (
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                # The LoRA MoE runner packs the canonical scales itself.
+                or get_moe_runner_backend().is_lora()
             ):
                 # Match FlashInfer TRT-LLM MoE test contracts:
                 # 1) quantize in canonical (non-swizzled) scale layout, and
@@ -2814,6 +2839,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif (
                 get_moe_runner_backend().is_flashinfer_trtllm()
                 or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+                or get_moe_runner_backend().is_lora()
             ):
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
@@ -2889,7 +2915,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w13_weight.is_shuffled = True
             layer.w2_weight.is_shuffled = True
 
+    def _process_weights_for_marlin(self, layer: Module) -> None:
+        if self.use_mxfp8 and not self.quant_config.is_checkpoint_fp8_serialized:
+            # Online MXFP8 uses the serialized checkpoint layout before repacking.
+            for name in ("w13", "w2"):
+                weight = getattr(layer, f"{name}_weight").data
+                experts, rows, k = weight.shape
+                qweight, scale = mxfp8_group_quantize(
+                    weight.reshape(-1, k).contiguous()
+                )
+                setattr(
+                    layer,
+                    f"{name}_weight",
+                    Parameter(qweight.view(experts, rows, k), requires_grad=False),
+                )
+                setattr(
+                    layer,
+                    f"{name}_weight_scale_inv",
+                    Parameter(scale.view(experts, rows, k // 32), requires_grad=False),
+                )
+        repack_moe_fp8_layer_for_marlin(
+            layer,
+            "mxfp8" if self.use_mxfp8 else "block",
+            scales="weight_scale_inv",
+            block_n=None if self.use_mxfp8 else self.weight_block_size[0],
+        )
+
     def process_weights_after_loading(self, layer: Module) -> None:
+        if self.use_marlin:
+            self._process_weights_for_marlin(layer)
+            return
+
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 

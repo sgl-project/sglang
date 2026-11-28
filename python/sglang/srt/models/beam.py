@@ -289,9 +289,10 @@ class BeamMoE(nn.Module):
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
+        a2a_backend = get_moe_a2a_backend()
         quant_scheme = get_beam_quantization(quant_config)
         supported_runners = get_beam_supported_moe_runners(quant_scheme)
-        if get_moe_a2a_backend().is_flashinfer_megamoe():
+        if a2a_backend.is_flashinfer_megamoe():
             # MegaMOE dispatches each DP rank's own tokens and combines them back
             # complete, so the post-experts all-reduces below are skipped.
             # Only the ModelOpt NVFP4 MoE method has MegaMOE weight hooks.
@@ -304,14 +305,11 @@ class BeamMoE(nn.Module):
                     "Beam supports the flashinfer_megamoe all-to-all only for "
                     "ModelOpt NVFP4 with the flashinfer_megamoe runner"
                 )
-        elif (
-            backend.value not in supported_runners
-            or not get_moe_a2a_backend().is_none()
-        ):
+        elif backend.value not in supported_runners or not a2a_backend.is_none():
             raise ValueError(
-                "Beam supports the auto or triton MoE runner for BF16/FP8 "
-                "and flashinfer_trtllm for NVFP4, with no MoE all-to-all; "
-                "NVFP4 also supports the flashinfer_megamoe all-to-all"
+                f"Beam {quant_scheme} MoE got runner {backend.value!r} "
+                f"with all-to-all {a2a_backend.value!r}. "
+                f"Standard dispatch accepts {supported_runners}."
             )
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -1269,9 +1267,9 @@ def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optiona
 
 def get_beam_supported_moe_runners(quant_scheme: Optional[str]) -> Tuple[str, ...]:
     return {
-        "bf16": ("auto", "triton"),
-        "fp8": ("auto", "triton"),
-        "nvfp4": ("flashinfer_trtllm",),
+        "bf16": ("auto", "triton", "lora_cutedsl", "lora_triton"),
+        "fp8": ("auto", "triton", "lora_marlin", "lora_cutedsl", "lora_triton"),
+        "nvfp4": ("flashinfer_trtllm", "lora_marlin", "lora_cutedsl"),
     }.get(quant_scheme, ())
 
 
@@ -1321,13 +1319,16 @@ class BeamForCausalLM(nn.Module):
                 "Beam has not been validated with expert relocation or "
                 "redundant experts; use trivial expert placement"
             )
-        if (get_lora().enable_lora or get_lora().lora_paths) and (
-            quant_scheme == "nvfp4"
-            or get_lora().lora_backend not in ("csgmv", "triton")
+        lora = get_lora()
+        if (lora.enable_lora or lora.lora_paths) and not (
+            lora.lora_backend == "triton_v2"
+            or (quant_scheme != "nvfp4" and lora.lora_backend in ("csgmv", "triton"))
         ):
             raise NotImplementedError(
-                "Beam LoRA supports BF16 or compressed-tensors FP8 with "
-                "--lora-backend csgmv or triton and --moe-runner-backend triton"
+                "Beam LoRA supports --lora-backend triton_v2 with a lora_* MoE "
+                "runner (BF16, compressed-tensors FP8 or NVFP4), or BF16 and "
+                "compressed-tensors FP8 with --lora-backend csgmv or triton and "
+                "--moe-runner-backend triton"
             )
         self.config = config
         self.model = BeamModel(config, quant_config, prefix=add_prefix("model", prefix))

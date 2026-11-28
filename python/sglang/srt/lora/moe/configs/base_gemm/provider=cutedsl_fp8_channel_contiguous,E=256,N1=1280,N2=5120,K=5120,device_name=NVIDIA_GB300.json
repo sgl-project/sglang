@@ -1,0 +1,34 @@
+{
+  "buckets": {
+    "8": {
+      "token_width": 8
+    },
+    "16": {
+      "token_width": 64
+    },
+    "64": {
+      "token_width": 64
+    },
+    "96": {
+      "token_width": 128
+    }
+  },
+  "tiles": [
+    {
+      "token_width": 8,
+      "persistent_clusters": 152
+    },
+    {
+      "token_width": 64,
+      "persistent_clusters": 128
+    },
+    {
+      "token_width": 128,
+      "persistent_clusters": 152
+    }
+  ],
+  "version": {
+    "generated_on": "NVIDIA GB300",
+    "cutedsl": "4.8.0"
+  }
+}

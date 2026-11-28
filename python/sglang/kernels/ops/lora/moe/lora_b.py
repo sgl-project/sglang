@@ -227,3 +227,56 @@ def invoke_down_b_into_base(
         num_warps=int(config["num_warps"]),
         num_stages=int(config["num_stages"]),
     )
+
+
+@triton.jit
+def _bit_or(a, b):
+    return a | b
+
+
+@triton.jit
+def _used_slot_list_kernel(
+    mapping_ptr,  # [num_tokens] adapter slot per token, -1 = base
+    num_tokens,
+    out_ptr,  # int32 [1 + SLOTS]
+    SLOTS: tl.constexpr,
+    SLOTS_P2: tl.constexpr,
+    WORDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Accumulate across chunks before reducing across tokens.
+    words = tl.arange(0, WORDS)
+    bits = tl.zeros((BLOCK, WORDS), tl.int32)
+    for start in range(0, num_tokens, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        slot = tl.load(mapping_ptr + offs, mask=offs < num_tokens, other=-1)
+        slot = slot.to(tl.int32)
+        bit = tl.where(
+            (slot >= 0) & (slot < SLOTS),
+            tl.full((BLOCK,), 1, tl.int32) << (slot & 31),
+            0,
+        )
+        bits |= tl.where((slot >> 5)[:, None] == words[None, :], bit[:, None], 0)
+    word_bits = tl.reduce(bits, 0, _bit_or)
+    bits_per_word: tl.constexpr = min(SLOTS_P2, 32)
+    bit_offsets = tl.arange(0, bits_per_word)
+    used = tl.reshape((word_bits[:, None] >> bit_offsets[None, :]) & 1, (SLOTS_P2,))
+    slots = tl.arange(0, SLOTS_P2)
+    tl.store(out_ptr + 1 + tl.cumsum(used, axis=0) - used, slots, mask=used > 0)
+    tl.store(out_ptr + tl.arange(0, 1), tl.zeros((1,), tl.int32) + tl.sum(used))
+
+
+def used_slot_list(mapping: torch.Tensor, max_loras: int, out: torch.Tensor) -> None:
+    """Write [count, sorted slot IDs] on device so graph replay follows the mapping."""
+    assert out.dtype == torch.int32 and out.numel() >= 1 + max_loras
+    slots_p2 = max(2, triton.next_power_of_2(max_loras))
+    words = max(1, slots_p2 // 32)
+    _used_slot_list_kernel[(1,)](
+        mapping,
+        mapping.numel(),
+        out,
+        SLOTS=max_loras,
+        SLOTS_P2=slots_p2,
+        WORDS=words,
+        BLOCK=max(16, min(1024, 8192 // words)),
+    )

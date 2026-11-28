@@ -84,6 +84,7 @@ def _resolve_execution(
         activation=ActivationFn.SILU,
         hidden_size=hidden_size,
         num_local_experts=experts,
+        vendor="cutedsl",
     )[mode]
     launch_config = selected.tiles.config_for(num_tokens)
     if architecture == "sm100" and mode is Phase.DECODE:
@@ -299,7 +300,7 @@ def test_selected_pipeline_matches_reference_in_eager_and_cuda_graph(
     # Preserve the small FP32 cases; wide/rank-256 cases model BF16 stage stores.
     reference_plan = choice.plan if physical_rank == 256 else None
 
-    provider_cls = select_provider_cls(choice.base_gemm_rows, "bf16")
+    provider_cls = select_provider_cls(choice.base_gemm_rows, "bf16", "cutedsl")
     provider = provider_cls(
         MoeLoraBf16QuantInfo(
             w13_weight=gpu["w13_weight"],
@@ -470,7 +471,7 @@ def test_fp8_base_pipeline_matches_reference_under_graph_replay(
         experts=_FP8_EXPERTS,
         quant_family="fp8",
     )
-    provider = select_provider_cls(choice.base_gemm_rows, "fp8")(
+    provider = select_provider_cls(choice.base_gemm_rows, "fp8", "cutedsl")(
         MoeLoraFp8QuantInfo(
             w13_weight=w13_codes.to(device),
             w13_scale=w13_scales.to(device),

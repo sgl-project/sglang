@@ -40,6 +40,7 @@ def _grouped_lora_a_kernel(
     stride_wk,
     stride_om,
     stride_on,
+    stride_oplane,
     stride_pp,
     stride_pm,
     stride_pn,
@@ -58,8 +59,10 @@ def _grouped_lora_a_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     WINDOWED: tl.constexpr = False,
+    OUT_ROW_MAP: tl.constexpr = False,
+    OUT_PLANES: tl.constexpr = False,
 ):
-    # WINDOWED tiles cannot straddle rank blocks or apply the live-rank prefix.
+    # Windowed tiles stay inside one stack's rank block.
     pid = tl.program_id(0)
     pid_k = tl.program_id(1)
     if WINDOWED:
@@ -138,20 +141,33 @@ def _grouped_lora_a_kernel(
         )
         accumulator += tl.dot(lhs, rhs, out_dtype=tl.float32)
 
-    out_mask = pair_mask[:, None] & n_mask[None, :]
+    pair_store_mask = pair_mask[:, None] & n_mask[None, :]
+    if OUT_ROW_MAP:
+        out_rows = input_rows
+        store_mask = input_mask[:, None] & n_mask[None, :]
+    else:
+        out_rows = pair_ids
+        store_mask = pair_store_mask
+    out_base = output_ptr
+    if OUT_PLANES:
+        out_base += (bucket_id // GROUPS_PER_SLOT).to(tl.int64) * stride_oplane
     output_ptrs = (
-        output_ptr + pair_ids[:, None] * stride_om + n_offsets[None, :] * stride_on
+        out_base + out_rows[:, None] * stride_om + n_offsets[None, :] * stride_on
     )
     if SPLIT_K == 1:
         tl.store(
-            output_ptrs, accumulator.to(output_ptr.dtype.element_ty), mask=out_mask
+            output_ptrs,
+            accumulator.to(output_ptr.dtype.element_ty),
+            mask=store_mask,
         )
     else:
         plane_ptrs = (
             partial_ptr + pair_ids[:, None] * stride_pm + n_offsets[None, :] * stride_pn
         )
         tl.store(
-            plane_ptrs + pid_k.to(tl.int64) * stride_pp, accumulator, mask=out_mask
+            plane_ptrs + pid_k.to(tl.int64) * stride_pp,
+            accumulator,
+            mask=pair_store_mask,
         )
         if SPLIT_MODE == "serial":
             # The barrier orders this program's plane stores before its release;
@@ -163,10 +179,12 @@ def _grouped_lora_a_kernel(
                 total = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
                 for s in tl.static_range(SPLIT_K):
                     total += tl.load(
-                        plane_ptrs + s * stride_pp, mask=out_mask, other=0.0
+                        plane_ptrs + s * stride_pp, mask=pair_store_mask, other=0.0
                     )
                 tl.store(
-                    output_ptrs, total.to(output_ptr.dtype.element_ty), mask=out_mask
+                    output_ptrs,
+                    total.to(output_ptr.dtype.element_ty),
+                    mask=store_mask,
                 )
                 tl.atomic_xchg(counter_ptr + tile, 0, sem="release", scope="gpu")
 
@@ -186,18 +204,23 @@ def grouped_lora_a(
     counters: torch.Tensor | None = None,
     weight_div: int = 1,
     windowed: bool = False,
+    place_rows: bool = False,
 ) -> None:
-    """Shrink aligned rows into a pair-major bridge.
+    """Write the LoRA bridge in pair order or via pair_to_row with place_rows.
 
-    ``pair_to_row`` overrides pair/token input indexing; the weight plane is
-    bucket // weight_div. ``lora_ranks`` limits output to rank * stack.
-    ``windowed`` block s reads input[:, s*K:(s+1)*K], ignoring ``lora_ranks``.
-    Split-K uses FP32 partial[split, row, N]; serial needs zeroed counters and
-    sums planes in a fixed order. Planes mode leaves reduction to B.
+    A 3-D output adds a slot axis. Weights use bucket // weight_div.
+    lora_ranks limits rank * stack. Windowed mode reads K columns per stack
+    and ignores lora_ranks.
+    Serial split-K requires zeroed counters. Planes mode leaves reduction to B.
     """
     num_pairs = routing.num_rows
     if num_pairs == 0:
         return
+    if place_rows and (pair_to_row is None or output.shape[-2] < input.shape[0]):
+        raise ValueError(
+            "place_rows requires pair_to_row and an output row for each input row"
+        )
+    planes = output.dim() == 3
     block_size_n, num_n_blocks = shrink_column_tiles(
         int(config["BLOCK_SIZE_N"]), weight.shape[1], stack, windowed
     )
@@ -231,8 +254,9 @@ def grouped_lora_a(
         weight.stride(0),
         weight.stride(1),
         weight.stride(2),
-        output.stride(0),
-        output.stride(1),
+        output.stride(-2),
+        output.stride(-1),
+        output.stride(0) if planes else 0,
         stride_pp,
         stride_pm,
         stride_pn,
@@ -251,6 +275,8 @@ def grouped_lora_a(
         BLOCK_SIZE_K=int(config["BLOCK_SIZE_K"]),
         GROUP_SIZE_M=int(config["GROUP_SIZE_M"]),
         WINDOWED=windowed,
+        OUT_ROW_MAP=place_rows,
+        OUT_PLANES=planes,
         num_warps=int(config["num_warps"]),
         num_stages=int(config["num_stages"]),
     )
