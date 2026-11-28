@@ -1,5 +1,6 @@
 import enum
 import functools
+import inspect
 import json
 import os
 import random
@@ -414,15 +415,56 @@ class _Dumper:
             extra_imports=["from sglang.srt.debug_utils.dumper import dumper"],
         )
 
+    def _check_tag_keys(self, tags: dict[str, Any]) -> None:
+        non_str = [k for k in tags if not isinstance(k, str)]
+        if non_str:
+            raise TypeError(f"dumper tag names must be strings, got {non_str}")
+        # Tags reach dump() as keyword arguments and then a dict built next to
+        # `name` and `recompute_status` and the set_ctx values, so any of these
+        # names would raise a TypeError on the first dump, inside the forward.
+        reserved = (set(inspect.signature(self.dump).parameters) - {"kwargs"}) | {
+            "recompute_status"
+        }
+        clash = sorted(set(tags) & (reserved | set(self._state.global_ctx)))
+        if clash:
+            raise ValueError(
+                f"dumper tag names {clash} collide with dump() arguments or "
+                f"set_ctx keys; use other names"
+            )
+
     def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
+        *,
+        tags: Optional[dict[str, Any]] = None,
     ) -> Optional["_NonIntrusiveDumper"]:
+        """Hook ``model`` so its forwards are dumped without editing model code.
+
+        ``tags`` is attached to every dump these hooks emit, so it appears in the
+        dump filename (``...___runner=draft___...pt``) and can be used in
+        ``filter`` (for example ``runner == "draft"``). It is bound here, so two
+        models registered in one process keep their own tags even when their
+        forwards interleave. Under speculative decoding ``ModelRunner`` passes
+        ``{"runner": "draft"}`` or ``{"runner": "target"}``, because the draft
+        and target forwards can share a ``ForwardMode`` (DSPARK's draft block
+        runs as ``TARGET_VERIFY``). With ``tags=None`` dump names are unchanged.
+
+        Tag names must be strings, must not be a ``dump()`` argument or
+        ``recompute_status``, and must not already be a ``set_ctx`` key; these raise
+        here instead of failing inside the model's forward. Do not ``set_ctx`` a
+        name that a registered tag uses afterwards.
+
+        Returns None when ``non_intrusive_mode`` is ``off``.
+        """
         self._http_manager  # noqa: B018
+        if tags:
+            self._check_tag_keys(tags)
         mode = self._config.non_intrusive_mode
         if mode == "off":
             return None
-        non_intrusive = _NonIntrusiveDumper(dumper=self, model=model, mode=mode)
+        non_intrusive = _NonIntrusiveDumper(
+            dumper=self, model=model, mode=mode, tags=tags
+        )
         self._non_intrusives.append(non_intrusive)
         return non_intrusive
 
@@ -662,9 +704,11 @@ class _NonIntrusiveDumper:
         dumper: _Dumper,
         model: "torch.nn.Module",
         mode: str,
+        tags: Optional[dict[str, Any]] = None,
     ):
         self._dumper = dumper
         self._mode = mode
+        self._tags: dict[str, Any] = dict(tags) if tags else {}
         self._handles: list = []
         self._core_fields: frozenset[str] = frozenset().union(
             *(p.core_fields() for p in _plugins)
@@ -750,10 +794,12 @@ class _NonIntrusiveDumper:
         ).items():
             effective_key = key or sub_name.rsplit(".", 1)[-1]
             if effective_key in self._core_fields:
-                self._dumper.dump(effective_key, item)
+                self._dumper.dump(effective_key, item, **self._tags)
             elif self._mode == "all":
                 parts = [p for p in (module_name, sub_name, key) if p]
-                self._dumper.dump(self._NAME_PREFIX + ".".join(parts), item)
+                self._dumper.dump(
+                    self._NAME_PREFIX + ".".join(parts), item, **self._tags
+                )
 
     @staticmethod
     def _convert_value(value, *, skip_forward_batch: bool = False) -> dict[str, Any]:
