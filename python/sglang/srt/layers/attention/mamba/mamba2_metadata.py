@@ -81,6 +81,13 @@ class ForwardMetadata:
     # h_track_buf snapshot (KDA path) with plain integer indexing, so the
     # copy into the track slots does not nonzero()-sync the stream.
     track_ssm_h_batch_src: Optional[torch.Tensor] = None
+    # Extend state-commit valid rows, computed once per step in
+    # init_forward_metadata (an arange: eager slot resolution never yields
+    # -1, so every row commits). Per-layer commits filter padded rows through
+    # this instead of re-running nonzero() (which stream-syncs behind the
+    # chunk kernel) after every KDA layer. None on graph-bucket metadata,
+    # whose commits fall back to the per-layer nonzero.
+    extend_valid_positions: Optional[torch.Tensor] = None
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0
