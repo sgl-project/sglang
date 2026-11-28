@@ -4749,6 +4749,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
+            self.linker.record_transfer_bytes()
             self.linker.check_prefetch_events()
             return
 
