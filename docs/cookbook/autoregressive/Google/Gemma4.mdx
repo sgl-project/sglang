@@ -67,14 +67,14 @@ Gemma 4 is Google's next-generation family of open models, building on the Gemma
 
 ## 2. SGLang Installation
 
-Gemma 4 (including the encoder-free unified 12B, [sgl-project/sglang#27167](https://github.com/sgl-project/sglang/pull/27167)) is supported on SGLang main. Install it together with the matching transformers commit:
+Gemma 4 (including the encoder-free unified 12B, [sgl-project/sglang#27167](https://github.com/sgl-project/sglang/pull/27167)) is supported on SGLang main. Install it together with the matching Transformers version:
 
 ```bash Command
 # Install SGLang from main
 pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
 
-# Install transformers with Gemma 4 support (encoder-free unified family included)
-pip install 'git+https://github.com/huggingface/transformers.git@1423d22f7a3b62e8c70ad67b58ec25cd9b675897'
+# Match SGLang's Transformers dependency
+pip install transformers==5.19.0
 ```
 
 ### Docker
@@ -102,6 +102,8 @@ The Gemma 4 series offers models in various sizes and architectures, optimized f
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model variant.
 
 <Gemma4Deployment />
+
+The **E2B + BMG** configuration serves text on one Intel Arc Pro B70 with the Intel XPU attention backend and decode graphs. Use an [Intel XPU installation](/docs/hardware-platforms/xpu). This configuration uses `--language-model-only` to omit the vision/audio encoders and rejects image, video, and audio requests. For multimodal requests, omit that flag and use `--attention-backend triton` for bidirectional image attention.
 
 ### 3.2 Configuration Tips
 
