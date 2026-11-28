@@ -5,14 +5,16 @@
 //! itself, but it does not reproduce the Python script's selection: the two
 //! use different random number generators, so the same `--seed` draws
 //! different prompts. Totals and distributions match; individual prompts do
-//! not.
+//! not. `openai` reads its requests in file order and draws nothing.
 
+use std::io::BufRead;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use rand::prelude::*;
 use rand::rngs::StdRng;
 use serde::Deserialize;
+use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 
 use crate::args::{Args, DatasetName};
@@ -23,17 +25,24 @@ pub enum Prompt {
     Text(String),
     /// `--tokenize-prompt`: skip the server's tokenizer and send ids.
     TokenIds(Vec<u32>),
+    /// The `openai` dataset: a chat request's `messages`, sent as written.
+    Messages(Vec<Value>),
 }
 
 #[derive(Clone, Debug)]
 pub struct DatasetRow {
     pub prompt: Prompt,
+    /// 0 for the `openai` dataset: only the server's chat template knows the
+    /// length, so the request takes it from the reported `prompt_tokens`.
     pub prompt_len: usize,
     pub output_len: usize,
     pub text_prompt_len: usize,
     /// Always 0 here: this port has no image datasets. The field exists so the
     /// reported totals keep the Python script's shape.
     pub vision_prompt_len: usize,
+    /// Per-request body fields (the `openai` dataset's `tools`, `temperature`,
+    /// ...), merged over `--extra-request-body` as the Python script does.
+    pub extra_body: Map<String, Value>,
 }
 
 impl DatasetRow {
@@ -44,6 +53,7 @@ impl DatasetRow {
             output_len,
             text_prompt_len: prompt_len,
             vision_prompt_len: 0,
+            extra_body: Map::new(),
         }
     }
 }
@@ -72,6 +82,7 @@ pub fn load(
             let corpus = corpus.context("the sharegpt dataset needs a corpus path")?;
             sample_sharegpt(args, required(tokenizer)?, corpus, &mut rng)?
         }
+        DatasetName::Openai => load_openai(args, Path::new(&args.dataset_path))?,
     };
     anyhow::ensure!(
         !rows.is_empty(),
@@ -79,7 +90,12 @@ pub fn load(
     );
     let input_tokens: usize = rows.iter().map(|row| row.prompt_len).sum();
     let output_tokens: usize = rows.iter().map(|row| row.output_len).sum();
-    println!("#Input tokens: {input_tokens}");
+    if args.dataset_name == DatasetName::Openai {
+        println!("Loaded {} OpenAI-format requests", rows.len());
+        println!("#Input tokens: counted from the server's prompt_tokens");
+    } else {
+        println!("#Input tokens: {input_tokens}");
+    }
     println!("#Output tokens: {output_tokens}");
     Ok(rows)
 }
@@ -210,6 +226,62 @@ fn sample_sharegpt(
             prompt_len,
             output_len,
         ));
+    }
+    Ok(rows)
+}
+
+/// Request fields the `openai` dataset does not pass through: `messages` is
+/// the prompt, the two length fields become `output_len`, and `model` is the
+/// run's. The same set as the Python `sample_openai_requests`.
+const OPENAI_EXCLUDED_FIELDS: [&str; 4] =
+    ["messages", "max_tokens", "max_completion_tokens", "model"];
+
+/// The `openai` dataset, as the Python `sample_openai_requests` reads it: one
+/// chat completion request per line, in file order, up to `--num-prompts`.
+/// Lines that are not JSON objects or carry no `messages` are skipped. The
+/// output length is `--sharegpt-output-len`, else the line's `max_tokens`,
+/// else 256. Every other field except `model` goes into the request body.
+///
+/// The prompt length is left at 0. Python counts it with the tokenizer's chat
+/// template, which this crate cannot apply (and some models' templates are
+/// not Jinja at all); the server reports it in `usage.prompt_tokens`, so the
+/// request records that instead.
+fn load_openai(args: &Args, path: &Path) -> Result<Vec<DatasetRow>> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let mut rows = Vec::new();
+    for line in std::io::BufReader::new(file).lines() {
+        if rows.len() == args.num_prompts {
+            break;
+        }
+        let line = line.with_context(|| format!("cannot read {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(Value::Object(mut request)) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(Value::Array(messages)) = request.remove("messages") else {
+            continue;
+        };
+        if messages.is_empty() {
+            continue;
+        }
+        let output_len = args
+            .sharegpt_output_len
+            .or_else(|| {
+                request
+                    .get("max_tokens")
+                    .and_then(Value::as_u64)
+                    .map(|tokens| tokens as usize)
+            })
+            .unwrap_or(256);
+        for field in OPENAI_EXCLUDED_FIELDS {
+            request.remove(field);
+        }
+        let mut row = DatasetRow::new(Prompt::Messages(messages), 0, output_len);
+        row.extra_body = request;
+        rows.push(row);
     }
     Ok(rows)
 }
@@ -363,6 +435,75 @@ mod tests {
             std::env::temp_dir().join(format!("sgl-bench-empty-{}.json", std::process::id()));
         std::fs::write(&path, b"[]").unwrap();
         assert!(load_sharegpt_pairs(&path, &mut StdRng::seed_from_u64(1)).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `openai` keeps each line's messages and extra fields, in file order,
+    /// stops at `--num-prompts`, and skips what the Python loader skips. The
+    /// output length is the flag, else `max_tokens`, else 256; the prompt
+    /// length is left for the server to report.
+    #[test]
+    fn openai_lines_become_chat_requests() {
+        let path =
+            std::env::temp_dir().join(format!("sgl-bench-openai-{}.jsonl", std::process::id()));
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "q"}], "#,
+                r#""max_tokens": 5, "max_completion_tokens": 9, "model": "x", "#,
+                r#""temperature": 0.3, "tools": [{"type": "function"}]}"#,
+                "\n\n",
+                "not json\n",
+                r#"{"prompt": "no messages"}"#,
+                "\n",
+                r#"{"messages": []}"#,
+                "\n",
+                r#"[{"role": "user", "content": "not an object"}]"#,
+                "\n",
+                r#"{"messages": [{"role": "user", "content": "r"}]}"#,
+                "\n",
+                r#"{"messages": [{"role": "user", "content": "past --num-prompts"}]}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let messages = |row: &DatasetRow| match &row.prompt {
+            Prompt::Messages(messages) => messages.clone(),
+            _ => panic!("expected messages"),
+        };
+
+        let two = Args {
+            num_prompts: 2,
+            ..Args::default()
+        };
+        let rows = load_openai(&two, &path).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            messages(&rows[0]),
+            vec![
+                serde_json::json!({"role": "system", "content": "s"}),
+                serde_json::json!({"role": "user", "content": "q"}),
+            ]
+        );
+        assert_eq!((rows[0].prompt_len, rows[0].output_len), (0, 5));
+        assert_eq!(
+            serde_json::Value::Object(rows[0].extra_body.clone()),
+            serde_json::json!({"temperature": 0.3, "tools": [{"type": "function"}]})
+        );
+        assert_eq!(
+            messages(&rows[1]),
+            vec![serde_json::json!({"role": "user", "content": "r"})]
+        );
+        assert_eq!(rows[1].output_len, 256);
+        assert!(rows[1].extra_body.is_empty());
+
+        let fixed = Args {
+            num_prompts: 2,
+            sharegpt_output_len: Some(16),
+            ..Args::default()
+        };
+        let rows = load_openai(&fixed, &path).unwrap();
+        assert!(rows.iter().all(|row| row.output_len == 16));
         std::fs::remove_file(&path).unwrap();
     }
 }

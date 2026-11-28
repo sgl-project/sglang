@@ -91,7 +91,7 @@ cp target/release/libsglang_bench.so \
   `lmdeploy-chat` (`/v1/chat/completions`), streaming and not.
 - **Protocols**: `--protocol http` (default) and `--protocol grpc`, the Rust
   server's `sglang.api.v1` service (below).
-- **Datasets**: `random`, `random-ids`, `sharegpt`.
+- **Datasets**: `random`, `random-ids`, `sharegpt`, `openai`.
 - Poisson request pacing (`--request-rate`), a concurrency cap, warmup, cache
   flush, profiler start/stop, the readiness probe, `--extra-request-body`,
   custom headers, and API-key auth.
@@ -99,6 +99,25 @@ cp target/release/libsglang_bench.so \
   peak-concurrency windows, with NumPy's percentile interpolation and
   population standard deviation so the numbers line up with the Python
   script's.
+
+### OpenAI chat requests
+
+`--dataset-name openai --dataset-path requests.jsonl` reads one chat
+completion request per line, as the Python `openai` dataset does, and needs a
+chat backend (`sglang-oai-chat`, `vllm-chat`, `lmdeploy-chat`). Each line's
+`messages` go out as written, so multi-turn and system prompts survive; its
+other fields (`tools`, `temperature`, ...) are merged over
+`--extra-request-body`, and `model`, `max_tokens` and `max_completion_tokens`
+are dropped. The output length is `--sharegpt-output-len` (1 measures
+prefill alone), else the line's `max_tokens`, else 256. Lines are read in
+file order up to `--num-prompts`; ones that are not JSON objects or carry no
+`messages` are skipped.
+
+One difference: the Python client counts each prompt with the tokenizer's
+chat template before sending. This client has no template engine, and some
+models' templates are not Jinja, so it takes the length from the server's
+`usage.prompt_tokens` instead (asking a stream to report usage), and the
+input totals sum those. A server that reports no usage leaves them at 0.
 
 ### Token ids on both ends
 
@@ -138,7 +157,7 @@ silently dropped flag would report a benchmark nobody ran.
 
 - **Backends**: `trt`, `gserver`, `truss`, and the embedding backends.
 - **Datasets**: `image`, `mmmu`, `mooncake`, `agentic-trace`,
-  `generated-shared-prefix`, `custom`, `openai`, `longbench-v2`,
+  `generated-shared-prefix`, `custom`, `longbench-v2`,
   `speed-bench`, and trace-timestamp replay.
 - Multi-turn replay, LoRA request distributions, `--cache-report`,
   `--plot-throughput`, PD-separated profiling, and the per-stage profiler
