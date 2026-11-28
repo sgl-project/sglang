@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import threading
 import time
 import zlib
 from array import array
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from http import HTTPStatus
@@ -223,6 +224,9 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    _pp_pending_writes: Optional[
+        dict[NodeId, tuple[RadixKey, int, DecLockRefParams]]
+    ] = None
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
     # Whether eviction walks every component in one joint LRU order; set from the
@@ -508,6 +512,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if self._pp_pending_writes:
+            self._release_pp_write_locks()
+        if self._pp_pending_writes is not None:
+            self._pp_prefix_digests.clear()
         # In-flight restores still read their host slots; finish them first.
         self._discard_restore_backups()
         self.tree_core.reset()
@@ -723,7 +731,7 @@ class UnifiedRadixCache(BasePrefixCache):
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
-        self._apply_cache_actions(result.cache_actions)
+        self._apply_cache_actions(result.cache_actions, params.key)
         return self._finalize_match_result(params, result)
 
     def _finalize_match_result(
@@ -767,7 +775,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.disable:
             return
         result = self.tree_core.match_prefix(MatchPrefixParams(key=key))
-        self._apply_cache_actions(result.cache_actions)
+        self._apply_cache_actions(result.cache_actions, key)
 
     def supports_prefix_sharing(self) -> bool:
         return not self.disable
@@ -798,7 +806,7 @@ class UnifiedRadixCache(BasePrefixCache):
         try:
             step = self.tree_core.begin_insert(params)
             while True:
-                self._apply_cache_actions(step.actions)
+                self._apply_cache_actions(step.actions, params.key)
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
@@ -807,7 +815,7 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             # Drain still-pending actions so frees reach the allocator on abort.
             try:
-                self._apply_cache_actions(self.tree_core.end_insert())
+                self._apply_cache_actions(self.tree_core.end_insert(), params.key)
             finally:
                 self.insert_session_id = None
             if self.buffer_pipeline is not None:
@@ -1929,13 +1937,25 @@ class UnifiedRadixCache(BasePrefixCache):
     # ---- Internal Helpers ----
 
     def _apply_cache_actions(
-        self, actions: list[CacheAction | ComponentAction]
+        self,
+        actions: list[CacheAction | ComponentAction],
+        key: Optional[RadixKey] = None,
     ) -> None:
         # Apply and consume one at a time: a spent list cannot be double-applied.
         actions.reverse()
         try:
             while actions:
-                self._apply_cache_action(actions.pop())
+                action = actions.pop()
+                if (
+                    isinstance(action, BackupKV)
+                    and key is not None
+                    and self._pp_pending_writes is not None
+                    and self.buffer_pipeline is None
+                    and self.linker is None
+                ):
+                    self._queue_pp_backup(action, key)
+                else:
+                    self._apply_cache_action(action)
         finally:
             actions.reverse()
 
@@ -2300,6 +2320,252 @@ class UnifiedRadixCache(BasePrefixCache):
             self.tree_core.build_backup_kv_action(node_id)
         )
 
+    def enable_pp_write_admission(self, prepare_vote: Callable[[], None]) -> bool:
+        # A shared host arena can reclaim a different set of KV/SWA pages
+        # on uneven stages. Keep the native path for the whole pipeline.
+        controller = self.cache_controller
+        independent = controller is not None and all(
+            e.host_pool.shared_allocation_domain is None
+            for e in controller.mem_pool_host.entries
+        )
+        (enabled,) = self._pp_write_min([int(independent)])
+        if not enabled:
+            return False
+        self._pp_prepare_write_vote = prepare_vote
+        self._pp_pending_writes = {}
+        self._pp_prefix_digests = OrderedDict()
+        return True
+
+    def _queue_pp_backup(self, action: BackupKV, key: RadixKey) -> None:
+        if not action.node_ids:
+            return
+        # The suffix lock protects the full device path across a split. Rebuild
+        # its parent-first chain against the live tree when the scheduler polls.
+        target = action.node_ids[-1]
+        first = self.tree_core.collect_path_info([action.node_ids[0]])[0][-1]
+        start = first.path_start
+        if target not in self._pp_pending_writes:
+            self._pp_pending_writes[target] = (
+                key,
+                start,
+                self.inc_lock_ref(target).to_dec_params(),
+            )
+        else:
+            saved_key, previous_start, lock = self._pp_pending_writes[target]
+            if start < previous_start:
+                self._pp_pending_writes[target] = saved_key, start, lock
+
+    def _release_pp_write_locks(self):
+        for target, (_, _, receipt) in self._pp_pending_writes.items():
+            self.dec_lock_ref(target, receipt)
+        self._pp_pending_writes.clear()
+
+    def _pp_write_min(self, values: list[int]) -> list[int]:
+        data = torch.tensor(values, dtype=torch.int64, device="cpu")
+        op = torch.distributed.ReduceOp.MIN
+        self._all_reduce_attn_groups(data, op)
+        torch.distributed.all_reduce(data, op=op, group=self.pp_group)
+        return data.tolist()
+
+    def _admit_pp_writes(self, invited: bool) -> None:
+        pending = self._pp_pending_writes
+        try:
+            if not invited:
+                return
+            self._pp_prepare_write_vote()
+            nodes = {}
+            for target, (key, start, _) in pending.items():
+                chain = set(self.tree_core.build_backup_kv_action(target).node_ids)
+                path = self.tree_core.collect_path_info([target])[0]
+                scope = (key.extra_key, key.cache_salt, key.is_bigram)
+                prefix = hashlib.sha256(json.dumps(scope).encode())
+                raw = memoryview(key.token_ids)
+                offset = 0
+                for span in path:
+                    if span.path_end > len(key):
+                        break
+                    end = span.path_end + int(key.is_bigram)
+                    node_id = span.node_id
+                    checkpoint = (node_id, span.parent_id, end, scope)
+                    saved = self._pp_prefix_digests.get(checkpoint)
+                    if saved is not None:
+                        prefix, offset = saved, end
+                        self._pp_prefix_digests.move_to_end(checkpoint)
+                    if (
+                        node_id not in chain
+                        or node_id in nodes
+                        or span.path_start < start
+                    ):
+                        continue
+                    if offset < end:
+                        # The endpoint of an existing radix node denotes the
+                        # same token prefix across splits. Hash only the suffix
+                        # since the last backed chunk or overlapping intent.
+                        prefix = prefix.copy()
+                        prefix.update(raw[offset:end])
+                        offset = end
+                        self._pp_prefix_digests[checkpoint] = prefix
+                        if len(self._pp_prefix_digests) > 1024:
+                            self._pp_prefix_digests.popitem(last=False)
+                    digest = prefix.copy()
+                    digest.update(span.path_start.to_bytes(8, "little"))
+                    nodes[node_id] = digest.digest(), span.parent_id
+            digest = hashlib.sha256(
+                b"".join(value for value, _ in nodes.values())
+            ).digest()
+            signature = int.from_bytes(digest[:8], "little") >> 1
+            low, neg_high = self._pp_write_min([signature, -signature])
+            if low != -neg_high:
+                return
+            skipped = set()
+            queue = deque((node, parent) for node, (_, parent) in nodes.items())
+            while queue:
+                if queue[0][1] in skipped:
+                    skipped.add(queue.popleft()[0])
+                    continue
+                wave = []
+                covered = set()
+                for node, parent in queue:
+                    if parent in covered or parent in skipped:
+                        break
+                    device, components = self.tree_core.build_backup_spec(node)
+                    publishes = self._backup_publish_node_ids(node, components)
+                    if covered.intersection(publishes):
+                        break
+                    wave.append((node, device, components))
+                    covered.update(publishes)
+                # Side-pool transfers can cover an ancestor besides their
+                # anchor. Use the same independent prefix on every stage.
+                (width,) = self._pp_write_min([len(wave)])
+                wave = wave[:width]
+                committed = self._try_pp_write_wave(wave)
+                for node, _, _ in wave[committed:]:
+                    if not self._admit_pp_write(node):
+                        skipped.add(node)
+                for _ in wave:
+                    queue.popleft()
+        finally:
+            self._release_pp_write_locks()
+
+    def _pp_write_transfers(self, device, components):
+        sidecars = self._build_backup_sidecar(device, components)
+        transfers = [t for items in components.values() for t in items] + sidecars
+        # Derived indices alias another pool. Pre-resolved indices belong to
+        # the caller. Only newly allocated independent transfers can be freed.
+        owned = [
+            t
+            for t in transfers
+            if t.indices_from_pool is None and t.host_indices is None
+        ]
+        return transfers, owned
+
+    def _publish_pp_reservation(self, node, device, components, reservation):
+        host, resolved = reservation
+        self.cache_controller.write_queue.append(
+            CacheOperation(host, device, node, pool_transfers=resolved or None)
+        )
+        self._commit_kv_backup(node, host, components, write_back=False)
+
+    def _try_pp_write_wave(self, wave) -> int:
+        # One vector vote covers the whole wave when host capacity is ample.
+        # Retry in order under pressure, after returning all tentative slots.
+        controller = self.cache_controller
+        pools = controller.mem_pool_host
+        leases = deque()
+        states = []
+        try:
+            for node, device, components in wave:
+                if not device.numel() and not components:
+                    states.append(0)
+                    continue
+                transfers, owned = self._pp_write_transfers(device, components)
+                reservation = controller.allocate_host_transfers(
+                    device,
+                    transfers or None,
+                    start_owner=self.tree_core.rotation_phase_of(node),
+                    allow_reclaim=False,
+                )
+                states.append(-1 if reservation is None else 1)
+                if reservation is not None:
+                    leases.append((node, device, components, reservation, owned))
+            limits = self._pp_write_min(states + [-state for state in states])
+            for index, (low, high) in enumerate(
+                zip(limits[: len(wave)], limits[len(wave) :])
+            ):
+                if low < 0 or low != -high:
+                    return index
+                if low:
+                    node, device, components, reservation, _ = leases.popleft()
+                    self._publish_pp_reservation(node, device, components, reservation)
+            return len(wave)
+        finally:
+            for _, _, _, reservation, owned in leases:
+                self._release_pp_reservation(pools, reservation, owned)
+
+    @staticmethod
+    def _release_pp_reservation(pools, reservation, owned):
+        pools.release_transfers(owned)
+        pools.free(reservation[0])
+        for transfer in owned:
+            transfer.host_indices = None
+        for transfer in reservation[1] or ():
+            if transfer.indices_from_pool is not None:
+                transfer.host_indices = None
+
+    def _admit_pp_write(self, node_id: NodeId) -> bool:
+        device, components = self.tree_core.build_backup_spec(node_id)
+        needed = bool(device.numel() or components)
+        all_need, all_skip = self._pp_write_min([int(needed), int(not needed)])
+        if not all_need:
+            return bool(all_skip)
+        transfers, owned = self._pp_write_transfers(device, components)
+        controller = self.cache_controller
+        pools = controller.mem_pool_host
+        owner = self.tree_core.rotation_phase_of(node_id)
+        reservation = controller.allocate_host_transfers(
+            device,
+            transfers or None,
+            start_owner=owner,
+            allow_reclaim=False,
+        )
+        # Uniform pressure on a full host cache must still replace old entries.
+        # Reclamation is a separate group decision. A rank with a tentative
+        # reservation must never evict an existing prefix for a peer's miss.
+        accepted, all_failed = self._pp_write_min(
+            [int(reservation is not None), int(reservation is None)]
+        )
+        if all_failed:
+            requirements = {pools.anchor_entry.name: device.numel()}
+            for transfer in owned:
+                if (
+                    transfer.device_indices is not None
+                    and transfer.name in pools.entry_map
+                ):
+                    requirements[transfer.name] = requirements.get(
+                        transfer.name, 0
+                    ) + len(transfer.device_indices)
+            capacity = [
+                (name, required, pools.available_size(name))
+                for name, required in sorted(requirements.items())
+            ]
+            digest = hashlib.sha256(json.dumps(capacity).encode()).digest()
+            pressure = int.from_bytes(digest[:8], "little") >> 1
+            low, neg_high = self._pp_write_min([pressure, -pressure])
+            if low == -neg_high:
+                shortfall = device.numel() - pools.available_size()
+                if shortfall > 0:
+                    self.evict_host(shortfall)
+                reservation = controller.allocate_host_transfers(
+                    device, transfers or None, start_owner=owner
+                )
+                (accepted,) = self._pp_write_min([int(reservation is not None)])
+        if not accepted:
+            if reservation is not None:
+                self._release_pp_reservation(pools, reservation, owned)
+            return False
+        self._publish_pp_reservation(node_id, device, components, reservation)
+        return True
+
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> Optional[int]:
@@ -2325,16 +2591,18 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             if host_indices is None:
                 return None
-            self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
-            lock_params = None
-            if not write_back:
-                lock_params = self.inc_lock_ref(node_id).to_dec_params()
-            publish_node_ids = self._backup_publish_node_ids(node_id, comp_xfers)
-            self._track_write_through_node(
-                node_id, lock_params, publish_node_ids=publish_node_ids
-            )
+            self._commit_kv_backup(node_id, host_indices, comp_xfers, write_back)
             written = len(host_indices)
         return written
+
+    def _commit_kv_backup(self, node_id, host_indices, comp_xfers, write_back):
+        self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
+        lock_params = None if write_back else self.inc_lock_ref(node_id).to_dec_params()
+        self._track_write_through_node(
+            node_id,
+            lock_params,
+            publish_node_ids=self._backup_publish_node_ids(node_id, comp_xfers),
+        )
 
     @staticmethod
     def _backup_publish_node_ids(
@@ -4400,11 +4668,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
                 mins = [min(col) for col in zip(*rows)]
                 return mins[0], mins[1], tuple(mins[2:-2]), extra_pool_names
+        pending = self._pp_pending_writes
         ready_counts = torch.tensor(
             [
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
+                *([int(not pending)] if pending is not None else []),
                 digest,
                 -digest,
             ],
@@ -4417,6 +4687,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
+        if pending is not None:
+            self._pp_write_invited = count_values.pop(-3) == 0
         assert digest == count_values[-2] and digest == -count_values[-1], (
             "write_back duplicate-reclaim victims or live storage prefetches "
             "diverged across PP/TP ranks"
@@ -4767,6 +5039,8 @@ class UnifiedRadixCache(BasePrefixCache):
         ) = self._sync_hicache_ready_counts()
         self.writing_check(finish_count=write_finish_count)
         self.loading_check(finish_count=load_finish_count)
+        if self._pp_pending_writes is not None:
+            self._admit_pp_writes(self._pp_write_invited)
 
         if self.enable_storage and storage_queue_sizes:
             n_storage_hit, n_ack_prefetch, n_backup, n_release = storage_queue_sizes[:4]
@@ -4799,7 +5073,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # The buffer-mode pipeline (storage without a host pool) tracks its
         # own device-to-host copies and load-backs.
         return bool(
-            self.ongoing_write_through
+            getattr(self, "_pp_pending_writes", None)
+            or self.ongoing_write_through
             or self.ongoing_load_back
             or self.ongoing_backup
             or self.ongoing_prefetch

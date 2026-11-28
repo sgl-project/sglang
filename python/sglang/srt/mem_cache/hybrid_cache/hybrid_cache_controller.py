@@ -713,14 +713,16 @@ class HybridCacheController(BaseHiCacheController):
         *,
         reclaim: Optional[Callable[[int], Any]] = None,
         start_owner: Optional[int] = None,
+        allow_reclaim: bool = True,
     ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
         if self._uses_shared_host_domain(extra_pools):
             allocation = self.allocate_shared_host_transfers(
-                device_indices, extra_pools
+                device_indices, extra_pools, allow_reclaim=allow_reclaim
             )
             anchor = self.mem_pool_host.anchor_entry
             if (
                 allocation is None
+                and allow_reclaim
                 and reclaim is not None
                 and anchor.host_evict_fn is None
             ):
@@ -731,7 +733,9 @@ class HybridCacheController(BaseHiCacheController):
             return allocation
 
         host_indices = self.mem_pool_host.alloc(
-            len(device_indices), reclaim=reclaim, start_owner=start_owner
+            len(device_indices),
+            reclaim=reclaim if allow_reclaim else None,
+            start_owner=start_owner,
         )
         if host_indices is None:
             return None
@@ -740,6 +744,7 @@ class HybridCacheController(BaseHiCacheController):
                 extra_pools,
                 primary_device_indices=device_indices,
                 primary_host_indices=host_indices,
+                allow_reclaim=allow_reclaim,
             )
         except BaseException as error:
             # No operation or DMA owns these slots until all pools resolve.
@@ -806,7 +811,7 @@ class HybridCacheController(BaseHiCacheController):
         return True
 
     def _alloc_shared_host_requests_with_reclaim(
-        self, requests: list[tuple[PoolName, int]]
+        self, requests: list[tuple[PoolName, int]], *, allow_reclaim: bool = True
     ) -> Optional[list[torch.Tensor]]:
         entries = [self.mem_pool_host.entry_map[name] for name, _ in requests]
         domain = entries[0].host_pool.shared_allocation_domain
@@ -823,7 +828,7 @@ class HybridCacheController(BaseHiCacheController):
         # across attention ranks. Layout compaction waits for local I/O before
         # allocating; transfer readiness does not change the capacity decision.
         allocated = domain.alloc_many(domain_requests)
-        if allocated is not None:
+        if allocated is not None or not allow_reclaim:
             return allocated
 
         pools = [entry.host_pool for entry in entries]
@@ -879,6 +884,8 @@ class HybridCacheController(BaseHiCacheController):
         self,
         kv_device_indices: torch.Tensor,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        *,
+        allow_reclaim: bool = True,
     ) -> Optional[tuple[torch.Tensor, Optional[list[PoolTransfer]]]]:
         """Atomically reserve the anchor and all independent host side pools."""
         requests = [(self.mem_pool_host.anchor_entry.name, len(kv_device_indices))]
@@ -896,7 +903,9 @@ class HybridCacheController(BaseHiCacheController):
             requests.append((transfer.name, len(transfer.device_indices)))
             request_transfers.append(transfer)
 
-        allocated = self._alloc_shared_host_requests_with_reclaim(requests)
+        allocated = self._alloc_shared_host_requests_with_reclaim(
+            requests, allow_reclaim=allow_reclaim
+        )
         if allocated is None:
             return None
         host_indices = allocated[0]

@@ -514,7 +514,64 @@ def _two_rank_settlement(rank, rendezvous_dir, skip_rank):
         torch.distributed.destroy_process_group()
 
 
+def _pp_write_through_insert(rank, directory):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{directory}/gloo-pp",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        with contextlib.ExitStack() as cleanup:
+            cache, allocator, _ = _build_cache(cleanup, host_memory_mode="cache")
+            cache.pp_rank, cache.pp_size = rank, 2
+            cache.pp_group = torch.distributed.group.WORLD
+            cache.pp_sync_window = 2
+            cache.write_through_threshold = 1
+            cache.enable_pp_write_admission(lambda: None)
+            pools = cache.cache_controller.mem_pool_host
+            nodes = []
+            for token in (11, 22, 33):
+                occupied = None
+                if rank == 1 and token == 22:
+                    occupied = pools.alloc(pools.available_size())
+                key = RadixKey(array("q", [token, token + 1]))
+                cache.insert(InsertParams(key=key, value=allocator.alloc(len(key))))
+                node = cache.match_prefix(MatchPrefixParams(key=key)).last_device_node
+                if token == 11:
+                    # Split an intent at a real radix boundary before it is polled.
+                    prefix = cache.match_prefix(
+                        MatchPrefixParams(key=key[:1])
+                    ).last_device_node
+                for _ in range(3):
+                    cache.check_hicache_events()
+                if occupied is not None:
+                    pools.free(occupied)
+                nodes.append(node)
+            assert [cache.is_backuped(n) for n in [prefix, *nodes]] == [
+                True,
+                True,
+                False,
+                True,
+            ]
+            assert not cache.ongoing_write_through
+            assert not cache.cache_controller.ack_write_queue
+            cache.sanity_check()
+            for work_round in cache.work_rounds:
+                for work in work_round:
+                    work.wait()
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 class TestTwoRankSettlement(unittest.TestCase):
+    def test_pp_write_through_insert_survives_a_rank_local_allocation_miss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            torch.multiprocessing.spawn(
+                _pp_write_through_insert, args=(directory,), nprocs=2
+            )
+
     def _spawn(self, skip_rank):
         with tempfile.TemporaryDirectory(prefix="hicache-backup-settle-") as directory:
             torch.multiprocessing.spawn(

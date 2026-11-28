@@ -181,6 +181,30 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        cache = getattr(self, "tree_cache", None)
+        cache = getattr(cache, "inner", cache)
+        enable_admission = getattr(cache, "enable_pp_write_admission", None)
+        if (
+            getattr(self, "enable_hierarchical_cache", False)
+            and enable_admission is not None
+            and cache.buffer_pipeline is None
+            and cache.linker is None
+            # DP-attention replicas can reach different scheduler collectives.
+            # PP2 on NPU uses a paired HCCL exchange instead of the output ring.
+            and get_parallel().attn_dp_size == 1
+            and not (_is_npu and get_parallel().pp_size == 2)
+            # Rank zero must post these receives after the current forward
+            # when an SM-sensitive kernel uses the explicit receive fence.
+            and not (
+                get_parallel().pp_size > 2
+                and get_parallel().pp_async_batch_depth == 0
+                and not self._pp_spec_relay
+                and envs.SGLANG_ENABLE_PP_OUTPUT_RECV_AFTER_FORWARD.get()
+            )
+            and enable_admission(self._pp_prepare_write_vote)
+        ):
+            self._pp_output_receives_due = 0
+            self._pp_received_outputs = deque()
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -1176,7 +1200,38 @@ class SchedulerPPMixin:
             pp_proxy_tensors = PPProxyTensors(tensor_dict)
         return pp_proxy_tensors
 
+    def _pp_prepare_write_vote(self: Scheduler) -> None:
+        # A follower may need the previous iteration's output to reach the
+        # same cache poll. Publish it before entering a blocking collective.
+        if not self.pp_group.is_last_rank and self.pp_outputs:
+            self.send_output_work.extend(
+                self._pp_send_dict_to_next_stage(
+                    self.pp_outputs.tensors, async_send=True, msg_type="output"
+                )
+            )
+            self.pp_outputs = None
+        # The last stage may still be waiting for rank zero to receive a
+        # result it has already sent. Preserve the normal consumption order.
+        while self._pp_output_receives_due > 0:
+            self._pp_received_outputs.append(self._pp_recv_output_dict())
+            self._pp_output_receives_due -= 1
+
     def _pp_recv_dict_from_prev_stage(
+        self: Scheduler,
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
+        buffered = getattr(self, "_pp_received_outputs", None)
+        if buffered:
+            return buffered.popleft()
+        value = self._pp_recv_output_dict()
+        if (
+            buffered is not None
+            and self.pp_group.is_first_rank
+            and get_parallel().pp_size > 2
+        ):
+            self._pp_output_receives_due -= 1
+        return value
+
+    def _pp_recv_output_dict(
         self: Scheduler,
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
         return self._pp_recv_typed_dict(
@@ -1691,6 +1746,18 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors | None,
     ) -> List[P2PWork]:
         send_output_work = []
+        if (
+            getattr(self, "_pp_received_outputs", None) is not None
+            and self.pp_group.is_first_rank
+            and get_parallel().pp_size > 2
+        ):
+            target = mbs[next_first_rank_mb_id]
+            if (
+                target is not None
+                and not target.forward_mode.is_prebuilt()
+                and not _pp_can_skip_output_comm(target)
+            ):
+                self._pp_output_receives_due += 1
         if self.pp_group.is_last_rank:
             # send ready PP output to rank 0
             target = mbs[next_first_rank_mb_id]

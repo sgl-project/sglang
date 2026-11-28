@@ -242,6 +242,7 @@ class HostPoolGroup:
         *,
         primary_device_indices: torch.Tensor | None = None,
         primary_host_indices: torch.Tensor | None = None,
+        allow_reclaim: bool = True,
     ) -> list[PoolTransfer] | None:
         """Allocate unresolved side-pool host indices atomically.
 
@@ -283,7 +284,7 @@ class HostPoolGroup:
                 indices = self.alloc(
                     len(transfer.device_indices),
                     pool=transfer.name,
-                    reclaim=entry.host_evict_fn,
+                    reclaim=entry.host_evict_fn if allow_reclaim else None,
                 )
                 if indices is None:
                     rollback()
