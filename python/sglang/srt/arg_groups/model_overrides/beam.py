@@ -36,10 +36,18 @@ def _beam_overrides(server_args: Any, hf_config: Any) -> dict:
         quantization = quant_config.get("quant_algo")
     if (
         quantization in ("modelopt_fp4", "NVFP4")
-        and get_platform().is_sm100
         and cfg.moe_runner_backend == "auto"
         and cfg.moe_a2a_backend == "none"
     ):
-        logger.info("Use flashinfer_trtllm as MoE runner backend for quantized Beam")
-        overrides["moe_runner_backend"] = "flashinfer_trtllm"
+        # trtllm-gen MoE kernels are SM100-only; SM120 runs FlashInfer's CUTLASS
+        # NVFP4 MoE instead.
+        if get_platform().is_sm100:
+            runner = "flashinfer_trtllm"
+        elif get_platform().is_sm120:
+            runner = "flashinfer_cutlass"
+        else:
+            runner = None
+        if runner is not None:
+            logger.info("Use %s as MoE runner backend for quantized Beam", runner)
+            overrides["moe_runner_backend"] = runner
     return overrides

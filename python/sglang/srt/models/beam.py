@@ -183,6 +183,10 @@ def _request_beam_workspace(hidden_size: int):
         return None
     if get_parallel().tp_size not in (2, 4, 8):
         return None
+    # Only Hopper and SM100-class GPUs run the fused boundaries
+    # (`_all_reduce_limits`); elsewhere the workspace would sit unused.
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
+        return None
     from sglang.srt.distributed.device_communicators.symm_workspace import (
         WorkspaceRequest,
         request_group_workspace,
@@ -310,8 +314,10 @@ class BeamMoE(nn.Module):
         ):
             raise ValueError(
                 "Beam supports the auto or triton MoE runner for BF16/FP8 "
-                "and flashinfer_trtllm for NVFP4, with no MoE all-to-all; "
-                "NVFP4 also supports the flashinfer_megamoe all-to-all"
+                "and, for NVFP4, flashinfer_trtllm on SM100 or "
+                "flashinfer_cutlass on SM120, with no MoE all-to-all; "
+                "NVFP4 also supports the flashinfer_megamoe all-to-all; "
+                f"got {backend.value!r}"
             )
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -1268,10 +1274,14 @@ def get_beam_quantization(quant_config: Optional[QuantizationConfig]) -> Optiona
 
 
 def get_beam_supported_moe_runners(quant_scheme: Optional[str]) -> Tuple[str, ...]:
+    if quant_scheme == "nvfp4":
+        # trtllm-gen MoE runs only on SM100; SM120 uses FlashInfer's CUTLASS MoE.
+        if _is_cuda and torch.cuda.get_device_capability()[0] == 12:
+            return ("flashinfer_cutlass",)
+        return ("flashinfer_trtllm",)
     return {
         "bf16": ("auto", "triton"),
         "fp8": ("auto", "triton"),
-        "nvfp4": ("flashinfer_trtllm",),
     }.get(quant_scheme, ())
 
 
