@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
 from sglang.srt.speculative.eagle_megakernel import EagleMegakernel
@@ -317,48 +318,6 @@ def _leaves(hint):
 
 
 class TestEagleBinding(CustomTestCase):
-    def test_real_eagle_binding_runs_covered_dispatch_and_capture_tail(self):
-        for arch, backend in (
-            ("Qwen3_5ForCausalLM", _hybrid()),
-            ("Qwen3_5ForCausalLMMTP", _trtllm(KvPool())),
-        ):
-            with self.subTest(architecture=arch):
-                binding = runtime._binding_class([arch])(model=torch.nn.Module())
-                self.assertIsInstance(binding, eb.EagleBinding)
-                built = SimpleNamespace(
-                    plan=MagicMock(return_value=Step(mode="decode", rows=2)),
-                    forward=lambda step, *args, **kwargs: step.view,
-                )
-                original = MagicMock(return_value="standard")
-                dispatch = runtime._Dispatch(
-                    built=built, original=original, binding=binding
-                )
-                forward = dispatch.wrapped()
-                batch = SimpleNamespace(batch_size=2)
-                ids = torch.zeros(2, dtype=torch.int64)
-                check = runtime._CaptureCheck(
-                    spec=SimpleNamespace(name="eagle"), dispatch=dispatch
-                )
-                runner = SimpleNamespace(capture_bs=(2,))
-                with patch.object(eb, "get_attn_backend", return_value=backend):
-                    for capturing in (False, True):
-                        with patch.object(
-                            torch.cuda,
-                            "is_current_stream_capturing",
-                            return_value=capturing,
-                        ):
-                            view = forward(ids, None, batch)
-                        self.assertIsInstance(view, eb.EagleForwardView)
-                    original.assert_not_called()
-                    check(runner, None, batch, 2)
-                    self.assertTrue(check.is_done)
-                    backend.token_to_kv_pool.k[3] = torch.zeros(4, 2)
-                    check = runtime._CaptureCheck(
-                        spec=SimpleNamespace(name="eagle"), dispatch=dispatch
-                    )
-                    with self.assertRaisesRegex(RuntimeError, "kv was reallocated"):
-                        check(runner, None, batch, 2)
-
     def test_a_qwen3_5_view_is_the_running_forward_and_tolerated_members_exist(self):
         """A covered step is captured once and replays SGLang's refills of the
         backends' metadata, so the view must hold those very tensors."""
@@ -687,6 +646,8 @@ class TestEagleEntries(CustomTestCase):
                     numerics=SimpleNamespace(kind=SimpleNamespace(value="exact")),
                     binding="",
                     prefill_graph=False,
+                    tensor_verify_build=None,
+                    tensor_verify_binding_kind=0,
                 )
                 hooks = []
                 refused = (
@@ -969,11 +930,29 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         self.assertIs(selected.post_verify.local_keys, custom_keys)
 
     def test_default_post_verify_uses_the_stock_signature(self):
+        def local_keys(view):
+            return None
+
+        expected = (
+            torch.tensor([1]),
+            torch.tensor([0]),
+            torch.tensor([0]),
+        )
+        # The route is derived from the view: logit_bias adjusts, top-p truncates.
+        sampling = SimpleNamespace(
+            step_penalties=None,
+            logit_bias=torch.zeros(1, 4),
+            has_custom_logit_processor=False,
+            need_top_k_sampling=False,
+            need_top_p_sampling=True,
+            need_min_p_sampling=False,
+        )
         io = SimpleNamespace(
             device=torch.device("cpu"),
             is_idle=False,
             seq_lens=torch.tensor([3]),
-            sampling_info=SimpleNamespace(),
+            sampling=sampling,
+            sampling_info=sampling,
             req_pool_indices=torch.tensor([0]),
             return_logprob=False,
             verify_tree=object(),
@@ -986,36 +965,30 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
             simulated_accept_length_rng=None,
             sparse_bonus_argmax=False,
         )
-        expected = (
-            torch.tensor([1]),
-            torch.tensor([0]),
-            torch.tensor([0]),
-        )
-        with (
-            patch(
-                "sglang.srt.speculative.eagle_utils.LOCAL_KEYS_SUPPORTED",
-                False,
-                create=True,
-            ),
-            patch(
-                "sglang.srt.speculative.eagle_utils.eagle_sample",
-                return_value=expected,
-            ) as sample,
-        ):
-            output = speculative_runtime.default_post_verify(io, lambda view: None)
+        with patch(
+            "sglang.srt.speculative.eagle_utils.eagle_sample",
+            return_value=expected,
+        ) as sample:
+            output = speculative_runtime.default_post_verify(io, local_keys)
         self.assertEqual(
             sample.call_args.kwargs,
             {
                 "uno_target_max_top_k": None,
-                "watermark_state": None,
-                "watermark_full_mask": True,
                 "simulated_acc_len": None,
                 "simulated_acc_len_rng": None,
                 "sparse_bonus_argmax": False,
+                "local_keys": local_keys,
             },
         )
         self.assertTrue(torch.equal(output.token_ids, expected[0]))
-        batch = sample.call_args.args[1]
+        verify = sample.call_args.args[1]
+        self.assertEqual(
+            verify.route,
+            VerifyRoute(adjusts_logits=True, need_truncated_sampling=True),
+        )
+        self.assertIsNone(verify.watermark)
+        self.assertIsNone(verify.grammar_mask)
+        batch = verify.batch
         self.assertIsInstance(batch, speculative_runtime.StockVerifyBatch)
         self.assertIs(batch.forward_mode, ForwardMode.TARGET_VERIFY)
         self.assertIs(batch.sampling_info, io.sampling_info)

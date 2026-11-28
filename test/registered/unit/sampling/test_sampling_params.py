@@ -3,8 +3,8 @@
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
-register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
-register_xpu_ci(est_time=10, suite="stage-a-test-1-gpu-xpu")
+register_cpu_ci(est_time=8, suite="extra-test-cpu-intel")
+register_xpu_ci(est_time=10, suite="extra-test-1-gpu-xpu")
 
 import copy
 import re
@@ -803,6 +803,16 @@ class TestRegexMaxLength(CustomTestCase):
         """Test that lookahead (?=a) hits the unhandled-token fallback (MAX_LEN)."""
         result = get_max_seq_length("(?=a)b")
         self.assertGreaterEqual(result, MAX_LEN)
+
+
+class TestForSample(CustomTestCase):
+    def test_samples_get_distinct_seeds_that_match_rust(self):
+        """Sample 0 keeps the seed; the others match Rust's for_sample
+        (`seeds_for_samples_match_python`)."""
+        sp = SamplingParams(sampling_seed=42)
+        self.assertEqual(sp.for_sample(0).sampling_seed, 42)
+        self.assertEqual(sp.for_sample(1).sampling_seed, -7046029254386353089)
+        self.assertEqual(sp.for_sample(2).sampling_seed, 4354685564936845396)
 
 
 if __name__ == "__main__":

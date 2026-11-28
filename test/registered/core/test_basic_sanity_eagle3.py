@@ -25,9 +25,9 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=120, stage="base-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=200, suite="stage-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=200, suite="base-a-test-1-gpu-small-amd")
 # backend-specific: SAIL EAGLE3 kernels, decode graphs, and device-timer occupancy.
-register_ppu_ci(est_time=350, suite="stage-a-test-1-gpu-ppu")
+register_ppu_ci(est_time=350, suite="extra-test-1-gpu-ppu")
 
 
 class TestBasicSanityEagle3(
@@ -82,7 +82,11 @@ class TestBasicSanityEagle3(
                 "--enable-metrics",
                 "--cuda-graph-backend-prefill=disabled",
             ],
-            env={"SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1"},
+            env={
+                "SGLANG_ENABLE_METRICS_DEVICE_TIMER": "1",
+                # The EAGLE3 draft derives a shorter context than the target.
+                "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN": "1",
+            },
         )
 
     @classmethod

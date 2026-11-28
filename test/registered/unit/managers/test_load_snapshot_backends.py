@@ -562,6 +562,13 @@ def build_rust_loads_fixture() -> dict:
         utilization=0.5,
         total_prefill_uncached_tokens=987654321,
         total_prefill_busy_us=123456789,
+        total_storage_prefetch_hit_tokens=55555,
+        total_storage_prefetch_unfulfilled_tokens={
+            "storage_transfer": 333,
+            "device_covered": 44,
+        },
+        total_backuped_tokens=77777,
+        total_backup_dropped_tokens=6666,
         decode_moments=[100.0, 2.5, 0.125],
         memory=MemoryMetrics(
             weight_gb=60.5, kv_cache_gb=120.25, graph_gb=2.0, token_capacity=1048576
@@ -569,7 +576,11 @@ def build_rust_loads_fixture() -> dict:
         speculative=SpeculativeMetrics(accept_length=3.5, accept_rate=0.75),
         lora=LoRAMetrics(slots_used=1, slots_total=8, utilization=0.125),
         disaggregation=DisaggregationMetrics(
-            mode="decode", decode_prealloc_queue_reqs=2, kv_transfer_speed_gb_s=12.5
+            mode="decode",
+            decode_prealloc_queue_reqs=2,
+            kv_transfer_speed_gb_s=12.5,
+            decode_host_pool_blocked=1,
+            decode_host_staged_landed_reqs=6,
         ),
         queues=QueueMetrics(
             waiting=3, grammar=1, paused=0, retracted=2, prealloc_ready=4

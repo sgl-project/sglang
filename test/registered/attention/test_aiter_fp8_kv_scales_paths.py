@@ -30,9 +30,9 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd")
 # The head-dim-256 cases need gfx950.
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 _RUNNABLE = is_hip()
 if _RUNNABLE:
@@ -245,7 +245,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             swa_page_table=None,
             paged_kv_view=None,
             max_q_len=max(seq_lens),
-            max_kv_len=max(seq_lens),
+            batch_max_kv_len=max(seq_lens),
         )
         forward_batch = SimpleNamespace(
             batch_size=batch,
@@ -335,7 +335,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             swa_page_table=None,
             paged_kv_view=None,
             max_q_len=max(extend_lens),
-            max_kv_len=max(seq_lens),
+            batch_max_kv_len=max(seq_lens),
         )
         forward_batch = SimpleNamespace(
             batch_size=batch,
@@ -428,7 +428,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             swa_out_cache_loc=None,
             paged_kv_view=None,
             max_q_len=max(extend_lens),
-            max_kv_len=max(extend_lens),
+            batch_max_kv_len=max(extend_lens),
         )
         forward_batch = SimpleNamespace(
             batch_size=batch,
@@ -537,7 +537,7 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
             paged_kv_view=None,
             asm_ctx_ready=False,
             max_q_len=max(extend_lens),
-            max_kv_len=max(seq_lens),
+            batch_max_kv_len=max(seq_lens),
         )
         forward_batch = SimpleNamespace(
             batch_size=batch,

@@ -23,7 +23,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
-register_xpu_ci(est_time=300, suite="nightly-xpu-kernel-main-4-gpu", nightly=True)
+register_xpu_ci(est_time=300, suite="nightly-kernel-main-test-4-gpu-xpu", nightly=True)
 
 _XPU_AVAILABLE = torch.xpu.is_available()
 # Prefill holds device 0 and decode TP 2 takes devices 1-2. Both backends only

@@ -11,6 +11,7 @@ import torch
 from sglang.kernels.ops.layernorm.mhc_post_split_h import mhc_post_split_h
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.layers import mori_gemm_ar
 from sglang.srt.layers.attention.hip_flash_mla import (
     hip_attention_needs_head_pad,
     resolve_hip_flashmla_backend,
@@ -166,6 +167,16 @@ def attention_inv_rope(
     return torch.view_as_real(attn.freqs_cis).flatten(-2), positions
 
 
+def fused_wo_b(attn, o) -> Optional[torch.Tensor]:
+    """wo_b's GEMM fused with its all-reduce through mori (SGLANG_OPT_FUSED_WO_B_AR), or
+    None to run the plain wo_b. Only for an all-reduce that is not deferred, since fusing
+    performs it; mori_gemm_ar fuses only a reduce over the whole TP group, so the
+    attention-TP all-reduce that follows wo_b never applies to its result."""
+    # the gfx950 wo_a fork already returned [T, G * R], so only the plain tensor needs flattening
+    o_in = o.flatten(1) if isinstance(o, torch.Tensor) else o
+    return mori_gemm_ar.fused_wo_b(attn.wo_b, o_in)
+
+
 # ---- DeepseekV4DecoderLayer ----
 
 
@@ -182,9 +193,23 @@ def init_decoder_layer(layer, quant_config) -> None:
     )
     layer._wqkv_a_native_consumer_checked = False
     layer._wqkv_a_native_consumer = False
+    # Whether the layer can take the fused boundary; fused_boundary_this_step picks
+    # the step's path. The AMD monokernel checks this at attach.
     layer.hc_boundary_fused = (
         _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
     )
+
+
+def fused_boundary_this_step(forward_batch) -> bool:
+    """Whether this step's hc_boundary_fused layers take the fused mHC boundary.
+
+    Mega-mHC runs the seam from forward_hc_pre_from_prev instead; running both would
+    apply the same post twice. _post_fusion takes Mega-mHC on prefill only, so every
+    other step keeps the fused boundary.
+    """
+    if not envs.SGLANG_OPT_DSV41_MEGA_MHC_PREFILL.get():
+        return True
+    return not forward_batch.forward_mode.is_extend_without_speculative()
 
 
 def hc_post(cfg, x, residual, post, comb) -> Optional[torch.Tensor]:
@@ -246,3 +271,15 @@ def input_norm(
     if coefficients is not None:
         coefficients.materialize()
     return layer.input_layernorm(hidden_states), None
+
+
+# ---- DeepseekV4ForCausalLM ----
+
+
+def prepare_fused_wo_b(wo_b_layers) -> None:
+    """Build the fused wo_b's weight copies and symmetric window up front: they are sized
+    from configuration alone, so the memory profiler then sizes the KV cache around them.
+    Call after process_weights_after_loading, which lays out the mxfp8 weights they copy
+    (post_load_weights runs before it), with the wo_b of every MQALayer only: DSPARK's
+    attention also has a wo_b but calls it directly."""
+    mori_gemm_ar.prepare_fused_wo_b(wo_b_layers)

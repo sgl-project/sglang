@@ -40,7 +40,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=290, stage="nightly", runner_config="4-gpu-h100")
 register_amd_ci(
     est_time=300,
-    suite="nightly-amd-4-gpu",
+    suite="nightly-test-4-gpu-amd",
     nightly=True,
     disabled="TP=2 vs TP=4 numerical mismatch on AMD (comparator fails tolerance check)",
 )
@@ -310,7 +310,8 @@ def _run_server_and_generate(
         "128",
         "--mem-fraction-static",
         "0.5",
-        "--disable-cuda-graph",
+        "--disable-decode-cuda-graph",
+        "--disable-prefill-cuda-graph",
         "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
         *ADMIN_LAUNCH_ARGS_FOR_TEST,

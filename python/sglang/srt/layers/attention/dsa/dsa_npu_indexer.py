@@ -25,6 +25,7 @@ from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
     import torch_npu
+    from sgl_kernel_npu.operators.indexer import mlp_lightning_indexer
 
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
@@ -88,7 +89,7 @@ def plan_indexer_query_shard(
 
 
 class _IndexerQueryShard(NamedTuple):
-    """This rank's rows of an extend batch, and how to reassemble the top-k."""
+    """This rank's query rows and how to reassemble the top-k."""
 
     start: int
     rows: int
@@ -97,10 +98,11 @@ class _IndexerQueryShard(NamedTuple):
     tp_size: int
     actual_seq_lengths_q: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
+    request_rows: Optional[slice] = None
 
     def take(self, x: torch.Tensor) -> torch.Tensor:
-        if self.num_real == self.rows:
-            return x[self.start : self.start + self.rows]
+        if self.request_rows is not None or self.num_real == self.rows:
+            return x[self.start : self.start + self.num_real]
         # Padding rows lie past actual_seq_lengths_q[-1]; gather() drops them.
         out = x.new_zeros((self.rows, *x.shape[1:]))
         out[: self.num_real] = x[self.start : self.start + self.num_real]
@@ -108,15 +110,23 @@ class _IndexerQueryShard(NamedTuple):
 
     def gather(self, topk_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
         """All-gather the per-rank top-k back to ``num_tokens`` rows."""
-        out = topk_indices.new_empty((self.rows * self.tp_size, topk_indices.shape[-1]))
+        topk_width = topk_indices.shape[-1]
+        if self.request_rows is not None and self.num_real < self.rows:
+            # The collective needs equal-size tiles.
+            padded_topk = topk_indices.new_empty((self.rows, topk_width))
+            if self.num_real:
+                padded_topk[: self.num_real].copy_(topk_indices)
+            topk_indices = padded_topk
+        gather_rows = self.rows * self.tp_size
+        out = topk_indices.new_empty((gather_rows, topk_width))
         attn_tp_all_gather_into_tensor(out, topk_indices.contiguous())
         return out[:num_tokens]
 
     def resolve(
         self, topk_indices: torch.Tensor, num_tokens: int, forward_batch
     ) -> torch.Tensor:
-        """Full-width top-k, or this rank's own rows when the token shard will
-        slice the gathered tensor straight back to them anyway.
+        """Full-width top-k, or local rows when only token-sharded attention
+        consumes them. MTP seed export still needs batch-global row offsets.
 
         Sets ``npu_indexer_topk_is_local`` so attention knows which it got.
         """
@@ -130,6 +140,12 @@ class _IndexerQueryShard(NamedTuple):
                 f"(plan {plan.local_start}+{plan.rows} against shard "
                 f"{self.start}+{self.rows}); keeping the top-k all-gather"
             )
+            local = False
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if getattr(spec_info, "dsa_seed_topk_capture", None) is not None:
+            # write_mtp_seed selects each request's last prefill token using
+            # global row indices. Keep the gather for that extra consumer;
+            # attention will slice the full-width top-k back to its own rows.
             local = False
         forward_batch.npu_indexer_topk_is_local = local
         if not local:
@@ -215,6 +231,37 @@ def _get_indexer_query_shard(
     return shard
 
 
+def _build_decode_indexer_shard(
+    request_width: int,
+    query_ends: torch.Tensor,
+    kv_lens: torch.Tensor,
+    tp_size: int,
+    tp_rank: int,
+) -> _IndexerQueryShard:
+    """Assign whole requests from the same batch layout on every TP rank."""
+    batch_size = query_ends.numel()
+    # Contiguous equal-capacity tiles put all collective padding after real rows.
+    requests_per_rank = (batch_size + tp_size - 1) // tp_size
+    request_start = min(tp_rank * requests_per_rank, batch_size)
+    request_end = min(request_start + requests_per_rank, batch_size)
+    request_rows = slice(request_start, request_end)
+    rows = requests_per_rank * request_width
+    start = request_start * request_width
+    local_query_ends = query_ends[request_rows]
+    if request_start < request_end:
+        local_query_ends = local_query_ends - start
+    return _IndexerQueryShard(
+        start=start,
+        rows=rows,
+        num_real=(request_end - request_start) * request_width,
+        total=batch_size * request_width,
+        tp_size=tp_size,
+        actual_seq_lengths_q=local_query_ends,
+        actual_seq_lengths_kv=kv_lens[request_rows],
+        request_rows=request_rows,
+    )
+
+
 class DSANPUIndexerMixin:
     def _forward_npu_lsa_indexer(
         self,
@@ -239,7 +286,7 @@ class DSANPUIndexerMixin:
         q_ends = actual_seq_lengths_q.to(device=query.device, dtype=torch.int64)
         kv_lengths = actual_seq_lengths_kv.to(device=query.device, dtype=torch.int64)
         zero = q_ends.new_zeros(1)
-        indices, _ = torch.ops.npu.mlp_lightning_indexer(
+        indices, _ = mlp_lightning_indexer(
             query,
             key,
             weights.float(),
@@ -274,12 +321,16 @@ class DSANPUIndexerMixin:
         # indexer (before the attention backend's forward_extend), so prepare it
         # here rather than in the shared eager runner.
         attn_backend = get_attn_backend()
+        # Hybrid models (Kimi K2/K3) wrap a full-attn and a linear backend;
+        # unwrap before preparing CP metadata as well as reading it.
+        if hasattr(attn_backend, "full_attn_backend"):
+            attn_backend = attn_backend.full_attn_backend
         if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
             attn_backend.prepare_dsa_cp_metadata(forward_batch)
-        if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
+        if attn_backend.forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_lengths_kv = attn_backend.forward_metadata.seq_lens
         else:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens_cpu_int
+            actual_seq_lengths_kv = attn_backend.forward_metadata.seq_lens_cpu_int
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -301,7 +352,11 @@ class DSANPUIndexerMixin:
             if is_prefill and not uses_prefill_cp
             else None
         )
-        q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
+        q_sliced_early = (
+            shard is not None
+            and self.rotary_emb is not None
+            and self.rotary_emb.is_neox_style
+        )
         if q_sliced_early:
             if dynamic_scale is not None:
                 dynamic_scale = shard.take(dynamic_scale)
@@ -310,7 +365,30 @@ class DSANPUIndexerMixin:
         else:
             bs_q = bs
 
-        if self.rotary_emb.is_neox_style:
+        if self.rotary_emb is None:
+            # skip_rope (index_rope_dim == 0, e.g. Kimi K3.1): the indexer
+            # q/k carry no rope part at all, so skip the rope split/apply
+            # entirely; q is all-nope and k needs no rotation.
+            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+                indexer_weight_stream = get_indexer_weight_stream()
+                indexer_weight_stream.wait_stream(torch.npu.current_stream())
+                with torch.npu.stream(indexer_weight_stream):
+                    x = x.view(-1, self.hidden_size)
+                    weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
+                    weights.record_stream(indexer_weight_stream)
+                    weights_event = indexer_weight_stream.record_event()
+            else:
+                x = x.view(-1, self.hidden_size)
+                weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
+
+            q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+            q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+
+            k_proj = self.wk(x)[0]  # [bs, 7168] @ [7168, 128] = [bs, 128]
+            k = self.k_norm(k_proj).unsqueeze(1)  # [bs, 1, 128]
+
+        elif self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
                 cos_sin = self.rotary_emb.cos_sin_cache[positions]
                 cos, sin = cos_sin.chunk(2, dim=-1)
@@ -452,11 +530,9 @@ class DSANPUIndexerMixin:
         if (
             parallel.dcp_enabled
             and parallel.attn_dcp_size > 1
-            and not get_attn_backend().is_draft_worker
+            and not attn_backend.is_draft_worker
         ):
-            indexer_cache_loc = (
-                get_attn_backend().forward_metadata.dcp_origin_out_cache_loc
-            )
+            indexer_cache_loc = attn_backend.forward_metadata.dcp_origin_out_cache_loc
             assert indexer_cache_loc is not None, (
                 "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
             )
@@ -465,6 +541,13 @@ class DSANPUIndexerMixin:
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
         pool = get_token_to_kv_pool()
+        # Hybrid pools (Kimi K2/K3) keep the index buffers on the inner
+        # full-attn pool, which is keyed by compact (dense) layer ids;
+        # translate the global layer id before unwrapping the wrapper.
+        if hasattr(pool, "full_kv_pool"):
+            pool._wait_for_layer(layer_id)
+            layer_id = pool._transfer_full_attention_id(layer_id)
+            pool = pool.full_kv_pool
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer and (self.num_init_tokens or self.num_local_tokens):
             raise NotImplementedError(
@@ -479,7 +562,30 @@ class DSANPUIndexerMixin:
                 pool.index_k_scale_dtype,
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
-        pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
+        if getattr(pool, "layer_shard_enabled", False):
+            # The split pool caches the CP-gathered full-sequence index rows
+            # on non-owner ranks, skipping the get-time owner broadcast.
+            # Only safe when this write covers the whole read range (no
+            # cached prefix), same guard as the main-KV store path.
+            # cp_gathered_chunk covers the prefix-chunk patch-write: the
+            # gather above ran (full-chunk rows) but a prefix remains, so
+            # the write only completes a one-layer-ahead prefix broadcast.
+            prefix_lens = forward_batch.extend_prefix_lens_cpu
+            no_prefix = prefix_lens is not None and all(n == 0 for n in prefix_lens)
+            gather_ran = (
+                is_prefill
+                and self.dsa_enable_prefill_cp
+                and forward_batch.attn_cp_metadata is not None
+            )
+            pool.set_index_k_buffer(
+                layer_id,
+                indexer_cache_loc,
+                k,
+                cp_gathered_full=(gather_ran and no_prefix),
+                cp_gathered_chunk=(gather_ran and not no_prefix),
+            )
+        else:
+            pool.set_index_k_buffer(layer_id, indexer_cache_loc, k)
         if is_prefill:
             if (
                 self.dsa_enable_prefill_cp
@@ -487,21 +593,21 @@ class DSANPUIndexerMixin:
             ):
                 # V2: local metadata already prepared by prepare_dsa_cp_metadata.
                 actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
+                    attn_backend.forward_metadata.actual_seq_lengths_q
                 )
                 actual_seq_lengths_kv = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv
+                    attn_backend.forward_metadata.actual_seq_lengths_kv
                 )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
         else:
-            if get_attn_backend().forward_metadata.actual_seq_lengths_q is None:
+            if attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (
                     forward_batch.forward_mode.is_draft_extend_v2()
                     or forward_batch.forward_mode.is_target_verify()
                 ):
-                    num_draft_tokens = get_attn_backend().speculative_num_draft_tokens
+                    num_draft_tokens = attn_backend.speculative_num_draft_tokens
                     actual_seq_lengths_q = torch.arange(
                         num_draft_tokens,
                         num_draft_tokens + bs,
@@ -517,18 +623,25 @@ class DSANPUIndexerMixin:
                     )
             else:
                 actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
+                    attn_backend.forward_metadata.actual_seq_lengths_q
                 )
 
-        past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
+        past_key_states = pool.get_index_k_buffer(layer_id)
 
-        if self.rotary_emb.is_neox_style and self.alt_stream is not None:
+        if (
+            self.rotary_emb is not None
+            and self.rotary_emb.is_neox_style
+            and self.alt_stream is not None
+        ):
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
-        block_table = get_attn_backend().forward_metadata.block_tables
+        # Take block tables from the (hybrid-unwrapped) full-attn backend:
+        # Kimi K2/K3 wrap full-attn + linear backends and the metadata lives
+        # on the full-attn side (see the unwrap at the top of forward_npu).
+        block_table = attn_backend.forward_metadata.block_tables
         if self.num_init_tokens or self.num_local_tokens:
             return self._forward_npu_lsa_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
@@ -540,6 +653,32 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table,
             )
+        if (
+            attn_backend.use_decode_indexer_request_shard
+            and not input_on_attn_tp_slices
+        ):
+            request_width = None
+            mode = forward_batch.forward_mode
+            if mode.is_decode():
+                request_width = 1
+            elif mode.is_target_verify() and forward_batch.ragged_verify_layout is None:
+                request_width = int(forward_batch.spec_info.draft_token_num)
+
+            if request_width is not None:
+                shard = _build_decode_indexer_shard(
+                    request_width,
+                    actual_seq_lengths_q,
+                    actual_seq_lengths_kv,
+                    parallel.attn_tp_size,
+                    parallel.attn_tp_rank,
+                )
+                if shard.num_real == 0:
+                    # Empty ranks skip scoring and still join the gather.
+                    empty_topk = torch.empty(
+                        (0, self.index_topk), dtype=torch.int32, device=k.device
+                    )
+                    return shard.resolve(empty_topk, bs, forward_batch)
+                block_table = block_table[shard.request_rows]
         if (
             is_prefill
             and self.dsa_enable_prefill_cp

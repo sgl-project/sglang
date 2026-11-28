@@ -79,25 +79,26 @@ class Serving(msgspec.Struct):
     ] = False
     grpc_port: A[
         Optional[int],
-        "Port for the native gRPC server, started alongside HTTP. Setting this "
-        "(or SGLANG_GRPC_PORT) enables the native gRPC server; it is off by "
-        "default. Follower nodes expose GetServerInfo only.",
+        "Port for the native gRPC server (sglang.api.v1), served by the Rust "
+        "server alongside HTTP; requires SGLANG_RUST_SERVER=1. Setting this "
+        "(or SGLANG_GRPC_PORT) enables it; it is off by default.",
     ] = None
     grpc_response_timeout_secs: A[
         int,
         "Timeout in seconds waiting for each native gRPC response chunk, "
         "including the first. Must be positive. Defaults to 300.",
     ] = 300
-    # Env-only (SGLANG_GRPC_WORKER_THREADS); a field so the projection sees it.
+    # Deprecated and ignored: the Python gRPC bridge it sized was removed. Kept
+    # so the positional constructor signature does not shift.
     grpc_worker_threads: A[Optional[int], Arg(no_cli=True)] = None
     sidecar: A[
         Optional[str],
         "Start a locally managed sidecar against the native gRPC server. "
         "The selected module must expose main(argv) and read the resolved "
         "native gRPC endpoint from SGLANG_GRPC_ENDPOINT. Requires --grpc-port "
-        "or SGLANG_GRPC_PORT. With SGLANG_RUST_SERVER, every node that hosts a "
-        "Rust listener runs one sidecar, with SGLANG_GRPC_ENDPOINT set to that "
-        "node's first listener (--grpc-port).",
+        "or SGLANG_GRPC_PORT. Every node that hosts a Rust listener runs one "
+        "sidecar, with SGLANG_GRPC_ENDPOINT set to that node's first listener "
+        "(--grpc-port).",
     ] = None
     sidecar_args: A[
         Optional[List[str]],
@@ -200,7 +201,7 @@ class Serving(msgspec.Struct):
         bool,
         "Return sampled output token ids on the response-level sglext extension for every chat completion request, as if return_output_ids_in_sglext were set on the request.",
     ] = False
-    reasoning_parser: Optional[str] = None
+    reasoning_parser: A[Optional[str], Arg(no_cli=True, resolvable=True)] = None
     default_chat_template_kwargs: A[
         Optional[Dict[str, Any]],
         Arg(
@@ -219,7 +220,7 @@ class Serving(msgspec.Struct):
         bool,
         "Enable strict token filtering during the thinking phase. Blocks model-specific excluded tokens (e.g., tool call markers) during reasoning. Requires a grammar backend that supports token filtering.",
     ] = False
-    tool_call_parser: Optional[str] = None
+    tool_call_parser: A[Optional[str], Arg(no_cli=True, resolvable=True)] = None
     tool_server: A[
         Optional[str],
         "Either 'demo' or a comma-separated list of tool server urls to use for the model. If not specified, no tool server will be used.",

@@ -220,13 +220,21 @@ struct KimiK3FusedRoutingKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
+    // Each thread loads 4 scores (8 B bf16 / 16 B fp32) and 4 bias values (16 B).
+    constexpr auto kVecSize = LargeRouterRadixTrait::kVecSize;
+    const auto score_bytes = is_type<fp32_t>(scores.dtype()) ? sizeof(fp32_t) : sizeof(bf16_t);
     auto score_dtype = SymbolicDType{};
-    TensorMatcher({M_, N_})
+    TensorMatcher({M_, N_})  //
         .with_dtype<bf16_t, fp32_t>(score_dtype)
         .with_device(device)
         .with_strides({-1, 1})
+        .ensure_alignment(kVecSize * score_bytes)
         .verify(scores);
-    TensorMatcher({N_}).with_dtype<fp32_t>().with_device(device).verify(bias);
+    TensorMatcher({N_})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .ensure_alignment(kVecSize * sizeof(fp32_t))
+        .verify(bias);
     TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device).verify(out_w);
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device).verify(out_i);
     auto w_dtype = SymbolicDType{};
@@ -240,37 +248,37 @@ struct KimiK3FusedRoutingKernel {
     TensorMatcher({1}).with_dtype<int32_t>().with_device(device).verify(total_num_padded_tokens);
     TensorMatcher({N_}).with_dtype<int32_t>().with_device(device).verify(num_tokens_per_expert);
 
-    RuntimeCheck(
-        N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
-        "kimi_k3_fused_routing is specialized for N=896, K=16");
-    RuntimeCheck(scores.stride(0) % 4 == 0, "kimi_k3_fused_routing: scores row stride must be a multiple of 4");
+    CHECK_HOST(N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_)
+        << "kimi_k3_fused_routing is specialized for N=896, K=16";
     const auto M = static_cast<uint32_t>(M_.unwrap());
-    RuntimeCheck(M <= kKimiK3RoutingMaxTokens, "kimi_k3_fused_routing: at most 256 rows");
-    RuntimeCheck(
-        expanded_idx_to_permuted_idx.size(0) == static_cast<int64_t>(M) * kTopK_,
-        "kimi_k3_fused_routing: expanded_idx_to_permuted_idx must hold M * 16 entries");
-    RuntimeCheck(
+    CHECK_HOST(M <= kKimiK3RoutingMaxTokens) << "kimi_k3_fused_routing: at most 256 rows, got " << M;
+    CHECK_HOST(expanded_idx_to_permuted_idx.size(0) == static_cast<int64_t>(M) * kTopK_)
+        << "kimi_k3_fused_routing: expanded_idx_to_permuted_idx must hold M * 16 entries";
+    CHECK_HOST(
         0 <= local_expert_offset && 0 < num_local_experts &&
-            local_expert_offset + num_local_experts <= static_cast<int64_t>(kNumExperts_),
-        "kimi_k3_fused_routing: the local expert range must lie within the 896 experts");
-    RuntimeCheck(0 < tile_tokens && tile_tokens <= 256, "kimi_k3_fused_routing: tile_tokens must be in [1, 256]");
+        local_expert_offset + num_local_experts <= static_cast<int64_t>(kNumExperts_))
+        << "kimi_k3_fused_routing: the local expert range must lie within the 896 experts";
+    CHECK_HOST(0 < tile_tokens && tile_tokens <= 256) << "kimi_k3_fused_routing: tile_tokens must be in [1, 256]";
 
     const int32_t* num_valid_ptr = nullptr;
     if (num_valid.has_value()) {
+      // A 0-dim or [1] int32 tensor: callers pass either, so check numel rather than a shape.
       const auto& nv = num_valid.value();
-      RuntimeCheck(
-          nv.numel() == 1 && nv.device().device_type == kDLCUDA && is_type<int32_t>(nv.dtype()),
-          "kimi_k3_fused_routing: num_valid must be a CUDA int32 scalar");
+      CHECK_HOST(nv.numel() == 1 && nv.device().device_type == kDLCUDA && is_type<int32_t>(nv.dtype()))
+          << "kimi_k3_fused_routing: num_valid must be a CUDA int32 scalar";
       num_valid_ptr = static_cast<const int32_t*>(nv.data_ptr());
     }
 
     auto x_dtype = SymbolicDType{};
-    TensorMatcher({M_, -1}).with_dtype<bf16_t, fp32_t>(x_dtype).with_device(device).with_strides({-1, 1}).verify(x);
+    TensorMatcher({M_, kQuantHidden_})  //
+        .with_strides({-1, 1})
+        .with_dtype<bf16_t, fp32_t>(x_dtype)
+        .with_device(device)
+        .verify(x);
     const auto quant_params =
         x_dtype.is_type<fp32_t>()
             ? build_quant_context<RouteQuantTraitT<fp32_t>, /*kMasked=*/false>(x, out_q, out_s).params
             : build_quant_context<RouteQuantTraitT<bf16_t>, /*kMasked=*/false>(x, out_q, out_s).params;
-    RuntimeCheck(quant_params.hidden_size == kQuantHidden_, "kimi_k3_fused_routing: activation row must be 3584 wide");
     if (M == 0) return;
 
     const auto params = KimiK3FusedRoutingParams{

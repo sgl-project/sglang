@@ -15,6 +15,7 @@ Exit codes:
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -29,15 +30,27 @@ DYNAMIC_SUITES = {"1-gpu", "2-gpu"}
 
 
 def load_execution_reports(reports_dir: Path) -> list[dict]:
-    """Load all execution report JSON files from the given directory."""
-    reports = []
+    """Load the latest artifact report for each suite partition."""
+    reports = {}
     for json_file in reports_dir.glob("**/execution_report_*.json"):
         with open(json_file, "r", encoding="utf-8") as f:
-            reports.append(json.load(f))
-    return reports
+            report = json.load(f)
+        artifact = json_file.relative_to(reports_dir).parts[0]
+        attempt = (
+            int(artifact.rsplit("-", 1)[1])
+            if artifact.startswith("diffusion-report-")
+            else 0
+        )
+        key = (report["suite"], report["partition_id"])
+        # a rerun replaces the whole partition, including its coverage and failures
+        if key not in reports or attempt > reports[key][0]:
+            reports[key] = (attempt, report)
+    return [report for _, report in reports.values()]
 
 
-def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
+def get_expected_cases(
+    repo_root: Path, pr_families: tuple[str, ...] = ()
+) -> dict[str, set[str]]:
     """
     Get all expected cases from case config and run_suite.py.
 
@@ -49,7 +62,9 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
     case_config_path = resolve_case_config_path(repo_root, run_suite_path)
 
-    suites = collect_diffusion_suites(case_config_path, baseline_path)
+    suites = collect_diffusion_suites(
+        case_config_path, baseline_path, pr_families=pr_families
+    )
 
     expected = {}
     for suite_name, suite_info in suites.items():
@@ -64,8 +79,8 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     empty_dynamic_suites = [
         suite_name
         for suite_name in DYNAMIC_SUITES
-        if suite_name in expected
-        and not any(
+        if suite_name not in expected
+        or not any(
             not case_id.startswith("standalone:") for case_id in expected[suite_name]
         )
     ]
@@ -280,7 +295,10 @@ def main():
 
     # Get expected cases
     try:
-        expected = get_expected_cases(repo_root)
+        families = tuple(
+            json.loads(os.environ.get("DIFFUSION_H100_PR_FAMILIES") or "[]")
+        )
+        expected = get_expected_cases(repo_root, families)
     except (RuntimeError, FileNotFoundError) as exc:
         print(f"\nERROR: {exc}")
         sys.exit(1)

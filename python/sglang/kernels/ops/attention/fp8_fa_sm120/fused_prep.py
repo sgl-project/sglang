@@ -151,7 +151,7 @@ def _pack_qkv(
 
     # The kernel packs P straight from the score fragment; V^T's stored key
     # order must follow it: stored position p holds key
-    # p//16*16 + 8*((p%4)//2) + 2*((p%16)//4) + p%2 (see key_order_for_positions).
+    # p//16*16 + 8*((p%4)//2) + 2*((p%16)//4) + p%2.
     # The permutation is applied on the LOAD side as a row gather: every gathered
     # row is still 256 contiguous bytes, and the transposed store stays contiguous.
     # Permuting the store instead scatters bytes inside 16 B windows and doubled
