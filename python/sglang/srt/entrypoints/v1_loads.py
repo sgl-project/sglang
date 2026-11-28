@@ -115,6 +115,30 @@ async def get_loads(
         per-DP-rank loads
     """
     include_list = [s.strip() for s in include.split(",")] if include else None
+    include_set = set(include_list) if include_list else None
+
+    # Reject an unknown section at the query boundary rather than inside
+    # ``LoadSnapshot.to_dict``: the check there does not run at all when no
+    # snapshot is read (an out-of-range ``dp_rank``, or a shared-memory segment
+    # that is not attached yet), so the same bad query would answer 200. The
+    # Rust frontend validates ``include`` up front
+    # (``rust/sglang-server/src/api_server/http/loads.rs``), and this matches it.
+    #
+    # ``all`` keeps its opt-out. It means "every section", so the Rust
+    # ``parse_include`` ignores the other names once it sees it; matching that
+    # is what keeps the two frontends answering the same thing.
+    if include_set is not None and "all" not in include_set:
+        # Imported here so this entrypoint module stays importable where
+        # ``load_snapshot`` (and the ``fcntl`` it needs) is not.
+        from sglang.srt.managers.load_snapshot import LoadSnapshot
+
+        invalid = include_set - LoadSnapshot.VALID_SECTIONS
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid include sections: {invalid}. "
+                f"Valid options: {sorted(LoadSnapshot.VALID_SECTIONS)}",
+            )
 
     start = time.perf_counter()
     try:
@@ -131,15 +155,10 @@ async def get_loads(
                 time.perf_counter() - start
             )
 
-    include_set = set(include_list) if include_list else None
-
     if format == "prometheus":
         return _format_loads_prometheus(load_results, include_set)
 
-    loads = []
-    for load in load_results:
-        d = load.to_dict(include_set)
-        loads.append(d)
+    loads = [load.to_dict(include_set) for load in load_results]
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
