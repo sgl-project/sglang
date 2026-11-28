@@ -1711,7 +1711,7 @@ class TestCosmosDreamsRolloutStreams(unittest.TestCase):
         stage.server_args = args
         stage.overlap_vae_decode = True
         stage.vae = None
-        stage._decode_stream = stage._priority_stream = None
+        stage._decode_stream = None
         batch = SimpleNamespace(sampling_params=SimpleNamespace(quality="exact"))
         dreams = (
             "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
@@ -1734,17 +1734,7 @@ class TestCosmosDreamsRolloutStreams(unittest.TestCase):
             second = stage._decode_queue(torch.device("cuda"), batch)
             self.assertEqual((first.fast_path, second.fast_path), (False, True))
             self.assertIs(first.stream, second.stream)
-            self.assertIsNone(stage._priority_stream)
             self.assertEqual(make_stream.call_count, 1)
-            stage._decode_stream = None
-            switch = "SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY"
-            with mock.patch.dict(os.environ, {switch: "1"}):
-                stage._decode_queue(torch.device("cuda"), batch)
-                priority = stage._priority_stream
-                stage._decode_queue(torch.device("cuda"), batch)
-            self.assertIs(stage._priority_stream, priority)
-            self.assertIsNot(priority, stage._decode_stream)
-            self.assertEqual(make_stream.call_count, 3)
 
 
 class TestCosmosDreamsStreamedOutput(unittest.TestCase):

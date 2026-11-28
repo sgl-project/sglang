@@ -12,7 +12,7 @@ import json
 import math
 import os
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from typing import Any, NamedTuple
 
 import msgspec
@@ -21,7 +21,6 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     HISTORY_MODE_FULL,
     TEXT_TOKENS_TRAINING_MAX,
@@ -858,24 +857,6 @@ class CausalDecodeQueue:
         return torch.cat(self.outputs, dim=2)
 
 
-@contextmanager
-def rollout_stream(
-    device: torch.device, stream: torch.cuda.Stream | None
-) -> Iterator[None]:
-    """Run the block on ``stream`` (None keeps the current one), a scheduling change only."""
-    if stream is None:
-        yield
-        return
-    entry = torch.cuda.current_stream(device)
-    stream.wait_stream(entry)
-    try:
-        with torch.cuda.stream(stream):
-            yield
-    finally:
-        # Later stages run on the entry stream and must see the block's work done.
-        entry.wait_stream(stream)
-
-
 class CosmosDreamsPrepareStage(PipelineStage):
     """Validate the request and build every input the rollout needs.
 
@@ -1446,7 +1427,6 @@ class CosmosDreamsRolloutStage(PipelineStage):
         self.overlap_vae_decode = bool(overlap_vae_decode and vae is not None)
         # Made on first use and kept: the CUDA allocator caches freed memory per stream.
         self._decode_stream: torch.cuda.Stream | None = None
-        self._priority_stream: torch.cuda.Stream | None = None
         # Without a resolved profile the stage runs the artifact as exported:
         # its t_list on every chunk and its K/V window.
         self.profile = profile or CosmosDreamsInferenceProfile(
@@ -1526,9 +1506,6 @@ class CosmosDreamsRolloutStage(PipelineStage):
             return None
         if self._decode_stream is None:
             self._decode_stream = torch.cuda.Stream(device=device)
-            if envs.SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY:
-                # 0 is the lowest CUDA stream priority; lower numbers rank higher.
-                self._priority_stream = torch.cuda.Stream(device=device, priority=-1)
         return CausalDecodeQueue(
             self.vae,
             device=device,
@@ -1606,16 +1583,12 @@ class CosmosDreamsRolloutStage(PipelineStage):
             )
         decode_queue = self._decode_queue(device, batch)
         with decode_queue or nullcontext():
-            # Only a rollout that shares the GPU with its decode has anything to outrank.
-            with rollout_stream(
-                device, None if decode_queue is None else self._priority_stream
-            ):
-                latents = self._rollout_chunks(
-                    batch,
-                    self._rollout_context(batch, device),
-                    target_frame=target_frame,
-                    decode_queue=decode_queue,
-                )
+            latents = self._rollout_chunks(
+                batch,
+                self._rollout_context(batch, device),
+                target_frame=target_frame,
+                decode_queue=decode_queue,
+            )
         if decode_queue is not None:
             self._hand_over_decode(batch, decode_queue)
         return latents
