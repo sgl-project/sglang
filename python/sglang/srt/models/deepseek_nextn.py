@@ -24,7 +24,10 @@ from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
+from sglang.kernels.ops.layernorm.fused_eh_norm import (
+    fused_eh_norm,
+    fused_eh_norm_triton,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
@@ -51,12 +54,13 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForC
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
-from sglang.srt.utils import BumpAllocator, is_cuda, is_npu
+from sglang.srt.utils import BumpAllocator, is_cuda, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -263,6 +267,22 @@ class DeepseekModelNextN(nn.Module):
             )
         if _is_cuda:
             eh_input = fused_eh_norm(
+                input_embeds,
+                previous_hidden_states,
+                self.enorm.weight,
+                self.hnorm.weight,
+                self.enorm.variance_epsilon,
+            )
+        elif (
+            _is_hip
+            and input_embeds.dtype in (torch.float16, torch.bfloat16)
+            and input_embeds.dim() == 2
+            and input_embeds.stride(1) == 1
+            and previous_hidden_states.stride(1) == 1
+            and previous_hidden_states.shape == input_embeds.shape
+            and input_embeds.shape[1] <= 16384
+        ):
+            eh_input = fused_eh_norm_triton(
                 input_embeds,
                 previous_hidden_states,
                 self.enorm.weight,
