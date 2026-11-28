@@ -112,7 +112,11 @@ def _static_reject_reason(linear: Any) -> str | None:
         return "multi-rank gather_output"
     weight = getattr(linear, "weight", None)
     bias = getattr(linear, "bias", None)
-    if weight is None or bias is None or weight.dim() != 2:
+    if weight is None or bias is None:
+        return "missing bias or non-2D weight"
+    # A layerwise-offloaded weight is a shared (1,) placeholder whenever its
+    # layer is not on the device, so only the shape is judged at use time.
+    if weight.dim() != 2 and not getattr(weight, "_sglang_layerwise_offloaded", False):
         return "missing bias or non-2D weight"
     if weight.dtype not in (torch.bfloat16, torch.float16):
         return f"non-half weight dtype {weight.dtype}"
