@@ -3,18 +3,30 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import triton
 
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_device_name, is_hip
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 _LOW_SMEM_FP8_DEFAULT_CUTOFF_BYTES = 128 * 1024
+_MIN_DOT_BLOCK_K = 32  # Smallest K tl.dot accepts for INT8 operands.
+
+
+def _get_standard_dispatcher_ep_size() -> int:
+    # StandardDispatcher keeps global (M, topk) ids with non-local experts masked to -1,
+    # so only M * topk / ep_size slots reach this rank's E_local experts.
+    if get_moe_a2a_backend().is_none():
+        return get_parallel().moe_ep_size
+    return 1
 
 
 @functools.lru_cache(maxsize=None)
@@ -88,15 +100,15 @@ def get_moe_configs(
 
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
     # so we also include the Triton version as a key for finding the fused_moe_kernel config to achieve the best performance.
-    config_dir = os.environ.get(
-        "SGLANG_MOE_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
-    )
+    config_dir = envs.SGLANG_MOE_CONFIG_DIR.get()
+    if config_dir is None:
+        config_dir = os.path.dirname(os.path.realpath(__file__))
 
     triton_version = triton.__version__
     version_dir = f"triton_{triton_version.replace('.', '_')}"
+    configs_root = os.path.join(config_dir, "configs")
     config_file_path = os.path.join(
-        config_dir,
-        "configs",
+        configs_root,
         version_dir,
         json_file_name,
     )
@@ -112,15 +124,18 @@ def get_moe_configs(
             return {int(key): val for key, val in json.load(f).items()}
 
     # Discover available triton config dirs on disk and search newest-first.
-    configs_root = os.path.join(config_dir, "configs")
-    available_versions = sorted(
-        (
-            d.removeprefix("triton_").replace("_", ".")
-            for d in os.listdir(configs_root)
-            if d.startswith("triton_")
-        ),
-        key=lambda v: tuple(int(x) for x in v.split(".")),
-        reverse=True,
+    available_versions = (
+        sorted(
+            (
+                d.removeprefix("triton_").replace("_", ".")
+                for d in os.listdir(configs_root)
+                if d.startswith("triton_")
+            ),
+            key=lambda v: tuple(int(x) for x in v.split(".")),
+            reverse=True,
+        )
+        if os.path.isdir(configs_root)
+        else []
     )
 
     for try_triton_version in available_versions:
@@ -177,6 +192,93 @@ def get_moe_configs(
     return None
 
 
+def _get_meff_block_size_m(M: int, E: int, topk: int) -> int:
+    # Expected routed rows per expert; E is E_local, so scale back to global under EP.
+    m_per_expert = (M * topk) / (max(E, 1) * _get_standard_dispatcher_ep_size())
+    if m_per_expert <= 4.0:
+        return 16
+    if m_per_expert <= 16.0:
+        return 32
+    return 64
+
+
+def _get_fp8_per_tensor_config(block_size_m: int, N: int) -> Dict[str, int]:
+    small_m = block_size_m <= 32
+    if _use_low_smem_fp8_default():
+        return {
+            "BLOCK_SIZE_M": block_size_m,
+            "BLOCK_SIZE_N": 64 if (small_m or N < 128) else 128,
+            "BLOCK_SIZE_K": 256,
+            "GROUP_SIZE_M": 1 if small_m else 64,
+            "num_warps": 4,
+            "num_stages": 4 if small_m else 2,
+        }
+    if N < 128:
+        block_size_n = 64
+    elif small_m or N < 256:
+        block_size_n = 128
+    else:
+        block_size_n = 256
+    return {
+        "BLOCK_SIZE_M": block_size_m,
+        "BLOCK_SIZE_N": block_size_n,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1 if small_m else 32,
+        "num_warps": 4 if small_m else 8,
+        "num_stages": 2 if _is_hip else 4,
+    }
+
+
+def _get_fp8_block_wise_config(
+    block_size_m: int, block_shape: List[int]
+) -> Dict[str, int]:
+    # The kernel applies one scale per K tile, so block_shape[1] must be divisible by BLOCK_SIZE_K.
+    return {
+        "BLOCK_SIZE_M": block_size_m,
+        "BLOCK_SIZE_N": block_shape[0],
+        "BLOCK_SIZE_K": block_shape[1],
+        "GROUP_SIZE_M": 1 if block_size_m == 16 else 16,
+        "num_warps": 4,
+        "num_stages": 2 if _is_hip else 3,
+    }
+
+
+def _get_unquantized_config(block_size_m: int, N: int) -> Dict[str, int]:
+    if block_size_m <= 32:
+        return {
+            "BLOCK_SIZE_M": block_size_m,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
+    return {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128 if N >= 128 else 64,
+        "BLOCK_SIZE_K": 64,
+        "GROUP_SIZE_M": 16,
+        "num_warps": 4,
+        "num_stages": 4,
+    }
+
+
+def _get_legacy_unquantized_config(M: int, E: int, is_marlin: bool) -> Dict[str, int]:
+    if M <= E or (is_marlin and M <= 32):
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+        }
+    return {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 32,
+        "GROUP_SIZE_M": 8,
+    }
+
+
 def get_default_config(
     M: int,
     E: int,
@@ -188,76 +290,41 @@ def get_default_config(
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
     if get_exec().deterministic.enable_deterministic_inference:
-        config = {
+        return {
             "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": 64,
             "BLOCK_SIZE_K": 32,
             "GROUP_SIZE_M": 8,
         }
-        return config
+    if dtype == "float32":
+        # FP32 tiles are twice as wide in shared memory; keep the pre-M_eff config,
+        # which fits the 99 KiB SM86/SM89 per-block limit.
+        return _get_legacy_unquantized_config(M=M, E=E, is_marlin=is_marlin)
+    block_size_m = _get_meff_block_size_m(M=M, E=E, topk=topk)
     if dtype == "fp8_w8a8":
         if block_shape is None:
-            if _use_low_smem_fp8_default():
-                config = {
-                    "BLOCK_SIZE_M": 32,
-                    "BLOCK_SIZE_N": 64,
-                    "BLOCK_SIZE_K": 256,
-                    "GROUP_SIZE_M": 1,
-                    "num_warps": 4,
-                    "num_stages": 4,
-                }
-                if M > E:
-                    config = {
-                        "BLOCK_SIZE_M": 64,
-                        "BLOCK_SIZE_N": 128,
-                        "BLOCK_SIZE_K": 256,
-                        "GROUP_SIZE_M": 64,
-                        "num_warps": 4,
-                        "num_stages": 2,
-                    }
-            else:
-                config = {
-                    "BLOCK_SIZE_M": 128,
-                    "BLOCK_SIZE_N": 256,
-                    "BLOCK_SIZE_K": 128,
-                    "GROUP_SIZE_M": 32,
-                    "num_warps": 8,
-                    "num_stages": 2 if _is_hip else 4,
-                }
-                if M <= E:
-                    config = {
-                        "BLOCK_SIZE_M": 64,
-                        "BLOCK_SIZE_N": 128,
-                        "BLOCK_SIZE_K": 128,
-                        "GROUP_SIZE_M": 1,
-                        "num_warps": 4,
-                        "num_stages": 2 if _is_hip else 4,
-                    }
-        else:
-            # Block-wise quant: BLOCK_SIZE_K must be divisible by block_shape[1]
-            config = {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": block_shape[0],
-                "BLOCK_SIZE_K": block_shape[1],
-                "GROUP_SIZE_M": 32,
-                "num_warps": 4,
-                "num_stages": 2 if _is_hip else 3,
-            }
-    else:
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": 64,
-            "BLOCK_SIZE_K": 32,
-            "GROUP_SIZE_M": 8,
+            return _get_fp8_per_tensor_config(block_size_m=block_size_m, N=N)
+        return _get_fp8_block_wise_config(
+            block_size_m=block_size_m, block_shape=block_shape
+        )
+    # A heuristic: fused marlin works faster with this config for small M
+    if is_marlin and M <= 32:
+        return {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
         }
-        # A heuristic: fused marlin works faster with this config for small M
-        if M <= E or (is_marlin and M <= 32):
-            config = {
-                "BLOCK_SIZE_M": 16,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 64,
-                "GROUP_SIZE_M": 1,
-            }
+    config = _get_unquantized_config(block_size_m=block_size_m, N=N)
+    if dtype == "int8_w8a8" and block_shape is not None:
+        # Block-wise INT8 shares the one-scale-per-K-tile kernel path with block-wise FP8.
+        if block_shape[1] < _MIN_DOT_BLOCK_K:
+            raise ValueError(
+                f"Block-wise INT8 MoE needs block_shape[1] >= {_MIN_DOT_BLOCK_K} "
+                f"(one scale per K tile, tl.dot needs K >= {_MIN_DOT_BLOCK_K}); "
+                f"got {block_shape[1]}."
+            )
+        config["BLOCK_SIZE_K"] = math.gcd(config["BLOCK_SIZE_K"], block_shape[1])
     return config
 
 
