@@ -46,7 +46,6 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     bind_thread_to_device,
     build_dcp_token_transfer_plan,
-    group_concurrent_contiguous,
     pack_int_lists,
     run_on_device,
     unpack_int_lists,
@@ -58,7 +57,7 @@ from sglang.srt.disaggregation.mooncake.buffers import (
     BufferKind,
     MooncakeBufferKey,
     copy_ranges,
-    group_units,
+    group_contiguous_units,
 )
 from sglang.srt.disaggregation.mooncake.transport import (
     MooncakeRemoteBuffers,
@@ -296,7 +295,7 @@ class _DcpEntryCopy(msgspec.Struct, frozen=True):
     dst: MooncakeBufferKey
     dst_offset: int
     token_bytes: int
-    # group_units() rows of (first src token, first dst token, token count).
+    # group_contiguous_units() rows of (first src token, first dst token, token count).
     units: np.ndarray
 
     def to_copy(self) -> Copy:
@@ -1368,16 +1367,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         """
         # Host and device buffers may use different destination page spaces.
         # Build both transfer plans once, then select per destination buffer.
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_data_indices, dst_data_indices
+        kv_units = group_contiguous_units(prefill_data_indices, dst_data_indices)
+        device_kv_units = (
+            group_contiguous_units(prefill_data_indices, dst_device_data_indices)
+            if dst_device_data_indices is not None
+            else None
         )
-        device_prefill_kv_blocks = device_dst_kv_blocks = None
-        if dst_device_data_indices is not None:
-            device_prefill_kv_blocks, device_dst_kv_blocks = (
-                group_concurrent_contiguous(
-                    prefill_data_indices, dst_device_data_indices
-                )
-            )
 
         # Skipped once registration has cleared this peer's layout.
         if (
@@ -1415,13 +1410,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         if layers_params is None:
             return -1
-
-        kv_units = group_units(prefill_kv_blocks, dst_kv_blocks)
-        device_kv_units = (
-            group_units(device_prefill_kv_blocks, device_dst_kv_blocks)
-            if device_prefill_kv_blocks is not None
-            else None
-        )
 
         def layer_copy(src_entry: int, dst_entry: int, item_len: int, units) -> Copy:
             return Copy(
@@ -1467,18 +1455,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if max_batch_indices <= 0 or prefill_data_indices.size <= max_batch_indices:
                 return process_layers(layers_params)
 
-            def process_index_batch(
-                prefill_blocks,
-                dst_blocks,
-                device_prefill_blocks=None,
-                device_dst_blocks=None,
-            ) -> int:
-                units = group_units(prefill_blocks, dst_blocks)
-                device_units = (
-                    group_units(device_prefill_blocks, device_dst_blocks)
-                    if device_prefill_blocks is not None
-                    else None
-                )
+            def process_index_batch(units, device_units) -> int:
                 copies = []
                 for src_entry, dst_entry, item_len in layers_params:
                     if dst_device_entries and dst_entry in dst_device_entries:
@@ -1495,24 +1472,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_data_indices.size,
                 max_batch_indices,
             ):
-                batch_prefill_blocks, batch_dst_blocks = group_concurrent_contiguous(
-                    prefill_data_indices[start : start + max_batch_indices],
-                    dst_data_indices[start : start + max_batch_indices],
+                batch_slice = slice(start, start + max_batch_indices)
+                batch_src_indices = prefill_data_indices[batch_slice]
+                units = group_contiguous_units(
+                    batch_src_indices, dst_data_indices[batch_slice]
                 )
-                batch_device_prefill_blocks = batch_device_dst_blocks = None
-                if dst_device_data_indices is not None:
-                    batch_device_prefill_blocks, batch_device_dst_blocks = (
-                        group_concurrent_contiguous(
-                            prefill_data_indices[start : start + max_batch_indices],
-                            dst_device_data_indices[start : start + max_batch_indices],
-                        )
+                device_units = (
+                    group_contiguous_units(
+                        batch_src_indices, dst_device_data_indices[batch_slice]
                     )
-                ret = process_index_batch(
-                    batch_prefill_blocks,
-                    batch_dst_blocks,
-                    batch_device_prefill_blocks,
-                    batch_device_dst_blocks,
+                    if dst_device_data_indices is not None
+                    else None
                 )
+                ret = process_index_batch(units, device_units)
                 if ret != 0:
                     return ret
             return 0
@@ -1777,7 +1749,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     packed_ptrs, src_units = packed
                     sources = self._dcp_pack_sources(pack_buffer, packed_ptrs)
                     pack_offset_bytes += src_rows.size * width * len(index_k.src_ptrs)
-            units = group_units(*group_concurrent_contiguous(src_units, dst_units))
+            units = group_contiguous_units(src_units, dst_units)
             copies += [
                 _DcpEntryCopy(
                     src=src,
@@ -2045,11 +2017,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if packed is not None:
                 packed_ptrs, src_token_indices = packed
                 sources = self._dcp_pack_sources(pack_buffer, packed_ptrs)
-        units = group_units(
-            *group_concurrent_contiguous(
-                src_token_indices, plan.target_dst_token_indices
-            )
-        )
+        units = group_contiguous_units(src_token_indices, plan.target_dst_token_indices)
         return [
             _DcpEntryCopy(
                 src=src,
@@ -2086,10 +2054,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             raise ValueError(
                 "PD DCP with different draft TP sizes requires destination KV lengths"
             )
-        units = group_units(
-            *group_concurrent_contiguous(
-                plan.draft_src_token_indices, plan.draft_dst_token_indices
-            )
+        units = group_contiguous_units(
+            plan.draft_src_token_indices, plan.draft_dst_token_indices
         )
         copies, slices = [], []
         for entry in draft_entries:
@@ -2181,9 +2147,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if packed is None:
             return None
         packed_ptrs, packed_indices = packed
-        units = group_units(
-            *group_concurrent_contiguous(packed_indices, plan.draft_dst_token_indices)
-        )
+        units = group_contiguous_units(packed_indices, plan.draft_dst_token_indices)
         return [
             _DcpEntryCopy(
                 src=src,

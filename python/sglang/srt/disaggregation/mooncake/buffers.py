@@ -102,5 +102,43 @@ def group_units(src_groups, dst_groups) -> npt.NDArray[np.uint64]:
     ).reshape(-1, 3)
 
 
+def group_contiguous_units(
+    src_indices: npt.NDArray[np.integer], dst_indices: npt.NDArray[np.integer]
+) -> npt.NDArray[np.uint64]:
+    """Return (first src slot, first dst slot, slot count) for each paired run."""
+    size = src_indices.size
+    if size == 0 or dst_indices.size == 0:
+        return np.empty((0, 3), dtype=np.uint64)
+    if size != dst_indices.size:
+        raise ValueError(
+            "group_concurrent_contiguous requires equal-length src/dst index arrays, "
+            f"got {size} and {dst_indices.size}"
+        )
+
+    if size > 1:
+        # Detect boundaries in the original dtype, as in group_concurrent_contiguous.
+        cuts = (
+            np.flatnonzero((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))
+            + 1
+        )
+        if cuts.size:
+            bounds = np.empty(cuts.size + 2, dtype=np.intp)
+            bounds[0], bounds[1:-1], bounds[-1] = 0, cuts, size
+            starts = bounds[:-1]
+            src_starts, dst_starts = src_indices[starts], dst_indices[starts]
+            lengths = np.diff(bounds)
+            # Keep the existing Python-to-uint64 conversion behavior for
+            # negative offsets, including rejection with NumPy 2.
+            if src_starts.min() < 0 or dst_starts.min() < 0:
+                rows = zip(src_starts.tolist(), dst_starts.tolist(), lengths.tolist())
+                return np.array(list(rows), dtype=np.uint64)
+            units = np.empty((starts.size, 3), dtype=np.uint64)
+            units[:, 0] = src_starts
+            units[:, 1] = dst_starts
+            units[:, 2] = lengths
+            return units
+    return np.array([(int(src_indices[0]), int(dst_indices[0]), size)], dtype=np.uint64)
+
+
 # A decode registers a single staging ring.
 PEER_STAGING_KEY = MooncakeBufferKey(BufferKind.STAGING, 0)
