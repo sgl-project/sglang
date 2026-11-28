@@ -163,7 +163,7 @@ class TestBeamParityDecodeGraph(TestBeamParity):
         "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION": "1",
         "SGLANG_ENABLE_BEAM_DECODE_GRAPH": "1",
         "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH": str(GRAPH_BEAM_WIDTH),
-        "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS": str(MAX_NEW_TOKENS),
+        "SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY": str(MAX_NEW_TOKENS),
     }
     # Shared-context attention needs FlashInfer decode attention. Decode graph
     # sizes are rows: one request of GRAPH_BEAM_WIDTH beams.

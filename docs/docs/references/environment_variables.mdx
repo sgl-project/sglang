@@ -1764,8 +1764,8 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tokens such a graph holds per beam request when the model bundles no trie. It is the graph's capacity, not a limit on requests: a longer request decodes eagerly from the next token on. Such a model gets shared-context graphs only when this is set. Every replay pays for this many decode steps, so set it to the requests' <code>max_new_tokens</code>. A model with a trie uses its codebook count.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tokens such a graph holds per beam request when the model bundles no trie. It is the graph's capacity, not a limit on requests: a longer request decodes eagerly from the next token on. Such a model gets shared-context graphs only when this is set. A replay pays only for the decode steps its requests have taken; set it to the requests' <code>max_new_tokens</code>. A model with a trie uses its codebook count.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>

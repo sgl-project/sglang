@@ -20,7 +20,7 @@ import torch
 from sglang.kernels.ops.attention.beam_shared_context import shared_context_attention
 from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
-    FixedWidthCapacity,
+    FixedWidthGraphConfig,
     FixedWidthSharedContextInput,
 )
 from sglang.srt.beam_search.forward_inputs import BeamForwardInputs
@@ -34,7 +34,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
 
 WIDTH = 8
-CAPACITY = FixedWidthCapacity(beam_width=WIDTH, max_context_len=8, max_decode_len=3)
+CONFIG = FixedWidthGraphConfig(beam_width=WIDTH, max_context_len=8, max_decode_len=3)
 # A KV slot no loaded batch uses: reading it changes the result.
 STALE_SLOT = 63
 
@@ -87,7 +87,7 @@ class TestSharedContextGraphReplay(CustomTestCase):
         inputs = BeamGraphInputs(
             trie_levels_input=None,
             shared_context_input=FixedWidthSharedContextInput(
-                max_rows=2 * WIDTH, device="cuda", capacity=CAPACITY
+                max_rows=2 * WIDTH, device="cuda", config=CONFIG
             ),
         )
 

@@ -40,14 +40,20 @@ from sglang.srt.beam_search.shared_context_attention import (
 )
 from sglang.srt.beam_search.trie_config import get_beam_trie_config
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner_utils.capture_mode import (
+    get_capture_logits_variant,
+)
+from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +69,7 @@ class TrieLevelsInput:
     """
 
     def __init__(self, *, max_rows: int, device):
-        # [max_rows] int64 SID codebook depth per row.
+        # SID codebook depth per row.
         self._graph_levels = torch.zeros(max_rows, dtype=torch.int64, device=device)
 
     def can_capture(self, graph_size: int) -> bool:
@@ -82,15 +88,16 @@ class TrieLevelsInput:
         self._graph_levels[: trie_levels.shape[0]].copy_(trie_levels)
 
 
-class FixedWidthCapacity(msgspec.Struct, frozen=True):
-    """Limits of the fixed-width shared-context graphs."""
+class FixedWidthGraphConfig(msgspec.Struct, frozen=True):
+    """What the fixed-width shared-context graphs are captured for."""
 
     # The one beam width the graphs serve.
     beam_width: int
     # Prompt tokens per request: the model's context length, so every prompt fits.
     max_context_len: int
-    # Generated tokens per beam that a decode step attends. The kernel unrolls its
-    # decode loop this many times at compile time, so every replay pays for all.
+    # Capacity of the graph's decode-slot buffer: generated tokens per beam that a
+    # decode step may attend. The kernel loops over the runtime decode length, so a
+    # replay only pays for the steps its groups actually have.
     max_decode_len: int
 
 
@@ -113,13 +120,13 @@ class FixedWidthSharedContextInput:
       leading rows.
     """
 
-    def __init__(self, *, max_rows: int, device, capacity: FixedWidthCapacity):
-        self.capacity = capacity
-        max_groups = max_rows // capacity.beam_width
+    def __init__(self, *, max_rows: int, device, config: FixedWidthGraphConfig):
+        self.config = config
+        max_groups = max_rows // config.beam_width
         int32 = {"dtype": torch.int32, "device": device}
         self._packed_buffer = torch.zeros(sum(self._packed_sizes(max_groups)), **int32)
         self._decode_slots_buffer = torch.zeros(
-            (max_groups, capacity.beam_width * capacity.max_decode_len), **int32
+            (max_groups, config.beam_width * config.max_decode_len), **int32
         )
 
     @classmethod
@@ -128,7 +135,7 @@ class FixedWidthSharedContextInput:
     ) -> Optional[FixedWidthSharedContextInput]:
         """Returns None, and logs why, when shared-context batches get no graph."""
         beam_width = cls._read_beam_width()
-        max_new_tokens = cls._read_max_new_tokens(model_runner.model_config)
+        new_token_capacity = cls._read_new_token_capacity(model_runner.model_config)
         reason = None
         if model_runner.lora_manager is not None:
             reason = "LoRA is enabled"
@@ -137,10 +144,10 @@ class FixedWidthSharedContextInput:
                 "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH is not set; set it to the "
                 "requests' beam width"
             )
-        elif max_new_tokens is None:
+        elif new_token_capacity is None:
             reason = (
                 "the model bundles no trie and "
-                "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS is not set"
+                "SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY is not set"
             )
         if reason is not None:
             logger.warning(
@@ -149,13 +156,13 @@ class FixedWidthSharedContextInput:
                 reason,
             )
             return None
-        capacity = FixedWidthCapacity(
+        config = FixedWidthGraphConfig(
             beam_width=beam_width,
             max_context_len=model_runner.model_config.context_len,
             # The step that generates token n attends the n - 1 tokens before it.
-            max_decode_len=max_new_tokens - 1,
+            max_decode_len=new_token_capacity - 1,
         )
-        return cls(max_rows=max_rows, device=model_runner.device, capacity=capacity)
+        return cls(max_rows=max_rows, device=model_runner.device, config=config)
 
     @staticmethod
     def _read_beam_width() -> Optional[int]:
@@ -168,39 +175,29 @@ class FixedWidthSharedContextInput:
         return beam_width
 
     @staticmethod
-    def _read_max_new_tokens(model_config: ModelConfig) -> Optional[int]:
-        """Tokens a request may generate on the graphs; None when nothing sets it."""
+    def _read_new_token_capacity(model_config: ModelConfig) -> Optional[int]:
+        """Tokens per request the graphs hold; None when nothing sets it."""
         trie_config = get_beam_trie_config(model_config)
         if trie_config is not None:
             # Admission pins a trie request's max_new_tokens to the codebook count.
             return trie_config.num_codebooks
-        max_new_tokens = envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS.get()
-        if max_new_tokens is not None and max_new_tokens < 2:
+        new_token_capacity = envs.SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY.get()
+        if new_token_capacity is not None and new_token_capacity < 2:
             raise ValueError(
-                "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS must be at "
-                "least 2 (the first token comes from the prefill), got "
-                f"{max_new_tokens}."
+                "SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY must be at least 2 "
+                "(the first token comes from the prefill), got "
+                f"{new_token_capacity}."
             )
-        return max_new_tokens
-
-    def describe_size_requirement(self) -> str:
-        """Which decode graph sizes to add; logged when no size got a beam graph."""
-        width = self.capacity.beam_width
-        return (
-            f"With SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH={width} a beam graph needs "
-            f"a size that is a multiple of {width} rows: add {width}, {2 * width}, "
-            "... to --cuda-graph-bs-decode, one size per number of requests that "
-            "decode together."
-        )
+        return new_token_capacity
 
     def _packed_sizes(self, num_groups: int) -> tuple[int, int, int, int]:
         """Element counts of row_indices, context_cu_seqlens, decode_lens and
         context_slots, in buffer order, for a graph of num_groups groups."""
         return (
-            num_groups * self.capacity.beam_width,
+            num_groups * self.config.beam_width,
             num_groups + 1,
             num_groups,
-            num_groups * self.capacity.max_context_len,
+            num_groups * self.config.max_context_len,
         )
 
     def _graph_bucket(self, num_groups: int) -> BeamAttentionBucket:
@@ -211,19 +208,19 @@ class FixedWidthSharedContextInput:
             sizes
         )
         return BeamAttentionBucket(
-            row_indices=row_indices.view(num_groups, self.capacity.beam_width),
+            row_indices=row_indices.view(num_groups, self.config.beam_width),
             context_slots=context_slots,
             context_cu_seqlens=context_cu_seqlens,
             decode_slots=self._decode_slots_buffer[:num_groups],
-            beam_width=self.capacity.beam_width,
+            beam_width=self.config.beam_width,
             decode_lens=decode_lens,
         )
 
     def can_capture(self, graph_size: int) -> bool:
-        return graph_size % self.capacity.beam_width == 0
+        return graph_size % self.config.beam_width == 0
 
     def prepare_capture_inputs(self, graph_size: int) -> BeamAttentionMetadata:
-        num_groups = graph_size // self.capacity.beam_width
+        num_groups = graph_size // self.config.beam_width
         graph_bucket = self._graph_bucket(num_groups)
         # Capture-time values: per group, one prompt token and max_decode_len
         # generated tokens on KV slot 0. Each size writes its own, because a
@@ -231,7 +228,7 @@ class FixedWidthSharedContextInput:
         rows = torch.arange(graph_size, device=self._packed_buffer.device)
         graph_bucket.row_indices.copy_(rows.view_as(graph_bucket.row_indices))
         graph_bucket.context_cu_seqlens.copy_(rows[: num_groups + 1])
-        graph_bucket.decode_lens.fill_(self.capacity.max_decode_len)
+        graph_bucket.decode_lens.fill_(self.config.max_decode_len)
         graph_bucket.context_slots.zero_()
         graph_bucket.decode_slots.zero_()
         return BeamAttentionMetadata(buckets=[graph_bucket], num_rows=graph_size)
@@ -247,11 +244,10 @@ class FixedWidthSharedContextInput:
         # [num_groups, beam_width * generated tokens per beam]
         decode_width = batch_bucket.decode_slots.shape[1]
         return (
-            # Every request has the graphs' beam width.
-            batch_bucket.beam_width == self.capacity.beam_width
+            batch_bucket.beam_width == self.config.beam_width
             # The requests fill the graph: the kernel takes no padding rows.
             and metadata.num_rows == graph_size
-            and decode_width <= self.capacity.beam_width * self.capacity.max_decode_len
+            and decode_width <= self.config.beam_width * self.config.max_decode_len
         )
 
     def load_replay_inputs(self, metadata: BeamAttentionMetadata) -> None:
@@ -292,8 +288,6 @@ class BeamGraphInputs:
     ):
         self.trie_levels_input = trie_levels_input
         self.shared_context_input = shared_context_input
-        # Sizes, in rows, of the beam graphs captured so far.
-        self.captured_sizes: set[int] = set()
 
     def _inputs_with_batch_values(self, beam: BeamForwardInputs):
         return (
@@ -310,7 +304,6 @@ class BeamGraphInputs:
         )
 
     def prepare_capture_inputs(self, graph_size: int) -> BeamForwardInputs:
-        self.captured_sizes.add(graph_size)
         return BeamForwardInputs(
             trie_levels=(
                 None
@@ -326,8 +319,6 @@ class BeamGraphInputs:
 
     def can_replay(self, beam: BeamForwardInputs, *, graph_size: int) -> bool:
         """graph_size is the batch's row count padded up to a decode graph size."""
-        if graph_size not in self.captured_sizes:
-            return False
         for graph_input, batch_value in self._inputs_with_batch_values(beam):
             if graph_input is None:
                 # The batch runs a fast path the graphs do not hold.
@@ -343,37 +334,38 @@ class BeamGraphInputs:
             if graph_input is not None:
                 graph_input.load_replay_inputs(batch_value)
 
-
-def _create_beam_graph_inputs(model_runner: ModelRunner) -> Optional[BeamGraphInputs]:
-    """Returns None, and logs why, when no all-beam batch could replay a beam graph."""
-    # Rows of the largest decode graph; the shared logits buffer holds as many.
-    max_rows = model_runner.max_decode_logits_rows()
-    shared_context_input = None
-    if shared_context_attention.enabled() and (
-        shared_context_attention.supports_shared_context(model_runner)
-    ):
-        shared_context_input = FixedWidthSharedContextInput.create(
-            model_runner, max_rows=max_rows
+    @classmethod
+    def create(cls, model_runner: ModelRunner) -> Optional[BeamGraphInputs]:
+        """Returns None, and logs why, when no all-beam batch could replay a beam graph."""
+        # Rows of the largest decode graph; the shared logits buffer holds as many.
+        max_rows = model_runner.max_decode_logits_rows()
+        shared_context_input = None
+        if shared_context_attention.enabled() and (
+            shared_context_attention.supports_shared_context(model_runner)
+        ):
+            shared_context_input = FixedWidthSharedContextInput.create(
+                model_runner, max_rows=max_rows
+            )
+            if shared_context_input is None:
+                # Every all-beam batch carries shared-context metadata on this server,
+                # so a beam graph without that input would never replay.
+                return None
+        trie_levels_input = (
+            TrieLevelsInput(max_rows=max_rows, device=model_runner.device)
+            if model_runner.beam_trie_compact_enabled
+            else None
         )
-        if shared_context_input is None:
-            # Every all-beam batch carries shared-context metadata on this server,
-            # so a beam graph without that input would never replay.
+        if trie_levels_input is None and shared_context_input is None:
+            logger.info(
+                "No beam decode graphs captured; all-beam batches run neither the "
+                "compact trie head nor shared-context attention and replay the "
+                "ordinary decode graphs."
+            )
             return None
-    trie_levels_input = (
-        TrieLevelsInput(max_rows=max_rows, device=model_runner.device)
-        if model_runner.beam_trie_compact_enabled
-        else None
-    )
-    if trie_levels_input is None and shared_context_input is None:
-        logger.info(
-            "No beam decode graphs captured; all-beam batches run neither the "
-            "compact trie head nor shared-context attention and replay the "
-            "ordinary decode graphs."
+        return cls(
+            trie_levels_input=trie_levels_input,
+            shared_context_input=shared_context_input,
         )
-        return None
-    return BeamGraphInputs(
-        trie_levels_input=trie_levels_input, shared_context_input=shared_context_input
-    )
 
 
 class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
@@ -389,8 +381,8 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
           get a beam graph.
         - Every request has that beam width.
         - The batch's rows (requests x width) equal a captured size.
-        - Every request is within the graphs' token budget: the trie's codebook
-          count, or SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS on a
+        - Every request is within the graphs' token capacity: the trie's
+          codebook count, or SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY on a
           model without a trie.
     - With the compact trie head on ordinary attention:
         - Every size gets a beam graph.
@@ -405,9 +397,24 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
     - With neither fast path on, no beam graph is captured.
     """
 
+    @staticmethod
+    def enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
+        """Whether a server decodes on this runner: the switch is on, and the
+        server admits beam requests, which BeamCoordinator.validate_and_init
+        refuses under speculative decoding, pipeline parallelism and DP
+        attention; on such a server no beam graph would replay."""
+        return (
+            envs.SGLANG_ENABLE_BEAM_DECODE_GRAPH.get()
+            and spec_algorithm.is_none()
+            # Non-last PP ranks also return no beam_normalizer for
+            # _process_output_after_replay to trim.
+            and get_parallel().pp_size == 1
+            and not is_dp_attention_enabled()
+        )
+
     def __init__(self, model_runner: ModelRunner, **kwargs):
         # Set both before the parent's __init__, which captures the graphs.
-        self._beam_graph_inputs = _create_beam_graph_inputs(model_runner)
+        self._beam_graph_inputs = BeamGraphInputs.create(model_runner)
         self._capturing_beam_graph = False
         super().__init__(model_runner, **kwargs)
         self._log_captured_beam_graphs()
@@ -416,21 +423,32 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         graph_inputs = self._beam_graph_inputs
         if graph_inputs is None:
             return
-        if graph_inputs.captured_sizes:
+        captured_sizes = [
+            size for size in self.capture_bs if graph_inputs.can_capture(size)
+        ]
+        if captured_sizes:
             logger.info(
                 "Beam decode graphs captured for %s rows (compact trie head %s, "
                 "shared-context attention %s).",
-                sorted(graph_inputs.captured_sizes),
+                captured_sizes,
                 "on" if graph_inputs.trie_levels_input is not None else "off",
                 "on" if graph_inputs.shared_context_input is not None else "off",
             )
         else:
             # Only the shared-context input refuses sizes, so it is set here.
+            width = graph_inputs.shared_context_input.config.beam_width
             logger.warning(
                 "SGLANG_ENABLE_BEAM_DECODE_GRAPH is set, but no decode graph size "
-                "in %s holds a beam graph, so all-beam batches run eagerly. %s",
+                "in %s holds a beam graph, so all-beam batches run eagerly. With "
+                "SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH=%d a beam graph needs a size "
+                "that is a multiple of %d rows: add %d, %d, ... to "
+                "--cuda-graph-bs-decode, one size per number of requests that "
+                "decode together.",
                 self.capture_bs,
-                graph_inputs.shared_context_input.describe_size_requirement(),
+                width,
+                width,
+                width,
+                2 * width,
             )
 
     def capture_one_shape(
@@ -440,6 +458,9 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         graph_inputs = self._beam_graph_inputs
         if graph_inputs is None or not graph_inputs.can_capture(size):
             return
+        self._set_profile_trace_tag(
+            size, BEAM_GRAPH_VARIANT, attention_variant, get_capture_logits_variant()
+        )
         self._capturing_beam_graph = True
         try:
             super().capture_one_shape(
@@ -461,16 +482,15 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             return BEAM_GRAPH_VARIANT
         return super()._resolve_lora_variant(forward_batch)
 
-    def _can_replay_beam(self, forward_batch: ForwardBatch) -> bool:
+    def _can_run_beam_graph(self, forward_batch: ForwardBatch) -> bool:
+        graph_inputs = self._beam_graph_inputs
         rows = forward_batch.batch_size
-        if self._beam_graph_inputs is None or rows > self.max_bs:
+        if graph_inputs is None or rows > self.max_bs:
             return False
         graph_size = (
             rows if self.disable_padding else self._pad_to_bucket(rows, self.capture_bs)
         )
-        return self._beam_graph_inputs.can_replay(
-            forward_batch.beam, graph_size=graph_size
-        )
+        return graph_inputs.can_replay(forward_batch.beam, graph_size=graph_size)
 
     def load_batch(self, forward_batch: ForwardBatch, pp_proxy_tensors=None):
         if forward_batch.beam is not None:
@@ -480,10 +500,7 @@ class BeamDecodeCudaGraphRunner(DecodeCudaGraphRunner):
     def _init_replay_attn_metadata(self, forward_batch: ForwardBatch, **kwargs):
         # A shared-context beam graph reads the loaded beam metadata and needs no
         # FlashInfer plan.
-        if (
-            forward_batch.beam is not None
-            and forward_batch.beam.attention_metadata is not None
-        ):
+        if shared_context_attention.has_shared_context(forward_batch):
             return
         super()._init_replay_attn_metadata(forward_batch, **kwargs)
 

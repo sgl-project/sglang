@@ -768,7 +768,7 @@ class Envs:
     # required there.
     SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH = EnvInt(None)
     # Tokens such a graph holds per request; required when the model has no trie.
-    SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS = EnvInt(None)
+    SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY = EnvInt(None)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism

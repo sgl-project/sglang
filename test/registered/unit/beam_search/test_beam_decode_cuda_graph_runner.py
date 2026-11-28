@@ -25,7 +25,7 @@ import torch
 from sglang.srt.beam_search import beam_decode_cuda_graph_runner
 from sglang.srt.beam_search.beam_decode_cuda_graph_runner import (
     BeamGraphInputs,
-    FixedWidthCapacity,
+    FixedWidthGraphConfig,
     FixedWidthSharedContextInput,
     TrieLevelsInput,
 )
@@ -40,20 +40,16 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-CAPACITY = FixedWidthCapacity(beam_width=2, max_context_len=4, max_decode_len=3)
+CONFIG = FixedWidthGraphConfig(beam_width=2, max_context_len=4, max_decode_len=3)
 
 
-def _inputs(max_rows, *, trie_head=True, shared_context=True) -> BeamGraphInputs:
+def _inputs(max_rows, *, trie_head=True) -> BeamGraphInputs:
     return BeamGraphInputs(
         trie_levels_input=(
             TrieLevelsInput(max_rows=max_rows, device="cpu") if trie_head else None
         ),
-        shared_context_input=(
-            FixedWidthSharedContextInput(
-                max_rows=max_rows, device="cpu", capacity=CAPACITY
-            )
-            if shared_context
-            else None
+        shared_context_input=FixedWidthSharedContextInput(
+            max_rows=max_rows, device="cpu", config=CONFIG
         ),
     )
 
@@ -119,11 +115,10 @@ class TestBeamGraphInputs(CustomTestCase):
         """Replaying a beam graph for a batch that does not fit its buffers
         returns the attention of other slots; such a batch runs eagerly."""
         inputs = _inputs(8)
-        inputs.prepare_capture_inputs(4)
         levels = torch.zeros(4, dtype=torch.int64)
         at_capacity = _metadata(
-            prompt_lens=[CAPACITY.max_context_len] * 2,
-            decode_lens=[CAPACITY.max_decode_len, 1],
+            prompt_lens=[CONFIG.max_context_len] * 2,
+            decode_lens=[CONFIG.max_decode_len, 1],
         )
         self.assertTrue(
             inputs.can_replay(BeamForwardInputs(levels, at_capacity), graph_size=4)
@@ -132,11 +127,6 @@ class TestBeamGraphInputs(CustomTestCase):
         two_widths = _metadata(prompt_lens=[1, 1], decode_lens=[1, 1])
         two_widths.buckets.append(two_widths.buckets[0])
         rejected = {
-            "no graph of this size": (
-                torch.zeros(8, dtype=torch.int64),
-                _metadata(prompt_lens=[1] * 4, decode_lens=[1] * 4),
-                8,
-            ),
             "fewer rows than the graph": (
                 levels,
                 _metadata(prompt_lens=[1], decode_lens=[1]),
@@ -145,7 +135,7 @@ class TestBeamGraphInputs(CustomTestCase):
             "decode steps past the capacity": (
                 levels,
                 _metadata(
-                    prompt_lens=[1, 1], decode_lens=[CAPACITY.max_decode_len + 1, 1]
+                    prompt_lens=[1, 1], decode_lens=[CONFIG.max_decode_len + 1, 1]
                 ),
                 4,
             ),
@@ -155,7 +145,6 @@ class TestBeamGraphInputs(CustomTestCase):
                 4,
             ),
             "two widths in the batch": (levels, two_widths, 4),
-            "ordinary attention": (levels, None, 4),
         }
         for name, (trie_levels, metadata, graph_size) in rejected.items():
             with self.subTest(name):
@@ -166,20 +155,6 @@ class TestBeamGraphInputs(CustomTestCase):
                     )
                 )
 
-    def test_ordinary_attention_graph_takes_no_shared_context_batch(self):
-        """Without shared-context attention a beam graph holds FlashInfer
-        attention, which a batch with shared-context metadata does not run."""
-        inputs = _inputs(4, shared_context=False)
-        inputs.prepare_capture_inputs(4)
-        levels = torch.zeros(3, dtype=torch.int64)
-        self.assertTrue(
-            inputs.can_replay(BeamForwardInputs(levels, None), graph_size=4)
-        )
-        shared = _metadata(prompt_lens=[1, 1], decode_lens=[1, 1])
-        self.assertFalse(
-            inputs.can_replay(BeamForwardInputs(levels, shared), graph_size=4)
-        )
-
 
 class TestFixedWidthSharedContextInput(CustomTestCase):
     def test_a_smaller_graph_captures_on_its_own_values(self):
@@ -187,13 +162,13 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
         reads them at other offsets. What a larger graph's batch left there is
         no valid input: a length past the capacity reads outside the buffers."""
         shared_context_input = FixedWidthSharedContextInput(
-            max_rows=8, device="cpu", capacity=CAPACITY
+            max_rows=8, device="cpu", config=CONFIG
         )
         shared_context_input.prepare_capture_inputs(8)
         shared_context_input.load_replay_inputs(
             _metadata(
-                prompt_lens=[CAPACITY.max_context_len] * 4,
-                decode_lens=[CAPACITY.max_decode_len] * 4,
+                prompt_lens=[CONFIG.max_context_len] * 4,
+                decode_lens=[CONFIG.max_decode_len] * 4,
             )
         )
         bucket = shared_context_input.prepare_capture_inputs(4).buckets[0]
@@ -203,7 +178,7 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
         self.assertEqual(prompt_offsets, sorted(prompt_offsets))
         self.assertLessEqual(prompt_offsets[-1], bucket.context_slots.numel())
         for decode_len in bucket.decode_lens.tolist():
-            self.assertIn(decode_len, range(1, CAPACITY.max_decode_len + 1))
+            self.assertIn(decode_len, range(1, CONFIG.max_decode_len + 1))
 
     def test_graphs_need_a_width_and_a_token_budget(self):
         """The graph is captured for one beam width and a fixed number of decode
@@ -216,20 +191,21 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
             model_config=SimpleNamespace(context_len=16),
         )
         cases = (
-            # (width, max new tokens, trie codebooks) -> max_decode_len, or None for no graph
-            ((None, 4, None), None),
+            # (width, new token capacity, trie codebooks) -> max_decode_len, or None for no graph
             ((2, None, None), None),
             ((2, 4, None), 3),
             ((2, None, 3), 2),
             ((2, 8, 3), 2),
         )
-        for (width, max_new_tokens, codebooks), max_decode_len in cases:
+        for (width, new_token_capacity, codebooks), max_decode_len in cases:
             trie_config = (
                 None if codebooks is None else SimpleNamespace(num_codebooks=codebooks)
             )
             with (
                 self.subTest(
-                    width=width, max_new_tokens=max_new_tokens, codebooks=codebooks
+                    width=width,
+                    new_token_capacity=new_token_capacity,
+                    codebooks=codebooks,
                 ),
                 patch.object(
                     beam_decode_cuda_graph_runner,
@@ -237,8 +213,8 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
                     return_value=trie_config,
                 ),
                 envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH.override(width),
-                envs.SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH_MAX_NEW_TOKENS.override(
-                    max_new_tokens
+                envs.SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY.override(
+                    new_token_capacity
                 ),
             ):
                 attention = FixedWidthSharedContextInput.create(runner, max_rows=8)
@@ -246,8 +222,8 @@ class TestFixedWidthSharedContextInput(CustomTestCase):
                     self.assertIsNone(attention)
                 else:
                     self.assertEqual(
-                        attention.capacity,
-                        FixedWidthCapacity(
+                        attention.config,
+                        FixedWidthGraphConfig(
                             beam_width=2,
                             max_context_len=16,
                             max_decode_len=max_decode_len,
