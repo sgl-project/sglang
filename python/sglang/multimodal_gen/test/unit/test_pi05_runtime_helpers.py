@@ -793,3 +793,20 @@ def test_normalized_float_image_is_not_normalized_twice():
         preprocessed[:, (0, 3)],
         torch.full((3, 2, 4), -1.0),
     )
+
+
+def test_pi05_int8_components_reject_action_heads_and_unknown_names():
+    # FP32 action/time heads are a stability set and must never be INT8.
+    for components in (
+        ["action_heads"],
+        ["paligemma", "lm_head"],
+        ["vision", "vision"],
+    ):
+        with pytest.raises(ValueError):
+            Pi05PipelineConfig(int8_components=components)
+    assert Pi05PipelineConfig(
+        int8_components=["paligemma", "vision"]
+    ).int8_components == [
+        "paligemma",
+        "vision",
+    ]

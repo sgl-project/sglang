@@ -68,6 +68,9 @@ class Pi05PipelineConfig(PipelineConfig):
     parallel_layout_version: str = "pi05-split-prefix-action-v1"
 
     skip_unused_lm_head: bool = True
+    # Online W8A8 INT8 projections (sm80+), applied after BF16 weights load; lossy.
+    # Components: "paligemma", "action_expert", "vision", "projector". Empty keeps BF16.
+    int8_components: list[str] = field(default_factory=list)
     materialize_dtype: str = "bf16"
     loader_component_map: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: {
@@ -88,6 +91,12 @@ class Pi05PipelineConfig(PipelineConfig):
 
     def __post_init__(self) -> None:
         self._validate_cuda_graph_config()
+        self._validate_int8_config()
+
+    def _validate_int8_config(self) -> None:
+        from sglang.multimodal_gen.runtime.vla.pi05_int8 import validate_int8_components
+
+        self.int8_components = validate_int8_components(list(self.int8_components))
 
     def _validate_cuda_graph_config(self) -> None:
         try:

@@ -421,6 +421,22 @@ For mixed CPU offload and low-VRAM 16GB-class modes, Pi0.5 still uses the header
 
 Run:ai Model Streamer does not reduce steady inference VRAM after parameters, caches, activations, CUDA contexts, and graph buffers are resident. For Pi0.5 low-VRAM work, prioritize component placement, prefix cache size, CUDA graph residency, and CPU/offload first. Model Streamer is a cold-start optimization after the steady-memory budget is correct.
 
+### 6.6 INT8 Projections on Ampere (sm80/sm86)
+
+The ModelOpt FP8 path needs sm89+. On Ampere GPUs (A100, A6000, RTX 30xx), `int8_components` quantizes the linear projections to W8A8 INT8 when the BF16 checkpoint loads. No calibration data or new checkpoint is needed:
+
+```json File
+{
+  "int8_components": ["paligemma", "vision", "projector", "action_expert"]
+}
+```
+
+- Weights use symmetric per-output-channel scales, and activations are quantized per token at runtime. Embeddings, `lm_head`, norms, AdaRMS `dense` and the FP32 action/time heads stay unquantized.
+- It requires sm80+, a single resident GPU without offload or TP/SP, and can't be combined with an FP8 checkpoint. CUDA graphs work as usual.
+- On an RTX A6000 at batch 1, all four components cut p50 latency from ~107 ms to ~90 ms (about −16 %). On LIBERO-10, success matched BF16 (88.7 % vs 88.7 %, 3 seeds × 500 episodes).
+- Use all four components. Quantizing `action_expert` alone measured lower on LIBERO-10 (−1.6 pp) and saves little time.
+- INT8 changes action numerics. Validate closed-loop success on your own checkpoint before deploying.
+
 ## 7. OpenPI Comparison Benchmark
 
 Use `bench_pi05_openpi.py` when you need a side-by-side latency and action-difference report against the OpenPI policy implementation. Start the SGLang Pi0.5 server first for HTTP or websocket modes, then run the benchmark from the SGLang repository root:

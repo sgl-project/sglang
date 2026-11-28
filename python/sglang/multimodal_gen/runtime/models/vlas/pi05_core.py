@@ -80,10 +80,14 @@ def gated_residual(
     return x + y * gate
 
 
+# FP8 (ModelOpt) and INT8 (online W8A8) projections compute in BF16.
+_QUANTIZED_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.int8)
+
+
 def linear_compute_dtype(module: nn.Module) -> torch.dtype:
     return (
         torch.bfloat16
-        if module.weight.dtype == torch.float8_e4m3fn
+        if module.weight.dtype in _QUANTIZED_WEIGHT_DTYPES
         else module.weight.dtype
     )
 
@@ -185,7 +189,7 @@ class PiGemmaMLP(nn.Module):
     @property
     def projection_dtype(self) -> torch.dtype:
         dtype = self.gate_up_proj.weight.dtype
-        if dtype == torch.float8_e4m3fn:
+        if dtype in _QUANTIZED_WEIGHT_DTYPES:
             return config_compute_dtype(self.config) or torch.bfloat16
         return dtype
 
@@ -342,7 +346,7 @@ class PiGemmaAttention(nn.Module):
     @property
     def projection_dtype(self) -> torch.dtype:
         dtype = self.qkv_proj.weight.dtype
-        if dtype == torch.float8_e4m3fn:
+        if dtype in _QUANTIZED_WEIGHT_DTYPES:
             return config_compute_dtype(self.config) or torch.bfloat16
         return dtype
 
