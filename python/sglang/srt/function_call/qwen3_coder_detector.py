@@ -14,6 +14,7 @@ from sglang.srt.function_call.utils import (
     convert_string_union_value,
     get_schema_properties,
     infer_type_from_json_schema,
+    json_safe_value,
     safe_literal_eval,
 )
 
@@ -147,15 +148,16 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 maybe_convert = (
                     False if "." in param_value or "e" in param_value.lower() else True
                 )
-                param_value: float = float(param_value)
-                if maybe_convert and param_value.is_integer():
-                    param_value = int(param_value)
+                number = float(param_value)
+                if maybe_convert and number.is_integer():
+                    number = int(number)
             except Exception:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' is not a float in tool "
                     f"'{func_name}', degenerating to string."
                 )
-            return param_value
+                return param_value
+            return json_safe_value(number, param_value, param_name, func_name)
         elif param_type in ["boolean", "bool", "binary"]:
             param_value = param_value.lower()
             if param_value not in ["true", "false"]:
@@ -170,15 +172,18 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 or param_type.startswith("list")
             ):
                 try:
-                    param_value = json.loads(param_value)
-                    return param_value
+                    return json_safe_value(
+                        json.loads(param_value), param_value, param_name, func_name
+                    )
                 except Exception:
                     logger.warning(
                         f"Parsed value '{param_value}' of parameter '{param_name}' cannot be parsed with json.loads in tool "
                         f"'{func_name}', will try other methods to parse it."
                     )
             try:
-                param_value = safe_literal_eval(param_value)
+                return json_safe_value(
+                    safe_literal_eval(param_value), param_value, param_name, func_name
+                )
             except Exception:
                 logger.warning(
                     f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted via Python `ast.literal_eval()` in tool '{func_name}', degenerating to string."
