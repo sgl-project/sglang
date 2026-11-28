@@ -125,6 +125,9 @@ class GraniteToolCallDetector(BaseFormatDetector):
     ) -> Any:
         """Convert the raw text of a parameter using the tool's JSON schema."""
         if raw.lower() == "null":
+            schema = schema_map.get(name)
+            if isinstance(schema, dict) and schema.get("type") in _STRING_TYPES:
+                return raw
             return None
 
         if name not in schema_map:
