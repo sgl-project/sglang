@@ -1365,6 +1365,35 @@ class InputItemNormalizationTestCase(CustomTestCase):
         )
         self.assertEqual(kept["content"], [{"type": "text", "text": "No screen."}])
 
+    def test_function_call_output_image_flattens_on_a_text_only_model(self):
+        request = ResponsesRequest(
+            model="m",
+            input=[
+                {"type": "message", "role": "user", "content": "Take a screenshot."},
+                {
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "screenshot",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_abc",
+                    "output": [
+                        {"type": "input_text", "text": "Screenshot captured."},
+                        {
+                            "type": "input_image",
+                            "image_url": "data:image/png;base64,AA",
+                        },
+                    ],
+                },
+            ],
+        )
+
+        # Media validation would turn a kept image into a 400 on this model.
+        messages = make_serving(is_multimodal=False)._construct_input_messages(request)
+        self.assertEqual(messages[-1]["content"], "Screenshot captured.")
+
     def test_function_call_output_with_a_malformed_image_url_fails_validation(self):
         normalized = OpenAIServingResponses._normalize_response_message_for_chat(
             {
