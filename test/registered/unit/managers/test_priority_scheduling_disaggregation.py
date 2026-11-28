@@ -1043,6 +1043,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.tree_cache = MagicMock()
         scheduler.model_config = MagicMock()
         scheduler.enable_overlap = enable_overlap
+        scheduler.enable_freed_slot_admission = False
         scheduler.spec_algorithm = MagicMock()
         scheduler.draft_worker = None
         scheduler.max_running_requests = 1

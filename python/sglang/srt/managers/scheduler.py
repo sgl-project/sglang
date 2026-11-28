@@ -7408,6 +7408,7 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     # A PD role switch can select a different loop on the same scheduler.
     scheduler.enable_continuous_input_polling = False
     scheduler.enable_skip_finishing_decode = False
+    scheduler.enable_freed_slot_admission = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
         if get_parallel().pp_size > 1:
