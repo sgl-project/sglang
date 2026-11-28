@@ -143,5 +143,29 @@ def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
 
 
+@pytest.mark.parametrize("topk", [2, 3, 4])
+@pytest.mark.parametrize("strided", ["input", "output"])
+@pytest.mark.skipif(_is_hip, reason="Skip for AMD GPU")
+def test_moe_sum_rejects_non_contiguous(topk: int, strided: str):
+    # Slices of wider buffers, e.g. base[..., :k] (#53583).
+    m, k, padded_k = 4, 64, 96
+    dtype = torch.bfloat16
+    if strided == "input":
+        input = torch.randn((m, topk, padded_k), device="cuda", dtype=dtype)[..., :k]
+        output = torch.full((m, k), 99.0, device="cuda", dtype=dtype)
+        canary = output
+    else:
+        input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
+        canary = torch.full((m, padded_k), 99.0, device="cuda", dtype=dtype)
+        output = canary[:, :k]
+
+    with pytest.raises(RuntimeError, match=f"expect {strided} to be contiguous"):
+        moe_sum(input, output)
+    torch.cuda.synchronize()
+
+    # Nothing may be written, inside or outside the output view.
+    assert torch.all(canary == 99.0)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

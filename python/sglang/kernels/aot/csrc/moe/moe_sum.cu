@@ -37,6 +37,10 @@ void moe_sum(
     torch::Tensor& input,   // [num_tokens, topk, hidden_size]
     torch::Tensor& output)  // [num_tokens, hidden_size]
 {
+  // moe_sum_kernel (topk 2-4) indexes with packed offsets, so a strided view would read and write the wrong elements.
+  TORCH_CHECK(input.is_contiguous(), "expect input to be contiguous");
+  TORCH_CHECK(output.is_contiguous(), "expect output to be contiguous");
+
   const int hidden_size = input.size(-1);
   const auto num_tokens = output.numel() / hidden_size;
   const int topk = input.size(1);
