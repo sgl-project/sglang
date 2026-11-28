@@ -13,6 +13,10 @@ from sglang.kernels.ops.attention.fla.utils import input_guard
 from sglang.srt.utils import is_cuda
 
 
+def _is_sm90(device: torch.device) -> bool:
+    return torch.cuda.get_device_capability(device)[0] == 9
+
+
 @triton.jit(do_not_specialize=["T"])
 def fused_recurrent_gated_delta_rule_fwd_kernel(
     q,
@@ -373,6 +377,16 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         and torch.cuda.get_device_capability(mixed_qkv.device)[0] == 10
     )
     BV = min(triton.next_power_of_2(V), 8 if use_small_value_tile else 32)
+    if (
+        is_cuda()
+        and K == V == 128
+        and initial_state.dtype == torch.float32
+        and _is_sm90(mixed_qkv.device)
+    ):
+        # Tuned on H200: with an FP32 state BV=4 is the fastest tile at every measured
+        # (H, HV, batch) and bit-identical to BV=32. No BF16-state tile wins everywhere
+        # on SM90, so BF16 keeps 32.
+        BV = 4
     num_stages = 3
     num_warps = 1
 
