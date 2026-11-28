@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 import torch
+
 from sglang.kernels.ops.sampling import trace_replay as trace_replay_op
 from sglang.srt.utils.device import (
     async_h2d,
