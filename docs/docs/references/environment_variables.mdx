@@ -508,6 +508,11 @@ SGLang supports various environment variables that can be used to configure its 
   </thead>
   <tbody>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_FUSED_WO_B_AR</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ROCm gfx950, TP only: fuse DeepSeek-V4.1-Flash <code>wo_b</code>'s GEMM with its all-reduce through mori cco (needs <code>MORI_ENABLE_SDMA=1</code>). It reserves memory outside torch's allocator, about 560-700 MiB of symmetric window per rank plus a re-laid-out copy of every <code>wo_b</code> weight (about 840 MiB at TP2), so lower <code>--mem-fraction-static</code> when enabling it. Online weight updates (<code>update_weights_from_tensor</code> / <code>_from_distributed</code>) are refused while it is on, because the copies would go stale. Off under Megatron SP, data-parallel attention and LoRA, where <code>wo_b</code> does not perform this all-reduce.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MORI_DISPATCH_DTYPE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Override MoRI-EP dispatch quantization type. <code>auto</code> uses auto-detection from weight dtype; <code>bf16</code>/<code>fp8</code>/<code>fp4</code> forces the specified type for all layers</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>"auto"</code></td>
@@ -1749,6 +1754,21 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_BEAM_DECODE_GRAPH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Replay decode batches made only of beam requests as CUDA graphs when they run the compact trie output head, shared-context attention (<code>SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION=1</code>) or both; without either they already replay the ordinary decode graphs. A batch that fits no captured graph runs eagerly. With shared-context attention the graphs also need <code>SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH</code> and matching sizes in <code>--cuda-graph-bs-decode</code>; the server warns at startup when it captures none. Shared-context attention gets no graph on a server with LoRA.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BEAM_DECODE_GRAPH_FIXED_WIDTH</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The requests' <code>beam_width</code> for those graphs under shared-context attention; requests of another width run eagerly, and without it shared-context beam batches get no graph. Decode graph sizes (<code>--cuda-graph-bs-decode</code>) count rows, so only multiples of this width get a beam graph: list the width times each number of requests that decode together. An explicit list replaces the default sizes.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_BEAM_DECODE_GRAPH_NEW_TOKEN_CAPACITY</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tokens such a graph holds per beam request when the model bundles no trie. It is a capacity, not a request limit: a longer request decodes eagerly from the next token on. Set it to the requests' <code>max_new_tokens</code>; a model with a trie uses its codebook count.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Force FA3 metadata updates on MThreads MUSA.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
@@ -1766,6 +1786,16 @@ SGLang supports various environment variables that can be used to configure its 
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the KDA output gated RMSNorm with per-token-group FP8 quantization for small-M target-verify batches feeding a blockwise-FP8 output projection. Takes effect only on SM90 with <code>SGLANG_ENABLE_FP8_BLOCK_GEMV=1</code>; otherwise it stays off.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_QUACK_SWIGLU_GEMM</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On SM120 (RTX Blackwell), fuse SiLU-and-mul into the gate/up GEMM of unquantized BF16 dense MLPs that dispatch through <code>DualGemm</code>. Deterministic inference, on-policy RL, torch.compile, LoRA and sequence parallelism keep the unfused path.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Run shared-context beam attention (<code>SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION=1</code>) with the split-KV kernel, which splits each prompt across CTAs, instead of the default kernel.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>
@@ -2339,7 +2369,7 @@ MPS and does not read them.
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_GRPC_PORT</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Port for the native gRPC server.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Port for the native gRPC server (<code>sglang.api.v1</code>); requires the Rust server (<code>SGLANG_RUST_SERVER=1</code>).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>

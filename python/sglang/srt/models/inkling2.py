@@ -7,6 +7,7 @@ from torch import nn
 from sglang.kernels.ops.activation.softcap import (
     softcap_inplace_logits as fused_softcap,
 )
+from sglang.kernels.ops.layernorm import inkling2_norm_ctrl_sm120 as norm_ctrl_sm120
 from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
 from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
     MultimemAllGatherer,
@@ -118,6 +119,18 @@ class Inkling2DecoderLayer(nn.Module):
             else None
         )
         self.controller_weights = None
+        self._qkv_norm_weight = None
+
+    def _scaled_attn_res_query(self, state, kind):
+        q = state.attn_res.scaled_query(kind, self.layer_id)
+        if q is not None:
+            return q
+        raw = (
+            state.attn_res.attn_query(self.layer_id)
+            if kind == "attn"
+            else state.attn_res.mlp_queries[self.layer_id]
+        )
+        return raw.float() * (raw.shape[-1] ** -0.5)
 
     def _attention_input(self, streams, messages):
         if messages is not None:
@@ -150,6 +163,112 @@ class Inkling2DecoderLayer(nn.Module):
             )
         )
 
+    def _attention_input_sm120(self, state, messages):
+        if not get_platform().is_sm120 or not state.blocks:
+            return None, None
+        pre_w = (
+            self.attn_norm.pre_weight if self.is_local else self.q_input_norm.pre_weight
+        )
+        norm_w = self.attn_norm.weight if self.is_local else self._qkv_norm_weight
+        if pre_w is not None or norm_w is None:
+            return None, None
+        norm_eps = self.attn_norm.eps if self.is_local else self.q_input_norm.eps
+        attn_q = self._scaled_attn_res_query(state, "attn")
+        if messages is not None:
+            if not norm_ctrl_sm120.can_use_loop_ctrl_sm120(
+                state.blocks,
+                state.partial,
+                messages.blocks,
+                self.controller_weights,
+                norm_w,
+                self.config.loop_config["gate_rank"],
+                normalize_values=state.attn_res.normalize_values,
+            ):
+                return None, None
+            out, mlp_msg = norm_ctrl_sm120.loop_pre_attn_rmsnorm(
+                state.blocks,
+                state.partial,
+                attn_q,
+                messages.blocks,
+                messages.scaled_queries[
+                    self.layer_id - self.config.loop_core_layers.start
+                ],
+                self.controller_weights,
+                norm_w,
+                is_local=self.is_local,
+                norm_eps=norm_eps,
+            )
+            return AttentionSources(*out.unbind(0)), mlp_msg
+        if not norm_ctrl_sm120.can_use_attn_res_norm_sm120(
+            state.blocks,
+            state.partial,
+            attn_q,
+            norm_w,
+            normalize_values=state.attn_res.normalize_values,
+            pre_weight=pre_w,
+        ):
+            return None, None
+        out = norm_ctrl_sm120.attn_res_norm_bf16(
+            state.blocks,
+            state.partial,
+            None,
+            attn_q,
+            norm_w,
+            norm_eps=norm_eps,
+        )
+        if self.is_local:
+            return out[0], None
+        return AttentionSources(*out.unbind(0)), None
+
+    def _mlp_input_sm120(self, state, attention, messages, mlp_msg):
+        if not get_platform().is_sm120 or self.mlp_norm.pre_weight is not None:
+            return None
+        is_boundary = state.attn_res.is_block_boundary(self.layer_id)
+        mlp_blocks = [*state.blocks, state.partial] if is_boundary else state.blocks
+        mlp_partial = attention if is_boundary else state.partial
+        mlp_addend = None if is_boundary else attention
+        mlp_q = self._scaled_attn_res_query(state, "mlp")
+        if messages is not None:
+            if mlp_msg is None or not norm_ctrl_sm120.can_use_loop_ctrl_sm120(
+                mlp_blocks,
+                mlp_partial,
+                messages.blocks,
+                self.controller_weights,
+                self.mlp_norm.weight,
+                self.config.loop_config["gate_rank"],
+                normalize_values=state.attn_res.normalize_values,
+                addend=mlp_addend,
+            ):
+                return None
+            return norm_ctrl_sm120.loop_pre_mlp_rmsnorm(
+                mlp_blocks,
+                mlp_partial,
+                mlp_addend,
+                mlp_q,
+                mlp_msg,
+                self.controller_weights,
+                self.mlp_norm.weight,
+                norm_eps=self.mlp_norm.eps,
+            )
+        if not norm_ctrl_sm120.can_use_attn_res_norm_sm120(
+            mlp_blocks,
+            mlp_partial,
+            mlp_q,
+            self.mlp_norm.weight,
+            normalize_values=state.attn_res.normalize_values,
+            pre_weight=self.mlp_norm.pre_weight,
+            addend=mlp_addend,
+        ):
+            return None
+        return norm_ctrl_sm120.attn_res_norm_bf16(
+            mlp_blocks,
+            mlp_partial,
+            mlp_addend,
+            mlp_q,
+            self.mlp_norm.weight,
+            norm_eps=self.mlp_norm.eps,
+        )[0]
+
     def forward(self, state, positions, forward_batch, *, pass_idx=0, messages=None):
         conv_layer_id = self.config.conv_layer_id(self.layer_id, pass_idx)
         with (
@@ -159,9 +278,11 @@ class Inkling2DecoderLayer(nn.Module):
             self._forward(state, positions, forward_batch, pass_idx, messages)
 
     def _forward(self, state, positions, forward_batch, pass_idx, messages):
-        attn_input = self._attention_input(
-            state.attention_input(self.layer_id), messages
-        )
+        attn_input, mlp_msg = self._attention_input_sm120(state, messages)
+        if attn_input is None:
+            attn_input = self._attention_input(
+                state.attention_input(self.layer_id), messages
+            )
         attention = self.attn(attn_input, positions, forward_batch, pass_idx=pass_idx)
         attention = self.attn_sconv(attention, positions, forward_batch)
         routed = forward_batch.forward_mode.is_decode() or (
@@ -175,15 +296,21 @@ class Inkling2DecoderLayer(nn.Module):
             if forward_batch.forward_mode.is_target_verify() or messages is not None
             else self.mlp.local_input_rows(tokens, combine=not routed)
         )
-        mlp_input = state.mlp_input(self.layer_id, attention, rows)
-        if messages is not None:
-            mlp_input = messages.mix(
-                self.layer_id - self.config.loop_core_layers.start,
-                (mlp_input,),
-                self.controller_weights,
-                "mlp",
-            )[0]
-        mlp_input = self.mlp_norm(mlp_input)
+        mlp_input = (
+            self._mlp_input_sm120(state, attention, messages, mlp_msg)
+            if rows is None
+            else None
+        )
+        if mlp_input is None:
+            mlp_input = state.mlp_input(self.layer_id, attention, rows)
+            if messages is not None:
+                mlp_input = messages.mix(
+                    self.layer_id - self.config.loop_core_layers.start,
+                    (mlp_input,),
+                    self.controller_weights,
+                    "mlp",
+                )[0]
+            mlp_input = self.mlp_norm(mlp_input)
         mlp = self.mlp(
             mlp_input,
             forward_batch,
@@ -358,7 +485,30 @@ class Inkling2CausalLLM(nn.Module):
                 layer(state, positions, forward_batch)
         else:
             state = self._run_loop(state, positions, forward_batch, captures)
-        hidden = self.norm(state.compute_output())
+        hidden = None
+        if get_platform().is_sm120:
+            out_q = self.attn_res.scaled_query("output", 0)
+            if out_q is None:
+                raw_q = self.attn_res.output_query
+                out_q = raw_q.float() * (raw_q.shape[-1] ** -0.5)
+            if norm_ctrl_sm120.can_use_attn_res_norm_sm120(
+                state.blocks,
+                state.partial,
+                out_q,
+                self.norm.weight,
+                normalize_values=state.attn_res.normalize_values,
+                pre_weight=self.norm.pre_weight,
+            ):
+                hidden = norm_ctrl_sm120.attn_res_norm_bf16(
+                    state.blocks,
+                    state.partial,
+                    None,
+                    out_q,
+                    self.norm.weight,
+                    norm_eps=self.norm.eps,
+                )[0]
+        if hidden is None:
+            hidden = self.norm(state.compute_output())
         if captures is not None:
             captures.append(hidden.to(self.lm_head.weight.dtype))
             return hidden, captures.finalize()
@@ -367,6 +517,18 @@ class Inkling2CausalLLM(nn.Module):
     def prepare_loop(self) -> None:
         """Stack the message controllers and scale their queries after loading,
         updating in place on reload so captured graphs keep their pointers."""
+        if get_platform().is_sm120:
+            for layer in self.layers:
+                if not layer.is_local and layer._qkv_norm_weight is None:
+                    params = (
+                        layer.q_input_norm.weight,
+                        layer.k_input_norm.weight,
+                        layer.v_input_norm.weight,
+                    )
+                    stacked_w = torch.stack([p.data for p in params])
+                    for param, row in zip(params, stacked_w):
+                        param.data = row
+                    layer._qkv_norm_weight = stacked_w
         if self.config.loop_config is None:
             return
         scaled = scaled_loop_queries(
