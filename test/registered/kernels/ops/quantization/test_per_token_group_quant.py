@@ -1181,6 +1181,26 @@ def test_fused_silu_tiny_group():
     torch.testing.assert_close(deq, ref, rtol=0.13, atol=0.0)
 
 
+@pytest.mark.parametrize("rows", [1, 7, 8, 9, 17, 255, 256, 257])
+def test_silu_and_mul_clamp_multi_row_parity(rows):
+    """Multi-row CTA packing for small out_dim matches FP32 reference."""
+    from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
+
+    torch.manual_seed(rows)
+    hidden = 256
+    x = (
+        torch.randn(rows, 2 * hidden, device="cuda", dtype=torch.bfloat16) * 8.0
+    ).contiguous()
+    out = torch.empty((rows, hidden), device="cuda", dtype=torch.bfloat16)
+    silu_and_mul_clamp(x, out, 10.0)
+    gate, up = x.chunk(2, dim=-1)
+    ref = (
+        torch.nn.functional.silu(gate.clamp(max=10.0).float())
+        * up.clamp(-10.0, 10.0).float()
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(out, ref, rtol=1e-2, atol=0.125)
+
+
 if __name__ == "__main__":
     import sys
 
