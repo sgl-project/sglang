@@ -65,6 +65,8 @@ SGLANG_USE_MLX=1 python -m sglang.launch_server \
   --host 0.0.0.0
 ```
 
+Leave the server running in this terminal. To try the model, open a second terminal and follow [Sending a request](/docs/basic_usage/send_request).
+
 **Key Parameters Explained:**
 
 1. `SGLANG_USE_MLX=1` - Enables the use of MLX as the SGLang runtime backend (if disabled, SGLang will fall back to `torch.mps`, which has less support)
