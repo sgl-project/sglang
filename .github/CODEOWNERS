@@ -82,7 +82,6 @@
 /python/sglang/srt/weight_cache @liusy58 @QiuMike @alexnails @Shunkangz
 /python/sglang/kernels/aot @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /python/sglang/kernels/aot/csrc/musa @yeahdongcn
-/rust/sglang-grpc @alexnails @ishandhanani
 /rust/sglang-mm @sherlockwu @merrymercy
 /rust/sglang-processor @sagearc @sherlockwu
 /rust/sglang-radix-tree @Jialin @alphabetc1

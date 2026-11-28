@@ -44,8 +44,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # Needed by setuptools-rust to build the bundled native gRPC extension
-      # (rust/sglang-grpc) when `python -m build` builds the sglang wheel.
+      # Needed by setuptools-rust to build the bundled Rust extensions
+      # (rust/sglang-mm, rust/sglang-server) when `python -m build` builds the sglang wheel.
       - name: Install protoc
         run: sudo bash scripts/ci/utils/install_protoc.sh
 

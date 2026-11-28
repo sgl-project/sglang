@@ -170,6 +170,20 @@ class TestMixedPrecisionLayerConfig(CustomTestCase):
         )
         self.assertEqual(matched["weight"]["dtype"], "fp8_e4m3")
 
+    def test_self_mapped_fused_tensor_is_a_leaf(self):
+        """Phi-3 maps qkv_proj to itself, so it resolves without recursing."""
+        from sglang.srt.models.llama import Phi3ForCausalLM
+
+        quark_config = self._build_bare_config()
+        quark_config.packed_modules_mapping = Phi3ForCausalLM.packed_modules_mapping
+        for name in (
+            "model.layers.0.self_attn.qkv_proj",
+            "model.layers.0.mlp.gate_up_proj",
+        ):
+            with self.subTest(name=name):
+                matched = quark_config._find_matched_config(name, torch.nn.Module())
+                self.assertIn("weight", matched)
+
     def test_shared_expert_fusion_disabled_on_precision_mismatch(self):
         quark_config = self._build_bare_config()
         self.assertFalse(quark_config.can_fuse_shared_expert())

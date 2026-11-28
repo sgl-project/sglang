@@ -148,7 +148,6 @@ READBACK_MODULES = (
     "srt/managers/tokenizer_control_mixin.py",
     "srt/managers/multi_tokenizer_mixin.py",
     "srt/entrypoints/http_server.py",
-    "srt/entrypoints/grpc_bridge.py",
     "srt/entrypoints/engine.py",
     "srt/entrypoints/openai",
 )
