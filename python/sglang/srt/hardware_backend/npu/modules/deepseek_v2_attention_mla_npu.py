@@ -22,6 +22,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     NPUDecodeContextParallelMetadata,
+    dcp_extend_crop_free,
     dcp_extend_gather_buffer,
     dcp_extend_gathers_kv,
 )
@@ -614,7 +615,11 @@ def prepare_dcp_extend_metadata_npu(
         return None
     # The gather plan needs extend_seq_lens_cpu, so the backend fills it in.
     return NPUDecodeContextParallelMetadata(
-        **{f.name: getattr(metadata, f.name) for f in fields(metadata)}
+        **{f.name: getattr(metadata, f.name) for f in fields(metadata)},
+        extend_crop_free=dcp_extend_crop_free(
+            extend_prefix_lens_cpu,
+            m.indexer.index_topk if m.indexer is not None else None,
+        ),
     )
 
 
@@ -719,8 +724,8 @@ def forward_dsa_core_npu(
             m, dcp_metadata, k_nope, k_pe
         )
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
-    # Never set under DCP: the plan refuses it, so a forward never takes both
-    # paths.
+    # Under DCP, set only for an extend that gathers the KV: the plan refuses
+    # the query gather, so a forward never takes both paths.
     dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
     if dsa_token_shard_plan is None:
         attn_output = forward_mla_attention_npu(

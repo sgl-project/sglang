@@ -39,10 +39,12 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_cumulative_key_lens,
     dsa_token_shard_cumulative_query_lens,
     dsa_token_shard_key_lens,
     get_dsa_token_shard_plan,
 )
+from sglang.srt.layers.attention.dsa.dsa_token_shard_layout import DsaTokenShardPlan
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -1516,7 +1518,9 @@ class AscendAttnBackend(AttentionBackend):
         topk_indices: Optional[torch.Tensor],
         layer: RadixAttention,
         actual_seq_qlen: torch.Tensor,
+        forward_batch: ForwardBatch,
         dcp_metadata: NPUDecodeContextParallelMetadata,
+        dsa_token_shard_plan: Optional[DsaTokenShardPlan],
     ) -> torch.Tensor:
         """DCP extend over the context the model gathered, one contiguous run
         per request: TND keys, cumulative lengths, no block table.
@@ -1534,6 +1538,17 @@ class AscendAttnBackend(AttentionBackend):
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
         seq_lengths_kv = dcp_metadata.dcp_kv_indptr[1:]
+        sparse_mode = 3
+        if dsa_token_shard_plan is not None:
+            if dcp_metadata.extend_crop_free:
+                # Full per-request KV lengths, no crop: no request's start moves.
+                sparse_mode = 0
+            else:
+                # Lengths double as request boundaries: shortening is safe only
+                # for a single request, and the plan refuses more.
+                seq_lengths_kv = dsa_token_shard_cumulative_key_lens(
+                    forward_batch, dsa_token_shard_plan, q_nope.device
+                )
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=key_nope,
@@ -1554,7 +1569,7 @@ class AscendAttnBackend(AttentionBackend):
             # table is omitted, not passed as None: to a tiling function the two
             # are not always the same thing.
             layout_kv="TND",
-            sparse_mode=3,
+            sparse_mode=sparse_mode,
             attention_mode=2,
             return_softmax_lse=False,
         )
@@ -2291,7 +2306,9 @@ class AscendAttnBackend(AttentionBackend):
                     topk_indices,
                     layer,
                     actual_seq_qlen,
+                    forward_batch,
                     dcp_metadata,
+                    dsa_token_shard_plan,
                 )
 
             if topk_indices is not None:
