@@ -74,17 +74,30 @@ class AsyncDynamicbatchTokenizer:
                 kwargs_list = [kwargs]
                 result_futures = [result_future]
 
-                # Check if there are more items immediately available in the queue
-                # If queue is empty, process single item immediately without timeout
-                if self._queue.empty():
-                    # No other requests waiting, process immediately
-                    pass
-                else:
-                    # There might be more requests, wait for dynamic batching opportunity
+                # Drain any immediately queued items without timer overhead
+                while len(prompts) < self.max_batch_size and not self._queue.empty():
+                    prompt, kwargs, result_future = self._queue.get_nowait()
+                    prompts.append(prompt)
+                    kwargs_list.append(kwargs)
+                    result_futures.append(result_future)
+
+                # Wait for dynamic batching opportunity if more requests may arrive
+                if len(prompts) > 1 or not self._queue.empty():
                     start_time = asyncio.get_running_loop().time()
 
                     # Collect more requests up to max_batch_size or batch_wait_timeout_s
                     while len(prompts) < self.max_batch_size:
+                        while (
+                            len(prompts) < self.max_batch_size
+                            and not self._queue.empty()
+                        ):
+                            prompt, kwargs, result_future = self._queue.get_nowait()
+                            prompts.append(prompt)
+                            kwargs_list.append(kwargs)
+                            result_futures.append(result_future)
+                        if len(prompts) >= self.max_batch_size:
+                            break
+
                         elapsed = asyncio.get_running_loop().time() - start_time
                         if elapsed >= self.batch_wait_timeout_s:
                             break
@@ -112,6 +125,20 @@ class AsyncDynamicbatchTokenizer:
                 logger.error(f"Error in dynamic batch loop: {e}")
                 # Continue the loop to handle other requests
 
+    def _encode_individually(
+        self,
+        prompts: List[str],
+        kwargs_list: List[Dict],
+    ) -> List[tuple[Any, Optional[Exception]]]:
+        """Encode each prompt individually, capturing per-request exceptions."""
+        outcomes: List[tuple[Any, Optional[Exception]]] = []
+        for prompt, kw in zip(prompts, kwargs_list):
+            try:
+                outcomes.append((self.tokenizer(prompt, **kw), None))
+            except Exception as exc:
+                outcomes.append((None, exc))
+        return outcomes
+
     async def _process_dynamic_batch(
         self,
         prompts: List[str],
@@ -119,19 +146,46 @@ class AsyncDynamicbatchTokenizer:
         result_futures: List[asyncio.Future],
     ) -> None:
         """Process a dynamic batch of encode requests for single string prompts."""
+        active = [
+            (p, kw, fut)
+            for p, kw, fut in zip(prompts, kwargs_list, result_futures)
+            if not fut.done()
+        ]
+        if not active:
+            return
+        prompts = [item[0] for item in active]
+        kwargs_list = [item[1] for item in active]
+        result_futures = [item[2] for item in active]
+
         # Check if all kwargs are identical for efficient batch processing
         first_kw = kwargs_list[0]
         can_batch = all(kw == first_kw for kw in kwargs_list[1:])
         kwargs = first_kw if can_batch else None
+        loop = asyncio.get_running_loop()
 
         try:
             # If every request uses identical kwargs we can run a single
             # batch tokenizer call for a big speed-up.
             if can_batch and len(prompts) > 1:
                 encode_fn = partial(self.tokenizer, prompts, **kwargs)
-                results = await asyncio.get_running_loop().run_in_executor(
-                    self._executor, encode_fn
-                )
+                try:
+                    results = await loop.run_in_executor(self._executor, encode_fn)
+                except Exception as batch_exc:
+                    logger.warning(
+                        f"AsyncDynamicbatchTokenizer: Batch encode failed ({batch_exc}); "
+                        f"falling back to per-request tokenization to isolate failing input."
+                    )
+                    outcomes = await loop.run_in_executor(
+                        self._executor,
+                        partial(self._encode_individually, prompts, kwargs_list),
+                    )
+                    for fut, (res, err) in zip(result_futures, outcomes):
+                        if not fut.done():
+                            if err is not None:
+                                fut.set_exception(err)
+                            else:
+                                fut.set_result(res)
+                    return
 
                 for i, fut in enumerate(result_futures):
                     if not fut.done():
@@ -146,16 +200,17 @@ class AsyncDynamicbatchTokenizer:
                         f"Consider using consistent tokenization parameters across requests."
                     )
 
-                encode_fn = lambda prompts=prompts, kwargs=kwargs_list: [
-                    self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs_list)
-                ]
-                results = await asyncio.get_running_loop().run_in_executor(
-                    self._executor, encode_fn
+                outcomes = await loop.run_in_executor(
+                    self._executor,
+                    partial(self._encode_individually, prompts, kwargs_list),
                 )
 
-                for fut, res in zip(result_futures, results):
+                for fut, (res, err) in zip(result_futures, outcomes):
                     if not fut.done():
-                        fut.set_result(res)
+                        if err is not None:
+                            fut.set_exception(err)
+                        else:
+                            fut.set_result(res)
         except Exception as e:
             logger.error(f"Error in dynamic batch processing: {e}")
             for fut in result_futures:
