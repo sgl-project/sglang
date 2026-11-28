@@ -519,6 +519,112 @@ class TestTransferFramesAndHistory(unittest.TestCase):
             vae.encode_causal_groups(failing_groups())
         self.assertEqual([t for t in vae._enc_feat_map if t is not None], [])
 
+    @_fails_if_hung
+    def test_repeated_control_clip_reuses_conditioning_cache(self):
+        from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
+
+        class _CountingVae(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(
+                    patch_size=None, latents_mean=[0.0], latents_std=[1.0]
+                )
+                self.use_feature_cache = True
+                self.weight = torch.nn.Parameter(torch.ones(1))
+                self.calls = 0
+                self.z_dim = 1
+
+            def clear_cache(self):
+                self._enc_feat_map = []
+                self._enc_conv_idx = 0
+
+            def encoder(self, x):
+                self.calls += 1
+                return x[:, :1, -1:]
+
+            def quant_conv(self, x):
+                return torch.cat([x, x], dim=1)
+
+        _CountingVae.causal_prefix_frames = staticmethod(
+            AutoencoderKLWan.causal_prefix_frames
+        )
+        _CountingVae.encode = AutoencoderKLWan.encode
+        _CountingVae.encode_causal_groups = AutoencoderKLWan.encode_causal_groups
+        _CountingVae._encode_causal_groups = AutoencoderKLWan._encode_causal_groups
+        _CountingVae._posterior = AutoencoderKLWan._posterior
+
+        clip = torch.arange(5 * 4 * 4 * 3, dtype=torch.uint8).reshape(5, 4, 4, 3)
+        device = torch.device("cpu")
+        vae = _CountingVae().eval()
+        cache = ConditioningCache(64 * 1024 * 1024)
+
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "control.mp4")
+            with open(path, "wb") as handle:
+                handle.write(b"clip-v1")
+
+            def _iter_frames(p, max_frames):
+                yield from clip.numpy()[:max_frames]
+
+            def run_once(fit):
+                with mock.patch.object(
+                    control_clip,
+                    "iter_video_frames",
+                    side_effect=_iter_frames,
+                ):
+                    decode = ControlClipDecode(path, max_frames=5)
+                    try:
+                        with torch.no_grad(), cache.scope():
+                            return encode_decoding_control_latent(
+                                vae, decode, fit=fit, device=device
+                            )
+                    finally:
+                        decode.close()
+
+            fit_a = functools.partial(
+                direct_resize_control, height=4, width=4, hint="edge"
+            )
+            fit_b = functools.partial(
+                direct_resize_control, height=2, width=2, hint="edge"
+            )
+            first_latent, first_frames = run_once(fit_a)
+            self.assertEqual((vae.calls, cache.hits), (2, 0))
+            second_latent, second_frames = run_once(fit_a)
+            self.assertEqual((vae.calls, cache.hits), (2, 1))
+            self.assertTrue(torch.equal(first_latent, second_latent))
+            self.assertTrue(torch.equal(first_frames, second_frames))
+            # Different fit geometry misses the cache and encodes once.
+            run_once(fit_b)
+            self.assertEqual((vae.calls, cache.hits), (4, 1))
+            # Updated file bytes at the same path miss the cache.
+            with open(path, "wb") as handle:
+                handle.write(b"clip-v2")
+            run_once(fit_a)
+            self.assertEqual((vae.calls, cache.hits), (6, 1))
+
+        # In-memory clips without a staged file still hit @cached_vae_encode.
+        mem_vae = _CountingVae().eval()
+        mem_cache = ConditioningCache(64 * 1024 * 1024)
+        mem_frames = clip.permute(3, 0, 1, 2).contiguous()
+
+        class _MemClip:
+            def wait(self, frames=None):
+                return 5 if frames is None else min(frames, 5)
+
+            def frames(self, start, end):
+                return mem_frames[:, start:end]
+
+        with torch.no_grad(), mem_cache.scope():
+            m1, _ = encode_decoding_control_latent(
+                mem_vae, _MemClip(), fit=None, device=device
+            )
+            self.assertEqual((mem_vae.calls, mem_cache.hits), (2, 0))
+            m2, _ = encode_decoding_control_latent(
+                mem_vae, _MemClip(), fit=None, device=device
+            )
+            self.assertEqual((mem_vae.calls, mem_cache.hits), (2, 1))
+            self.assertTrue(torch.equal(m1, m2))
+
     def test_long_prompt_is_truncated_like_training(self):
         tokenizer = _FakeTokenizer()
         tokenizer.template_ids = list(range(5000))

@@ -11,6 +11,7 @@ committed afterwards. History retention follows the resolved
 paired control/RGB window with pinned sink frames.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -35,8 +36,16 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsManifest,
     CosmosDreamsTransferHistoryProfile,
 )
-from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    _inference_cache,
+    cached_vae_call,
+    use_gpu_conditioning_hash,
+)
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_world_size,
+    model_parallel_is_initialized,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -447,7 +456,7 @@ def encode_control_latent(
 
 
 def streams_control_encode(vae: Any) -> bool:
-    """A streamed encode skips the conditioning cache, whose lookup hashes the whole clip."""
+    """Whether causal control encoding can overlap clip decoding."""
     return vae.use_feature_cache
 
 
@@ -481,8 +490,79 @@ def encode_decoding_control_latent(
             )
             encoded_frames = stop
 
-    with torch.no_grad():
-        latent = vae.encode_causal_groups(groups()).mode()
+    def stream_posterior():
+        with torch.no_grad():
+            return vae.encode_causal_groups(groups())
+
+    cache = _inference_cache(vae)
+    use_cache = cache is not None and not (
+        model_parallel_is_initialized() and get_world_size() > 1
+    )
+    if use_cache:
+        fit_key = None
+        if fit is None:
+            fit_key = ("identity",)
+        elif isinstance(fit, partial) and fit.func in (
+            resize_center_crop_uint8,
+            direct_resize_control,
+        ):
+            fit_key = (
+                fit.func.__name__,
+                fit.args,
+                tuple(sorted(fit.keywords.items())),
+            )
+        if (
+            fit_key is not None
+            and isinstance(decode, ControlClipDecode)
+            and os.path.isfile(decode.local_path)
+        ):
+            digest = hashlib.sha256()
+            with open(decode.local_path, "rb") as handle:
+                while chunk := handle.read(2 * 1024 * 1024):
+                    digest.update(chunk)
+            cache_args = (
+                "control_clip",
+                digest.digest(),
+                decode.max_frames,
+                fit_key,
+                bool(float32_normalization),
+                str(vae_dtype),
+            )
+            posterior = cached_vae_call(
+                vae, "encode_decoding_control_latent", cache_args, stream_posterior
+            )
+            latent = posterior.mode()
+            if encoded_frames == 0:
+                # Cache hit skipped streaming, so slice the exact causal prefix frames.
+                encoded_frames = vae.causal_prefix_frames(int(latent.shape[2]))
+                decode.wait(encoded_frames)
+                raw = decode.frames(0, encoded_frames)
+                frames = raw if fit is None else fit(raw)
+            else:
+                frames = (
+                    decode.frames(0, encoded_frames)
+                    if fit is None
+                    else torch.cat(fitted, dim=1)
+                )
+            return _normalized_latent(vae, latent), frames
+        # In-memory clips without a staged file reuse @cached_vae_encode on vae.encode.
+        for latent_frames in count(1):
+            stop = vae.causal_prefix_frames(latent_frames)
+            if decode.wait(stop) < stop:
+                break
+            encoded_frames = stop
+        frames = decode.frames(0, encoded_frames)
+        if fit is not None:
+            frames = fit(frames)
+        latent = encode_control_latent(
+            vae,
+            frames,
+            device=device,
+            float32_normalization=float32_normalization,
+        )
+        return latent, frames
+
+    latent = stream_posterior().mode()
     frames = (
         decode.frames(0, encoded_frames) if fit is None else torch.cat(fitted, dim=1)
     )
