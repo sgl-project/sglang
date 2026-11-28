@@ -5,8 +5,11 @@ maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 import asyncio
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import PreTrainedTokenizerFast
 
@@ -148,6 +151,75 @@ class TestDetokenize(CustomTestCase):
         for tokens in ([len(WORDS)], [[8], [2**40]]):
             with self.subTest(tokens=tokens):
                 self.assertEqual(detokenize(tokens).status_code, 400)
+
+
+class TestTokenizeHTTPResponse(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        from sglang.srt.entrypoints.http_server import app
+
+        # Use the production routes, including both aliases and JSON validation,
+        # with a real small tokenizer and no inference-engine lifecycle.
+        cls.app = FastAPI()
+        cls.app.router.routes.extend(
+            route
+            for route in app.routes
+            if getattr(route, "path", None) in ("/tokenize", "/v1/tokenize")
+        )
+
+    def setUp(self):
+        tokenizer = _tokenizer()
+        tokenizer.model_max_length = 10**30  # HF's unknown-length sentinel.
+        manager = SimpleNamespace(
+            tokenizer=tokenizer,
+            server_args=None,
+            model_config=SimpleNamespace(context_len=131072),
+            request_logger=SimpleNamespace(log_requests=False),
+        )
+        self.app.state.openai_serving_tokenize = OpenAIServingTokenize(manager)
+        self.client = TestClient(self.app)
+        self.addCleanup(self.client.close)
+
+    def test_aliases_preserve_scalar_and_ragged_batch_tokens(self):
+        """Direct JSON serialization must preserve the scalar/batch union shapes."""
+        for path in ("/tokenize", "/v1/tokenize"):
+            for prompt, tokens in (
+                ("hello hi", _ids("hello hi")),
+                (["hello hi", "", "Paris"], [_ids("hello hi"), [], _ids("Paris")]),
+                ([], []),
+            ):
+                with self.subTest(path=path, prompt=prompt):
+                    response = self.client.post(
+                        path, json={"prompt": prompt, "add_special_tokens": False}
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(
+                        response.headers["content-type"], "application/json"
+                    )
+                    self.assertEqual(
+                        response.json(),
+                        {
+                            "tokens": tokens,
+                            "count": (
+                                [len(row) for row in tokens]
+                                if isinstance(prompt, list)
+                                else len(tokens)
+                            ),
+                            "max_model_len": 131072,
+                        },
+                    )
+
+    def test_error_response_keeps_its_status_and_body(self):
+        """A pre-built error response must not become a successful JSON model."""
+        for path in ("/tokenize", "/v1/tokenize"):
+            with self.subTest(path=path):
+                response = self.client.post(path, json={"messages": HISTORY})
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.headers["content-type"], "application/json")
+                self.assertEqual(
+                    response.json()["message"],
+                    "Chat template tokenization requires a template manager.",
+                )
 
 
 if __name__ == "__main__":
