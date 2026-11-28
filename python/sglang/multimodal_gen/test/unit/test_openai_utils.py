@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -40,6 +41,27 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     RequestMetrics,
 )
 from sglang.srt.utils.json_response import orjson_response
+
+
+def test_ephemeral_media_uses_configured_volume_and_cleans_on_cancel(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    with pytest.raises(asyncio.CancelledError):
+        with openai_utils.temp_dir_if_disabled(None) as scratch:
+            path = Path(scratch)
+            assert path.parent == tmp_path
+            (path / "fixture").write_bytes(b"synthetic")
+            raise asyncio.CancelledError
+    assert not path.exists()
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "missing-volume"))
+    with pytest.raises(FileNotFoundError), openai_utils.temp_dir_if_disabled(None):
+        pytest.fail("must not fall back to the system temporary directory")
+    persistent = tmp_path / "outputs"
+    with openai_utils.temp_dir_if_disabled(str(persistent)) as target:
+        (Path(target) / "fixture").write_bytes(b"kept")
+    assert (persistent / "fixture").read_bytes() == b"kept"
 
 
 @pytest.mark.parametrize(

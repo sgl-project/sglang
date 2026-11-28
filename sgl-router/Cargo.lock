@@ -931,66 +931,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
-name = "deepseek-recipe"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e9a3c713c6026c73883e20f51a91e21e6dcbb3dd1dd89d9eaaa82b11d97febc"
-dependencies = [
- "async-stream",
- "base64 0.22.1",
- "data-url",
- "deepseek-recipe-core",
- "deepseek-recipe-macros",
- "indexmap",
- "itertools 0.14.0",
- "jsonschema",
- "rand 0.9.5",
- "serde",
- "serde_json",
- "strum_macros 0.28.0",
- "tokenizers 0.23.2",
- "tokio-stream",
- "xxhash-rust",
-]
-
-[[package]]
-name = "deepseek-recipe-core"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82329b9b368a326f06eb0114710c86a085bc8792e6e5cffd259125b422cbabef"
-dependencies = [
- "deepseek-recipe-macros",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "deepseek-recipe-encoding"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "136e9554e91dc94beeb9dfa60e9955db1d1b0a4661429c626a2c6ff2c0f74d45"
-dependencies = [
- "aho-corasick",
- "deepseek-recipe-core",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokenizers 0.23.2",
- "tracing",
-]
-
-[[package]]
-name = "deepseek-recipe-macros"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1263cc15fcdc65e4ac61cdee44b1ac5f95868bdaab35579960a6cdc150fa5801"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "derive_builder"
 version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1098,13 +1038,14 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "dynamo-protocols"
-version = "7.0.0"
+version = "10.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45ca7eba9c7e08c01b523fa8dc3d2287a7dabe53b1f9249827d329a91ad8f925"
+checksum = "b5b09675775fb8bcc5a4dc03ae5cd44724693ec00121309351000eb72d66668a"
 dependencies = [
  "async-openai",
  "derive_builder",
  "futures",
+ "indexmap",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -1115,15 +1056,17 @@ dependencies = [
 
 [[package]]
 name = "dynamo-renderer"
-version = "7.1.1"
+version = "10.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8a2960657bf5e8ddcf24aedfe97cb6d9b1541ad658e07d8a2f5df0e699ee977"
+checksum = "f19978746d8472c58fb380960e51c72aa963d30e0b441227f9d8d15961854eb7"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "chrono",
  "dynamo-protocols",
  "dynamo-tokenizers",
  "either",
+ "memchr",
  "minijinja",
  "minijinja-contrib",
  "serde",
@@ -1133,15 +1076,16 @@ dependencies = [
 
 [[package]]
 name = "dynamo-tokenizers"
-version = "3.1.0"
+version = "4.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2bee9c4bcbcb9c498d03199d4ec6738cc0a9f861463074369fc3f7352539e44"
+checksum = "3a733cf7d77e9ce3c12e38b514ef50ffdcb68f0e7c54b2ea6d384a88338e8b14"
 dependencies = [
  "aho-corasick",
  "anyhow",
  "base64 0.22.1",
  "basetenkenizer",
  "blake3",
+ "fancy-regex 0.13.0",
  "fastokens",
  "moka",
  "rayon",
@@ -1150,7 +1094,7 @@ dependencies = [
  "serde_json",
  "strum 0.27.2",
  "tiktoken-rs",
- "tokenizers 0.21.4",
+ "tokenizers",
  "tracing",
 ]
 
@@ -1290,12 +1234,14 @@ dependencies = [
 
 [[package]]
 name = "fastokens"
-version = "0.3.1"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35ff8cf975d8f772e7d4c3be439659b0b23b1ae1086ebee7204573807053ff7f"
+checksum = "d915324fcf00aa9cade45192ffb7eb49f44a66eb9e7059914d87a2a34b58d88d"
 dependencies = [
+ "aho-corasick",
  "daachorse 1.0.1",
  "fancy-regex 0.17.0",
+ "fastrand",
  "hf-hub",
  "icu_normalizer",
  "libc",
@@ -1307,6 +1253,7 @@ dependencies = [
  "serde_json",
  "strum 0.27.2",
  "thiserror 2.0.20",
+ "unicode-normalization-alignments",
  "ureq",
 ]
 
@@ -1379,9 +1326,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -3720,6 +3667,66 @@ dependencies = [
 ]
 
 [[package]]
+name = "sgl-deepseek-recipe"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d9d7216e715b2cf4a7860edf836fb60792e1407b3c0360a1241d9c390c21797"
+dependencies = [
+ "async-stream",
+ "base64 0.22.1",
+ "data-url",
+ "indexmap",
+ "itertools 0.14.0",
+ "jsonschema",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "sgl-deepseek-recipe-core",
+ "sgl-deepseek-recipe-macros",
+ "strum_macros 0.28.0",
+ "tokenizers",
+ "tokio-stream",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "sgl-deepseek-recipe-core"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fbe1e10dc8ec8248ac0276adcaaf0ed3bd3144b4643a6986a634830c720bbf5"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sgl-deepseek-recipe-macros",
+]
+
+[[package]]
+name = "sgl-deepseek-recipe-encoding"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "febd90c09508323617de22aae68d4ecf5655fe94258e846462c7ed1cb1855f89"
+dependencies = [
+ "aho-corasick",
+ "serde",
+ "serde_json",
+ "sgl-deepseek-recipe-core",
+ "thiserror 2.0.20",
+ "tokenizers",
+ "tracing",
+]
+
+[[package]]
+name = "sgl-deepseek-recipe-macros"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2f667efef4ee7a84bf688b04600beaa92b8ed50e3a409e07317f9a3207e7992"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "sgl-kv-indexer"
 version = "0.1.0"
 dependencies = [
@@ -3776,7 +3783,6 @@ dependencies = [
  "sgl-kv-indexer",
  "sglang-api-types",
  "sglang-processor",
- "sglang-runtime-v1-types",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
@@ -3796,7 +3802,7 @@ dependencies = [
 
 [[package]]
 name = "sglang-api-types"
-version = "0.2.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "prost",
@@ -3810,10 +3816,8 @@ dependencies = [
 name = "sglang-processor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
- "deepseek-recipe",
- "deepseek-recipe-core",
- "deepseek-recipe-encoding",
  "dynamo-protocols",
  "dynamo-renderer",
  "futures",
@@ -3822,21 +3826,14 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sgl-deepseek-recipe",
+ "sgl-deepseek-recipe-core",
+ "sgl-deepseek-recipe-encoding",
  "sglang-api-types",
  "thiserror 2.0.20",
- "tokenizers 0.23.2",
+ "tokenizers",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "sglang-runtime-v1-types"
-version = "0.1.0"
-dependencies = [
- "prost",
- "prost-types",
- "tonic",
- "tonic-prost",
 ]
 
 [[package]]
@@ -4064,7 +4061,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4168,40 +4165,6 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
-
-[[package]]
-name = "tokenizers"
-version = "0.21.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a620b996116a59e184c2fa2dfd8251ea34a36d0a514758c6f966386bd2e03476"
-dependencies = [
- "ahash",
- "aho-corasick",
- "compact_str",
- "dary_heap",
- "derive_builder",
- "esaxx-rs",
- "getrandom 0.3.4",
- "hf-hub",
- "itertools 0.14.0",
- "log",
- "macro_rules_attribute",
- "monostate",
- "onig",
- "paste",
- "rand 0.9.5",
- "rayon",
- "rayon-cond",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "spm_precompiled",
- "thiserror 2.0.20",
- "unicode-normalization-alignments",
- "unicode-segmentation",
- "unicode_categories",
-]
 
 [[package]]
 name = "tokenizers"
@@ -4613,9 +4576,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",

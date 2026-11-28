@@ -15,14 +15,13 @@ register_npu_ci(
 )
 
 QWEN3_6_27B_16K_1k_ENVS = {
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
-    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "50",
     "GDN_ATTN_BACKEND_TRITON": "1",
     "ASCEND_USE_FIA": "1",
 }
@@ -47,7 +46,7 @@ QWEN3_6_27B_16K_1k_OTHER_ARGS = [
     "--max-mamba-cache-size",
     74,
     "--mem-fraction-static",
-    0.70,
+    0.63,
     "--cuda-graph-bs-decode",
     1,
     2,
@@ -92,6 +91,9 @@ QWEN3_6_27B_16K_1k_OTHER_ARGS = [
     "qwen3",
     "--tool-call-parser",
     "qwen3_coder",
+    "--enable-prefill-delayer",
+    "--prefill-delayer-max-delay-passes",
+    "50",
 ]
 
 

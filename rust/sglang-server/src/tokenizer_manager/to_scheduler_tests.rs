@@ -198,7 +198,7 @@ fn request_abort_keeps_the_sink_and_queues_behind_the_request() {
 }
 
 /// A context ceiling high enough that only a test which sets one on purpose
-/// can reach it. `context_len` is mandatory now, so "no ceiling" has to be a
+/// can reach it. The length limits are mandatory, so "no ceiling" has to be a
 /// large number rather than `None`; kept well below `u64::MAX` so the
 /// `as i64` in the auto-truncate clamp cannot go negative if a future test
 /// does reach this path.
@@ -206,13 +206,14 @@ const NO_CONTEXT_CEILING: u64 = 1 << 40;
 
 /// The default test limits: a real tokenizer, vocab 1000, no context ceiling.
 /// Spelled out rather than `..Default::default()` — `Limits` deliberately has
-/// no `Default`, because a zero `vocab_size`/`context_len` would reject every
+/// no `Default`, because a zero `vocab_size`/`max_req_len` would reject every
 /// request instead of behaving like "unset".
 fn test_limits() -> Limits {
     Limits {
         skip_tokenizer_init: false,
         vocab_size: 1000,
-        context_len: NO_CONTEXT_CEILING,
+        max_req_len: NO_CONTEXT_CEILING,
+        max_req_input_len: NO_CONTEXT_CEILING,
         num_reserved_tokens: 0,
         allow_auto_truncate: false,
         return_hidden_states_mode: HiddenStatesMode::Null,
@@ -240,7 +241,7 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
 #[test]
 fn total_tokens_over_context_is_rejected() {
     let limits = Limits {
-        context_len: 10,
+        max_req_len: 10,
         ..test_limits()
     };
     let mut g = GenerateRequest {
@@ -271,7 +272,7 @@ fn total_tokens_over_context_is_rejected() {
 #[test]
 fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
     let limits = Limits {
-        context_len: 1000,
+        max_req_len: 1000,
         ..test_limits()
     };
     let request = |max_new_tokens| GenerateRequest {
@@ -305,7 +306,7 @@ fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
 #[test]
 fn reserved_tokens_count_toward_the_limit() {
     let limits = Limits {
-        context_len: 10,
+        max_req_len: 10,
         num_reserved_tokens: 5,
         ..test_limits()
     };
@@ -335,7 +336,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
         ..Default::default()
     };
     let truncating = Limits {
-        context_len: 10,
+        max_req_len: 10,
         allow_auto_truncate: true,
         ..test_limits()
     };
@@ -351,7 +352,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
     // itself is still checked (see `input_length_is_checked_unconditionally`).
     g.sampling_params = sp(None);
     let roomy = Limits {
-        context_len: 100,
+        max_req_len: 100,
         ..test_limits()
     };
     assert!(check_total_tokens(&mut g, &roomy).is_ok());
@@ -364,7 +365,7 @@ fn auto_truncate_clamps_and_unknowns_skip() {
 fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
     for allow_auto_truncate in [false, true] {
         let limits = Limits {
-            context_len: 10,
+            max_req_len: 10,
             allow_auto_truncate,
             ..test_limits()
         };
@@ -387,26 +388,28 @@ fn defaulted_max_new_tokens_is_left_to_the_scheduler() {
         ..Default::default()
     };
     let limits = Limits {
-        context_len: 10,
+        max_req_input_len: 9,
         ..test_limits()
     };
     let err = check_total_tokens(&mut g, &limits).unwrap_err();
-    assert!(err.to_string().contains("longer than the model's context"));
+    assert!(
+        err.to_string()
+            .contains("exceeds the maximum allowed length")
+    );
 }
 
 /// `max_new_tokens: null` means "no cap", NOT "skip the checks" — the input
 /// alone must still fit. Gating the whole function on `max_new_tokens` let an
 /// over-long prompt through to the scheduler with no error at all.
-/// Python compares with `>=`: a prompt that exactly fills the window leaves no
-/// room to generate.
+/// The limit is inclusive: a prompt of exactly `max_req_input_len` tokens fits.
 #[test]
 fn input_length_is_checked_unconditionally() {
     let limits = Limits {
-        context_len: 3,
+        max_req_input_len: 2,
         ..test_limits()
     };
     let req = |max_new_tokens| GenerateRequest {
-        input_ids: Some(vec![1, 2, 3]), // exactly fills a 3-token window
+        input_ids: Some(vec![1, 2, 3]), // one past a 2-token limit
         sampling_params: SamplingParams {
             max_new_tokens,
             ..Default::default()
@@ -415,9 +418,15 @@ fn input_length_is_checked_unconditionally() {
     };
     for max_new_tokens in [None, Some(1)] {
         let err = check_total_tokens(&mut req(max_new_tokens), &limits)
-            .expect_err("input == context_len must be rejected (Python uses >=)");
+            .expect_err("input > max_req_input_len must be rejected");
         assert!(matches!(err, Error::Validation(_)));
-        assert!(err.to_string().contains("longer than the model's context"));
+        // Python's `get_input_length_error` text, byte for byte.
+        assert_eq!(
+            err.to_string(),
+            "Input length (3 tokens) exceeds the maximum allowed length (2 tokens). \
+             This model's maximum context length is 2 tokens on this server. \
+             Use a shorter input or enable --allow-auto-truncate."
+        );
     }
     // One token shorter fits, with or without a cap.
     let mut g = GenerateRequest {
@@ -436,9 +445,20 @@ fn input_length_is_checked_unconditionally() {
     assert!(check_total_tokens(&mut g, &truncating).is_ok());
     assert_eq!(
         g.input_ids.as_deref(),
-        Some(&[1, 2, 3][..]),
-        "fits at the cap"
+        Some(&[1, 2][..]),
+        "cut to the limit"
     );
+    let reserving = Limits {
+        num_reserved_tokens: 1,
+        ..truncating
+    };
+    // Reserved slots are already out of `max_req_input_len`.
+    let mut g = GenerateRequest {
+        input_ids: Some(vec![1, 2]),
+        ..Default::default()
+    };
+    assert!(check_total_tokens(&mut g, &reserving).is_ok());
+    assert_eq!(g.input_ids.as_deref(), Some(&[1, 2][..]), "not cut");
 }
 
 /// The clamp runs AFTER `verify` (which happens in `Normalizing`), so lowering
@@ -448,7 +468,7 @@ fn input_length_is_checked_unconditionally() {
 #[test]
 fn auto_truncate_cannot_invert_min_and_max_new_tokens() {
     let limits = Limits {
-        context_len: 10,
+        max_req_len: 10,
         allow_auto_truncate: true,
         ..test_limits()
     };
@@ -544,7 +564,7 @@ fn limits_resolve_the_hidden_states_mode() {
 #[test]
 fn over_context_request_deregisters_unless_its_cap_is_defaulted() {
     let (mut intake, detok_rx, consumer, _tm_tx, _mm_rx) = make_intake_with(Limits {
-        context_len: 4,
+        max_req_len: 4,
         ..test_limits()
     });
     let sampling_params = SamplingParams {
@@ -1052,6 +1072,38 @@ fn admitted_request_keeps_registration() {
     );
 }
 
+/// A request's dispatch finish time is stamped once the scheduler channel
+/// takes it, and never for one a full channel refuses.
+#[test]
+fn dispatch_finish_time_is_stamped_when_the_channel_takes_the_request() {
+    let (mut intake, _detok_rx, consumer, _tm_tx, _mm_rx) = make_intake();
+    let dispatch_finish_time = |req: &Request| match &req.kind {
+        RequestKind::Generate(g) => g.dispatch_finish_time.clone(),
+        other => panic!("not a generate request: {other:?}"),
+    };
+    let before = std::time::SystemTime::now();
+    // The test channel holds 16; the 17th request is refused.
+    let stamps: Vec<_> = (0..17)
+        .map(|id| {
+            let req = generate_req(id, SamplingParams::default());
+            let stamp = dispatch_finish_time(&req);
+            assert_eq!(stamp.get(), None, "unstamped before dispatch");
+            intake.drive(req);
+            stamp
+        })
+        .collect();
+    assert_eq!(consumer.drain(32).len(), 16);
+    for stamp in &stamps[..16] {
+        let stamped = stamp.get().expect("dispatched");
+        assert!(before <= stamped && stamped <= std::time::SystemTime::now());
+    }
+    assert_eq!(
+        stamps[16].get(),
+        None,
+        "a refused request was never dispatched"
+    );
+}
+
 /// A pool return in `Failed` state (failed encode) is rejected via the same
 /// path and deregistered, not leaked.
 #[test]
@@ -1196,7 +1248,10 @@ fn full_tokenizer_pool_rejects_without_blocking_intake() {
         let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
             panic!("expected a terminal error frame");
         };
-        assert!(matches!(err, Error::QueueFull), "{err}");
+        assert!(
+            matches!(err, Error::QueueFull(QueueStage::Tokenizer)),
+            "{err}"
+        );
     }
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "2")
@@ -1232,6 +1287,52 @@ fn mm_pool_gone_deregisters() {
         Ok(DetokMsg::Deregister { .. })
     ));
     assert!(consumer.drain(16).is_empty(), "nothing queued");
+}
+
+/// A full mm pool queue and a full request ring each refuse with `QueueFull`
+/// naming their stage, as the tokenizer pool's does.
+#[test]
+fn full_mm_pool_and_request_ring_name_their_stage() {
+    let (detok_tx, _detok_rx) = flume::unbounded();
+    let (to_scheduler_tx, consumer) = to_scheduler(1);
+    // A rendezvous channel with no worker waiting: every hand-off finds it full.
+    let (mm_tx, _mm_rx) = flume::bounded(0);
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let mut intake = Intake::new(
+        flume::unbounded().1,
+        flume::unbounded().1,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![detok_tx],
+        },
+        to_scheduler_tx,
+        test_limits(),
+        test_mm(mm_tx, true),
+        sd_rx,
+    );
+    let refused_at = |intake: &mut Intake, mut req: Request| {
+        let (tx, mut rx) = mpsc::channel(8);
+        req.sink = ResponseSink::Local(tx);
+        intake.drive(req);
+        match rx.try_recv() {
+            Ok(ResponseItem::Error(Error::QueueFull(stage))) => Some(stage),
+            _ => None,
+        }
+    };
+    let generate = |id| generate_req(id, SamplingParams::default());
+    assert_eq!(
+        refused_at(&mut intake, mm_pretokenized_req("mm")),
+        Some(QueueStage::Mm)
+    );
+    assert_eq!(refused_at(&mut intake, generate(1)), None);
+    assert_eq!(
+        refused_at(&mut intake, generate(2)),
+        Some(QueueStage::Scheduler)
+    );
+    assert_eq!(consumer.drain(4).len(), 1, "only the first fit the ring");
 }
 
 /// Build a generate request carrying an image and a text prompt.
@@ -1313,6 +1414,7 @@ fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffe
         req.state
     );
     if let RequestKind::Generate(g) = &mut req.kind {
+        g.mm = None;
         g.input_ids = Some(input_ids);
         g.mm_buffers = buffers;
     }
@@ -1321,11 +1423,14 @@ fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffe
 
 /// An abort while the request is out in the mm pool cancels it: the sink is
 /// deregistered at once, no AbortReq is sent (the scheduler never saw the
-/// rid), and the returning request is dropped instead of pushed -- releasing
-/// the shm its buffers carry -- so no GPU time or KV memory goes to a client
-/// that left.
+/// rid), the request's `MmCancellation` runs its callbacks for the processor,
+/// and the returning request is dropped instead of pushed -- releasing the shm
+/// its buffers carry -- so no GPU time or KV memory goes to a client that left.
 #[test]
 fn abort_while_in_mm_pool_drops_on_return() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     let (mut intake, detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
     let (tx, mut rx) = mpsc::channel(8);
     let mut req = mm_pretokenized_req("mm-gone");
@@ -1333,8 +1438,26 @@ fn abort_while_in_mm_pool_drops_on_return() {
     intake.drive(req);
     let mut req = mm_rx.try_recv().expect("sent to the mm pool");
     assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { .. })));
+    let RequestKind::Generate(g) = &req.kind else {
+        panic!("a generate request");
+    };
+    let cancellation = g.mm.as_ref().unwrap().cancellation.clone();
+    let cancels = Arc::new(AtomicUsize::new(0));
+    let count = |cancels: &Arc<AtomicUsize>| {
+        let cancels = cancels.clone();
+        move || {
+            cancels.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    cancellation.on_cancel(count(&cancels));
+    assert!(!cancellation.is_cancelled());
 
     intake.on_abort(AbortSource::Guard("mm-gone".to_string().into()));
+    assert!(cancellation.is_cancelled());
+    assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    // A processor that registers after the abort is told at once.
+    cancellation.on_cancel(count(&cancels));
+    assert_eq!(cancels.load(Ordering::SeqCst), 2);
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "mm-gone")
     );
@@ -1486,6 +1609,85 @@ fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
     );
 }
 
+/// A request that asks for its prompt ids finds the final (expanded) ids in
+/// its slot once pushed to the scheduler, or once back from the mm pool after
+/// an abort, which then reports them; none are left before, or for a request
+/// that did not ask.
+#[test]
+fn requested_prompt_ids_are_left_once_final() {
+    for (requested, aborted) in [(false, false), (true, false), (true, true)] {
+        let case = format!("requested={requested} aborted={aborted}");
+        let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+        let mut req = mm_pretokenized_req("mm-ids");
+        let slot = requested.then(crate::message::request::PromptTokenIdsSlot::default);
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.prompt_token_ids = slot.clone();
+        }
+        intake.drive(req);
+        let mut req = mm_rx.try_recv().expect("mm pool must receive the request");
+        assert!(
+            slot.as_ref().is_none_or(|slot| slot.get().is_none()),
+            "{case}"
+        );
+        if aborted {
+            intake.on_abort(AbortSource::Guard("mm-ids".to_string().into()));
+        }
+        encode_like_worker(&mut req, vec![5, 6, 7, 8], Vec::new());
+        intake.drive(req);
+
+        assert_eq!(consumer.drain(16).len(), usize::from(!aborted), "{case}");
+        if let Some(slot) = slot {
+            assert_eq!(
+                slot.get().map(|ids| &ids[..]),
+                Some(&[5, 6, 7, 8][..]),
+                "{case}"
+            );
+        }
+    }
+}
+
+/// A text prompt's ids from the tokenizer pool are final once intake has
+/// fitted them to the context: they are left as it pushes the request, or as
+/// it drops one aborted while in the pool, truncated under auto-truncation.
+#[test]
+fn tokenizer_pool_return_leaves_fitted_prompt_ids() {
+    for (aborted, truncating) in [(false, false), (true, false), (false, true), (true, true)] {
+        let case = format!("aborted={aborted} truncating={truncating}");
+        let (mut intake, tok_rx, _mm_rx, consumer, _detok_rx) = make_intake_with_tokenizer(false);
+        if truncating {
+            intake.limits.max_req_input_len = 2;
+            intake.limits.allow_auto_truncate = true;
+        }
+        let (tx, _rx) = mpsc::channel(8);
+        let slot = crate::message::request::PromptTokenIdsSlot::default();
+        intake.drive(Request {
+            rid: "text-ids".to_string().into(),
+            state: RequestState::Received,
+            sink: ResponseSink::Local(tx),
+            kind: RequestKind::Generate(Box::new(GenerateRequest {
+                rid: "text-ids".to_string().into(),
+                text: Some("hi".into()),
+                prompt_token_ids: Some(slot.clone()),
+                ..Default::default()
+            })),
+        });
+        let mut req = tok_rx.try_recv().expect("text goes to the tokenizer pool");
+        if aborted {
+            intake.on_abort(AbortSource::Guard("text-ids".to_string().into()));
+        }
+        // The pool fills the ids and advances the FSM, as `TokenizerWorker` does.
+        if let RequestKind::Generate(g) = &mut req.kind {
+            g.input_ids = Some(vec![7, 1, 8]);
+        }
+        req.state.apply(Event::TokenizeDone).unwrap();
+        intake.drive(req);
+
+        assert_eq!(consumer.drain(16).len(), usize::from(!aborted), "{case}");
+        let expected: &[i64] = if truncating { &[7, 1] } else { &[7, 1, 8] };
+        assert_eq!(slot.get().map(|ids| &ids[..]), Some(expected), "{case}");
+    }
+}
+
 /// A multimodal *text* prompt visits the tokenizer pool first
 /// (`Tokenizing { then: Encode }`), then the mm pool in `Encoding` carrying the
 /// tokenizer's ids -- the MM worker never sees text. `Encoded` then -> channel.
@@ -1634,4 +1836,21 @@ fn mm_text_prompt_under_skip_tokenizer_init_is_a_400() {
     intake.drive(req);
     assert!(rx.try_recv().is_err(), "no error frame");
     assert!(mm_rx.try_recv().is_ok(), "submitted to the mm pool");
+}
+
+/// The detok shard learns about stop strings at `Register`, which runs before
+/// `normalize`: both the API aliases and the normalized fields count, and empty
+/// strings do not.
+#[test]
+fn has_stop_strings_reads_aliases_and_normalized_fields() {
+    let parse = |json: &str| serde_json::from_str::<SamplingParams>(json).expect("parses");
+    assert!(!has_stop_strings(&parse("{}")));
+    assert!(!has_stop_strings(&parse(r#"{"stop": [""]}"#)));
+    assert!(has_stop_strings(&parse(r#"{"stop": "STéOP"}"#)));
+    assert!(has_stop_strings(&parse(r#"{"stop": ["", "x"]}"#)));
+    assert!(has_stop_strings(&parse(r#"{"stop_regex": "\\d{3}"}"#)));
+    let mut normalized = parse(r#"{"stop": "x"}"#);
+    normalized.normalize(false, 1000).expect("normalizes");
+    assert!(normalized.stop.is_none());
+    assert!(has_stop_strings(&normalized));
 }

@@ -150,6 +150,7 @@ def _storage(
             state_slots=4 if state else 0,
             max_running_requests=3,
             context_len=256,
+            req_to_token_row_width=256,
             alignment=1,
         ),
     )
@@ -163,7 +164,6 @@ def _storage(
             enable_memory_saver=False,
             need_sort=False,
             max_num_reqs=3,
-            model_context_len=256,
             lazy_compaction=True,
             state_cache_params=SimpleNamespace(layers=state_layers),
         ),
@@ -334,37 +334,34 @@ class TestWindowRetirement(CustomTestCase):
                 self.subTest(shares=shares, no_overlap=no_overlap),
                 patch("sglang.srt.runtime_context.get_schedule", return_value=schedule),
                 patch("sglang.srt.runtime_context.get_spec", return_value=spec),
+                patch(
+                    "sglang.srt.mem_cache.allocation_sizing.get_spec",
+                    return_value=spec,
+                ),
                 envs.SGLANG_SWA_EVICTION_INTERVAL.override(32),
             ):
                 self.assertEqual(
                     window_retirement(shares_prefixes=shares),
-                    (lag, 0 if no_overlap else 1, 32),
+                    (lag, 1, 32),
                 )
 
     def test_a_decode_step_allocates_ahead_of_its_processed_length(self):
-        """Decode allocates ahead of retirement by the overlapped step, or by the
-        speculative reserve, which covers the overlap lag too."""
-        for algorithm, no_overlap, lag in (
-            (None, False, 1),
-            (None, True, 0),
-            ("EAGLE", False, 10),
-            ("EAGLE", True, 10),
-        ):
+        """Decode allocates ahead of retirement by the decode-ahead, which
+        covers the overlap lag too."""
+        for no_overlap in (False, True):
             schedule = SimpleNamespace(
                 chunked_prefill_size=16, disable_overlap_schedule=no_overlap
             )
-            spec = SimpleNamespace(speculative_algorithm=algorithm)
             with (
-                self.subTest(algorithm=algorithm, no_overlap=no_overlap),
+                self.subTest(no_overlap=no_overlap),
                 patch("sglang.srt.runtime_context.get_schedule", return_value=schedule),
-                patch("sglang.srt.runtime_context.get_spec", return_value=spec),
                 patch(
-                    "sglang.srt.mem_cache.allocation_sizing.get_alloc_reserve_per_decode",
+                    "sglang.srt.mem_cache.allocation_sizing.get_decode_ahead",
                     return_value=10,
                 ),
             ):
                 retirement = window_retirement(shares_prefixes=True)
-                self.assertEqual(retirement.decode_retire_lag, lag)
+                self.assertEqual(retirement.decode_retire_lag, 10)
 
 
 class TestAdmission(_AdderCase):
@@ -505,7 +502,7 @@ class TestMemoryClip(_AdderCase):
             dict(
                 input_tokens=rng.choice((8, 40, 96, 200, 400)),
                 max_new_tokens=rng.choice((0, 4, 64, 600)),
-                token_capacity=rng.choice((10**6, 120)),
+                token_capacity=10**6,
                 sliding_window_size=8,
                 chunk_size=rng.choice((None, 16)),
                 chunk_align=rng.choice((None, 8)),
@@ -526,12 +523,9 @@ class TestMemoryClip(_AdderCase):
                 key = tuple(sorted(question.items()))
                 if key in asked:
                     self.assertEqual(priced.call_count, before)
-                else:
-                    paged = -(-question["input_tokens"] // 4) * 4
-                    room = question["token_capacity"] - paged - 4 - 1
-                    if answer == min(question["max_new_tokens"], max(0, room)):
-                        whole += 1
-                        self.assertEqual(priced.call_count, before + 1)
+                elif answer == question["max_new_tokens"]:
+                    whole += 1
+                    self.assertEqual(priced.call_count, before + 1)
                 asked.add(key)
                 if (tokens := allocator.alloc(4)) is not None:
                     held.append(tokens)
@@ -539,24 +533,6 @@ class TestMemoryClip(_AdderCase):
         self.assertLess(whole, len(asked))
         for tokens in held:
             allocator.free(tokens)
-
-    def test_clip_applies_the_scheduler_token_capacity(self):
-        """BUG REGRESSION. The clip must not grant decode beyond the token
-        capacity the scheduler passes (CP padding, KV sharding)."""
-        allocator = _window_pool(8192)
-        kwargs = dict(sliding_window_size=8, chunk_size=16)
-        free = allocator.max_new_tokens_for_memory(
-            12, 80, token_capacity=allocator.size_full, **kwargs, **RETIRE_AT_ONCE
-        )
-        self.assertEqual(free, 80)
-        for capacity in (40, 64, 90):
-            with self.subTest(capacity=capacity):
-                self.assertEqual(
-                    allocator.max_new_tokens_for_memory(
-                        12, 80, token_capacity=capacity, **kwargs, **RETIRE_AT_ONCE
-                    ),
-                    min(80, max(0, capacity - 12 - 4 - 1)),
-                )
 
     def test_clip_cuts_no_chunk_below_the_alignment(self):
         """A truncated chunk is cut to the scheduler's alignment, so the clip

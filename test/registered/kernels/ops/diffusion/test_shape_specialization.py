@@ -28,6 +28,11 @@ from sglang.kernels.ops.diffusion import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
+    ltx2_ada_values9,
+)
+from sglang.kernels.ops.diffusion.layout.head_group_copy_triton import (
+    copy_head_groups,
+    prebuild_copy_head_groups,
 )
 from sglang.kernels.ops.diffusion.layout.ulysses_qkv_triton import (
     pack_qkv_destination_major,
@@ -123,6 +128,11 @@ def _temb_table_slices(seq_len):
     fused_temb_table_slices(table, temb)
 
 
+def _ltx2_ada_values9(seq_len):
+    table = torch.randn(9, HIDDEN, device=DEVICE, dtype=torch.float32)
+    ltx2_ada_values9(table, _bf16(1, seq_len, 9 * HIDDEN))
+
+
 def _pack_qkv(seq_len):
     q = _bf16(seq_len, 4, 128)
     pack_qkv_destination_major(q, torch.randn_like(q), torch.randn_like(q), 2)
@@ -178,6 +188,7 @@ LAUNCHES = {
     "layernorm_modulate": _layernorm_modulate,
     "qk_head_layernorm": _qk_head_layernorm,
     "temb_table_slices": _temb_table_slices,
+    "ltx2_ada_values9": _ltx2_ada_values9,
     "pack_qkv": _pack_qkv,
     "wan_cat_pad": _wan_cat_pad,
     "wan_cat_pad_channels_first": _wan_cat_pad_channels_first,
@@ -206,6 +217,41 @@ def test_scale_shift_batch_size_compiles_nothing():
     torch.cuda.synchronize()
     with _compiled_kernels() as compiled:
         _scale_shift(64, batch=2)
+        torch.cuda.synchronize()
+    assert compiled == []
+
+
+def test_prebuilt_head_group_copies_compile_nothing():
+    """The widths the head-group pipeline can pick are built ahead; a strided
+    shard copied into pitched blocks and back, as the pipeline does, must hit
+    those builds."""
+    head_dim, groups, rows, slot_rows = 80, 3, 37, 44
+    group_heads = (2, 5)  # block widths 256 and 512
+    prebuild_copy_head_groups(
+        {heads * head_dim for heads in group_heads}, torch.bfloat16, DEVICE
+    )
+    torch.cuda.synchronize()
+    with _compiled_kernels() as compiled:
+        for heads in group_heads:
+            width = heads * head_dim
+            shard = _bf16(1, rows, groups * heads + 3, head_dim)[:, :, 3:]
+            as_groups = (
+                shard.unflatten(2, (groups, heads)).flatten(3).permute(2, 0, 1, 3)
+            )
+            group_numel = 3 * slot_rows * width
+            pool = torch.zeros(groups * group_numel, device=DEVICE, dtype=shard.dtype)
+            blocks = pool.as_strided(
+                (groups, 1, rows, width),
+                (group_numel, slot_rows * width, width, 1),
+                slot_rows * width,
+            )
+            copy_head_groups(as_groups, blocks)
+            back = torch.zeros_like(shard)
+            copy_head_groups(
+                blocks,
+                back.unflatten(2, (groups, heads)).flatten(3).permute(2, 0, 1, 3),
+            )
+            assert torch.equal(back, shard)
         torch.cuda.synchronize()
     assert compiled == []
 

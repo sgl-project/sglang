@@ -13,12 +13,20 @@ from sglang.srt.parser.inkling_tokenizer import (
     AUDIO_TOKEN_ID,
     CONTENT_AUDIO_INPUT,
     CONTENT_IMAGE,
+    CONTENT_INVOKE_TOOL_JSON,
     CONTENT_TEXT,
     IMAGE_TOKEN_ID,
+    INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
 
 INKLING_DEFAULT_REASONING_EFFORT = 0.9
+
+# The TMLv0 tool-call header a checkpoint writes, between <|message_model|> and
+# <|content_invoke_tool_json|>: "tool_name" writes the tool's name; "independent" writes the
+# assistant message's own name (empty for an unnamed assistant); "drop_name" drops assistant
+# message names, so every header is empty.
+TOOL_CALL_AUTHOR_NAME_MODES = ("tool_name", "independent", "drop_name")
 
 TML_RENDERERS_INSTALL_HINT = (
     "Serving Inkling requires the `tml-renderers` package (TML's reference "
@@ -33,20 +41,60 @@ _TEXT_PART_TYPES = frozenset({None, "text", "input_text"})
 _IMAGE_LOCATION_PREFIX = "sglang-inkling-image://"
 _AUDIO_LOCATION_PREFIX = "sglang-inkling-audio://"
 
+# Inkling2 checkpoints keep these native audio IDs as unused reserved tokens.
+_UNUSED_SPECIALS = {
+    "inkling": (),
+    "inkling2": ("content_audio_input", "audio", "audio_end"),
+}
+
 
 @functools.cache
-def load_tml_renderers() -> SimpleNamespace:
+def load_tml_renderers(spec: str = "inkling") -> SimpleNamespace:
     try:
         from tml_renderers import chat, tokenizers, v0
     except ImportError as exc:
         raise ImportError(TML_RENDERERS_INSTALL_HINT) from exc
-    tokenizer = tokenizers.O200kBaseChatTokenizer()
+    native_tokenizers = {
+        "inkling": tokenizers.O200kBaseChatTokenizer,
+        "inkling2": tokenizers.H200kBaseChatTokenizer,
+    }
+    tokenizer = native_tokenizers[spec]()
     return SimpleNamespace(
         chat=chat,
         v0=v0,
         tokenizer=tokenizer,
         renderer=v0.Renderer(tokenizer),
+        unused_special_ids=frozenset(
+            tokenizer.encode_special(name) for name in _UNUSED_SPECIALS[spec]
+        ),
     )
+
+
+_TOKENIZER_PROBE = "Hello, 世界! def f(x): return x**2\n\t  naïve 👩‍🚀 12345678901"
+
+
+def check_served_tokenizer(tokenizer: Any, *, spec: str) -> None:
+    # Prompts and outputs use tml-renderers' tokenizer, while the scheduler matches
+    # stop strings and detokenizes with the served one; they must agree.
+    tml = load_tml_renderers(spec)
+    # encode() is the lookup both the HF and the tiktoken tokenizer wrappers share.
+    mismatched = []
+    for token in INKLING_SPECIAL_TOKEN_IDS:
+        token_id = tml.tokenizer.encode_special(token[2:-2])
+        if token_id not in tml.unused_special_ids and tokenizer.encode(
+            token, add_special_tokens=False
+        ) != [token_id]:
+            mismatched.append(token)
+    if tokenizer.encode(_TOKENIZER_PROBE, add_special_tokens=False) != list(
+        tml.tokenizer.encode_ordinary(_TOKENIZER_PROBE)
+    ):
+        mismatched.append("ordinary text")
+    if mismatched:
+        raise ValueError(
+            "The served tokenizer disagrees with tml-renderers' "
+            f"{type(tml.tokenizer).__name__} on {', '.join(mismatched)}; "
+            "Inkling prompts and outputs would be misencoded."
+        )
 
 
 def render_inkling_messages(
@@ -56,10 +104,15 @@ def render_inkling_messages(
     tool_choice: str | Mapping[str, Any] | None = "auto",
     parallel_tool_calls: bool = True,
     reasoning_effort: float | None = None,
+    spec: str = "inkling",
+    tool_call_author_name_mode: str = "tool_name",
 ) -> list[int]:
     """Media parts emit one placeholder each; Inkling samples its own assistant header.
     The tool-choice instruction joins the first system message."""
-    tml = load_tml_renderers()
+    check_tool_call_author_name_mode(tool_call_author_name_mode, spec=spec)
+    if tool_call_author_name_mode == "drop_name":
+        messages = _drop_assistant_names(messages)
+    tml = load_tml_renderers(spec)
     media_marker = f"sglang-inkling-media-{uuid.uuid4().hex}:"
     chat_messages, media_kinds = _to_chat_messages(messages, media_marker)
     tools = _tools_for_choice(tools=tools, tool_choice=tool_choice)
@@ -87,13 +140,84 @@ def render_inkling_messages(
         )
         for message in chat_message.to_messages()
     ]
+    if tool_call_author_name_mode == "tool_name":
+        spans, _parser = tml.renderer.render_for_completion(native)
+        return _spans_to_input_ids(spans, tml)
+    # tml-renderers only writes tool_name headers and refuses any other author name on a
+    # tool call, so render the calls unnamed, then write each call's own author name.
+    native, header_names = _unname_tool_calls(native, tml.chat)
     spans, _parser = tml.renderer.render_for_completion(native)
-    return _spans_to_input_ids(spans, tml)
+    return _write_tool_call_header_names(
+        _spans_to_input_ids(spans, tml), tml.tokenizer, header_names
+    )
 
 
-def render_inkling_assistant_prefix(prefix: str) -> list[int]:
+def check_tool_call_author_name_mode(mode: str, *, spec: str) -> None:
+    if mode not in TOOL_CALL_AUTHOR_NAME_MODES:
+        raise ValueError(
+            f"tool_call_author_name_mode must be one of {TOOL_CALL_AUTHOR_NAME_MODES}, "
+            f"got {mode!r}"
+        )
+    if mode != "tool_name" and spec != "inkling2":
+        raise ValueError(
+            f"tool_call_author_name_mode={mode!r} needs an inkling2 checkpoint"
+        )
+
+
+def _drop_assistant_names(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    return [
+        (
+            {key: value for key, value in message.items() if key != "name"}
+            if message.get("role") == "assistant"
+            else message
+        )
+        for message in messages
+    ]
+
+
+def _unname_tool_calls(native: list[Any], chat: Any) -> tuple[list[Any], list[str]]:
+    """Clear the author name of each tool-call message; return the names, in call order."""
+    out, names = [], []
+    for message in native:
+        if isinstance(message.content, chat.InvokeTool):
+            names.append(message.author.name or "")
+            message = message.copy()
+            message.author = chat.Author(message.author.kind, None)
+        out.append(message)
+    return out, names
+
+
+def _write_tool_call_header_names(
+    input_ids: list[int], tokenizer: Any, names: Sequence[str]
+) -> list[int]:
+    """Replace the name in each <|message_model|>NAME<|content_invoke_tool_json|> header,
+    in order, with ``names``."""
+    message_model = tokenizer.encode_special(_special_name(MESSAGE_MODEL))
+    invoke_json = tokenizer.encode_special(_special_name(CONTENT_INVOKE_TOOL_JSON))
+    out: list[int] = []
+    remaining = iter(names)
+    for token_id in input_ids:
+        if token_id == invoke_json:
+            start = len(out)
+            while start > 0 and not tokenizer.is_special_token(out[start - 1]):
+                start -= 1
+            if start == 0 or out[start - 1] != message_model:
+                raise ValueError("A rendered tool call has no <|message_model|> header")
+            name = next(remaining, None)
+            if name is None:
+                raise ValueError("More rendered tool calls than tool-call messages")
+            out[start:] = tokenizer.encode_ordinary(name) if name else []
+        out.append(token_id)
+    if next(remaining, None) is not None:
+        raise ValueError("Fewer rendered tool calls than tool-call messages")
+    return out
+
+
+def render_inkling_assistant_prefix(prefix: str, *, spec: str = "inkling") -> list[int]:
     """TMLv0 has no prefill; continuation opens a model text block without a terminator."""
-    tokenizer = load_tml_renderers().tokenizer
+    tokenizer = load_tml_renderers(spec).tokenizer
     return [
         tokenizer.encode_special(_special_name(MESSAGE_MODEL)),
         tokenizer.encode_special(_special_name(CONTENT_TEXT)),
@@ -249,6 +373,7 @@ def _spans_to_input_ids(spans: Sequence[Any], tml: SimpleNamespace) -> list[int]
                 input_ids,
                 location=span.location,
                 tokenizer=tml.tokenizer,
+                unused_special_ids=tml.unused_special_ids,
             )
         else:
             raise ValueError(
@@ -262,18 +387,23 @@ def _append_media_placeholder(
     *,
     location: str,
     tokenizer: Any,
+    unused_special_ids: frozenset[int],
 ) -> None:
     if location.startswith(_IMAGE_LOCATION_PREFIX):
         input_ids.append(IMAGE_TOKEN_ID)
         return
+    audio_input, audio_end = (
+        tokenizer.encode_special(_special_name(token))
+        for token in (CONTENT_AUDIO_INPUT, AUDIO_END)
+    )
+    if {audio_input, audio_end} & unused_special_ids:
+        raise ValueError("This Inkling checkpoint does not accept audio input")
     # tml-renderers DMel-encodes audio at render time, so audio rides in an image
     # slot and gets the MM processor's audio framing here.
     if input_ids[-1] != tokenizer.encode_special(_special_name(CONTENT_IMAGE)):
         raise ValueError("Inkling audio placeholder is not framed as a content block")
-    input_ids[-1] = tokenizer.encode_special(_special_name(CONTENT_AUDIO_INPUT))
-    input_ids.extend(
-        [AUDIO_TOKEN_ID, tokenizer.encode_special(_special_name(AUDIO_END))]
-    )
+    input_ids[-1] = audio_input
+    input_ids.extend([AUDIO_TOKEN_ID, audio_end])
 
 
 def _special_name(token: str) -> str:

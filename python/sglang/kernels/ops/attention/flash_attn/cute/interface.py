@@ -27,9 +27,10 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
     cute_dsl_ptxas.patch()
 
 
+from sglang.kernels.ops.attention import fa4_sm120
 from sglang.kernels.ops.attention.fa4_sm120.dispatch import (
     get_forward_host,
-    try_cached_paged_decode,
+    try_cached_paged,
     try_cached_varlen,
 )
 from sglang.kernels.ops.attention.flash_attn.cute import fa_logging, utils
@@ -417,6 +418,7 @@ def _flash_attn_fwd(
     qk_sf_vec_size: Optional[int] = None,
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    rel_bias_presheared: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -462,7 +464,7 @@ def _flash_attn_fwd(
             )
         )
     ):
-        fast_result = try_cached_paged_decode(
+        fast_result = try_cached_paged(
             arch=arch,
             q=q,
             k=k,
@@ -971,9 +973,15 @@ def _flash_attn_fwd(
         # The qv kernel has no split-KV variant.
         num_splits = 1
 
-    fp32_out_sm90 = arch // 10 == 9 and out.dtype == torch.float32 and num_splits == 1
-    is_split_kv = num_splits > 1 or fp32_out_sm90
-    if fp32_out_sm90:
+    # SM90 and forward-host kernels write FP32 only as split partials;
+    # a single split's partial is the output itself.
+    fp32_out_one_split = (
+        (arch // 10 == 9 or arch_forward_host is not None)
+        and out.dtype == torch.float32
+        and num_splits == 1
+    )
+    is_split_kv = num_splits > 1 or fp32_out_one_split
+    if fp32_out_one_split:
         out_partial = out.unsqueeze(0)
         lse_partial = (
             lse.unsqueeze(0)
@@ -1142,7 +1150,7 @@ def _flash_attn_fwd(
             "forward implementation"
         )
         qhead_per_kvhead_packgqa = qhead_per_kvhead if pack_gqa else 1
-        rel_extent = rel_bias.shape[-1]
+        rel_extent = rel_bias.shape[-1] - (256 if rel_bias_presheared else 0)
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
         assert tile_n == 128
@@ -1159,6 +1167,17 @@ def _flash_attn_fwd(
         tile_bias = (
             (seqlen_q_packgqa + 7) // 8 * 8 if seqlen_q_packgqa < tile_m else tile_m
         )
+    if rel_bias is not None and rel_bias_presheared:
+        # The caller already wrote the sheared layout this call's shear step
+        # would produce: (round_up(total_q, tile_m), num_head, rel_extent + 256).
+        assert cu_seqlens_q is not None
+        assert rel_bias.shape == (
+            _round_up_to_tile(total_q, tile_m),
+            num_head,
+            rel_extent_padded,
+        )
+        bias = rel_bias
+    elif rel_bias is not None:
         if cu_seqlens_q is None:
             bias_seqlen_q_rounded = _round_up_to_tile(seqlen_q, tile_m)
             assert rel_bias.shape == (batch_size, seqlen_q, num_head, rel_extent)
@@ -1897,7 +1916,7 @@ def _flash_attn_fwd(
                     pack_gqa=pack_gqa,
                 )
             compiled_fwd(*call_args)
-    if is_split_kv and not fp32_out_sm90:
+    if is_split_kv and not fp32_out_one_split:
         _flash_attn_fwd_combine(
             out_partial,
             lse_partial.transpose(-1, -2),
@@ -1910,6 +1929,7 @@ def _flash_attn_fwd(
         not fake_mode
         and not torch.cuda.is_current_stream_capturing()
         and arch_forward_host is not None
+        and not fp32_out_one_split
         and q is not None
         and k is not None
         and qv is None
@@ -1947,7 +1967,7 @@ def _flash_attn_fwd(
                 None,
             )
             compiled_combine = _flash_attn_fwd_combine.compile_cache[combine_key]
-        arch_forward_host.register_paged_decode(
+        arch_forward_host.register_paged(
             arch=arch,
             compiled_fn=compiled_fwd,
             compile_key=compile_key,
@@ -1978,7 +1998,10 @@ def _flash_attn_fwd(
 def _get_jit_cache(name: str):
     return get_jit_cache(
         name,
-        source_paths=(os.path.dirname(os.path.abspath(__file__)),),
+        source_paths=(
+            os.path.dirname(os.path.abspath(__file__)),
+            os.path.dirname(os.path.abspath(fa4_sm120.__file__)),
+        ),
         enable_tvm_ffi=True,
     )
 
@@ -2104,6 +2127,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         rel_bias_prep_cache: Optional[dict] = None,
         return_lse: bool = False,
         out: Optional[torch.Tensor] = None,
+        rel_bias_presheared: bool = False,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -2145,6 +2169,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             rel_bias=rel_bias,
+            rel_bias_presheared=rel_bias_presheared,
             sfq=sfq,
             sfk=sfk,
             sfv=sfv,
@@ -2270,6 +2295,7 @@ def flash_attn_varlen_func(
     rel_bias_prep_cache: Optional[dict] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
+    rel_bias_presheared: bool = False,
 ):
     """
     Tensor arguments:
@@ -2405,6 +2431,7 @@ def flash_attn_varlen_func(
         rel_bias_prep_cache,
         return_lse,
         out,
+        rel_bias_presheared,
     )
     needs_autograd = False
     if forward_host is not None or out is not None:
