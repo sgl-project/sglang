@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-motubrain2-backend"
+version = "0.1.0"
+description = "Register the Motubrain 2.0 serving backend with the SGLang CLI"
+requires-python = ">=3.11"
+dependencies = ["sglang[diffusion]"]
+
+[project.entry-points."sglang.serve_backends"]
+motubrain2 = "sglang.multimodal_gen.runtime.entrypoints.motubrain2_backend:make_backend"
+
+[tool.setuptools]
+py-modules = []
