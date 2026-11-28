@@ -67,22 +67,27 @@ def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple
         fb.global_num_token_non_padded_cpu,
         fb.num_token_non_padded,
     )
-    fb.global_num_tokens_cpu = counts
-    # Device ops only: this runs inside prefill graph capture, where a host copy
-    # would be recorded against pageable memory.
-    gpu = fb.global_num_tokens_gpu
-    if len(set(counts)) == 1:
-        fb.global_num_tokens_gpu = torch.full_like(gpu, counts[0])
-    else:
-        fb.global_num_tokens_gpu = async_h2d(counts, dtype=gpu.dtype, device=gpu.device)
-    fb.global_num_tokens_padded_cpu = counts
-    # The MoE gatherv reads its sizes from the logprob counts when present.
-    fb.global_num_tokens_for_logprob_cpu = counts
-    fb.global_num_tokens_for_logprob_gpu = fb.global_num_tokens_gpu
-    fb.global_dp_buffer_len = sum(counts)
-    # Tail rows are real rows only, so the late layers gather variable lengths.
-    fb.dp_padding_mode = DpPaddingMode.SUM_LEN
-    fb.dp_local_start_pos = fb.dp_local_num_tokens = None
+    # MegaMoE with a DP LM head needs no gather metadata during capture.
+    # Tail counts still bound local MoE rows, even on that no-gather path.
+    if fb.global_num_tokens_gpu is not None:
+        fb.global_num_tokens_cpu = counts
+        # Device ops only: this runs inside prefill graph capture, where a host copy
+        # would be recorded against pageable memory.
+        gpu = fb.global_num_tokens_gpu
+        if len(set(counts)) == 1:
+            fb.global_num_tokens_gpu = torch.full_like(gpu, counts[0])
+        else:
+            fb.global_num_tokens_gpu = async_h2d(
+                counts, dtype=gpu.dtype, device=gpu.device
+            )
+        fb.global_num_tokens_padded_cpu = counts
+        # The MoE gatherv reads its sizes from the logprob counts when present.
+        fb.global_num_tokens_for_logprob_cpu = counts
+        fb.global_num_tokens_for_logprob_gpu = fb.global_num_tokens_gpu
+        fb.global_dp_buffer_len = sum(counts)
+        # Tail rows are real rows only, so the late layers gather variable lengths.
+        fb.dp_padding_mode = DpPaddingMode.SUM_LEN
+        fb.dp_local_start_pos = fb.dp_local_num_tokens = None
     # With attention TP=1 the invariant scalar also describes local MoE rows.
     # Preserve an idle peer's zero bound even when it carries fabricated rows.
     local_rows = counts[get_parallel().attn_dp_rank if len(counts) > 1 else 0]
@@ -95,7 +100,8 @@ def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple
             fb.global_num_token_non_padded, max=local_rows
         )
         fb.num_token_non_padded = fb.global_num_token_non_padded
-    set_dp_buffer_len_from_batch(fb)
+    if fb.global_num_tokens_gpu is not None:
+        set_dp_buffer_len_from_batch(fb)
     return saved
 
 
@@ -115,4 +121,5 @@ def exit_late_layer_dp(forward_batch: ForwardBatch, saved: tuple) -> None:
         fb.global_num_token_non_padded_cpu,
         fb.num_token_non_padded,
     ) = saved
-    set_dp_buffer_len_from_batch(fb)
+    if fb.global_num_tokens_gpu is not None:
+        set_dp_buffer_len_from_batch(fb)
