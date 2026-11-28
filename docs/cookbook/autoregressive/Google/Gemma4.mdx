@@ -141,8 +141,8 @@ The Gemma 4 series offers models in various sizes and architectures, optimized f
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-12B-it</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1x H200 / 1x B200 / 1x B300 / 2x Tesla T4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1 (H200/B200/B300) / 2 (T4)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>gemma-4-31B-it</td>
@@ -1314,6 +1314,95 @@ Median ITL (ms):                         15.11
 ```
 
 > **Performance tuning**: On B200, raising `--scheduler-recv-interval` to 16 lifted text throughput from 5497 to 5673 tok/s output (≈ +3%) at concurrency 100 with no accuracy change, by reducing the scheduler's per-step Python overhead. It is a safe, low-risk knob for high-concurrency serving.
+
+#### gemma-4-12B-it (2x Tesla T4, TP=2)
+
+Server Launch Command:
+
+<Accordion title="Tesla T4 patch (SGLang 0.5.19, CUDA 12.9)">
+
+On Tesla T4, the default Triton tiles for [Gemma 4 12B IT](https://huggingface.co/google/gemma-4-12B-it/tree/43c9d014b231474fa7212dbb48a762566c2b255d)'s 512-wide attention heads exceed the 64 KiB shared-memory limit per block. The patch uses smaller tiles and fixes a separate SGLang 0.5.19 warmup failure caused by a missing `lm_head_is_tied` flag.
+
+```bash Command
+SGLANG_SITE_PACKAGES="$(python3 -c 'from importlib.util import find_spec; from pathlib import Path; print(Path(find_spec("sglang").origin).resolve().parent.parent)')"
+patch -d "$SGLANG_SITE_PACKAGES" -p1 -N <<'PATCH'
+--- a/sglang/kernels/ops/attention/extend_attention.py
++++ b/sglang/kernels/ops/attention/extend_attention.py
+@@ -143,6 +143,10 @@
+             BLOCK_M, BLOCK_N = (64, 64) if Lq <= 128 else (32, 32)
+
+         num_warps = 4 if Lq <= 64 else 8
++        if _is_cuda and CUDA_CAPABILITY == (7, 5) and max(Lq, Lv) >= 512:
++            # T4 has 64 KiB of shared memory per block. A 32x32 tile
++            # needs 128 KiB for Gemma 4's 512-wide global attention.
++            BLOCK_M, BLOCK_N, num_warps = 16, 16, 4
+
+     return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
+
+--- a/sglang/kernels/ops/attention/decode_attention.py
++++ b/sglang/kernels/ops/attention/decode_attention.py
+@@ -818,6 +818,14 @@
+     extra_kargs = {}
+     num_stages = 2
+     num_warps = 4
++    if (
++        not _is_hip
++        and q.is_cuda
++        and max(Lk, Lv) >= 512
++        and torch.cuda.get_device_capability(q.device) == (7, 5)
++    ):
++        # Bound shared memory for 512-wide grouped-query attention on T4.
++        BLOCK, num_stages = 16, 1
+     if _is_hip:
+         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
+         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
+--- a/sglang/srt/models/gemma4_unified.py
++++ b/sglang/srt/models/gemma4_unified.py
+@@ -190,7 +190,8 @@
+         )
+
+         text_tie = getattr(text_config, "tie_word_embeddings", True)
+-        if self.pp_group.world_size == 1 and text_tie:
++        self.lm_head_is_tied = self.pp_group.world_size == 1 and text_tie
++        if self.lm_head_is_tied:
+             self.lm_head = self.language_model.embed_tokens
+         elif self.pp_group.is_last_rank:
+             self.lm_head = ParallelLMHead(
+PATCH
+```
+
+</Accordion>
+
+```bash Command
+SGLANG_FORCE_FUSED_OP_BACKEND=torch sglang serve --model-path /path/to/gemma-4-12B-it \
+  --tp-size 2 --dtype float16 --attention-backend triton --sampling-backend pytorch \
+  --disable-cuda-graph --disable-custom-all-reduce \
+  --context-length 2048 --max-total-tokens 2048 --chunked-prefill-size 128 \
+  --max-running-requests 1 --mem-fraction-static 0.96
+```
+
+**Throughput Benchmark (Text)**
+
+```bash Command
+python3 -m sglang.benchmark.serving --backend sglang \
+  --host 127.0.0.1 --dataset-name random-ids --tokenize-prompt \
+  --random-input-len 128 --random-output-len 64 --random-range-ratio 1 \
+  --num-prompts 5 --max-concurrency 1
+```
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Max request concurrency:                 1
+Successful requests:                     5
+Benchmark duration (s):                  50.09
+Total input tokens:                      640
+Total generated tokens:                  320
+Output token throughput (tok/s):         6.39
+Median TTFT (ms):                        315.40
+Median TPOT (ms):                        152.37
+==================================================
+```
 
 ### 5.2 Accuracy Benchmark
 
