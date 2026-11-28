@@ -55,7 +55,6 @@ _COLUMN_TAIL_MAX_TOKENS_K31 = 384
 # From this many tokens each rank computes its 1/TP routed up_proj columns into the
 # shared-expert all-reduce.
 _UP_PROJ_COLUMN_SPLIT_MIN_TOKENS = 2048
-_ROW_SHARDED_TAIL_MIN_TOKENS = 4096
 # from here sglang's A8W4 GEMMs beat AITER's fused_moe (MI350X)
 _A8W4_MOE_MIN_TOKENS = 2048
 
@@ -309,11 +308,11 @@ class KimiK3MoEHipMixin:
         return out if prefix_sum is None else out + prefix_sum
 
     def _row_sharded_tail_eligible(self, num_tokens: int, has_prefix: bool) -> bool:
-        """Whether the tail runs on this rank's 1/TP of the rows (gfx950 prefill
-        batches; see _row_sharded_tail)."""
+        """Whether the tail runs on this rank's 1/TP of the rows (gfx950; see
+        _row_sharded_tail)."""
         return (
             _is_gfx95
-            and num_tokens >= _ROW_SHARDED_TAIL_MIN_TOKENS
+            and num_tokens >= envs.SGLANG_ROCM_K3_ROW_SHARDED_TAIL_MIN_TOKENS.get()
             and self.tp_size > 1
             and has_prefix
             and not k3_ar_fusion.enabled()
