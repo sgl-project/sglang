@@ -25,6 +25,7 @@ import asyncio
 import io
 import logging
 import math
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, AsyncGenerator, List, Optional, Union
@@ -386,25 +387,37 @@ class OpenAIServingTranscription(OpenAIServingBase):
     ]:
         """Transcribe pre-split long audio (duration > max_audio_clip_s).
 
-        Each chunk is an independent generation. Chunks run sequentially so
-        one user-controlled upload cannot fan out into an unbounded number of
-        tokenizer/GPU requests. Results are stitched in chunk (= audio) order.
+        Each chunk is an independent generation, so the chunks are dispatched
+        concurrently and stitched back in chunk (= audio) order thanks to
+        ``asyncio.gather``. To keep one user-controlled upload from fanning out
+        into an unbounded number of tokenizer/GPU requests, a semaphore caps the
+        chunks in flight per request at ``SGLANG_ASR_CHUNK_CONCURRENCY``
+        (default 4).
         """
         chunk_requests = [
             self._build_chunk_request(adapted_request, chunk_audio, stream=False)
             for chunk_audio in request._audio_chunks
         ]
-        rets = []
-        try:
-            for chunk_request in chunk_requests:
-                ret = await self.tokenizer_manager.generate_request(
+        concurrency = max(1, int(os.environ.get("SGLANG_ASR_CHUNK_CONCURRENCY", "4")))
+        semaphore = asyncio.Semaphore(concurrency)
+
+        async def _run_chunk(chunk_request: GenerateReqInput) -> dict:
+            async with semaphore:
+                return await self.tokenizer_manager.generate_request(
                     chunk_request, raw_request
                 ).__anext__()
-                rets.append(ret)
+
+        tasks = [asyncio.create_task(_run_chunk(cr)) for cr in chunk_requests]
+        try:
+            rets = await asyncio.gather(*tasks)
         except BaseException as e:
-            # Abort the in-flight request on failures or parent cancellation.
-            # Later chunks have not been dispatched.
+            # Abort in-flight chunks and cancel the rest on failures or parent
+            # cancellation; drain the cancellations so no chunk keeps decoding
+            # behind the error response.
+            for task in tasks:
+                task.cancel()
             self._abort_chunk_requests(chunk_requests)
+            await asyncio.gather(*tasks, return_exceptions=True)
             if isinstance(e, ValueError):
                 return self.create_error_response(str(e))
             raise
