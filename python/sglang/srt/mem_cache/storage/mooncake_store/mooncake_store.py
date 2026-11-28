@@ -1376,8 +1376,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         else:
             kv_pages = self.batch_exists(keys, extra_info)
 
-        if not kv_pages:
-            return PoolTransferResult(0, {}, [])
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        # Start from every KV prefix and let each pool remove the stop points it
+        # cannot serve. Collect the whole set, not just its maximum: a
+        # TRAILING_PAGES pool leaves holes (see PoolTransferResult), and the
+        # caller has to intersect these sets across ranks.
+        restorable = list(range(1, kv_pages + 1))
+
+        if not restorable:
+            return PoolTransferResult(0, hit_count, [])
 
         prepared = []
         all_component_keys = []
@@ -1390,30 +1397,76 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             all_component_keys.extend(component_keys)
             prepared.append((transfer, key_multiplier, start, len(all_component_keys)))
 
-        probe = bool(all_component_keys) and hasattr(self.store, "batch_probe_key")
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             all_exists = self._batch_exist_pool_pages(
-                all_component_keys, prepared, kv_pages, probe
+                all_component_keys, prepared, kv_pages
             )
-            hit_count, restorable = self._fold_pool_hits(prepared, all_exists, kv_pages)
-            if probe and restorable:
-                # Lease only the windows the restore reads; an object evicted
-                # since the probe moves the restore point to a shallower one.
-                window = self._trailing_window_indices(prepared, restorable[-1])
-                leased = (
-                    self._batch_exist([all_component_keys[i] for i in window])
-                    if window
-                    else []
-                )
-                missing = [i for i, r in zip(window, leased) if r != 1]
-                if missing:
-                    for i in missing:
-                        all_exists[i] = 0
-                    hit_count, restorable = self._fold_pool_hits(
-                        prepared, all_exists, kv_pages
+        for transfer, key_multiplier, start, end in prepared:
+            if not restorable:
+                break
+            ex = all_exists[start:end]
+            if key_multiplier > 0:
+                page_exists = [
+                    all(
+                        r == 1
+                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
                     )
+                    for i in range(kv_pages)
+                ]
+            else:
+                page_exists = [False] * kv_pages
+            boundary = 0
+            pool_restorable = []
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                try:
+                    boundary = page_exists.index(False)
+                except ValueError:
+                    boundary = kv_pages
+                pool_restorable = list(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # Compressed-block pools (DeepSeek-V4 C128) keep one key per
+                # block. Only endpoints of leading complete blocks are valid
+                # restore boundaries; the query span starts on a block boundary.
+                block = max(1, int(transfer.block_pages))
+                complete = 0
+                for idx in range(block - 1, kv_pages, block):
+                    if not page_exists[idx]:
+                        break
+                    complete += 1
+                boundary = complete * block
+                pool_restorable = list(range(block, boundary + 1, block))
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                # A stop point works when the window ending there is complete,
+                # so scan every one instead of stopping at the longest.
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(
+                        page_exists[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        pool_restorable.append(prefix_len)
+                        if boundary == 0:
+                            boundary = prefix_len
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
+            if boundary:
+                hit_count[transfer.name] = boundary
+            pool_restorable_set = set(pool_restorable)
+            restorable = [p for p in restorable if p in pool_restorable_set]
 
         final_pages = restorable[-1] if restorable else 0
+        if final_pages and hasattr(self.store, "batch_probe_key"):
+            window = []
+            for transfer, key_multiplier, start, _ in prepared:
+                if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                    first = max(0, final_pages - len(transfer.keys or ()))
+                    stop = start + final_pages * key_multiplier
+                    window += all_component_keys[start + first * key_multiplier : stop]
+            if window:
+                with self.request_context(
+                    **self._request_context_from_extra_info(extra_info)
+                ):
+                    self._batch_exist(window)
         return PoolTransferResult(final_pages, hit_count, restorable)
 
     def _batch_io_v2(
@@ -2041,19 +2094,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self.store.batch_is_exist(key_strs)
 
     def _batch_exist_pool_pages(
-        self, keys: List[str], prepared: list, kv_pages: int, probe: bool
+        self, keys: List[str], prepared: list, kv_pages: int
     ) -> List[int]:
-        if not probe:
+        if not keys or not hasattr(self.store, "batch_probe_key"):
             return self._batch_exist(keys) if keys else []
         exists = [0] * len(keys)
         leased = []
         for transfer, key_multiplier, start, end in prepared:
             if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                # A restore reads only the window at its stop point; leasing the
-                # other pages would keep superseded windows from being freed.
+                # Only the window at the restore point is read; it is leased later.
                 stop = start + kv_pages * key_multiplier
-                if stop > start:
-                    exists[start:stop] = self.store.batch_probe_key(keys[start:stop])
+                exists[start:stop] = self.store.batch_probe_key(keys[start:stop])
             else:
                 leased.extend(range(start, end))
         if leased:
@@ -2061,81 +2112,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             for i, result in zip(leased, results):
                 exists[i] = result
         return exists
-
-    @staticmethod
-    def _fold_pool_hits(
-        prepared: list, all_exists: List[int], kv_pages: int
-    ) -> Tuple[dict, List[int]]:
-        hit_count: dict = {PoolName.KV: kv_pages}
-        # Start from every KV prefix and let each pool remove the stop points it
-        # cannot serve. Collect the whole set, not just its maximum: a
-        # TRAILING_PAGES pool leaves holes (see PoolTransferResult), and the
-        # caller has to intersect these sets across ranks.
-        restorable = list(range(1, kv_pages + 1))
-        for transfer, key_multiplier, start, end in prepared:
-            if not restorable:
-                break
-            ex = all_exists[start:end]
-            if key_multiplier > 0:
-                page_exists = [
-                    all(
-                        r == 1
-                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
-                    )
-                    for i in range(kv_pages)
-                ]
-            else:
-                page_exists = [False] * kv_pages
-            boundary = 0
-            pool_restorable = []
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                try:
-                    boundary = page_exists.index(False)
-                except ValueError:
-                    boundary = kv_pages
-                pool_restorable = list(range(1, boundary + 1))
-            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
-                # Compressed-block pools (DeepSeek-V4 C128) keep one key per
-                # block. Only endpoints of leading complete blocks are valid
-                # restore boundaries; the query span starts on a block boundary.
-                block = max(1, int(transfer.block_pages))
-                complete = 0
-                for idx in range(block - 1, kv_pages, block):
-                    if not page_exists[idx]:
-                        break
-                    complete += 1
-                boundary = complete * block
-                pool_restorable = list(range(block, boundary + 1, block))
-            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
-                # A stop point works when the window ending there is complete,
-                # so scan every one instead of stopping at the longest.
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-                for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
-                        pool_restorable.append(prefix_len)
-                        if boundary == 0:
-                            boundary = prefix_len
-            else:
-                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
-            if boundary:
-                hit_count[transfer.name] = boundary
-            pool_restorable_set = set(pool_restorable)
-            restorable = [p for p in restorable if p in pool_restorable_set]
-        return hit_count, restorable
-
-    @staticmethod
-    def _trailing_window_indices(prepared: list, final_pages: int) -> List[int]:
-        indices = []
-        for transfer, key_multiplier, start, _ in prepared:
-            if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
-                continue
-            trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-            first = start + max(0, final_pages - trailing) * key_multiplier
-            indices.extend(range(first, start + final_pages * key_multiplier))
-        return indices
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
