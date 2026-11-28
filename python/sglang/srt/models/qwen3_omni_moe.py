@@ -47,6 +47,7 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.mrope_rope_index import (
     _get_feat_extract_output_lengths,
 )
@@ -188,7 +189,12 @@ class SinusoidsPositionEmbedding(nn.Module):
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
-    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig, quant_config=None):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeAudioEncoderConfig,
+        quant_config=None,
+        prefix: str = "",
+    ):
         super().__init__(config)
 
         embed_dim = config.d_model
@@ -199,8 +205,10 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3OmniMoeAudioEncoderLayer(config)
-                for _ in range(config.encoder_layers)
+                Qwen3OmniMoeAudioEncoderLayer(
+                    config, prefix=add_prefix(f"layers.{layer_idx}", prefix)
+                )
+                for layer_idx in range(config.encoder_layers)
             ]
         )
         self.ln_post = nn.LayerNorm(config.d_model)
@@ -228,13 +236,20 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             config.d_model,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("conv_out", prefix),
         )
         self.proj1 = ReplicatedLinear(
-            config.d_model, config.d_model, quant_config=quant_config
+            config.d_model,
+            config.d_model,
+            quant_config=quant_config,
+            prefix=add_prefix("proj1", prefix),
         )
         self.act = ACT2FN[config.activation_function]
         self.proj2 = ReplicatedLinear(
-            config.d_model, config.output_dim, quant_config=quant_config
+            config.d_model,
+            config.output_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("proj2", prefix),
         )
         self.n_window_infer = self.config.n_window_infer
         self.conv_chunksize = self.config.conv_chunksize
@@ -405,6 +420,7 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
             vision_config=config,
             quant_config=quant_config,
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+            prefix=prefix,
         )
 
         self.merger = Qwen3OmniMoeVisionPatchMerger(
@@ -423,9 +439,9 @@ class Qwen3OmniMoeVisionEncoder(Qwen3VLMoeVisionModel):
                     spatial_merge_size=config.spatial_merge_size,
                     use_postshuffle_norm=True,
                     quant_config=quant_config,
-                    prefix=add_prefix("merger_list", prefix),
+                    prefix=add_prefix(f"merger_list.{layer_idx}", prefix),
                 )
-                for _ in range(len(config.deepstack_visual_indexes))
+                for layer_idx in range(len(config.deepstack_visual_indexes))
             ]
         )
         del self.deepstack_merger_list
@@ -455,7 +471,9 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         super().__init__(
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, quant_config)
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(
+            config.audio_config, quant_config, prefix=add_prefix("audio_tower", prefix)
+        )
         self.visual = Qwen3OmniMoeVisionEncoder(
             config.vision_config,
             quant_config=quant_config,
@@ -489,6 +507,28 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
 
 
 class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
+    @staticmethod
+    def get_hf_to_sglang_mapper(config) -> WeightsMapper:
+        """Renames checkpoint module names (quantization ignore lists) to SGLang's."""
+        # The audio tower fuses q/k/v into attn.qkv_proj and names out_proj
+        # attn.proj; the rules are per layer so text-model names stay untouched.
+        audio_attn = {}
+        for layer_idx in range(config.thinker_config.audio_config.encoder_layers):
+            ckpt = f"audio_tower.layers.{layer_idx}.self_attn."
+            sglang = f"audio_tower.layers.{layer_idx}.attn."
+            for shard in ("q_proj", "k_proj", "v_proj"):
+                audio_attn[ckpt + shard] = sglang + "qkv_proj"
+            audio_attn[ckpt + "out_proj"] = sglang + "proj"
+        return WeightsMapper(
+            orig_to_new_substr={"attn.qkv": "attn.qkv_proj", **audio_attn},
+            orig_to_new_prefix={
+                "thinker.model.": "model.language_model.",
+                "thinker.lm_head": "lm_head",
+                "thinker.visual.": "visual.",
+                "thinker.audio_tower.": "audio_tower.",
+            },
+        )
+
     def __init__(
         self,
         config: Qwen3VLMoeConfig,
