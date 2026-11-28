@@ -206,6 +206,8 @@ _GDN_FUSED_QKVZBA_RATIOS = (
     if _use_aiter
     else (1, 2, 3, 4)
     if (_is_cuda or _is_hip)
+    else ()
+    if _is_npu
     else (1, 2, 4)
 )
 
@@ -1040,7 +1042,44 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_k_dim,
                 self.head_v_dim,
             )
+        elif _is_npu:
+            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                fused_rmsnorm_gated_strided_z,
+            )
+
+            qkv_dim = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
+            nv_tp = self.num_v_heads // self.attn_tp_size
+            use_npu_strided_z = (
+                fused_rmsnorm_gated_strided_z is not None
+                and projected_states_qkvz.is_contiguous()
+                and self.norm.group_size is None
+                and getattr(self.norm, "norm_before_gate", True)
+                and getattr(self.norm, "activation", "silu") in ("silu", "swish")
+                and (self.head_v_dim & (self.head_v_dim - 1)) == 0
+            )
+            if (
+                forward_batch.forward_mode.is_decode()
+                and self.conv_kernel_size == 4
+                and self.conv1d.bias is None
+                and projected_states_qkvz.is_contiguous()
+                and projected_states_ba.is_contiguous()
+            ):
+                mixed_qkv = (projected_states_qkvz, projected_states_ba)
+                a = projected_states_ba
+                b = projected_states_ba
+            else:
+                mixed_qkv = projected_states_qkvz[:, :qkv_dim].contiguous()
+                b = projected_states_ba[:, :nv_tp].contiguous()
+                a = projected_states_ba[:, nv_tp:].contiguous()
+            z = (
+                None
+                if use_npu_strided_z
+                else projected_states_qkvz[:, qkv_dim:].reshape(
+                    projected_states_qkvz.shape[0], -1, self.head_v_dim
+                )
+            )
         else:
+            use_npu_strided_z = False
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba
             )
@@ -1066,6 +1105,32 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out, z = attn_result
         else:
             core_attn_out = attn_result
+
+        if _is_npu and z is None and not use_fused_proj_conv:
+            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                fused_rmsnorm_gated_strided_z,
+            )
+
+            assert fused_rmsnorm_gated_strided_z is not None
+            qkv_dim = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
+            nv_tp = self.num_v_heads // self.attn_tp_size
+            core_attn_out = core_attn_out.reshape(-1, nv_tp, self.head_v_dim)
+            if core_attn_out.shape[0] != projected_states_qkvz.shape[0]:
+                core_attn_out_pad = core_attn_out.new_zeros(
+                    (projected_states_qkvz.shape[0], nv_tp, self.head_v_dim)
+                )
+                core_attn_out_pad[: core_attn_out.shape[0]] = core_attn_out
+                core_attn_out = core_attn_out_pad
+            core_attn_out = fused_rmsnorm_gated_strided_z(
+                core_attn_out.contiguous(),
+                projected_states_qkvz,
+                self.norm.weight,
+                qkv_dim,
+                self.norm.eps,
+            )
+            output, _ = self.out_proj(core_attn_out)
+            return output
+
         assert z is not None
 
         z_shape_og = z.shape
