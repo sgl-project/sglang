@@ -138,9 +138,72 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 delattr(layer, native)
         return result
 
+    def _process_weights_for_fused_w4a16(self, layer) -> bool:
+        """False: unsupported. Gate/up use the gate's BF16-rounded global scale, as Marlin."""
+        from sglang.kernels.ops.moe.muse_spark_nvfp4_w4a16_moe import (
+            init_runtime,
+            repack_nvfp4_experts,
+            scales_supported,
+        )
+        from sglang.srt.layers.muse_spark.muse_spark_sp_experts import max_tokens
+        from sglang.srt.runtime_context import get_parallel
+
+        w13_scale, w2_scale = (
+            layer.gate_up_proj_weight_scale,
+            layer.down_proj_weight_scale,
+        )
+        # one path on all ranks
+        ok = torch.tensor(
+            [int(scales_supported(w13_scale, w2_scale))], device=w13_scale.device
+        )
+        torch.distributed.all_reduce(
+            ok,
+            op=torch.distributed.ReduceOp.MIN,
+            group=get_parallel().tp_group.device_group,
+        )
+        if not ok.item():
+            return False
+        w13 = repack_nvfp4_experts(layer.gate_up_proj, w13_scale, gate_up=True)
+        w2 = repack_nvfp4_experts(layer.down_proj, w2_scale, gate_up=False)
+        gs13 = layer.gate_up_proj_weight_scale_2
+        gs13 = (
+            (gs13[:, 0] if gs13.dim() == 2 else gs13)
+            .to(torch.bfloat16)
+            .float()
+            .contiguous()
+        )
+        gs2 = layer.down_proj_weight_scale_2.to(torch.bfloat16).float().contiguous()
+        for _, native in self._MARLIN_PARAM_ALIASES:
+            # the loader holds it until this hook returns
+            if (old := layer._parameters.pop(native)).numel() > (1 << 20):
+                old.untyped_storage().resize_(0)
+        for name, value in (
+            ("w13_weight", w13),
+            ("w2_weight", w2),
+            ("w13_weight_scale_2", gs13),
+            ("w2_weight_scale_2", gs2),
+        ):
+            layer.register_parameter(
+                name, torch.nn.Parameter(value, requires_grad=False)
+            )
+        setup = layer.dynamic_guest_setup
+        torch.cuda.empty_cache()
+        init_runtime(w13.device, max_tokens())
+        if setup is not None:
+            setup.on_repacked()
+        return True
+
     def process_weights_after_loading(self, layer):
         """Prepare the TRT-LLM layout from native HF parameters in place."""
         backend = getattr(self, "_moe_runner_backend", None)
+        if getattr(layer, "use_fused_w4a16", False):
+            layer.set_post_expert_norm(layer.post_expert_norm)
+            layer.use_fused_w4a16 = (
+                layer._fused_w4a16_ready()
+                and self._process_weights_for_fused_w4a16(layer)
+            )
+            if layer.use_fused_w4a16:
+                return None
         if backend is not None and backend.is_marlin():
             return self._process_weights_for_marlin(layer)
         input_scale = layer.gate_up_proj_input_scale.max().float()

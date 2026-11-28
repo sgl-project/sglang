@@ -80,11 +80,18 @@ template <
     bool kPostNormIsInputScale,
     bool kHasRouter,
     bool kPostWeight,
-    bool kGate>
-__global__ void __launch_bounds__(kNumThreads)
+    bool kGate,
+    bool kCommon,
+    int kGroup>
+__global__ void __launch_bounds__(kNumThreads, 1)
     muse_spark_norm_residual_kernel(const __grid_constant__ NormResidualParams params) {
   using namespace device;
   using namespace device::norm_residual;
+  constexpr int kVec = kGroup;
+  constexpr int kPairs = kGroup / 2;
+  constexpr int kFVec = kGroup < static_cast<int>(kMaxVecBytes / 4) ? kGroup : static_cast<int>(kMaxVecBytes / 4);
+  constexpr int kFParts = kGroup / kFVec;
+  constexpr int kFPairs = kFVec / 2;
 
   constexpr int kPacks = kHidden / (kNumThreads * kVec);
   constexpr int kNumWarps = kNumThreads / kWarpThreads;
@@ -109,9 +116,9 @@ __global__ void __launch_bounds__(kNumThreads)
   // areas; separate areas keep the second reduction free of a WAR barrier.
   __shared__ float smem[kNumWarps == 1 ? 1 : 2 * kNumWarps];
 
-  const bool channel_wise = kGate && params.gate_channel_wise;
-  const bool has_pre_weight = params.has_pre_weight;
-  const bool pre_bf16 = params.pre_norm_bf16;
+  const bool channel_wise = kGate && (kCommon || params.gate_channel_wise);
+  const bool has_pre_weight = kCommon || params.has_pre_weight;
+  const bool pre_bf16 = !kCommon && params.pre_norm_bf16;
 
   fp32x2_t vals[kPacks][kPairs];
   fp32x2_t post_w[kPostWeight ? kPacks : 1][kPairs];
@@ -119,6 +126,7 @@ __global__ void __launch_bounds__(kNumThreads)
   F32Vec alpha_pf[kPreSlots][kFParts], beta_pf[kPreSlots][kFParts];
   BF16Vec pre_w_pf[kPreSlots];
 
+  if (gridDim.x <= 96) PDLTriggerSecondary<kUsePDL>();
   PDLWaitPrimary<kUsePDL>();
 
   float sum_sq = 0.0f;
@@ -616,10 +624,12 @@ template <
     bool kUsePDL,
     bool kPrefetchWeights,
     int kClusterSize,
+    int kGroup,
     bool kPostNormIsInputScale,
     bool kHasRouter>
 struct MuseSparkNormResidual {
   static_assert(kClusterSize == 1 || kClusterSize == 2 || kClusterSize == 4 || kClusterSize == 8 || kClusterSize == 16);
+  static_assert(kGroup == 8 || (kGroup == 4 && kClusterSize == 1));
 
   static void
   run(const tvm::ffi::TensorView branch,
@@ -695,18 +705,32 @@ struct MuseSparkNormResidual {
 
     const auto launch = [&]<bool kHasPostWeight, bool kHasGate>() {
       if constexpr (kClusterSize == 1) {
-        LaunchKernel(num_rows, kNumThreads, device)
-            .config({.use_pdl = kUsePDL})(
-                muse_spark_norm_residual_kernel<
-                    kHidden,
-                    kNumThreads,
-                    kUsePDL,
-                    kPrefetchWeights,
-                    kPostNormIsInputScale,
-                    kHasRouter,
-                    kHasPostWeight,
-                    kHasGate>,
-                params);
+        auto kernel = muse_spark_norm_residual_kernel<
+            kHidden,
+            kNumThreads,
+            kUsePDL,
+            kPrefetchWeights,
+            kPostNormIsInputScale,
+            kHasRouter,
+            kHasPostWeight,
+            kHasGate,
+            false,
+            kGroup>;
+        // the model's flags as constants
+        if constexpr (kHasGate)
+          if (gate_channel_wise && pre_weight.has_value() && !pre_norm_bf16)
+            kernel = muse_spark_norm_residual_kernel<
+                kHidden,
+                kNumThreads,
+                kUsePDL,
+                kPrefetchWeights,
+                kPostNormIsInputScale,
+                kHasRouter,
+                kHasPostWeight,
+                kHasGate,
+                true,
+                kGroup>;
+        LaunchKernel(num_rows, kNumThreads, device).config({.use_pdl = kUsePDL})(kernel, params);
       } else {
         constexpr auto kernel = muse_spark_norm_residual_cluster<
             kHidden,

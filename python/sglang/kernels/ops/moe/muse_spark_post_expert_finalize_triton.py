@@ -7,13 +7,16 @@ import triton.language as tl
 _MIN_TOKENS_FOR_FUSED = 32
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["part"])
 def _post_expert_norm_weighted_sum_kernel(
     x_ptr,
     w_ptr,
     s_ptr,
     out_ptr,
     ids_ptr,
+    rows_ptr,
+    part_ptr,
+    part,
     TOPK: tl.constexpr,
     H: tl.constexpr,
     eps,
@@ -21,10 +24,15 @@ def _post_expert_norm_weighted_sum_kernel(
     HAS_WEIGHT: tl.constexpr,
     WEIGHT_FIRST: tl.constexpr,
     HAS_IDS: tl.constexpr,
+    HAS_ROWS: tl.constexpr,
     ROUND_PRODUCT: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     tok = tl.program_id(0)
+    if HAS_ROWS:
+        tok += tl.load(part_ptr + part)
+        if tok >= tl.load(part_ptr + part + 1):
+            return
     offs = tl.arange(0, BLOCK_H)
     mask = offs < H
 
@@ -36,6 +44,9 @@ def _post_expert_norm_weighted_sum_kernel(
     for k in tl.static_range(TOPK):
         base = (tok * TOPK + k) * H
         live = True
+        if HAS_ROWS:
+            base = tl.load(rows_ptr + tok * TOPK + k).to(tl.int64) * H
+            live = base >= 0
         if HAS_IDS:
             live = tl.load(ids_ptr + tok * TOPK + k) >= 0
         if live:
@@ -73,6 +84,9 @@ def fused_post_expert_norm_weighted_sum(
     apply_norm: bool = True,
     slot_expert_ids: Optional[torch.Tensor] = None,
     round_product: bool = False,
+    rows: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    part: Optional[tuple[torch.Tensor, int]] = None,
 ) -> torch.Tensor:
     """Normalize and combine experts without reading inactive slots.
 
@@ -80,11 +94,19 @@ def fused_post_expert_norm_weighted_sum(
     when combining an already normalized low-precision tensor.
     """
     x = expert_output.contiguous()
-    tokens, topk, hidden = x.shape
-    out = torch.empty((tokens, hidden), dtype=x.dtype, device=x.device)
+    tokens, topk, hidden = x.shape if rows is None else (*rows.shape, x.shape[-1])
+    # the eager path below handles only the plain layout: no rows / part, a fresh output
+    plain = rows is None and part is None and out is None
+    if out is None:
+        out = torch.empty((tokens, hidden), dtype=x.dtype, device=x.device)
     if tokens == 0:
         return out
-    if tokens < _MIN_TOKENS_FOR_FUSED and slot_expert_ids is None and not round_product:
+    if (
+        tokens < _MIN_TOKENS_FOR_FUSED
+        and slot_expert_ids is None
+        and not round_product
+        and plain
+    ):
         y = x
         if apply_norm:
             f = y.float()
@@ -109,6 +131,8 @@ def fused_post_expert_norm_weighted_sum(
         topk_scores.contiguous(),
         out,
         slot_expert_ids.contiguous() if slot_expert_ids is not None else x,
+        rows.contiguous() if rows is not None else x,
+        *(part or (x, 0)),
         TOPK=topk,
         H=hidden,
         eps=eps,
@@ -116,6 +140,7 @@ def fused_post_expert_norm_weighted_sum(
         HAS_WEIGHT=norm_weight is not None,
         WEIGHT_FIRST=weight_first,
         HAS_IDS=slot_expert_ids is not None,
+        HAS_ROWS=rows is not None,
         ROUND_PRODUCT=round_product,
         BLOCK_H=block_h,
         num_warps=8 if block_h >= 4096 else 4,

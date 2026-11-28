@@ -12,6 +12,7 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
@@ -19,6 +20,9 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
+)
+from sglang.srt.managers.scheduler_components.input_logprob_chunk_cap import (
+    InputLogprobChunkCap,
 )
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
@@ -1333,6 +1337,236 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(len(adder2.can_run_list), 2)
         self.assertEqual(adder2.rem_chunk_tokens, 0)  # 3 - 3 = 0
         self.assertEqual(result3, AddReqResult.OTHER)
+
+    def test_input_logprob_cap_cuts_only_requests_reading_input_logprobs(self):
+        """SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS bounds the input-logprob rows of one
+        batch; a prefill without input logprobs keeps the batch's chunk budget."""
+        self.mock_token_allocator.available_size.return_value = 100000
+        adder = self.create_adder(
+            self.create_running_batch(), rem_input_tokens=100000, rem_chunk_tokens=4096
+        )
+        with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(1024):
+            cap = InputLogprobChunkCap.for_batch(4096)
+
+        def req(rid, n, logprob):
+            r = self._create_delayer_req(n, rid=rid)
+            r.return_logprob, r.logprob_start_len = logprob, 0
+            r.origin_input_ids = r.full_untruncated_fill_ids
+            return r
+
+        reqs = [
+            req("lp_a", 600, True),
+            req("plain", 2000, False),
+            req("lp_b", 1000, True),  # takes the 424 left of the cap
+            req("lp_c", 10, True),  # no cap left
+        ]
+        results = [
+            cap.add_one_req(adder, r, has_chunked_req=False, truncation_align_size=None)
+            for r in reqs
+        ]
+        self.assertEqual([r.rid for r in adder.can_run_list], ["lp_a", "plain", "lp_b"])
+        self.assertEqual([r.extend_len for r in adder.can_run_list], [600, 2000, 424])
+        self.assertIs(adder.new_chunked_req, reqs[2])
+        self.assertEqual(results[3], AddReqResult.OTHER)
+        self.assertEqual(adder.rem_chunk_tokens, 4096 - 3024)
+        with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(1024):
+            self.assertIsNone(InputLogprobChunkCap.for_batch(1024).room)
+
+    def test_input_logprob_cap_below_the_first_chunk_is_rejected_at_startup(self):
+        """Admission cuts a first chunk down to the truncation alignment, and to
+        whole pages unless it fills chunks exactly; a prefix hit's encoder replay
+        rows take chunk room ahead of its extend. A cap below the replay rows plus
+        that step cuts a longer input-logprob prompt to an empty chunk, so it would
+        wait forever; the startup check rejects exactly those caps."""
+        self.mock_token_allocator.available_size.return_value = 100000
+        self.mock_tree_cache.supports_mamba.return_value = False
+
+        def admit(cap_tokens, align, prefix_len, session_turn):
+            with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(cap_tokens):
+                cap = InputLogprobChunkCap.for_batch(4096)
+            adder = self.create_adder(
+                self.create_running_batch(),
+                page_size=64,
+                rem_input_tokens=100000,
+                rem_chunk_tokens=4096,
+            )
+            req = self._create_delayer_req(
+                prefix_len + 128, rid=f"lp_{cap_tokens}_{align}_{prefix_len}"
+            )
+            req.prefix_len = prefix_len
+            req.return_logprob, req.logprob_start_len = True, prefix_len
+            req.origin_input_ids = req.full_untruncated_fill_ids
+            if session_turn:
+                # A retracted streaming turn, set up for admission as the
+                # scheduler does it, before the cap sees it.
+                req.is_retracted = True
+                req.session = SimpleNamespace(streaming=True)
+                req.is_dllm.return_value = False
+                req.multimodal_inputs = None
+                req.positional_embed_overrides = None
+                Req.init_next_round_input(req)
+            cap.add_one_req(
+                adder, req, has_chunked_req=False, truncation_align_size=align
+            )
+            return [r.extend_len for r in adder.can_run_list]
+
+        def accepted_at_startup(cap_tokens, align):
+            with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(cap_tokens):
+                try:
+                    InputLogprobChunkCap.check_fits_alignment(
+                        chunked_prefill_size=4096,
+                        page_size=64,
+                        truncation_align_size=align,
+                        exact_chunk_fill=schedule_policy.uses_exact_chunk_fill(
+                            self.mock_tree_cache, None
+                        ),
+                        tree_cache=self.mock_tree_cache,
+                    )
+                except ValueError:
+                    return False
+            return True
+
+        # (exact chunk fill, truncation alignment, encoder replay, cache, cap,
+        #  first chunk admitted). With replay, a request is a 256-token prefix hit
+        # under a radix cache; under a disabled one ("off") only a fresh prompt;
+        # with streaming sessions on a disabled cache, a retracted turn that
+        # re-enters its 256-token session prefix: it returns no input logprobs,
+        # so the cap neither limits it nor reserves its replay.
+        cases = (
+            (False, None, False, "radix", 32, []),
+            (False, None, False, "radix", 64, [64]),
+            (True, None, False, "radix", 32, [32]),
+            (True, 64, False, "radix", 32, []),
+            (True, 64, False, "radix", 64, [64]),
+            (False, None, True, "radix", 128, []),
+            (False, None, True, "radix", 192, [64]),
+            (True, None, True, "radix", 128, []),
+            (True, None, True, "radix", 129, [1]),
+            (False, None, True, "off", 32, []),
+            (False, None, True, "off", 64, [64]),
+            (True, None, True, "off", 1, [1]),
+            (False, None, True, "session", 64, [128]),
+        )
+        for exact, align, replay, cache, cap_tokens, admitted in cases:
+            override = get_context().override_server_args(
+                enable_encoder_swa_bounded_replay=replay,
+                enable_streaming_session=cache == "session",
+            )
+            override.install()
+            self.mock_tree_cache.supports_prefix_sharing.return_value = cache == "radix"
+            try:
+                with (
+                    self.subTest(
+                        exact=exact,
+                        align=align,
+                        replay=replay,
+                        cache=cache,
+                        cap=cap_tokens,
+                    ),
+                    patch.object(
+                        schedule_policy, "_use_exact_chunk_fill", return_value=exact
+                    ),
+                ):
+                    prefix_len = 256 if replay and cache != "off" else 0
+                    self.assertEqual(
+                        admit(cap_tokens, align, prefix_len, cache == "session"),
+                        admitted,
+                    )
+                    self.assertEqual(
+                        accepted_at_startup(cap_tokens, align), bool(admitted)
+                    )
+            finally:
+                override.restore()
+
+    def test_input_logprob_cap_cut_is_the_batchs_only_chunked_request(self):
+        """A capped request cut short is the one chunked request the batch tracks:
+        a later request is admitted only whole, against the batch's restored
+        chunk budget, whether or not the cut lands on the cap."""
+        self.mock_token_allocator.available_size.return_value = 100000
+        self.mock_tree_cache.supports_mamba.return_value = False
+
+        def run(align, second_len):
+            with envs.SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS.override(1000):
+                cap = InputLogprobChunkCap.for_batch(4096)
+            adder = self.create_adder(
+                self.create_running_batch(),
+                rem_input_tokens=100000,
+                rem_chunk_tokens=4096,
+            )
+            lp = self._create_delayer_req(3000, rid="lp")
+            lp.return_logprob, lp.logprob_start_len = True, 0
+            lp.origin_input_ids = lp.full_untruncated_fill_ids
+            plain = self._create_delayer_req(second_len, rid="plain")
+            plain.return_logprob = False
+            results = [
+                cap.add_one_req(
+                    adder, r, has_chunked_req=False, truncation_align_size=align
+                )
+                for r in (lp, plain)
+            ]
+            admitted = [(r.rid, r.extend_len) for r in adder.can_run_list]
+            return results, admitted, adder.new_chunked_req, adder.rem_chunk_tokens
+
+        cont, other = AddReqResult.CONTINUE, AddReqResult.OTHER
+        for align, second_len, results, admitted, rem_chunk in (
+            # The cut rounds down to the alignment: 104 cap tokens are left.
+            (128, 5000, [cont, other], [("lp", 896)], 3200),
+            (128, 2000, [cont, cont], [("lp", 896), ("plain", 2000)], 1200),
+            # The cut lands on the cap; the batch keeps its other 3096 tokens.
+            (None, 5000, [cont, other], [("lp", 1000)], 3096),
+            (None, 2000, [cont, cont], [("lp", 1000), ("plain", 2000)], 1096),
+        ):
+            with self.subTest(align=align, second_len=second_len):
+                lp_results, lp_admitted, chunked, rem = run(align, second_len)
+                self.assertEqual(lp_results, results)
+                self.assertEqual(lp_admitted, admitted)
+                self.assertEqual(chunked.rid, "lp")
+                self.assertEqual(rem, rem_chunk)
+
+    def test_ignore_eos_is_not_cut_beside_a_chunked_request(self):
+        """The disabled-cache ignore-EOS path tracks one chunked request too: it
+        neither cuts a request beside the resumed one nor beside one cut in this
+        batch, and still admits a request that fits whole."""
+        self.mock_tree_cache.disable = True
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_token_allocator.available_size.return_value = 100000
+
+        def ignore_eos_req(rid, num_tokens):
+            req = self.create_mock_req(rid, priority=0, max_new_tokens=8)
+            req.sampling_params.ignore_eos = True
+            req.origin_input_ids = list(range(num_tokens))
+            req.full_untruncated_fill_ids = list(range(num_tokens))
+            return req
+
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=1024)
+        long_req = ignore_eos_req("long", 4096)
+        self.assertEqual(
+            adder.add_one_req(
+                long_req, has_chunked_req=True, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [])
+
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=1024)
+        first, second, short = (
+            ignore_eos_req("first", 4096),
+            ignore_eos_req("second", 4096),
+            ignore_eos_req("short", 256),
+        )
+        adder.add_one_req(first, has_chunked_req=False, truncation_align_size=None)
+        self.assertIs(adder.new_chunked_req, first)
+        # As a cap would leave it: the batch's chunk budget is back.
+        adder.rem_chunk_tokens = 1024
+        self.assertEqual(
+            adder.add_one_req(
+                second, has_chunked_req=False, truncation_align_size=None
+            ),
+            AddReqResult.OTHER,
+        )
+        adder.add_one_req(short, has_chunked_req=False, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [first, short])
+        self.assertIs(adder.new_chunked_req, first)
 
     @patch(
         "sglang.srt.managers.schedule_policy.page_interleave_shard_size",

@@ -109,6 +109,22 @@ def _use_exact_chunk_fill() -> bool:
     return is_gfx95_supported()
 
 
+def uses_exact_chunk_fill(
+    tree_cache: BasePrefixCache, dllm_config: Optional[DllmConfig]
+) -> bool:
+    """Whether `PrefillAdder` cuts a chunk at the token budget itself; otherwise
+    it rounds the chunk down to whole pages."""
+    # Mamba checkpoints only land on page-aligned chunk ends.
+    # Exact fill ends a chunk off the page grid; deterministic mode keeps chunk
+    # ends on pages, which some batch-invariant kernels depend on.
+    return (
+        _use_exact_chunk_fill()
+        and dllm_config is None
+        and not (tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing())
+        and not get_exec().deterministic.enable_deterministic_inference
+    )
+
+
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -1117,17 +1133,7 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
-        # Mamba checkpoints only land on page-aligned chunk ends.
-        # Exact fill ends a chunk off the page grid; deterministic mode keeps chunk
-        # ends on pages, which some batch-invariant kernels depend on.
-        self.exact_chunk_fill = (
-            _use_exact_chunk_fill()
-            and dllm_config is None
-            and not (
-                tree_cache.supports_mamba() and tree_cache.supports_prefix_sharing()
-            )
-            and not get_exec().deterministic.enable_deterministic_inference
-        )
+        self.exact_chunk_fill = uses_exact_chunk_fill(tree_cache, dllm_config)
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -1477,6 +1483,13 @@ class PrefillAdder:
             and encoder_swa_replay.resets_swa_window(req)
         ):
             return encoder_swa_replay.replay_len(prefix_len)
+        return 0
+
+    @staticmethod
+    def max_replay_len() -> int:
+        """The most replay rows `_replay_len` adds to a first chunk."""
+        if get_exec().features.enable_encoder_swa_bounded_replay:
+            return encoder_swa_replay.MAX_REPLAY_LEN
         return 0
 
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
@@ -1884,7 +1897,10 @@ class PrefillAdder:
 
     @capacity_decision
     def add_one_req_ignore_eos(
-        self, req: Req, truncation_align_size: Optional[int] = None
+        self,
+        req: Req,
+        truncation_align_size: Optional[int] = None,
+        has_chunked_req: bool = False,
     ):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         if is_cp_sharded_padded():
@@ -2031,7 +2047,7 @@ class PrefillAdder:
                 cached_tokens=req.prefix_len,
             )
         else:
-            if chunk_limit <= 0:
+            if chunk_limit <= 0 or has_chunked_req:
                 return AddReqResult.OTHER
 
             # Chunked prefill
@@ -2107,8 +2123,14 @@ class PrefillAdder:
         if self.chunked_req_waits:
             return AddReqResult.NO_TOKEN
 
+        # A batch tracks one unfinished chunked request: once one is cut in this
+        # batch, a later request is admitted only whole.
+        has_chunked_req = has_chunked_req or self.new_chunked_req is not None
+
         if req.sampling_params.ignore_eos and self.tree_cache.disable:
-            return self.add_one_req_ignore_eos(req, truncation_align_size)
+            return self.add_one_req_ignore_eos(
+                req, truncation_align_size, has_chunked_req=has_chunked_req
+            )
 
         max_new = self._swa_new_tokens(req)
         total_tokens, state_slots = self._prefill_charge(req)

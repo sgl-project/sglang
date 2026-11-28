@@ -211,6 +211,49 @@ class TestApplyWithAddend(CustomTestCase):
             self.assertEqual(kernel_calls, [route])
 
 
+class TestApplyIntoHopperGemv(CustomTestCase):
+    @torch.inference_mode()
+    def test_gemv_takes_only_a_contiguous_bf16_output_of_the_linear_shape(self):
+        """The GEMV writes contiguous BF16 rows and reads an fp32 output as the
+        router's weight layout; other caller-owned outputs keep the checked path."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        layer = SimpleNamespace(
+            weight=torch.randn(128, 64, dtype=torch.bfloat16, device=device) / 8
+        )
+        x = torch.randn(4, 64, dtype=torch.bfloat16, device=device)
+        calls = []
+
+        def gemv(x, weight, out):
+            calls.append(out.dtype)
+            return out.copy_(F.linear(x, weight))
+
+        outputs = {
+            "bf16": torch.empty(4, 128, dtype=torch.bfloat16, device=device),
+            "strided": torch.empty(128, 4, dtype=torch.bfloat16, device=device).t(),
+            "fp32": torch.empty(4, 128, dtype=torch.float32, device=device),
+        }
+        with (
+            _cublas_only_backend(),
+            patch.object(unquant, "_use_hopper_bf16_gemv", lambda *a: True),
+            patch.object(unquant, "_hopper_bf16_gemv", gemv),
+        ):
+            for name, out in outputs.items():
+                with self.subTest(out=name):
+                    calls.clear()
+                    try:
+                        unquant.UnquantizedLinearMethod().apply_into(layer, x, out)
+                    except RuntimeError:  # the stock mm rejects an fp32 out
+                        self.assertEqual(name, "fp32")
+                    self.assertEqual(calls, [torch.bfloat16] if name == "bf16" else [])
+                    if name != "fp32":
+                        torch.testing.assert_close(
+                            out,
+                            F.linear(x, layer.weight),
+                            rtol=_BF16_RTOL,
+                            atol=_BF16_ATOL,
+                        )
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestLowMAutotuneRankSymmetry(CustomTestCase):
     @torch.no_grad()

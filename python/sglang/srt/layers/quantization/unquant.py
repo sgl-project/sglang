@@ -526,6 +526,19 @@ def initialize_bf16_gemm_config() -> None:
 
             _hopper_bf16_tiny_gemv = hopper_bf16_tiny_gemv
             _use_hopper_bf16_tiny_gemv = use_hopper_bf16_tiny_gemv
+    elif (
+        backend_str == "auto"
+        and envs.SGLANG_HOPPER_SMALL_M_GEMV.get()
+        and _is_cuda
+        and torch.cuda.get_device_capability() == (9, 0)
+        and not get_exec().deterministic.enable_deterministic_inference
+    ):
+        from sglang.kernels.ops.gemm.hopper_bf16_small_m_gemv import (
+            gemv as _hopper_bf16_gemv,
+        )
+        from sglang.kernels.ops.gemm.hopper_bf16_small_m_gemv import (
+            use as _use_hopper_bf16_gemv,
+        )
     elif backend.is_cutedsl():
         if get_exec().deterministic.enable_deterministic_inference:
             raise ValueError(
@@ -1157,7 +1170,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (
-            (get_bf16_gemm_backend().is_cutedsl() or get_bf16_gemm_backend().is_gemv())
+            (get_bf16_gemm_backend().is_cutedsl() or _use_hopper_bf16_gemv is not None)
             and x.is_cuda
             and x.dtype == torch.bfloat16
             and layer.weight.dtype == torch.bfloat16
@@ -1217,6 +1230,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and _bf16_low_m_autotune(x, layer.weight, bias, out=output) is not None
         ):
             return output
+        if (
+            bias is None
+            and _use_hopper_bf16_gemv
+            and not get_bf16_gemm_backend().is_gemv()
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            # an fp32 output would select the GEMV's router weight layout
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and _use_hopper_bf16_gemv(*output.shape, x.shape[-1])
+            and x.is_contiguous()
+        ):
+            return _hopper_bf16_gemv(x, layer.weight, output)
         if (
             _enable_bf16_splitk_gemm
             and bias is None

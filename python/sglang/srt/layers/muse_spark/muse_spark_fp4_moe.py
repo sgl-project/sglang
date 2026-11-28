@@ -27,12 +27,25 @@ from sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant import (
     fused_norm_fp4_quant_static,
 )
 from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
+from sglang.kernels.ops.moe.muse_spark_nvfp4_w4a16_moe import (
+    DG_MIN,
+    SP_MIN,
+)
+from sglang.kernels.ops.moe.muse_spark_nvfp4_w4a16_moe import (
+    is_supported as fused_w4a16_supported,
+)
+from sglang.kernels.ops.moe.muse_spark_nvfp4_w4a16_moe import (
+    nvfp4_w4a16_moe_sp,
+    nvfp4_w4a16_moe_with_post_norm,
+    sp_dynamic_guest_ids,
+)
 from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
     fused_post_expert_norm_weighted_sum,
 )
 from sglang.srt.distributed import moe_tensor_model_parallel_all_reduce
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.muse_spark.muse_spark_layers import MuseSpark1xRMSNorm
 from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
     MuseSparkNvFp4FusedMoEMethod,
 )
@@ -156,6 +169,19 @@ class MuseSpark1xFp4Experts(nn.Module):
                 "Marlin preparation asserts on the unpadded shape instead of "
                 "padding."
             )
+        from sglang.srt.layers.muse_spark.fused.glue import hopper_kernels_enabled
+
+        self.use_fused_w4a16 = (
+            self.use_marlin
+            and self.params_dtype == torch.bfloat16
+            and num_local_experts != num_experts
+            and expert_tp_size == 1
+            and fused_w4a16_supported(
+                hidden_size, intermediate_size, num_local_experts, top_k
+            )
+            and hopper_kernels_enabled()
+        )
+        self.dynamic_guest_setup = self.dynamic_guests = None
 
         # post_expert_norm is unknown until set_post_expert_norm; start with the
         # OSS default (standard, eps=1e-8) and rebuild when the real module arrives.
@@ -253,6 +279,7 @@ class MuseSpark1xFp4Experts(nn.Module):
                 eps=eps,
                 weight_first=weight_first,
             )
+        self._post_expert_norm_weight_f32 = self._post_expert_norm_weight.float()
 
     def _pre_norm_weight(self, pre_expert_norm: nn.Module) -> Optional[torch.Tensor]:
         weight = pre_expert_norm._get_effective_weight()
@@ -521,6 +548,38 @@ class MuseSpark1xFp4Experts(nn.Module):
             has_inactive_prefix_count=expert_map is None,
         ).view(num_tokens, topk, size_k), local_topk_ids
 
+    def sp_exchange_ready(self, num_tokens: int) -> bool:
+        return self._fused_w4a16_ready() and num_tokens >= SP_MIN
+
+    def forward_sp_exchange(self, topk_scores, topk_ids, buffers, rows: int) -> None:
+        dg = self.dynamic_guests if topk_ids.shape[0] >= DG_MIN else None
+        local_ids = (
+            self._expert_map[topk_ids]
+            if dg is None
+            else sp_dynamic_guest_ids(topk_ids, buffers.rank, dg.gsrc, buffers.route_ns)
+        )
+        nvfp4_w4a16_moe_sp(
+            local_ids,
+            topk_scores,
+            self.w13_weight,
+            self.w13_weight_scale_2,
+            self.w2_weight,
+            self.w2_weight_scale_2,
+            self._post_expert_norm_weight_f32,
+            shard=buffers.shard[:rows],
+            shard_ptrs=buffers.shard_ptrs,
+            recv_ptrs=buffers.recv_ptrs,
+            dg=dg,
+        )
+
+    def _fused_w4a16_ready(self) -> bool:
+        return (
+            self.use_fused_w4a16
+            and self._post_expert_norm_weight is not None
+            and self._post_expert_norm_weight_first
+            and self._post_expert_norm_eps == 1e-8
+        )
+
     def _forward_marlin(
         self,
         hidden_states: torch.Tensor,
@@ -541,7 +600,18 @@ class MuseSpark1xFp4Experts(nn.Module):
                 "SM100+ with --moe-runner-backend flashinfer_trtllm instead."
             )
         if pre_expert_norm is not None:
-            hidden_states = pre_expert_norm(hidden_states)
+            hidden_states = _pre_expert_rms_norm(pre_expert_norm, hidden_states)
+        if self._fused_w4a16_ready():
+            return nvfp4_w4a16_moe_with_post_norm(
+                hidden_states,
+                self._expert_map[topk_ids],
+                topk_scores,
+                self.w13_weight,
+                self.w13_weight_scale_2,
+                self.w2_weight,
+                self.w2_weight_scale_2,
+                self._post_expert_norm_weight_f32,
+            )
         expert_outputs, local_topk_ids = self._marlin_expert_outputs(
             hidden_states, topk_scores, topk_ids
         )
@@ -865,6 +935,37 @@ def finalize_identity_with_post_expert_norm(
             round_product=True,
         ).to(out_dtype)
     return (normed * weights.unsqueeze(-1)).sum(dim=1).to(out_dtype)
+
+
+_PLAIN_RMS_NORM_FORWARD = MuseSpark1xRMSNorm.forward
+
+
+def _pre_expert_rms_norm(
+    norm: nn.Module, x: torch.Tensor, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    from sglang.kernels.ops.layernorm.norm import (
+        is_supported_rmsnorm_hidden_size,
+        rmsnorm,
+    )
+    from sglang.srt.layers.muse_spark.fused.glue import hopper_kernels_enabled
+
+    weight = norm._get_effective_weight()
+    if (
+        weight is None
+        or x.dim() != 2
+        or x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or x.shape[0] == 0
+        or not is_supported_rmsnorm_hidden_size(x.shape[1])
+        or type(norm).forward is not _PLAIN_RMS_NORM_FORWARD
+        or not hopper_kernels_enabled(x.device)
+    ):
+        return norm(x) if out is None else out.copy_(norm(x))
+    if out is None:
+        out = torch.empty_like(x)
+    rmsnorm(x, weight, out, norm.eps)
+    return out
 
 
 __all__ = [

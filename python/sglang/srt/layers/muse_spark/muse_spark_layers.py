@@ -52,6 +52,19 @@ def calculate_gain_center(
     raise ValueError(f"Unknown gain_center_type: {gain_center_type}")
 
 
+def refill_cached(cached: Optional[torch.Tensor], value: torch.Tensor) -> torch.Tensor:
+    """``value``, written into ``cached`` when it fits: captured CUDA graphs keep
+    reading the first tensor a weight reload rebuilds."""
+    if (
+        cached is None
+        or cached.shape != value.shape
+        or cached.dtype != value.dtype
+        or cached.device != value.device
+    ):
+        return value
+    return cached.copy_(value)
+
+
 class MuseSpark1xRMSNorm(nn.Module):
     def __init__(
         self,
@@ -94,7 +107,11 @@ class MuseSpark1xRMSNorm(nn.Module):
     def precompute_effective_weight(self) -> None:
         if self.weight is not None and self.zero_centered_gamma:
             object.__setattr__(
-                self, "_frozen_weight", (self.weight + self.gain_center).detach()
+                self,
+                "_frozen_weight",
+                refill_cached(
+                    self._frozen_weight, (self.weight + self.gain_center).detach()
+                ),
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -170,10 +187,11 @@ class MuseSpark1xNormPreservingResidualConnection(nn.Module):
             alpha, beta = self._coefficients(
                 self.gate.view(1, -1).float() / self.temperature
             )
-            self._alpha = (
-                alpha if isinstance(alpha, torch.Tensor) else torch.tensor(alpha)
+            self._alpha = refill_cached(
+                self._alpha,
+                alpha if isinstance(alpha, torch.Tensor) else torch.tensor(alpha),
             )
-            self._beta = beta
+            self._beta = refill_cached(self._beta, beta)
 
     def forward(self, stream: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
         if stream.numel() == 0:

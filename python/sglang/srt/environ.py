@@ -2497,9 +2497,26 @@ class Envs:
     # Triton two_dot variant, 1.16-1.38x faster across GLM/DS shapes).
     SGLANG_OPT_Q8KV8_QPREP_VARIANT = EnvStr("auto")
 
+    # Opt-in: DFlash verifies the running requests' draft blocks inside the mixed
+    # extend forward (--enable-mixed-chunk) instead of a separate decode round.
+    SGLANG_ENABLE_DFLASH_MIXED_VERIFY = EnvBool(False)
+    # Opt-in: DFlash draft fast path for TP > 1 (TP-split context projection,
+    # packed top-k gather, the target projecting its own context rows, startup
+    # cuBLAS shape sweep).
+    SGLANG_OPT_DFLASH_DRAFT_FAST_PATH = EnvBool(False)
+
+    # Opt-in SM90 small-M BF16 GEMV (TileLang) for the unquantized linear method,
+    # on the (N, K) shapes in hopper_bf16_small_m_gemv's tables.
+    SGLANG_HOPPER_SMALL_M_GEMV = EnvBool(False)
+
+    # Chunk tokens per prefill batch for requests returning input logprobs (0: no cap).
+    SGLANG_INPUT_LOGPROB_MAX_CHUNK_TOKENS = EnvInt(0)
+
     # ===================================================================
     # Muse Spark
     # ===================================================================
+    # Muse Spark Hopper (SM90) kernels; off: the stock paths.
+    SGLANG_MUSE_SPARK_HOPPER_KERNELS = EnvBool(True)
     # Fuse the unpooler all-gather into the FFN-boundary norm-residual kernel.
     SGLANG_ENABLE_MUSE_SPARK_AG_NORM_FUSION = EnvBool(True)
     # Muse Spark on MI355X (gfx950): AgentX fast paths, all on by default. Each

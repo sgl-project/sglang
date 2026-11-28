@@ -789,3 +789,21 @@ for _op, _module in (
         )
     )
 del _op, _module
+
+# Muse Spark on Hopper: NVRTC verify (8-token chain / tree) and extend / mixed attention with fused
+# QK-norm, RoPE, FP8 KV write and norm gate (sm_90a).
+for _mod, _fn in (
+    ("muse_spark_verify_sm90", "verify_attention"),
+    ("muse_spark_extend_sm90", "extend_attention"),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.muse_spark_{_fn}_sm90",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+            ),
+        )
+    )
+del _mod, _fn

@@ -1,8 +1,10 @@
+import copy
 import logging
 import math
 import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.memory.small_copy import try_small_copy
@@ -27,6 +29,7 @@ from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding import (
     bind_dflash_runtime,
 )
+from sglang.srt.layers.cp.base import is_cp_enabled
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.logits_processor import (
@@ -69,7 +72,7 @@ from sglang.srt.runtime_context import (
     mamba_track_grid,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.sampling_pipeline import VerifyStep
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.sampling.verify_accept import VerifyAccept
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
@@ -85,6 +88,14 @@ from sglang.srt.speculative.dflash_draft_ring import (
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+from sglang.srt.speculative.dflash_tree import (
+    TREE_NODES,
+    TreeKVMove,
+    accept_tree,
+    build_tree,
+    tree_buffers,
+    tree_max_batch,
+)
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
     apply_dflash_simulated_acceptance,
@@ -153,6 +164,8 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     simulated_acc_len_generator,
 )
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     async_h2d,
     is_cuda,
@@ -293,6 +306,46 @@ def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
 
 
+def _plain_greedy(si, *, has_grammar: bool) -> bool:
+    """Greedy with no sampling-time logits adjustment to apply."""
+    return si is None or (
+        si.is_all_greedy
+        and not VerifyRoute.derive(
+            si, has_grammar=has_grammar, has_watermark=si.watermark is not None
+        ).adjusts_logits
+        and si.sampling_mask_batch_indices is None
+    )
+
+
+def _tree_hidden(hidden, perm):
+    """Target hidden states [B * N, H] in committed order."""
+    return hidden.index_select(0, perm.view(-1))
+
+
+class _DraftBlock(msgspec.Struct, frozen=True):
+    tokens: torch.Tensor
+    positions: torch.Tensor
+    positions_2d: torch.Tensor
+    verify_out_cache_loc: torch.Tensor
+    verify_out_cache_loc_2d: torch.Tensor
+    iteration_ids: IterationIds
+    ring_block_locs: Optional[torch.Tensor]
+    tree: bool
+
+
+class _TailRows(msgspec.Struct, frozen=True):
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    req_pool_indices: torch.Tensor
+    sampling_info: None = None
+    can_run_decode_cuda_graph: bool = True
+
+
+class _TailDraftInput(msgspec.Struct, frozen=True):
+    bonus_tokens: torch.Tensor
+    nxt_kv_lens_cpu: None = None
+
+
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
     # Row 0 is the anchor, unless shift_label: then row i drafts token i + 1.
     pred_hidden = pred_hidden[:, :-1] if draft_model.shift_label else pred_hidden[:, 1:]
@@ -354,7 +407,9 @@ class _SelectorDraftSampler:
         device,
         sampling_enabled: bool,
         acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
+        tree=None,
     ):
+        self.tree = tree
         self.draft_model = draft_model
         self.selector = draft_model.candidate_selector
         self.block_size = int(block_size)
@@ -426,6 +481,13 @@ class _SelectorDraftSampler:
                 greedy_mask=self.greedy_mask[:bs],
                 features_out=self.feature_out[:bs],
                 predictions_out=self.confidence_out[:bs],
+            )
+        if self.tree is not None:
+            build_tree(
+                candidate_ids=candidate_ids,
+                scores=scores,
+                anchor=block_ids[:, 0],
+                out=self.tree,
             )
 
 
@@ -796,6 +858,38 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._aux_overlap:
             logger.info("DFLASH aux graph runs on a side stream beside the draft prep")
         self._init_verify_planner()
+        self._tree = self._maybe_tree_buffers()
+        self._kv_move = None
+        if hasattr(target_model, "set_dflash_context_projector") and getattr(
+            self.draft_model, "projects_rows", False
+        ):
+            target_model.set_dflash_context_projector(
+                self.draft_model.project_target_rows
+            )
+            self.draft_model.target_projects_rows = True
+
+    def _maybe_tree_buffers(self):
+        """Static tree arrays, made before the target graphs' capture. Rows: the largest decode
+        graph batch, as the draft graph builds a tree at every captured size."""
+        if not (
+            SIMULATE_ACC_LEN <= 0
+            and is_cuda()  # NVRTC tree kernels; other platforms keep the chain
+            and self.selector is not None
+            and 4 <= self.selector.top_k <= 32
+            and int(self.block_size) == TREE_NODES
+            and self.page_size == 1
+            # planned (ragged) verify lengths, a bound runtime and the draft KV ring
+            # assume chain rows
+            and self._verify_planner is None
+            and self._runtime is None
+            and not get_spec().speculative_dflash_draft_kv_ring
+            and hasattr(self._target_worker.model_runner.model, "supports_tree_verify")
+            and self._target_worker.model_runner.model.supports_tree_verify()
+        ):
+            return None
+        return tree_buffers(
+            self.device, max(get_exec().graph.cuda_graph_config.decode.bs)
+        )
 
     def _init_verify_planner(self) -> None:
         """Confidence-scheduled verify (SGLANG_RAGGED_VERIFY_MODE cap-accept or
@@ -1071,6 +1165,37 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if target_dp_enabled and not _is_npu and self.selector is not None:
                 self._warm_eager_selector()
+            self._warm_cublas_shapes()
+
+    def _warm_cublas_shapes(self) -> None:
+        """A GEMM shape's first cuBLASLt use stalls the host: run each eager GEMM per row count once."""
+        dm = self.draft_model
+        if getattr(dm, "quantizable", True) or not dm.fast_path:
+            return
+        from sglang.srt.models.dflash import _FC_ROW_SPLIT_MIN_TOKENS as rows
+
+        # the TP-split fc below the row split (gemm_ag or column slices) and the KV GEMM
+        w, kv = dm.fc.weight, self._fused_kv_helper
+        for t in range(1, rows):
+            h = dm._tp_split_fc(w.new_zeros(t, w.shape[1]))
+            if kv and h is not None:
+                torch.mm(h, kv.flat_kv_weight.t())
+        # Row-split fc and KV GEMMs up to a chunk, largest first so every output
+        # reuses the first one's allocator block; then the target's own eager GEMMs.
+        n = max(get_schedule().chunked_prefill_size or 0, rows)
+        x = w.new_zeros(-(-n // get_parallel().tp_group.world_size), w.shape[1])
+        # The KV GEMM reads draft hidden rows; a TP-split fc weight holds only its columns.
+        h = w.new_zeros(n, kv.flat_kv_weight.shape[1]) if kv else None
+        for t in range(n, 0, -1):
+            if t <= x.shape[0]:
+                torch.mm(x[:t], w.t())
+            if kv and t >= rows:
+                torch.mm(h[:t], kv.flat_kv_weight.t())
+        warm_target = getattr(
+            self.target_worker.model_runner.model, "warm_eager_gemms", None
+        )
+        if warm_target is not None:
+            warm_target(n)
 
     def _warm_eager_selector(self) -> None:
         # Build selector kernels before serving rather than under the watchdog.
@@ -1267,6 +1392,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 device=self.device,
                 sampling_enabled=self._selector_sampling_enabled,
                 acceptance_estimator=self._acceptance_estimator,
+                tree=self._tree,
             )
         if self.lilicorr is not None:
             if not head_supported:
@@ -2216,6 +2342,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._mla_ctx = MlaContextKV.for_worker(self)
         return self._mla_ctx
 
+    def _project_context(
+        self, target_hidden: torch.Tensor, tree_perm: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """`project_target_hidden`, its rows in committed order when `tree_perm` is given."""
+        # one projection GEMM (no row split): rows do not depend on their order, so reorder the narrow output
+        late = (
+            tree_perm is not None
+            and getattr(self.draft_model, "projects_rows", False)
+            and target_hidden.shape[0] < 512
+        )
+        if tree_perm is not None and not late:
+            target_hidden = _tree_hidden(target_hidden, tree_perm)
+        ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+        return _tree_hidden(ctx_hidden, tree_perm) if late else ctx_hidden
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -2227,10 +2368,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         extend_lens: Optional[torch.Tensor] = None,
         swa_cache_loc: Optional[torch.Tensor] = None,
         projected: bool = False,
+        tree_perm: Optional[torch.Tensor] = None,
     ) -> None:
         """Materialize target context features into the draft KV cache at explicit slots.
 
         `projected=True`: `target_hidden` already went through `project_target_hidden`.
+        `tree_perm`: a tree verify's rows, taken in committed order (`_tree_hidden`).
 
         For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
@@ -2337,11 +2480,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
             draft_tp_context(self.draft_parallel_layout),
         ):
-            ctx_hidden = (
-                target_hidden
-                if projected
-                else self.draft_model.project_target_hidden(target_hidden)
-            )
+            if projected:
+                ctx_hidden = (
+                    target_hidden
+                    if tree_perm is None
+                    else _tree_hidden(target_hidden, tree_perm)
+                )
+            else:
+                ctx_hidden = self._project_context(target_hidden, tree_perm)
             if self.lilicorr is not None:
                 self._lilicorr_anchor = publish_anchor(
                     draft_sampler=self._draft_sampler,
@@ -2462,6 +2608,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: torch.Tensor,
         commit_lens: torch.Tensor,
         swa_cache_loc: Optional[torch.Tensor] = None,
+        tree_perm: Optional[torch.Tensor] = None,
     ) -> None:
         # The aux graphs hold no sliding-window locations: such drafts append eagerly.
         if not self._use_aux_graph or swa_cache_loc is not None:
@@ -2472,14 +2619,21 @@ class DFlashWorkerV2(BaseSpecWorker):
                 cache_loc_2d=cache_loc_2d,
                 commit_lens=commit_lens,
                 swa_cache_loc=swa_cache_loc,
+                tree_perm=tree_perm,
             )
             return
-        # A TP-split fc all-reduces, so project on the main stream in program order;
-        # the aux graph may replay on a side stream beside other collectives.
-        projected = self.draft_model.fc_tp_columns is not None
+        # A TP-split fc all-reduces (or all-gathers, on the draft fast path), so project
+        # on the main stream in program order; the aux graph may replay on a side stream
+        # beside other collectives.
+        projected = self.draft_model.fc_tp_columns is not None or (
+            getattr(self.draft_model, "fast_path", False)
+            and get_parallel().tp_group.world_size > 1
+        )
         if projected:
             with torch.inference_mode(), draft_tp_context(self.draft_parallel_layout):
-                target_hidden = self.draft_model.project_target_hidden(target_hidden)
+                target_hidden = self._project_context(target_hidden, tree_perm)
+        elif tree_perm is not None:
+            target_hidden = _tree_hidden(target_hidden, tree_perm)
 
         key = (tuple(target_hidden.shape), tuple(cache_loc_2d.shape))
         entry = self._aux_graphs.get(key)
@@ -2794,10 +2948,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         bs: int,
         target_predict: Optional[torch.Tensor] = None,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
+        tree_loc: Optional[torch.Tensor] = None,
     ):
         """With cutoff_verify_lens, request i accepts at most
         cutoff_verify_lens[i] - 1 drafts and takes its bonus from the last row
-        it verified; cap_trim_lens counts the accepted drafts the cutoff cut."""
+        it verified; cap_trim_lens counts the accepted drafts the cutoff cut.
+        With tree_loc (a tree verify's slots) the greedy accept walks `self._tree`;
+        accept_len is then None."""
         out_tokens = None
         new_seq_lens = None
         cap_trim_lens = None
@@ -2834,6 +2991,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         else:
             if target_predict is None:
                 target_predict = torch.argmax(next_token_logits, dim=-1)
+            # No rank-0 broadcast: every rank argmaxes the same gathered logits over the same tree.
+            if tree_loc is not None:
+                if self._kv_move is None:
+                    self._kv_move = TreeKVMove(
+                        self.model_runner.token_to_kv_pool, self.device
+                    )
+                out_tokens, commit_lens, bonus = accept_tree(
+                    tree=self._tree,
+                    target_predict=target_predict,
+                    verify_cache_loc=tree_loc,
+                    kv_move=self._kv_move,
+                )
+                return None, commit_lens, bonus, out_tokens, None, None
             target_predict = target_predict.view(bs, int(self.block_size))
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
             if cutoff_verify_lens is not None:
@@ -2973,8 +3143,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
         pp_proxy_tensors=None,
+        bind_tails=None,
     ) -> GenerationBatchResult:
         if not self._hosts_draft:
+            if bind_tails:
+                bind_tails()
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -2985,6 +3158,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 on_publish(batch_output.new_seq_lens)
             return batch_output
         self._validate_phase1_sampling_support(batch)
+        self._bind = bind_tails
         if (
             batch.forward_mode.is_extend()
             or batch.is_extend_in_batch
@@ -2993,6 +3167,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             # A pending aux append may own draft KV rows this forward reuses; only the
             # decode draft prep (no KV writes) runs beside it, up to the draft forward.
             self._join_aux()
+
+        if self._runs_mixed_verify(batch):
+            self._note_non_decode_step()
+            return self._forward_mixed_verify(batch, on_publish=on_publish)
+        if bind_tails:
+            bind_tails()
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             self._note_non_decode_step()
@@ -3170,8 +3350,31 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         bs = len(batch.seq_lens)
-        device = self.device
         self._info_dumper.begin_step()
+        want_tree = (
+            self._tree is not None
+            # logits adjustments (penalties, grammar, watermark) and spec logprobs
+            # assume chain rows (row j = depth j)
+            and _plain_greedy(batch.sampling_info, has_grammar=batch.has_grammar)
+            and not batch.return_logprob
+            and batch.hisparse_coordinator is None
+            and get_global_experts_capturer() is None
+            and get_global_indexer_capturer() is None
+            and bs <= tree_max_batch(self.model_runner)
+        )
+        draft = self._draft_block(batch, draft_input, bs, tree=want_tree)
+        return self._verify_block(
+            batch,
+            draft_input,
+            draft,
+            bs,
+            on_publish=on_publish,
+            grammar_barrier=grammar_barrier,
+        )
+
+    def _draft_block(self, batch, draft_input, bs: int, tree: bool) -> "_DraftBlock":
+        device = self.device
+        is_tree = False
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -3430,6 +3633,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self._acceptance_estimator is not None:
                 self._draft_feature = self._draft_sampler.feature_out[:bs]
                 self._draft_confidence = self._draft_sampler.confidence_out[:bs]
+            if tree:
+                draft_next, is_tree = self._tree.tok[:bs, 1:], True
             if (
                 self.selector is not None
                 and not _is_all_greedy(batch.sampling_info)
@@ -3505,7 +3710,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ).view(bs, int(self.block_size) - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
-        if not (
+        if is_tree:  # the tree rows in place (node 0 is the anchor)
+            draft_tokens = self._tree.tok[:bs]
+        elif not (
             bs == 1
             and self._batched_small_copy
             and try_small_copy(
@@ -3514,6 +3721,40 @@ class DFlashWorkerV2(BaseSpecWorker):
         ):
             draft_tokens[:, 0].copy_(block_ids[:, 0])
             draft_tokens[:, 1:].copy_(draft_next)
+        if self._tree is not None and not is_tree and bs <= self._tree.tok.shape[0]:
+            self._tree.set_chains(bs)
+        return _DraftBlock(
+            tokens=draft_tokens,
+            positions=positions,
+            positions_2d=positions_2d,
+            verify_out_cache_loc=verify_out_cache_loc,
+            verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+            iteration_ids=iteration_ids,
+            ring_block_locs=ring_block_locs,
+            tree=is_tree,
+        )
+
+    def _verify_block(
+        self,
+        batch,
+        draft_input,
+        draft: "_DraftBlock",
+        bs: int,
+        *,
+        on_publish,
+        grammar_barrier,
+    ) -> GenerationBatchResult:
+        draft_tokens, positions, positions_2d = (
+            draft.tokens,
+            draft.positions,
+            draft.positions_2d,
+        )
+        verify_out_cache_loc, verify_out_cache_loc_2d = (
+            draft.verify_out_cache_loc,
+            draft.verify_out_cache_loc_2d,
+        )
+        iteration_ids, ring_block_locs = draft.iteration_ids, draft.ring_block_locs
+        prefix_lens, block_size = batch.seq_lens, int(self.block_size)
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -3532,6 +3773,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             iteration_ids=iteration_ids,
+            tree_anc=self._tree.anc if draft.tree else None,
+            tree_depth=self._tree.depth if draft.tree else None,
         )
 
         batch.out_cache_loc = verify_out_cache_loc
@@ -3643,6 +3886,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
+            tree_loc=verify_out_cache_loc_2d if draft.tree else None,
         )
         verify.commit(
             VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
@@ -3701,7 +3945,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_token_budget=verify_token_budget,
                 prefix_lens=prefix_lens,
                 draft_tokens=draft_tokens,
-                accept_len=accept_len,
+                accept_len=commit_lens - 1 if accept_len is None else accept_len,
                 cap_trim_lens=cap_trim_lens,
                 bonus=bonus,
                 commit_lens=commit_lens,
@@ -3724,6 +3968,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._append_target_hidden_decode(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+            tree_perm=self._tree.perm[:bs] if draft.tree else None,
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             positions=positions,
@@ -3893,4 +4138,211 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
                 rids=[req.rid for req in batch.reqs],
             )
+        )
+
+    def _runs_mixed_verify(self, batch: ScheduleBatch) -> bool:
+        return (
+            envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
+            and batch.forward_mode.is_mixed()
+            and bool(batch.decoding_reqs)
+            and _plain_greedy(batch.sampling_info, has_grammar=batch.has_grammar)
+            and not (
+                batch.has_grammar or batch.return_logprob or batch.return_hidden_states
+            )
+            # per-request captures assume one row layout per forward
+            and get_global_experts_capturer() is None
+            and get_global_indexer_capturer() is None
+            and batch.seq_lens_cpu is not None
+            and self._target_logits_processor is not None
+            and batch.hisparse_coordinator is None
+            and not (
+                self._is_domino
+                or self.lilicorr is not None
+                or self._need_mamba_verify_commit
+                # planned verify lengths, a bound runtime and the draft KV ring
+                # take the decode round only
+                or self._verify_planner is not None
+                or self._runtime is not None
+                or self.draft_kv_ring is not None
+            )
+            and not get_parallel().attn_dp_enabled
+            and get_parallel().pp_group.world_size == 1
+            # a context-parallel forward splits the rows across ranks and runs the
+            # stock attention, which has no tree mask for the verify rows
+            and not is_cp_enabled()
+            # a full prefill graph replays the extend body with no eager break for the verify rows
+            and not getattr(
+                self.model_runner.prefill_cuda_graph_runner, "_is_full_backend", False
+            )
+        )
+
+    def _forward_mixed_verify(
+        self, batch: ScheduleBatch, on_publish=None
+    ) -> GenerationBatchResult:
+        """One target forward: prefill rows extend as scheduled, running rows (the tail) verify blocks."""
+        self._wait_for_fused_hicache_load(batch)
+        self.target_worker.set_hicache_consumer(batch.hicache_consumer_index)
+        block_size, device = int(self.block_size), self.device
+        n_dec = len(batch.decoding_reqs)
+        n_ext = len(batch.reqs) - n_dec
+        ext_lens = list(batch.extend_lens[:n_ext])
+        n_ext_tok = sum(ext_lens)
+        # running rows: a one-token extend of the bonus token
+        committed = batch.seq_lens[n_ext:] - 1
+        # FA3 / FA4 take host lengths only as bounds; other draft backends need them exact
+        if self._bind and getattr(
+            self.draft_model_runner.attn_backend, "fa_impl_ver", 0
+        ) not in (3, 4):
+            self._bind()
+            self._bind = None
+        # unbound host tails lag by <= 1 block: draft on this bound
+        committed_cpu = (
+            batch.seq_lens_cpu[n_ext:] - 1 + (block_size if self._bind else 0)
+        )
+        tail_input = _TailDraftInput(bonus_tokens=batch.input_ids[n_ext_tok:])
+        draft = self._draft_block(
+            _TailRows(
+                seq_lens=committed,
+                seq_lens_cpu=committed_cpu,
+                req_pool_indices=batch.req_pool_indices[n_ext:],
+            ),
+            tail_input,
+            n_dec,
+            tree=self._tree is not None and n_dec <= tree_max_batch(self.model_runner),
+        )
+        if self._bind:
+            self._bind()
+            committed_cpu = batch.seq_lens_cpu[n_ext:] - 1
+
+        step = copy.copy(batch)
+        step.input_ids = torch.cat(
+            [
+                batch.input_ids[:n_ext_tok],
+                draft.tokens.reshape(-1).to(batch.input_ids.dtype),
+            ]
+        )
+        step.out_cache_loc = torch.cat(
+            [
+                batch.out_cache_loc[:n_ext_tok],
+                draft.verify_out_cache_loc.to(batch.out_cache_loc.dtype),
+            ]
+        )
+        step.seq_lens = torch.cat(
+            [batch.seq_lens[:n_ext], (committed + block_size).to(batch.seq_lens.dtype)]
+        )
+        step.seq_lens_cpu = torch.cat(
+            [batch.seq_lens_cpu[:n_ext], committed_cpu + block_size]
+        )
+        step.seq_lens_sum = int(step.seq_lens_cpu.sum())
+        step.extend_lens = ext_lens + [block_size] * n_dec
+        step.prefix_lens = list(batch.prefix_lens[:n_ext]) + committed_cpu.tolist()
+        step.extend_num_tokens = n_ext_tok + block_size * n_dec
+        forward_batch = ForwardBatch.init_new(
+            step,
+            self.model_runner,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            return_hidden_states_before_norm=False,
+        )
+        forward_batch.mixed_verify_rows = n_dec
+        if draft.tree:
+            forward_batch.mixed_verify_tree = (self._tree.anc, self._tree.depth)
+        forward_batch.extend_logits_row_index = torch.cat(
+            [
+                torch.tensor(ext_lens, dtype=torch.int64).cumsum(0) - 1,
+                torch.arange(
+                    n_ext_tok, n_ext_tok + n_dec * block_size, dtype=torch.int64
+                ),
+            ]
+        ).to(device, non_blocking=True)
+        target_out = self.target_worker.forward_batch_generation(
+            batch=None, forward_batch=forward_batch, is_verify=True
+        )
+        logits_output = target_out.logits_output
+        logits = logits_output.next_token_logits
+        target_lp = self._target_logits_processor
+        predict = (
+            target_lp.deferred_argmax(logits)
+            if target_lp.is_deferred_shard(logits)
+            else torch.argmax(logits, dim=-1)
+        )
+        logits_output.next_token_logits = None
+        ext_next = predict[:n_ext]
+        self._tp_sync.sync(SpecTpSyncSite.DFLASH_TARGET, ext_next)
+        _, commit_lens, bonus, out_tokens, tail_seq_lens, _ = self._accept_block(
+            candidates=draft.tokens,
+            next_token_logits=None,
+            sampling_info=None,
+            draft_input=tail_input,
+            prefix_lens=committed,
+            bs=n_dec,
+            target_predict=predict[n_ext:],
+            tree_loc=draft.verify_out_cache_loc_2d if draft.tree else None,
+        )
+        if tail_seq_lens is None:
+            tail_seq_lens = committed + commit_lens.to(committed.dtype)
+        new_seq_lens = torch.cat(
+            [batch.seq_lens[:n_ext], tail_seq_lens.to(batch.seq_lens.dtype)]
+        )
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+
+        hidden = logits_output.hidden_states
+        if n_ext_tok:
+            ctx_lens = async_h2d(ext_lens, dtype=torch.int32, device=device)
+            positions, _ = compute_position(
+                self.model_runner.prefill_attention_backend_str,
+                async_h2d(batch.prefix_lens[:n_ext], dtype=torch.int32, device=device),
+                ctx_lens,
+                n_ext_tok,
+            )
+            ext_swa_loc = self._draft_write_ids(
+                forward_batch.iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            )
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden[:n_ext_tok],
+                cache_loc=self._draft_write_ids(forward_batch.iteration_ids)[
+                    :n_ext_tok
+                ],
+                swa_cache_loc=(
+                    None if ext_swa_loc is None else ext_swa_loc[:n_ext_tok]
+                ),
+                positions=positions,
+                extend_lens=ctx_lens,
+            )
+        tail_loc = self._draft_write_ids(draft.iteration_ids)
+        tail_hidden = hidden[n_ext_tok : n_ext_tok + n_dec * block_size]
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=tail_hidden,
+            tree_perm=self._tree.perm[:n_dec] if draft.tree else None,
+            cache_loc=tail_loc,
+            cache_loc_2d=tail_loc.view(n_dec, block_size),
+            swa_cache_loc=self._draft_write_ids(
+                draft.iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            ),
+            positions=draft.positions,
+            commit_lens=commit_lens,
+        )
+        logits_output.hidden_states = None
+
+        tokens = torch.zeros(
+            (n_ext + n_dec, block_size), dtype=out_tokens.dtype, device=device
+        )
+        tokens[:n_ext, 0] = ext_next
+        tokens[n_ext:] = out_tokens.view(n_dec, block_size)
+        accept_lens = torch.cat(
+            [torch.ones(n_ext, dtype=commit_lens.dtype, device=device), commit_lens]
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=tokens,
+            accept_lens=accept_lens,
+            mixed_verify=True,
+            can_run_cuda_graph=target_out.can_run_cuda_graph,
+            next_draft_input=self._make_next_draft_input_decode(
+                bonus_tokens=torch.cat([ext_next, bonus.view(-1).to(ext_next.dtype)]),
+                new_seq_lens=new_seq_lens,
+            ),
+            speculative_num_draft_tokens=block_size,
+            new_seq_lens=new_seq_lens,
+            kv_weight_version_record=target_out.kv_weight_version_record,
         )

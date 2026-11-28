@@ -69,7 +69,8 @@ def all_gather_norm_residual_supported(
         or num_tokens * hidden_size * 2 > comm.request.push_slot_bytes
     ):
         return False
-    if not current_arch().is_sm_at_least(10):
+    # SM90 runs the one-CTA row kernel (no clusters), SM100+ the cluster kernel too.
+    if not current_arch().is_sm_at_least(9):
         return False
     try:
         norm_residual_launch_config(hidden_size=hidden_size, num_tokens=num_tokens)

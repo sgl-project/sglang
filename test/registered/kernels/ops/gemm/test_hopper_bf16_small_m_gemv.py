@@ -1,0 +1,93 @@
+"""SM90 small-M BF16 GEMV (TileLang): one decode shape at M = 1 and both sides of its first
+config boundary, against an fp64 reference and cuBLAS."""
+
+import sys
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
+if SM90:
+    from sglang.kernels.ops.gemm import hopper_bf16_small_m_gemv as g
+
+pytestmark = pytest.mark.skipif(not SM90, reason="SM90")
+U, PAD, NAN = 2.0**-24, 64, float("nan")
+# bf16 out (the unquant decode GEMMs): the table's first shape
+CASES = [(*next(iter(g._GWC)), "GWC")] if SM90 else []
+
+
+def _bits(t):
+    return t.view(torch.int16 if t.dtype == torch.bfloat16 else torch.int32)
+
+
+def _fold(y):  # router columns: per 16, 8 experts' hi then their lo; logit = hi + lo
+    return y.view(y.shape[0], -1, 2, 8).sum(2).flatten(1)
+
+
+def _setup(n, k, mode, seed):
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    tab = getattr(g, "_" + mode)
+    x = torch.randn(tab[(n, k)][-1][0], k, generator=gen, device="cuda").bfloat16()
+    w = (torch.randn(n, k, generator=gen, device="cuda") * 0.05).bfloat16()
+    f32 = mode != "GWC"  # fp32 out takes the weight as [K, N]
+    return tab, f32, x, w, w.t().contiguous() if f32 else w
+
+
+def _test_ms(rows):
+    """M = 1 and both sides of the first row boundary, which switches the kernel config."""
+    return [1, rows[0][0], rows[0][0] + 1]
+
+
+def _err(y, ref):  # bf16: outputs not correctly rounded; fp32: squared error
+    if y.dtype == torch.bfloat16:
+        return (y != ref.bfloat16()).sum().item()
+    return (y.double() - ref).square().sum().item()
+
+
+def test_use_admits_only_table_shapes():
+    for tab in (g._GWC, g._GWR, g._GWS):
+        for (n, k), rows in tab.items():
+            hi = rows[-1][0]
+            assert g.use(1, n, k, tab) and g.use(hi, n, k, tab)
+            assert not g.use(0, n, k, tab) and not g.use(hi + 1, n, k, tab)
+            # non-multiple N / K are not in the tables: the caller keeps cuBLAS
+            assert not g.use(1, n + 8, k, tab) and not g.use(1, n, k + 8, tab)
+
+
+@pytest.mark.parametrize("n,k,mode", CASES)
+def test_table_ms(n, k, mode):
+    tab, f32, x, w, arg = _setup(n, k, mode, seed=n + k)
+    ms, dt = _test_ms(tab[(n, k)]), torch.float32 if f32 else torch.bfloat16
+    xd, wd = x.double(), w.double()
+    ref, s = xd @ wd.t(), xd.abs() @ wd.abs().t()
+    if f32:
+        ref, s = _fold(ref), _fold(s)
+    ours = stock = 0.0
+    for m in ms:
+        xb = torch.full((m + PAD, k), NAN, dtype=torch.bfloat16, device="cuda")
+        yb = torch.full((m + PAD, ref.shape[1]), NAN, dtype=dt, device="cuda")
+        xb[:m] = x[:m]
+        y = g.gemv(xb[:m], arg, yb[:m], tab)
+        assert y.data_ptr() == yb.data_ptr() and yb[m:].isnan().all(), m
+        # bitwise repeatable, and rows past M of x are never read
+        again = g.gemv(x[:m].clone(), arg, torch.empty_like(y), tab)
+        assert torch.equal(_bits(y), _bits(again)), m
+        # any-order fp32 dots: gamma_K * sum|x w| (2x covers the hi + lo add and
+        # non-RN accumulators); bf16 out adds one rounding (2^-9 |y|)
+        tol = 2 * k * U * s[:m] + (0 if f32 else 2**-8 * ref[:m].abs())
+        assert ((y.double() - ref[:m]).abs() <= tol).all(), m
+        c = _fold(torch.mm(x[:m], arg, out_dtype=dt)) if f32 else F.linear(x[:m], w)
+        ours, stock = ours + _err(y, ref[:m]), stock + _err(c, ref[:m])
+    # as accurate as cuBLAS (the stock path) against the fp64 reference, up to the
+    # summation order (it decides some roundings on long K: 1.27x at K = 40960)
+    slack = 0 if f32 else 2e-5 * n * sum(ms)
+    assert ours <= 1.5 * stock + slack, (ours, stock)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

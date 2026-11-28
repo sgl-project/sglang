@@ -435,6 +435,9 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
+            mixed_verify_lens = (
+                result.accept_lens.tolist() if result.mixed_verify else None
+            )
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
             self.materialize_sampling_mask_output(batch.reqs, logits_output)
             materialize_typed_customized_info(logits_output)
@@ -503,6 +506,7 @@ class SchedulerBatchResultProcessor:
                     if (x := self.kv_weight_version_tracker) is not None:
                         x.fill_req_prefill_weight_versions(req)
 
+                    committed = None
                     if discard_finish_reason is not None:
                         req.request_finish(discard_finish_reason)
                         req.update_finish_state(0)
@@ -519,12 +523,24 @@ class SchedulerBatchResultProcessor:
                         # The overlap pages' text is already the first outputs.
                         req.update_finish_state()
                     else:
+                        if mixed_verify_lens is None:
+                            committed = [next_token_id]
+                        elif batch.decoding_reqs and req in batch.decoding_reqs:
+                            # A verify step run inside the extend forward
+                            committed = next_token_id[: mixed_verify_lens[i]]
+                            req.spec_verify_ct += 1
+                            req.spec_num_correct_drafts += len(committed) - 1
+                            req.update_spec_correct_drafts_histogram(len(committed) - 1)
+                        else:
+                            committed = next_token_id[:1]
                         # req output_ids are set here
-                        req.output_ids.append(next_token_id)
+                        req.output_ids.extend(committed)
 
-                        self._maybe_update_reasoning_tokens(req, next_token_id)
+                        self._maybe_update_reasoning_tokens(
+                            req, committed if len(committed) > 1 else committed[0]
+                        )
 
-                        req.update_finish_state()
+                        req.update_finish_state(len(committed))
                     # A mixed spec tail committed its pending bonus token; advance
                     # so the next spec prepare_for_decode reserves from the right base.
                     if (
@@ -532,8 +548,9 @@ class SchedulerBatchResultProcessor:
                         and batch.decoding_reqs
                         and req in batch.decoding_reqs
                         and not batch.spec_algorithm.is_none()
+                        and committed is not None
                     ):
-                        req.kv.commit_decode(1)
+                        req.kv.commit_decode(len(committed))
                     if req.finished():
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)

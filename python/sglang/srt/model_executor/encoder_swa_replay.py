@@ -36,10 +36,14 @@ def resets_swa_window(req) -> bool:
     return req.kv.req_pool_idx is None or req.is_retracted
 
 
+# The last SWA window: the most cached tokens a hit replays.
+MAX_REPLAY_LEN = 128
+
+
 def replay_len(prefix_len: int) -> int:
     """Cached tokens replayed in front of a hit's extend: the last SWA window.
     The prefill budget, the MLP-sync row count and the fold all read this."""
-    return min(prefix_len, 128)
+    return min(prefix_len, MAX_REPLAY_LEN)
 
 
 def folded_replay_rows(batch) -> int:

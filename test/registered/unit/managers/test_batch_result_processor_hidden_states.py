@@ -255,7 +255,7 @@ class _PrefillReq(FakeReq):
     def finished(self):
         return False
 
-    def update_finish_state(self):
+    def update_finish_state(self, new_accepted_len=1):
         return None
 
 
@@ -333,6 +333,7 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                     grammar_advanced=False,
                     can_run_cuda_graph=False,
                     skipped_output_comm=False,
+                    mixed_verify=False,
                 )
                 processor = _make_processor(self, server_mode)
 
@@ -403,6 +404,7 @@ class TestRowsStillInBatch(CustomTestCase):
                     grammar_advanced=False,
                     can_run_cuda_graph=False,
                     skipped_output_comm=False,
+                    mixed_verify=False,
                 )
                 processor = replace(
                     _make_processor(self, server_mode),
@@ -507,6 +509,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
             grammar_advanced=False,
             can_run_cuda_graph=False,
             skipped_output_comm=True,
+            mixed_verify=False,
         )
         processor = _make_processor(self)
 
@@ -565,6 +568,7 @@ class TestMixedBatchKvRelease(CustomTestCase):
             grammar_advanced=False,
             can_run_cuda_graph=False,
             skipped_output_comm=False,
+            mixed_verify=False,
         )
         processor = _make_processor(self)
 

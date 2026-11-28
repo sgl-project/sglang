@@ -448,6 +448,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         _selector_sampling_enabled=True,
         _acceptance_estimator=None,
         _runtime=None,
+        _tree=None,
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
         ),
@@ -578,6 +579,100 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
     assert cap_trim_lens is None
     assert observed["target_predict"].tolist() == [[1, 0]]
     assert sync_sites == [worker_mod.SpecTpSyncSite.DFLASH_ACCEPT_GREEDY]
+
+
+def test_mixed_verify_result_carries_the_kv_weight_version_record(monkeypatch):
+    """With --enable-prefill-weight-versions, a prompt finishing in a mixed DFlash
+    step needs the target forward's KV weight-version record in the result."""
+    from sglang.srt.speculative import dflash_worker_v2 as w
+
+    worker, record, rows = object.__new__(w.DFlashWorkerV2), object(), torch.arange(2)
+    req = object()
+    batch = SimpleNamespace(
+        decoding_reqs=[req],
+        reqs=[req],
+        extend_lens=[],
+        prefix_lens=[],
+        seq_lens=torch.tensor([5]),
+        seq_lens_cpu=torch.tensor([5]),
+        req_pool_indices=torch.tensor([0]),
+        input_ids=torch.tensor([7]),
+        out_cache_loc=torch.tensor([3]),
+        hicache_consumer_index=0,
+    )
+    target_out = SimpleNamespace(
+        logits_output=SimpleNamespace(
+            next_token_logits=torch.zeros(2, 4), hidden_states=torch.zeros(2, 3)
+        ),
+        can_run_cuda_graph=False,
+        kv_weight_version_record=record,
+    )
+    worker.__dict__.update(
+        block_size=2,
+        device="cpu",
+        model_runner=None,
+        _bind=None,
+        _tree=None,
+        _wait_for_fused_hicache_load=lambda b: None,
+        _target_worker=SimpleNamespace(
+            set_hicache_consumer=lambda i: None,
+            forward_batch_generation=lambda **k: target_out,
+        ),
+        _draft_block=lambda *a, **k: SimpleNamespace(
+            tokens=torch.zeros(1, 2, dtype=torch.long),
+            verify_out_cache_loc=rows,
+            tree=False,
+            iteration_ids=None,
+            positions=None,
+        ),
+        _target_logits_processor=SimpleNamespace(is_deferred_shard=lambda l: False),
+        _tp_sync=SimpleNamespace(sync=lambda *a: None),
+        _accept_block=lambda **k: (
+            None,
+            torch.tensor([1]),
+            torch.tensor([5]),
+            torch.zeros(1, 2, dtype=torch.long),
+            None,
+            None,
+        ),
+        _draft_write_ids=lambda *a: rows,
+        _append_target_hidden_to_draft_kv_by_loc=lambda **k: None,
+        _make_next_draft_input_decode=lambda **k: None,
+    )
+    monkeypatch.setattr(
+        w.ForwardBatch, "init_new", lambda *a, **k: SimpleNamespace(iteration_ids=None)
+    )
+    result = worker._forward_mixed_verify(batch)
+    assert result.mixed_verify
+    assert result.kv_weight_version_record is record
+
+
+def test_deferred_mixed_tails_wait_for_the_d2h_copy_once():
+    """A mixed DFlash step binds its decode tails inside the forward, whose isolation
+    then restores the batch; the scheduler's batch must still end with the fresh
+    lengths, behind one wait on the D2H stream per step."""
+    from sglang.srt.managers.overlap_utils import FutureMap
+
+    waits = []
+    fm = object.__new__(FutureMap)
+    fm.fwd_prepare_d2h_stream = SimpleNamespace(synchronize=lambda: waits.append(1))
+    fm.new_seq_lens_cpu_pinned = torch.tensor([0, 9, 0, 6])
+    fm.deferred_tails = torch.tensor([3, 1])
+    batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([4, 5, 2, 2]),
+        seq_lens_sum=13,
+        prefix_lens=[0, 1, 1, 1],
+    )
+    scheduled = dict(vars(batch))
+    fm.bind_tails(batch)  # the worker's callback
+    bound = dict(vars(batch))
+    vars(batch).update(scheduled)  # the forward isolation restores the batch
+    fm.finish_deferred_tails(batch)
+    assert waits == [1] and fm.deferred_tails is None
+    assert batch.prefix_lens == bound["prefix_lens"] == [0, 1, 6, 9]
+    assert batch.seq_lens_cpu.tolist() == [4, 5, 7, 10] and batch.seq_lens_sum == 26
+    fm.finish_deferred_tails(batch)  # nothing deferred: no wait
+    assert waits == [1]
 
 
 @pytest.mark.parametrize("branch", ["selector", "sampled", "cutoff", "triton_failed"])

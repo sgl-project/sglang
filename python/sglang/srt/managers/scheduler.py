@@ -257,6 +257,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
+    uses_exact_chunk_fill,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -279,6 +280,9 @@ from sglang.srt.managers.scheduler_components.gc_freezer import GCFreezer
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
+)
+from sglang.srt.managers.scheduler_components.input_logprob_chunk_cap import (
+    InputLogprobChunkCap,
 )
 from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
@@ -775,6 +779,16 @@ class Scheduler(
         self.init_dsa_kpool_truncation_align()
         self.init_mamba_truncation_align()
         self.check_truncation_align_fits_chunk()
+        if self.disaggregation_mode != DisaggregationMode.DECODE:
+            InputLogprobChunkCap.check_fits_alignment(
+                chunked_prefill_size=self.chunked_prefill_size,
+                page_size=self.page_size,
+                truncation_align_size=self.truncation_align_size,
+                exact_chunk_fill=uses_exact_chunk_fill(
+                    self.tree_cache, self.dllm_config
+                ),
+                tree_cache=self.tree_cache,
+            )
 
         self.init_weight_updater()
 
@@ -4775,8 +4789,20 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        logprob_cap = InputLogprobChunkCap.for_batch(chunked_prefill_size)
         max_prefill_tokens = self.max_prefill_tokens
-        num_mixed_decode_tokens = running_bs if self.is_mixed_chunk else 0
+        # a mixed DFlash batch carries each running request's verify block
+        num_mixed_decode_tokens = (
+            running_bs
+            * (
+                int(get_spec().speculative_num_draft_tokens or 1)
+                if envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
+                and self.spec_algorithm.is_dflash()
+                else 1
+            )
+            if self.is_mixed_chunk
+            else 0
+        )
         token_budget = self.policy.prefill_token_budget(
             page_size=self.page_size, align=self.truncation_align_size
         )
@@ -4826,7 +4852,7 @@ class Scheduler(
                 self.page_size,
                 processed_tokens=self.processed_tokens_counter,
             )
-            if adder.add_chunked_req(resumed_req) is None:
+            if logprob_cap.add_chunked_req(adder, resumed_req) is None:
                 # Its last chunk is in this batch.
                 move([resumed_req], self.prefill_launched_reqs)
 
@@ -4982,7 +5008,8 @@ class Scheduler(
                     if bounded_active:
                         self.policy.mark_admission_skipped(req)
                     continue
-            res = adder.add_one_req(
+            res = logprob_cap.add_one_req(
+                adder,
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
@@ -5600,6 +5627,10 @@ class Scheduler(
                                 fwd_kwargs["grammar_barrier"] = (
                                     self._advance_pending_grammar
                                 )
+                            if self.future_map.deferred_tails is not None:
+                                fwd_kwargs["bind_tails"] = partial(
+                                    self.future_map.bind_tails, batch
+                                )
 
                         if input_ids_from_graph:
                             fwd_kwargs["input_ids_from_graph"] = True
@@ -5644,6 +5675,7 @@ class Scheduler(
                                 self._copy_result_to_cpu(batch_result, batch)
                         else:
                             batch_result.future_indices = future_indices
+                    self.future_map.finish_deferred_tails(batch)
 
                 # Next-iter input_ids relayed via future_map.
                 batch.input_ids = None

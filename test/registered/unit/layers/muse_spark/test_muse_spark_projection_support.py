@@ -52,7 +52,7 @@ class TestMuseSparkProjectionSupport(CustomTestCase):
             self.assertFalse(self.supported(9))
             self.assertTrue(self.supported(8))
         self.comm.world_size = 8
-        for capability in ((9, 0), (10, 1), (12, 0)):
+        for capability in ((10, 1), (12, 0)):  # SM90 has its own Hopper path
             self.assertFalse(self.supported(9, capability=capability))
 
     def test_dtype_shape_and_layout_fallbacks(self):

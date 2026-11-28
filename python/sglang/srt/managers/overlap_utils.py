@@ -312,6 +312,9 @@ class FutureMap:
     """
 
     _relay = None
+    deferred_tails = None
+    # the deferred tails' host lengths, read once per step behind one D2H wait
+    _tails_cpu = None
 
     def __init__(
         self,
@@ -673,8 +676,23 @@ class FutureMap:
                 self.new_seq_lens_cpu_pinned.copy_(
                     self.new_seq_lens_buf, non_blocking=True
                 )
+            if (
+                self.spec_algo.is_dflash()
+                and envs.SGLANG_ENABLE_DFLASH_MIXED_VERIFY.get()
+            ):
+                self.deferred_tails = batch.mix_running_indices_cpu
+                return
             self.fwd_prepare_d2h_stream.synchronize()
             fresh_cpu = self.new_seq_lens_cpu_pinned[batch.mix_running_indices_cpu]
+        self.bind_tails(batch, fresh_cpu)
+
+    def bind_tails(self, batch: ScheduleBatch, fresh_cpu=None) -> None:
+        if fresh_cpu is None:
+            if self._tails_cpu is None:
+                self.fwd_prepare_d2h_stream.synchronize()
+                self._tails_cpu = self.new_seq_lens_cpu_pinned[self.deferred_tails]
+            fresh_cpu = self._tails_cpu
+        n = len(fresh_cpu)
         if batch.seq_lens_cpu is not None:
             seq_lens_cpu = batch.seq_lens_cpu.clone()
             seq_lens_cpu[-n:] = fresh_cpu + 1
@@ -683,6 +701,14 @@ class FutureMap:
         batch.prefix_lens = batch.prefix_lens[:-n] + [
             int(x) for x in fresh_cpu.tolist()
         ]
+
+    def finish_deferred_tails(self, batch: ScheduleBatch) -> None:
+        """Bind the deferred tails into the scheduler's batch after the forward: the
+        forward isolation restored the fields a bind inside the forward set."""
+        if self.deferred_tails is None:
+            return
+        self.bind_tails(batch)
+        self.deferred_tails = self._tails_cpu = None
 
     def resolve_seq_lens_cpu(
         self, batch: ScheduleBatch, stream_ordered: bool = False
