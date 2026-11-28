@@ -105,6 +105,7 @@ class _FakeReq:
         self.output_ids = []
         self.extra_key = None
         self.cache_salt = None
+        self._user_cache_salt = None
         self.last_node = None
         self.swa_branching_seqlen = None
         self.lock = None
