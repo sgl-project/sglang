@@ -7,10 +7,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
 import numpy as np
 import torch
 
-from sglang.kernels.ops.memory.common import (
-    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
-)
-from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
@@ -173,6 +169,21 @@ def storage_prefetch_end(
     """
     token_ids = req.full_untruncated_fill_ids
     return len(_req_radix_key(tree_cache, req, token_ids, max_prefix_len))
+
+
+def prefill_load_tokens(
+    seqlen: int, matched: int, storage_span: Optional[tuple[int, int]]
+) -> int:
+    """Prefill tokens a waiting request adds to the load: its sequence less the
+    matched prefix and the storage hit its prefetch has confirmed, in flight or
+    staged. Ranking counts a storage hit only once it is staged; the load counts
+    it from confirmation, and a revoked or failed prefetch drops its span, so
+    the next reading charges the full work."""
+    uncached = max(0, seqlen - matched)
+    if storage_span is not None:
+        start, end = storage_span
+        uncached -= max(0, min(end, seqlen) - max(start, matched))
+    return uncached
 
 
 def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:

@@ -131,7 +131,7 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = default_port())]
     pub port: u16,
 
-    /// Port for the native gRPC server (`sglang.runtime.v1.SglangService`, which
+    /// Port for the native gRPC server (`sglang.api.v1.SglangService`, which
     /// engines serve with `--grpc-port`); requests reach engines over their gRPC port.
     #[arg(long)]
     pub grpc_port: Option<u16>,
@@ -151,6 +151,10 @@ pub struct ServerArgs {
     /// `/model_info`). Set it to the engines' `--api-key`.
     #[arg(long)]
     pub worker_api_key: Option<String>,
+
+    /// API key required by Worker management mutation endpoints.
+    #[arg(long)]
+    pub worker_management_api_key: Option<String>,
 
     /// Upstream timeout in seconds: the whole response of a non-streaming request,
     /// the response headers of a streaming one. SGLang's chat endpoint sends those
@@ -177,6 +181,13 @@ pub struct ServerArgs {
     /// PD: return decode's stream only once prefill completes.
     #[arg(long)]
     pub pd_stream_after_prefill: bool,
+
+    /// PD: answer a chat, completions or generate request for at most one
+    /// token (one sample, one prompt) on the prefill engine alone, with no
+    /// decode and no KV transfer. A prefill whose /server_info does not report
+    /// `prefill_answers_alone` keeps the normal prefill and decode path.
+    #[arg(long)]
+    pub pd_one_token_on_prefill_only: bool,
 
     /// PD: at most N requests per prefill DP rank go to decode before their
     /// first token; the rest wait and get their decode DP rank when sent.
@@ -265,11 +276,17 @@ pub struct RoutingArgs {
     #[arg(long)]
     pub dp_aware: bool,
 
-    /// How --dp-aware picks a rank that no routing key or cached prefix decides,
-    /// which in PD mode is every decode rank. Defaults to least_in_flight;
-    /// least_tokens needs the engine's --load-publish-endpoint feed.
+    /// How --dp-aware picks a rank that no routing key or cached prefix decides.
+    /// Defaults to least_in_flight; least_tokens needs the engine's
+    /// --load-publish-endpoint feed. In PD mode this is the prefill rank; the
+    /// decode rank follows --decode-dp-rank-policy.
     #[arg(long, value_enum, requires = "dp_aware")]
     pub dp_rank_policy: Option<DpRankPolicy>,
+
+    /// How --dp-aware picks the PD decode rank, which no routing key or cached
+    /// prefix ever decides. Defaults to --dp-rank-policy.
+    #[arg(long, value_enum, requires = "dp_aware")]
+    pub decode_dp_rank_policy: Option<DpRankPolicy>,
 
     /// Static bucket configuration JSON; the reorg schema with --chat-routing reorg.
     /// Omit to use the global candidate domain (default buckets with reorg).
@@ -346,6 +363,27 @@ pub struct CacheArgs {
     /// 0 (default) leaves it unbounded. Requires --cache-pending-prefix-ttl-ms.
     #[arg(long)]
     pub cache_pending_prefix_max_followers: Option<u64>,
+
+    /// Remember where each chat with images was routed, and on its next turns
+    /// prefer that worker and DP rank, for this many milliseconds after its last
+    /// turn. KV events confirm such a chat only up to its first image (the engine
+    /// derives image token ids from pixels the router never sees), so without
+    /// this its later turns tie on the shared prefix and scatter by load. A
+    /// remembered placement counts only where it is deeper than every confirmed
+    /// match. Without one (another replica routed the previous turn), the tied
+    /// workers are ordered by a rendezvous hash of the conversation, so every
+    /// replica picks the same one; that preference is worth one block, within
+    /// --cache-switch-margin-tokens, so the pressure guard still overrides it
+    /// for a materially more loaded worker. A chat with a remembered placement
+    /// is exempt from --cache-affinity-min-matched-tokens (it counts prompt
+    /// tokens only, none of the image's KV), its tied peers included, so short
+    /// image chats keep their worker and the pressure guard keeps an
+    /// alternative; the match-ratio floor still applies. Under --dp-aware the
+    /// remembered rank is preferred the same way, and the rendezvous rank only
+    /// breaks a tie among equally loaded ranks. 0 or unset disables it.
+    /// Requires the radix_tree provider.
+    #[arg(long)]
+    pub cache_media_affinity_ttl_ms: Option<u64>,
 
     /// Confirmed-first pending prefixes: a stake counts only where it is
     /// strictly deeper than the confirmed KV-event match, and the pending
@@ -642,7 +680,13 @@ impl Cli {
             .server
             .worker_api_key
             .as_deref()
-            .map(bearer)
+            .map(|key| bearer(key, "--worker-api-key"))
+            .transpose()?;
+        let worker_management_auth = self
+            .server
+            .worker_management_api_key
+            .as_deref()
+            .map(|key| bearer(key, "--worker-management-api-key"))
             .transpose()?;
         let config = Config {
             server: ServerConfig {
@@ -652,6 +696,7 @@ impl Cli {
                 shutdown_drain_secs: self.server.shutdown_drain_secs,
                 termination_grace_secs: self.server.termination_grace_secs,
                 worker_auth,
+                worker_management_auth,
             },
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
@@ -674,6 +719,7 @@ impl Cli {
                 decode_policy: self.routing.decode_policy,
                 dp_aware: self.routing.dp_aware,
                 dp_rank_policy: self.routing.dp_rank_policy.unwrap_or_default(),
+                decode_dp_rank_policy: self.routing.decode_dp_rank_policy,
                 bucket_config,
                 reorg_buckets,
                 reorg_admission,
@@ -695,6 +741,7 @@ impl Cli {
                 max_backoff_ms: self.server.retry_max_backoff_ms,
                 decode_dispatch_limit: self.server.decode_dispatch_limit,
                 stream_after_prefill: self.server.pd_stream_after_prefill,
+                one_token_on_prefill_only: self.server.pd_one_token_on_prefill_only,
             },
             router_inflight_load: InflightLoadConfig {
                 stale_request_timeout_secs: self.server.stale_request_timeout_secs,
@@ -920,6 +967,12 @@ impl CacheArgs {
             "--cache-pending-prefix-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
         );
         ensure!(
+            self.cache_media_affinity_ttl_ms.is_none_or(|ttl| ttl == 0)
+                || (policy == PolicyKind::CacheAware
+                    && cache_prefix_provider == CachePrefixProvider::RadixTree),
+            "--cache-media-affinity-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
+        );
+        ensure!(
             self.cache_pending_prefix_max_followers.is_none()
                 || self.cache_pending_prefix_ttl_ms.is_some(),
             "--cache-pending-prefix-max-followers requires --cache-pending-prefix-ttl-ms"
@@ -973,6 +1026,7 @@ impl CacheArgs {
             bootstrap_seed_required: self.kv_bootstrap_seed_required,
             pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
             pending_prefix_max_followers: self.cache_pending_prefix_max_followers.unwrap_or(0),
+            media_affinity_ttl_ms: self.cache_media_affinity_ttl_ms.unwrap_or(0),
             pending_prefix_consult_below: self.cache_pending_prefix_consult_below,
         }))
     }
@@ -1211,9 +1265,9 @@ fn join_selector(terms: &[String]) -> Option<String> {
 }
 
 /// `Bearer <key>`, marked sensitive so it stays out of `Debug` output.
-fn bearer(key: &str) -> Result<HeaderValue> {
+fn bearer(key: &str, option: &str) -> Result<HeaderValue> {
     let mut value = HeaderValue::from_str(&format!("Bearer {key}"))
-        .context("--worker-api-key is not a valid HTTP header value")?;
+        .with_context(|| format!("{option} is not a valid HTTP header value"))?;
     value.set_sensitive(true);
     Ok(value)
 }
@@ -1482,6 +1536,21 @@ mod tests {
         assert_eq!(c.proxy.request_timeout_secs, 300);
         assert_eq!(c.router_inflight_load.stale_request_timeout_secs, 600);
         assert_eq!(c.server.shutdown_drain_secs, 30);
+        assert!(c.server.worker_management_auth.is_none());
+    }
+
+    #[test]
+    fn worker_management_api_key_maps_to_sensitive_bearer_header() {
+        let c = into_config_owned(with_model(&[
+            "--worker-urls",
+            "http://10.0.0.1:30000",
+            "--worker-management-api-key",
+            "management-secret",
+        ]))
+        .unwrap();
+        let auth = c.server.worker_management_auth.unwrap();
+        assert_eq!(auth, "Bearer management-secret");
+        assert!(auth.is_sensitive());
     }
 
     /// Several values, not just the default: a clamp or a rescale in the
@@ -3126,6 +3195,26 @@ mod tests {
         );
     }
 
+    /// Reorg's cache-aware groups build their own prefix provider; it must honor
+    /// --cache-pending-prefix-consult-below like the other routing path does.
+    #[tokio::test]
+    async fn reorg_prefix_provider_honors_pending_consult_below() {
+        let state = crate::state::kv_events::KvEventIndex::new();
+        let provider = |argv: &str| {
+            let config = cfg_of(argv).unwrap();
+            crate::policies_reorg::factory::local_prefix_provider(&config.model, &state)
+        };
+        let set = provider(
+            "--chat-routing reorg --policy cache_aware --cache-pending-prefix-ttl-ms 60000 \
+             --cache-pending-prefix-consult-below 0.8",
+        );
+        assert_eq!(set.pending_consult_below(), Some(0.8));
+        let unset = provider(
+            "--chat-routing reorg --policy cache_aware --cache-pending-prefix-ttl-ms 60000",
+        );
+        assert_eq!(unset.pending_consult_below(), None);
+    }
+
     #[test]
     fn pending_prefix_ttl_needs_the_local_radix_tree() {
         let cache = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
@@ -3176,6 +3265,23 @@ mod tests {
             DpRankPolicy::LeastTokens
         );
         assert!(cfg_of("--policy power_of_two --dp-rank-policy least_tokens").is_err());
+    }
+
+    #[test]
+    fn decode_dp_rank_policy_defaults_to_dp_rank_policy_and_can_differ() {
+        let model = |args: &str| cfg_of(args).unwrap().model;
+        let inherited = model("--policy power_of_two --dp-aware --dp-rank-policy least_tokens");
+        assert_eq!(inherited.decode_dp_rank_policy(), DpRankPolicy::LeastTokens);
+        let split = model("--policy power_of_two --dp-aware --decode-dp-rank-policy least_tokens");
+        assert_eq!(split.dp_rank_policy, DpRankPolicy::LeastInFlight);
+        assert_eq!(split.decode_dp_rank_policy(), DpRankPolicy::LeastTokens);
+        let both = model(
+            "--policy power_of_two --dp-aware --dp-rank-policy round_robin \
+             --decode-dp-rank-policy least_in_flight",
+        );
+        assert_eq!(both.dp_rank_policy, DpRankPolicy::RoundRobin);
+        assert_eq!(both.decode_dp_rank_policy(), DpRankPolicy::LeastInFlight);
+        assert!(cfg_of("--policy power_of_two --decode-dp-rank-policy least_tokens").is_err());
     }
 
     #[test]

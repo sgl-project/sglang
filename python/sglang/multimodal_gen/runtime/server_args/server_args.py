@@ -31,6 +31,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
 from sglang.multimodal_gen.configs.quantization.qvg_kv import QVGKVQuantArgs
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
@@ -67,6 +68,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_co
     normalize_cpu_offload_components,
     normalize_layerwise_offload_components,
 )
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    parse_request_time_limits,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -82,7 +86,6 @@ from sglang.multimodal_gen.runtime.utils.argparse import (
 )
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
-    is_valid_ipv6_address,
     normalize_gpu_ids,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -94,6 +97,10 @@ from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYP
 from sglang.multimodal_gen.runtime.weights.source import (
     is_explicit_weight_file_reference,
 )
+from sglang.srt.environ import envs as srt_envs
+from sglang.srt.environ import validate_env_values
+from sglang.srt.multimodal.media_io import configure_media_url_security
+from sglang.srt.utils.network import is_valid_ipv6_address
 
 logger = init_logger(__name__)
 
@@ -208,6 +215,8 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "fal/ideogram-v4-instant",
         "flux.1-dev",
         "glm-image",
+        "hy-nomas",
+        "tencent/hy-nomas",
         "ideogram-4",
         "ideogram-4-fp8",
         "ideogram-4-nf4",
@@ -267,6 +276,7 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "MiniMaxH3ImagePipelineConfig",
         "MingImagePipelineConfig",
         "MingImageLayerPipelineConfig",
+        "NomasPipelineConfig",
         "QwenImagePipelineConfig",
         "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
@@ -568,7 +578,13 @@ class ServerArgs(DisaggServerArgsMixin):
     host: str | None = "127.0.0.1"
     port: int | None = 30000
     http_graceful_shutdown_timeout: int | None = None
+    # Request watchdog (runtime/managers/request_watchdog.py): SECONDS or TASK=SECONDS
+    # entries; a request executing longer turns /health unhealthy. Unset: off.
+    request_time_limit: list[str] | None = None
     enable_metrics: bool = False
+    # HTTP auth, as the LLM server's --api-key / --admin-api-key; kept out of logs.
+    api_key: str | None = field(default=None, repr=False)
+    admin_api_key: str | None = field(default=None, repr=False)
 
     # TODO: webui and their endpoint, check if webui_port is available.
     webui: bool = False
@@ -590,6 +606,14 @@ class ServerArgs(DisaggServerArgsMixin):
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
+    media_gateway_key_file: str | None = None
+
+    # Client-supplied media URL policy, as in the LLM server; the default size
+    # limit is larger because requests carry videos.
+    allowed_media_domains: list[str] = field(default_factory=list)
+    allow_private_media_hosts: bool = False
+    media_url_max_file_size_mb: int = 512
+    media_url_timeout: float | None = None
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -613,7 +637,12 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
+    stage_deployment: str | None = None
+    stage_role: str | None = None
+    stage_endpoint: str | None = None
+    stage_node: str | None = None
     disagg_timeout: int = 3600
+    disagg_max_slots_per_instance: int = 8
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
@@ -637,7 +666,7 @@ class ServerArgs(DisaggServerArgsMixin):
     # Logging
     log_level: str = "info"
     log_requests: bool = False
-    log_requests_level: int = 2
+    log_requests_level: int = 0
     log_requests_format: str = "text"
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
@@ -695,9 +724,13 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_adjust_auto_fsdp_with_offload_enabled()
             auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
+            auto_tuner.maybe_plan_extra_dit_residency()
         self._adjust_path()
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
+        if self.admin_api_key is None:
+            # --admin-api-key wins; without it the server takes SGLANG_ADMIN_API_KEY.
+            self.admin_api_key = srt_envs.SGLANG_ADMIN_API_KEY.get() or None
         self._adjust_quant_config()
         self._adjust_breakable_cuda_graph_support()
         self._adjust_warmup()
@@ -713,6 +746,7 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
+        validate_env_values()
         self._validate_scheduler_rpc_timeout()
         timeout = self.http_graceful_shutdown_timeout
         if timeout is not None and (
@@ -722,6 +756,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "http_graceful_shutdown_timeout must be None or a non-negative "
                 "integer in seconds"
             )
+        # Publishes the media URL policy to this process, so invalid media
+        # flags fail at parse time, as in the LLM server.
+        configure_media_url_policy(self)
         self._validate_pipeline()
         self._validate_offload()
         self._validate_direct_gpu_weight_loading()
@@ -733,6 +770,7 @@ class ServerArgs(DisaggServerArgsMixin):
         self._validate_batching()
         self._validate_breakable_cuda_graph()
         self._validate_minimax_h3_adaln()
+        parse_request_time_limits(self.request_time_limit)
         self.pipeline_config.validate_server_args(self)
 
     def _validate_minimax_h3_adaln(self) -> None:
@@ -776,6 +814,34 @@ class ServerArgs(DisaggServerArgsMixin):
 
     def _validate_breakable_cuda_graph(self):
         if not self.enable_breakable_cuda_graph:
+            return
+        dit_residency = self.residency_mode("transformer")
+        if dit_residency != RESIDENT:
+            # BCG captures the DiT forward; every offload flavor rebinds or
+            # frees its weight storage between forwards, and a captured graph
+            # replays the addresses recorded at capture. Other components
+            # never enter the captured graph and stay free to offload.
+            if self.explicit_residency_mode(
+                "transformer"
+            ) is not None or self.is_explicit_layerwise_offload_component(
+                "transformer"
+            ):
+                raise ValueError(
+                    "--enable-breakable-cuda-graph requires a resident DiT: "
+                    f"the selected {dit_residency!r} placement rebinds weight "
+                    "storage between forwards, while a captured graph replays "
+                    "the addresses recorded at capture. Remove the DiT "
+                    "offload selection or drop --enable-breakable-cuda-graph."
+                )
+            logger.warning(
+                "[Diffusion BCG] the %s DiT placement was selected "
+                "automatically for this configuration; disabling "
+                "--enable-breakable-cuda-graph because a captured graph would "
+                "replay weight addresses the offload rebinds. The DiT runs "
+                "eager.",
+                dit_residency,
+            )
+            self.enable_breakable_cuda_graph = False
             return
         # BCG graphs are captured per resolution and only replay for that exact
         # latent shape, so the user must declare the resolutions up front. We
@@ -993,6 +1059,9 @@ class ServerArgs(DisaggServerArgsMixin):
             and not self.disagg_mode
             and replica_size > 1
         )
+
+        if self.pipeline_config.task_type == ModelTaskType.S2V:
+            return
 
         if fold_replica:
             mode = "replica"
@@ -1279,15 +1348,16 @@ class ServerArgs(DisaggServerArgsMixin):
         if (
             self.backend != Backend.DIFFUSERS
             and isinstance(self.pipeline_config, MiniMaxH3PipelineConfig)
-            and self.attention_backend == "laser_attn"
+            and self.attention_backend in ("laser_attn", "ascend_sparse_attn")
             and "text_encoder" not in self.component_attention_backends
             and "text_encoder" not in self.component_attention_backend_roles
         ):
-            # Laser Attention is used only by the MiniMax-H3 transformer.
-            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
+            # Laser and Ascend sparse attention target the H3 transformer. Keep the
+            # Qwen3-VL text encoder on SDPA to preserve its causal mask semantics.
             logger.info(
                 "Automatically set torch_sdpa backend for the MiniMax H3 text "
-                "encoder; laser_attn applies to the transformer"
+                "encoder; %s applies to the transformer",
+                self.attention_backend,
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
@@ -1994,6 +2064,15 @@ class ServerArgs(DisaggServerArgsMixin):
     ) -> None:
         self._component_layerwise_capabilities[component_name] = supported
 
+    @property
+    def node_local_gpu_worker_count(self) -> int:
+        """GPU worker processes sharing this node's host memory.
+
+        Per-process host budgets divide by it, because each worker reads the
+        same host-wide free-memory number.
+        """
+        return max(1, self.num_gpus // max(1, self.nnodes))
+
     def has_layerwise_offload_components(self) -> bool:
         return bool(
             self.dit_layerwise_offload
@@ -2247,6 +2326,14 @@ class ServerArgs(DisaggServerArgsMixin):
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
+        if (
+            any(
+                value is not None
+                for value in (self.stage_role, self.stage_node, self.stage_endpoint)
+            )
+            and self.stage_deployment is None
+        ):
+            raise ValueError("Stage worker selectors require --stage-deployment")
         self._validate_disagg_capability()
         self.gpu_ids = normalize_gpu_ids(self.gpu_ids)
 
@@ -2289,7 +2376,10 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Semantic checkpoint variant to serve. Models with partitioned "
                 "checkpoints use this value to select the compatible weights "
-                "without exposing repository subfolder layout."
+                "without exposing repository subfolder layout. MiniMax H3: "
+                "fl2va, ref2va, or fl2va+ref2va (both transformers in one "
+                "server, each request on its task's; the automatic memory "
+                "policy keeps both resident when they fit)."
             ),
         )
         parser.add_argument(
@@ -2956,8 +3046,10 @@ class ServerArgs(DisaggServerArgsMixin):
         parser.add_argument(
             "--pin-cpu-memory",
             action=StoreBoolean,
-            help='Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument". '
-            "Should be enabled in almost all cases",
+            help="Pin CPU-offloaded weights for faster host-to-device transfers, "
+            "subject to the host memory budget. Pinned memory cannot be reclaimed; "
+            "use --pin-cpu-memory false to reduce host/cgroup memory pressure "
+            'or work around CUDA pinning errors such as "invalid argument".',
         )
         parser.add_argument(
             "--ltx2-two-stage-device-mode",
@@ -3164,10 +3256,37 @@ class ServerArgs(DisaggServerArgsMixin):
             "Does not bound GPU worker teardown or preserve asynchronous video jobs.",
         )
         parser.add_argument(
+            "--request-time-limit",
+            type=str,
+            nargs="+",
+            default=ServerArgs.request_time_limit,
+            help="Execution time limit per request: SECONDS for every request, or "
+            "TASK=SECONDS for one task of a model that names its request tasks "
+            "(MiniMax-H3: t2va, fl2va, ref2va); 0 or off removes a limit. A "
+            "request executing longer (queueing excluded) is logged with every "
+            "worker's Python stacks and turns /health unhealthy; restart the "
+            "server then. Unset: off. Not available with disaggregated roles.",
+        )
+        parser.add_argument(
             "--enable-metrics",
             action=StoreBoolean,
             default=ServerArgs.enable_metrics,
             help="Expose Prometheus metrics at /metrics.",
+        )
+        parser.add_argument(
+            "--api-key",
+            type=str,
+            default=ServerArgs.api_key,
+            help="Set API key of the server. It is also used in the OpenAI API compatible server.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=ServerArgs.admin_api_key,
+            help="Set admin API key for management endpoints. Sensitive ones (e.g. weight "
+            "updates, LoRA loading, memory release, profiling) are refused unless it is "
+            "set. When set, admin endpoints require this key and do NOT accept --api-key. "
+            "Defaults to SGLANG_ADMIN_API_KEY.",
         )
         parser.add_argument(
             "--strict-ports",
@@ -3199,6 +3318,44 @@ class ServerArgs(DisaggServerArgsMixin):
             type=str,
             default=ServerArgs.input_save_path,
             help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
+        )
+        parser.add_argument(
+            "--allowed-media-domains",
+            type=str,
+            nargs="*",
+            default=[],
+            help="Restrict client-supplied HTTP(S) image, video, and audio URLs to "
+            "these exact hostnames. Redirect destinations are checked against the "
+            "same allowlist, and an allowlisted host may resolve to a private "
+            "address. When unset, any host that resolves only to public addresses "
+            "is allowed (see --allow-private-media-hosts).",
+        )
+        parser.add_argument(
+            "--allow-private-media-hosts",
+            action=StoreBoolean,
+            default=ServerArgs.allow_private_media_hosts,
+            help="Allow client-supplied HTTP(S) media URLs to resolve to private, "
+            "loopback, or link-local IP addresses (including cloud metadata "
+            "endpoints such as 169.254.169.254). Disabled by default; enable only "
+            "when the server intentionally fetches media from a private network. "
+            "An explicitly allowlisted domain is exempt regardless.",
+        )
+        parser.add_argument(
+            "--media-url-max-file-size-mb",
+            type=int,
+            default=ServerArgs.media_url_max_file_size_mb,
+            help="Maximum size in MiB for one client-supplied remote media download. "
+            "The limit is enforced while streaming; set to 0 to disable it.",
+        )
+        parser.add_argument(
+            "--media-url-timeout",
+            type=float,
+            default=ServerArgs.media_url_timeout,
+            help="Time budget in seconds of one client-supplied media URL "
+            "download, redirects and body included, for every media type; a "
+            "server that sends the body slowly is cut off when the budget runs "
+            "out. When unset, REQUEST_TIMEOUT applies, else each loader's "
+            "default.",
         )
 
         # LoRA
@@ -3280,6 +3437,11 @@ class ServerArgs(DisaggServerArgsMixin):
             "If unset, falls back to the OTEL_SERVICE_NAME env var, then to 'sglang-diffusion'.",
         )
         parser.add_argument(
+            "--media-gateway-key-file",
+            help="Require a trusted gateway for OpenAI image, video and mesh jobs. "
+            "Read its 64-digit hex key from this file; scope jobs by its verified X-SGLang-Tenant.",
+        )
+        parser.add_argument(
             "--log-requests",
             action="store_true",
             help="Log user-facing fields of all requests (default: False). "
@@ -3293,7 +3455,7 @@ class ServerArgs(DisaggServerArgsMixin):
             help="Verbosity level for request logging. "
             "0: Log request metadata only (request_id). "
             "1: Log metadata + sampling config (seed, steps, guidance, resolution, frames, fps, ...). "
-            "2: Log metadata + sampling config + prompt/negative prompt (truncated to 2 KiB). "
+            "2: Also log prompt/negative prompt (first and last 1,024 characters of long text). "
             "3: Log metadata + sampling config + full prompt/negative prompt.",
         )
         parser.add_argument(
@@ -3713,6 +3875,7 @@ class ServerArgs(DisaggServerArgsMixin):
         default_args: dict[str, Any] | None = None,
         *,
         argv: list[str] | None = None,
+        forced_args: dict[str, Any] | None = None,
     ) -> "ServerArgs":
         if unknown_args is None:
             unknown_args = []
@@ -3751,6 +3914,9 @@ class ServerArgs(DisaggServerArgsMixin):
         if default_args:
             for key, value in default_args.items():
                 provided_args.setdefault(key, value)
+        if forced_args:
+            # unlike default_args, these win over the CLI and the config file
+            provided_args.update(forced_args)
 
         if dynamic_paths:
             existing = dict(provided_args.get("component_paths") or {})
@@ -3908,6 +4074,16 @@ class ServerArgs(DisaggServerArgsMixin):
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
+                if arg_name not in destinations and arg_name not in vars(args):
+                    # argparse also accepts an unambiguous prefix of a flag; a
+                    # flag spelled in full (also one registered later) wins.
+                    abbreviated = {
+                        dest
+                        for name, dest in destinations.items()
+                        if name.startswith(arg_name)
+                    }
+                    if len(abbreviated) == 1:
+                        arg_name = abbreviated.pop()
                 provided_arg_names.add(destinations.get(arg_name, arg_name))
 
         # Populate provided_args if the argument from the namespace was on the command line.
@@ -4262,6 +4438,16 @@ def set_global_server_args(server_args: ServerArgs):
     """
     global _global_server_args
     _global_server_args = server_args
+
+
+def configure_media_url_policy(server_args: ServerArgs) -> None:
+    """Apply the client media URL policy to this process's media loaders."""
+    configure_media_url_security(
+        server_args.allowed_media_domains,
+        server_args.media_url_max_file_size_mb,
+        server_args.media_url_timeout,
+        allow_private_media_hosts=server_args.allow_private_media_hosts,
+    )
 
 
 def get_global_server_args() -> ServerArgs:

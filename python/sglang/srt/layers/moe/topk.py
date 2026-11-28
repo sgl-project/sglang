@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -103,9 +105,38 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_musa = is_musa()
 _is_sail = is_sail()
+
+
+def _compile_unless_batch_invariant(**compile_kwargs):
+    """torch.compile a routing function, but run it eagerly in batch-invariant mode.
+
+    Inductor tunes the generated kernels (block sizes, reduction splits) by timing
+    on first use, so the summation order of the routing scores, and with it the
+    selected experts, can differ between server starts and with the batch.
+    Deterministic inference needs the eager kernels, whose order is fixed.
+    """
+
+    def decorator(fn):
+        compiled = torch.compile(fn, **compile_kwargs)
+        # Also kept out of an outer trace (--enable-torch-compile compiles the whole
+        # forward), which would otherwise inline the eager function and generate kernels.
+        eager = torch.compiler.disable(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if is_batch_invariant_mode_enabled():
+                return wrapper.eager(*args, **kwargs)
+            return wrapper.compiled(*args, **kwargs)
+
+        wrapper.compiled = compiled
+        wrapper.eager = eager
+        return wrapper
+
+    return decorator
+
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -1045,7 +1076,6 @@ class TopK(BaseFusedOp):
                 num_token_non_padded, expert_location_dispatch_info
             )
         )
-        self.topk_config.torch_native = True
         # [NOTE] XPU device support for topk kernels
         #   - support 'topk_softmax' and 'topk_sigmoid'
         #   - support up to 8 top-k and 256 experts
@@ -1373,7 +1403,9 @@ def fused_topk(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@_compile_unless_batch_invariant(
+    dynamic=True, backend=get_compiler_backend(), disable=_is_npu
+)
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1531,48 +1563,9 @@ def grouped_topk_xpu(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def kimi_k2_biased_topk_impl(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    routed_scaling_factor: Optional[float] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
-    """
-    Optimized version for num_expert_group=1 case (e.g., Kimi K2 with 384 experts).
-    Simplifies the grouped topk logic by removing unnecessary group masking operations.
-    Note: This function assumes num_fused_shared_experts=0.
-    """
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    scores = gating_output.sigmoid()
-    num_token = scores.shape[0]
-
-    # When num_expert_group=1, no need for group masking
-    # Directly compute scores with correction bias
-    tmp_scores = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
-
-    # Directly select topk experts (no need to sort since num_fused_shared_experts=0)
-    _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
-    topk_weights = scores.gather(1, topk_ids)
-
-    if renormalize:
-        # fp32 like the reference gate (the epsilon is not representable in
-        # fp16); the sum dtype and the division's type promotion upcast inside
-        # the existing kernels, so no extra cast launch is needed
-        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
-        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-    if apply_routed_scaling_factor_on_output:
-        topk_weights *= routed_scaling_factor
-
-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    return topk_weights, topk_ids
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@_compile_unless_batch_invariant(
+    dynamic=True, backend=get_compiler_backend(), disable=_is_npu
+)
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1769,7 +1762,9 @@ def biased_topk_xpu(
     return output, indices
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@_compile_unless_batch_invariant(
+    dynamic=True, backend=get_compiler_backend(), disable=_is_npu
+)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1958,7 +1953,7 @@ def _zero_topk_weights_padded_region(
     topk_weights[_padded_row_mask(topk_weights, num_token_non_padded), :] = 0.0
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@_compile_unless_batch_invariant(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
@@ -2140,7 +2135,6 @@ def biased_grouped_topk_gpu(
         )
 
     elif _use_aiter:
-        assert not apply_routed_scaling_factor_on_output, "Not implemented"
         token = gating_output.shape[0]
         device = gating_output.device
         assert hidden_states.shape[0] == gating_output.shape[0], (
@@ -2372,7 +2366,6 @@ def biased_grouped_topk_cpu(
     renormalize: bool,
     num_expert_group: Optional[int] = None,
     topk_group: Optional[int] = None,
-    compiled: bool = True,
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,

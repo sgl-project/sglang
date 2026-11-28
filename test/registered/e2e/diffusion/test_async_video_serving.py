@@ -193,7 +193,7 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
     )
 
     # fail output persistence after admission, not input validation or GPU compute
-    bad_output = tmp_path / "unwritable-output"
+    bad_output = tmp_path / "videos" / "unwritable-output"
     bad_output.mkdir()
     with _paused(workers):
         failed_save = submit(output_path=str(bad_output))
@@ -203,18 +203,23 @@ def test_video_jobs_survive_concurrency_timeouts_and_deletion(
         wait([failed_save], expected="failed")
         call("GET", f"/v1/videos/{failed_save}/content", expected=404)
         job = call("GET", f"/v1/videos/{failed_save}").json()
-        assert str(bad_output) in job["error"]["message"], job
+        assert job["error"]["message"] == "Video generation failed", job
     finally:
         bad_output.unlink()
 
     failed_jobs = {}
     with _paused(workers):
-        timed_out = [submit() for _ in range(num_gpus if mode == "dp2" else 1)]
+        # keep late work out of recovery batches so the hash check compares
+        # the same serial execution shape as the reference
+        timed_out = [
+            submit(num_inference_steps=8 if mode == "batch2" else 4)
+            for _ in range(num_gpus if mode == "dp2" else 1)
+        ]
         wait(timed_out, expected="failed")
         for job_id in timed_out:
             call("GET", f"/v1/videos/{job_id}/content", expected=404)
             job = call("GET", f"/v1/videos/{job_id}").json()
-            assert "Scheduler did not respond in time" in job["error"]["message"], job
+            assert job["error"]["message"] == "Video generation failed", job
             failed_jobs[job_id] = job
 
     # timeout ends the RPC, not GPU work: late results must not revive failed jobs

@@ -9,6 +9,9 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
+      # Host networking lets Prometheus scrape SGLang on 127.0.0.1; listen there
+      # only, so the UI is not exposed on the host's other interfaces.
+      - '--web.listen-address=127.0.0.1:9090'
 
   grafana:
     image: grafana/grafana:latest
@@ -19,6 +22,14 @@ services:
       - ./grafana/dashboards/config:/etc/grafana/provisioning/dashboards
       - ./grafana/dashboards/json:/var/lib/grafana/dashboards
     environment:
+      # Listen on loopback only (host networking); reach it remotely through an
+      # SSH tunnel rather than exposing it.
+      - GF_SERVER_HTTP_ADDR=127.0.0.1
+      # No default admin/admin: `docker compose up` fails until it is set.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
+      # No plugin installs from the UI: a plugin such as Infinity turns a Grafana
+      # login into HTTP requests from this host.
+      - GF_PLUGINS_PLUGIN_ADMIN_ENABLED=false
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
       - GF_AUTH_BASIC_ENABLED=false

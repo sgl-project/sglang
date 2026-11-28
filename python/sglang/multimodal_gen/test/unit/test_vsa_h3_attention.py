@@ -10,10 +10,14 @@ tile masking, the untile permutation, and the softmax scale.
 from __future__ import annotations
 
 import math
+from collections import defaultdict
+from unittest import mock
 
 import pytest
 import torch
+import triton
 
+from sglang.multimodal_gen.runtime.layers.attention.backends import vsa_h3_kernels
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
     VSA_H3_TILE_ELEMS,
     VideoSparseAttentionH3Impl,
@@ -188,6 +192,132 @@ def test_topk_list_kernel_matches_sorted_topk(num_prefix, num_video, sparsity) -
         assert torch.equal(out[..., : num_prefix + keep], reference)
         assert not mask.any()
     assert (out[..., num_prefix + keep :] == -1).all()
+
+
+def _fresh_compile_cache(monkeypatch, kernel) -> dict:
+    """An empty compile cache for ``kernel``: the test counts its own variants."""
+    monkeypatch.setattr(kernel, "device_caches", defaultdict(kernel.create_binder))
+    return kernel.device_caches[torch.cuda.current_device()][0]
+
+
+@requires_cuda
+def test_topk_list_kernel_compiles_once_per_bucket(monkeypatch) -> None:
+    """The prompt length moves the tile counts, the list strides and the
+    alignment of the video rows; within one VIDEO_POW2 bucket every
+    divisibility class must reuse one variant."""
+    cache = _fresh_compile_cache(monkeypatch, vsa_h3_kernels._topk_lists_kernel)
+    for num_prefix, num_video in ((16, 528), (17, 529), (29, 600), (32, 544)):
+        n_tiles = num_prefix + num_video
+        scores = torch.randn(HEADS, n_tiles, n_tiles, device="cuda")
+        reference = _topk_tile_lists(scores, num_prefix, num_video, 0.8, True)
+        keep = reference.shape[-1] - num_prefix
+        # as served: the video rows of [H, n_tiles + 1, n_tiles] lists
+        lists = torch.zeros(
+            HEADS, n_tiles + 1, n_tiles, dtype=torch.int32, device="cuda"
+        )
+        lists[..., :num_prefix] = torch.arange(
+            num_prefix, dtype=torch.int32, device="cuda"
+        )
+        mask = torch.zeros(HEADS, num_video, num_video, dtype=torch.int8, device="cuda")
+        picked = scores[:, num_prefix:, num_prefix:].topk(keep, sorted=False).indices
+        vsa_h3_kernels.vsa_h3_topk_lists(
+            picked, mask, lists[:, num_prefix:n_tiles], num_prefix
+        )
+        assert torch.equal(lists[:, num_prefix:n_tiles, : num_prefix + keep], reference)
+    assert len(cache) == 1
+
+
+def _same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a.dtype == b.dtype and torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@requires_cuda
+def test_untile_kernel_compiles_once_per_mode(monkeypatch) -> None:
+    """The used rows and the tile count follow the prompt length; each
+    divisibility class must reuse one variant per mode and give the bytes of
+    the length-specialized kernel."""
+    kernel = vsa_h3_kernels._untile_kernel
+    cache = _fresh_compile_cache(monkeypatch, kernel)
+    specialized = triton.jit(kernel.fn)
+    block = vsa_h3_kernels.VSA_H3_KERNEL_BLOCK
+    # (tiles, used rows): each divisible by 16 or not
+    for n_tiles, used in ((32, 2048), (32, 2047), (33, 2096), (33, 2100)):
+        total = n_tiles * block
+        out, gate = (
+            torch.randn(7, total, HEAD_DIM, device="cuda").to(torch.bfloat16)
+            for _ in range(2)
+        )
+        compress = torch.randn(7, n_tiles, HEAD_DIM, device="cuda")
+        dst = torch.randperm(total, device="cuda").to(torch.int32)
+        for has_gate in (True, False):
+            results = []
+            for jit in (kernel, specialized):
+                result = torch.empty(
+                    total, 7, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+                )
+                with mock.patch.object(vsa_h3_kernels, "_untile_kernel", jit):
+                    vsa_h3_kernels.vsa_h3_untile(
+                        out,
+                        gate if has_gate else None,
+                        compress if has_gate else None,
+                        dst,
+                        used,
+                        result,
+                    )
+                results.append(result)
+            assert _same_bytes(*results)
+    assert len(cache) == 2
+
+
+@requires_cuda
+def test_pack_tiles_kernel_compiles_once_per_mode(monkeypatch) -> None:
+    """The tile count follows the prompt length; each divisibility class must
+    reuse one variant per mode and give the bytes of the length-specialized
+    kernel."""
+    kernel = vsa_h3_kernels._pack_tiles_kernel
+    cache = _fresh_compile_cache(monkeypatch, kernel)
+    specialized = triton.jit(kernel.fn)
+    block = vsa_h3_kernels.VSA_H3_KERNEL_BLOCK
+    for n_tiles in (32, 33):  # divisible by 16 or not
+        # one empty tile past n_tiles, as the workspace may hold
+        seq_pad, used = (n_tiles + 1) * block, n_tiles * block - 37
+        # q / k / v as slices of one fused [rows, heads, 3 * D] projection
+        q, k, v = (
+            torch.randn(used, 7, 3 * HEAD_DIM, device="cuda")
+            .to(torch.bfloat16)
+            .split(HEAD_DIM, dim=-1)
+        )
+        gate = torch.randn(used, 7, HEAD_DIM, device="cuda").to(torch.bfloat16)
+        src_index = torch.full((seq_pad,), -1, dtype=torch.int32, device="cuda")
+        slots = torch.randperm(n_tiles * block, device="cuda")[:used]
+        src_index[slots] = torch.arange(used, dtype=torch.int32, device="cuda")
+        sizes = (src_index[: n_tiles * block].view(n_tiles, block) >= 0).sum(1).int()
+        for has_gate in (True, False):
+            results = []
+            for jit in (kernel, specialized):
+                tiled = torch.zeros(
+                    3 + has_gate,
+                    7,
+                    seq_pad,
+                    HEAD_DIM,
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                )
+                pooled = torch.zeros(3, 7, n_tiles, HEAD_DIM, device="cuda")
+                with mock.patch.object(vsa_h3_kernels, "_pack_tiles_kernel", jit):
+                    vsa_h3_kernels.vsa_h3_pack_tiles(
+                        q,
+                        k,
+                        v,
+                        gate if has_gate else None,
+                        src_index,
+                        sizes,
+                        tiled,
+                        pooled,
+                    )
+                results.append((tiled, pooled))
+            assert all(_same_bytes(*pair) for pair in zip(*results))
+    assert len(cache) == 2
 
 
 def _masked_dense_reference(meta, used, q, k, v, gate, sparsity):

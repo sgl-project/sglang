@@ -190,6 +190,13 @@ pub struct ServerArgs {
     /// Start accepting health checks immediately instead of waiting for the
     /// main process's startup warmup request to finish.
     pub skip_server_warmup: bool,
+    /// The image Python's startup warmup sends a VLM, as base64 PNG data
+    /// (`_execute_server_warmup`): the warmup then generates from it and a
+    /// chat prompt instead of from text. `None` warms with text.
+    pub vlm_warmup_image_base64: Option<String>,
+    /// That warmup's prompt, rendered by the launcher for a chat template
+    /// this server cannot render; `None` renders it with the served one.
+    pub vlm_warmup_prompt: Option<String>,
     /// `--gc-threshold`: the thresholds the scheduler ranks set when they
     /// freeze their garbage collectors after startup; `None` keeps Python's.
     pub gc_threshold: Option<Vec<i64>>,
@@ -253,6 +260,9 @@ pub struct ServerArgs {
     /// and the scheduler-derived KV token capacity, reported by `/server_info`.
     pub version: String,
     pub max_total_num_tokens: u64,
+    /// The scheduler's request length limits (`get_request_length_limits`).
+    pub max_req_len: u64,
+    pub max_req_input_len: u64,
     /// Resolved deployment metadata used by out-of-process orchestrators.
     pub deployment_info: DeploymentInfo,
     /// Python's `/server_info` fields that are fixed at launch, which
@@ -318,6 +328,8 @@ impl ServerArgs {
         tokenizer_backend,
         skip_tokenizer_init,
         skip_server_warmup,
+        vlm_warmup_image_base64,
+        vlm_warmup_prompt,
         gc_threshold,
         custom_warmups_pending,
         health_generate_headers,
@@ -339,6 +351,8 @@ impl ServerArgs {
         tokenizer_model_max_length,
         version,
         max_total_num_tokens,
+        max_req_len,
+        max_req_input_len,
         deployment_info,
         launch_server_info,
         launch_model_info,
@@ -386,6 +400,8 @@ impl ServerArgs {
         tokenizer_backend: String,
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
+        vlm_warmup_image_base64: Option<String>,
+        vlm_warmup_prompt: Option<String>,
         gc_threshold: Option<Vec<i64>>,
         custom_warmups_pending: bool,
         health_generate_headers: BTreeMap<String, String>,
@@ -407,6 +423,8 @@ impl ServerArgs {
         tokenizer_model_max_length: i64,
         version: String,
         max_total_num_tokens: u64,
+        max_req_len: u64,
+        max_req_input_len: u64,
         deployment_info: DeploymentInfo,
         launch_server_info: JsonObject,
         launch_model_info: JsonObject,
@@ -452,6 +470,8 @@ impl ServerArgs {
             tokenizer_backend,
             skip_tokenizer_init,
             skip_server_warmup,
+            vlm_warmup_image_base64,
+            vlm_warmup_prompt,
             gc_threshold,
             custom_warmups_pending,
             health_generate_headers,
@@ -473,6 +493,8 @@ impl ServerArgs {
             tokenizer_model_max_length,
             version,
             max_total_num_tokens,
+            max_req_len,
+            max_req_input_len,
             deployment_info,
             launch_server_info,
             launch_model_info,
@@ -494,6 +516,9 @@ impl Default for ServerArgs {
     /// complete `model_config` so the runtime boots. Real launches never use
     /// this — Python supplies every field.
     fn default() -> Self {
+        let model_config = ModelConfig::default();
+        // `get_request_length_limits` for an unbounded KV pool, no dLLM block, nothing reserved.
+        let max_req_len = model_config.context_len;
         Self {
             model_path: String::new(),
             served_model_name: String::new(),
@@ -525,6 +550,8 @@ impl Default for ServerArgs {
             tokenizer_backend: "huggingface".into(),
             skip_tokenizer_init: false,
             skip_server_warmup: false,
+            vlm_warmup_image_base64: None,
+            vlm_warmup_prompt: None,
             gc_threshold: None,
             custom_warmups_pending: false,
             health_generate_headers: BTreeMap::new(),
@@ -533,7 +560,7 @@ impl Default for ServerArgs {
             enable_request_decompression: false,
             incremental_streaming_output: false,
             disaggregation_mode: DisaggregationMode::Null,
-            model_config: ModelConfig::default(),
+            model_config,
             preferred_sampling_params: None,
             default_max_new_tokens: Some(128),
             lora_ids: BTreeMap::new(),
@@ -546,6 +573,8 @@ impl Default for ServerArgs {
             tokenizer_model_max_length: -1,
             version: String::new(),
             max_total_num_tokens: 0,
+            max_req_len,
+            max_req_input_len: max_req_len - 1 - 5,
             deployment_info: DeploymentInfo::default(),
             launch_server_info: JsonObject::default(),
             launch_model_info: JsonObject::default(),
@@ -647,10 +676,29 @@ impl DeploymentInfo {
 }
 
 /// One DP rank's listener, as a base URL (`http://host:port`).
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct RustServerEndpoint {
     pub dp_rank: u32,
     pub endpoint: String,
+    /// The secret this listener's control relay route requires (see
+    /// `api_server::core::peer`), drawn at launch by the rank that hosts the
+    /// listener and shared with the other ranks only through their startup
+    /// all-gather. Never serialized, so `/server_info` does not publish it.
+    #[serde(default, skip_serializing)]
+    pub peer_token: Option<String>,
+}
+
+impl std::fmt::Debug for RustServerEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustServerEndpoint")
+            .field("dp_rank", &self.dp_rank)
+            .field("endpoint", &self.endpoint)
+            .field(
+                "peer_token",
+                &self.peer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

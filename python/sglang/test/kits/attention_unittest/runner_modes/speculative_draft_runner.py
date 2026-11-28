@@ -170,6 +170,10 @@ class _EagleDraftWorkerHarness:
         settings: EagleDraftRunnerSettings,
     ):
         self.model_runner = fixture.runner
+        # The draft graph runners run the model runner's capture tail hooks.
+        fixture.runner.capture_tail_hooks = getattr(
+            fixture.runner, "capture_tail_hooks", []
+        )
         self.draft_attn_backend = draft_attn_backend
         self.topk = settings.topk
         self.speculative_num_steps = settings.speculative_num_steps
@@ -218,6 +222,10 @@ class _FrozenKVMTPWorkerHarness:
         settings: EagleDraftRunnerSettings,
     ):
         self.model_runner = fixture.runner
+        # The draft graph runners run the model runner's capture tail hooks.
+        fixture.runner.capture_tail_hooks = getattr(
+            fixture.runner, "capture_tail_hooks", []
+        )
         self.draft_attn_backend = draft_attn_backend
         self.topk = settings.topk
         self.speculative_num_steps = settings.speculative_num_steps
@@ -427,7 +435,7 @@ def _run_eagle_draft_eager(
     else:
         worker.draft_attn_backend.init_forward_metadata(batch)
     batch.mark_forward_metadata_ready()  # mirror production: pre-plan marks
-    return worker.draft_forward(batch)
+    return worker.draft_forward(batch, greedy=False)
 
 
 def _run_frozen_kv_mtp_eager(

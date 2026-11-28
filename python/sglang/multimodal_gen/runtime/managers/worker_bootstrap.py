@@ -19,6 +19,7 @@ Keep module scope limited to the standard library and import-neutral types.
 
 from __future__ import annotations
 
+import io
 import logging
 import pickle
 import sys
@@ -78,6 +79,25 @@ def _warn_if_runtime_imported_early() -> None:
     )
 
 
+def _restore_config_tensor(data: bytes):
+    import torch
+
+    return torch.load(io.BytesIO(data), map_location="cpu", weights_only=True)
+
+
+class _ConfigPickler(pickle.Pickler):
+    def reducer_override(self, obj):
+        import torch
+
+        # Tensor subclasses may need globals rejected by the weights-only loader.
+        if type(obj) in (torch.Tensor, torch.nn.Parameter) and obj.device.type == "cpu":
+            # Tensor's pickle reducer uses legacy torch.save, which warns on NPU.
+            buffer = io.BytesIO()
+            torch.save(obj, buffer, _use_new_zipfile_serialization=True)
+            return _restore_config_tensor, (buffer.getvalue(),)
+        return NotImplemented
+
+
 @dataclass(frozen=True, slots=True)
 class ServerArgsPayload:
     """A deferred ``ServerArgs`` snapshot safe to unpickle before bootstrap."""
@@ -86,7 +106,9 @@ class ServerArgsPayload:
 
     @classmethod
     def capture(cls, server_args: ServerArgs) -> ServerArgsPayload:
-        return cls(pickle.dumps(server_args, protocol=pickle.HIGHEST_PROTOCOL))
+        buffer = io.BytesIO()
+        _ConfigPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(server_args)
+        return cls(buffer.getvalue())
 
     def materialize(self) -> ServerArgs:
         # Importing ServerArgs pulls in pipeline configuration modules. This
@@ -154,6 +176,28 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
         server_args=server_args,
         pipe_writer=spec.pipe_writer,
     )
+
+
+def bootstrap_stage_role(server_args: ServerArgsPayload) -> None:
+    from sglang.multimodal_gen.runtime.platforms import initialize_current_platform
+    from sglang.multimodal_gen.runtime.utils.process import kill_itself_when_parent_died
+
+    kill_itself_when_parent_died()
+    initialize_current_platform()
+
+    from sglang.multimodal_gen.runtime.platforms.plugins import (
+        apply_plugin_hooks,
+        load_plugins,
+    )
+
+    load_plugins()
+    apply_plugin_hooks()
+
+    from sglang.multimodal_gen.runtime.disaggregation.deployment.launch import (
+        launch_stage_deployment,
+    )
+
+    launch_stage_deployment(server_args.materialize())
 
 
 def bootstrap_http_server_process(

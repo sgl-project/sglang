@@ -18,10 +18,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
+
+from sglang.multimodal_gen.runtime.utils.process import local_media_subprocess_env
+from sglang.srt.multimodal.media_io import media_url_timeout, open_remote_media
 
 MINIMAX_H3_MATERIAL_CACHE_EXTRA_KEY = "minimax_h3_material_localization"
 MINIMAX_H3_MATERIAL_PROBE_EXTRA_KEY = "minimax_h3_material_probe_facts"
@@ -37,6 +40,9 @@ _BASE64_ALPHABET = frozenset(
 # The alphabet, then at most two padding characters. Payloads with percent escapes
 # or whitespace, which material URIs may also carry, take the per-character path.
 _PLAIN_BASE64_PAYLOAD = re.compile(r"[A-Za-z0-9+/_-]*={0,2}")
+# pre-queue probes localize one request's materials on threads; they must
+# create and share a single material workdir
+_MATERIAL_WORKDIR_LOCK = threading.Lock()
 
 _DEFAULT_SUFFIX_BY_TYPE = {
     "image": ".png",
@@ -336,6 +342,7 @@ def _ffprobe_media(path: str) -> dict[str, Any]:
                     "-i",
                     path,
                 ],
+                env=local_media_subprocess_env(),
                 check=True,
                 capture_output=True,
                 text=True,
@@ -572,15 +579,16 @@ def _material_output_paths(
 
 
 def _material_workdir(batch: Any) -> str:
-    registry = batch.extra.setdefault(MINIMAX_H3_TEMP_DIRS_EXTRA_KEY, {})
-    material_dirs = registry.get("material")
-    if isinstance(material_dirs, list) and material_dirs:
-        return str(material_dirs[0])
-    return minimax_h3_register_temp_dir(
-        batch,
-        tempfile.mkdtemp(prefix="minimax_h3_material_"),
-        owner="material",
-    )
+    with _MATERIAL_WORKDIR_LOCK:
+        registry = batch.extra.setdefault(MINIMAX_H3_TEMP_DIRS_EXTRA_KEY, {})
+        material_dirs = registry.get("material")
+        if isinstance(material_dirs, list) and material_dirs:
+            return str(material_dirs[0])
+        return minimax_h3_register_temp_dir(
+            batch,
+            tempfile.mkdtemp(prefix="minimax_h3_material_"),
+            owner="material",
+        )
 
 
 def _decode_base64_chunk(encoded: bytes | bytearray) -> bytes:
@@ -739,20 +747,6 @@ def _stream_tar_member_material(
     return str(output_path)
 
 
-def _http_media_type(response: Any) -> str | None:
-    headers = getattr(response, "headers", None)
-    if headers is None:
-        return None
-    get_content_type = getattr(headers, "get_content_type", None)
-    if callable(get_content_type):
-        value = get_content_type()
-    else:
-        value = headers.get("Content-Type") or headers.get("content-type")
-        if isinstance(value, str):
-            value = value.split(";", 1)[0].strip()
-    return str(value).lower() if value else None
-
-
 def _stream_http_material(
     batch: Any,
     uri: str,
@@ -761,33 +755,16 @@ def _stream_http_material(
     condition_index: int,
     timeout_s: float,
 ) -> str:
-    # Use the repository's legacy urllib behavior.  Model-specific material
-    # localization intentionally does not perform the shared public SSRF
-    # policy or a cumulative request deadline.
-    with urllib.request.urlopen(uri, timeout=timeout_s) as response:
-        media_type = _http_media_type(response)
-        suffix = (
-            _safe_suffix(uri)
-            or _SUFFIX_BY_MEDIA_TYPE.get(str(media_type or "").lower())
-            or _DEFAULT_SUFFIX_BY_TYPE.get(condition_type, ".bin")
+    with open_remote_media(uri, media_url_timeout(timeout_s)) as (_, chunks):
+        # The suffix follows the condition type, never the URL or Content-Type:
+        # a ".m3u8" name would steer FFmpeg's probe toward the HLS demuxer.
+        output_path, partial_path = _material_output_paths(
+            batch, condition_type=condition_type, condition_index=condition_index
         )
-        output_path = (
-            Path(_material_workdir(batch))
-            / f"condition_{int(condition_index):04d}{suffix}"
-        )
-        partial_path = output_path.with_name(output_path.name + ".partial")
         total = 0
         try:
             with partial_path.open("wb") as output:
-                while True:
-                    chunk = response.read(MINIMAX_H3_HTTP_READ_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    if not isinstance(chunk, bytes):
-                        raise TypeError(
-                            "HTTP material response.read() must return bytes, got "
-                            f"{type(chunk).__name__}"
-                        )
+                for chunk in chunks:
                     total += len(chunk)
                     output.write(chunk)
             if total == 0:

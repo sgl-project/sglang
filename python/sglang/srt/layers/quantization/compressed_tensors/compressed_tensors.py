@@ -12,7 +12,6 @@ from typing import (
     Dict,
     List,
     Literal,
-    NamedTuple,
     Optional,
     Tuple,
     cast,
@@ -63,6 +62,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     NPUCompressedTensorsW4A16Int4DynamicMoE,
     NPUCompressedTensorsW8A8Int8,
     NPUCompressedTensorsW8A8Int8DynamicMoE,
+    XPUCompressedTensorsW8A8Int8,
     XPUCompressedTensorsWNA16,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
@@ -78,6 +78,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.platforms.device_mixin import DeviceCapability
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
@@ -100,23 +101,6 @@ __all__ = ["CompressedTensorsLinearMethod"]
 
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
-
-
-class DeviceCapability(NamedTuple):
-    major: int
-    minor: int
-
-    def as_version_str(self) -> str:
-        return f"{self.major}.{self.minor}"
-
-    def to_int(self) -> int:
-        """
-        Express device capability as an integer ``<major><minor>``.
-
-        It is assumed that the minor version is always a single digit.
-        """
-        assert 0 <= self.minor < 10
-        return self.major * 10 + self.minor
 
 
 # The MLP prefix of a plain `ignore` entry that names its layer.
@@ -167,9 +151,6 @@ class CompressedTensorsConfig(QuantizationConfig):
         ):
             return "FP8"
         return None
-
-    def get_linear_method(self) -> CompressedTensorsLinearMethod:
-        return CompressedTensorsLinearMethod(self)
 
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.float16, torch.bfloat16]
@@ -484,20 +465,15 @@ class CompressedTensorsConfig(QuantizationConfig):
         else:
             device_capability = torch.cuda.get_device_capability()
 
-        capability_tuple = DeviceCapability(*device_capability)
-
-        if capability_tuple is not None:
-            capability = capability_tuple.to_int()
-            supported = capability >= min_capability
-            if error and not supported:
-                raise RuntimeError(
-                    "Quantization scheme is not supported for ",
-                    f"the current GPU. Min capability: {min_capability}. ",
-                    f"Current capability: {capability}.",
-                )
-            return supported
-        else:
-            return False
+        capability = DeviceCapability(*device_capability).to_int()
+        supported = capability >= min_capability
+        if error and not supported:
+            raise RuntimeError(
+                "Quantization scheme is not supported for "
+                f"the current GPU. Min capability: {min_capability}. "
+                f"Current capability: {capability}."
+            )
+        return supported
 
     def _is_dynamic_token_w4a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
@@ -993,6 +969,12 @@ class CompressedTensorsConfig(QuantizationConfig):
                     )
 
             if self._is_dynamic_token_w8a8(weight_quant, input_quant):
+                if _is_xpu:
+                    return XPUCompressedTensorsW8A8Int8(
+                        strategy=weight_quant.strategy,
+                        is_static_input_scheme=False,
+                        input_symmetric=input_quant.symmetric,
+                    )
                 if not _is_npu:
                     return CompressedTensorsW8A8Int8(
                         strategy=weight_quant.strategy,
@@ -1064,6 +1046,13 @@ class CompressedTensorsConfig(QuantizationConfig):
                 ):
                     return CompressedTensorsMxInt4MoE(self, weight_quant=weight_quant)
                 elif _is_hip:
+                    # The Triton runner gets no zero points (get_triton_quant_info), so an
+                    # asymmetric checkpoint would be dequantized with an implicit -8.
+                    if not weight_quant.symmetric:
+                        raise ValueError(
+                            "The ROCm Triton WNA16 MoE path only supports symmetric INT4 "
+                            "group quantization; this checkpoint has zero points."
+                        )
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(
                         self, weight_quant=weight_quant
@@ -1301,6 +1290,26 @@ class CompressedTensorsConfig(QuantizationConfig):
             layer=layer, layer_name=layer_name, matched_target=matched_target
         )
 
+    # Calibration-only QuantizationArgs fields; the loader never reads them.
+    _CALIBRATION_ONLY_ARGS = frozenset({"observer", "observer_kwargs"})
+
+    # What the loader builds for a target: the group format with its top-level
+    # fallback resolved, and the args without calibration-only fields.
+    def _loaded_scheme_key(self, target: str) -> tuple:
+        scheme = self.target_scheme_map[target]
+
+        def args_key(args: Optional[QuantizationArgs]):
+            if args is None:
+                return None
+            return args.model_dump(exclude=self._CALIBRATION_ONLY_ARGS)
+
+        group_format = scheme.get("format")
+        return (
+            group_format if group_format is not None else self.quant_format,
+            args_key(scheme.get("weights")),
+            args_key(scheme.get("input_activations")),
+        )
+
     def get_scheme_dict(
         self,
         layer: torch.nn.Module,
@@ -1334,6 +1343,7 @@ class CompressedTensorsConfig(QuantizationConfig):
                     module=layer,
                     targets=self.target_scheme_map.keys(),
                     fused_mapping=self.packed_modules_mapping,
+                    scheme_key=self._loaded_scheme_key,
                 )
 
             return self.target_scheme_map[matched_target]

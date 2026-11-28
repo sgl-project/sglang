@@ -5,6 +5,9 @@ ARG ENABLE_SGL_NVIDIA_MEGA=1
 ARG CUDA_VERSION=13.0.3
 ARG UV_VERSION=latest
 ARG PYTHON_VERSION=3.12
+# AWS EFA userspace (libfabric, aws-ofi-nccl), see scripts/install_efa.sh.
+ARG EFA_INSTALLER_VERSION=1.51.0
+ARG EFA_INSTALLER_SHA256=83993044fa4df3dc2f8b5c2f7051d61b9689441be023a2c92ea51d3f53f2465c
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
 
@@ -17,7 +20,7 @@ ARG SGL_KERNEL_VERSION=0.4.11
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
-ARG SGL_NCCL_VERSION=2.30.7
+ARG SGL_NCCL_VERSION=2.31.2
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
@@ -83,8 +86,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     patchelf \
     ccache \
     git-lfs \
-    # MPI and NUMA
-    libopenmpi-dev \
+    # NUMA
     libnuma1 \
     libnuma-dev \
     numactl \
@@ -107,7 +109,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libgtest-dev \
     libjsoncpp-dev \
     libunwind-dev \
-    libboost-all-dev \
+    libboost-dev \
     libssl-dev \
     libgrpc-dev \
     libgrpc++-dev \
@@ -119,7 +121,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libcurl4-openssl-dev \
     libczmq4 \
     libczmq-dev \
-    libfabric-dev \
     linux-libc-dev \
     # Package building tools
     devscripts \
@@ -190,7 +191,7 @@ ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
 
-# Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
+# Rust toolchain for setuptools-rust extensions (sglang-mm, sglang-server).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
 ENV PATH="/root/.cargo/bin:${PATH}"
 RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
@@ -211,9 +212,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Split from the pip install so changes to these build inputs invalidate the
 # dependency layer, while unrelated Python source changes do not.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
-COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY rust/sglang-runtime-v1-types /tmp/sglang_deps/rust/sglang-runtime-v1-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
@@ -545,6 +544,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --prerelease=allow --index-strategy unsafe-best-match \
         --extra-index-url https://pypi.nvidia.com/ ai-dynamo
 
+# Install the AWS EFA userspace for NIXL's LIBFABRIC backend, Mooncake's EFA
+# transport and NCCL over aws-ofi-nccl.
+ARG EFA_INSTALLER_VERSION
+ARG EFA_INSTALLER_SHA256
+RUN --mount=type=bind,source=scripts/install_efa.sh,target=/tmp/install_efa.sh \
+    bash /tmp/install_efa.sh
+# LD_LIBRARY_PATH is required: under `--gpus` the NVIDIA toolkit reruns
+# ldconfig, which puts the distro libfabric first in the cache.
+ENV LD_LIBRARY_PATH="/opt/amazon/efa/lib:${LD_LIBRARY_PATH}" \
+    PATH="/opt/amazon/efa/bin:${PATH}"
+
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
 
@@ -608,6 +618,17 @@ ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 
 WORKDIR /sgl-workspace
+
+# torch 2.14 pins cuBLAS 13.1, which has no SM120 GEMM kernels; SM120 images can opt into
+# 13.4 (--build-arg SGL_CUBLAS_VERSION=13.4.3.11). Keep after every torch dependency install.
+ARG SGL_CUBLAS_VERSION=
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ -n "${SGL_CUBLAS_VERSION}" ]; then \
+        if [ "${CUDA_VERSION%%.*}" != "13" ]; then \
+            echo "SGL_CUBLAS_VERSION installs the CUDA 13 cuBLAS wheel, not for CUDA ${CUDA_VERSION}" && exit 1; \
+        fi; \
+        uv pip install --reinstall --no-deps "nvidia-cublas==${SGL_CUBLAS_VERSION}"; \
+    fi
 
 COPY --from=local_src /src /tmp/local_src
 RUN if [ "$BRANCH_TYPE" = "local" ]; then \

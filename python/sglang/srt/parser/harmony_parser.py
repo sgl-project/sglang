@@ -420,7 +420,6 @@ class TextStrategy:
     """Parses the text-based Harmony fallback format."""
 
     def __init__(self):
-        self.buffer_context = ""
         self.patterns = {
             "analysis_then_final": re.compile(
                 r"^\s*(?:assistant)?\s*(analysis|commentary)(.*?)\s*assistantfinal\s*(.*)\s*$",
@@ -434,9 +433,6 @@ class TextStrategy:
                 re.IGNORECASE | re.DOTALL,
             ),
         }
-
-    def set_buffer_context(self, buffer: str):
-        self.buffer_context = buffer
 
     def parse(self, text: str) -> Tuple[List[Event], str]:
         events = []
@@ -526,10 +522,6 @@ class HarmonyParser:
             else:
                 # Not yet determined, hold
                 return []
-
-        if hasattr(self.strategy, "set_buffer_context"):
-            # Provide full buffer context to strategy for smarter whitespace handling
-            self.strategy.set_buffer_context(self._buffer)
 
         events, remaining = self.strategy.parse(self._buffer)
 

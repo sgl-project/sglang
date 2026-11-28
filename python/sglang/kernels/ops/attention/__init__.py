@@ -64,6 +64,7 @@ _TRITON_KERNELS = [
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
     ("mla_qk_prep", "concat_and_cast_mha_k_triton"),
     ("beam_shared_context", "shared_context_attention"),
+    ("beam_shared_context_split_kv", "shared_context_attention_split_kv"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -473,6 +474,15 @@ for _bk in ("torch", "triton", "helion"):
         )
     )
 del _bk
+# gfx950 TLX kernels; see "TLX kernel backend" in kernels/README.md.
+register_kernel(
+    KernelSpec(
+        op="attention.tlx_qk_norm_rope_kv_cache",
+        backend=KernelBackend.TLX,
+        target="sglang.kernels.ops.attention.tlx_qk_norm_rope_kv_cache:qk_norm_rope_kv_cache",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 for _mod, _fn in [
     ("mla_qk_prep", "concat_and_cast_q_fp8_pad"),
     ("mla_qk_prep", "absorbed_bmm_concat_cast_q_fp8"),
@@ -764,6 +774,14 @@ register_kernel(
         op="attention.indexer_q_quant_head_gate",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.attention.dsa.head_gate:indexer_q_quant_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_head_gate",
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )

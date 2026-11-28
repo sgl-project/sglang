@@ -10,11 +10,13 @@ import io
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.choices import REMOVED_CHOICES
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.multimodal.media_io import (
     configure_media_url_security,
+    media_url_security_config,
     media_url_timeout,
     read_local_media_file,
 )
@@ -132,6 +134,13 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
         finally:
             configure_media_url_security([], max_file_size_mb=64)
 
+    def test_allow_private_media_hosts_arg(self):
+        try:
+            self._parse(["--allow-private-media-hosts"])
+            self.assertEqual(media_url_security_config()[4], True)
+        finally:
+            configure_media_url_security([], max_file_size_mb=64)
+
     def test_media_url_security_args_reject_invalid_values(self):
         try:
             with self.assertRaises(ValueError):
@@ -145,11 +154,8 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def test_literal_auto_derives_choices(self):
         """Literal type annotations produce argparse choices automatically."""
-        sa = self._parse(
-            ["--deepep-mode", "low_latency", "--elastic-ep-backend", "none"]
-        )
+        sa = self._parse(["--deepep-mode", "low_latency"])
         self.assertEqual(sa.deepep_mode, "low_latency")
-        self.assertEqual(sa.elastic_ep_backend, "none")
 
     def test_startup_weight_load_mode(self):
         """The startup loading mode keeps serial as the safe default."""
@@ -173,6 +179,40 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                     "unsupported",
                 ]
             )
+
+    def test_continuous_decode_steps_is_a_deprecated_noop(self):
+        from sglang.srt.entrypoints.engine import Engine
+
+        flag = "--num-continuous-decode-steps"
+        field = "num_continuous_decode_steps"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = os.path.join(tmp, "config.yaml")
+            with open(config, "w") as handle:
+                handle.write("num-continuous-decode-steps: 2\n")
+            yaml_args = ConfigArgumentMerger(self.parser).merge_config_with_args(
+                ["--config", config]
+            )
+            for source, argv in (("CLI", [flag, "2"]), ("YAML", yaml_args)):
+                with self.subTest(source=source):
+                    with self.assertLogs() as logs:
+                        args = self._parse(argv)
+                    self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
+                    self.assertIsNone(resolution_result(args, field))
+
+        # Stop the offline Engine at the subprocess boundary.
+        with (
+            patch("sglang.srt.entrypoints.engine.atexit.register"),
+            patch.object(
+                Engine, "_launch_subprocesses", side_effect=StopIteration
+            ) as launch,
+            self.assertRaises(StopIteration),
+        ):
+            Engine(model_path="dummy", num_continuous_decode_steps=2)
+        args = launch.call_args.kwargs["server_args"]
+        with self.assertLogs() as logs:
+            args.resolve_once()
+        self.assertIn(f"{field} is deprecated", "\n".join(logs.output))
+        self.assertIsNone(resolution_result(args, field))
 
     def test_removed_flags_name_their_replacement(self):
         """A flag removed in SGLang 1.0 stops the launch with a message naming
@@ -232,7 +272,7 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 )
 
     def test_each_deprecation_shape_does_its_job(self):
-        """The four `Deprecated*Action` shapes, on a throwaway parser.
+        """Four `Deprecated*Action` shapes, on a throwaway parser.
 
         `ServerArgs` registers `DeprecatedAction` with `error_message=` (the
         removed flags, covered above) and `DeprecatedAliasStoreAction`

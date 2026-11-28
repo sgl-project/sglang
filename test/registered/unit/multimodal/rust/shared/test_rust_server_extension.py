@@ -393,7 +393,9 @@ def build_rust_frame_metadata_fixture() -> dict:
                 send_to_detokenizer=send_to_detokenizer,
                 tree_cache=None,
                 server_args=SimpleNamespace(
-                    enable_hierarchical_cache=False, enable_lmcache=False
+                    enable_hierarchical_cache=False,
+                    enable_lmcache=False,
+                    enable_unified_cache_external_linker=False,
                 ),
                 is_generation=True,
                 spec_algorithm=SpeculativeAlgorithm.EAGLE,
@@ -681,6 +683,7 @@ def launch_context(server_cls, cores=(None, None)):
             "get_disagg",
             return_value=SimpleNamespace(disaggregation_mode="null"),
         ),
+        patch.object(server_module, "vlm_warmup_image_base64", return_value=None),
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
         ) as build_args,
@@ -735,6 +738,8 @@ class TestRustServerExtension(CustomTestCase):
             request_class=GenerateReqInput,
             server_added_custom_params=(),
             port_offset=1,
+            vlm_warmup_image_base64=None,
+            vlm_warmup_prompt=None,
         )
         # What a crash dump carries.
         self.assertIs(instance.server_args, sentinel.server_args)
@@ -771,8 +776,9 @@ class TestRustServerExtension(CustomTestCase):
 
     def test_gather_server_endpoints_lists_every_listener_by_dp_rank(self):
         """Every rank joins the collective; only listener ranks contribute an
-        entry, an unspecified bind host is replaced by a reachable one, and
-        the table comes back sorted by DP rank."""
+        entry, with a peer token drawn afresh at each launch, an unspecified
+        bind host is replaced by a reachable one, and the table comes back
+        sorted by DP rank."""
         gathered = []
 
         def all_gather_object(obj):
@@ -780,7 +786,8 @@ class TestRustServerExtension(CustomTestCase):
             return [
                 {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
                 None,
-                obj or {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                # The listener rank's entry, the same on every rank.
+                obj or gathered[0],
                 None,
             ]
 
@@ -819,16 +826,21 @@ class TestRustServerExtension(CustomTestCase):
         ):
             table = RustServer.gather_server_endpoints(hosts_listener=True)
             others_only = RustServer.gather_server_endpoints(hosts_listener=False)
+            relaunched = RustServer.gather_server_endpoints(hosts_listener=True)
 
-        self.assertEqual(
-            gathered[0], {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
-        )
+        token = gathered[0]["peer_token"]
+        self.assertGreaterEqual(len(token), 32)
+        self.assertNotEqual(relaunched[0]["peer_token"], token)
         self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
         self.assertEqual(others_only, table)
         self.assertEqual(
             table,
             [
-                {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                {
+                    "dp_rank": 0,
+                    "endpoint": "http://10.0.0.1:30000",
+                    "peer_token": token,
+                },
                 {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
             ],
         )
@@ -906,6 +918,9 @@ class TestRustServerExtension(CustomTestCase):
                 ),
                 patch.object(server_module, "get_serving", return_value=serving),
                 patch.object(RustServer, "_port_offset", return_value=0),
+                patch.object(
+                    server_module.secrets, "token_urlsafe", return_value="token"
+                ),
             ):
                 for hosts_listener in (True, False):
                     with self.subTest(
@@ -925,6 +940,7 @@ class TestRustServerExtension(CustomTestCase):
                                         "endpoint": server_module.NetworkAddress(
                                             published, 30000
                                         ).to_url(),
+                                        "peer_token": "token",
                                     }
                                 ],
                             )
@@ -939,7 +955,7 @@ class TestRustServerExtension(CustomTestCase):
         def all_gather_object(obj):
             gathered.append(obj)
             return [
-                obj or {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                obj or gathered[0],
                 {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
             ]
 
@@ -981,6 +997,9 @@ class TestRustServerExtension(CustomTestCase):
                     "get_serving",
                     return_value=SimpleNamespace(host="10.0.0.1", port=30000),
                 ),
+                patch.object(
+                    server_module.secrets, "token_urlsafe", return_value="token"
+                ),
             ):
                 gathered.clear()
                 tables = [
@@ -991,12 +1010,14 @@ class TestRustServerExtension(CustomTestCase):
                     self.assertEqual(tables, [[], []])
                     self.assertEqual(gathered, [], "a joiner never enters the gather")
                 else:
-                    self.assertEqual(
-                        gathered,
-                        [{"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}, None],
-                    )
+                    own = {
+                        "dp_rank": 0,
+                        "endpoint": "http://10.0.0.1:30000",
+                        "peer_token": "token",
+                    }
+                    self.assertEqual(gathered, [own, None])
                     expected = [
-                        {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                        own,
                         {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
                     ]
                     self.assertEqual(tables, [expected, expected])

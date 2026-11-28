@@ -110,7 +110,6 @@ def pcg_dsa_indexer_prefill_split(
             num_tokens=extend_num_tokens,
         )
         indexer._get_topk_ragged(
-            False,
             forward_batch,
             layer_id,
             q_fp8,
@@ -135,7 +134,6 @@ def pcg_dsa_indexer_prefill_split(
             enable_dual_stream=False,
         )
         indexer._get_topk_ragged(
-            False,
             forward_batch,
             layer_id,
             q_fp8,
@@ -202,7 +200,6 @@ def pcg_dsa_indexer_prefill_split(
     if not return_indices:
         return
     indexer._get_topk_ragged(
-        False,
         forward_batch,
         layer_id,
         q_fp8 if in_cp else q_fp8[:extend_num_tokens],

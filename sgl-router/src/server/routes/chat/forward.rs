@@ -9,8 +9,8 @@ use super::preparation::{
 };
 use crate::config::DpRankPolicy;
 use crate::discovery::{ModelId, WorkerId, WorkerMode};
-use crate::policies::dp_rank::{projected_rank_tokens, select_dp_rank};
-use crate::proxy::grpc::{Additions, EngineRpc, GrpcResponse};
+use crate::policies::dp_rank::{expected_rank_tokens, select_dp_rank};
+use crate::proxy::grpc::{Additions, GrpcResponse};
 use crate::proxy::sse::{self, ErrorEventScanner, PumpItem, StreamEnd, StreamEndReason};
 use crate::proxy::Proxy;
 use crate::server::app_context::AppContext;
@@ -19,6 +19,7 @@ use crate::server::metrics::{
     classify_stream_end, outcome_from_status, MediaCounts, MetricsRegistry, RequestLogContext,
     RequestOutcome, StaleRequestOutcome, WorkerModeLabel,
 };
+use crate::state::kv_events::prefix_provider::RankDepths;
 use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
@@ -27,7 +28,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::StreamExt;
-use sglang_runtime_v1_types::DisaggregatedParams;
+use sglang_api_types::api::v1::GenerateRequest;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -92,17 +93,14 @@ pub(super) async fn forward_request(
 
 /// [`forward_request`] for a gRPC client: the engines are called with `rpc`.
 /// The log context is `None` when the request failed before dispatch.
-pub(super) async fn forward_request_grpc<R: EngineRpc>(
-    rpc: R,
+pub(super) async fn forward_request_grpc(
+    rpc: GenerateRequest,
     ctx: &AppContext,
     request: &mut PreparedRequest,
     routing: &super::ModelRouting<'_>,
     headers: HeaderMap,
     request_started_at: Instant,
-) -> (
-    Result<GrpcResponse<R::Reply>, ApiError>,
-    Option<RequestLogContext>,
-) {
+) -> (Result<GrpcResponse, ApiError>, Option<RequestLogContext>) {
     let transport = Grpc(Arc::new(rpc));
     let mut excluded = Vec::new();
     let mut failed = None;
@@ -176,6 +174,7 @@ async fn dispatch<T: Transport>(
         decode,
         track_dispatch_timestamps,
     } = workers;
+    let decode = decode.filter(|_| !prefill_answers_alone(ctx, request, &prefill));
     let decode_url_header = decode
         .as_ref()
         .and_then(|worker| parse_decode_url_header(&worker.url));
@@ -230,16 +229,13 @@ async fn dispatch<T: Transport>(
     let engine_rid = request.engine_rid();
     let additions = Additions {
         rid: engine_rid.clone(),
-        bootstrap: pd.as_ref().map(|(_, bootstrap)| DisaggregatedParams {
-            bootstrap_host: bootstrap.host.clone(),
-            bootstrap_port: bootstrap.port.map_or(0, i32::from),
-            bootstrap_room: bootstrap.room as i64,
-        }),
+        bootstrap: pd.as_ref().map(|(_, bootstrap)| bootstrap.clone()),
         sampling_defaults: request.sampling_defaults(),
         routed_dp_rank: None,
+        disagg_prefill_dp_rank: None,
     };
     let body = request.outgoing_body(
-        ctx,
+        &ctx.metrics,
         pd.as_ref().map(|(_, bootstrap)| bootstrap),
         engine_rid.as_deref(),
     )?;
@@ -254,7 +250,7 @@ async fn dispatch<T: Transport>(
     let prefill_load_guards = (
         worker_load_guard,
         active_request_guard,
-        prefill_rank.map(|rank| rank_guard(ctx, &prefill, rank)),
+        prefill_rank.map(|rank| rank_guard(&prefill, rank, ctx.config.model.dp_rank_policy)),
     );
 
     // In PD mode, prefill runs independently and decode supplies the client response.
@@ -297,16 +293,11 @@ async fn dispatch<T: Transport>(
                 .await?;
                 abort.disarm();
             }
+            let decode_policy = ctx.config.model.decode_dp_rank_policy();
             let decode_rank = dp_aware
                 .then(|| {
-                    let rank_tokens = rank_tokens(ctx, &decode);
-                    select_dp_rank(
-                        &decode,
-                        None,
-                        &[],
-                        &rank_tokens,
-                        ctx.config.model.dp_rank_policy,
-                    )
+                    let rank_tokens = rank_tokens(ctx, &decode, decode_policy);
+                    select_dp_rank(&decode, None, &[], None, &rank_tokens, decode_policy)
                 })
                 .flatten();
             let decode_load_guards = (
@@ -318,7 +309,7 @@ async fn dispatch<T: Transport>(
                     1,
                     request_started_at.elapsed(),
                 ),
-                decode_rank.map(|rank| rank_guard(ctx, &decode, rank)),
+                decode_rank.map(|rank| rank_guard(&decode, rank, decode_policy)),
             );
             let decode_leg = Leg::new(
                 dp_aware,
@@ -397,6 +388,17 @@ async fn dispatch<T: Transport>(
         decode_url_header,
         retry_excluding,
     })
+}
+
+/// Whether `prefill` answers this request with no decode: the operator opted
+/// in, the engine reports it can, and the request wants at most one token. A
+/// request with no bootstrap fields is then plain to prefill, which samples
+/// its one token, finishes it and caches the prompt.
+fn prefill_answers_alone(ctx: &AppContext, request: &PreparedRequest, prefill: &Worker) -> bool {
+    ctx.config.proxy.one_token_on_prefill_only
+        && prefill.mode() == WorkerMode::Prefill
+        && prefill.prefill_answers_alone()
+        && request.wants_at_most_one_token()
 }
 
 async fn admit_decode(
@@ -507,6 +509,7 @@ impl Leg {
         let routed_dp_rank = dp_aware.then_some(rank);
         let additions = Additions {
             routed_dp_rank,
+            disagg_prefill_dp_rank: prefill_rank,
             ..additions.clone()
         };
         Self {
@@ -621,17 +624,12 @@ fn prepend_prefill_logprobs(prefill_body: &[u8], decode_body: &[u8]) -> Option<V
     serde_json::to_vec(&decode).ok()
 }
 
-/// Reaches engines through the native RPC the client called.
-struct Grpc<R>(Arc<R>);
+/// Forwards the shared Generate request to the selected engines.
+#[derive(Clone)]
+struct Grpc(Arc<GenerateRequest>);
 
-impl<R> Clone for Grpc<R> {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl<R: EngineRpc> Transport for Grpc<R> {
-    type Response = GrpcResponse<R::Reply>;
+impl Transport for Grpc {
+    type Response = GrpcResponse;
     async fn respond(
         _request: &mut PreparedRequest,
         response: Self::Response,
@@ -674,9 +672,8 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         ctx.proxy
             .forward_grpc(
                 worker,
-                &*self.0,
+                &self.0,
                 &leg.headers,
-                leg.body,
                 &leg.additions,
                 engine_rid,
                 metrics.streaming,
@@ -696,11 +693,10 @@ impl<R: EngineRpc> Transport for Grpc<R> {
         _path: &'static str,
         leg: Leg,
     ) -> PrefillOutcome<Self::Response> {
-        let (headers, body, additions) = (&leg.headers, leg.body, &leg.additions);
+        let (headers, additions) = (&leg.headers, &leg.additions);
         let result = proxy
             .forward_grpc(
-                &worker, &*self.0, headers, body, additions, None, false, None, None, None, None,
-                None,
+                &worker, &self.0, headers, additions, None, false, None, None, None, None, None,
             )
             .await;
         let status = match result {
@@ -754,39 +750,47 @@ fn prompt_dp_rank(
         .into_iter()
         .flatten()
         .find_map(|name| nonempty_header(headers, name));
-    let prefix_depths = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
+    let placement = match (key, &ctx.dp_rank_prefix_provider, &request.tokens) {
         (None, Some(provider), Some(tokens)) => {
             provider.rank_depths(&tokens.ids, &request.cache_namespace, &worker.url)
         }
-        _ => Vec::new(),
+        _ => RankDepths::default(),
     };
-    let rank_tokens = rank_tokens(ctx, worker);
-    select_dp_rank(
+    let rank_tokens = rank_tokens(ctx, worker, model.dp_rank_policy);
+    let rank = select_dp_rank(
         worker,
         key,
-        &prefix_depths,
+        &placement.depths,
+        placement.preferred,
         &rank_tokens,
         model.dp_rank_policy,
-    )
+    );
+    if let (Some(rank), Some(provider), Some(tokens)) =
+        (rank, &ctx.dp_rank_prefix_provider, &request.tokens)
+    {
+        provider.record_rank(&tokens.ids, &request.cache_namespace, &worker.url, rank);
+    }
+    rank
 }
 
-/// KV tokens per rank of `worker` for `--dp-rank-policy least_tokens`: the
-/// engine's fresh readings projected by this router's dispatches since them.
+/// KV tokens per rank of `worker` when `policy` is `least_tokens`: what each
+/// rank is expected to hold, from the engine's fresh readings and this
+/// router's dispatches since them.
 /// Empty under any other policy, and while any rank lacks a fresh reading,
 /// which makes the selector fall back to its in-flight count.
-fn rank_tokens(ctx: &AppContext, worker: &Worker) -> Vec<(u32, u64)> {
-    if ctx.config.model.dp_rank_policy != DpRankPolicy::LeastTokens || worker.dp_ranks() <= 1 {
+fn rank_tokens(ctx: &AppContext, worker: &Worker, policy: DpRankPolicy) -> Vec<(u32, u64)> {
+    if policy != DpRankPolicy::LeastTokens || worker.dp_ranks() <= 1 {
         return Vec::new();
     }
     ctx.engine_reported_load
         .fresh_rank_loads(&worker.url, Instant::now())
-        .map_or_else(Vec::new, |loads| projected_rank_tokens(worker, &loads))
+        .map_or_else(Vec::new, |loads| expected_rank_tokens(worker, &loads))
 }
 
 /// Holds the rank slot; stamped under `least_tokens` so later selections can
 /// count it against the engine's last reading.
-fn rank_guard(ctx: &AppContext, worker: &Worker, rank: u32) -> DpRankGuard {
-    if ctx.config.model.dp_rank_policy == DpRankPolicy::LeastTokens {
+fn rank_guard(worker: &Worker, rank: u32, policy: DpRankPolicy) -> DpRankGuard {
+    if policy == DpRankPolicy::LeastTokens {
         worker.dp_rank_timestamped_guard(rank)
     } else {
         worker.dp_rank_guard(rank)
@@ -1192,11 +1196,54 @@ impl Drop for RequestDurationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::WorkerSpec;
+    use crate::workers::worker::EngineProfile;
     use axum::http::StatusCode;
+
+    fn worker(mode: WorkerMode, prefill_answers_alone: bool) -> Worker {
+        let spec = WorkerSpec {
+            id: WorkerId("p".into()),
+            url: "http://p:30000".into(),
+            mode,
+            model_ids: vec![ModelId("m".into())],
+            ..Default::default()
+        };
+        let profile = EngineProfile {
+            prefill_answers_alone,
+            ..EngineProfile::from(crate::workers::WireProtocol::default())
+        };
+        Worker::with_cb_config(spec, None, profile)
+    }
+
+    /// Skipping decode needs the operator's flag and a prefill engine that
+    /// reports it can answer alone; an older engine keeps prefill and decode.
+    #[test]
+    fn prefill_answers_alone_needs_the_flag_and_the_engine() {
+        let mut ctx = AppContext::stub();
+        let mut request = PreparedRequest::test_generate(Some(1));
+        let capable = worker(WorkerMode::Prefill, true);
+        assert!(!prefill_answers_alone(&ctx, &request, &capable));
+
+        ctx.config.proxy.one_token_on_prefill_only = true;
+        assert!(prefill_answers_alone(&ctx, &request, &capable));
+        assert!(!prefill_answers_alone(
+            &ctx,
+            &request,
+            &worker(WorkerMode::Prefill, false)
+        ));
+        assert!(!prefill_answers_alone(
+            &ctx,
+            &request,
+            &worker(WorkerMode::Plain, true)
+        ));
+
+        request.output_tokens = Some(2);
+        assert!(!prefill_answers_alone(&ctx, &request, &capable));
+    }
 
     #[tokio::test]
     async fn stream_after_prefill_waits_for_prefill() {
-        let prefill = Arc::new(Worker::new(crate::discovery::WorkerSpec {
+        let prefill = Arc::new(Worker::new(WorkerSpec {
             mode: WorkerMode::Prefill,
             ..Default::default()
         }));

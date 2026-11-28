@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
+    StorageMetricsCollector,
     radix_cache_metric_labels,
     resolve_collector_class,
 )
@@ -38,6 +39,7 @@ from sglang.srt.runtime_context import get_observability, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
+    from sglang.srt.managers.kv_hints import KvHintsEnvelope
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
     from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -486,6 +488,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     cache_controller: Optional[HiCacheController] = None
     buffer_pipeline: Optional[BufferModePipeline] = None
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
+    # Set by caches with an L3 storage backend and storage metrics enabled.
+    storage_metrics_collector: Optional[StorageMetricsCollector] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
 
@@ -933,6 +937,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Whether a request's prefix stays in the cache for other requests to
         share, including after the request finishes."""
         return True
+
+    def forwards_kv_hints(self) -> bool:
+        """Whether request ``kv_hints`` reach an attached storage backend."""
+        return False
+
+    def forwards_kv_hint_actions(self, kv_hints: Optional[KvHintsEnvelope]) -> bool:
+        """Whether this request's ``kv_hints`` would reach the storage backend."""
+        return (
+            kv_hints is not None and bool(kv_hints.actions) and self.forwards_kv_hints()
+        )
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
