@@ -22,6 +22,12 @@ class BootstrapRoom:
     ready_notified: bool = False
     failed: bool = False
     expires_at: float = 0.0
+    # The transfer succeeded and decode has been told; the owner has not
+    # released the room yet.
+    concluded: bool = False
+    # Decode's registration of the room's next request, which arrived while
+    # this one was concluded but not released.
+    next_endpoint: tuple[str, int] | None = None
 
 
 class DeferredBootstrap:
@@ -50,8 +56,8 @@ class DeferredBootstrap:
             if state.failed:
                 return state.endpoint, True
             if state.ready and not state.ready_notified:
-                # One readiness message per transfer. Decode must consume it
-                # before publishing destinations, so none can trail Success
+                # One readiness message per transfer and PP stage, sent before
+                # that stage's Success; so none can trail the room's Success
                 # and accidentally admit the next transfer using this room.
                 state.ready_notified = True
                 return state.endpoint, False
@@ -68,6 +74,12 @@ class DeferredBootstrap:
     def register(self, room: int, endpoint: tuple[str, int]) -> BootstrapNotification:
         with self.lock:
             state = self._room(room)
+            if state.concluded:
+                # Decode heard Success, so this registers the room's next
+                # request; it applies once this one is released.
+                if state.next_endpoint is None:
+                    state.next_endpoint = endpoint
+                return None
             if state.endpoint is not None and state.endpoint != endpoint:
                 # A room identifies one request, not a reusable allocation slot.
                 # Reject another receiver without replacing the first endpoint.
@@ -83,13 +95,37 @@ class DeferredBootstrap:
             state.ready = True
             return self._notification(state)
 
+    def conclude(self, room: int) -> bool:
+        """Commit the room's transfer success before decode is told. False when
+        a failure or cancellation won, which then owns decode's notification."""
+        with self.lock:
+            state = self.rooms.get(room)
+            if state is None or state.owner is None or state.failed:
+                return False
+            state.concluded = True
+            return True
+
+    def awaits_release(self, room: int) -> bool:
+        """Whether the room's previous request succeeded but is not released;
+        its next request must not open the room until then."""
+        with self.lock:
+            state = self.rooms.get(room)
+            return state is not None and state.owner is not None and state.concluded
+
     def fail(self, room: int) -> BootstrapNotification:
         with self.lock:
             state = self._room(room)
-            if state.failed:
+            if state.failed or state.concluded:
+                # Decode already holds a concluded transfer's Success.
                 return None
             state.failed = True
             return self._notification(state)
+
+    def cancel(self, room: int) -> None:
+        """Record decode's ABORT; on a concluded room it cancels the room's
+        next request, the only one decode can still abort."""
+        with self.lock:
+            self._room(room).failed = True
 
     def close(
         self, room: int, owner: object, *, success: bool = False
@@ -98,12 +134,19 @@ class DeferredBootstrap:
             state = self.rooms.get(room)
             if state is None or state.owner is not owner:
                 return None
-            if success and not state.failed:
-                # The caller clears transport state before sending Success.
-                # Only then can decode reuse this room for recomputation.
-                del self.rooms[room]
-                return (state.endpoint, False) if state.endpoint is not None else None
+            if not state.failed and (success or state.concluded):
+                # The transfer worker already told decode. A registration of the
+                # room's next request that arrived since starts that room.
+                if state.next_endpoint is None:
+                    del self.rooms[room]
+                else:
+                    self.rooms[room] = BootstrapRoom(
+                        endpoint=state.next_endpoint,
+                        expires_at=time.monotonic() + self.timeout,
+                    )
+                return None
             state.owner = None
+            state.concluded = False
             already_failed = state.failed
             state.failed = True
             state.expires_at = time.monotonic() + self.timeout

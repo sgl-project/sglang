@@ -111,6 +111,10 @@ class _Stage(SchedulerDisaggregationPrefillMixin):
             request_status=self.store,
             failure_records={},
             failure_lock=threading.Lock(),
+            deferred_bootstrap=None,
+        )
+        self.kv_mgr._room_awaits_release = partial(
+            CommonKVManager._room_awaits_release, self.kv_mgr
         )
         self.pp_group = SimpleNamespace(
             recv_object=pp_group.recv_object, send_object=pp_group.send_object
