@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 import torch
 
-from ..batch_layout import num_prefill_rows
+from sglang.srt.utils.device import async_h2d
+
+from ..batch_layout import prefill_completes
 from ..config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
+    MAX_WATERMARKED_CONTEXTS_PER_REQUEST,
     WatermarkRequestConfig,
     parse_watermark_key,
 )
@@ -19,7 +22,7 @@ from .state import WatermarkState
 if TYPE_CHECKING:
     from sglang.srt.arg_groups.fields.exec_ import ExecFeatures
     from sglang.srt.arg_groups.model_override_base import ResolvingConfig
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
@@ -133,6 +136,92 @@ def build_rows(values: torch.Tensor, candidates_host: list[bool]) -> GumbelRows:
     )
 
 
+class GumbelPrefill(msgspec.Struct, frozen=True):
+    # Per batch row, the fill tail a row whose prefill completes seeds its context
+    # from; None for every other row.
+    prompt_tails: list[Optional[list[int]]]
+    # Per batch row, the contexts a retracted request already watermarked, for
+    # the seeded rows; None without a seeded retracted request.
+    histories: Optional[list[Optional[list[int]]]]
+    # Batch rows that commit, every row but the unfinished prefill chunks; None
+    # when every row commits.
+    commit_rows: Optional[torch.Tensor]
+
+    def __repr__(self) -> str:
+        return f"GumbelPrefill(rows={len(self.prompt_tails)!r})"
+
+
+def build_prefill(
+    rows: GumbelRows,
+    reqs: Sequence[Req],
+    num_prefill_rows: int,
+    *,
+    features: ExecFeatures,
+) -> GumbelPrefill:
+    seeds = [
+        index < num_prefill_rows and prefill_completes(req)
+        for index, req in enumerate(reqs)
+    ]
+    commits = [index >= num_prefill_rows or seeds[index] for index in range(len(reqs))]
+    context_window = features.watermark_context_window
+    histories = [
+        (
+            _retracted_context_hashes(req, features)
+            if seed and req.retracted_stain
+            else None
+        )
+        for seed, req in zip(seeds, reqs)
+    ]
+    return GumbelPrefill(
+        prompt_tails=[
+            list(req.get_fill_ids()[-context_window:]) if seed else None
+            for seed, req in zip(seeds, reqs)
+        ],
+        histories=histories if any(h is not None for h in histories) else None,
+        commit_rows=(
+            None
+            if all(commits)
+            else async_h2d(
+                [index for index, commit in enumerate(commits) if commit],
+                dtype=torch.int64,
+                device=rows.keys.device,
+            )
+        ),
+    )
+
+
+def _retracted_context_hashes(req: Req, features: ExecFeatures) -> list[int]:
+    """The distinct contexts the retracted request watermarked, in order, up to
+    the state's capacity, which ``init_from_prompt`` applies."""
+    request_config = req.sampling_params.watermark
+    _, context_window, request_enabled = resolve_watermark_request(
+        request_config,
+        server_enabled=True,
+        default_key=features.watermark_key,
+        default_context_window=features.watermark_context_window,
+        default_enabled=features.watermark_default_enabled,
+        enforce_all=features.watermark_enforce_all,
+    )
+    if not request_enabled or req.sampling_params.top_k <= 1:
+        return []
+
+    token_ids = list(req.origin_input_ids) + list(req.output_ids)
+    seen = set()
+    history = []
+    for position in range(len(req.origin_input_ids), len(token_ids)):
+        context = token_ids[max(0, position - context_window) : position]
+        if not context:
+            continue
+        context_hash = hash_context(context)
+        if context_hash in seen:
+            continue
+        seen.add(context_hash)
+        history.append(_as_signed_int32(context_hash))
+        if len(history) == MAX_WATERMARKED_CONTEXTS_PER_REQUEST:
+            break
+    return history
+
+
 def request_enabled(sampling_params: SamplingParams, *, features: ExecFeatures) -> bool:
     _, _, enabled = resolve_watermark_request(
         sampling_params.watermark,
@@ -163,25 +252,12 @@ def make_engine(
         max_probability=features.watermark_max_probability,
         device=device,
     )
-    return GumbelEngine(state, features)
+    return GumbelEngine(state)
 
 
 class GumbelEngine:
-    def __init__(self, state: WatermarkState, features: ExecFeatures) -> None:
+    def __init__(self, state: WatermarkState) -> None:
         self.state = state
-        self._features = features
-
-    def seed_payload(
-        self, batch: ScheduleBatch
-    ) -> Optional[
-        tuple[list[Optional[list[int]]], Optional[list[Optional[list[int]]]]]
-    ]:
-        if batch.sampling_info.watermark is None:
-            return None
-        prompt_tails = self._prompt_tails(batch)
-        if prompt_tails is None:
-            return None
-        return prompt_tails, self._retracted_context_hashes(batch)
 
     def bind_sample(self, forward_batch: ForwardBatch) -> Optional[GumbelSample]:
         rows = forward_batch.sampling_info.watermark
@@ -195,69 +271,6 @@ class GumbelEngine:
         if rows is None:
             return None
         return GumbelVerify(self.state, rows, full_mask)
-
-    def _prompt_tails(
-        self, batch: ScheduleBatch
-    ) -> Optional[list[Optional[list[int]]]]:
-        if not batch.forward_mode.is_extend_without_speculative():
-            return None
-
-        num_prefill_reqs = num_prefill_rows(batch)
-        if num_prefill_reqs == 0:
-            return None
-
-        tails: list[Optional[list[int]]] = []
-        for index, req in enumerate(batch.reqs):
-            if index >= num_prefill_reqs:
-                tails.append(None)
-                continue
-            tails.append(list(req.get_fill_ids()[-self.state.context_window :]))
-        return tails
-
-    def _retracted_context_hashes(
-        self, batch: ScheduleBatch
-    ) -> Optional[list[Optional[list[int]]]]:
-        if not batch.forward_mode.is_extend_without_speculative():
-            return None
-
-        histories: list[Optional[list[int]]] = []
-        has_retracted_request = False
-        for req in batch.reqs:
-            if not req.retracted_stain:
-                histories.append(None)
-                continue
-
-            has_retracted_request = True
-            request_config = req.sampling_params.watermark
-            _, context_window, request_enabled = resolve_watermark_request(
-                request_config,
-                server_enabled=True,
-                default_key=self._features.watermark_key,
-                default_context_window=self.state.context_window,
-                default_enabled=self._features.watermark_default_enabled,
-                enforce_all=self._features.watermark_enforce_all,
-            )
-            if not request_enabled or req.sampling_params.top_k <= 1:
-                histories.append([])
-                continue
-
-            token_ids = list(req.origin_input_ids) + list(req.output_ids)
-            seen = set()
-            history = []
-            for position in range(len(req.origin_input_ids), len(token_ids)):
-                context = token_ids[max(0, position - context_window) : position]
-                if not context:
-                    continue
-                context_hash = hash_context(context)
-                if context_hash in seen:
-                    continue
-                seen.add(context_hash)
-                history.append(_as_signed_int32(context_hash))
-                if len(history) == self.state.watermarked_context_hashes.shape[1]:
-                    break
-            histories.append(history)
-
-        return histories if has_retracted_request else None
 
 
 class GumbelSample:
@@ -280,8 +293,11 @@ class GumbelSample:
         forward_batch = self.forward_batch
         logprob_logits = logits.clone() if keep_logits else None
         req_pool_indices = forward_batch.req_pool_indices[: logits.shape[0]]
-        if forward_batch.watermark_seed is not None:
-            self.state.init_from_prompt(req_pool_indices, *forward_batch.watermark_seed)
+        prefill = forward_batch.sampling_info.watermark_prefill
+        if prefill is not None:
+            self.state.init_from_prompt(
+                req_pool_indices, prefill.prompt_tails, prefill.histories
+            )
         self.state.force(
             logits,
             req_pool_indices,
@@ -294,6 +310,12 @@ class GumbelSample:
 
     def commit(self, token_ids: torch.Tensor) -> None:
         req_pool_indices = self.forward_batch.req_pool_indices[: token_ids.shape[0]]
+        prefill = self.forward_batch.sampling_info.watermark_prefill
+        if prefill is not None and prefill.commit_rows is not None:
+            if prefill.commit_rows.numel() == 0:
+                return
+            req_pool_indices = req_pool_indices[prefill.commit_rows]
+            token_ids = token_ids[prefill.commit_rows]
         self.state.append(req_pool_indices, token_ids)
 
 

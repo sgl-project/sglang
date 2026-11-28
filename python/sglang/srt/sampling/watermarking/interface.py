@@ -13,7 +13,7 @@ from torch import Tensor
 if TYPE_CHECKING:
     from sglang.srt.arg_groups.fields.exec_ import ExecFeatures
     from sglang.srt.arg_groups.model_override_base import ResolvingConfig
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
@@ -97,12 +97,18 @@ class VerifyWatermark(Protocol):
         ...
 
 
+class WatermarkPrefill(Protocol):
+    """One step's prefill rows, built by the scheduler at each launch from the
+    step's requests: the seed of each row whose prefill completes, which starts
+    its request's state, and the rows of unfinished chunks, whose sampled tokens
+    are dropped, so they commit nothing.
+
+    Only the algorithm's own engine reads its fields.
+    """
+
+
 class WatermarkEngine(Protocol):
     """Per-server device state, owned by the target ModelRunner (``model_runner.watermark``)."""
-
-    def seed_payload(self, batch: ScheduleBatch) -> Optional[Any]:
-        """Host-side state the next sample seeds from (``ForwardBatch.watermark_seed``)."""
-        ...
 
     def bind_sample(self, forward_batch: ForwardBatch) -> Optional[SampleWatermark]:
         """The batch's sampling watermark, or None when it has no watermark rows."""
@@ -151,6 +157,19 @@ class WatermarkAdapter(Protocol):
     def build_rows(self, values: Tensor, candidates_host: list[bool]) -> WatermarkRows:
         """The batch's rows from its gathered [NUM_POOL_FIELDS, bs] values;
         called only when some row is a candidate."""
+        ...
+
+    def build_prefill(
+        self,
+        rows: WatermarkRows,
+        reqs: Sequence[Req],
+        num_prefill_rows: int,
+        *,
+        features: ExecFeatures,
+    ) -> Optional[WatermarkPrefill]:
+        """The step's prefill rows, from its requests, of which the first
+        ``num_prefill_rows`` prefill; None when no row seeds and every row
+        commits. Called only when some row is a candidate and some row prefills."""
         ...
 
     def request_enabled(

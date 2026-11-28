@@ -499,18 +499,18 @@ class TestStepBuilds(CustomTestCase):
             self._make_req(top_k=3, mask_mode="support"),
         ]
         info = _make_info()
-        info.set_step_state(reqs, _rows())
+        info.set_step_state(reqs, _rows(), num_prefill_rows=0)
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1, 2, 3])
         self.assertEqual(
             info.sampling_support_logprobs_capture_indices.tolist(), [1, 2]
         )
         self.assertEqual(info.sampling_mask_top_ks, [1, 7, 50, 3])
 
-        info.set_step_state(reqs[:2], _rows())
+        info.set_step_state(reqs[:2], _rows(), num_prefill_rows=0)
         self.assertEqual(info.sampling_mask_batch_indices.tolist(), [1])
         self.assertIsNone(info.sampling_support_logprobs_capture_indices)
 
-        info.set_step_state(reqs[:1], _rows())
+        info.set_step_state(reqs[:1], _rows(), num_prefill_rows=0)
         self.assertIsNone(info.sampling_mask_batch_indices)
         self.assertIsNone(info.sampling_mask_top_ks)
 
@@ -534,7 +534,7 @@ class TestStepBuilds(CustomTestCase):
             max_page_tokens=3,
         )
         info = _make_info()
-        info.set_step_state([req], _rows())
+        info.set_step_state([req], _rows(), num_prefill_rows=0)
         self.assertTrue(info.facts.custom_logit_processor)
         logits = torch.zeros(1, VOCAB_SIZE)
         apply_custom_logit_processor(logits, info)
@@ -544,20 +544,20 @@ class TestStepBuilds(CustomTestCase):
     def test_grammars_are_set_only_when_a_request_has_one(self):
         reqs = [self._make_req(), self._make_req()]
         info = _make_info()
-        info.set_step_state(reqs, _rows())
+        info.set_step_state(reqs, _rows(), num_prefill_rows=0)
         self.assertIsNone(info.grammars)
         self.assertFalse(info.facts.grammar)
 
         grammar = object()
         reqs[1].grammar = grammar
-        info.set_step_state(reqs, _rows())
+        info.set_step_state(reqs, _rows(), num_prefill_rows=0)
         self.assertEqual(info.grammars, [None, grammar])
         self.assertTrue(info.facts.grammar)
 
     def test_stage_facts_follow_the_rows_and_keep_the_param_facts(self):
         info = _make_info()
         greedy = SamplingFacts(all_greedy=True)
-        info.set_step_state([self._make_req()], _rows(facts=greedy))
+        info.set_step_state([self._make_req()], _rows(facts=greedy), num_prefill_rows=0)
         self.assertEqual(info.facts, greedy)
 
         penalties = object()
@@ -567,7 +567,7 @@ class TestStepBuilds(CustomTestCase):
             watermark=object(),
             sampling_seed=torch.zeros(1, dtype=torch.int64),
         )
-        info.set_step_state([self._make_req()], rows)
+        info.set_step_state([self._make_req()], rows, num_prefill_rows=0)
         self.assertIs(info.step_penalties, penalties)
         self.assertEqual(
             info.facts,
@@ -578,7 +578,7 @@ class TestStepBuilds(CustomTestCase):
         req = self._make_req()
         req.custom_logit_processor = DisallowedTokensLogitsProcessor.to_str()
         info = _make_info()
-        info.set_step_state([req], _rows())
+        info.set_step_state([req], _rows(), num_prefill_rows=0)
         self.assertFalse(info.facts.custom_logit_processor)
         self.assertIsNone(info.custom_logit_processor)
 
@@ -595,7 +595,7 @@ class TestStepBuilds(CustomTestCase):
         req2.sampling_params.custom_params = None
 
         info = _make_info()
-        info.set_step_state([req1, req2], _rows())
+        info.set_step_state([req1, req2], _rows(), num_prefill_rows=0)
 
         self.assertTrue(info.facts.custom_logit_processor)
         self.assertIsNotNone(info.custom_logit_processor)

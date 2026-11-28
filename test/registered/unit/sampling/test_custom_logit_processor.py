@@ -133,7 +133,7 @@ class TestCustomLogitProcessorRows(CustomTestCase):
                     # No seeds, penalties, or watermark.
                     rows = SamplingRows(**dict.fromkeys(SamplingRows._fields))
                     rows = rows._replace(facts=SamplingFacts())
-                    info.set_step_state(reqs, rows)
+                    info.set_step_state(reqs, rows, num_prefill_rows=0)
                 logits = torch.full((3, 4), -1.0)
                 apply_custom_logit_processor(logits, info)
                 want = [float(rid) if rid in opted_in else -1.0 for rid in order]

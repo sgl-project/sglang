@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, Sequence
 
 import msgspec
 import torch
@@ -9,9 +9,9 @@ from sglang.kernels.ops.sampling.synthid import MAX_CHAIN_WIDTH
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.async_probe import sanitize_nan_logits
-from sglang.srt.utils.device import is_cuda, rows_where
+from sglang.srt.utils.device import async_h2d, is_cuda, rows_where
 
-from ..batch_layout import num_prefill_rows
+from ..batch_layout import prefill_completes
 from ..config import SYNTHID_CONFIG_FIELDS, WatermarkRequestConfig
 from ..interface import NO_WATERMARK_VIEW_FIELDS
 from .algorithm import SynthIDConfig
@@ -20,7 +20,7 @@ from .watermark import FilterProbs, SynthIDWatermark
 if TYPE_CHECKING:
     from sglang.srt.arg_groups.fields.exec_ import ExecFeatures
     from sglang.srt.arg_groups.model_override_base import ResolvingConfig
-    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.sampling.sampling_params import SamplingParams
@@ -101,6 +101,59 @@ def build_rows(values: torch.Tensor, candidates_host: list[bool]) -> SynthIDRows
     )
 
 
+class SynthIDPrefill(msgspec.Struct, frozen=True):
+    # Batch indices of the watermarked rows whose prefill completes, on the batch
+    # device, and the tokens each one's request already generated; None when no
+    # watermarked row seeds.
+    seed_rows: Optional[torch.Tensor]
+    replay_token_ids: list[list[int]]
+    # Batch indices of the watermarked rows that commit, every one but the
+    # unfinished prefill chunks; None when every watermarked row commits.
+    commit_rows: Optional[torch.Tensor]
+
+    def __repr__(self) -> str:
+        return f"SynthIDPrefill(seeds={len(self.replay_token_ids)!r})"
+
+
+def build_prefill(
+    rows: SynthIDRows,
+    reqs: Sequence[Req],
+    num_prefill_rows: int,
+    *,
+    features: ExecFeatures,
+) -> Optional[SynthIDPrefill]:
+    watermarked = [
+        index for index, candidate in enumerate(rows.candidates_host) if candidate
+    ]
+    seed_rows = [
+        index
+        for index in watermarked
+        if index < num_prefill_rows and prefill_completes(reqs[index])
+    ]
+    commit_rows = [
+        index
+        for index in watermarked
+        if index >= num_prefill_rows or prefill_completes(reqs[index])
+    ]
+    all_commit = len(commit_rows) == len(watermarked)
+    if not seed_rows and all_commit:
+        return None
+    device = rows.indices.device
+    return SynthIDPrefill(
+        seed_rows=(
+            async_h2d(seed_rows, dtype=torch.int64, device=device)
+            if seed_rows
+            else None
+        ),
+        replay_token_ids=[list(reqs[index].output_ids) for index in seed_rows],
+        commit_rows=(
+            None
+            if all_commit
+            else async_h2d(commit_rows, dtype=torch.int64, device=device)
+        ),
+    )
+
+
 def request_enabled(sampling_params: SamplingParams, *, features: ExecFeatures) -> bool:
     return _resolve_enabled(
         sampling_params.watermark,
@@ -143,21 +196,6 @@ class SynthIDEngine:
     ) -> None:
         self.watermark = watermark
         self.allow_fused_sample = allow_fused_sample
-
-    def seed_payload(
-        self, batch: ScheduleBatch
-    ) -> Optional[tuple[list[int], list[list[int]]]]:
-        rows = batch.sampling_info.watermark
-        if rows is None or not batch.forward_mode.is_extend_without_speculative():
-            return None
-        seed_rows = [
-            index
-            for index in range(num_prefill_rows(batch))
-            if rows.candidates_host[index]
-        ]
-        if not seed_rows:
-            return None
-        return seed_rows, [list(batch.reqs[index].output_ids) for index in seed_rows]
 
     def bind_sample(self, forward_batch: ForwardBatch) -> Optional[SynthIDSample]:
         rows = forward_batch.sampling_info.watermark
@@ -249,17 +287,16 @@ class SynthIDSample:
     def _seed_and_select(
         self, logits: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Seed the prefilled rows, sanitize ``logits``, and return the
-        watermarked rows' slots and temperatures."""
+        """Seed the rows whose prefill completes, sanitize ``logits``, and
+        return the watermarked rows' slots and temperatures."""
         forward_batch = self.forward_batch
         rows = self.rows
         req_pool_indices = forward_batch.req_pool_indices[: logits.shape[0]]
-        # Seeded at every extend that prefills the row; the commit has no mask,
-        # so a non-final chunk's commit is undone by the next chunk's reseed.
-        if forward_batch.watermark_seed is not None:
-            seed_rows, replay_token_ids = forward_batch.watermark_seed
-            seed_rows = torch.tensor(seed_rows, device=req_pool_indices.device)
-            self.watermark.state.seed(req_pool_indices[seed_rows], replay_token_ids)
+        prefill = forward_batch.sampling_info.watermark_prefill
+        if prefill is not None and prefill.seed_rows is not None:
+            self.watermark.state.seed(
+                req_pool_indices[prefill.seed_rows], prefill.replay_token_ids
+            )
         slots = rows.take(req_pool_indices)
         temperatures = rows.take(forward_batch.sampling_info.temperatures)
         # The stock sampler sanitizes too, but after the candidate top-k here.
@@ -268,9 +305,15 @@ class SynthIDSample:
 
     def commit(self, token_ids: torch.Tensor) -> None:
         req_pool_indices = self.forward_batch.req_pool_indices[: token_ids.shape[0]]
-        self.watermark.state.commit(
-            self.rows.take(req_pool_indices), self.rows.take(token_ids)
-        )
+        prefill = self.forward_batch.sampling_info.watermark_prefill
+        if prefill is None or prefill.commit_rows is None:
+            self.watermark.state.commit(
+                self.rows.take(req_pool_indices), self.rows.take(token_ids)
+            )
+        elif prefill.commit_rows.numel() > 0:
+            self.watermark.state.commit(
+                req_pool_indices[prefill.commit_rows], token_ids[prefill.commit_rows]
+            )
 
     def _can_fuse(self, keep_logits: bool) -> bool:
         sampling_info = self.forward_batch.sampling_info

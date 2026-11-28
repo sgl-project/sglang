@@ -83,7 +83,8 @@ The [operator guide's detector specification](../../../../../docs/docs/advanced_
 
 | File | Role |
 | --- | --- |
-| `interface.py` | The algorithm-neutral contract engine code calls: per-step rows, sample and verify hooks, and the per-server engine. |
+| `interface.py` | The algorithm-neutral contract engine code calls: per-step rows and prefill rows (each request's state is seeded once, when its prefill completes; an unfinished prefill chunk commits nothing), sample and verify hooks, and the per-server engine. |
+| `batch_layout.py` | Which rows of a batch prefill, and whether a prefill completes in this step. |
 | `runtime.py` | Engine entry points; the one place that dispatches on `--watermark-algorithm`. |
 | `config.py` | Key parsing, bounded JSON configuration loading, request watermark objects, and shared protocol limits. |
 | `redaction.py` | Redaction of watermark secrets from logs, dumps, and the launch command. |

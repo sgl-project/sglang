@@ -12,6 +12,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo, SamplingFacts
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.srt.sampling.verify_accept import VerifyAccept
+from sglang.srt.sampling.watermarking.batch_layout import num_prefill_rows
 from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.sampling.watermarking.synthid import adapter
@@ -197,32 +198,101 @@ class TestSynthIDRequestPolicy(CustomTestCase):
         self.assertFalse(rows.all_on)
 
 
-class TestSynthIDEngine(CustomTestCase):
-    def test_seed_payload_covers_prefill_rows_only(self):
-        engine = adapter.SynthIDEngine(_watermarks()[0], allow_fused_sample=False)
-        rows = _rows([True, False, True, True])
-        reqs = [SimpleNamespace(output_ids=ids) for ids in ([], [5], [7, 8], [9])]
-
+class TestBatchLayout(CustomTestCase):
+    def test_num_prefill_rows_counts_the_leading_extend_rows(self):
         def batch(mode, *, decoding_reqs=None, num_mixed=0):
             return SimpleNamespace(
-                sampling_info=SimpleNamespace(watermark=rows),
                 forward_mode=mode,
-                reqs=reqs,
+                reqs=[None] * 4,
                 decoding_reqs=decoding_reqs,
                 mix_running_indices_cpu=torch.zeros(num_mixed),
             )
 
+        self.assertEqual(num_prefill_rows(batch(ForwardMode.EXTEND)), 4)
+        # The trailing rows of a mixed batch decode.
+        self.assertEqual(num_prefill_rows(batch(ForwardMode.MIXED, num_mixed=3)), 1)
         self.assertEqual(
-            engine.seed_payload(batch(ForwardMode.EXTEND)),
-            ([0, 2, 3], [[], [7, 8], [9]]),
+            num_prefill_rows(batch(ForwardMode.EXTEND, decoding_reqs=[None])), 0
         )
-        # The trailing rows of a mixed batch decode and keep their state.
-        self.assertEqual(
-            engine.seed_payload(batch(ForwardMode.MIXED, num_mixed=2)), ([0], [[]])
+        self.assertEqual(num_prefill_rows(batch(ForwardMode.DECODE)), 0)
+
+
+class TestSynthIDEngine(CustomTestCase):
+    def test_prefill_seeds_completed_rows_and_masks_unfinished_chunks(self):
+        def req(output_ids, *, done):
+            return SimpleNamespace(
+                output_ids=output_ids,
+                extend_end=8 if done else 4,
+                full_untruncated_fill_ids=list(range(8)),
+            )
+
+        # Rows 0-2 prefill (row 2 runs a non-final chunk), rows 3-4 decode.
+        reqs = [req([], done=True), req([5], done=True), req([7], done=False)]
+        reqs += [req([9], done=True), req([1], done=True)]
+        prefill = adapter.build_prefill(
+            _rows([True, False, True, True, True]), reqs, 3, features=_features()
         )
+        self.assertEqual(prefill.seed_rows.tolist(), [0])
+        self.assertEqual(prefill.replay_token_ids, [[]])
+        self.assertEqual(prefill.commit_rows.tolist(), [0, 3, 4])
+
+        # Every watermarked row commits: no mask.
+        prefill = adapter.build_prefill(
+            _rows([True, True]), reqs[:2], 2, features=_features()
+        )
+        self.assertEqual(prefill.seed_rows.tolist(), [0, 1])
+        self.assertEqual(prefill.replay_token_ids, [[], [5]])
+        self.assertIsNone(prefill.commit_rows)
+        # No watermarked row seeds and every one commits.
         self.assertIsNone(
-            engine.seed_payload(batch(ForwardMode.EXTEND, decoding_reqs=reqs))
+            adapter.build_prefill(
+                _rows([False, True]), reqs[:2], 1, features=_features()
+            )
         )
+
+    def test_chunked_prefill_state_equals_a_single_seed_from_the_prompt(self):
+        """A chunked prefill, with a decode row beside it, leaves the state that
+        seeding once from the whole prompt and committing the first token does,
+        for a fresh request and for a retracted one replaying its outputs."""
+        for output_ids in ([], [3, 5, 3]):
+            with self.subTest(output_ids=output_ids):
+                watermark, reference = _watermarks()
+                engine = adapter.SynthIDEngine(watermark, allow_fused_sample=False)
+                rows = _rows([True, True])
+                prefilling = SimpleNamespace(
+                    output_ids=output_ids, full_untruncated_fill_ids=list(range(8))
+                )
+                decoding = SimpleNamespace(output_ids=[4])
+                req_pool_indices = torch.tensor([6, 1])
+
+                def step(extend_end, token_ids):
+                    prefilling.extend_end = extend_end
+                    info = _info(2, watermark=rows)
+                    info.watermark_prefill = adapter.build_prefill(
+                        rows, [prefilling, decoding], 1, features=_features()
+                    )
+                    sample = engine.bind_sample(
+                        SimpleNamespace(
+                            sampling_info=info, req_pool_indices=req_pool_indices
+                        )
+                    )
+                    sample.apply(torch.randn(2, 16), keep_logits=False)
+                    sample.commit(torch.tensor(token_ids))
+
+                torch.manual_seed(0)
+                before = synthid_state(watermark.state)
+                step(4, [7, 8])  # a non-final chunk: row 0 drops its token
+                # Its slot is untouched; the decode row commits.
+                for name, value in synthid_state(watermark.state).items():
+                    self.assertTrue(torch.equal(value[6], before[name][6]), name)
+                step(8, [9, 10])
+
+                reference.state.commit(torch.tensor([1]), torch.tensor([8]))
+                reference.state.seed(torch.tensor([6]), [output_ids])
+                reference.state.commit(torch.tensor([6, 1]), torch.tensor([9, 10]))
+                assert_synthid_state_equal(
+                    synthid_state(watermark.state), synthid_state(reference.state)
+                )
 
     def test_sample_watermarks_on_rows_and_commits_their_slots(self):
         watermark, twin = _watermarks()
@@ -235,10 +305,11 @@ class TestSynthIDEngine(CustomTestCase):
             watermark=rows,
         )
         req_pool_indices = torch.tensor([6, 1, 4, 2])
+        info.watermark_prefill = adapter.SynthIDPrefill(
+            seed_rows=torch.tensor([2]), replay_token_ids=[[3, 5]], commit_rows=None
+        )
         forward_batch = SimpleNamespace(
-            sampling_info=info,
-            req_pool_indices=req_pool_indices,
-            watermark_seed=([2], [[3, 5]]),
+            sampling_info=info, req_pool_indices=req_pool_indices
         )
         torch.manual_seed(0)
         logits = torch.randn(4, 16)
