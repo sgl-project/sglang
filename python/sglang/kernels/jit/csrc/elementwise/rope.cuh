@@ -301,6 +301,9 @@ struct FusedRopeKernel {
         .verify(positions);
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) {
+      return;
+    }
     const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
     const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
     const auto q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType));
@@ -411,6 +414,9 @@ struct FusedRopeKernel {
         .verify(v_cache);
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
+    if (num_tokens == 0) {
+      return;
+    }
     const auto num_qo_heads = static_cast<uint32_t>(Q.unwrap());
     const auto num_kv_heads = static_cast<uint32_t>(K.unwrap());
     const auto q_stride_bytes = static_cast<int64_t>(Dq.unwrap() * sizeof(DType));

@@ -159,6 +159,10 @@ void rotary_embedding_contiguous(
   TORCH_CHECK(query.size(0) == num_tokens && key.size(0) == num_tokens,
               "query, key and positions must have the same number of tokens");
 
+  if (num_tokens == 0) {
+    return;
+  }
+
   int64_t query_token_stride = query.stride(0);
   int64_t query_head_stride = query.stride(1);
   int64_t query_dim_stride = query.stride(2);
@@ -218,6 +222,10 @@ void batched_rotary_embedding_contiguous(
               "positions must have the same num_tokens as cos_sin_cache_offsets");
   TORCH_CHECK(query.dim() == 3, "query must be 3D [num_tokens, num_heads, head_size]");
   TORCH_CHECK(key.dim() == 3, "key must be 3D [num_tokens, num_kv_heads, head_size]");
+
+  if (num_tokens == 0) {
+    return;
+  }
 
   int64_t query_token_stride = query.stride(0);
   int64_t query_head_stride = query.stride(1);

@@ -243,6 +243,10 @@ struct RotaryEmbeddingKernel {
           "query, key and positions must have the same batch_size and seq_len");
     }
 
+    if (num_tokens == 0) {
+      return;
+    }
+
     // Make sure head_size is valid for query and key
     // hidden_size = num_heads * head_size
     int query_hidden_size = query.numel() / num_tokens;
