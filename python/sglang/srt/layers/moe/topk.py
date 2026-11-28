@@ -52,6 +52,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    hip_fused_moe_routing,
     is_moe_input_scattered_across_dp_ranks,
 )
 from sglang.srt.layers.moe.utils import (
@@ -2998,21 +2999,56 @@ def select_experts(
                 ):
                     # the ROCm decode gate writes the aiter shared columns itself
                     _packed_kwargs["num_shared_append"] = num_shared_topk_slots
-            topk_weights, topk_ids = _biased_topk(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                correction_bias=correction_bias,
-                topk=top_k_for_gate,
-                renormalize=renormalize,
-                scoring_func=scoring_func,
-                num_fused_shared_experts=num_shared_topk_slots_for_gate,
-                routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-                **_packed_kwargs,
-            )
-            padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
+            # SGLANG_OPT_HIP_FUSED_MOE_ROUTING: one kernel for top-k + shared slot + sort + MXFP8 quant
+            # above 256 rows; None falls back to the router below.
+            fused_routing = None
+            if hip_fused_moe_routing.enabled():
+                fused_routing = hip_fused_moe_routing.route_or_skip(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    correction_bias=correction_bias,
+                    renormalize=renormalize,
+                    routed_scaling_factor=routed_scaling_factor,
+                    shared_w=topk_config.fused_shared_experts_scaling_factor or 1.0,
+                    num_token_non_padded=num_token_non_padded,
+                    skip_reasons=(
+                        ("no aiter", not _use_aiter),
+                        ("scoring", scoring_func != "sqrtsoftplus"),
+                        ("shared slots", num_shared_topk_slots != 1),
+                        (
+                            "per-rank shared slots",
+                            has_per_rank_fused_shared_slots(num_shared_topk_slots),
+                        ),
+                        ("packed ids", packed_topk is not None),
+                        ("split-K partials", router_logits_partials is not None),
+                        ("routing overridden", routing_overridden),
+                        (
+                            "expert remapping",
+                            expert_location_dispatch_info is not None
+                            and is_expert_remapping_enabled(),
+                        ),
+                    ),
+                )
+            if fused_routing is None:
+                topk_weights, topk_ids = _biased_topk(
+                    hidden_states=hidden_states,
+                    gating_output=router_logits,
+                    correction_bias=correction_bias,
+                    topk=top_k_for_gate,
+                    renormalize=renormalize,
+                    scoring_func=scoring_func,
+                    num_fused_shared_experts=num_shared_topk_slots_for_gate,
+                    routed_scaling_factor=routed_scaling_factor,
+                    num_token_non_padded=num_token_non_padded,
+                    expert_location_dispatch_info=expert_location_dispatch_info,
+                    apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                    **_packed_kwargs,
+                )
+                padded_rows_masked = _fused_gate_masks_padded_rows(scoring_func)
+            else:
+                # [M, top_k]: the kernel writes the shared column too
+                topk_weights, topk_ids = fused_routing
+                padded_rows_masked = num_token_non_padded is not None
         elif (
             topk_config.runner_backend is not None
             and topk_config.runner_backend.is_flashinfer_trtllm_routed()
