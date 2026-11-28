@@ -53,6 +53,10 @@ _NVFP4_PER_TOKEN_SCALE_INV = 1.0 / (448.0 * 6.0)
 
 _MARLIN_SHAPE_ALIGNMENT = 64
 _MARLIN_BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
+# Up to this many routes per expert on average, counted over all experts rather
+# than this rank's, M blocks stay at 16 rows.
+_MARLIN_SMALL_BATCH_MAX_ROUTES_PER_EXPERT = 8
+_MARLIN_SMALL_BATCH_BLOCK_SIZE_M = 16
 
 
 def _resolve_moe_runner_backend():
@@ -411,9 +415,12 @@ class MuseSpark1xFp4Experts(nn.Module):
         local_topk_ids = local_topk_ids.contiguous()
         topk_weights = topk_scores.to(torch.float32).contiguous()
 
-        for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
-            if num_tokens * topk / self.num_local_experts / block_size_m < 0.9:
-                break
+        block_size_m = _marlin_block_size_m(
+            num_tokens=num_tokens,
+            topk=topk,
+            num_local_experts=self.num_local_experts,
+            num_experts=self.global_num_experts,
+        )
 
         if num_tokens == 1 and topk <= 32 and expert_map is None:
             from sglang.kernels.ops.moe.moe_align_single_token import (
@@ -865,6 +872,25 @@ def finalize_identity_with_post_expert_norm(
             round_product=True,
         ).to(out_dtype)
     return (normed * weights.unsqueeze(-1)).sum(dim=1).to(out_dtype)
+
+
+def _marlin_block_size_m(
+    *, num_tokens: int, topk: int, num_local_experts: int, num_experts: int
+) -> int:
+    """Rows per Marlin M block for ``num_tokens`` tokens routed to ``topk`` experts."""
+    routes_per_local_expert = num_tokens * topk / num_local_experts
+    for block_size_m in _MARLIN_BLOCK_SIZE_M_CANDIDATES:
+        if routes_per_local_expert / block_size_m < 0.9:
+            break
+    # Routing is skewed: a few experts take most of a small batch's routes.
+    # Blocks past 16 rows then mostly pad the cold experts, while 8-row blocks
+    # re-read the hot experts' weights once per extra block. On H200 under EP8,
+    # 16-row blocks beat both at 128 and 256 tokens, 4 and 8 routes per expert.
+    # The estimate above divides every route, local or not, by the local experts,
+    # so EP inflates it; without EP it already picks at most 16 rows here.
+    if num_tokens * topk / num_experts <= _MARLIN_SMALL_BATCH_MAX_ROUTES_PER_EXPERT:
+        return min(block_size_m, _MARLIN_SMALL_BATCH_BLOCK_SIZE_M)
+    return block_size_m
 
 
 __all__ = [
