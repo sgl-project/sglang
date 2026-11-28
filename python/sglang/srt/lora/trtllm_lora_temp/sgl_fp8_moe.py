@@ -90,7 +90,16 @@ def fused_experts_fp8_sgl(
             assert quant_info.weight_block_k == 32
             from flashinfer import mxfp8_quantize
 
-            a_q, a_sf = mxfp8_quantize(hidden_states, False)
+            from sglang.srt.layers.quantization.batch_invariant_quant import (
+                use_flashinfer_bi_mxfp8_quantizer,
+            )
+
+            if use_flashinfer_bi_mxfp8_quantizer(hidden_states, 32):
+                a_q, a_sf = mxfp8_quantize(
+                    hidden_states, False, backend="auto", batch_invariant=True
+                )
+            else:
+                a_q, a_sf = mxfp8_quantize(hidden_states, False)
             # FlashInfer TRT-LLM MxFP8 expects token-major activation scales:
             # [num_tokens, hidden_size // 32] (no transpose).
             a_sf_t = a_sf.view(torch.uint8).reshape(hidden_states.shape[0], -1)

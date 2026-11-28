@@ -77,6 +77,11 @@ def _fp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tenso
 def _mxfp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
     from flashinfer import block_scale_interleave, mm_mxfp8, mxfp8_quantize
 
+    from sglang.srt.layers.quantization.batch_invariant_quant import (
+        mm_mxfp8_batch_invariant_shape_ok,
+        use_flashinfer_bi_mxfp8_quantizer,
+    )
+
     weight = lm_head.weight
     cache = getattr(lm_head, "_mxfp8_weight_cache", None)
     if cache is None or cache[0].shape != weight.shape:
@@ -89,8 +94,24 @@ def _mxfp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Ten
         ).contiguous()
         cache = (w_q, w_sf)
         lm_head._mxfp8_weight_cache = cache
-    h_q, h_sf = mxfp8_quantize(hidden.to(torch.bfloat16), is_sf_swizzled_layout=True)
-    logits = mm_mxfp8(h_q, cache[0].t(), h_sf, cache[1], backend="cute-dsl")
+    hidden_bf16 = hidden.to(torch.bfloat16)
+    # The deterministic mode runs the quantizer and the GEMM on FlashInfer's
+    # batch-invariant kernels; otherwise the calls are unchanged.
+    if use_flashinfer_bi_mxfp8_quantizer(
+        hidden_bf16, 32
+    ) and mm_mxfp8_batch_invariant_shape_ok(cache[0], torch.bfloat16):
+        h_q, h_sf = mxfp8_quantize(
+            hidden_bf16,
+            is_sf_swizzled_layout=True,
+            backend="auto",
+            batch_invariant=True,
+        )
+        logits = mm_mxfp8(
+            h_q, cache[0].t(), h_sf, cache[1], backend="auto", batch_invariant=True
+        )
+    else:
+        h_q, h_sf = mxfp8_quantize(hidden_bf16, is_sf_swizzled_layout=True)
+        logits = mm_mxfp8(h_q, cache[0].t(), h_sf, cache[1], backend="cute-dsl")
     return logits if logits.dtype == hidden.dtype else logits.to(hidden.dtype)
 
 

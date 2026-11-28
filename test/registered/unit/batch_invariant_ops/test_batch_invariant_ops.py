@@ -12,6 +12,8 @@ from sglang.test.test_utils import CustomTestCase
 # Note: MI300 (gfx942) has 64KB shared memory limit but kernel needs 66KB
 # MI35x (gfx950/CDNA4) may have different limits - testing on MI35x only
 register_cuda_ci(est_time=20, stage="nightly", runner_config="1-gpu-large")
+# B200 runs MXFP8 quantization and GEMM through FlashInfer's batch-invariant kernels.
+register_cuda_ci(est_time=30, stage="nightly", runner_config="4-gpu-b200")
 register_amd_ci(est_time=10, suite="nightly-test-1-gpu-amd-mi35x", nightly=True)
 
 device_type = getattr(torch.accelerator.current_accelerator(), "type", "cpu")
@@ -20,6 +22,20 @@ torch.set_default_device(device_type)
 # Just to get the logging out of the way
 with set_batch_invariant_mode(True):
     pass
+
+
+def _cuda_kernel_names(fn):
+    """The CUDA kernel names one call of ``fn`` launches (torch.profiler)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    fn()
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as p:
+        fn()
+        torch.cuda.synchronize()
+    return [
+        e.name for e in p.events() if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
 
 
 class TestBatchInvariantOps(CustomTestCase):
@@ -130,6 +146,164 @@ class TestBatchInvariantOps(CustomTestCase):
         finally:
             if original_mode is not None:
                 deep_gemm.use_deterministic_algorithms(original_mode)
+
+    def test_flashinfer_mxfp8_batch_invariance(self):
+        """On SM100-family parts the deterministic mode quantizes MXFP8
+        activations and runs the dense MXFP8 GEMM through FlashInfer's
+        batch-invariant kernels: the wrapper gives their bytes, a row's bits do
+        not depend on the batch it is in, and the dense linear launches exactly
+        those two kernels (the bits alone cannot tell the routes apart on parts
+        where the previous kernels are invariant too)."""
+        from sglang.srt.layers.quantization import fp8_utils
+        from sglang.srt.layers.quantization.batch_invariant_quant import (
+            flashinfer_bi_quant_supported,
+            use_flashinfer_bi_quantizers,
+        )
+
+        if not flashinfer_bi_quant_supported(torch.cuda.current_device()):
+            self.skipTest("FlashInfer batch-invariant MXFP8 kernels are unavailable")
+        from flashinfer import SfLayout, mm_mxfp8, mxfp8_quantize
+
+        generator = torch.Generator(device=device_type).manual_seed(0)
+        K, N = 4096, 256
+        x = torch.randn(257, K, dtype=torch.bfloat16, generator=generator)
+        with set_batch_invariant_mode(True):
+            flag = use_flashinfer_bi_quantizers(x.device)
+            self.assertTrue(flag)
+            for swizzled in (True, False):
+                with self.subTest(swizzled=swizzled):
+                    q, sf = fp8_utils.flashinfer_mxfp8_quantize(
+                        x, swizzled, 32, batch_invariant=flag
+                    )
+                    q_ref, sf_ref = mxfp8_quantize(
+                        x,
+                        is_sf_swizzled_layout=swizzled,
+                        alignment=32,
+                        backend="auto",
+                        sf_swizzle_layout=(
+                            SfLayout.layout_128x4
+                            if swizzled
+                            else SfLayout.layout_linear
+                        ),
+                        batch_invariant=True,
+                    )
+                    torch.testing.assert_close(
+                        q.view(torch.uint8), q_ref.view(torch.uint8), rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(
+                        sf.view(torch.uint8), sf_ref.view(torch.uint8), rtol=0, atol=0
+                    )
+            # Row 0 alone against row 0 inside a batch; the scales are read in the
+            # linear layout (the swizzled layout places the same bytes).
+            q1, sf1 = fp8_utils.flashinfer_mxfp8_quantize(
+                x[:1], False, 32, batch_invariant=flag
+            )
+            for m in (16, 64, 257):
+                qm, sfm = fp8_utils.flashinfer_mxfp8_quantize(
+                    x[:m], False, 32, batch_invariant=flag
+                )
+                torch.testing.assert_close(
+                    qm[:1].view(torch.uint8), q1.view(torch.uint8), rtol=0, atol=0
+                )
+                torch.testing.assert_close(
+                    sfm.view(torch.uint8).view(m, -1)[0],
+                    sf1.view(torch.uint8).view(1, -1)[0],
+                    rtol=0,
+                    atol=0,
+                )
+            # The dense linear: the batch-invariant quantizer, then the GEMM.
+            weight = torch.randn(N, K, dtype=torch.bfloat16, generator=generator)
+            w_q, w_sf = mxfp8_quantize(weight, is_sf_swizzled_layout=True)
+            outs = {
+                m: fp8_utils.flashinfer_mxfp8_blockscaled_linear(
+                    x[:m], w_q, w_sf, backend="cute-dsl"
+                )
+                for m in (1, 64, 257)
+            }
+            for m in (64, 257):
+                torch.testing.assert_close(outs[m][:1], outs[1], rtol=0, atol=0)
+            for m in (1, 64, 257):
+                names = _cuda_kernel_names(
+                    lambda: fp8_utils.flashinfer_mxfp8_blockscaled_linear(
+                        x[:m], w_q, w_sf, backend="cute-dsl"
+                    )
+                )
+                bi_kernels = [k for k in names if "batch_invariant" in k]
+                self.assertEqual(len(bi_kernels), 2, names)
+                self.assertEqual(len(set(bi_kernels)), 2, names)
+            x_q, x_sf = mxfp8_quantize(
+                x, is_sf_swizzled_layout=True, backend="auto", batch_invariant=True
+            )
+            expected = mm_mxfp8(
+                x_q,
+                w_q.t(),
+                x_sf,
+                w_sf,
+                out_dtype=torch.bfloat16,
+                backend="auto",
+                batch_invariant=True,
+            )
+            torch.testing.assert_close(outs[257], expected, rtol=0, atol=0)
+
+    def test_flashinfer_mxfp8_fallbacks(self):
+        """Under the mode, an input outside FlashInfer's batch-invariant kernels
+        (rows over 128 KiB) and the env opt-out run the previous kernels: the
+        output is the pinned path's bit for bit and no batch-invariant kernel is
+        launched (CUPTI kernel names)."""
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization import fp8_utils
+        from sglang.srt.layers.quantization.batch_invariant_quant import (
+            flashinfer_bi_quant_supported,
+        )
+
+        if not flashinfer_bi_quant_supported(torch.cuda.current_device()):
+            self.skipTest("FlashInfer batch-invariant MXFP8 kernels are unavailable")
+        from flashinfer import mxfp8_quantize
+
+        kernels = _cuda_kernel_names
+        generator = torch.Generator(device=device_type).manual_seed(0)
+        lin = fp8_utils.flashinfer_mxfp8_blockscaled_linear
+        cases = {
+            # rows over 128 KiB: the quantizer and the GEMM keep the previous kernels
+            "long rows": (
+                torch.randn(16, 66048, dtype=torch.bfloat16, generator=generator),
+                4096,
+                False,
+            ),
+            # the env opt-out keeps both previous kernels
+            "opt-out": (
+                torch.randn(16, 4096, dtype=torch.bfloat16, generator=generator),
+                256,
+                True,
+            ),
+        }
+        for name, (x, n, opt_out) in cases.items():
+            with self.subTest(case=name):
+                weight = torch.randn(
+                    n, x.shape[1], dtype=torch.bfloat16, generator=generator
+                )
+                w_q, w_sf = mxfp8_quantize(weight, is_sf_swizzled_layout=True)
+                with set_batch_invariant_mode(True):
+                    with (
+                        envs.SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS.override(
+                            False
+                        )
+                    ):
+                        pinned = lin(x, w_q, w_sf, backend="cute-dsl", pin_tactic=True)
+                    if opt_out:
+                        with envs.SGLANG_ENABLE_DETERMINISTIC_FLASHINFER_BI_KERNELS.override(
+                            False
+                        ):
+                            out = lin(x, w_q, w_sf, backend="cute-dsl")
+                            names = kernels(
+                                lambda: lin(x, w_q, w_sf, backend="cute-dsl")
+                            )
+                    else:
+                        out = lin(x, w_q, w_sf, backend="cute-dsl")
+                        names = kernels(lambda: lin(x, w_q, w_sf, backend="cute-dsl"))
+                torch.testing.assert_close(out, pinned, rtol=0, atol=0)
+                bi_kernels = [k for k in names if "batch_invariant" in k]
+                self.assertFalse(bi_kernels, bi_kernels)
 
     def test_small_matrices(self):
         """Test batch invariance with small matrix sizes"""

@@ -373,14 +373,22 @@ class Mxfp4FlashinferTrtllmMoEMethod:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """MXFP8 quant of the routed input, with the scale in the linear
         [tokens, hidden // 32] layout the routed MoE op requires."""
+        from sglang.srt.layers.quantization.batch_invariant_quant import (
+            use_flashinfer_bi_mxfp8_quantizer,
+        )
         from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
-        x_quant, x_scale = flashinfer_mxfp8_quantize(
-            hidden_states,
-            False,
-            alignment=hidden_size,
-            backend=_MXFP8_QUANTIZE_BACKEND,
-        )
+        if use_flashinfer_bi_mxfp8_quantizer(hidden_states, hidden_size):
+            x_quant, x_scale = flashinfer_mxfp8_quantize(
+                hidden_states, False, alignment=hidden_size, batch_invariant=True
+            )
+        else:
+            x_quant, x_scale = flashinfer_mxfp8_quantize(
+                hidden_states,
+                False,
+                alignment=hidden_size,
+                backend=_MXFP8_QUANTIZE_BACKEND,
+            )
         x_scale = x_scale.view(torch.float8_e4m3fn).reshape(
             *hidden_states.shape[:-1], -1
         )

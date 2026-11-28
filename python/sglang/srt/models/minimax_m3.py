@@ -75,6 +75,9 @@ from sglang.srt.layers.moe.utils import (
     get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.batch_invariant_quant import (
+    use_flashinfer_bi_quantizers,
+)
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
     accepts_mxfp8_deepgemm_input,
@@ -369,7 +372,11 @@ class MiniMaxM3MLP(nn.Module):
             and can_use_silu_mul_mxfp8(gate_up)
         ):
             return None
-        if accepts_mxfp8_swizzled_input(self.down_proj):
+        # The deterministic mode quantizes in down_proj (FlashInfer's
+        # batch-invariant kernel), not in the fused activation kernel.
+        if accepts_mxfp8_swizzled_input(
+            self.down_proj
+        ) and not use_flashinfer_bi_quantizers(gate_up.device):
             return Mxfp8SwizzledInput(
                 *swiglu_oai_mxfp8(gate_up, self.swiglu_alpha, self.swiglu_limit)
             )

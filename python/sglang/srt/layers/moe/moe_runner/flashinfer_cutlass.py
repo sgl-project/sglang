@@ -542,11 +542,24 @@ def _fused_experts_flashinfer_mxfp4_cutlass(
     if weight_global_scale is not None:
         from flashinfer import mxfp8_quantize
 
-        x, input_sf = mxfp8_quantize(
-            x,
-            is_sf_swizzled_layout=True,
-            alignment=32,
+        from sglang.srt.layers.quantization.batch_invariant_quant import (
+            use_flashinfer_bi_mxfp8_quantizer,
         )
+
+        if use_flashinfer_bi_mxfp8_quantizer(x, 32):
+            x, input_sf = mxfp8_quantize(
+                x,
+                is_sf_swizzled_layout=True,
+                alignment=32,
+                backend="auto",
+                batch_invariant=True,
+            )
+        else:
+            x, input_sf = mxfp8_quantize(
+                x,
+                is_sf_swizzled_layout=True,
+                alignment=32,
+            )
         fc1_expert_weights = fc1_expert_weights.view(torch.int64)
         fc2_expert_weights = fc2_expert_weights.view(torch.int64)
         quant_scales = [

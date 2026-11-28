@@ -14,7 +14,12 @@ import torch
 from flashinfer import block_scale_interleave
 
 from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
-from sglang.srt.layers.quantization import fp8, fp8_utils, mxfp8_input
+from sglang.srt.layers.quantization import (
+    batch_invariant_quant,
+    fp8,
+    fp8_utils,
+    mxfp8_input,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import Fp8GemmRunnerBackend
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
@@ -716,6 +721,32 @@ class TestBlockFp8AsMxfp8PrefillAutotune(_LinearBackendCheck):
                 ):
                     method.apply(layer, torch.empty(rows, 128, device="cuda"))
                 self.assertEqual(call.call_args.kwargs.get("pin_tactic"), expected)
+
+
+class TestFlashinferBatchInvariantMxfp8Dispatch(CustomTestCase):
+    """The weights FlashInfer's batch-invariant MXFP8 GEMM takes under the
+    deterministic mode; the others keep the pinned-tactic path (no GPU work).
+    Shapes the pinned kernels cannot serve either (N < 128) are only reachable here."""
+
+    def test_batch_invariant_gemm_shape_rule(self):
+        w = torch.empty(256, 512, dtype=torch.float8_e4m3fn)
+        shape_ok = batch_invariant_quant.mm_mxfp8_batch_invariant_shape_ok
+        self.assertTrue(shape_ok(w, torch.bfloat16))
+        self.assertTrue(shape_ok(w, torch.float16))
+        self.assertFalse(shape_ok(w[:64], torch.bfloat16))
+        self.assertFalse(
+            shape_ok(torch.empty(256, 96, dtype=torch.float8_e4m3fn), torch.bfloat16)
+        )
+        self.assertFalse(shape_ok(w[:132], torch.bfloat16))
+        self.assertFalse(shape_ok(w.t(), torch.bfloat16))
+        self.assertFalse(shape_ok(w, torch.float32))
+        long_k = torch.empty(256, 66048, dtype=torch.float8_e4m3fn, device="meta")
+        self.assertFalse(shape_ok(long_k, torch.bfloat16))
+        takes = fp8_utils._mxfp8_linear_batch_invariant
+        self.assertTrue(takes(w, torch.bfloat16, "cute-dsl", device_ok=True))
+        self.assertTrue(takes(w, torch.bfloat16, "cutlass", device_ok=True))
+        self.assertFalse(takes(w, torch.bfloat16, "trtllm", device_ok=True))
+        self.assertFalse(takes(w, torch.bfloat16, "cute-dsl", device_ok=False))
 
 
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")

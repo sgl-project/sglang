@@ -216,6 +216,24 @@ class TestMLAParallelGroups(CustomTestCase):
                             )
                             self.assertEqual(attention.n_local_groups, 2)
 
+    def test_deepseek_v4_wo_b_predicate_decides_the_quant_method_first(self):
+        """`use_flashinfer_mxfp8_wo_b` consults the deterministic mode only for
+        a FlashInfer MXFP8 wo_b. A GGUF wo_b registers `qweight`, never
+        `weight`, so the property answers False without reading it, mode off
+        or on."""
+        from sglang.srt.batch_invariant_ops import set_batch_invariant_mode
+        from sglang.srt.layers.quantization.gguf import GGUFConfig
+
+        for variant in (False, True):
+            with self.subTest(fuse_wqa_wkv=variant):
+                attention = build_mla("deepseek_v4", variant, quant_config=GGUFConfig())
+                self.assertNotIn("weight", dict(attention.wo_b.named_parameters()))
+                self.assertFalse(attention.use_flashinfer_mxfp8_wo_b)
+                # A fresh module: the property is cached per instance.
+                attention = build_mla("deepseek_v4", variant, quant_config=GGUFConfig())
+                with set_batch_invariant_mode(True):
+                    self.assertFalse(attention.use_flashinfer_mxfp8_wo_b)
+
 
 if __name__ == "__main__":
     unittest.main()

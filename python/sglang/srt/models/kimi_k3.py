@@ -101,6 +101,9 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.batch_invariant_quant import (
+    use_flashinfer_bi_quantizers,
+)
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -1605,7 +1608,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
     def _route_quant_fuse_eligible(self) -> bool:
         """Whether to stage routed_input for the fused route+pack+quant launch
         (route_quant_handoff). Only the trtllm-gen SiTU runner with mxfp8
-        activations consumes the staged quant, so only that runner stages."""
+        activations consumes the staged quant, so only that runner stages; the
+        deterministic mode quantizes in the MoE layer instead (FlashInfer's
+        batch-invariant kernel)."""
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
 
         method = self.experts.quant_method
@@ -1622,7 +1627,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             hidden_states, router_logits, routed_input, latent
         ):
             return
-        if self._route_quant_fuse_eligible:
+        if self._route_quant_fuse_eligible and not use_flashinfer_bi_quantizers(
+            routed_input.device
+        ):
             route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
             topk_output = self.topk(hidden_states, router_logits)
@@ -1638,7 +1645,9 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
-        if self._route_quant_fuse_eligible:
+        if self._route_quant_fuse_eligible and not use_flashinfer_bi_quantizers(
+            routed_input.device
+        ):
             route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
             topk_output = self.topk(hidden_states, router_logits)
