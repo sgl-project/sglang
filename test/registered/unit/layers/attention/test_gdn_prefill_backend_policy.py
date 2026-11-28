@@ -374,7 +374,12 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         self.assertIsNone(self.apply_policy(runner))
 
     def capture_probe_runner(
-        self, *, buckets=(16, 32, 64, 8192), context_len=262144, pool_size=64
+        self,
+        *,
+        buckets=(16, 32, 64, 8192),
+        context_len=262144,
+        pool_size=64,
+        lora_manager=None,
     ):
         """An SM90 runner carrying everything the graph-capture probe reads, so
         a case exercises the probe's own conditions instead of tripping its
@@ -401,6 +406,7 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
         runner.model_config.context_len = context_len
         runner.req_to_token_pool = SimpleNamespace(size=pool_size)
         runner.spec_algorithm = SimpleNamespace(is_none=lambda: True)
+        runner.lora_manager = lora_manager
         return runner
 
     def apply_sm90_policy(self, runner, *, buckets=(16, 32, 64, 8192)):
@@ -434,6 +440,19 @@ class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
             ):
                 runner = self.capture_probe_runner(**runner_args)
                 self.assertEqual(self.apply_sm90_policy(runner), "flashinfer")
+
+    def test_sm90_keeps_flashinfer_when_lora_disables_prefill_graphs(self):
+        """capture_prefill_graph() hands an uncapturable LoRA setup to the eager
+        runner, so Triton would lose its reason to be selected."""
+        for supported, expected in ((True, None), (False, "flashinfer")):
+            with (
+                self.subTest(supports_prefill_cuda_graph=supported),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+            ):
+                runner = self.capture_probe_runner(
+                    lora_manager=SimpleNamespace(supports_prefill_cuda_graph=supported)
+                )
+                self.assertEqual(self.apply_sm90_policy(runner), expected)
 
     def test_rejects_unvalidated_runtime_modes(self):
         cases = (

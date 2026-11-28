@@ -301,6 +301,12 @@ def _gdn_prefill_graph_extend_captures(model_runner: ModelRunner) -> bool:
             return False
         if not model_runner.spec_algorithm.is_none():
             return False
+        # capture_prefill_graph() returns the eager runner for a LoRA
+        # configuration it cannot capture, which would leave Triton running an
+        # uncaptured extend. The manager is built before this dispatch runs.
+        lora_manager = getattr(model_runner, "lora_manager", None)
+        if lora_manager is not None and not lora_manager.supports_prefill_cuda_graph:
+            return False
         prefill = get_exec().graph.cuda_graph_config.prefill
         if getattr(prefill, "backend", None) != "breakable":
             return False
