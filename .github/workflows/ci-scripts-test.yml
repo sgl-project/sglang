@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "scripts/ci/**"
+      - "scripts/ci_monitor/**"
+      - "python/sglang/multimodal_gen/test/runner/pytest_runner.py"
       - ".github/workflows/pr-test.yml"
       - ".github/workflows/pr-gate.yml"
       - ".github/workflows/ci-scripts-test.yml"
@@ -25,8 +27,9 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install PyGithub PyYAML
+        run: pip install PyGithub PyYAML anthropic requests pytest tabulate
 
       - name: Run tests
         run: |
           python -m unittest discover -s scripts/ci -p 'test_diffusion_rust_gate.py' -v
+          python -m unittest discover -s scripts/ci_monitor -v

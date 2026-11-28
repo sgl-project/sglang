@@ -1,6 +1,5 @@
 """Regressions for attributing CI failures from completed pytest attempts."""
 
-import importlib.util
 import os
 import subprocess
 import sys
@@ -9,17 +8,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+import ci_auto_bisect as bisect
+from ci_failures_analysis import SGLangFailuresAnalyzer
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
-
-_SCRIPT = (
-    Path(__file__).resolve().parents[4] / "scripts/ci_monitor/ci_failures_analysis.py"
+_RUNNER_DIR = (
+    Path(__file__).resolve().parents[2] / "python/sglang/multimodal_gen/test/runner"
 )
-_SPEC = importlib.util.spec_from_file_location("ci_failures_analysis", _SCRIPT)
-_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
 
 _SESSION = "================ test session starts ================\n"
 _SERVER_ARGS = "server_args: model_path='test-model'\n"
@@ -44,21 +38,16 @@ Attempt 1 failure summary:
 """
 
 
-class TestCIFailuresAnalysis(CustomTestCase):
-    def setUp(self):
-        super().setUp()
-        self.analyzer = _MODULE.SGLangFailuresAnalyzer("")
-        self.addCleanup(self.analyzer.session.close)
-
+class TestCIFailuresAnalysis(unittest.TestCase):
     def _failed_paths(self, logs):
-        summary = self.analyzer.parse_test_summary(logs)
+        summary = SGLangFailuresAnalyzer.parse_test_summary(logs)
         return (
             [test["full_path"] for test in summary["failed_tests"]] if summary else []
         )
 
     def test_pytest_failures_override_last_running_test(self):
         """A passing loader must not replace the failures listed by pytest."""
-        summary = self.analyzer.parse_test_summary(
+        summary = SGLangFailuresAnalyzer.parse_test_summary(
             """
 sglang/test/test_text_encoder_loader.py::TestLoader::test_quantized [10-27 01:41:06]
 server_args: model_path='test-model'
@@ -106,7 +95,7 @@ FAILED sglang/test/test_nomas.py::test_growing_history
         ):
             with self.subTest(prefix=prefix):
                 logs = "\n".join(f"{prefix}\x1b[31m{line}\x1b[0m" for line in lines)
-                summary = self.analyzer.parse_test_summary(logs)
+                summary = SGLangFailuresAnalyzer.parse_test_summary(logs)
                 self.assertEqual(
                     {t["full_path"]: t["test_ids"] for t in summary["failed_tests"]},
                     {
@@ -151,7 +140,7 @@ FAILED sglang/test/test_nomas.py::test_growing_history
         """A quiet run after a completed session must keep both independent failures."""
         program = (
             "import subprocess, sys\n"
-            "from sglang.multimodal_gen.test.runner.pytest_runner import run_pytest\n"
+            "from pytest_runner import run_pytest\n"
             "run_pytest(['test_recovers.py'])\n"
             "sys.stdout.flush()\n"
             "for args in (['test_fails.py'], ['-q', 'test_quiet.py'], ['-q', 'test_passes.py']):\n"
@@ -172,7 +161,11 @@ FAILED sglang/test/test_nomas.py::test_growing_history
             result = subprocess.run(
                 [sys.executable, "-c", program],
                 cwd=root,
-                env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+                env={
+                    **os.environ,
+                    "PYTHONPATH": str(_RUNNER_DIR),
+                    "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                },
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -183,7 +176,7 @@ FAILED sglang/test/test_nomas.py::test_growing_history
         )
 
     def test_unfinished_session_keeps_earlier_failures(self):
-        summary = self.analyzer.parse_test_summary(
+        summary = SGLangFailuresAnalyzer.parse_test_summary(
             _failed_session("test/test_old.py")
             + _SESSION
             + "test/test_current.py::test_current\n"
@@ -197,11 +190,11 @@ FAILED sglang/test/test_nomas.py::test_growing_history
 
     def test_passing_session_has_no_summary(self):
         """An empty summary would hide the monitor's missing-summary diagnostic."""
-        self.assertIsNone(self.analyzer.parse_test_summary(_PASSED_SESSION))
+        self.assertIsNone(SGLangFailuresAnalyzer.parse_test_summary(_PASSED_SESSION))
 
     def test_hang_after_finished_session_is_inferred(self):
         """A unittest file prints no session header, so a pytest result can precede it."""
-        summary = self.analyzer.parse_test_summary(
+        summary = SGLangFailuresAnalyzer.parse_test_summary(
             _PASSED_SESSION
             + "Begin (1/2):\npython3 /repo/test_hang.py\n"
             + _SERVER_ARGS
@@ -211,7 +204,7 @@ FAILED sglang/test/test_nomas.py::test_growing_history
 
     def test_nested_quiet_run_is_not_a_failure(self):
         """test_sequential_server_requests.py runs `pytest -q` inside its session."""
-        summary = self.analyzer.parse_test_summary(
+        summary = SGLangFailuresAnalyzer.parse_test_summary(
             _SESSION
             + "test/test_outer.py::test_nested\n"
             + "================ short test summary info ================\n"
@@ -229,7 +222,7 @@ FAILED sglang/test/test_nomas.py::test_growing_history
 
     def test_passing_outer_session_discards_nested_framed_failure(self):
         self.assertIsNone(
-            self.analyzer.parse_test_summary(
+            SGLangFailuresAnalyzer.parse_test_summary(
                 _SESSION
                 + "test_outer.py "
                 + _failed_session("test_generated.py")
@@ -250,12 +243,6 @@ FAILED sglang/test/test_nomas.py::test_growing_history
 
     def test_auto_bisect_targets_the_failures_pytest_listed(self):
         """The bisect must not spend its analysis on a passing loader."""
-        spec = importlib.util.spec_from_file_location(
-            "ci_auto_bisect", _SCRIPT.with_name("ci_auto_bisect.py")
-        )
-        bisect = importlib.util.module_from_spec(spec)
-        with mock.patch.dict(sys.modules, {"ci_failures_analysis": _MODULE}):
-            spec.loader.exec_module(bisect)
         logs = (
             _SESSION
             + "test/test_loader.py::test_quantized\n"
