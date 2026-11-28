@@ -5,9 +5,11 @@ Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
 rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
-    Page-locked host memory of exactly the table's size (``cudaHostAlloc``;
-    ``torch.empty(..., pin_memory=True)`` on non-CUDA builds). On a discrete
-    GPU this frees VRAM.
+    Page-locked host memory of exactly the table's size. On a discrete GPU this
+    frees VRAM. On CUDA the table is an anonymous mapping on transparent huge
+    pages, page-locked with ``cudaHostRegister`` (on base pages the random-row
+    gather is bound by address translation); if that fails, ``cudaHostAlloc``.
+    ``torch.empty(..., pin_memory=True)`` on non-CUDA builds.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -38,6 +40,7 @@ import logging
 import os
 import re
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional, Sequence
 
@@ -59,7 +62,14 @@ _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS = 88
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
+_MADV_HUGEPAGE = 14
 _PAGE_SHIFT = 12
+# The huge-page table is used only with 64 KiB base pages (the hosts it was measured on),
+# where a PMD huge page is 512 MiB; the mapping starts aligned to it.
+_HUGEPAGE_BASE_PAGE = 64 << 10
+_HUGEPAGE_ALIGN = 512 << 20
+# Below this share of the table on huge pages the gather is translation-bound again.
+_MIN_HUGEPAGE_COVERAGE = 0.9
 # One MADV_DONTNEED call takes mmap_lock for its whole range; over the full
 # 47.7 GiB table that is ~3.5 s during which every fault in the process --
 # including the ones the gather kernel takes -- stalls. Trim in slices.
@@ -247,6 +257,10 @@ def allocate_ple_host_table(
         )
     if backend == "pinned":
         if torch.version.cuda is not None:
+            if os.sysconf("SC_PAGESIZE") == _HUGEPAGE_BASE_PAGE:
+                table = _pinned_hugepage_table(shape, dtype)
+                if table is not None:
+                    return table
             return _alloc_cuda_host_table(tuple(shape), dtype)
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
@@ -501,6 +515,98 @@ def _alloc_cuda_host_table(shape: tuple, dtype: torch.dtype) -> torch.Tensor:
         alloc=lambda nbytes: cudart.cudaHostAlloc(nbytes).value,
         free=lambda ptr: cudart.cudaFreeHost(ctypes.c_void_p(ptr)),
     )
+
+
+def _pinned_hugepage_table(
+    shape: Sequence[int], dtype: torch.dtype
+) -> Optional[torch.Tensor]:
+    """A page-locked, huge-page-backed host tensor of ``shape``/``dtype``; None (with a warning)
+    when the mapping, the advice or the registration fails, so the caller takes cudaHostAlloc."""
+    import mmap
+
+    numel = 1
+    for d in shape:
+        numel *= int(d)
+    nbytes = numel * torch.empty(0, dtype=dtype).element_size()
+    try:
+        mapping = mmap.mmap(
+            -1, nbytes + _HUGEPAGE_ALIGN, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+        )
+        raw = (ctypes.c_char * (nbytes + _HUGEPAGE_ALIGN)).from_buffer(mapping)
+        base = ctypes.addressof(raw)
+        offset = -base % _HUGEPAGE_ALIGN
+        if not _madvise(base + offset, nbytes, _MADV_HUGEPAGE):
+            raise OSError("madvise(MADV_HUGEPAGE) failed")
+        storage = torch.frombuffer(raw, dtype=torch.uint8, count=nbytes, offset=offset)
+        cudart = torch.cuda.cudart()
+        rc = int(cudart.cudaHostRegister(base + offset, nbytes, 0))
+        if rc != 0:
+            _clear_cuda_last_error()
+            raise OSError(f"cudaHostRegister returned {rc}")
+    except Exception as exc:  # noqa: BLE001 - fall back to cudaHostAlloc
+        logger.warning(
+            "PLE table: huge-page mapping failed, using cudaHostAlloc (%s)",
+            exc,
+        )
+        return None
+    table = storage.view(dtype).view(*[int(d) for d in shape])
+    table._sglang_ple_mapping = (mapping, raw)
+    # Unregistered with the table's last view, before the mapping is unmapped; at
+    # interpreter exit the driver reclaims it.
+    weakref.finalize(raw, cudart.cudaHostUnregister, base + offset).atexit = False
+    covered = _huge_page_bytes(base + offset, nbytes)
+    # only whole huge pages fit: the tail past the last one stays on base pages
+    coverable = nbytes // _HUGEPAGE_ALIGN * _HUGEPAGE_ALIGN
+    if covered is not None and covered < _MIN_HUGEPAGE_COVERAGE * coverable:
+        logger.warning(
+            "PLE table: only %.0f%% of the %.1f GiB table is on transparent huge pages, "
+            "so its gather is slower; check /sys/kernel/mm/transparent_hugepage/enabled "
+            "and defrag, and the host's free memory",
+            100 * covered / nbytes,
+            nbytes / 2**30,
+        )
+    else:
+        logger.info(
+            "PLE table: on transparent huge pages, page-locked (%.1f GiB, %s, %s%%)",
+            nbytes / 2**30,
+            dtype,
+            "?" if covered is None else f"{100 * covered / nbytes:.0f}",
+        )
+    return table
+
+
+def _clear_cuda_last_error() -> None:
+    """A failed cudaHostRegister leaves the runtime's last error set, and torch's next launch
+    check would raise it; clear it in every libcudart this process loaded. Failure path only:
+    torch's runtime need not be the first libcudart in the process, the one CudaRTLibrary opens."""
+    try:
+        with open("/proc/self/maps") as f:
+            paths = sorted({ln.split()[-1] for ln in f if "libcudart.so" in ln})
+    except OSError:
+        paths = []
+    for path in paths:
+        try:
+            ctypes.CDLL(path).cudaGetLastError()
+        except (OSError, AttributeError):
+            continue
+
+
+def _huge_page_bytes(start: int, length: int) -> Optional[int]:
+    """AnonHugePages of the mappings overlapping ``[start, start + length)``; None if
+    /proc/self/smaps cannot be read."""
+    end, total, inside = start + length, 0, False
+    try:
+        with open("/proc/self/smaps") as f:
+            for line in f:
+                head = line.split(maxsplit=1)[0]
+                if not head.endswith(":"):  # a mapping's header: "lo-hi perms ..."
+                    lo, hi = (int(x, 16) for x in head.split("-"))
+                    inside = lo < end and hi > start
+                elif inside and head == "AnonHugePages:":
+                    total += int(line.split()[1]) << 10
+    except (OSError, ValueError):
+        return None
+    return total
 
 
 def _libc() -> Optional[ctypes.CDLL]:
