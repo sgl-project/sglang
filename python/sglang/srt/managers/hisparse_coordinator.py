@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 )
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
+    KVCache,
     MiniMaxSparseKVPool,
     ReqToTokenPool,
 )
@@ -129,6 +130,24 @@ def resolve_shared_index_layers(
         )
         return None
     return pattern
+
+
+def _resolve_pool_layer_index(
+    *,
+    kvcache: KVCache,
+    device_pool: KVCache,
+    callers_pass_model_layer_ids: bool,
+) -> Optional[Dict[int, int]]:
+    # A hybrid pool keeps only its full-attention layers, in a dense full pool.
+    if isinstance(kvcache, HybridLinearKVPool):
+        return kvcache.full_attention_layer_id_mapping
+    # A pipeline-parallel stage keeps only its own layers.
+    if callers_pass_model_layer_ids and device_pool.start_layer > 0:
+        return {
+            device_pool.start_layer + layer_index: layer_index
+            for layer_index in range(device_pool.layer_num)
+        }
+    return None
 
 
 def _build_prefetch_groups(
@@ -652,12 +671,14 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
-        # Model layer id -> layer index of the dense full pool; None when the
-        # attention callers already pass pool layer indices.
-        self._pool_layer_index: Optional[Dict[int, int]] = (
-            kvcache.full_attention_layer_id_mapping
-            if isinstance(kvcache, HybridLinearKVPool)
-            else None
+        # Model layer id -> layer index of the device and host buffers; None when
+        # the attention callers already pass buffer layer indices.
+        self._pool_layer_index = _resolve_pool_layer_index(
+            kvcache=kvcache,
+            device_pool=self.mem_pool_device,
+            callers_pass_model_layer_ids=not (
+                self.is_dsv4_hisparse or self.is_m3_hisparse
+            ),
         )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
