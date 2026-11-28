@@ -4,6 +4,7 @@
 // 16-value block over split() lanes, MXFP8 gives each lane 16 values. Other rows
 // are left unset.
 
+#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -44,13 +45,15 @@ template <int E>
 __device__ __forceinline__ void
 quantize_part(float const (&x)[E], float amax, float block_max, uint32_t& packed, uint8_t& scale) {
   float encoder = fminf(__fdiv_rn(1536.0f, amax), kFltMax);
-  float decoder = __fdiv_rn(1.0f, encoder);
+  float decoder = device::math::rcp_nr_ftz(encoder);
   float outer = __fmul_rn(amax, float(1.0 / 1536.0));
   uint8_t bits6, bits4;
   float scale6 = e4m3_round(fminf(__fmul_rn(block_max, __fmul_rn(encoder, float(1.0 / 6.0))), 448.0f), bits6);
   float scale4 = e4m3_round(fminf(__fmul_rn(block_max, __fmul_rn(encoder, 0.25f)), 448.0f), bits4);
-  float inverse6 = fminf(__fdiv_rn(1.0f, __fmul_rn(scale6, decoder)), kFltMax);
-  float inverse4 = fminf(__fdiv_rn(1.0f, __fmul_rn(scale4, decoder)), kFltMax);
+  float prod6 = __fmul_rn(scale6, decoder);
+  float prod4 = __fmul_rn(scale4, decoder);
+  float inverse6 = prod6 > 0.0f ? fminf(device::math::rcp_nr_ftz(prod6), kFltMax) : kFltMax;
+  float inverse4 = prod4 > 0.0f ? fminf(device::math::rcp_nr_ftz(prod4), kFltMax) : kFltMax;
   uint32_t p6 = 0, p4 = 0;
   float e6[E], e4[E];
 #pragma unroll

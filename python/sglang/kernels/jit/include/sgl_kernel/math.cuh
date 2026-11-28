@@ -180,6 +180,22 @@ struct fast_mod_div_u32_t {
   uint32_t m_shift;
 };
 
+/// \brief Branchless 1-step Newton-Raphson refinement of `rcp.approx.ftz.f32`.
+///
+/// 0-ULP bit-identical to `__frcp_rn(x)` across all finite positive E4M3 scales
+/// and normal-range FP32 scale products; returns `0.0f` for non-positive / NaN inputs.
+SGL_DEVICE float rcp_nr_ftz(float x) {
+#ifdef USE_ROCM
+  return x > 0.0f ? __frcp_rn(x) : 0.0f;
+#else
+  const float sx = x > 0.0f ? x : 1.0f;
+  float r;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(sx));
+  r = __fmaf_rn(__fmaf_rn(-sx, r, 1.0f), r, r);
+  return x > 0.0f ? r : 0.0f;
+#endif
+}
+
 template <typename T>
 SGL_DEVICE uint2 div(T n, const fast_mod_div_u32_t& d) {
   return {n / d, n % d};
