@@ -7,22 +7,25 @@ import logging
 import os
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.kernels.arch import current_arch
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
-    record_foreign_defaults,
-    register_post_process,
     resolved_view,
     resolving_view,
-    run_post_process_pass,
     use_mla_backend,
+)
+from sglang.srt.arg_groups.overrides import (
+    declare_resolution,
+    record_foreign_defaults,
+    register_post_process,
+    run_post_process_pass,
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import is_host_cpu_arm64
+from sglang.srt.utils.device import is_host_cpu_arm64
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,58 @@ def handle_npu_backends(server_args: Any):
         set_default_server_args(server_args)
 
 
+def handle_mlu_backends(server_args: Any):
+    """Resolve backend-independent MLU runtime defaults."""
+    cfg = resolving_view(server_args)
+    if cfg.device != "mlu":
+        return
+    if cfg.quantization is not None:
+        raise NotImplementedError(
+            "MLU inference currently requires unquantized weights."
+        )
+    if cfg.speculative_algorithm is not None:
+        raise NotImplementedError("MLU speculative decoding is not supported yet.")
+    if cfg.sampling_backend not in (None, "pytorch"):
+        raise ValueError("MLU inference requires the pytorch sampling backend.")
+    if cfg.sampling_backend is None:
+        declare_resolution(
+            server_args, "handle_mlu_backends", sampling_backend="pytorch"
+        )
+    if cfg.page_size is None:
+        declare_resolution(server_args, "handle_mlu_backends", page_size=16)
+
+
+def handle_mlu_attention_backend_compatibility(server_args: Any):
+    """Validate MLU cache layouts after model and attention defaults resolve."""
+    cfg = resolving_view(server_args)
+    if cfg.device != "mlu":
+        return
+    for field in (
+        "attention_backend",
+        "prefill_attention_backend",
+        "decode_attention_backend",
+    ):
+        if getattr(cfg, field) not in (None, "mlu", "triton"):
+            raise ValueError(f"MLU inference requires {field}='mlu' or 'triton'.")
+    prefill_backend, decode_backend = attention_backends_of(cfg)
+    if prefill_backend != decode_backend:
+        raise ValueError(
+            "MLU prefill and decode share a KV cache memory pool. "
+            "Use the same attention backend to ensure compatible layouts."
+        )
+    use_hnd = prefill_backend == "mlu"
+    if (
+        envs.SGLANG_USE_HND_KVCACHE.is_set()
+        and envs.SGLANG_USE_HND_KVCACHE.get() != use_hnd
+    ):
+        # MLA uses token-linear storage independently of the MHA layout.
+        if not use_mla_backend(server_args):
+            raise ValueError(
+                f"MLU MHA attention backend {prefill_backend!r} "
+                f"requires SGLANG_USE_HND_KVCACHE={int(use_hnd)}."
+            )
+
+
 def handle_mps_backends(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.device == "mps":
@@ -65,6 +120,11 @@ def handle_amd_specifics(server_args: Any):
         # GPU rather than staging it, and the MMU notifier on that registration
         # evicts our KFD queues once per tensor while weights load. In KB.
         os.environ.setdefault("GPU_PINNED_MIN_XFER_SIZE", str(4 * 1024 * 1024))
+        # gfx1250 lacks the fp4-activation WMMA scale instruction, so aiter's
+        # fused_moe has to run MXFP4 experts as a8w4 there; aiter reads this.
+        hip = current_arch().hip
+        if hip is not None and hip.gcn_arch == "gfx1250":
+            os.environ.setdefault("AITER_FORCE_A8W4", "1")
 
 
 def handle_nccl_pre_warm(server_args: Any):

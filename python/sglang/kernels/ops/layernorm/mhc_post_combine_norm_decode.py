@@ -13,7 +13,7 @@ from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.srt.utils import get_device_core_count
 from sglang.srt.utils.custom_op import register_custom_op
 
-MAX_ROWS = 1024
+MAX_ROWS = 2048
 SPLIT4_MAX_ROWS = 128
 SPLIT2_MAX_ROWS = 640
 
@@ -59,7 +59,17 @@ def _pick_config(m: int, device: torch.device, quant: bool) -> Tuple[int, int]:
     return threads, 1
 
 
-@register_custom_op(mutates_args=["updated", "normalized", "q", "sf"])
+@register_custom_op(
+    mutates_args=[
+        "updated",
+        "normalized",
+        "q",
+        "sf",
+        "moe_x",
+        "moe_sf",
+        "moe_shared_sf",
+    ]
+)
 def _mhc_post_combine_norm_decode(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -75,9 +85,28 @@ def _mhc_post_combine_norm_decode(
     quant: bool,
     threads: int,
     split: int,
+    moe_x: Optional[torch.Tensor] = None,
+    moe_sf: Optional[torch.Tensor] = None,
+    moe_shared_sf: Optional[torch.Tensor] = None,
+    moe_shared_block_m: int = 0,
 ) -> None:
     _module(threads, split).run(
-        x, residual, post, comb, pre, weight, updated, normalized, q, sf, eps, quant
+        x,
+        residual,
+        post,
+        comb,
+        pre,
+        weight,
+        updated,
+        normalized,
+        q,
+        sf,
+        eps,
+        quant,
+        moe_x,
+        moe_sf,
+        moe_shared_sf,
+        moe_shared_block_m,
     )
 
 
@@ -91,9 +120,11 @@ def mhc_post_combine_norm_decode(
     eps: float,
     *,
     quant: bool = False,
+    moe_input: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Return ``(updated_residual, normed_rows, q, sf)``; ``q``/``sf`` are None
-    unless ``quant``."""
+    unless ``quant``. ``moe_input`` is ``MegaMoeInput.views()``: the normed rows
+    are also quantized into the MegaMoE buffer, as mega_moe_pre_dispatch would."""
     m = x.shape[0]
     updated, normalized = torch.empty_like(residual), torch.empty_like(x)
     if quant:
@@ -117,6 +148,7 @@ def mhc_post_combine_norm_decode(
         eps,
         quant,
         *_pick_config(m, x.device, quant),
+        *(() if moe_input is None else moe_input),
     )
     if not quant:
         return updated, normalized, None, None

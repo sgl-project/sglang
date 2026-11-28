@@ -190,7 +190,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         self,
         messages: str,
         pil_images,
-        max_req_input_len=-1,
         base_size: int = None,
         image_size: int = None,
         crop_mode: bool = None,
@@ -201,7 +200,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         image_size = image_size or self.image_size
         crop_mode = crop_mode if crop_mode is not None else self.crop_mode
 
-        tokenized_data = []
         masked_tokenized_data = []
         images_list = []
         images_seq_mask = []
@@ -278,7 +276,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
-        max_req_input_len: int = -1,
         base_size: int = None,
         image_size: int = None,
         crop_mode: bool = None,
@@ -301,7 +298,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         ) = self.format_messages_v2(
             prompt,
             images,
-            max_req_input_len,
             base_size=base_size,
             image_size=image_size,
             crop_mode=crop_mode,
@@ -350,7 +346,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         apply_sft_format: bool = False,
         inference_mode: bool = True,
         system_prompt: str = "",
-        max_req_input_len: int = -1,
         text: list[str] = None,
         base_size: int = None,
         image_size: int = None,
@@ -370,21 +365,12 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             apply_sft_format=apply_sft_format,
             inference_mode=inference_mode,
             system_prompt=system_prompt,
-            max_req_input_len=max_req_input_len,
             base_size=base_size if base_size is not None else self.base_size,
             image_size=image_size if image_size is not None else self.image_size,
             crop_mode=crop_mode if crop_mode is not None else self.crop_mode,
             v2_layout=v2_layout,
         )
         return prepare
-
-    def find_all_indices(self, messages, target_value):
-        """Return all indices where target_value appears in messages."""
-        indices = []
-        for index, item in enumerate(messages):
-            if item == target_value:
-                indices.append(index)
-        return indices
 
     def _preprocess_page(self, image, *, cropping, base_size, image_size, v2_layout):
         """Global view, local crops and tile grid of one page, memoised.

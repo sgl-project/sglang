@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.arg_groups.model_override_base import (
-    ep_scale_joiner_of,
+    ep_offset_joiner_of,
     resolving_view,
 )
 from sglang.srt.distributed import (
@@ -38,6 +38,7 @@ from sglang.srt.runtime_context import (
     get_stream,
 )
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_xpu
+from sglang.srt.utils.common import ceil_align
 
 if is_xpu():
     # custom_all_reduce_v2 imports tvm_ffi, absent on XPU; isinstance(x, ()) is False.
@@ -88,16 +89,26 @@ def dp_slot_in(per_rank) -> int:
     The sequence carries one entry per replica of the gather this process
     takes part in, so its length is the gather width. Length one is the
     all-gather-skipped batch, which carries this process's entry alone.
+
+    Under elastic EP it may be wider (dp_capacity_for); retirees are the tail.
     """
     if len(per_rank) == 1:
         return 0
     width = dp_gather_width()
-    if len(per_rank) != width:
+    if len(per_rank) != width and not (
+        len(per_rank) > width and get_exec().moe.elastic_ep_backend is not None
+    ):
         raise ValueError(
             f"a per-replica sequence of {len(per_rank)} entries does not "
             f"belong to a DP gather of width {width}"
         )
-    return dp_gather_slot()
+    slot = dp_gather_slot()
+    if slot >= len(per_rank):
+        raise ValueError(
+            f"DP slot {slot} is outside a per-replica sequence of "
+            f"{len(per_rank)} entries"
+        )
+    return slot
 
 
 def dp_gather_slot() -> int:
@@ -414,6 +425,50 @@ def get_dp_global_num_tokens() -> List[int]:
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
 
 
+def ascend_allgather_row_sizes_for_batch(
+    forward_batch,
+    *,
+    use_cp: bool,
+    use_tp_attn_a2a_scatter: Optional[bool],
+) -> Optional[List[int]]:
+    """Per-TP-rank row counts for the ascend_ops prefill allgather path.
+
+    ``use_tp_attn_a2a_scatter`` describes the MoE input layout when
+    ``attn_tp_size > 1``: True means each attention-TP rank holds a contiguous
+    slice of the DP shard, False means the full shard is gathered on every
+    rank, and None means the layout is unknown. ``None`` is also returned when
+    the counts cannot be derived from the batch alone, so the dispatcher must
+    exchange row counts on the fly.
+    """
+    parallel = get_parallel()
+    if use_cp:
+        if parallel.attn_cp_size == parallel.tp_size:
+            metadata = forward_batch.attn_cp_metadata
+            return getattr(metadata, "per_rank_actual_token", None)
+        return None
+
+    if parallel.attn_cp_size != 1 or parallel.attn_dp_size == 1:
+        return None
+    dp_rows = forward_batch.global_num_tokens_padded_cpu
+    if dp_rows is None or len(dp_rows) != parallel.attn_dp_size:
+        return None
+    attn_tp_size = parallel.attn_tp_size
+    if attn_tp_size == 1:
+        return dp_rows
+    if use_tp_attn_a2a_scatter is None:
+        return None
+    if use_tp_attn_a2a_scatter:
+        # Match tensor_split(attn_tp_size)[attn_tp_rank]: the first
+        # ``rows % attn_tp_size`` ranks take one extra row.
+        row_sizes = []
+        for rows in dp_rows:
+            base, extra = divmod(rows, attn_tp_size)
+            row_sizes.extend(base + (rank < extra) for rank in range(attn_tp_size))
+        return row_sizes
+    # Gathered: every attention-TP rank holds the whole DP shard.
+    return [rows for rows in dp_rows for _ in range(attn_tp_size)]
+
+
 def get_dp_hidden_size() -> int:
     return _DpGatheredBufferWrapper.get_dp_hidden_size()
 
@@ -466,7 +521,8 @@ def initialize_dp_attention_flags(server_args: ServerArgs):
     dp.enabled = get_parallel().attn_dp_enabled
 
     if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
-        if ep_scale_joiner_of(resolving_view(server_args)):
+        # Resolved, since this process's publish may not have happened yet.
+        if ep_offset_joiner_of(resolving_view(server_args)):
             dp.joiner_skip_all_gather = True
 
 
@@ -574,6 +630,16 @@ def reject_attn_tp_shard_with_tp_reduce(
 
 def is_allocation_symmetric() -> bool:
     return not is_dp_attention_enabled() or is_dp_max_padding()
+
+
+def dp_capacity_for(dp_size: int) -> int:
+    """Graph-facing DP buffer width: the max_ep_size pool ceiling, not the live width.
+
+    Same in every process, joiners included; callable before DP attention is set up."""
+    max_ep_size = get_parallel().max_ep_size
+    if not max_ep_size or get_exec().moe.elastic_ep_backend is None:
+        return dp_size
+    return max(dp_size, max_ep_size)
 
 
 def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -976,7 +1042,7 @@ def note_rank_barrier_in_prefill_graph() -> None:
     """For breaks that capture graphs of their own behind TP-group barriers."""
     dp = get_flags().dp
     if dp.capturing_prefill_graph:
-        dp.prefill_graph_has_rank_barrier = True
+        dp.prefill_graph_shape_has_rank_barrier = True
 
 
 def _dp_gather(
@@ -1188,29 +1254,6 @@ def _tbo_event(key) -> torch.cuda.Event:
     return ev
 
 
-def dp_gather_partial_async(
-    global_tokens: torch.Tensor,
-    local_tokens: torch.Tensor,
-    forward_batch: ForwardBatch,
-    event_key=("gather", 0),
-) -> torch.cuda.Event:
-    """Launch `dp_gather_partial` (all_gatherv) on the shared DP TBO comm stream;
-    re-record + return a PERSISTENT event (keyed by `event_key`) that fires when
-    the gather completes. Caller yields, then `compute_stream.wait_event(ev)`
-    before reading `global_tokens`."""
-    comm = get_dp_tbo_comm_stream()
-    compute = torch.cuda.current_stream()
-    # Keep buffers alive across streams (caching allocator).
-    local_tokens.record_stream(comm)
-    global_tokens.record_stream(comm)
-    ev = _tbo_event(event_key)
-    with torch.cuda.stream(comm):
-        comm.wait_stream(compute)  # inputs were produced on the compute stream
-        dp_gather_partial(global_tokens, local_tokens, forward_batch)
-        ev.record(comm)
-    return ev
-
-
 # Persistent grow-only buffers for non-EP DP TBO, keyed by (kind, tbo_subbatch).
 # Reused across ALL layers (and forwards) so the caching allocator does not churn
 # a fresh per-layer `torch.empty` for the 8x DP-gather / combine buffers. That
@@ -1296,11 +1339,6 @@ def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
 
 
-def get_moe_cp_group() -> GroupCoordinator:
-    """Returns the MOE_DP group, which includes CP partners when attn_cp_size > moe_dp_size."""
-    return get_parallel().moe_dp_group
-
-
 def get_moe_cp_rank() -> int:
     return get_parallel().moe_dp_group.rank_in_group
 
@@ -1326,3 +1364,141 @@ def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
     return get_parallel().attn_tp_group.all_gather(
         input, output_tensor_list=output_list
     )
+
+
+def require_mlp_tp_gather(*, moe_a2a_backend=None):
+    """
+    Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
+    """
+    from sglang.srt.layers.moe.utils import MoeA2ABackend, get_moe_a2a_backend
+
+    if moe_a2a_backend is None:
+        moe_a2a_backend = get_moe_a2a_backend()
+    elif not isinstance(moe_a2a_backend, MoeA2ABackend):
+        moe_a2a_backend = MoeA2ABackend(moe_a2a_backend)
+
+    # elastic-EP scale-up widens num_dp_ranks on the published config
+    if get_parallel().attn_dp_enabled:
+        assert get_parallel().num_dp_ranks > 1, (
+            "attention DP needs more than one DP rank"
+        )
+        if get_exec().moe.elastic_ep_backend is not None:
+            from sglang.srt.elastic_ep.elastic_ep import (
+                elastic_expanded_world_enabled,
+            )
+
+            if elastic_expanded_world_enabled():
+                return True
+        if (
+            get_parallel().moe_dense_tp_size is None
+        ):  # TODO(ch-wan): some MoE models do not have dense layers
+            return True
+        elif not get_parallel().enable_dp_lm_head:
+            return True
+        elif moe_a2a_backend.is_none():
+            return True
+        elif moe_a2a_backend.is_flashinfer() or moe_a2a_backend.is_mori_epv2():
+            # FlashInfer/MORI EPv2 A2A need a rank-invariant, DP-synchronized per-rank
+            # token count: MoeAlltoAll uses fixed-geometry buffers and the decode
+            # cuda-graph bucket must be identical across EP ranks, otherwise ranks
+            # replay different-sized graphs -> geometry mismatch -> illegal memory
+            # access (issue #30242). No literal MLP TP-gather happens here -- the
+            # MoE stays SCATTERED and the a2a op owns dispatch/combine -- but we
+            # reuse this flag's DP-sync bookkeeping (uniform global_num_tokens +
+            # max-based graph bucket). See #30432 re: the misleading flag name.
+            return True
+        elif moe_a2a_backend.is_flashinfer_megamoe():
+            # MegaMoE's capacity profiles require the same decode graph
+            # bucket on every EP rank. As for FlashInfer A2A above, this only
+            # enables DP-count bookkeeping; expert inputs remain local.
+            return True
+        elif moe_a2a_backend.is_mori() and envs.SGLANG_MORI_RECV_BOUND.get():
+            # Same bookkeeping, for the same reason. Bounding mori's receive
+            # buffer means baking a fan-in size into a captured graph, and the
+            # fan-in depends on what the *peers* send. Without a DP-synchronized
+            # bucket every rank buckets its own batch, so a rank on a narrow tier
+            # can be handed rows by a peer on a wider one; the only bound valid
+            # under that is the widest tier's, which is 4-16x looser than the
+            # batch actually being run and costs more in expert-GEMM tiles than
+            # the trim saves. With uniform buckets the per-tier fan-in is exact.
+            # Scoped to the opt-in gate so the default path is untouched.
+            return True
+        else:
+            return (
+                get_parallel().moe_dense_tp_size
+                > get_parallel().tp_size // get_parallel().num_dp_ranks
+            )
+    else:
+        return False
+
+
+def require_attn_tp_gather():
+    """
+    Check if the input of attention is scattered.
+    """
+    # Opt-out for models that manage SP scatter/gather at the model level
+    # and do not consume the upstream gathered_buffer. Without this, the
+    # cuda graph runner pads num_tokens to attn_tp_size, which can cause
+    # autotuners to pick suboptimal kernel variants at small batches.
+
+    if get_parallel().disable_attn_tp_gather:
+        return False
+
+    from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+    if (
+        not get_moe_a2a_backend().is_none()
+        or get_parallel().moe_dense_tp_size is not None
+    ):
+        if get_parallel().attn_dp_enabled:
+            return get_parallel().num_dp_ranks < get_parallel().tp_size
+        else:
+            return True
+    else:
+        return False
+
+
+def require_gathered_buffer():
+    return require_mlp_tp_gather() or require_attn_tp_gather()
+
+
+def require_mlp_sync():
+
+    return get_parallel().attn_dp_enabled or require_gathered_buffer()
+
+
+def get_cuda_graph_batch_size_alignment(
+    *,
+    gathered_buffer_required: Optional[bool] = None,
+    include_cp_alignment: bool = True,
+) -> int:
+    """Decode may waive CP alignment only when no gathered buffer needs it."""
+    if gathered_buffer_required is None:
+        gathered_buffer_required = require_gathered_buffer()
+    alignment = 1
+    if get_exec().overlap.enable_two_batch_overlap:
+        alignment *= 2
+    if gathered_buffer_required:
+        alignment *= get_parallel().attn_tp_size
+    # TODO: unverified on NVIDIA; drop the gate once validated on CUDA.
+    if (
+        (include_cp_alignment or gathered_buffer_required)
+        and not is_hip()
+        and alignment % get_parallel().attn_cp_size != 0
+    ):
+        alignment *= get_parallel().attn_cp_size
+    return alignment
+
+
+def get_cuda_graph_max_batch_size(max_batch_size: int) -> int:
+    return ceil_align(max_batch_size, get_cuda_graph_batch_size_alignment())
+
+
+def get_eager_max_batch_size(max_batch_size: int) -> int:
+    if not require_mlp_sync():
+        return max_batch_size
+
+    from sglang.srt.layers.cp.padding import get_cp_padding_align_size
+
+    max_batch_size = ceil_align(max_batch_size, get_parallel().attn_tp_size)
+    return ceil_align(max_batch_size, get_cp_padding_align_size())

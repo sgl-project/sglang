@@ -952,6 +952,89 @@ fn evict_component_all_frees_both_tiers_without_the_host_lru() {
     assert!(!tc.host_lru_list(MAMBA).in_list(Some(a)));
 }
 
+fn state_cost_core() -> UnifiedTreeCore<Vec<i64>> {
+    UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            mamba_cache_chunk_size: Some(256),
+            eviction_policy: "state_cost".to_string(),
+            state_cost: Some((1.0, 0.0)),
+            ..CacheInitParams::default()
+        },
+        vec![FULL, MAMBA],
+    )
+}
+
+fn walk_state_cost(tc: &mut UnifiedTreeCore<Vec<i64>>, states: usize) {
+    let mut tracker = HashMap::from([(MAMBA, 0)]);
+    let (mut device_frees, mut host_frees) = (HashMap::new(), HashMap::new());
+    tc.evict_device_start(MAMBA, states);
+    while tracker[&MAMBA] < states {
+        let (leaf, step) = tc.evict_device_next_node(MAMBA, &tracker);
+        accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+        if let Some(leaf) = leaf {
+            let (_, step) = tc.evict_device_leaf(leaf, false).unwrap();
+            accumulate_step(step, &mut tracker, &mut device_frees, &mut host_frees);
+        }
+    }
+    tc.evict_device_end(MAMBA);
+}
+
+fn resumes_at(tc: &mut UnifiedTreeCore<Vec<i64>>, key: &Vec<i64>) -> bool {
+    tc.match_prefix(&match_params(key)).device_prefix_len == key.len()
+}
+
+// Each state's gain is the token gap to its nearest shallower state (d=1, e=0);
+// the depths keep every gain distinct so no order rests on a tie.
+#[test]
+fn state_cost_evicts_the_cheapest_state_not_the_oldest() {
+    let mut tc = state_cost_core();
+    let deep = vec![100, 101, 102, 103, 104, 105, 106];
+    tc.insert(&insert_params_mamba(&deep, &[1, 2, 3, 4, 5, 6, 7], Some(1)));
+    tc.insert(&insert_params_mamba(&vec![1], &[10], Some(2)));
+    tc.insert(&insert_params_mamba(&vec![1, 2, 3], &[10, 11, 12], Some(3)));
+
+    walk_state_cost(&mut tc, /* states = */ 1);
+
+    assert!(resumes_at(&mut tc, &deep));
+    assert!(!resumes_at(&mut tc, &vec![1]));
+}
+
+#[test]
+fn state_cost_counts_only_the_gap_to_the_nearest_shallower_state() {
+    let mut tc = state_cost_core();
+    let lone = vec![100, 101];
+    tc.insert(&insert_params_mamba(&vec![1, 2, 3], &[10, 11, 12], Some(1)));
+    tc.insert(&insert_params_mamba(
+        &vec![1, 2, 3, 4],
+        &[10, 11, 12, 13],
+        Some(2),
+    ));
+    tc.insert(&insert_params_mamba(&lone, &[20, 21], Some(3)));
+
+    walk_state_cost(&mut tc, /* states = */ 1);
+
+    assert!(!resumes_at(&mut tc, &vec![1, 2, 3, 4]));
+    assert!(resumes_at(&mut tc, &vec![1, 2, 3]));
+    assert!(resumes_at(&mut tc, &lone));
+}
+
+#[test]
+fn state_cost_rechecks_a_state_whose_ancestor_left_during_the_walk() {
+    let mut tc = state_cost_core();
+    let lone = vec![100, 101, 102, 103];
+    let child = vec![1, 2, 3, 4, 5];
+    tc.insert(&insert_params_mamba(&vec![1, 2], &[10, 11], Some(1)));
+    tc.insert(&insert_params_mamba(&child, &[10, 11, 12, 13, 14], Some(2)));
+    tc.insert(&insert_params_mamba(&lone, &[20, 21, 22, 23], Some(3)));
+
+    walk_state_cost(&mut tc, /* states = */ 2);
+
+    assert!(!resumes_at(&mut tc, &vec![1, 2]));
+    assert!(!resumes_at(&mut tc, &lone));
+    assert!(resumes_at(&mut tc, &child));
+}
+
 #[test]
 fn device_walk_advances_one_allocator_mutation_per_call() {
     let mut tc = mamba_core(/* page_size = */ 1);
@@ -1141,30 +1224,53 @@ fn check_mamba_restored_during_expanded_swa_backup(pin_ancestor: bool) {
 
     tc.evict_device_start(MAMBA, 1);
     let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
-    tc.evict_device_end(MAMBA);
     assert_eq!(next, None);
-    assert_eq!(step.mamba_backup_node_id, None);
-    assert_eq!(
-        step.tracker.get(&MAMBA).copied().unwrap_or(0),
-        usize::from(!pin_ancestor)
-    );
+    assert!(step.tracker.is_empty());
+    assert!(step.device_frees.is_empty());
     assert!(step.host_frees.is_empty());
     if pin_ancestor {
-        assert!(step.device_frees.is_empty());
+        assert_eq!(step.mamba_backup_node_id, None);
+        tc.evict_device_end(MAMBA);
+        tc.sanity_check(&active, &[]);
+        tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
+        tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
     } else {
-        assert_eq!(step.device_frees.len(), 1);
+        // A's new Mamba state has no host copy, so the walk asks for its backup.
+        assert_eq!(step.mamba_backup_node_id, Some(a_id));
+        tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
+        tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
+        let (full, mut transfers) = tc.build_backup_spec(a_id).unwrap();
+        assert_eq!(full.numel(), 0);
+        assert!(
+            transfers[&MAMBA][0]
+                .device_indices
+                .as_ref()
+                .unwrap()
+                .equal(&Tensor::from_slice(&[201i64]))
+        );
+        transfers.retain(|ct, _| *ct == MAMBA);
+        transfers.get_mut(&MAMBA).unwrap()[0].host_indices = Some(Tensor::from_slice(&[1201i64]));
+        tc.commit_backup(a_id, full, transfers).unwrap();
+        tc.mark_write_through_pending(vec![a_id], a_id).unwrap();
+        tc.finish_write_through(vec![a_id], a_id).unwrap();
+        let step = tc.finish_mamba_state_eviction(a_id);
+        tc.evict_device_end(MAMBA);
+        assert_eq!(step.tracker[&MAMBA], 1);
         assert_eq!(step.device_frees[&MAMBA].len(), 1);
         assert!(step.device_frees[&MAMBA][0].equal(&Tensor::from_slice(&[201i64])));
+        assert!(
+            tc.arena
+                .host_value(a, MAMBA)
+                .equal(&Tensor::from_slice(&[1201i64]))
+        );
+        active.retain(|&(_, id)| id != b_id);
+        tc.sanity_check(&active, &[]);
     }
     assert!(
         tc.arena
             .device_value(b, MAMBA)
             .equal(&Tensor::from_slice(&[202i64]))
     );
-    tc.sanity_check(&active, &[]);
-
-    tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
-    tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
     tc.evict_device_start(MAMBA, 1);
     let (next, step) = tc.evict_device_next_node(MAMBA, &HashMap::new());
     tc.evict_device_end(MAMBA);
@@ -2501,6 +2607,87 @@ fn evict_excess_path_states_without_a_cap_is_a_no_op() {
     assert!(result.device_frees.is_empty());
     assert!(result.host_frees.is_empty());
     assert!(tc.arena.node(a).try_device_value(MAMBA).is_some());
+}
+
+// a: host-only state (in the host LRU), b: device + host copy, c: the device tail.
+fn capped_path_with_host_copies() -> (UnifiedTreeCore<Vec<i64>>, [NodeIdx_; 3]) {
+    let mut tc = mamba_core_with_cap(1);
+    tc.set_hicache_enabled();
+    let [a, b, c] = chain::<3>(&mut tc);
+    set_mamba_host(&mut tc, a, 70);
+    tc.host_lru_list_mut(MAMBA).insert_mru(a);
+    set_mamba_device(&mut tc, b, 8);
+    set_mamba_host(&mut tc, b, 80);
+    set_mamba_device(&mut tc, c, 9);
+    (tc, [a, b, c])
+}
+
+#[test]
+fn evict_excess_path_states_leaves_host_copies_without_host_counting() {
+    let (mut tc, [a, b, c]) = capped_path_with_host_copies();
+    let result = tc
+        .evict_excess_path_states(tc.arena.node(c).id)
+        .expect("live test node");
+    assert_eq!(result.device_frees[&MAMBA].len(), 1);
+    assert!(result.host_frees.is_empty());
+    assert!(tc.arena.node(a).has_host_value(MAMBA));
+    assert!(!tc.arena.node(b).has_device_value(MAMBA));
+    assert!(tc.arena.node(b).has_host_value(MAMBA));
+    // The capped state's host copy becomes the host LRU's most recent entry.
+    assert_eq!(lru_order(tc.host_lru_list(MAMBA)), vec![b, a]);
+}
+
+#[test]
+fn evict_excess_path_states_counts_and_frees_host_copies_when_counting_host() {
+    let (mut tc, [a, b, c]) = capped_path_with_host_copies();
+    tc.set_mamba_path_cap_counts_host(true);
+    let mut result = tc
+        .evict_excess_path_states(tc.arena.node(c).id)
+        .expect("live test node");
+    let device = result.device_frees.remove(&MAMBA).unwrap();
+    assert_eq!(device.len(), 1);
+    assert!(device[0].equal(&Tensor::from_slice(&[8i64])));
+    let host = result.host_frees.remove(&MAMBA).unwrap();
+    assert_eq!(host.len(), 2);
+    assert!(host[0].equal(&Tensor::from_slice(&[70i64])));
+    assert!(host[1].equal(&Tensor::from_slice(&[80i64])));
+    for node in [a, b] {
+        assert!(!tc.arena.node(node).has_device_value(MAMBA));
+        assert!(!tc.arena.node(node).has_host_value(MAMBA));
+    }
+    assert!(tc.arena.node(c).has_device_value(MAMBA));
+    assert!(lru_order(tc.host_lru_list(MAMBA)).is_empty());
+}
+
+#[test]
+fn evict_excess_path_states_keeps_host_copies_that_are_locked_or_in_flight() {
+    type Guard = fn(&mut UnifiedTreeCore<Vec<i64>>, NodeIdx_);
+    let guards: [(&str, Guard); 3] = [
+        ("host_lock", |tc, a| {
+            tc.arena
+                .node_mut(a)
+                .set_lock_ref_(ValueSlotIdx::host(MAMBA), 1);
+        }),
+        ("backup", |tc, a| {
+            tc.arena.node_mut(a).write_through_pending_id = Some(1);
+        }),
+        ("load_back", |tc, a| {
+            tc.arena.node_mut(a).load_back_pending_id = Some(1);
+        }),
+    ];
+    for (guard, set_guard) in guards {
+        let (mut tc, [a, b, c]) = capped_path_with_host_copies();
+        tc.set_mamba_path_cap_counts_host(true);
+        set_guard(&mut tc, a);
+        let result = tc
+            .evict_excess_path_states(tc.arena.node(c).id)
+            .expect("live test node");
+        assert!(tc.arena.node(a).has_host_value(MAMBA), "{guard}");
+        // b still goes: the guarded copy does not count as a removal.
+        assert_eq!(result.host_frees[&MAMBA].len(), 1, "{guard}");
+        assert!(!tc.arena.node(b).has_host_value(MAMBA), "{guard}");
+        assert!(tc.arena.node(c).has_device_value(MAMBA), "{guard}");
+    }
 }
 
 #[test]

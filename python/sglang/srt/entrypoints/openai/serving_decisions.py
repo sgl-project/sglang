@@ -26,10 +26,10 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import _CHAT_TEMPLATE_CLIENT_ERRORS
+from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils import ImageData
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -346,11 +346,12 @@ class OpenAIServingDecisions(OpenAIServingBase):
                 )
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
         # Refuse here because --allow-auto-truncate would cut off the answer position.
-        context_len = self.tokenizer_manager.context_len
-        if len(prompt_ids) + self.tokenizer_manager.num_reserved_tokens >= context_len:
+        max_req_input_len = self.tokenizer_manager.max_req_input_len
+        if len(prompt_ids) > max_req_input_len:
             raise ValueError(
                 f"the prompt has {len(prompt_ids)} tokens, which does not fit "
-                f"the context length of {context_len} tokens"
+                f"the context length on this server (at most {max_req_input_len} "
+                "prompt tokens)"
             )
         label_ids = _encode_labels(
             tokenizer=tokenizer,

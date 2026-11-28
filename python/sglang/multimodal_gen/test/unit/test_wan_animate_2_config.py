@@ -6,12 +6,14 @@ No models, GPU, or network: the registry detector tests patch
 ``maybe_download_model_index``; stages run with stand-in encoders.
 """
 
+import contextlib
+import io
 import logging
 import math
 import os
 from dataclasses import fields, replace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -28,28 +30,19 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan_Animate_2_14B_Config,
     Wan_Animate_2_14B_Distilled_Config,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     Wan_Animate_2_14B_Distilled_SamplingParam,
     Wan_Animate_2_14B_SamplingParam,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     VideoGenerationsRequest,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     get_sampling_request_extra_fields,
-)
-from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
-    AttentionBackendEnum,
 )
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -87,12 +80,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     build_clip_conditioning,
     build_schedule,
     generation_token_grid,
+    get_sampling_sigmas,
     request_state_from_batch,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.denoising import (
     WanAnimate2DenoisingStage,
     _clip_decoded_frames_to_uint8,
-    get_sampling_sigmas,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.encoder_adapters import (
     WanAnimate2VaeAdapter,
@@ -108,15 +101,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.w
     write_reference_video,
     zigzag_padding,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args
 from sglang.multimodal_gen.runtime.server_warmup import prepare_warmup_image_path
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     SERVER_WARMUP_VIDEO_STEPS,
     build_warmup_reqs,
     lighten_warmup_req,
-)
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
 )
 
 # Wan_Animate_2_14B_Config
@@ -390,11 +381,11 @@ class _RotatedQuantConfig:
         return UnquantizedLinearMethod()
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_block_refuses_a_checkpoint_with_offline_qk_rotation(monkeypatch):
     # The parent block registers q_rot / k_rot and applies them in its own attention
     # path; forward_ref / forward_gen never do, so loading would be silently wrong.
     monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", "true")
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"), pytest.raises(ValueError, match="offline Q/K rotation"):
         WanAnimate2TransformerBlock(
             64,
@@ -491,6 +482,7 @@ def _checkpoint_keys() -> list[str]:
     return keys
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_every_checkpoint_key_maps_onto_a_distinct_dit_parameter():
     """The DiT loads with the shared Wan rules plus the Wan-Animate-2 extras; a rule that
     stops matching leaves a tensor unmapped (skipped with a warning) or lands two tensors on
@@ -503,18 +495,9 @@ def test_every_checkpoint_key_maps_onto_a_distinct_dit_parameter():
     assert unmapped == []
     assert len(set(mapped.values())) == len(keys)
 
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         model = WanAnimate2Transformer3DModel(WanAnimate2Config(), hf_config={})
     assert set(mapped.values()) == set(model.state_dict())
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    # The DiT's parallel linear layers need the TP group even on a meta device.
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def test_official_checkpoint_config_names_update_the_arch_config():
@@ -1099,7 +1082,6 @@ def _request_state_for_clip_tests(frames, schedule, clip_len):
     )
     return WanAnimate2RequestState(
         device=torch.device("cpu"),
-        sp_size=1,
         generator=torch.Generator().manual_seed(0),
         inputs=inputs,
         letterbox_info=LetterboxInfo(pad_axis="width", padding=0, content_len=width),
@@ -1358,14 +1340,18 @@ def _extract_with_fake_reader(monkeypatch, *, sample_rate, samples=None, error=N
     import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.audio as mod
 
     reader_calls: list[tuple] = []
+    video = io.BytesIO(b"drv")
 
-    def fake_decode(path, *, target_sr, mono):
-        reader_calls.append((path, target_sr, mono))
+    def fake_decode(source, *, target_sr, mono):
+        reader_calls.append((source.read(), target_sr, mono))
         if error is not None:
             raise error
         return samples
 
-    monkeypatch.setattr(mod, "_audio_track_sample_rate", lambda path: sample_rate)
+    monkeypatch.setattr(
+        mod, "open_video_source", lambda path: contextlib.nullcontext(video)
+    )
+    monkeypatch.setattr(mod, "_audio_track_sample_rate", lambda source: sample_rate)
     monkeypatch.setattr(mod, "decode_audio_container", fake_decode)
     logs = {"info": [], "warning": [], "no_audio_track": []}
     result = mod.extract_reference_video_audio(
@@ -1383,7 +1369,7 @@ def test_extracted_audio_is_batched_channels_first_at_the_native_rate(monkeypatc
     (audio, sample_rate), logs, reader_calls = _extract_with_fake_reader(
         monkeypatch, sample_rate=48000, samples=samples
     )
-    assert reader_calls == [("drv.mp4", 48000, False)]
+    assert reader_calls == [(b"drv", 48000, False)]
     assert sample_rate == 48000
     assert audio.shape == (1, 2, 480) and audio.dtype == torch.float32
     assert audio.is_contiguous()
@@ -1423,9 +1409,12 @@ def test_reader_failures_warn_with_the_reader_message(monkeypatch):
 def test_missing_reader_dependency_warns_instead_of_raising(monkeypatch):
     import sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.wan_animate_2.audio as mod
 
-    def probe(path):
+    def probe(source):
         raise ImportError("No module named 'av'")
 
+    monkeypatch.setattr(
+        mod, "open_video_source", lambda path: contextlib.nullcontext(io.BytesIO())
+    )
     monkeypatch.setattr(mod, "_audio_track_sample_rate", probe)
     warnings: list[str] = []
     result = mod.extract_reference_video_audio(
@@ -1778,13 +1767,27 @@ def test_reference_video_url_uses_native_media_loading(tmp_path):
     expected = read_reference_video_frames(str(path), 8)
     assert expected.shape == (2, 32, 64, 3)
     with patch(
-        "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
-        "wan_animate_2.preprocess.get_video_bytes",
-        return_value=path.read_bytes(),
+        "sglang.multimodal_gen.runtime.utils.vision.download_video_to_stream",
+        side_effect=lambda _, output: output.write(path.read_bytes()),
     ) as download:
         actual = read_reference_video_frames("https://example.com/reference.mp4", 8)
-    download.assert_called_once_with("https://example.com/reference.mp4")
+    download.assert_called_once()
+    assert download.call_args.args[0] == "https://example.com/reference.mp4"
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_reference_video_ffmpeg_protocol_string_is_never_opened():
+    payload = "subfile,,start,0,end,99,,:http:169.254.169.254/latest"
+    reader = MagicMock()
+    fake_decord = SimpleNamespace(VideoReader=reader)
+    with (
+        patch.dict("sys.modules", {"decord": fake_decord, "decord2": fake_decord}),
+        patch("av.open") as av_open,
+        pytest.raises(ValueError),
+    ):
+        read_reference_video_frames(payload, 8)
+    reader.assert_not_called()
+    av_open.assert_not_called()
 
 
 class _StubVae:
@@ -1928,12 +1931,9 @@ def test_before_denoising_stage_populates_the_standard_denoising_inputs(
     set_global_server_args(server_args)
     stage = _before_denoising_stage(server_args.pipeline_config)
 
-    with (
-        patch(f"{_BEFORE_DENOISING}.get_sp_world_size", return_value=1),
-        patch(
-            f"{_BEFORE_DENOISING}.get_local_torch_device",
-            return_value=torch.device("cpu"),
-        ),
+    with patch(
+        f"{_BEFORE_DENOISING}.get_local_torch_device",
+        return_value=torch.device("cpu"),
     ):
         batch = stage(req, server_args)
 

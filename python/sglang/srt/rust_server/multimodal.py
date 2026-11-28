@@ -117,7 +117,7 @@ class _ModalityTable(dict):
     this module keeps its light import footprint."""
 
     def __missing__(self, name):
-        from sglang.srt.managers.schedule_batch import Modality
+        from sglang.srt.multimodal.modality import Modality
 
         self.update(
             {"image": Modality.IMAGE, "video": Modality.VIDEO, "audio": Modality.AUDIO}
@@ -134,11 +134,12 @@ _MODALITIES = _ModalityTable()
 def settle_shm_buffers(buffers, *, admitted: bool) -> None:
     """Decide the unlink duty for every segment a drained request parked in
     POSIX shm (any buffer that is not an inline numpy array is the Rust
-    extension's ``ShmBuffer``, whatever its name). Admitted: Rust hands the
-    duty to the ``ShmPointerMMData`` stubs, which unlink after the
-    post-broadcast open on every rank. Rejected: unlink now. Both are
-    idempotent on the Rust side. This is the drain loop's job, never a
-    wrapper's, so a package's own ``_wrap_mm_result`` needs no knowledge of it."""
+    extension's ``ShmBuffer``, whatever its name, or a processor's external
+    buffer, which settles the same way). Admitted: Rust hands the duty to the
+    ``ShmPointerMMData`` stubs, which unlink after the post-broadcast open on
+    every rank. Rejected: unlink now. Both are idempotent on the Rust side.
+    This is the drain loop's job, never a wrapper's, so a package's own
+    ``_wrap_mm_result`` needs no knowledge of it."""
     import numpy as np
 
     for value in buffers.values():
@@ -153,16 +154,20 @@ def settle_shm_buffers(buffers, *, admitted: bool) -> None:
 class MmTransportStats:
     """Zero-copy accounting at the Rust-to-Python multimodal hand-off.
 
-    A feature tensor crosses in one of two shapes: ``inline`` -- a numpy array
-    that owns the Rust vector, viewed by ``torch.from_numpy`` -- or ``shm`` -- a
-    POSIX segment the worker wrote, named in the request so every TP rank maps
-    it after the broadcast."""
+    A feature tensor crosses in one of three shapes: ``inline`` -- a numpy
+    array that owns the Rust vector, viewed by ``torch.from_numpy`` -- ``shm``
+    -- a POSIX segment the worker wrote, named in the request so every TP rank
+    maps it after the broadcast -- or ``external`` -- a buffer the processor
+    published in its own transport (``MmProcessor::publish_features``), which
+    the package that wraps it records."""
 
     __slots__ = (
         "inline_features",
         "inline_bytes",
         "shm_features",
         "shm_bytes",
+        "external_features",
+        "external_bytes",
         "copies",
     )
 
@@ -171,6 +176,8 @@ class MmTransportStats:
         self.inline_bytes = 0
         self.shm_features = 0
         self.shm_bytes = 0
+        self.external_features = 0
+        self.external_bytes = 0
         self.copies = 0
 
     def record_inline(self, array, tensor) -> None:
@@ -184,6 +191,10 @@ class MmTransportStats:
 
         self.shm_features += 1
         self.shm_bytes += int(np.prod(stub.shape)) * np.dtype(stub.dtype).itemsize
+
+    def record_external(self, nbytes: int) -> None:
+        self.external_features += 1
+        self.external_bytes += nbytes
 
     def snapshot(self) -> Dict[str, int]:
         return {name: getattr(self, name) for name in self.__slots__}
@@ -221,6 +232,9 @@ class RustMmProcessor:
         # SGLANG_RUST_SERVER.
         from sglang.srt.managers.multimodal_processor import import_processors
         from sglang.srt.managers.tokenizer_manager import get_processor_wrapper
+        from sglang.srt.multimodal.token_space_mm_process.registry import (
+            register_token_space_models,
+        )
 
         self.server_args = server_args
         self.model_config = model_config
@@ -231,6 +245,7 @@ class RustMmProcessor:
         # init_tokenizer_and_processor. The caller's already-loaded HF
         # AutoProcessor is reused when available (identical construction args).
         import_processors("sglang.srt.multimodal.processors")
+        register_token_space_models()
         if mm_process_pkg := envs.SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE.get():
             import_processors(mm_process_pkg, overwrite=True)
         self._processor = processor or get_processor_wrapper()
@@ -338,22 +353,21 @@ class RustMmProcessor:
         The buffers are ``mm.feature.{i}`` per item (shaped ``[rows,
         feature_dim]`` f32, inline or shm), ``mm.mrope`` (``[3, seq_len]``
         int64), and ``mm.meta``, a msgpack sidecar decoding to ``{"items":
-        [{"modality", "hash", "offsets", "model_specific_data"}, ...],
+        [{"modality", "hash", "identity", "offsets", "model_specific_data"}, ...],
         "token_ids", "mrope_delta"}`` with the items in buffer order. External
         model packages receive the same layout and wrap it their own way.
 
         Runs on the scheduler loop, so it must stay copy-free *and* hash-free:
         the inline numpy arrays own the Rust buffers, ``torch.from_numpy`` just
-        views them, and each item's ``hash`` is worker-precomputed so
-        ``set_pad_value`` skips ``hash_feature``. Any per-byte work here — memcpy,
+        views them, and each item's full ``identity`` is worker-precomputed so
+        ``set_pad_value`` never rereads feature bytes. The drain boundary binds
+        these short digests to the serving configuration. Any feature-sized work here — memcpy,
         sha256, tens of MB per image-heavy request — measurably inflates every
         running request's inter-token latency."""
         import msgspec
         import torch
 
-        from sglang.srt.managers.schedule_batch import (
-            MultimodalProcessorOutput,
-        )
+        from sglang.srt.managers.req_types import MultimodalProcessorOutput
 
         # Ownership of the segments is not decided here: the drain loop
         # releases or discards every `ShmBuffer` once it knows whether the
@@ -396,7 +410,7 @@ class RustMmProcessor:
         import torch
 
         from sglang.srt.managers.mm_utils import ShmPointerMMData
-        from sglang.srt.managers.schedule_batch import MultimodalDataItem
+        from sglang.srt.managers.req_types import MultimodalDataItem
 
         feature = buffers[f"mm.feature.{index}"]
         if isinstance(feature, np.ndarray):
@@ -425,6 +439,7 @@ class RustMmProcessor:
             modality=_MODALITIES[item["modality"]],
             feature=feature,
             hash=item["hash"],
+            identity=bytes(item["identity"]),
             offsets=[tuple(span) for span in item["offsets"]],
             model_specific_data={
                 "image_grid_thw": torch.tensor([[t, h, w]], dtype=torch.long)

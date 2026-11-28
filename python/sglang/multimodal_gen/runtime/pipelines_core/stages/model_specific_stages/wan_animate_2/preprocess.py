@@ -10,15 +10,14 @@ from __future__ import annotations
 
 import math
 from copy import deepcopy
-from io import BytesIO
-from typing import Literal
+from typing import BinaryIO, Literal
 
 import cv2
 import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.utils.common import get_video_bytes
+from sglang.multimodal_gen.runtime.utils.vision import open_video_source
 
 __all__ = [
     "LetterboxInfo",
@@ -252,11 +251,13 @@ def read_reference_video_frames(path: str, fps_target: int) -> np.ndarray:
     exists only in CUDA builds); decord2 is the arm64 build of the same API; PyAV is the
     fallback when neither is installed.
     """
-    source = (
-        BytesIO(get_video_bytes(path))
-        if path.startswith(("http://", "https://", "data:"))
-        else path
-    )
+    # The client string never reaches decord or FFmpeg: open_video_source
+    # downloads http(s) under the media URL policy and opens local paths as files.
+    with open_video_source(path) as source:
+        return _read_frames_from_stream(source, fps_target)
+
+
+def _read_frames_from_stream(source: BinaryIO, fps_target: int) -> np.ndarray:
     try:
         from decord import VideoReader
     except ImportError:
@@ -278,7 +279,7 @@ def read_reference_video_frames(path: str, fps_target: int) -> np.ndarray:
     import av
 
     # Decode everything once so num_frames_source matches decord's len() exactly.
-    with av.open(source) as container:
+    with av.open(source, options={"protocol_whitelist": "data"}) as container:
         stream = container.streams.video[0]
         fps_source = float(stream.average_rate)
         frames_source = [
@@ -296,7 +297,7 @@ def write_reference_video(path: str, frames: np.ndarray, fps: int) -> None:
     """Write ``[N, H, W, 3]`` uint8 RGB frames to ``path`` as an mp4 at ``fps`` through the
     runtime's video writer (the one request outputs go through), so the synthetic warmup
     video is encoded exactly like a request output and decodes with the readers above."""
-    from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+    from sglang.multimodal_gen.configs.task_type import DataType
     from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
 
     try:

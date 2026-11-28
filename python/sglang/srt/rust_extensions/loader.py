@@ -122,13 +122,14 @@ def load_rust_extension(
 
     crate = _discover_crate(workspace, python_module)
     features = tuple(dict.fromkeys((*crate.features, *additional_features)))
+    cache_root = _cache_root(cache_dir)
     context = _build_context(
         crate,
         features=features,
         build_fingerprint=build_fingerprint,
         extension_module=load_module,
+        cache_dir=cache_root,
     )
-    cache_root = _cache_root(cache_dir)
     extension_path = _cached_extension_path(
         cache_root, crate, context.fingerprint, load_module
     )
@@ -249,18 +250,14 @@ def _build_context(
     features: tuple[str, ...] | None = None,
     build_fingerprint: Mapping[str, object] | None = None,
     extension_module: str | None = None,
+    cache_dir: Path | None = None,
 ) -> _BuildContext:
     if features is None:
         features = crate.features
     if extension_module is None:
         extension_module = crate.python_module
     source_digest = _source_digest(crate.workspace, crate.source_inputs)
-    toolchain = {
-        "cargo": _command_version(
-            "cargo", "--version", "--verbose", cwd=crate.workspace
-        ),
-        "rustc": _command_version("rustc", "-vV", cwd=crate.workspace),
-    }
+    toolchain = query_rust_toolchain(crate.workspace, cache_dir)
     python_abi = {
         "cache_tag": sys.implementation.cache_tag,
         "ext_suffix": sysconfig.get_config_var("EXT_SUFFIX"),
@@ -329,6 +326,22 @@ def _source_files(workspace: Path) -> Iterator[Path]:
             yield root_path / filename
 
 
+def query_rust_toolchain(
+    workspace: Path, cache_dir: Path | None = None
+) -> dict[str, str]:
+    """The cargo and rustc versions that key cached builds of ``workspace``.
+
+    Queried under a cache lock: rustup may install the pinned toolchain on first
+    use, and concurrent installs fail.
+    """
+    lock_path = _cache_root(cache_dir) / "locks" / "rust-toolchain.lock"
+    with _filesystem_lock(lock_path):
+        return {
+            "cargo": _command_version("cargo", "--version", "--verbose", cwd=workspace),
+            "rustc": _command_version("rustc", "-vV", cwd=workspace),
+        }
+
+
 def _command_version(command: str, *arguments: str, cwd: Path) -> str:
     try:
         result = subprocess.run(
@@ -339,8 +352,10 @@ def _command_version(command: str, *arguments: str, cwd: Path) -> str:
             cwd=cwd,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
+        stderr = (getattr(exc, "stderr", None) or "").strip()
         raise RuntimeError(
             f"failed to query the Rust toolchain with `{command} {' '.join(arguments)}`"
+            + (f": {stderr}" if stderr else "")
         ) from exc
     return result.stdout.strip()
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 import importlib.util
 import logging
 import re
-import subprocess
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
@@ -19,8 +18,13 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
+from sglang.srt.mem_cache.kv.plan import (
+    TREE_STATE,
+    TREE_TOKEN,
+    TREE_WINDOW,
+)
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.rust_extensions.loader import query_rust_toolchain
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -41,16 +45,32 @@ _RUST_TREE_CORE_MANIFEST = (
 )
 logger = logging.getLogger(__name__)
 
-# The slots the native core stores, and the family it keeps each by.
-NATIVE_SLOTS = {"FULL": TREE_TOKEN, "SWA": TREE_WINDOW, "MAMBA": TREE_STATE}
+# The id the native core stores each family's slot by. The native core keeps
+# one slot per family; the Rust adapter maps the tree's slot ids to these.
+NATIVE_FAMILY_IDS = {
+    TREE_TOKEN: ComponentType.FULL,
+    TREE_WINDOW: ComponentType.SWA,
+    TREE_STATE: ComponentType.MAMBA,
+}
+
+
+def several_window_slots(tree_slots) -> bool:
+    """Whether a tree keeps more than one window slot: the native core keeps
+    one."""
+    return sum(slot.family == TREE_WINDOW for slot in tree_slots) > 1
+
+
+def non_native_slots(tree_slots) -> list:
+    """The slots of a family the native core does not store."""
+    return [slot for slot in tree_slots if slot.family not in NATIVE_FAMILY_IDS]
 
 
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
-    if params.tree_slots is not None and any(
-        NATIVE_SLOTS.get(slot.component) != slot.family for slot in params.tree_slots
-    ):
+    if params.tree_slots is not None and several_window_slots(params.tree_slots):
+        return "a tree with several window slots requires the Python TreeCore"
+    if params.tree_slots is not None and non_native_slots(params.tree_slots):
         return "the configured components require the Python TreeCore"
     if params.component_registry_override:
         return "custom components require the Python TreeCore"
@@ -92,19 +112,10 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
             return "the requested Rust TreeCore source build has no sources"
         return "this installation contains neither the Rust TreeCore extension nor its sources"
     # Even a cached source build needs these version queries for its fingerprint.
-    # Match the loader's commands and cwd so rustup workspace overrides apply.
-    for command in (("cargo", "--version", "--verbose"), ("rustc", "-vV")):
-        try:
-            subprocess.run(
-                command,
-                cwd=workspace,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return f"the Rust TreeCore toolchain is unavailable ({' '.join(command)})"
+    try:
+        query_rust_toolchain(workspace)
+    except (OSError, RuntimeError) as exc:
+        return f"the Rust TreeCore toolchain is unavailable: {exc}"
     return None
 
 

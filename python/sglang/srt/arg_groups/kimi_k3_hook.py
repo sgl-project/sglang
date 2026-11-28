@@ -3,10 +3,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.runtime_context import get_platform
 
 if TYPE_CHECKING:
@@ -25,17 +23,33 @@ def apply_kimi_k3_spec_backend_defaults(server_args: ServerArgs) -> None:
     # Use the fused Kimi-K3/DSPARK CuTeDSL kernel for KDA target verification.
     # Decode is left free (its bf16-ssm SM100+ flashinfer default is fine -- the
     # target only verifies under spec); the verify backend is pinned directly.
-    if cfg.linear_attn_verify_backend is None:
-        declare_resolution(
-            server_args,
-            "apply_kimi_k3_spec_backend_defaults",
-            linear_attn_verify_backend="nv_cutedsl",
-        )
-        logger.info(
-            "Kimi hybrid model with speculative decoding: pinning "
-            "--linear-attn-verify-backend to nv_cutedsl (uses the fused "
-            "Kimi-K3/DSPARK CuTeDSL kernel)."
-        )
+    # CuTeDSL is CUDA-only; gfx950 keeps the Triton verify kernel.
+    if cfg.linear_attn_verify_backend is None and not get_platform().is_gfx95:
+        if get_platform().is_sm100:
+            declare_resolution(
+                server_args,
+                "apply_kimi_k3_spec_backend_defaults",
+                linear_attn_verify_backend="nv_cutedsl",
+            )
+            logger.info(
+                "Kimi hybrid model with speculative decoding: pinning "
+                "--linear-attn-verify-backend to nv_cutedsl (uses the fused "
+                "Kimi-K3/DSPARK CuTeDSL kernel)."
+            )
+        else:
+            # nv_cutedsl is CUDA-only and crashes the first verify on other
+            # platforms; fall back to the triton KDA path decode and prefill
+            # already use there.
+            declare_resolution(
+                server_args,
+                "apply_kimi_k3_spec_backend_defaults",
+                linear_attn_verify_backend="triton",
+            )
+            logger.info(
+                "Kimi hybrid model with speculative decoding: pinning "
+                "--linear-attn-verify-backend to triton (nv_cutedsl is "
+                "CUDA-only)."
+            )
 
     # dspark's draft is dense MQA; trtllm_mha avoids flashinfer's blocking
     # per-step host plan. DSPARK-only: other spec algos use MLA-family drafts.

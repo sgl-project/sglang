@@ -14,7 +14,7 @@ register_cuda_ci(
 
 @marker.parametrize("batch", [1, 2, 4, 8], [1, 8])
 @marker.parametrize("height,width", [(40, 40), (64, 64)], [(40, 40)])
-@marker.benchmark("impl", ["jit", "torch"])
+@marker.benchmark("impl", ["jit", "torch"], gate=["jit"])
 def benchmark(batch: int, height: int, width: int, impl: str):
     shortcut = torch.randn(
         batch, height, width, 768, device="cuda", dtype=torch.bfloat16

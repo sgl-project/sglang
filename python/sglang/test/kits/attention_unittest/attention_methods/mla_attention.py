@@ -15,12 +15,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -293,7 +294,7 @@ class MockMLAModelRunner(ModelRunner):
         self.max_running_requests = pool_batch_size
         self.req_to_token_pool = ReqToTokenPool(
             size=pool_batch_size,
-            max_context_len=max_context_len,
+            row_width=max_context_len,
             device=device,
             enable_memory_saver=False,
         )
@@ -313,6 +314,7 @@ class MockMLAModelRunner(ModelRunner):
             page_size=case.page_size,
             hands_out_virtual_ids=False,
             state_id_spaces=lambda: {},
+            request_id_spaces=lambda: {},
         )
         self.is_draft_worker = False
         self.init_runner_ids()

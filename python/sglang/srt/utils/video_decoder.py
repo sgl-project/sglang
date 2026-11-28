@@ -35,7 +35,7 @@ def _try_cuda_backend() -> bool:
 
 def _is_cpu_engine() -> bool:
     # Lazy import to avoid circular dependency issues and unnecessary imports on module load
-    from sglang.srt.utils.common import is_cpu
+    from sglang.srt.utils.device import is_cpu
 
     return is_cpu()
 
@@ -54,6 +54,10 @@ class VideoDecoderWrapper:
             1 = single decoder. Set > 1 to split frame indices across
             multiple decoders in parallel threads.
         """
+        if isinstance(source, str) and source.startswith(("http://", "https://")):
+            from sglang.srt.multimodal.media_io import get_video_bytes
+
+            source = get_video_bytes(source)
         self._source = source
         self._num_decode_threads = num_decode_threads
         self._source_bytes = source if isinstance(source, bytes) else None

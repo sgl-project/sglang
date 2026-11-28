@@ -41,8 +41,7 @@ class Mamba2Config(HFMamba2Config):
     def mamba2_cache_params(self) -> Mamba2CacheParams:
         from sglang.srt.runtime_context import get_parallel
 
-        parallel = get_parallel()
-        tp_world_size = parallel.tp_size if parallel else 1
+        tp_world_size = get_parallel().tp_size
         shape = Mamba2StateShape.create(
             tp_world_size=tp_world_size,
             intermediate_size=self.intermediate_size,

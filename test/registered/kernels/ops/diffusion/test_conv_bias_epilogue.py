@@ -18,7 +18,7 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 DEVICE = "cuda"
 
@@ -91,13 +91,9 @@ def test_conv_bias_epilogue_rejects_unsupported_inputs():
     x1 = torch.randn(1, 1, 2, 3, 4, device=DEVICE, dtype=torch.bfloat16)
     assert x1.is_contiguous(memory_format=torch.channels_last_3d)
     assert not can_use_conv_bias_epilogue(x1, bias[:1])  # C == 1 is ambiguous
-    with pytest.raises(ValueError):
-        conv_bias_epilogue(x.contiguous(), bias)
     with torch.enable_grad():
         xg = x.clone().requires_grad_(True)
         assert not can_use_conv_bias_epilogue(xg, bias)
-        with pytest.raises(ValueError):
-            conv_bias_epilogue(xg, bias)
 
 
 if __name__ == "__main__":

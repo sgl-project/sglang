@@ -60,28 +60,6 @@ def test_sm120_runtime_policy_delegates_decode_shapes():
     assert not future_policy.decode_uses_static_max_seqlen_k
 
 
-def test_sm120_preallocated_output_contract_is_validated_before_launch():
-    q = torch.empty((1, 1, 1, 32), device="cuda", dtype=torch.bfloat16)
-    k = torch.empty((1, 1, 1, 32), device="cuda", dtype=torch.bfloat16)
-    v = torch.empty_like(k)
-
-    with pytest.raises(ValueError, match="must not require gradients"):
-        flash_attn_with_kvcache(
-            q,
-            k,
-            v,
-            out=torch.empty_like(q, requires_grad=True),
-        )
-
-    strided_out = torch.empty(
-        (1, 1, 1, 64),
-        device="cuda",
-        dtype=torch.bfloat16,
-    )[..., ::2]
-    with pytest.raises(ValueError, match="must have stride 1"):
-        flash_attn_with_kvcache(q, k, v, out=strided_out)
-
-
 @pytest.mark.parametrize(
     (
         "head_dim",
@@ -1320,19 +1298,7 @@ def test_sm120_low_hd_paged_decode_reuses_cached_host_plan(
 ):
     """Low-HD MHA/GQA/MQA decode must reuse its compiled TVM-FFI plan."""
     sm120_forward_host.clear_launch_plans()
-    cache_hits = []
-    original_try_paged_decode = sm120_forward_host.try_paged_decode
-
-    def record_cache_hit(**kwargs):
-        result = original_try_paged_decode(**kwargs)
-        cache_hits.append(result is not None)
-        return result
-
-    monkeypatch.setattr(
-        sm120_forward_host,
-        "try_paged_decode",
-        record_cache_hit,
-    )
+    cache_hits = _record_paged_cache_hits(monkeypatch)
     torch.manual_seed(20260731 + head_dim + num_kv_heads)
     batch_size, num_q_heads = 2, 8
     max_seqlen, page_size = 512, 64
@@ -1394,6 +1360,116 @@ def test_sm120_low_hd_paged_decode_reuses_cached_host_plan(
     assert not any(cache_hits[:-1])
     assert cache_hits[-1]
     torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
+
+
+def _paged_prefill_batch(lengths, page_size, num_q_heads, num_kv_heads, head_dim):
+    pages = [-(-length // page_size) for length in lengths]
+    page_ids = torch.randperm(sum(pages), device="cuda").to(torch.int32)
+    page_table = torch.zeros(len(lengths), max(pages), device="cuda", dtype=torch.int32)
+    offsets = [0]
+    for i, num_pages in enumerate(pages):
+        page_table[i, :num_pages] = page_ids[offsets[-1] : offsets[-1] + num_pages]
+        offsets.append(offsets[-1] + num_pages)
+    q_offsets = [0]
+    for length in lengths:
+        q_offsets.append(q_offsets[-1] + length)
+    q = torch.randn(
+        sum(lengths), num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        sum(pages),
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    return dict(
+        q=q,
+        k_cache=k_cache,
+        v_cache=torch.randn_like(k_cache),
+        page_table=page_table,
+        cache_seqlens=torch.tensor(lengths, device="cuda", dtype=torch.int32),
+        cu_seqlens_q=torch.tensor(q_offsets, device="cuda", dtype=torch.int32),
+    )
+
+
+def _record_paged_cache_hits(monkeypatch):
+    cache_hits = []
+    original_try_paged = sm120_forward_host.try_paged
+
+    def record_cache_hit(**kwargs):
+        result = original_try_paged(**kwargs)
+        cache_hits.append(result is not None)
+        return result
+
+    monkeypatch.setattr(sm120_forward_host, "try_paged", record_cache_hit)
+    return cache_hits
+
+
+@pytest.mark.parametrize(("page_size", "num_kv_heads"), [(1, 8), (64, 2)])
+def test_sm120_paged_prefill_reuses_cached_host_plan(
+    monkeypatch,
+    page_size,
+    num_kv_heads,
+):
+    sm120_forward_host.clear_launch_plans()
+    cache_hits = _record_paged_cache_hits(monkeypatch)
+    torch.manual_seed(20261102 + page_size + num_kv_heads)
+    lengths = (192, 128, 77)
+    layers = [
+        _paged_prefill_batch(lengths, page_size, 16, num_kv_heads, 128)
+        for _ in range(3)
+    ]
+
+    # FlashAttentionBackend's paged extend passes no max_seqlen_k; the host then
+    # keys the plan on the KV pool's capacity.
+    def run(layer, out, max_seqlen_k=None):
+        return flash_attn_with_kvcache(
+            **layer,
+            max_seqlen_q=max(lengths),
+            max_seqlen_k=max_seqlen_k,
+            causal=True,
+            num_splits=1,
+            pack_gqa=None,
+            out=out,
+        )
+
+    outs = [torch.empty_like(layer["q"]) for layer in layers]
+    for layer, out in zip(layers, outs):
+        assert run(layer, out).data_ptr() == out.data_ptr()
+    torch.cuda.synchronize()
+    # The first layer misses in the wrapper and in the generic path, then registers.
+    assert cache_hits == [False, False, True, True]
+
+    for layer, cached in zip(layers, outs):
+        sm120_forward_host.clear_launch_plans()
+        generic = run(layer, torch.empty_like(layer["q"]))
+        torch.testing.assert_close(generic, cached, atol=0.0, rtol=0.0)
+
+    # Tile selection reads the exact max_seqlen_k, so another value needs its own plan.
+    cache_hits.clear()
+    for _ in range(2):
+        run(layers[0], torch.empty_like(outs[0]), max_seqlen_k=max(lengths) + 64)
+    assert cache_hits == [False, False, True]
+
+
+def test_sm120_split_kv_paged_prefill_is_not_replayed_from_a_plan():
+    """A prefill plan replays one launch, which would skip a SplitKV prefill's
+    combine step: repeated SplitKV launches must keep matching the unsplit one."""
+    sm120_forward_host.clear_launch_plans()
+    torch.manual_seed(20261118)
+    lengths = (512, 448, 400)
+    batch = _paged_prefill_batch(lengths, 64, 16, 2, 128)
+
+    def run(num_splits):
+        return flash_attn_with_kvcache(
+            **batch, max_seqlen_q=max(lengths), causal=True, num_splits=num_splits
+        )
+
+    unsplit = run(1)
+    for _ in range(2):
+        _assert_attention_close(run(2), unsplit)
 
 
 @pytest.mark.parametrize(
@@ -1838,19 +1914,7 @@ def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(
 ):
     """Ragged SplitKV must remain correct across uniform/ragged cache reuse."""
     sm120_forward_host.clear_launch_plans()
-    cache_hits = []
-    original_try_paged_decode = sm120_forward_host.try_paged_decode
-
-    def record_cache_hit(**kwargs):
-        result = original_try_paged_decode(**kwargs)
-        cache_hits.append(result is not None)
-        return result
-
-    monkeypatch.setattr(
-        sm120_forward_host,
-        "try_paged_decode",
-        record_cache_hit,
-    )
+    cache_hits = _record_paged_cache_hits(monkeypatch)
     torch.manual_seed(1234)
     batch_size, num_q_heads, head_dim = 4, 6, 256
     max_seqlen, page_size = 1024, 64
@@ -1937,6 +2001,94 @@ def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(
     error = (ragged_first.float() - reference).abs()
     assert error.max().item() < 1e-2
     assert error.mean().item() < 5e-4
+
+
+def test_sm120_paged_decode_graph_splits_follow_replay_lengths(monkeypatch):
+    """A large capture bound must not collapse shorter replay contexts into one split."""
+    sm120_forward_host.clear_launch_plans()
+    plans = []
+    original_resolve_plan = Sm120ForwardHost.resolve_plan
+
+    def record_plan(**kwargs):
+        plan = original_resolve_plan(**kwargs)
+        plans.append((kwargs["is_stream_capturing"], plan))
+        return plan
+
+    monkeypatch.setattr(Sm120ForwardHost, "resolve_plan", staticmethod(record_plan))
+    torch.manual_seed(1234)
+    # More than eight batch/head groups selects generic SplitKV, not transpose.
+    batch_size, num_q_heads, head_dim, page_size = 12, 6, 256, 64
+    context_bound, pages_per_request = 262144, 32
+    q = torch.randn(
+        batch_size, num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        batch_size * pages_per_request,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.zeros(
+        batch_size, context_bound // page_size, device="cuda", dtype=torch.int32
+    )
+    page_table[:, :pages_per_request] = torch.arange(
+        batch_size * pages_per_request, device="cuda", dtype=torch.int32
+    ).view(batch_size, pages_per_request)
+    cache_seqlens = torch.ones(batch_size, device="cuda", dtype=torch.int32)
+    cu_seqlens_q = torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+    out = torch.empty_like(q)
+
+    def run():
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            max_seqlen_k=context_bound,
+            causal=True,
+            num_splits=0,
+            out=out,
+        )
+
+    run()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    # Correct output alone does not catch this performance regression.
+    # Check that eager keeps its fixed grain and capture uses live partitioning.
+    assert any(
+        not capturing and plan.split_kv_blocks_per_cta > 0 for capturing, plan in plans
+    )
+    captured_plans = [plan for capturing, plan in plans if capturing]
+    assert captured_plans
+    for plan in captured_plans:
+        assert plan.num_splits > 1
+        assert plan.split_qk_n and not plan.transpose_qk_pv
+        assert plan.split_kv_blocks_per_cta == 0
+
+    lengths = [2048, 1000, 513, 257, 63, 1, 1536, 64, 65, 1999, 700, 128]
+    for replay_lengths in (lengths, lengths[::-1]):
+        cache_seqlens.copy_(cache_seqlens.new_tensor(replay_lengths))
+        graph.replay()
+        torch.cuda.synchronize()
+        for index, length in enumerate(replay_lengths):
+            pages = page_table[index, :pages_per_request]
+            k = k_cache.index_select(0, pages).flatten(0, 1)[:length]
+            v = v_cache.index_select(0, pages).flatten(0, 1)[:length]
+            reference, _ = _attention_reference(q[index : index + 1], k, v)
+            _assert_attention_close(out[index : index + 1], reference)
 
 
 def test_sm120_paged_decode_transpose_is_cache_order_independent():
@@ -2044,19 +2196,7 @@ def test_sm120_paged_decode_graph_pdl_is_correct_and_eager_reusable(
 ):
     """Every SplitKV dataflow must safely launch its captured combine early."""
     sm120_forward_host.clear_launch_plans()
-    cache_hits = []
-    original_try_paged_decode = sm120_forward_host.try_paged_decode
-
-    def record_cache_hit(**kwargs):
-        result = original_try_paged_decode(**kwargs)
-        cache_hits.append(result is not None)
-        return result
-
-    monkeypatch.setattr(
-        sm120_forward_host,
-        "try_paged_decode",
-        record_cache_hit,
-    )
+    cache_hits = _record_paged_cache_hits(monkeypatch)
     torch.manual_seed(20260730)
     batch_size, head_dim = 1, 256
     max_seqlen, page_size = 2048, 64

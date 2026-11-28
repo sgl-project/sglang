@@ -16,7 +16,7 @@ Unlike the CPU-only server-args guard unit test (TestTwoBatchOverlapBackend), th
 actually runs the TBO forward on the real model — which only DeepSeek-V4 implements,
 so it needs the real 8-GPU model (a dummy model path would not exercise TBO).
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-flash suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-flash suite
 """
 
 import os
@@ -37,7 +37,7 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-flash", nightly=True
+    est_time=7200, suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-flash", nightly=True
 )
 
 DEEPSEEK_V4_FLASH_FP8_MODEL_PATH = os.environ.get(
@@ -59,8 +59,6 @@ COMMON_ENV_VARS = {
     "SGLANG_HACK_FLASHMLA_BACKEND": FLASHMLA_BACKEND,
     "SGLANG_OPT_FP8_WO_A_GEMM": "false",
     "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "false",
-    "SGLANG_OPT_USE_TOPK_V2": "false",
-    "SGLANG_OPT_USE_AITER_INDEXER": "true",
     "SGLANG_OPT_USE_TILELANG_INDEXER": "false",
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "false",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "false",
@@ -74,7 +72,6 @@ COMMON_ENV_VARS = {
     "SGLANG_DP_USE_REDUCE_SCATTER": "1",
     "SGLANG_SHARED_EXPERT_TP1": "1",
     "SGLANG_DP_SHARED_EXPERT_LOCAL": "1",
-    "SGLANG_TBO_DEBUG": "1",
     # ROCm HSA-resource stability for TBO at high concurrency.
     "GPU_MAX_HW_QUEUES": "5",
     # FP8 variant

@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=370, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=800, suite="stage-b-test-2-gpu-large-amd")
+register_amd_ci(est_time=800, suite="extra-a-test-2-gpu-large-amd")
 
 FULL_MODEL = "Qwen/Qwen3-32B"
 

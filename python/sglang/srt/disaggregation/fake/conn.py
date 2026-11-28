@@ -13,7 +13,7 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
     KVTransferMetric,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
@@ -75,6 +75,9 @@ class FakeKVSender(BaseKVSender):
         return KVPoll.Success
 
     def poll_pp_consensus(self) -> KVPoll:
+        return self.poll()
+
+    def poll_pp_release(self) -> KVPoll:
         return self.poll()
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:

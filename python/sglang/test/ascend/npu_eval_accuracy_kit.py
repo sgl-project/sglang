@@ -26,11 +26,10 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 _NPU_ACCURACY_TOLERANCE = 0.99
 _NPU_MAX_ACCURACY_ATTEMPTS = 3
 
-# Nightly is also PR-triggered, so exclude it by workflow ref; every other caller
-# (full test, version bump, release cut) still gets the full run.
-_is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and (
-    "nightly-test-npu.yml" not in os.environ.get("GITHUB_WORKFLOW_REF", "")
-)
+# The PR pipeline (pr-test-npu.yml) runs on both `pull_request` and a daily
+# `schedule`, so match the workflow file instead of the event name. Every other
+# caller (nightly, full test, version bump, release cut) still gets the full run.
+_is_pr_pipeline = "pr-test-npu.yml" in os.environ.get("GITHUB_WORKFLOW_REF", "")
 
 
 def run_npu_pr_smoke(base_url):
@@ -47,7 +46,7 @@ def run_npu_pr_smoke(base_url):
 
 
 class NPUGSM8KMixin(GSM8KMixin):
-    """NPU GSM8K accuracy mixin — 1% tolerance + up to 3 retries.
+    """NPU GSM8K accuracy mixin — 1% tolerance + bounded retries.
 
     ``gsm8k_backend`` selects the harness:
 
@@ -56,6 +55,11 @@ class NPUGSM8KMixin(GSM8KMixin):
       temperature 1.0). Use it to keep thresholds calibrated against the
       legacy evalscope numbers (e.g. Moonlight bf16 tp2 = 0.837).
     """
+
+    # Retry cap for the accuracy check. Classes whose GSM8K pass is expensive
+    # (e.g. a full 1319-example evalscope run takes ~32 min) override this to
+    # keep the whole file inside its per-file CI timeout.
+    gsm8k_max_attempts: int = _NPU_MAX_ACCURACY_ATTEMPTS
 
     # evalscope request concurrency; 64 matches the harness the 0.83
     # Moonlight baseline was calibrated with.
@@ -79,7 +83,7 @@ class NPUGSM8KMixin(GSM8KMixin):
             self.gsm8k_num_examples if self.gsm8k_num_examples is not None else 100000
         )
         best = 0.0
-        for attempt in range(_NPU_MAX_ACCURACY_ATTEMPTS):
+        for attempt in range(self.gsm8k_max_attempts):
             metrics = run_evalscope(
                 host=parsed.hostname,
                 port=parsed.port,
@@ -93,15 +97,15 @@ class NPUGSM8KMixin(GSM8KMixin):
             if best >= threshold:
                 print(f"gsm8k evalscope score={best:.4f} >= {threshold:.4f}")
                 return
-            if attempt < _NPU_MAX_ACCURACY_ATTEMPTS - 1:
+            if attempt < self.gsm8k_max_attempts - 1:
                 print(
                     f"[{type(self).__name__}] evalscope GSM8K attempt "
-                    f"{attempt + 1}/{_NPU_MAX_ACCURACY_ATTEMPTS} failed "
+                    f"{attempt + 1}/{self.gsm8k_max_attempts} failed "
                     f"(best={best:.4f} < {threshold:.4f}), retrying..."
                 )
         raise AssertionError(
             f"GSM8K evalscope accuracy {best} below threshold {threshold} "
-            f"after {_NPU_MAX_ACCURACY_ATTEMPTS} attempts"
+            f"after {self.gsm8k_max_attempts} attempts"
         )
 
     def _resolve_relaxed_threshold(self) -> float:
@@ -137,15 +141,15 @@ class NPUGSM8KMixin(GSM8KMixin):
             self._test_gsm8k_evalscope(relaxed)
             return
 
-        for attempt in range(_NPU_MAX_ACCURACY_ATTEMPTS):
+        for attempt in range(self.gsm8k_max_attempts):
             try:
                 super().test_gsm8k()
                 return
             except AssertionError:
-                if attempt == _NPU_MAX_ACCURACY_ATTEMPTS - 1:
+                if attempt == self.gsm8k_max_attempts - 1:
                     raise
                 print(
                     f"[{type(self).__name__}] GSM8K attempt "
-                    f"{attempt + 1}/{_NPU_MAX_ACCURACY_ATTEMPTS} failed, "
+                    f"{attempt + 1}/{self.gsm8k_max_attempts} failed, "
                     f"retrying..."
                 )

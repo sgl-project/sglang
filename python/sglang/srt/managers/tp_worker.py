@@ -21,10 +21,16 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.managers.io_struct import (
@@ -38,15 +44,16 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.utils import (
+    GenerationBatchResult,
+    compute_num_reserved_tokens,
+    get_request_length_limits,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -62,12 +69,11 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
-from sglang.srt.utils.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
+from sglang.srt.state_capturer.routed_experts import (
+    PP_ROUTED_EXPERTS_KEY,
+    merge_relayed_routed_experts,
 )
+from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -420,11 +426,13 @@ class TpModelWorker(BaseTpWorker):
 
         # Validation
         assert self.model_runner.max_running_requests > 0, "max_running_request is zero"
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            self.model_runner.effective_logical_max_total_num_tokens - 1,
-        )
-        assert max_req_len > 0, "Memory pool size is too small"
+        assert (
+            min(
+                self.model_config.context_len,
+                self.model_runner.effective_logical_max_total_num_tokens,
+            )
+            > 1
+        ), "Memory pool size is too small"
 
     def init_attention_backends(self):
         """Initialize attention backends for all model runners."""
@@ -546,9 +554,6 @@ class TpModelWorker(BaseTpWorker):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
-    def register_hisparse_coordinator(self, coordinator):
-        self.model_runner.hisparse_coordinator = coordinator
-
     def get_worker_info(self):
         # The runner already reports logical DCP capacity.
         kv_capacity = (
@@ -569,13 +574,19 @@ class TpModelWorker(BaseTpWorker):
                 kv_capacity,
                 self.model_config.context_len,
             )
-        max_req_len = min(
-            self.model_config.context_len - 1,
-            kv_capacity - 1,
+        max_req_len, max_req_input_len = get_request_length_limits(
+            self.model_config.context_len,
+            kv_capacity,
+            dllm_block_size=(
+                self.dllm_algorithm.block_size if self.dllm_algorithm is not None else 0
+            ),
+            num_reserved_tokens=compute_num_reserved_tokens(),
         )
-        max_req_input_len = max_req_len - 5
-        if self.dllm_algorithm is not None:
-            max_req_input_len -= self.dllm_algorithm.block_size
+        assert max_req_input_len >= 1, (
+            f"No prompt fits: max_req_input_len={max_req_input_len} from "
+            f"context_len={self.model_config.context_len} and "
+            f"kv_capacity={kv_capacity}; raise the context length or the KV pool size."
+        )
         return (
             self.model_runner.logical_max_total_num_tokens,
             get_schedule().max_prefill_tokens,
@@ -587,7 +598,7 @@ class TpModelWorker(BaseTpWorker):
             self.device,
             self.model_runner.forward_stream,
             self.model_runner.req_to_token_pool.size,
-            self.model_runner.req_to_token_pool.max_context_len,
+            self.model_runner.req_to_token_pool.row_width,
             self.model_runner.token_to_kv_pool.size,
         )
 
@@ -679,6 +690,14 @@ class TpModelWorker(BaseTpWorker):
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
+        # Taken out before the forward: the model and its CUDA graphs only
+        # handle the proxy keys they allocate buffers for.
+        relayed_routed_experts = (
+            None
+            if pp_proxy_tensors is None
+            else pp_proxy_tensors.tensors.pop(PP_ROUTED_EXPERTS_KEY, None)
+        )
+
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
                 forward_batch,
@@ -704,7 +723,9 @@ class TpModelWorker(BaseTpWorker):
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
-                routed_experts_output=out.routed_experts_output,
+                routed_experts_output=merge_relayed_routed_experts(
+                    output=out.routed_experts_output, relayed=relayed_routed_experts
+                ),
                 indexer_topk_output=out.indexer_topk_output,
                 iteration_ids=(
                     None
@@ -732,6 +753,16 @@ class TpModelWorker(BaseTpWorker):
 
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
+                return batch_result
+
+            if batch is not None and is_beam_only_batch(batch):
+                # The beam coordinator selects the tokens. The placeholder sets
+                # has_sampled_token_ids, which gates the scheduler's relay, CPU
+                # copy and result processing; beam reqs never read its values.
+                batch_result.next_token_ids = torch.zeros(
+                    len(batch.reqs), dtype=torch.int64
+                )
+                self._maybe_finalize_elastic_cuda_graph_scale()
                 return batch_result
 
             # Delay sampling only for normal generation requests.
@@ -788,8 +819,14 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            routed_experts_output = merge_relayed_routed_experts(
+                output=out.routed_experts_output, relayed=relayed_routed_experts
+            )
+            if routed_experts_output is not None:
+                pp_proxy_tensors[PP_ROUTED_EXPERTS_KEY] = routed_experts_output.topk
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                routed_experts_output=routed_experts_output,
             )

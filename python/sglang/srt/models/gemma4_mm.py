@@ -16,8 +16,7 @@
 import logging
 import re
 from array import array
-from functools import lru_cache
-from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -37,23 +36,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-    flatten_nested_list,
-)
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -65,28 +57,14 @@ from sglang.srt.models.gemma4_causal import (
     pp_filter_load_weight,
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_xpu
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils import cpu_has_amx_support, flatten_nested_list, is_cpu, is_xpu
 
 logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-
-cached_get_processor = lru_cache(get_processor)
-
-
-class Gemma4ImagePixelInputs(TypedDict):
-    pixel_values: torch.Tensor
-    """Shape: `(batch_size * num_images, num_channels, height, width)`"""
-
-
-class Gemma4AudioInputs(TypedDict):
-    input_features_padded: torch.Tensor
-    """Shape: `(batch_size * num_audio, seq_length, num_features)`"""
-    input_features_mask: torch.Tensor
-    """Shape: `(batch_size * num_audio, seq_length)`"""
 
 
 class Gemma4MultimodalEmbedder(nn.Module):
@@ -176,10 +154,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         "gate_up_proj",
         "down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
 
     def __init__(
         self,
@@ -198,7 +172,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        # --language-model-only builds neither: multimodal requests are rejected
+        # before they reach the model.
+        if config.language_model_only:
+            self.vision_tower = None
+            self.embed_vision = None
+            self.audio_tower = None
+            self.embed_audio = None
+        elif self.pp_group.is_first_rank:
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
                 quant_config=quant_config,
@@ -306,11 +287,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Gemma 4 multimodal ties its LM head to the text embed_tokens
-        embed = self.language_model.embed_tokens.weight
-        return embed, embed
-
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
 
@@ -336,12 +312,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         is only enabled within each individual image group (same-item
         tokens), not across items, and only for checkpoints with
         ``use_bidirectional_attention == "vision"``; E2B/E4B keep it causal.
+        Triton and XPU scope image attention to sliding-window layers when
+        ``sliding_layers_only`` (HF Gemma 4 keeps full-attention layers causal;
+        DiffusionGemma does not). FA4 layer scoping is not handled here yet.
         Triton and FA4 use causal attention for image spans split across chunks.
-        XPU passes Gemma 3's per-token image-block ids to the sgl-kernel-xpu
-        prefill, on sliding-window layers only when ``sliding_layers_only`` (HF
-        Gemma 4 keeps full-attention layers causal; DiffusionGemma does not).
-        That mask has no sliding-window variant, so sliding layers keep causal
-        image attention once the KV length exceeds the window.
+        XPU passes Gemma 3's per-token image-block ids to sgl-kernel-xpu. That
+        mask has no sliding-window variant, so sliding layers keep causal image
+        attention once the KV length exceeds the window.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
@@ -352,7 +329,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return
         attn_backend = get_attn_backend()
         prefill_backend = getattr(attn_backend, "prefill_backend", attn_backend)
-        if getattr(prefill_backend, "fa_impl_ver", None) == 4:
+        if getattr(prefill_backend, "fa_impl_ver", None) == 4 or getattr(
+            prefill_backend, "fa3_upgrades_to_fa4", False
+        ):
             # O(query tokens) metadata instead of a dense Q x KV mask. Keep
             # absolute ranges so cached text prefixes retain the right offset.
             lengths = forward_batch.extend_seq_lens_cpu
@@ -484,6 +463,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 bidirectional_attn_mask_indptr
             )
             prefill_backend.forward_metadata.custom_mask = bidirectional_attn_masks
+            prefill_backend.forward_metadata.custom_mask_sliding_layers_only = (
+                sliding_layers_only
+            )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
@@ -655,15 +637,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     ) -> Optional[torch.Tensor]:
         return self.language_model.get_per_layer_inputs(input_ids)
 
-    def project_per_layer_inputs(
-        self,
-        inputs_embeds: torch.Tensor,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.language_model.project_per_layer_inputs(
-            inputs_embeds, per_layer_inputs
-        )
-
     @torch.no_grad()
     def forward(
         self,
@@ -721,6 +694,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 input_ids,
                 mask_dtype=torch.bool,
             )
+
+        # Graph PLE lookup needs the IDs from before multimodal embedding clamps them.
+        if is_first_rank and forward_batch.contains_mm_inputs():
+            input_ids = input_ids.clone()
 
         # general_mm_embed_routine already handles PP: it skips the embedding
         # work on non-first ranks and forwards pp_proxy_tensors via **kwargs.
@@ -955,6 +932,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "audio_tower." in name or "embed_audio." in name
             ):
                 continue
+            if self.vision_tower is None and (
+                "vision_tower." in name or "embed_vision." in name
+            ):
+                continue
 
             name = re.sub(r"^model\.", "", name)
 
@@ -1159,9 +1140,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return self.config.intermediate_size[0], self.config.hidden_size
         else:
             raise NotImplementedError()
-
-    def get_embed(self):
-        return self.language_model.embed_tokens.weight
 
     def get_embed_and_head(self):
         if self.pp_group.world_size > 1:

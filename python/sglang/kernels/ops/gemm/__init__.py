@@ -26,6 +26,20 @@ _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
+for _name, _backend in (
+    ("linear_bf16_quack", KernelBackend.CUTE_DSL),
+    ("linear_bf16_cublaslt", KernelBackend.FLASHINFER),
+):
+    register_kernel(
+        KernelSpec(
+            op="gemm.linear_bf16",
+            backend=_backend,
+            target=f"sglang.kernels.ops.gemm.sm120_bf16:{_name}",
+            capabilities=_SM120,
+        )
+    )
+del _name, _backend
+
 
 for _name in ("npu_w8a8_block_fp8_linear", "npu_w8a8_block_fp8_grouped_matmul"):
     register_kernel(
@@ -194,6 +208,15 @@ register_kernel(
         capabilities=_SM10X,
     )
 )
+# Same contract as gemm.dual_gemm_swiglu; a separate op because the registry holds one spec per (op, backend).
+register_kernel(
+    KernelSpec(
+        op="gemm.quack_swiglu_gemm",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.quack_swiglu_gemm:quack_swiglu_gemm",
+        capabilities=_SM120,
+    )
+)
 register_kernel(
     KernelSpec(
         op="gemm.dual_gemm_swiglu_fp8",
@@ -224,13 +247,6 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel:dsv3_fused_a_gemm",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
         capabilities=CUDA_ONLY,
@@ -241,22 +257,6 @@ register_kernel(
         op="gemm.tiny_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.tiny_gemm:tiny_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.n128k512",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n128k512_gemm_bf16",
-        capabilities=CUDA_ONLY,
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.n32k5120",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.small_gemm_bf16:n32k5120_gemm_bf16",
         capabilities=CUDA_ONLY,
     )
 )
@@ -296,7 +296,7 @@ def dual_gemm_swiglu_fp8(
     x_scale: torch.Tensor,
     gate_up_weight_scale: torch.Tensor,
     output_scale: Optional[torch.Tensor] = None,
-    quant_mode: Optional["DualGemmQuantMode"] = None,
+    quant_mode: Optional[DualGemmQuantMode] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fuse FP8 gate/up projections, SwiGLU, and activation quantization."""
     if quant_mode is None:
@@ -319,6 +319,16 @@ def dual_gemm_swiglu(
 ) -> torch.Tensor:
     """Fuse BF16/FP16 gate/up projections followed by SwiGLU."""
     return get_kernel("gemm.dual_gemm_swiglu", KernelBackend.CUTE_DSL)(
+        x, gate_up_weight
+    )
+
+
+def dual_gemm_swiglu_quack(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+) -> torch.Tensor:
+    """SM120 BF16 gate/up projection with SwiGLU in the GEMM epilogue (QuACK)."""
+    return get_kernel("gemm.quack_swiglu_gemm", KernelBackend.CUTE_DSL)(
         x, gate_up_weight
     )
 
@@ -381,6 +391,7 @@ __all__ = [
     "bmm_fp8",
     "dual_gemm_swiglu",
     "dual_gemm_swiglu_fp8",
+    "dual_gemm_swiglu_quack",
     "fp8_scaled_mm",
     "kimi_k3_tiny_gemm",
     "npu_w8a8_block_fp8_grouped_matmul",
@@ -430,6 +441,48 @@ register_kernel(
         capabilities=_SM90 | _SM12X,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="gemm.sm12x_bf16_gemv",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.gemm.sm12x_bf16_gemv:b12x_bf16_gemv",
+        capabilities=_SM12X,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm12x_bf16_gemv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.sm12x_bf16_gemv:sm12x_bf16_gemv",
+        capabilities=_SM12X,
+    )
+)
+for _name, _backend in (
+    ("nvfp4_expert_matmul", KernelBackend.FLASHINFER),
+    ("mxfp8_expert_matmul", KernelBackend.FLASHINFER),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.inkling2_{_name}_sm120",
+            backend=_backend,
+            target=f"sglang.kernels.ops.gemm.inkling2_grouped_sm120:{_name}",
+            capabilities=_SM12X,
+        )
+    )
+del _name, _backend
+for _name in (
+    "nvfp4_expert_matmul_lowm_scaled",
+    "mxfp8_expert_matmul_lowm",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.inkling2_{_name}_sm120",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.gemm.inkling2_moe_gemm_lowm_sm120:{_name}",
+            capabilities=_SM12X,
+        )
+    )
+del _name
 register_kernel(
     KernelSpec(
         op="gemm.fp8_blockwise_scaled_mm",
@@ -559,10 +612,9 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
-        op="gemm.muse_spark_router_gemm",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.muse_spark_router_gemm:router_gemm",
-        capabilities=CUDA_ONLY,
+        op="gemm.int8_scaled_mm_via_int_mm",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.int8_kernel:int8_scaled_mm_via_int_mm",
     )
 )
 register_kernel(
@@ -587,5 +639,92 @@ register_kernel(
         backend=KernelBackend.TORCH,
         target="sglang.kernels.ops.gemm.router_gemv:router_gemm_bf16x3_cublas",
         capabilities=CUDA_ONLY,
+    )
+)
+
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "bf16_splitk_gemm",
+        "bf16_splitk_gemm_partials",
+        "BF16 small-M split-K GEMM partials in FP32",
+    ),
+    (
+        "bf16_tiled_small_m_gemm",
+        "tiled_gemm",
+        "BF16 17..64-row GEMM from a tile-contiguous weight copy",
+    ),
+    ("router_gemm_fp32", "router_gemv_fp32", "bf16 x fp32 router logits GEMV, M <= 64"),
+    (
+        "router_gemm_fp32",
+        "router_gemm_tuned",
+        "bf16 x fp32 router logits, tuned split-K at verify widths",
+    ),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual",
+        "MoE unpooler GEMM + boundary norms + gated residual",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.gemm.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc
+# gfx950 TLX kernels; see "TLX kernel backend" in kernels/README.md.
+for _op, _target in (
+    ("tlx_linear", "tlx:linear"),
+    ("router_gemm_tlx", "router_gemm_fp32:router_gemm_tlx"),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual:unpool_gemm_norm_residual_tlx",
+    ),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_op}",
+            backend=KernelBackend.TLX,
+            target=f"sglang.kernels.ops.gemm.{_target}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _op, _target
+register_kernel(
+    KernelSpec(
+        op="gemm.project_active_codebook_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.codebook_projection:project_active_codebook_logits",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_fp8_block_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_fp8_block_gemv:hopper_fp8_block_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hopper_bf16_tiny_gemv",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.hopper_bf16_tiny_gemv:hopper_bf16_tiny_gemv",
+        capabilities=_SM90,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.router_gate_matvec_cuda",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.gemm.router_gate_matvec_cuda:router_gate_matvec_cuda",
+        capabilities=_SM90,
     )
 )

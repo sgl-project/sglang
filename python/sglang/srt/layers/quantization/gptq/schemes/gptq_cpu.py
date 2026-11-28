@@ -9,15 +9,13 @@ from sglang.srt.hardware_backend.cpu.quantization.gptq_kernels import (
     GPTQIntelAMXLinearKernel,
     GPTQIntelAMXMoEKernel,
 )
-from sglang.srt.layers.linear import set_weight_attrs
 from sglang.srt.layers.moe import MoeRunnerConfig
 from sglang.srt.layers.parameter import (
-    ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
-    PackedColumnParameter,
     PackedvLLMParameter,
     RowvLLMParameter,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 from .gptq_linear import GPTQLinearScheme
 from .gptq_scheme import GPTQMoESchemeBase
@@ -81,7 +79,6 @@ class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
             group_size = input_size
 
         scale_and_zero_size = input_size_per_partition // group_size
-        scale_and_zero_input_dim = 0
 
         qweight = PackedvLLMParameter(
             data=torch.empty(
@@ -123,25 +120,16 @@ class GPTQIntelAMXLinearScheme(GPTQLinearScheme):
             ),
             "weight_loader": weight_loader,
         }
-        if scale_and_zero_input_dim is None:
-            scales = ChannelQuantScaleParameter(output_dim=1, **weight_scale_args)
-            qzeros = PackedColumnParameter(
-                output_dim=1,
-                packed_dim=1,
-                packed_factor=self.quant_config.pack_factor,
-                **qzeros_args,
-            )
-        else:
-            scales = GroupQuantScaleParameter(
-                output_dim=1, input_dim=0, **weight_scale_args
-            )
-            qzeros = PackedvLLMParameter(
-                input_dim=0,
-                output_dim=1,
-                packed_dim=1,
-                packed_factor=self.quant_config.pack_factor,
-                **qzeros_args,
-            )
+        scales = GroupQuantScaleParameter(
+            output_dim=1, input_dim=0, **weight_scale_args
+        )
+        qzeros = PackedvLLMParameter(
+            input_dim=0,
+            output_dim=1,
+            packed_dim=1,
+            packed_factor=self.quant_config.pack_factor,
+            **qzeros_args,
+        )
 
         layer.register_parameter("qweight", qweight)
         layer.register_parameter("g_idx", g_idx)

@@ -5,15 +5,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    model_config_of,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -130,8 +126,8 @@ def handle_expert_pack(server_args: Any) -> None:
 
     pack_path = None
     if not raw_preparation_failed:
-        pack_path_value = loader_config.get("pack_path") or os.getenv(
-            "SGLANG_EXPERT_PACK_PATH"
+        pack_path_value = (
+            loader_config.get("pack_path") or envs.SGLANG_EXPERT_PACK_PATH.get()
         )
         pack_path = parse_path("pack_path", pack_path_value)
         if pack_path is None:

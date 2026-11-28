@@ -641,7 +641,9 @@ def fused_recurrent_kda_packed_decode(
     # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a
     # [BV, K] register tile per warp. ULP-level output differences only
     # (reduction order); small batches keep triton (launch-bound anyway).
-    if use_qk_l2norm_in_kernel:
+    # Safe-gate layers stay on triton: at GLM-5.3-Flash's 8-32 heads per rank it
+    # is faster than the row-streaming kernel at every batch on H200 and B200.
+    if use_qk_l2norm_in_kernel and lower_bound is None:
         from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
 
         if kda_decode_cuda.covered(

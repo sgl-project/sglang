@@ -10,17 +10,12 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
     MiniMaxH3DiTArchConfig,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MiniMaxH3AdalnCache,
 )
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
 from sglang.multimodal_gen.test.unit.host_sync_guard import forbid_host_syncs
+
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 _ARCH = MiniMaxH3DiTArchConfig(
     num_layers=2,
@@ -29,13 +24,6 @@ _ARCH = MiniMaxH3DiTArchConfig(
 )
 _BLOCK_WIDTH = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * _ARCH.hidden_size
 _FINAL_WIDTH = 2 * _ARCH.hidden_size
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def _weights_fill(*shape: int, scale: float) -> torch.Tensor:
@@ -76,7 +64,6 @@ def _online_cache(
     host_cache_bytes: int = 0,
     scale: float = 0.0,
 ) -> MiniMaxH3AdalnCache:
-    _ensure_single_process_parallel_runtime()
     weight_path = tmp_path / "model.safetensors"
     _write_online_weights(weight_path, omit=omit, scale=scale)
     cache = MiniMaxH3AdalnCache(
@@ -322,7 +309,6 @@ def test_host_tier_lru_eviction_and_shared_plan_refcount(tmp_path):
 
 
 def test_precision_fp32_projects_in_fp32_then_stores_bf16(tmp_path):
-    _ensure_single_process_parallel_runtime()
     weight_path = tmp_path / "model.safetensors"
     _write_online_weights(weight_path, scale=1.0)
     cache = MiniMaxH3AdalnCache(
@@ -462,6 +448,87 @@ def test_online_cache_failed_rebuild_can_be_retried(tmp_path):
     _write_online_weights(tmp_path / "model.safetensors")
     cache.build([plan_a], embed=_embed)
     cache.lookup(plan_a)
+
+
+@pytest.mark.parametrize("with_residents", [False, True])
+@pytest.mark.parametrize(
+    "failure_stage", ["embed_first", "embed_second", "tp_size", "tp_rank"]
+)
+def test_online_cache_failed_preparation_preserves_capacity(
+    tmp_path, monkeypatch, with_residents, failure_stage
+):
+    """Preparation failures must leave capacity reusable, even after eviction."""
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3_adaln_cache
+
+    cache = _online_cache(tmp_path, max_plans=3 if with_residents else 2)
+    missing = [torch.tensor([4.0]), torch.tensor([5.0, 6.0])]
+    wanted = list(missing)
+    if with_residents:
+        residents = [torch.tensor([float(i)]) for i in range(1, 4)]
+        cache.build(residents, embed=_embed)
+        retained = residents[0]
+        retained_slot = int(cache.lookup(retained))
+        wanted.insert(0, retained)
+
+    rebuilds = cache.rebuilds
+    built_plans = cache.stats.built_plans
+    error = RuntimeError("injected preparation failure")
+
+    def fail_tp_query():
+        raise error
+
+    for _ in range(cache.max_plans + 1):
+        embed_calls = 0
+
+        def embed(timesteps):
+            nonlocal embed_calls
+            embed_calls += 1
+            if (failure_stage == "embed_first" and embed_calls == 1) or (
+                failure_stage == "embed_second" and embed_calls == 2
+            ):
+                raise error
+            return _embed(timesteps)
+
+        with monkeypatch.context() as patch:
+            if failure_stage == "tp_size":
+                patch.setattr(
+                    minimax_h3_adaln_cache, "get_tp_world_size", fail_tp_query
+                )
+            elif failure_stage == "tp_rank":
+                patch.setattr(minimax_h3_adaln_cache, "get_tp_world_size", lambda: 2)
+                patch.setattr(minimax_h3_adaln_cache, "get_tp_rank", fail_tp_query)
+            with pytest.raises(RuntimeError) as exc:
+                cache.build(wanted, embed=embed)
+            assert exc.value is error
+
+        free_slots = set(cache._free_slots)
+        resident_slots = set(cache._slots.values())
+        assert len(free_slots) == len(cache._free_slots)
+        assert free_slots.isdisjoint(resident_slots)
+        assert free_slots | resident_slots == set(range(cache.max_plans))
+        assert torch.all(cache.plan_lengths[cache._free_slots] == 0)
+        assert cache.rebuilds == rebuilds
+        assert cache.stats.built_plans == built_plans
+        for plan in missing:
+            with pytest.raises(ValueError, match="does not cover"):
+                cache.lookup(plan)
+            with pytest.raises(ValueError, match="does not cover"):
+                cache.resolve_slots([plan])
+        if with_residents:
+            assert int(cache.lookup(retained)) == retained_slot
+            assert cache.resolve_slots([retained]).tolist() == [retained_slot]
+            for plan in residents[1:]:
+                with pytest.raises(ValueError, match="does not cover"):
+                    cache.lookup(plan)
+
+    cache.build(wanted, embed=_embed)
+    resolved = cache.resolve_slots(wanted).tolist()
+    assert len(set(resolved)) == cache.max_plans
+    assert not cache._free_slots
+    for plan, slot in zip(wanted, resolved):
+        assert int(cache.lookup(plan)) == slot
+    assert cache.rebuilds == rebuilds + 1
+    assert cache.stats.built_plans == built_plans + len(missing)
 
 
 def test_online_cache_width_rejection_preserves_resident_plans(tmp_path):

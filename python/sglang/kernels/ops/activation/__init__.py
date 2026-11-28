@@ -111,10 +111,11 @@ def situ_and_mul(
     out: Optional[torch.Tensor],
     beta: float,
     linear_beta: Optional[float],
+    cast: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     from .kimi_k3_situ_and_mul import situ_and_mul as impl
 
-    return impl(input, out, beta, linear_beta)
+    return impl(input, out, beta, linear_beta, cast)
 
 
 __all__ = [
@@ -153,6 +154,16 @@ register_kernel(
 )
 
 
+register_kernel(
+    KernelSpec(
+        op="activation.multimax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.multimax:multimax",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
 register_kernel(
     KernelSpec(
@@ -164,7 +175,15 @@ register_kernel(
 )
 
 
-# MXFP8-quantizing SwiGLU-OAI producers; registered for inventory.
+# MXFP8-quantizing SwiGLU producers; registered for inventory.
+register_kernel(
+    KernelSpec(
+        op="activation.silu_mul_mxfp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.swiglu_mxfp8_swizzled:silu_mul_mxfp8",
+        capabilities=CUDA_ONLY,
+    )
+)
 for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
     register_kernel(
         KernelSpec(
@@ -186,3 +205,24 @@ for _fn in ("silu_and_mul_clamp", "silu_and_mul_contig_post_quant"):
         )
     )
 del _fn
+
+register_kernel(
+    KernelSpec(
+        op="activation.silu_and_mul_block_quant_two_group",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.silu_and_mul_block_quant:silu_and_mul_block_quant_two_group",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+_SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+register_kernel(
+    KernelSpec(
+        op="activation.inkling2_nvfp4_swiglu_quant_bf16_lowm_sm120",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.activation.inkling2_swiglu_quant_lowm_sm120:"
+            "nvfp4_swiglu_quant_bf16_lowm"
+        ),
+        capabilities=_SM12X,
+    )
+)

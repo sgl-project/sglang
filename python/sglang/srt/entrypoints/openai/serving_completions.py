@@ -17,6 +17,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     CompletionStreamResponse,
     ErrorResponse,
     SglExt,
+    convert_json_schema_to_str,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
@@ -37,7 +38,6 @@ from sglang.srt.parser.code_completion_parser import (
 )
 from sglang.srt.runtime_context import get_serving
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
-from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -66,7 +66,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         if not prompt or (isinstance(prompt, list) and all(not p for p in prompt)):
             return "Prompt cannot be empty"
 
-        return None
+        return self._top_logprobs_error("logprobs", request.logprobs)
 
     def _convert_to_internal_request(
         self,

@@ -44,10 +44,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 # yapf: enable
 from sglang.multimodal_gen.runtime.utils.weight_attrs import set_weight_attrs
+from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
+from sglang.srt.utils import cpu_has_amx_support, use_intel_amx_backend
 
 logger = init_logger(__name__)
 
 IS_AMP_SUPPORTED = current_platform.is_amp_supported()
+USE_CPU_AMX = current_platform.is_cpu() and cpu_has_amx_support()
 _USE_AITER_TGEMM = current_platform.is_rocm() and envs.SGLANG_USE_ROCM_AITER_TGEMM
 if _USE_AITER_TGEMM:
     from aiter.tuned_gemm import tgemm
@@ -240,7 +243,9 @@ class LinearMethodBase(QuantizeMethodBase):
 
 
 def apply_unquantized_linear(
-    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply a plain linear projection with the runtime's reference semantics."""
     if x.device.type == "mps":
@@ -272,6 +277,53 @@ def apply_unquantized_linear(
     )
 
 
+def pack_rows_into_one_buffer(params: list[torch.Tensor]) -> None:
+    """Move the tensors into consecutive rows of one new buffer and leave each a
+    view of its rows, so one GEMM can read them all (``rows_of_one_buffer``).
+    Only the views hold the buffer: moving or offloading a layer frees it."""
+    with torch.no_grad():
+        packed = torch.cat([param.data for param in params])
+    offset = 0
+    for param in params:
+        rows = param.shape[0]
+        param.data = packed[offset : offset + rows]
+        offset += rows
+
+
+def rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
+    """``torch.cat(parts)`` without a copy while the parts are still consecutive
+    rows of one buffer; None once a move, load or offload gave one its own."""
+    first = parts[0]
+    storage = first.untyped_storage().data_ptr()
+    offset = first.storage_offset()
+    for part in parts:
+        if (
+            not part.is_contiguous()
+            or part.untyped_storage().data_ptr() != storage
+            or part.storage_offset() != offset
+            or part.dtype != first.dtype
+            or part.shape[1:] != first.shape[1:]
+        ):
+            return None
+        offset += part.numel()
+    rows = sum(part.shape[0] for part in parts)
+    return first.as_strided(
+        (rows, *first.shape[1:]), first.stride(), first.storage_offset()
+    )
+
+
+def apply_amx_packed_linear(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+) -> torch.Tensor:
+    output = torch.ops.sgl_kernel.weight_packed_linear(
+        x.reshape(-1, x.shape[-1]).to(weight.dtype),
+        weight,
+        bias,
+        True,  # is_vnni
+    )
+    return output.view(*x.shape[:-1], -1)
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
@@ -297,9 +349,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if USE_CPU_AMX:
+            _amx_process_weight_after_loading(layer, ["weight"])
+
     def apply(
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
+        if use_intel_amx_backend(layer):
+            return apply_amx_packed_linear(x=x, weight=layer.weight, bias=bias)
         return apply_unquantized_linear(x, layer.weight, bias)
 
 
@@ -350,7 +408,46 @@ class LinearBase(torch.nn.Module):
         raise NotImplementedError
 
 
-class ReplicatedLinear(LinearBase):
+class ParallelLinear(LinearBase):
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        skip_bias_add: bool = False,
+        params_dtype: torch.dtype | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        super().__init__(
+            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+        )
+
+    def parallel_input(self, input: torch.Tensor) -> torch.Tensor:
+        return input
+
+    def apply_quant_method(
+        self, input_: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, Parameter | None]:
+        bias = self.bias if not self.skip_bias_add else None
+        output_bias = self.bias if self.skip_bias_add else None
+        assert self.quant_method is not None
+        output = self.quant_method.apply(self, input_, bias)
+        return output, output_bias
+
+    def collect_output(self, output_parallel: torch.Tensor) -> torch.Tensor:
+        return output_parallel
+
+    def forward(self, input: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
+        input_parallel = self.parallel_input(input)
+        output_parallel, output_bias = self.apply_quant_method(
+            input_parallel, self.bias
+        )
+        output = self.collect_output(output_parallel)
+
+        return output, output_bias
+
+
+class ReplicatedLinear(ParallelLinear):
     """Replicated linear layer.
 
     Args:
@@ -426,13 +523,6 @@ class ReplicatedLinear(LinearBase):
         )
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
-        bias = self.bias if not self.skip_bias_add else None
-        assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
-
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
         s += f", output_features={self.output_size}"
@@ -507,7 +597,7 @@ class MergedReplicatedLinear(ReplicatedLinear):
         param_data.copy_(loaded_weight)
 
 
-class ColumnParallelLinear(LinearBase):
+class ColumnParallelLinear(ParallelLinear):
     """Linear layer with column parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -563,9 +653,6 @@ class ColumnParallelLinear(LinearBase):
 
         self.gather_output = gather_output
 
-        if output_sizes is None:
-            output_sizes = [output_size]
-
         assert self.quant_method is not None
         self.quant_method.create_weights(
             layer=self,
@@ -610,12 +697,7 @@ class ColumnParallelLinear(LinearBase):
             loaded_weight = loaded_weight.reshape(1)
         param.load_column_parallel_weight(loaded_weight=loaded_weight)
 
-    def forward(self, input_: torch.Tensor) -> tuple[torch.Tensor, Parameter | None]:
-        bias = self.bias if not self.skip_bias_add else None
-
-        # Matrix multiply.
-        assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+    def collect_output(self, output_parallel: torch.Tensor) -> torch.Tensor:
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(
@@ -623,8 +705,7 @@ class ColumnParallelLinear(LinearBase):
             )
         else:
             output = output_parallel
-        output_bias = self.bias if self.skip_bias_add else None
-        return output, output_bias
+        return output
 
     def extra_repr(self) -> str:
         s = f"in_features={self.input_size}"
@@ -1167,7 +1248,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         param_data.copy_(loaded_weight)
 
 
-class RowParallelLinear(LinearBase):
+class RowParallelLinear(ParallelLinear):
     """Linear layer with row parallelism.
 
     The linear layer is defined as Y = XA + b. A is parallelized along
@@ -1293,32 +1374,63 @@ class RowParallelLinear(LinearBase):
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
-    def forward(self, input_) -> tuple[torch.Tensor, Parameter | None]:
+    def parallel_input(self, input: torch.Tensor) -> torch.Tensor:
         if self.input_is_parallel:
-            input_parallel = input_
+            input_parallel = input
         else:
             tp_rank = self.tp_rank
             splitted_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size
+                input, num_partitions=self.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
+        return input_parallel
 
-        # Matrix multiply.
-        assert self.quant_method is not None
+    def apply_quant_method(
+        self, input: torch.Tensor, bias: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, Parameter | None]:
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
-        bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        bias = self.bias if (not self.skip_bias_add and self.tp_rank == 0) else None
+        output_bias = self.bias if self.skip_bias_add else None
+
+        assert self.quant_method is not None
+        output_parallel = self.quant_method.apply(self, input, bias=bias)
+        return output_parallel, output_bias
+
+    def collect_output(self, output_parallel: torch.Tensor) -> torch.Tensor:
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(
                 output_parallel, tp_group=self.tp_group
             )
         else:
             output = output_parallel
+        return output
 
-        output_bias = self.bias if self.skip_bias_add else None
+    def supports_partial_into(self, input_: torch.Tensor) -> bool:
+        """Whether ``partial_into`` runs the GEMM ``forward`` runs on this input."""
+        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        return (
+            type(self.quant_method) is UnquantizedLinearMethod
+            and current_platform.is_cuda()
+            # an out= GEMM is not differentiable
+            and not torch.is_grad_enabled()
+            and self.input_is_parallel
+            and input_.dim() >= 2
+            and input_.dtype == self.weight.dtype
+            and (
+                bias is None or (bias.dtype == input_.dtype and input_.is_contiguous())
+            )
+        )
 
-        return output, output_bias
+    def partial_into(self, input_: torch.Tensor, out: torch.Tensor) -> None:
+        """This rank's partial sum of ``forward``, before the all-reduce, written
+        into the 2D ``out``: the mm / addmm that ``F.linear`` lowers to."""
+        bias = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        rows = input_.reshape(-1, input_.shape[-1])
+        if bias is None:
+            torch.mm(rows, self.weight.t(), out=out)
+        else:
+            torch.addmm(bias, rows, self.weight.t(), out=out)
 
     def extra_repr(self) -> str:
         s = f"input_features={self.input_size_per_partition}"

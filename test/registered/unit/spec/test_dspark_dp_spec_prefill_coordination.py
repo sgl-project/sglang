@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_v4_dspark import DSparkAttention
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -50,6 +50,10 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     proposer = object.__new__(DraftBlockProposer)
                     proposer._dp_moe_sync = True
                     proposer._num_token_non_padded = None
+                    proposer._dp_meta_host = None
+                    proposer._dp_meta_device = None
+                    proposer._dp_meta_copied = []
+                    proposer._dp_meta_slot = 0
                     proposer.draft_model_runner = SimpleNamespace(device="cpu")
                     proposer._draft_block_spec_info = SimpleNamespace(
                         num_tokens_per_req=width, num_tokens_for_logprob_per_req=1
@@ -63,6 +67,13 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     self.assertEqual(forward.global_num_tokens_cpu, [0, 3 * width, 0])
                     self.assertEqual(
                         forward.global_num_tokens_for_logprob_cpu, [0, 3 * width, 0]
+                    )
+                    self.assertEqual(
+                        forward.global_num_tokens_gpu.tolist(), [0, 3 * width, 0]
+                    )
+                    self.assertEqual(
+                        forward.global_num_tokens_for_logprob_gpu.tolist(),
+                        [0, 3 * width, 0],
                     )
                     self.assertTrue(forward.dp_spec_prefill_coordination_applied)
                     self.assertTrue(forward.is_extend_in_batch)

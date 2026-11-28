@@ -19,6 +19,7 @@ from sglang.srt.distributed import (
     divide,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import AutoConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA, unwrap_lora_layer
@@ -40,7 +41,6 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_pin_memory_available
-from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -149,6 +149,7 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        max_rank_spaced_layout: bool = False,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -166,6 +167,8 @@ class LoRAMemoryPool:
         self.experts_shared_outer_loras: bool = experts_shared_outer_loras
         self.strict_loading: bool = strict_loading
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
+        # See BaseLoRABackend.uses_max_rank_spaced_lora_layout.
+        self.max_rank_spaced_layout: bool = max_rank_spaced_layout
         self.pin_memory_available: bool = is_pin_memory_available()
 
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
@@ -348,6 +351,21 @@ class LoRAMemoryPool:
         )
 
     @staticmethod
+    def _get_dense_module_layer_ids(
+        base_model: torch.nn.Module, module_name: str
+    ) -> Set[int]:
+        """Decoder layers containing this linear outside the fused experts."""
+        from sglang.srt.layers.linear import LinearBase
+
+        return {
+            layer_id
+            for name, module in base_model.named_modules()
+            if name.endswith(f".{module_name}")
+            and (layer_id := get_layer_id(name)) is not None
+            and isinstance(unwrap_lora_layer(module), LinearBase)
+        }
+
+    @staticmethod
     def _has_moe_module(base_model: torch.nn.Module) -> bool:
         # Config-only detection isn't reliable: some dense configs (e.g.
         # `Qwen3_5TextConfig`) inherit `num_experts > 1` from an MoE parent.
@@ -412,22 +430,6 @@ class LoRAMemoryPool:
         raise TypeError(
             f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
         )
-
-    def _get_standard_shape(
-        self,
-        module_name: str,
-        base_model: torch.nn.Module,
-        max_lora_dim: int,
-        layer_idx: int,
-    ) -> Tuple[int]:
-        """Get 3D shape for standard (non-MoE) modules."""
-        input_dim, _ = get_hidden_dim(
-            module_name, self.base_hf_config, base_model, layer_idx
-        )
-        c = get_stacked_multiply(module_name, base_model)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
-        return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
 
     def get_lora_A_shape(
         self,
@@ -610,10 +612,15 @@ class LoRAMemoryPool:
         # Cached once so the per-expert load path doesn't re-walk the HF
         # config for every adapter.
         self._num_experts_local: int = self._get_num_local_experts(base_model)
+        dense_layer_ids = {
+            name: self._get_dense_module_layer_ids(base_model, name)
+            for name in self.target_modules & {"gate_up_proj", "down_proj"}
+        }
 
         def alloc_per_layer(
             module_key: str,
             get_lora_shape_fn: Callable[[str, torch.nn.Module, int, int], Tuple[int]],
+            layer_ids: Optional[Set[int]] = None,
         ) -> List[Optional[torch.Tensor]]:
             return [
                 (
@@ -625,6 +632,7 @@ class LoRAMemoryPool:
                         device=device,
                     )
                     if idx in self.lora_layer_ids
+                    and (layer_ids is None or idx in layer_ids)
                     else None
                 )
                 for idx in range(self.num_layer)
@@ -650,10 +658,13 @@ class LoRAMemoryPool:
                 # Special handling for ambiguous target modules that can be in different contexts
                 ambiguous_modules = {"gate_up_proj", "down_proj"}
                 if module_name in ambiguous_modules and has_moe:
-                    # Allocate shared expert version (3D) only when model has shared experts
-                    if has_shared_experts:
+                    # Hybrid models also need 3D buffers for their dense MLPs.
+                    layer_ids = (
+                        None if has_shared_experts else dense_layer_ids[module_name]
+                    )
+                    if layer_ids is None or layer_ids:
                         buffer[module_name] = alloc_per_layer(
-                            module_name, get_lora_shape_fn
+                            module_name, get_lora_shape_fn, layer_ids
                         )
 
                     # MoE expert version (4D)
@@ -944,6 +955,11 @@ class LoRAMemoryPool:
                 raise ValueError(msg)
             else:
                 logger.warning(msg)
+
+        if self.max_rank_spaced_layout:
+            # The kernels contract over the full max_lora_rank, so rank tails left
+            # by an evicted higher-rank adapter must not survive into this slot.
+            self._clear_buffer_slot_for_base(buffer_id)
 
         for layer_id in range(self.num_layer):
             layer = lora_adapter.layers[layer_id]
@@ -1254,7 +1270,6 @@ class LoRAMemoryPool:
                                     ],
                                 )
                 else:
-                    buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
                     if weights is not None:
                         assert isinstance(weights_cache_key, str)
                         weights = self._get_maybe_cached_weight_for_transfer(
@@ -1262,7 +1277,22 @@ class LoRAMemoryPool:
                             weights_cache_key,
                             weights,
                         )
-                    load_lora_weight_tensor(buffer_view, weights)
+                    if self.max_rank_spaced_layout:
+                        for ci in range(c):
+                            load_lora_weight_tensor(
+                                target_buffer[
+                                    buffer_id, ci * max_r : ci * max_r + lora_rank, :
+                                ],
+                                (
+                                    None
+                                    if weights is None
+                                    else weights[ci * lora_rank : (ci + 1) * lora_rank]
+                                ),
+                            )
+                    else:
+                        load_lora_weight_tensor(
+                            target_buffer[buffer_id, : lora_rank * c, :], weights
+                        )
 
             for name, weights in temp_B_buffer.items():
                 if name not in active_target_modules:
@@ -1445,7 +1475,6 @@ class LoRAMemoryPool:
                     and ("lora_embedding_A" in name or "lora_A" in name)
                 ):
                     buffer_view = self.lm_head_A_buffer[target_module][
-                        # buffer_id, :, :lora_rank
                         buffer_id,
                         :lora_rank,
                         :,
@@ -1562,9 +1591,6 @@ class LoRAMemoryPool:
     ) -> torch.Tensor:
         """
         Get LoRA tensor buffer (automatically handles both 3D and 4D tensors).
-
-        if lora_type == LoRAType.LORA_A:
-            return self.A_buffer[target_module][layer_id]
 
         Args:
             target_module: Target module name (e.g., 'gate_up_proj' or 'gate_up_proj_moe' for MoE)

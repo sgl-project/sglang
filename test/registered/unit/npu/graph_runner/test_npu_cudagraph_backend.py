@@ -15,7 +15,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=10, suite="base-a-test-npu")
+register_npu_ci(est_time=10, suite="extra-a-test-npu")
 
 
 def _device_module_stub():
@@ -35,7 +35,9 @@ def _make_backend(runner=None):
             device_module=_device_module_stub(), enable_torch_compile=False
         )
     with (
-        get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+        get_parallel().override(
+            tp_group=SimpleNamespace(world_size=1, barrier=mock.Mock())
+        ),
         mock.patch.object(mod.TorchMemorySaverAdapter, "create", return_value=None),
     ):
         return mod.NPUCudaGraphBackend(runner), runner
@@ -54,11 +56,12 @@ def _make_eagle_draft_runner(
     runner.raw_bs = raw_bs
     runner.bs = bs
     runner.model_runner = SimpleNamespace(
+        kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
                 architectures=architectures, index_topk=index_topk
             )
-        )
+        ),
     )
     return runner
 
@@ -72,6 +75,7 @@ def _make_decode_runner(raw_bs=2, bs=2):
     runner.bs = bs
     runner.captured_req_width = 1
     runner.model_runner = SimpleNamespace(
+        kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
         ),
@@ -177,7 +181,8 @@ class TestNPUCudaGraphBackend(unittest.TestCase):
             shape_key,
             SimpleNamespace(
                 forward_mode=SimpleNamespace(
-                    is_target_verify=mock.Mock(return_value=False)
+                    is_target_verify=mock.Mock(return_value=False),
+                    is_idle=mock.Mock(return_value=False),
                 ),
                 seq_lens_cpu=torch.tensor([5, 3]),
             ),

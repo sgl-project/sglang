@@ -39,9 +39,9 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.two_batch_overlap import (
-    MaybeTboDeepEPDispatcher,
     model_forward_stages,
 )
 from sglang.srt.configs.dots3 import Dots3Config
@@ -53,7 +53,7 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
     append_stages,
@@ -72,7 +72,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
-    get_deepep_mode,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -88,6 +87,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -97,13 +98,9 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -115,6 +112,8 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 )
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
+from sglang.srt.models.utils import bind_or_assign
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_device,
     get_exec,
@@ -123,13 +122,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
-    add_prefix,
-    bind_or_assign,
     ceil_align,
     ceil_div,
     is_cuda,
     log_info_on_rank0,
-    make_pp_layers,
 )
 
 _is_cuda = is_cuda()
@@ -256,9 +252,7 @@ class Dots3MoEGate(nn.Module):
     def forward(self, hidden_states):
         # Use the fused router only for its tuned shapes.
         if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
-            logits = tiny_gemm_bf16(
-                hidden_states, self.weight, max_m=self.tiny_router_gemm_max_tokens
-            )
+            logits = tiny_gemm_bf16(hidden_states, self.weight)
         else:
             logits = F.linear(hidden_states, self.weight, None)
 
@@ -273,7 +267,6 @@ class Dots3MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        is_nextn: bool = False,
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -337,6 +330,7 @@ class Dots3MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
                 if get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
                 else "tp",
             )
@@ -360,35 +354,9 @@ class Dots3MoE(nn.Module):
 
         self.top_k = config.num_experts_per_tok
 
-        if get_moe_a2a_backend().is_deepep():
-            # TODO: we will support tp < ep in the future
-            self.ep_size = get_parallel().moe_ep_size
-            self.num_experts = (
-                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
-            )
-            self.renormalize = config.norm_topk_prob
-            self.topk_group = config.topk_group
-            self.num_expert_group = config.n_group
-            self.correction_bias = (
-                self.gate.e_score_correction_bias.data
-                if self.gate.e_score_correction_bias is not None
-                else None
-            )
-
-            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=get_parallel().tp_group.device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.n_routed_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=get_deepep_mode(),
-                async_finish=True,
-                return_recv_hook=True,
-            )
-
-        self._enable_deepep_moe = get_moe_a2a_backend().is_deepep()
+        self._enable_deepep_moe = (
+            get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops()
+        )
 
     def get_moe_weights(self):
         return [
@@ -684,7 +652,7 @@ class Dots3AttentionMLA(nn.Module):
             assert self.q_lora_rank is not None, (
                 "Dots3 NSA requires q_lora_rank to be set in the config."
             )
-            self.indexer = Indexer(
+            self.indexer = dsa_indexer_cls()(
                 hidden_size=self.hidden_size,
                 index_n_heads=config.index_n_heads,
                 index_head_dim=config.index_head_dim,
@@ -806,12 +774,7 @@ class Dots3AttentionMLA(nn.Module):
                 return Dots3AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return Dots3AttnForwardMethod.MLA
-        elif attention_backend in ("flashmla", "triton", "nsa"):
-            return Dots3AttnForwardMethod.MLA
-        else:
-            raise NotImplementedError(
-                f"Dots3 only supports CUDA attention backends (fa3, triton, flashmla, nsa), got: {attention_backend}"
-            )
+        return Dots3AttnForwardMethod.MLA
 
     def _apply_attention_gate(self, attn_output: torch.Tensor, g: torch.Tensor):
         if attn_output.ndim != 3:
@@ -858,6 +821,7 @@ class Dots3AttentionMLA(nn.Module):
 
     def _get_kv_write_loc(self, forward_batch):
         swa_loc = None
+        backend = None
         if self.use_swa:
             backend = get_attn_backend()
             from sglang.srt.layers.attention.dots_hybrid_backend import (
@@ -884,7 +848,12 @@ class Dots3AttentionMLA(nn.Module):
                 swa_loc = backend.runner_ids.ids_in(
                     IdSpaceKind.SLIDING_WINDOW, out_cache_loc
                 )
-        return KVWriteLoc.for_batch(forward_batch, swa_loc=swa_loc)
+        return KVWriteLoc.for_batch(
+            forward_batch,
+            window_locs=window_write_locs(
+                None if backend is None else backend.runner_ids, swa_loc
+            ),
+        )
 
     def forward(
         self,
@@ -1380,7 +1349,6 @@ class Dots3DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
-                is_nextn=is_nextn,
             )
         else:
             mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
@@ -1785,6 +1753,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                 if not (
                     self_attn.qk_nope_head_dim % weight_block_size[0] == 0
                     and self_attn.v_head_dim % weight_block_size[0] == 0
+                    and current_arch().is_sm(9)
                     and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                 ):
                     # NOTE(xiaozhi): At this point, we do not requant but change to use BF16.
@@ -1941,11 +1910,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             )
 
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
-        fuse_qkv_a_g_proj = True
         assert self.config.q_lora_rank is not None, (
             "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         )
-        cached_a_proj = {} if fuse_qkv_a_g_proj else None
+        cached_a_proj = {}
 
         def shard_g_proj_for_attention_tp(
             weight: torch.Tensor,
@@ -2203,14 +2171,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
                             continue
-                        if (
-                            fuse_qkv_a_g_proj
-                            and ".self_attn." in name
-                            and (
-                                "q_a_proj" in name
-                                or "kv_a_proj_with_mqa" in name
-                                or "g_proj" in name
-                            )
+                        if ".self_attn." in name and (
+                            "q_a_proj" in name
+                            or "kv_a_proj_with_mqa" in name
+                            or "g_proj" in name
                         ):
                             cached_a_proj[name] = loaded_weight
                             if "q_a_proj" in name:
@@ -2280,7 +2244,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                                 executor.submit(weight_loader, param, loaded_weight)
                             )
 
-            if fuse_qkv_a_g_proj and cached_a_proj:
+            if cached_a_proj:
                 unresolved = sorted(cached_a_proj.keys())
                 preview = ", ".join(unresolved[:6])
                 extra = f" (+{len(unresolved) - 6} more)" if len(unresolved) > 6 else ""
@@ -2312,8 +2276,12 @@ class Dots3LanguageModelForCausalLM(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    @staticmethod
+    def sliding_layer_window_size(config):
+        return get_attention_sliding_window_size(config)
+
     def get_attention_sliding_window_size(self):
-        return get_attention_sliding_window_size(self.config)
+        return self.sliding_layer_window_size(self.config)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

@@ -72,6 +72,8 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                     "python3",
                     "-m",
                     "mooncake.http_metadata_server",
+                    "--host",
+                    "127.0.0.1",
                     "--port",
                     str(cls.mooncake_metadata_port),
                 ],
