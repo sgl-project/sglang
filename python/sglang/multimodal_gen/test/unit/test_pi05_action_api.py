@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     pack_msgpack,
     unpack_msgpack,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 
 def _server_args(config: Pi05PipelineConfig | None = None) -> SimpleNamespace:
@@ -285,7 +286,10 @@ def action_client(monkeypatch):
         # Echo the observation as one action so the wire test checks both directions.
         state = np.asarray(req.sampling_params.state, dtype=np.float32)
         output = {"request_id": req.request_id, "actions": state[None, :]}
-        return SimpleNamespace(output=[output])
+        budget = req.sampling_params.deadline_ms
+        if budget is not None and budget < 1000:
+            return OutputBatch(error="deadline expired", deadline_expired=True)
+        return OutputBatch(output=[output])
 
     monkeypatch.setattr(protocol.async_scheduler_client, "forward", forward)
     with TestClient(app) as client:
@@ -355,3 +359,29 @@ def test_action_unsupported_output_format_is_a_client_error(action_client):
     reply = action_client.post("/v1/actions/generations", json=payload)
     assert reply.status_code == 400
     assert "output_format" in reply.json()["detail"]
+
+
+def test_action_deadline_requires_segmented_scheduling(action_client):
+    """A server that cannot honor a deadline must not silently ignore it."""
+    payload = _observation("unsupported", [0.0])
+    payload["runtime"] = {"deadline_ms": 5000}
+    reply = action_client.post("/v1/actions/generations", json=payload)
+    assert reply.status_code == 400
+    assert "segmented" in reply.json()["detail"]
+
+
+def test_expired_deadline_is_per_request(action_client):
+    action_client.app.state.server_args.pipeline_config = Pi05PipelineConfig(
+        enable_segmented_actions=True
+    )
+    payload = _observation("late", [0.0])
+    payload["runtime"] = {"deadline_ms": 5}
+    reply = action_client.post("/v1/actions/generations", json=payload)
+    assert reply.status_code == 504
+    with action_client.websocket_connect("/v1/actions/realtime") as ws:
+        ws.receive_bytes()
+        ws.send_bytes(msgpack.packb(payload))
+        error = msgpack.unpackb(ws.receive_bytes())
+        assert error["error_type"] == "deadline_expired"
+        ws.send_bytes(msgpack.packb(_observation("next", [1.0])))
+        assert msgpack.unpackb(ws.receive_bytes())["id"] == "next"

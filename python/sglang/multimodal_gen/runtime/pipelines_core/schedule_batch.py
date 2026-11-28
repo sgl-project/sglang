@@ -460,6 +460,8 @@ class OutputBatch:
     error: str | None = None
     # the client cancelled the request; error tells which one
     cancelled: bool = False
+    # the scheduler dropped the request after its deadline; error tells which one
+    deadline_expired: bool = False
     # the workers cannot serve another request after this error: the HTTP
     # server turns unhealthy with it until the server is restarted
     fatal_error: str | None = None

@@ -11,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
+    ActionDeadlineExpiredError,
     action_generation_response,
     action_metadata,
     action_raw_response,
@@ -226,6 +227,8 @@ async def create_action_generation(request: Request):
                 )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ActionDeadlineExpiredError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
     if wants_msgpack:
         return Response(
             content=pack_msgpack(response), media_type="application/msgpack"
