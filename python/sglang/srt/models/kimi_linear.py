@@ -73,7 +73,7 @@ from sglang.srt.runtime_context import (
     get_stream,
     linear_attn_parallel_group,
 )
-from sglang.srt.utils import is_xpu
+from sglang.srt.utils import is_cpu, is_xpu
 from sglang.srt.utils.common import BumpAllocator
 
 
@@ -205,6 +205,9 @@ class KimiMoE(nn.Module):
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
+        # CPU expert kernels do not apply the runner's routed scaling factor.
+        if is_cpu() and not self.experts.should_fuse_routed_scaling_factor_in_topk:
+            final_hidden_states = final_hidden_states * self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         return final_hidden_states.view(num_tokens, hidden_size)
@@ -775,7 +778,7 @@ class KimiLinearModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = None if is_xpu() else get_stream("alt")
+        self.alt_stream = None if is_cpu() or is_xpu() else get_stream("alt")
 
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
