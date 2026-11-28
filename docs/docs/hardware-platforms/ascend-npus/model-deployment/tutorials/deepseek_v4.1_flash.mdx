@@ -38,7 +38,7 @@ The following table summarizes the settings configured by the script. For parame
 
 Prepare a Ascend 950PR/DT Series (A5) host with eight NPUs. Install a compatible Ascend driver, CANN, TorchNPU,
 ATB, and custom operators, then run the setup and launch commands inside the prepared Ascend environment. Use an SGLang
-checkout that supports DeepSeek-V4.1-Flash and the `dsv4` NPU attention backend. Keep the same SGLang revision and model
+checkout that supports DeepSeek-V4.1-Flash and the dsv4 NPU attention backend. Keep the same SGLang revision and model
 checkpoint available at the same paths on every node.
 
 ### Model weights
@@ -173,6 +173,11 @@ docker run --runtime=runc -u root -it -d --name ${name} --net=host --privileged=
       <td style={{ whiteSpace: "nowrap" }}><code>HCCL_IF</code></td>
       <td>The single-node example uses <code>HCCL_IF="lo"</code>. To inspect available interfaces, run <code>ip -br addr</code>. To check the route to a peer, run <code>ip route get &lt;peer-node-ip&gt;</code>; use the interface shown after <code>dev</code> as <code>HCCL_IF</code>.</td>
       <td>Set <code>HCCL_IF</code> separately on each node to its local interface for HCCL communication. For example, configure the interface on <code>192.168.25.209</code> on that node, and the interface on <code>192.168.25.212</code> on the other node. Interface names may be the same or different, depending on the cluster configuration.</td>
+    </tr>
+    <tr>
+      <td style={{ whiteSpace: "nowrap" }}><code>GLOO_SOCKET_IFNAME</code></td>
+      <td>The script defaults to <code>data0.3001</code>. If that interface is unavailable in the container, set this to an available interface, for example <code>export GLOO_SOCKET_IFNAME="&lt;interface&gt;"</code>.</td>
+      <td>Set this separately on each node to that node's local interface for GLOO communication. Run <code>ip route get &lt;peer-node-ip&gt;</code> and use the interface shown after <code>dev</code>; set it with <code>export GLOO_SOCKET_IFNAME="&lt;interface&gt;"</code>. The interface can differ between nodes.</td>
     </tr>
   </tbody>
 </table>
