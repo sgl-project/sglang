@@ -2,7 +2,7 @@ import ast
 import json
 import logging
 import re
-from typing import List
+from typing import List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.environ import envs
@@ -15,6 +15,34 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import safe_ast_parse
 
 logger = logging.getLogger(__name__)
+
+
+def _find_call_list_end(text: str, start: int) -> int:
+    """Return the index of the "]" closing the "[" at ``start``, or -1.
+
+    Brackets inside quoted string arguments are skipped, so "a]b" in
+    ``[f(q="a]b")]`` does not end the call list.
+    """
+    depth = 0
+    quote = None
+    i = start
+    while i < len(text):
+        char = text[i]
+        if quote:
+            if char == "\\":
+                i += 1  # Skip the escaped character
+            elif char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
 
 
 class PythonicDetector(BaseFormatDetector):
@@ -34,9 +62,13 @@ class PythonicDetector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-        self.tool_call_regex = re.compile(
-            r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
-            re.DOTALL,
+        # Only locate the opening "[func()" or "[func(kw=": a regex spanning
+        # the whole call list backtracks exponentially on unterminated input
+        # (#52090). _find_call_list_end finds the closing bracket, and
+        # ast.parse validates the content. Requiring ")" or "kw=" keeps
+        # prose such as "items[len(items) - 1]" from matching.
+        self.tool_call_start_regex = re.compile(
+            r"\[[a-zA-Z]\w*\((?:\s*\)|[a-zA-Z]\w*\s*=)"
         )
 
     @staticmethod
@@ -47,8 +79,19 @@ class PythonicDetector(BaseFormatDetector):
         text = text.replace("<|python_end|>", "")
         return text
 
+    def _find_tool_call_span(self, text: str) -> Optional[Tuple[int, int]]:
+        """Return the [start, end) span of the first "[func(...)...]" block."""
+        match = self.tool_call_start_regex.search(text)
+        if match is None:
+            return None
+        end = _find_call_list_end(text, match.start())
+        if end == -1:
+            return None
+        return match.start(), end + 1
+
     def has_tool_call(self, text: str) -> bool:
-        return bool(self.tool_call_regex.search(self._text_strip(text.strip())))
+        text = self._text_strip(text.strip())
+        return self._find_tool_call_span(text) is not None
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         # Try parsing the text as a Python list of function calls
@@ -57,13 +100,12 @@ class PythonicDetector(BaseFormatDetector):
         # Remove unexpected <|python_start|> and <|python_end|> for llama4
         text = self._text_strip(text)
 
-        match = self.tool_call_regex.search(text)
-        if match is None:
+        span = self._find_tool_call_span(text)
+        if span is None:
             return StreamingParseResult(normal_text=text, calls=[])
 
         # Extract the tool call part and any text before/after it
-        tool_call_start = match.start()
-        tool_call_end = match.end()
+        tool_call_start, tool_call_end = span
 
         normal_text_before = text[:tool_call_start] if tool_call_start > 0 else ""
         tool_call_text = text[tool_call_start:tool_call_end]

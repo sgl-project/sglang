@@ -1,5 +1,6 @@
 import functools
 import json
+import time
 import unittest
 import warnings
 from unittest.mock import patch
@@ -498,6 +499,40 @@ class TestPythonicDetector(unittest.TestCase):
         # detect_and_parse does not exercise in isolation.
         self.assertTrue(self.detector.has_tool_call('[get_weather(location="Tokyo")]'))
         self.assertFalse(self.detector.has_tool_call("plain text only"))
+
+    def test_unterminated_calls_do_not_backtrack_exponentially(self):
+        """Regression for #52090: unterminated calls such as
+        "[f(a=0)f(a=1)..." made the old nested-quantifier regex backtrack
+        exponentially (about 47 s for 12 calls), blocking the event loop."""
+        text = "[" + "".join(f"func1(a={i})" for i in range(12))
+
+        start = time.perf_counter()
+        self.assertFalse(self.detector.has_tool_call(text))
+        result = self.detector.detect_and_parse(text, self.tools)
+        elapsed = time.perf_counter() - start
+
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, text)
+        self.assertLess(elapsed, 1.0)
+
+    def test_bracketed_expression_in_prose_is_not_a_tool_call(self):
+        """A "[name(" followed by a positional argument is prose, not a
+        tool call, and must come back unchanged."""
+        text = "Use `items[len(items) - 1]` to get the last item."
+
+        self.assertFalse(self.detector.has_tool_call(text))
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(result.calls, [])
+        self.assertEqual(result.normal_text, text)
+
+    def test_bracket_inside_string_argument(self):
+        """A "]" inside a string argument does not end the call list."""
+        text = "[search(query='a]b\\'c')] done"
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(json.loads(result.calls[0].parameters), {"query": "a]b'c"})
+        self.assertEqual(result.normal_text, " done")
 
     def test_invalid_escape_sequence_still_parses(self):
         """An invalid Python escape (e.g. "\\d+") must not drop the tool call.
