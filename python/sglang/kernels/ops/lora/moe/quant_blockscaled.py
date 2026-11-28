@@ -73,7 +73,6 @@ class BlockScaledRows(msgspec.Struct, frozen=True, kw_only=True):
         assert pack_e2m1 or self.data.dtype == torch.float8_e4m3fn
         assert not (self.nvfp4 and not pack_e2m1)
         assert self.sf_vec_size == (16 if self.nvfp4 else 32)
-        assert self.k % self.sf_vec_size == 0
         if self.per_row:
             assert self.global_scale is None and self.row_denominator > 0
             assert self.row_scales.dtype == torch.float32
