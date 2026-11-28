@@ -86,6 +86,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.eot_token = f"</{block}>"
         self.invoke_start_token = f"<{invoke}"
         self.invoke_end_token = f"</{invoke}>"
+        self.parameter_end_token = f"</{parameter}>"
         self.parameter_regex = (
             rf'<{parameter}\s+name="([^"]+)"\s+string="([^"]+)"\s*>(.*?)</{parameter}>'
         )
@@ -99,6 +100,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
             rf"|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"
         )
         self.current_tool_id = -1
+
+    @staticmethod
+    def _end_of_last(text: str, token: str) -> int:
+        # No match can end past the last closing tag; scanning only up to it stops
+        # each unclosed opening tag from rescanning to the end (quadratic).
+        idx = text.rfind(token)
+        return 0 if idx == -1 else idx + len(token)
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -152,7 +160,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
         parameters = {}
         # Find all complete parameter matches
         param_matches = list(
-            re.finditer(self.parameter_regex, invoke_content, re.DOTALL)
+            re.compile(self.parameter_regex, re.DOTALL).finditer(
+                invoke_content,
+                0,
+                self._end_of_last(invoke_content, self.parameter_end_token),
+            )
         )
 
         # Stray prose around the parameter tags is ignored, as before. Leftover
@@ -203,7 +215,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
         idx = text.find(self.bot_token)
         if idx != -1:
             normal_text = text[:idx].removesuffix("\n\n")
-            sections = re.findall(self.function_calls_regex, text, re.DOTALL)
+            sections = re.compile(self.function_calls_regex, re.DOTALL).findall(
+                text, 0, self._end_of_last(text, self.eot_token)
+            )
         else:
             # The streaming path accepts bare invokes without the outer
             # wrapper; parse them here too instead of leaking raw DSML.
