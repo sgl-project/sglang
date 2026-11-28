@@ -1573,33 +1573,7 @@ class Scheduler(
 
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
-        self.policy = SchedulePolicy(
-            self.schedule_policy,
-            self.tree_cache,
-            self.enable_hierarchical_cache,
-            self.enable_priority_scheduling,
-            self.schedule_low_priority_values_first,
-            shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
-            bounded_lpm_enabled=self.dllm_config is None,
-            uniboost_gamma=get_schedule().uniboost_gamma,
-            enable_uniboost_gamma_ada=get_schedule().enable_uniboost_gamma_ada,
-            # Every rank of a TP or PP group must admit the same batch.
-            uniboost_rank_invariant=get_parallel().tp_size > 1
-            or get_parallel().pp_size > 1,
-            uniboost_step_clock=lambda: self.forward_ct,
-            shortest_prefill_load_scaling=ShortestPrefillLoadScaling.resolve(
-                chunked_prefill_size=self.chunked_prefill_size,
-                halving_chunks=get_schedule().shortest_prefill_boundary_halving_chunks,
-                decay_start_chunks=get_schedule().shortest_prefill_boundary_decay_start_chunks,
-                budget_min_ratio=get_schedule().shortest_prefill_budget_min_ratio,
-                budget_doubling_chunks=get_schedule().shortest_prefill_budget_doubling_chunks,
-            ),
-        )
-        self.policy._on_bounded_state_change = lambda active: (
-            self.waiting_queue.set_on_leave(
-                self.policy.retire_waiting_members if active else None
-            )
-        )
+        self.policy = self.create_schedule_policy(self.schedule_policy)
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
             window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
@@ -1634,6 +1608,42 @@ class Scheduler(
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
+
+    def create_schedule_policy(self, schedule_policy: str) -> SchedulePolicy:
+        """Build the waiting-queue policy; startup and live updates share it."""
+        # Startup allows the load scaling only with shortest-prefill-first, so a
+        # live switch to another policy drops it and a switch back rebuilds it.
+        load_scaling = None
+        if schedule_policy == "shortest-prefill-first":
+            load_scaling = ShortestPrefillLoadScaling.resolve(
+                chunked_prefill_size=self.chunked_prefill_size,
+                halving_chunks=get_schedule().shortest_prefill_boundary_halving_chunks,
+                decay_start_chunks=get_schedule().shortest_prefill_boundary_decay_start_chunks,
+                budget_min_ratio=get_schedule().shortest_prefill_budget_min_ratio,
+                budget_doubling_chunks=get_schedule().shortest_prefill_budget_doubling_chunks,
+            )
+        policy = SchedulePolicy(
+            schedule_policy,
+            self.tree_cache,
+            self.enable_hierarchical_cache,
+            self.enable_priority_scheduling,
+            self.schedule_low_priority_values_first,
+            shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
+            bounded_lpm_enabled=self.dllm_config is None,
+            uniboost_gamma=get_schedule().uniboost_gamma,
+            enable_uniboost_gamma_ada=get_schedule().enable_uniboost_gamma_ada,
+            # Every rank of a TP or PP group must admit the same batch.
+            uniboost_rank_invariant=get_parallel().tp_size > 1
+            or get_parallel().pp_size > 1,
+            uniboost_step_clock=lambda: self.forward_ct,
+            shortest_prefill_load_scaling=load_scaling,
+        )
+        policy._on_bounded_state_change = lambda active: (
+            self.waiting_queue.set_on_leave(
+                policy.retire_waiting_members if active else None
+            )
+        )
+        return policy
 
     def feed_watchdog(self) -> None:
         """Tell the watchdogs the scheduler is alive while it waits on the host
