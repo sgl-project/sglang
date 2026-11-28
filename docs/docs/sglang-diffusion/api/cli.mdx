@@ -533,6 +533,33 @@ native NVIDIA CUDA serving. It is disabled by default. See
 [Asynchronous output saving](/docs/sglang-diffusion/performance-optimization#asynchronous-output-saving)
 for an example, eligible requests, and the response latency and memory tradeoffs.
 
+### Temporary media
+
+For ephemeral media, set `TMPDIR` to an existing, writable, absolute directory
+private to the service instance. The HTTP temporary media helper, remote video
+loader and Wan S2V input downloads use that directory or fail; they do not
+silently switch volumes. Wan S2V no longer caches downloads between requests.
+For repeated offline runs, pass a local file you own. Explicitly configured
+input and output directories and cloud objects are persistent, not scratch.
+
+Request cleanup cannot run after a process is killed. Let the supervisor own
+the scratch volume; do not sweep a shared directory while another replica
+might still be using it. For example, in a systemd template service:
+
+```ini
+[Service]
+RuntimeDirectory=sgld-media-%i
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=no
+Environment=TMPDIR=/run/sgld-media-%i
+```
+
+[systemd](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#RuntimeDirectoryPreserve=)
+removes the directory when the unit stops. On Kubernetes, a per-Pod
+[`emptyDir`](https://kubernetes.io/docs/concepts/storage/volumes/#emptydir)
+survives container restarts and is removed when the Pod is removed. Neither
+mechanism expires objects in external storage or guarantees secure erasure.
+
 ### Graceful shutdown
 
 Set `--http-graceful-shutdown-timeout 30` to allow up to 30 seconds for open HTTP
@@ -607,6 +634,37 @@ outstanding scheduler requests fail, and new POST requests are rejected with
 `503`. The hung request is not aborted; remove the instance from routing and
 restart the whole server. `--scheduler-rpc-timeout` is a different bound: it
 fails one caller's wait, queue time included, and leaves `/health` unchanged.
+
+### Client media URLs
+
+Requests can name input media by HTTP(S) URL (`image_path`, `video_path`,
+`input_reference`, `control_path`, model-specific condition URIs, and so on).
+The server downloads them under the same policy and flags as the LLM server
+(see [Server Arguments](/docs/advanced_features/server_arguments)):
+
+- A media host that resolves to a private, loopback, or link-local address
+  (such as `169.254.169.254`) is rejected, on the first URL and on every
+  redirect. Pass `--allow-private-media-hosts` to fetch media from a private
+  network.
+- `--allowed-media-domains HOST [HOST ...]` restricts media URLs to these exact
+  hostnames; an allowlisted host may resolve to a private address.
+- `--media-url-max-file-size-mb` caps one download. The default is `512`
+  (videos), larger than the LLM server's `64`; `0` disables the limit.
+- `--media-url-timeout` is the time budget of one download, redirects and
+  body included. A download stops when it runs out, even when the server
+  sends the body slowly.
+
+Media downloads connect directly to the checked origin address, never through
+a proxy: when the server environment sets an HTTP(S) proxy, include trusted
+media origins in `NO_PROXY`, or their downloads fail.
+
+The request-level check covers `image_path`, `video_path`, `video_url`,
+`input_reference`, `reference_url`, and `control_path`: other schemes such as
+`file:` or `ftp:`, and FFmpeg protocol strings such as `subfile,...:http:...`,
+are rejected with HTTP 400. Local paths and `data:` URLs are not governed by
+these flags. MiniMax-H3 `conditions[].uri` is not covered by that check: it
+still accepts local `file:`, `data:`, and tar URIs, while its http(s) URIs go
+through the same policy and flags as above.
 
 ### Cloud Storage
 

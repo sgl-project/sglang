@@ -18,7 +18,7 @@ from __future__ import annotations
 import itertools
 import logging
 import weakref
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import torch
@@ -51,6 +51,28 @@ class BeamAttentionMetadata(msgspec.Struct):
 
 def enabled() -> bool:
     return envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.get()
+
+
+def resolve_attention_kernel() -> Callable:
+    """The kernel the attention backend runs for every bucket, picked at its startup."""
+    if envs.SGLANG_USE_BEAM_SHARED_CONTEXT_SPLIT_KV.get():
+        from sglang.kernels.ops.attention.beam_shared_context_split_kv import (
+            shared_context_attention_split_kv,
+        )
+
+        return shared_context_attention_split_kv
+    from sglang.kernels.ops.attention.beam_shared_context import (
+        shared_context_attention,
+    )
+
+    return shared_context_attention
+
+
+def has_shared_context(forward_batch: ForwardBatch) -> bool:
+    return (
+        forward_batch.beam is not None
+        and forward_batch.beam.attention_metadata is not None
+    )
 
 
 def _unsupported_reason(model_runner: ModelRunner) -> Optional[str]:
@@ -218,6 +240,7 @@ def forward(
     layer: RadixAttention,
     forward_batch: ForwardBatch,
     kv_layers: KVLayerRouter,
+    shared_context_kernel: Callable,  # from resolve_attention_kernel()
 ) -> Optional[torch.Tensor]:
     if forward_batch.beam is None:
         return None
@@ -234,12 +257,8 @@ def forward(
     head_dim = layer.head_dim
     flat_q = q.contiguous().view(metadata.num_rows, q_heads, head_dim)
     output = torch.empty_like(flat_q)
-    from sglang.kernels.ops.attention.beam_shared_context import (
-        shared_context_attention,
-    )
-
     for bucket in metadata.buckets:
-        shared_context_attention(
+        shared_context_kernel(
             flat_q,
             k_buffer,
             v_buffer,

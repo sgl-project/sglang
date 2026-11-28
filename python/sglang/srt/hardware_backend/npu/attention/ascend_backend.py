@@ -2163,7 +2163,11 @@ class AscendAttnBackend(AttentionBackend):
             k_rope = k_rope.reshape(
                 k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
             )
-            if getattr(self.token_to_kv_pool, "layer_shard_enabled", False):
+            kv_view = (
+                self.token_to_kv_pool.layer_router.wrapped_view()
+                or self.token_to_kv_pool
+            )
+            if getattr(kv_view, "layer_shard_enabled", False):
                 # The split pool caches the CP-gathered full-sequence copy on
                 # non-owner ranks, skipping the get-time owner broadcast.
                 # Only safe when this write covers the whole read range: a
@@ -2268,6 +2272,11 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
             )
+            logical_rows = getattr(self.forward_metadata, "cp_query_num_tokens", None)
+            if logical_rows is not None:
+                # All-masked physical PCP rows can produce NaNs. They must
+                # not reach the output projection or subsequent reductions.
+                attn_out[logical_rows:].zero_()
         else:
             # extend_kv is set by the model only for a DCP extend that gathered the KV.
             dcp_metadata = forward_batch.attn_dcp_metadata
@@ -3852,6 +3861,31 @@ class AscendAttnBackend(AttentionBackend):
                     value_quant_mode=0,
                 )
             else:
+                # DFLASH draft blocks are ENCODER_ONLY: mutually visible
+                # (non-causal) with a per-layer look-back window. sparse_mode=4
+                # bands off the tril diagonal in atten_mask and widens by
+                # pre/next tokens, so the tril mtp_mask with pre=window /
+                # next=FULL yields keys [p - window, end] per row; a maskless
+                # sparse_mode=4 is rejected by the kernel.
+                if layer.attn_type == AttentionType.ENCODER_ONLY:
+                    is_swa_verify = layer.sliding_window_size != -1
+                    verify_sparse_mode = 4 if is_swa_verify else 0
+                    verify_mask = self.mtp_mask if is_swa_verify else None
+                    verify_pre_tokens = (
+                        layer.sliding_window_size if is_swa_verify else 0
+                    )
+                    verify_next_tokens = FULL_ATTENTION_WINDOW if is_swa_verify else 0
+                else:
+                    # Causal verify chain (MTP/DSPARK): tril mask, full
+                    # look-back; a sliding layer narrows the left edge.
+                    verify_sparse_mode = 4 if layer.sliding_window_size != -1 else 3
+                    verify_mask = self.mtp_mask
+                    verify_pre_tokens = (
+                        layer.sliding_window_size
+                        if layer.sliding_window_size != -1
+                        else FULL_ATTENTION_WINDOW
+                    )
+                    verify_next_tokens = 0
                 workspace = (
                     torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                         q_nope,
@@ -3867,10 +3901,12 @@ class AscendAttnBackend(AttentionBackend):
                         antiquant_scale=None,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=verify_sparse_mode,
+                        atten_mask=verify_mask,
                         actual_seq_lengths=actual_seq_lengths,
                         actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        pre_tokens=verify_pre_tokens,
+                        next_tokens=verify_next_tokens,
                     )
                 )
                 attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
@@ -3889,10 +3925,12 @@ class AscendAttnBackend(AttentionBackend):
                     antiquant_scale=None,
                     block_table=block_table,
                     block_size=self.page_size,
-                    sparse_mode=3,
-                    atten_mask=self.mtp_mask,
+                    sparse_mode=verify_sparse_mode,
+                    atten_mask=verify_mask,
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    pre_tokens=verify_pre_tokens,
+                    next_tokens=verify_next_tokens,
                     workspace=workspace,
                     out=[attn_output, softmax_lse],
                 )

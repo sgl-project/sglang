@@ -3951,6 +3951,12 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         &mut self,
         value: bool,
     ) -> Result<(), TreeCoreRuntimeError> {
+        // Stored marks describe the store being detached, not the next one.
+        if !value {
+            for node_id in self.collect_all_nodes_() {
+                self.arena.node_mut(node_id).external_cache_stored = false;
+            }
+        }
         self.enable_external_cache_linker = value;
         Ok(())
     }
@@ -4773,6 +4779,22 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn rotation_base_of(&self, node_id: NodeId) -> Result<Option<i64>, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
         Ok(self.arena.node(node_id).rotation_base)
+    }
+
+    /// The rotation base plus the node's first position-page: the shard owner
+    /// of its first page, which host backups draw their slots from.
+    pub fn rotation_phase_of(&self, node_id: NodeId) -> Result<Option<i64>, NodeAccessError> {
+        let node_idx = self.arena.resolve(node_id)?;
+        let mut node = self.arena.node(node_idx);
+        let Some(rotation_base) = node.rotation_base else {
+            return Ok(None);
+        };
+        let mut prefix_len = 0;
+        while !node.is_root() {
+            node = self.arena.node(node.parent());
+            prefix_len += node.key.atom_len();
+        }
+        Ok(Some(rotation_base + (prefix_len / self.page_size) as i64))
     }
 
     /// Return input indices in depth-first, subtree-weight order.

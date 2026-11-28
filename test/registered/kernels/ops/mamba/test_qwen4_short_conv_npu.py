@@ -65,7 +65,7 @@ def _make_case(mode, fast, monkeypatch):
         physical_tokens=x.shape[0],
         processed_tokens=x.shape[0],
         lengths=torch.tensor(lengths, device="npu"),
-        row_width=width,
+        tokens_per_seq=width,
         req_indices=req.to("npu"),
         token_offsets=offsets.to("npu"),
         valid_tokens=(req == 0).to("npu")
@@ -90,7 +90,7 @@ def _make_case(mode, fast, monkeypatch):
 def _reference(layer, x, state, batch):
     x, state = x.cpu(), state.cpu()
     expected, next_state = torch.empty_like(x), state.clone()
-    scratch = torch.zeros(3, batch.row_width, 10240, 9, dtype=x.dtype)
+    scratch = torch.zeros(3, batch.tokens_per_seq, 10240, 9, dtype=x.dtype)
     weight = layer.conv1d.weight.detach().cpu().to(x.dtype).float()
     for req, slot in enumerate([2, 1]):
         rows = batch.req_indices.cpu() == req
