@@ -37,6 +37,7 @@ template <
     class ClusterShape_MNK,
     class StageCountType,
     class KernelScheduleType,
+    MixedInputScaleMode ScaleMode = MixedInputScaleMode::kPostMma,
     class Enable = void>
 struct CollectiveBuilderMixedInput {
   static_assert(sizeof(ElementA) == 0, "Could not build a collective for given parameters.");
