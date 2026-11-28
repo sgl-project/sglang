@@ -554,7 +554,6 @@ NOT_COVERED = {
 }
 
 _LATER_CALLS_TO_CONTENT = "calls after the first go to content"
-_SECTION_END_DROPS_CALLS = "section end discards buffered calls"
 
 
 # (parser, mode) pairs that fail on main. Remove an entry when its fix lands.
@@ -563,8 +562,6 @@ KNOWN_FAILURES = {
     ("mistral", "one_call_per_chunk"): _LATER_CALLS_TO_CONTENT,
     ("mistral", "both_calls_in_one_chunk"): _LATER_CALLS_TO_CONTENT,
     ("mistral", "one_token_per_chunk"): _LATER_CALLS_TO_CONTENT,
-    ("step3", "one_call_per_chunk"): _SECTION_END_DROPS_CALLS,
-    ("step3", "both_calls_in_one_chunk"): _SECTION_END_DROPS_CALLS,
 }
 
 _REQUEST = ChatCompletionRequest(
