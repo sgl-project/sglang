@@ -474,6 +474,46 @@ class TestPoolsideV1Detector(CustomTestCase):
         params = "".join(c.parameters for c in all_calls if c.parameters)
         return names, params
 
+    def test_nullable_params_keep_declared_type(self):
+        """Optional[...] params (anyOf / type lists with null) are coerced by their
+        non-null type: numeric-looking strings stay strings, ints become ints."""
+        tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="lookup",
+                    description="Lookup",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "zip_code": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}]
+                            },
+                            "area_code": {"type": ["string", "null"]},
+                            "limit": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+                            "metric": {
+                                "anyOf": [{"type": "boolean"}, {"type": "null"}]
+                            },
+                        },
+                    },
+                ),
+            )
+        ]
+        text = (
+            "<tool_call>lookup\n"
+            "<arg_key>zip_code</arg_key>\n<arg_value>10001</arg_value>\n"
+            "<arg_key>area_code</arg_key>\n<arg_value>212</arg_value>\n"
+            "<arg_key>limit</arg_key>\n<arg_value>5</arg_value>\n"
+            "<arg_key>metric</arg_key>\n<arg_value>true</arg_value>\n"
+            "</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, tools)
+        self.assertEqual(len(result.calls), 1)
+        args = json.loads(result.calls[0].parameters)
+        self.assertEqual(
+            args, {"zip_code": "10001", "area_code": "212", "limit": 5, "metric": True}
+        )
+
 
 if __name__ == "__main__":
     import unittest
