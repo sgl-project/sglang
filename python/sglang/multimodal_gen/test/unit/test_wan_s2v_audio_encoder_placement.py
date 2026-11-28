@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Wan2.2-S2V before-denoising stage: residency, output rate, remote-input downloads."""
 
-from contextlib import ExitStack
-from io import BytesIO
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -187,12 +186,19 @@ def test_stage_saves_at_the_checkpoint_rate_not_the_requested_one(tmp_path):
 
 def test_remote_inputs_have_independent_lifetimes(tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
-    interrupted = BytesIO()
-    interrupted.read = Mock(side_effect=[b"partial", TimeoutError()])
+
+    def interrupted():
+        yield b"partial"
+        raise TimeoutError
+
     stage = _stage()
     url = "https://example.invalid/talk.wav"
     with patch.object(
-        stage_module, "urlopen", side_effect=[interrupted, BytesIO(b"A"), BytesIO(b"B")]
+        stage_module,
+        "open_remote_media",
+        side_effect=[
+            nullcontext(({}, chunks)) for chunks in (interrupted(), [b"A"], [b"B"])
+        ],
     ):
         with pytest.raises(TimeoutError), ExitStack() as files:
             stage._get_single_path(url, "audio_path", files)
@@ -220,7 +226,11 @@ def test_encoder_failure_releases_owned_inputs_only(tmp_path, monkeypatch):
         pose_video_path=None,
     )
     with (
-        patch.object(stage_module, "urlopen", return_value=BytesIO(b"fixture")),
+        patch.object(
+            stage_module,
+            "open_remote_media",
+            return_value=nullcontext(({}, [b"fixture"])),
+        ),
         patch.object(stage, "_encode_local_inputs", side_effect=ValueError("fixture")),
         pytest.raises(ValueError, match="fixture"),
     ):
