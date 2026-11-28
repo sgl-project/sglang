@@ -21,10 +21,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.beam_search.logits_capture import (
-    capture_pre_sample_logits,
-    is_unsampled,
-)
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
+from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
@@ -757,7 +755,7 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
-            if is_unsampled(logits_output):
+            if batch is not None and is_beam_only_batch(batch):
                 # Beam coordinator selects the tokens; this placeholder sets
                 # has_sampled_token_ids, which gates the scheduler's relay.
                 batch_result.next_token_ids = torch.zeros(

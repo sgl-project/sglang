@@ -137,6 +137,19 @@ def num_beam_member_rows(reqs) -> int:
     return sum(r.beam_group.num_member_rows for r in reqs if r.beam_group is not None)
 
 
+def is_beam_only_batch(batch: ScheduleBatch) -> bool:
+    """Every reqs-aligned row is a beam leader, so the sampler has no reader."""
+    tail = batch.beam_tail
+    if tail is not None:
+        return len(tail.entries) == tail.num_base_rows
+    mode = batch.forward_mode
+    return (
+        mode.is_extend()
+        and not mode.is_mixed()
+        and all(req.beam_group is not None for req in batch.reqs)
+    )
+
+
 def beam_retraction_order(sorted_indices: List[int], reqs: List[Req]) -> List[int]:
     """Beam groups are not retractable -- members alias the leader's prompt KV.
     Keep them, retract normal reqs first; the caller aborts the group instead."""

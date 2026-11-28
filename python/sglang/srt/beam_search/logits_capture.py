@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, List, Optional
 
 import msgspec
 
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
+
 if TYPE_CHECKING:
     import torch
 
@@ -39,21 +41,11 @@ if TYPE_CHECKING:
 class BeamLogitsCapture(msgspec.Struct):
     """The preserved raw logits, stashed on LogitsProcessorOutput.beam."""
 
-    leader_logits: torch.Tensor  # leader rows: a pre-sample clone, a view if unsampled
+    leader_logits: torch.Tensor  # leader rows: a pre-sample clone, a view if beam-only
     tail_logits: Optional[torch.Tensor] = None  # member rows' slice (decode)
     leader_rows: Optional[List[int]] = None  # leaders' batch indices (extend)
     leader_normalizer: Optional[torch.Tensor] = None
     tail_normalizer: Optional[torch.Tensor] = None
-    unsampled: bool = False
-
-
-def is_unsampled(logits_output: Optional[LogitsProcessorOutput]) -> bool:
-    """True for a beam-only batch, which the worker did not sample."""
-    return (
-        logits_output is not None
-        and logits_output.beam is not None
-        and logits_output.beam.unsampled
-    )
 
 
 def _copy_leader_rows(tensor: torch.Tensor, rows: List[int]) -> torch.Tensor:
@@ -73,19 +65,6 @@ def _copy_leader_rows(tensor: torch.Tensor, rows: List[int]) -> torch.Tensor:
     else:
         indices = torch.tensor(rows, dtype=torch.int64, device=tensor.device)
     return tensor.index_select(0, indices)
-
-
-def is_beam_only_batch(batch: ScheduleBatch) -> bool:
-    """Every reqs-aligned row is a beam leader, so the sampler has no reader."""
-    tail = batch.beam_tail
-    if tail is not None:
-        return len(tail.entries) == tail.num_base_rows
-    mode = batch.forward_mode
-    return (
-        mode.is_extend()
-        and not mode.is_mixed()
-        and all(req.beam_group is not None for req in batch.reqs)
-    )
 
 
 def capture_pre_sample_logits(
@@ -116,7 +95,6 @@ def capture_pre_sample_logits(
                 tail_logits=logits[n:],
                 leader_normalizer=normalizer[:n] if normalizer is not None else None,
                 tail_normalizer=normalizer[n:] if normalizer is not None else None,
-                unsampled=True,
             )
         else:
             leader_rows = [e.leader_idx for e in batch.beam_tail.entries]
@@ -147,7 +125,6 @@ def capture_pre_sample_logits(
                     leader_logits=logits_output.next_token_logits,
                     leader_rows=leader_rows,
                     leader_normalizer=normalizer,
-                    unsampled=True,
                 )
             else:
                 logits_output.beam = BeamLogitsCapture(
