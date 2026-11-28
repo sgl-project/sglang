@@ -15,6 +15,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
     AscendFAImpl,
     AscendFAMetadata,
     AscendFAMetadataBuilder,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_quant_fa import (
     AscendQuantAttention,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -87,6 +89,28 @@ def test_dispatch_preserves_inputs_and_rotates_once(
     assert options["q_rot"] is options["k_rot"]
     assert (options["q_rot"] is not None) == rotation
     assert ("fp8_fa_mode" in options) == (precision == "fp8")
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [({}, (2, 7.25)), ({"mxfp4_scale_alg": 1, "mxfp4_dst_type_max": 6.0}, (1, 6.0))],
+)
+def test_checkpoint_mxfp4_quantization_reaches_provider(adapter, overrides, expected):
+    config, provider, build = adapter
+    config.update(precision="mxfp4")
+    description = {"blocks.0.attn1": "MXFP4_DYNAMIC", **overrides}
+    impl = build(
+        prefix="blocks.0.attn1.impl",
+        quant_config=SimpleNamespace(quant_description=description),
+    )
+    query = torch.randn(1, 7, 4, 64)
+    impl.forward(query, query, query, None)
+    options = provider.call_args.kwargs
+    assert (options["mxfp4_scale_alg"], options["mxfp4_dst_type_max"]) == expected
+    config["precision"] = "fp8"
+    impl.forward(query, query, query, AscendFAMetadata(precision="fp8"))
+    assert "mxfp4_scale_alg" not in provider.call_args.kwargs
+    assert "mxfp4_dst_type_max" not in provider.call_args.kwargs
 
 
 def test_offline_rotation_is_respected_and_conflicts_rejected(adapter):
@@ -509,7 +533,10 @@ def test_metadata_scope_preserves_native_dispatch(
     monkeypatch, legacy_native, packed, scope
 ):
     from sglang.multimodal_gen.runtime import server_args
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        ascend_fa,
+        ascend_quant_fa,
+    )
 
     config, sd, build, quant, native_mx, native_float = legacy_native
     config["precision"] = "fp8"
@@ -520,6 +547,7 @@ def test_metadata_scope_preserves_native_dispatch(
     )
     loader = Mock(side_effect=AssertionError("Native FA must not load MindIE-SD"))
     monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
+    monkeypatch.setattr(ascend_quant_fa, "load_mindiesd_quant_attention", loader)
     monkeypatch.setitem(sys.modules, "mindiesd", None)
     impl = build(
         quant_config=type("MXFP8Config", (), {})(),
@@ -598,11 +626,15 @@ def test_metadata_changes_do_not_leak_between_calls(legacy_native, packed):
 def test_legacy_mxfp8_stays_native_with_sdk_installed(
     monkeypatch, legacy_native, kind, packed, offline
 ):
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        ascend_fa,
+        ascend_quant_fa,
+    )
 
     config, sd, build, quant, native_mx, native_float = legacy_native
     loader = Mock(side_effect=AssertionError("Legacy FA must not load MindIE-SD"))
     monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
+    monkeypatch.setattr(ascend_quant_fa, "load_mindiesd_quant_attention", loader)
     qc = type(kind, (), {"use_offline_qk_rotation": offline})()
     # Ulysses can reduce the head count passed to the kernel.
     impl = build(num_heads=12, quant_config=qc)
@@ -691,12 +723,14 @@ def test_legacy_nonquantized_calls_remain_native_float(
     "failure", [ImportError("missing SDK"), OSError("missing shared library")]
 )
 def test_sd_dependency_failure_never_falls_back(monkeypatch, legacy_native, failure):
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        ascend_quant_fa,
+    )
 
     config, sd, build, quant, native_mx, native_float = legacy_native
     config["precision"] = "fp8"
     loader = Mock(side_effect=failure)
-    monkeypatch.setattr(ascend_fa, "load_mindiesd_quant_attention", loader)
+    monkeypatch.setattr(ascend_quant_fa, "load_mindiesd_quant_attention", loader)
     impl = build(quant_config=type("MXFP8Config", (), {})())
     loader.assert_not_called()
     query = torch.randn(1, 64, 4, 64)
