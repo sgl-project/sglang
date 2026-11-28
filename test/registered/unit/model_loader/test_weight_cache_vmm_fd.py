@@ -732,6 +732,25 @@ class TestValidateVmmLayout(CustomTestCase):
     def test_accepts_the_plan(self):
         validate_vmm_layout(self.entries, self.sizes)
 
+    def test_derived_values_do_not_bypass_tensor_bounds(self):
+        self.entries["w_t"]["is_plain_tensor"] = True
+        self.entries["w_scale"] = {"is_plain_value": True, "value": 1.0}
+        self.entries["use_deep_gemm_bmm"] = {"is_plain_value": True, "value": False}
+        validate_vmm_layout(self.entries, self.sizes)
+        self.entries["w"]["offset"] = self.sizes[0]
+        with self.assertRaisesRegex(ValueError, "does not fit its allocation"):
+            validate_vmm_layout(self.entries, self.sizes)
+
+    def test_rejects_malformed_derived_values(self):
+        for value in (None, "1.0", [1.0]):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "malformed vmm_fd plain value"),
+            ):
+                validate_vmm_layout(
+                    {"w_scale": {"is_plain_value": True, "value": value}}, []
+                )
+
     def test_rejects_bad_allocation_sizes(self):
         for sizes in ([0], [-4096], [True], "4096", None, [4096.0]):
             with self.subTest(sizes=sizes), self.assertRaises(ValueError):
