@@ -439,6 +439,89 @@ def test_moe_align_inactive_prefix_count_graph(rows, num_experts, dtype):
             offset += padded
 
 
+@pytest.mark.parametrize("numel", [64, 65, 72, 127, 128, 129, 192, 255, 256, 257])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("block_size", [8, 16])
+def test_moe_align_medium_decode_replay(numel, dtype, block_size):
+    """Check every expert group, padding, and output bounds as routes change."""
+    num_experts, poison = 128, -100003
+    capacity = min(numel * block_size, numel + 129 * (block_size - 1))
+    capacity = ceil_div(capacity, 4) * 4
+
+    def guarded(size):
+        backing = torch.full((size + 32,), poison, device="cuda", dtype=torch.int32)
+        return backing, backing[16:-16]
+
+    buffers = [guarded(capacity), guarded(ceil_div(capacity, block_size)), guarded(2)]
+    sorted_ids, expert_ids, counts = [view for _, view in buffers]
+    cumsum = torch.empty(130, device="cuda", dtype=torch.int32)
+    valid = torch.arange(numel, dtype=dtype) % num_experts
+    ids = valid.cuda()
+
+    def run():
+        moe_align_block_size(
+            ids,
+            129,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            counts,
+            cumsum,
+            True,
+            write_inactive_prefix_count=True,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    mixed = valid.clone()
+    mixed[::3] = -1
+    generator = torch.Generator().manual_seed(42)
+    # Maximize padding: one assignment per other bucket and the remainder in
+    # bucket 128. At numel=129 this uses every bucket and the entire capacity.
+    max_padding = torch.full_like(valid, 127)
+    distinct = min(numel, 128)
+    max_padding[:distinct] = torch.arange(distinct, dtype=dtype) - 1
+    patterns = [
+        valid,
+        mixed,
+        max_padding,
+        torch.full_like(valid, -1),
+        torch.full_like(valid, 127),
+    ]
+    patterns += [
+        torch.randint(-1, 128, (numel,), generator=generator, dtype=dtype)
+        for _ in range(3)
+    ]
+    for routes in patterns:
+        ids.copy_(routes)
+        for _, view in buffers:
+            view.fill_(poison)
+        graph.replay()
+        used = 0
+        actual = sorted_ids.cpu()
+        for expert in sorted(set(routes.tolist())):
+            positions = torch.where(routes == expert)[0]
+            padded = ceil_div(positions.numel(), block_size) * block_size
+            group = actual[used : used + padded]
+            assert torch.equal(group[group < numel].long().sort().values, positions)
+            assert torch.all(group[group >= numel] == numel)
+            assert torch.all(
+                expert_ids[used // block_size : (used + padded) // block_size] == expert
+            )
+            used += padded
+        assert counts.cpu().tolist() == [
+            used,
+            ceil_div(int((routes == -1).sum()), block_size),
+        ]
+        assert torch.all(actual[used:] == numel)
+        for backing, _ in buffers:
+            assert torch.all(backing[:16] == poison)
+            assert torch.all(backing[-16:] == poison)
+
+
 @pytest.mark.parametrize("route_ids", [(-1, -1, -1), (2, -1, 0), (2, 0, 1)])
 def test_moe_align_single_token_inactive_prefix_count(route_ids):
     from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token

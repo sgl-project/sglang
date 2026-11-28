@@ -20,6 +20,10 @@ limitations under the License.
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#ifndef USE_ROCM
+#include <cub/block/block_scan.cuh>
+#endif
+
 #include <tvm/ffi/container/tensor.h>
 
 #include <algorithm>
@@ -37,6 +41,50 @@ namespace sglang {
 using Vec = int4;
 
 namespace moe {
+
+#ifndef USE_ROCM
+// One CTA keeps the histogram, prefix offsets, and each assignment's rank on
+// chip. This avoids the generic align + scatter launches for medium decode
+// batches with 128 experts and Marlin's eight-token blocks.
+__global__ void moe_align_medium_129_8_kernel(
+    const int32_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    int32_t numel,
+    int32_t capacity) {
+  using Scan = cub::BlockScan<int32_t, 256>;
+  __shared__ typename Scan::TempStorage scan;
+  __shared__ int32_t counts[256];
+  __shared__ int32_t offsets[256];
+  const int32_t tid = threadIdx.x;
+  counts[tid] = 0;
+  for (int32_t i = tid; i < capacity; i += 256) {
+    sorted_token_ids[i] = numel;
+  }
+  __syncthreads();
+
+  // Bucket zero is the existing -1 (inactive expert) sentinel.
+  const int32_t bucket = tid < numel ? topk_ids[tid] + 1 : 0;
+  const int32_t rank = tid < numel ? atomicAdd(counts + bucket, 1) : 0;
+  __syncthreads();
+
+  const int32_t padded = (counts[tid] + 7) & ~7;
+  int32_t offset, total;
+  Scan(scan).ExclusiveSum(padded, offset, total);
+  offsets[tid] = offset;
+  if (tid == 0) {
+    *reinterpret_cast<int2*>(total_tokens_post_pad) = make_int2(total, CEILDIV(counts[0], 8));
+  }
+  for (int32_t i = 0; i < padded; i += 8) {
+    expert_ids[(offset + i) / 8] = tid - 1;
+  }
+  __syncthreads();
+  if (tid < numel) {
+    sorted_token_ids[offsets[bucket] + rank] = tid;
+  }
+}
+#endif
 
 template <typename scalar_t>
 __device__ __forceinline__ int32_t sentinel_expert_bucket(scalar_t expert_id, int32_t num_buckets) {
@@ -581,6 +629,24 @@ struct MoeAlignBlockSizeKernel {
     int32_t* num_tokens_post_pad_ptr = static_cast<int32_t*>(num_tokens_post_pad.data_ptr());
     int32_t* cumsum_buffer_ptr = static_cast<int32_t*>(cumsum_buffer.data_ptr());
     size_t numel = topk_ids.numel();
+
+#ifndef USE_ROCM
+    if constexpr (
+        std::is_same_v<scalar_t, int32_t> && kWriteInactivePrefixCount && !kMapInvalidExpertsToSentinel &&
+        !kPadExpertIds) {
+      if (numel > 64 && numel <= 256 && num_experts == 129 && block_size == 8 && pad_sorted_token_ids) {
+        LaunchKernel(dim3(1), dim3(256), stream)(
+            moe::moe_align_medium_129_8_kernel,
+            topk_ids_ptr,
+            sorted_token_ids_ptr,
+            expert_ids_ptr,
+            num_tokens_post_pad_ptr,
+            static_cast<int32_t>(numel),
+            static_cast<int32_t>(max_num_tokens_padded));
+        return;
+      }
+    }
+#endif
 
     bool small_batch_expert_mode = (numel < 1024) && (num_experts <= 64);
 
