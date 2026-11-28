@@ -4,6 +4,9 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+from sglang.kernels.ops.mamba.mamba2_replayssm_spec import (
+    record_mamba2_replayssm_spec,
+)
 from sglang.kernels.ops.mamba.triton_ops import (
     mamba_chunk_scan_combined,
     selective_state_update,
@@ -693,6 +696,20 @@ class MambaMixer2(torch.nn.Module):
                 )
 
             hidden_states_d, B_d, C_d = split_hidden_states_B_C_fn(hidden_states_B_C_d)
+            replay_ring = is_target_verify and layer_cache.replayssm_decay is not None
+            if replay_ring:
+                record_mamba2_replayssm_spec(
+                    x=hidden_states_d,
+                    B=B_d,
+                    dt=dt_d,
+                    dt_bias=self.dt_bias,
+                    A=self.A,
+                    x_ring=layer_cache.replayssm_rawv,
+                    b_ring=layer_cache.replayssm_rawk,
+                    dt_ring=layer_cache.replayssm_g,
+                    decay_ring=layer_cache.replayssm_decay,
+                    num_steps=metadata.draft_token_num,
+                )
 
             # 3. State Space Model sequence transformation
             n_groups = local_num_groups

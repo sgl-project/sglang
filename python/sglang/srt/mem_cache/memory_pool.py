@@ -536,6 +536,7 @@ class MambaPool:
     # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
     # class-level default for subclasses that skip MambaPool.__init__.
     _slot_siblings: Tuple = ()
+    replayssm_is_mamba2 = False
 
     def register_slot_state(self, state) -> None:
         """Attach a state that rides along on clear / copy / host round-trip,
@@ -554,12 +555,15 @@ class MambaPool:
         #   replayssm_g: [num_layers, num_slots, HV, L]  (fp32)
         # Under GDN spec verify, rawv/rawk hold compact D/K low parts and beta is
         # None. KDA uses the same fields for its raw-input fold window.
+        # Mamba2 SSD spec verify: x, B, softplus dt, exp(A dt) per verify row,
+        # [layers, rows, T, ...] as mamba2_replayssm_spec.py reads them.
         replayssm_d: Optional[torch.Tensor] = None
         replayssm_k: Optional[torch.Tensor] = None
         replayssm_g: Optional[torch.Tensor] = None
         replayssm_rawv: Optional[torch.Tensor] = None
         replayssm_rawk: Optional[torch.Tensor] = None
         replayssm_beta: Optional[torch.Tensor] = None
+        replayssm_decay: Optional[torch.Tensor] = None
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
@@ -659,6 +663,34 @@ class MambaPool:
         )
         return phys, view
 
+    def _allocate_mamba2_replay_ring(
+        self,
+        *,
+        cache_params: BaseLinearStateParams,
+        num_mamba_layers: int,
+        num_rows: int,
+        record_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        hv, v_dim, k_dim = cache_params.shape.temporal
+        lead = (num_mamba_layers, num_rows, record_len)
+        x_ring = torch.zeros(
+            lead + (hv, v_dim), dtype=cache_params.dtype.conv, device=self.device
+        )
+        b_ring = torch.zeros(
+            lead + (cache_params.mamba2_local_groups, k_dim),
+            dtype=cache_params.dtype.conv,
+            device=self.device,
+        )
+        dt_ring = torch.zeros(lead + (hv,), dtype=torch.float32, device=self.device)
+        decay_ring = torch.zeros_like(dt_ring)
+        logger.info(
+            "Mamba2 ReplaySSM spec ring allocated (rows=%d, record_len=%d): %.3fGB",
+            num_rows,
+            record_len,
+            get_tensor_size_bytes([x_ring, b_ring, dt_ring, decay_ring]) / GB,
+        )
+        return x_ring, b_ring, dt_ring, decay_ring
+
     def __init__(
         self,
         *,
@@ -698,10 +730,16 @@ class MambaPool:
         # fold-every-commit for KDA. The shared g allocation gates on
         # `_replayssm_on`.
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
-        self.replayssm_spec_fold = bool(
-            enable_linear_replayssm_spec and cache_params.is_kda
+        self.replayssm_is_mamba2 = bool(
+            enable_linear_replayssm_spec and cache_params.is_mamba2_ssd
         )
-        _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
+        self.replayssm_spec_fold = bool(
+            enable_linear_replayssm_spec
+            and (cache_params.is_kda or self.replayssm_is_mamba2)
+        )
+        _replayssm_on = (
+            enable_linear_replayssm or enable_linear_replayssm_spec
+        ) and not self.replayssm_is_mamba2
         self.replayssm_request_ring = False
 
         # for disagg with nvlink
@@ -786,6 +824,22 @@ class MambaPool:
             # (--enable-linear-replayssm-spec) shares this allocation.
             replayssm_d = replayssm_k = replayssm_g = None
             replayssm_rawv = replayssm_rawk = replayssm_beta = None
+            replayssm_decay = None
+            if self.replayssm_is_mamba2:
+                assert speculative_num_draft_tokens is not None
+                if speculative_eagle_topk not in (None, 1):
+                    raise ValueError(
+                        "--enable-linear-replayssm-spec for Mamba2 requires a "
+                        f"linear draft chain, got topk={speculative_eagle_topk}."
+                    )
+                replayssm_rawv, replayssm_rawk, replayssm_g, replayssm_decay = (
+                    self._allocate_mamba2_replay_ring(
+                        cache_params=cache_params,
+                        num_mamba_layers=num_mamba_layers,
+                        num_rows=spec_state_size + 1,
+                        record_len=speculative_num_draft_tokens,
+                    )
+                )
             if _replayssm_on:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
@@ -1024,6 +1078,7 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
+                    replayssm_decay=replayssm_decay,
                 )
                 intermediate_ssm_gb = (
                     get_tensor_size_bytes(intermediate_ssm_state_cache) / GB
@@ -1050,6 +1105,7 @@ class MambaPool:
                     replayssm_rawv=replayssm_rawv,
                     replayssm_rawk=replayssm_rawk,
                     replayssm_beta=replayssm_beta,
+                    replayssm_decay=replayssm_decay,
                 )
                 logger.info(
                     f"Mamba Cache is allocated. "
@@ -1325,6 +1381,7 @@ class MambaPool:
             "replayssm_rawv",
             "replayssm_rawk",
             "replayssm_beta",
+            "replayssm_decay",
         }
     )
 

@@ -467,7 +467,9 @@ def handle_linear_attn_backend(server_args: Any):
     # window (MambaPool checks it); KDA (kda_backend) keeps a window of the
     # same length and folds via its own fused verify ring-write +
     # commit_kda_replayssm_after_verify.
-    if cfg.enable_linear_replayssm_spec:
+    if cfg.enable_linear_replayssm_spec and _is_mamba2_ssd_model(server_args):
+        _validate_mamba2_replayssm_spec(cfg)
+    elif cfg.enable_linear_replayssm_spec:
         if cfg.speculative_eagle_topk not in (None, 1):
             raise ValueError(
                 "--enable-linear-replayssm-spec requires a linear draft chain "
@@ -547,6 +549,62 @@ def handle_linear_attn_backend(server_args: Any):
                 "verify window; validate long-sequence accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
             )
+
+
+def _is_mamba2_ssd_model(server_args: Any) -> bool:
+    from sglang.srt.configs.hybrid_arch import mamba2_config
+    from sglang.srt.configs.nemotron_h import NemotronHConfig
+
+    return isinstance(mamba2_config(model_config_of(server_args)), NemotronHConfig)
+
+
+def _validate_mamba2_replayssm_spec(cfg: Any) -> None:
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    if cfg.speculative_algorithm is None:
+        raise ValueError(
+            "--enable-linear-replayssm-spec requires --speculative-algorithm."
+        )
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError(
+            "--enable-linear-replayssm-spec requires a linear draft chain "
+            "(--speculative-eagle-topk in {None, 1}), got "
+            f"{cfg.speculative_eagle_topk!r}."
+        )
+    if not get_platform().is_cuda:
+        raise ValueError("--enable-linear-replayssm-spec for Mamba2 requires CUDA.")
+    if pp_spec_stable_rows_enabled():
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 does not support "
+            "SGLANG_ENABLE_PP_SPEC yet."
+        )
+    if cfg.mamba_backend != "triton":
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 replays the Triton "
+            f"selective-state-update; got --mamba-backend={cfg.mamba_backend!r}."
+        )
+    if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 requires "
+            "SGLANG_RAGGED_VERIFY_MODE=static."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--enable-linear-replayssm-spec for Mamba2 does not support "
+            "--enable-unified-memory yet."
+        )
+    if cfg.disaggregation_mode == "prefill":
+        raise ValueError(
+            "--enable-linear-replayssm-spec is not supported on a PD prefill server."
+        )
+    if cfg.enable_linear_replayssm:
+        raise ValueError(
+            "--enable-linear-replayssm-spec and --enable-linear-replayssm are "
+            "mutually exclusive."
+        )
 
 
 def handle_multi_item_scoring(server_args: Any):
