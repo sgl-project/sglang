@@ -29,6 +29,13 @@ from sglang.multimodal_gen.runtime.platforms.aiter import (
 logger = logging.getLogger(__name__)
 
 _use_fp8_attn = os.environ.get("SGLANG_DIFFUSION_AITER_FP8_ATTN", "0") == "1"
+# `forward_varlen` hands Q/K/V to aiter as they are when only the last dim is
+# contiguous (e.g. the interleaved views of the packed Ulysses QKV buffer),
+# instead of copying them first. Set SGLANG_DIFFUSION_AITER_VARLEN_STRIDED_QKV=0
+# to restore the copies.
+_AITER_VARLEN_STRIDED_QKV = (
+    os.environ.get("SGLANG_DIFFUSION_AITER_VARLEN_STRIDED_QKV", "1") != "0"
+)
 _fp8_dtype = torch.float8_e4m3fn
 
 # fmha_fwd_hd128_fp8_gfx950 ASM kernel. Support full MHA with q/k/v head_dim == 128 -- e.g., Wan 2.2 self- and cross-attention.
@@ -648,10 +655,15 @@ class AITerImpl(AttentionImpl):
         attention_func = aiter.flash_attn_varlen_func
 
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
+        # The CK/ASM varlen forward kernels take the row and head strides of
+        # Q/K/V, and aiter itself only copies when stride(-1) != 1. Other
+        # routes (gfx1250 FlyDSL/ASM, the Triton fallback) keep the copies.
+        if not _AITER_VARLEN_STRIDED_QKV or USE_AITER_GFX1250 or not _AITER_ENABLE_CK:
+            query, key, value = query.contiguous(), key.contiguous(), value.contiguous()
         output = attention_func(
-            q=query.contiguous(),
-            k=key.contiguous(),
-            v=value.contiguous(),
+            q=query,
+            k=key,
+            v=value,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen,
