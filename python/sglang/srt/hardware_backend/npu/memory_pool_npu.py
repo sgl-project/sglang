@@ -10,6 +10,7 @@ from sglang.srt.hardware_backend.npu.kv_capability import (
     PackedQuantKvCapability,
     resolve_npu_kv_capability,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8
 from sglang.srt.mem_cache.memory_pool import (
@@ -793,6 +794,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
+        self._use_scatter_hp = not is_npu_arch35()
         self.enable_sparsity_driven_kv_offload = (
             envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
         )
@@ -1296,11 +1298,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
+    def _scatter_cache(self, cache, indices, updates):
+        if not self._use_scatter_hp:
+            torch_npu.npu_scatter_nd_update_(cache, indices, updates)
+            return
+
+        try:
+            from sgl_kernel_npu.operators.mem_cache import scatter_nd_update_
+        except ImportError:
+            torch_npu.npu_scatter_nd_update_(cache, indices, updates)
+            return
+
+        scatter_nd_update_(cache, indices, updates, impl="ascendc")
+
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
         assert scale.dtype == self.index_k_scale_dtype, (
             f"input scale has to be {scale.dtype=} but it is {self.index_k_scale_dtype=}"
         )
-        torch_npu.npu_scatter_nd_update_(
+        self._scatter_cache(
             self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
             loc.view(-1, 1),
             scale.view(-1, 1),
@@ -1419,7 +1434,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
             packed = self._pack_dsa_quant_kv_cache(cache_k, cache_v)
-            torch_npu.npu_scatter_nd_update_(
+            self._scatter_cache(
                 self.k_buffer[self._kv_local_offset(layer_id)].view(
                     -1, 1, self.kv_cache_dim
                 ),
@@ -1445,7 +1460,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_v = cache_v.view(self.store_dtype)
 
         if self.use_combined_kv_buffer:
-            torch_npu.npu_scatter_nd_update_(
+            self._scatter_cache(
                 self.get_combined_kv_buffer(layer_id).view(
                     -1, 1, self.kv_cache_dim + self.kr_cache_dim
                 ),
@@ -1460,7 +1475,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             self._set_fia_nz_kv_buffer(layer_id, loc, cache_k, cache_v)
             return
 
-        torch_npu.npu_scatter_nd_update_(
+        self._scatter_cache(
             self.k_buffer[self._kv_local_offset(layer_id)].view(
                 -1, 1, self.kv_lora_rank
             ),
@@ -1468,7 +1483,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k.view(-1, 1, self.kv_lora_rank),
         )
         if self.qk_rope_head_dim > 0:
-            torch_npu.npu_scatter_nd_update_(
+            self._scatter_cache(
                 self.v_buffer[self._kv_local_offset(layer_id)].view(
                     -1, 1, self.qk_rope_head_dim
                 ),
@@ -1554,7 +1569,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             if self.store_dtype != self.dtype:
                 index_k = index_k.view(self.store_dtype)
 
-        torch_npu.npu_scatter_nd_update_(
+        self._scatter_cache(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(
                 -1, 1, self.index_head_dim
             ),
