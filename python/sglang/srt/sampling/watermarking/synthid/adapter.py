@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 from typing import TYPE_CHECKING, Any, Optional
 
 import msgspec
@@ -14,7 +13,7 @@ from sglang.srt.utils.device import is_cuda, rows_where
 
 from ..batch_layout import num_prefill_rows
 from ..config import SYNTHID_CONFIG_FIELDS, WatermarkRequestConfig
-from ..interface import NO_WATERMARK_VIEW_FIELDS, SampleWatermarkOutput
+from ..interface import NO_WATERMARK_VIEW_FIELDS
 from .algorithm import SynthIDConfig
 from .watermark import FilterProbs, SynthIDWatermark
 
@@ -208,19 +207,6 @@ def _request_filter(
     return filter_probs
 
 
-def _without_request_filters(
-    sampling_info: SamplingBatchInfo, rows: SynthIDRows
-) -> SamplingBatchInfo:
-    """The sampling info the stock sampler draws watermarked rows with: their
-    top-p and min-p already ran inside the transform. The ``need_*`` flags
-    stay, so the other rows keep their sampling path."""
-    return dataclasses.replace(
-        sampling_info,
-        top_ps=sampling_info.top_ps.index_fill(0, rows.indices, 1.0),
-        min_ps=sampling_info.min_ps.index_fill(0, rows.indices, 0.0),
-    )
-
-
 class SynthIDSample:
     def __init__(
         self,
@@ -234,14 +220,38 @@ class SynthIDSample:
         self.rows = rows
         self.forward_batch = forward_batch
         self.allow_fused_sample = allow_fused_sample
+        # apply runs the request filters of every row it watermarks.
+        self.request_filtered_rows = rows.indices
+
+    def fused_sample(
+        self, logits: torch.Tensor, *, keep_logits: bool
+    ) -> Optional[torch.Tensor]:
+        if not self._can_fuse(keep_logits):
+            return None
+        slots, temperatures = self._seed_and_select(logits)
+        return self.watermark.sample(logits, temperatures, slots)
 
     def apply(
         self, logits: torch.Tensor, *, keep_logits: bool
-    ) -> SampleWatermarkOutput:
-        forward_batch = self.forward_batch
-        sampling_info = forward_batch.sampling_info
-        rows = self.rows
+    ) -> Optional[torch.Tensor]:
         logprob_logits = logits.clone() if keep_logits else None
+        slots, temperatures = self._seed_and_select(logits)
+        self.watermark.apply(
+            logits,
+            temperatures,
+            slots,
+            rows=self.rows.take_index,
+            filter_probs=_request_filter(self.forward_batch.sampling_info, self.rows),
+        )
+        return logprob_logits
+
+    def _seed_and_select(
+        self, logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Seed the prefilled rows, sanitize ``logits``, and return the
+        watermarked rows' slots and temperatures."""
+        forward_batch = self.forward_batch
+        rows = self.rows
         req_pool_indices = forward_batch.req_pool_indices[: logits.shape[0]]
         # Seeded at every extend that prefills the row; the commit has no mask,
         # so a non-final chunk's commit is undone by the next chunk's reseed.
@@ -250,27 +260,10 @@ class SynthIDSample:
             seed_rows = torch.tensor(seed_rows, device=req_pool_indices.device)
             self.watermark.state.seed(req_pool_indices[seed_rows], replay_token_ids)
         slots = rows.take(req_pool_indices)
-        temperatures = rows.take(sampling_info.temperatures)
+        temperatures = rows.take(forward_batch.sampling_info.temperatures)
         # The stock sampler sanitizes too, but after the candidate top-k here.
         sanitize_nan_logits(logits, "watermark: next_token_logits")
-
-        if self._can_fuse(keep_logits):
-            return SampleWatermarkOutput(
-                sampling_info=sampling_info,
-                logprob_logits=None,
-                token_ids=self.watermark.sample(logits, temperatures, slots),
-            )
-        self.watermark.apply(
-            logits,
-            temperatures,
-            slots,
-            rows=rows.take_index,
-            filter_probs=_request_filter(sampling_info, rows),
-        )
-        return SampleWatermarkOutput(
-            sampling_info=_without_request_filters(sampling_info, rows),
-            logprob_logits=logprob_logits,
-        )
+        return slots, temperatures
 
     def commit(self, token_ids: torch.Tensor) -> None:
         req_pool_indices = self.forward_batch.req_pool_indices[: token_ids.shape[0]]
@@ -299,6 +292,8 @@ class SynthIDVerify:
     def __init__(self, watermark: SynthIDWatermark, rows: SynthIDRows) -> None:
         self.watermark = watermark
         self.rows = rows
+        # apply runs the request filters of every row it watermarks.
+        self.request_filtered_rows = rows.indices
         # Set by apply, read by commit.
         self._req_pool_indices: Optional[torch.Tensor] = None
 
@@ -313,7 +308,7 @@ class SynthIDVerify:
         draft_token_num: int,
         custom_mask: Optional[torch.Tensor],
         keep_logits: bool,
-    ) -> tuple[torch.Tensor, SamplingBatchInfo]:
+    ) -> torch.Tensor:
         if keep_logits:
             logits = logits.clone()
         rows = self.rows
@@ -326,7 +321,7 @@ class SynthIDVerify:
             request_rows=rows.take_index,
             filter_probs=_request_filter(sampling_info, rows, width=draft_token_num),
         )
-        return logits, _without_request_filters(sampling_info, rows)
+        return logits
 
     def commit(self, accept: VerifyAccept) -> None:
         rows = self.rows

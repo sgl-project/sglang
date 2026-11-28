@@ -13,7 +13,6 @@ from ..config import (
     WatermarkRequestConfig,
     parse_watermark_key,
 )
-from ..interface import SampleWatermarkOutput
 from .detector import hash_context
 from .state import WatermarkState
 
@@ -268,10 +267,16 @@ class GumbelSample:
         self.state = state
         self.rows = rows
         self.forward_batch = forward_batch
+        self.request_filtered_rows = None
+
+    def fused_sample(
+        self, logits: torch.Tensor, *, keep_logits: bool
+    ) -> Optional[torch.Tensor]:
+        return None
 
     def apply(
         self, logits: torch.Tensor, *, keep_logits: bool
-    ) -> SampleWatermarkOutput:
+    ) -> Optional[torch.Tensor]:
         forward_batch = self.forward_batch
         logprob_logits = logits.clone() if keep_logits else None
         req_pool_indices = forward_batch.req_pool_indices[: logits.shape[0]]
@@ -285,9 +290,7 @@ class GumbelSample:
             self.rows.context_windows,
             self.rows.enabled,
         )
-        return SampleWatermarkOutput(
-            sampling_info=forward_batch.sampling_info, logprob_logits=logprob_logits
-        )
+        return logprob_logits
 
     def commit(self, token_ids: torch.Tensor) -> None:
         req_pool_indices = self.forward_batch.req_pool_indices[: token_ids.shape[0]]
@@ -303,6 +306,7 @@ class GumbelVerify:
         self.state = state
         self.rows = rows
         self.full_mask = full_mask
+        self.request_filtered_rows = None
         # (req_pool_indices, context_hashes, selected) of the applied verify.
         self._forced: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None
         self._chain_width: Optional[int] = None
@@ -318,7 +322,7 @@ class GumbelVerify:
         draft_token_num: int,
         custom_mask: Optional[torch.Tensor],
         keep_logits: bool,
-    ) -> tuple[torch.Tensor, SamplingBatchInfo]:
+    ) -> torch.Tensor:
         if keep_logits:
             logits = logits.clone()
         if custom_mask is None:
@@ -359,7 +363,7 @@ class GumbelVerify:
                 draft_token_num=draft_token_num,
             )
         self._forced = (req_pool_indices, context_hashes, selected)
-        return logits, sampling_info
+        return logits
 
     def commit(self, accept: VerifyAccept) -> None:
         req_pool_indices, context_hashes, selected = self._forced

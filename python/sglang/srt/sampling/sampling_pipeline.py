@@ -25,6 +25,7 @@ and the grammar mask.
 
 from __future__ import annotations
 
+import dataclasses
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
@@ -87,18 +88,23 @@ class SamplingPipeline(msgspec.Struct, frozen=True):
             if self.watermark is not None
             else None
         )
-        # The info the sampler reads; the watermark may replace it.
         sampler_info = sampling_info
         logprob_logits = None
         next_token_ids = None
         if watermark is not None:
-            step = watermark.apply(
+            next_token_ids = watermark.fused_sample(
                 logits_output.next_token_logits,
                 keep_logits=forward_batch.return_logprob,
             )
-            sampler_info = step.sampling_info
-            logprob_logits = step.logprob_logits
-            next_token_ids = step.token_ids
+            if next_token_ids is None:
+                logprob_logits = watermark.apply(
+                    logits_output.next_token_logits,
+                    keep_logits=forward_batch.return_logprob,
+                )
+                if watermark.request_filtered_rows is not None:
+                    sampler_info = _without_request_filters(
+                        sampling_info, watermark.request_filtered_rows
+                    )
         if next_token_ids is None:
             next_token_ids = graph_token_ids
 
@@ -234,6 +240,19 @@ def _adjust_after_watermark(
     return logits
 
 
+def _without_request_filters(
+    sampling_info: SamplingBatchInfo, rows: torch.Tensor
+) -> SamplingBatchInfo:
+    """The sampling info the sampler or the accept draws with when the watermark
+    already ran the request top-p and min-p of `rows`. The facts stay, so the
+    other rows keep their sampling path."""
+    return dataclasses.replace(
+        sampling_info,
+        top_ps=sampling_info.top_ps.index_fill(0, rows, 1.0),
+        min_ps=sampling_info.min_ps.index_fill(0, rows, 0.0),
+    )
+
+
 def _custom_logit_processor_stage(
     logits: torch.Tensor,
     sampling_info: SamplingBatchInfo,
@@ -297,9 +316,10 @@ class VerifyStep(msgspec.Struct):
     ) -> Tuple[torch.Tensor, SamplingBatchInfo]:
         """The stages over a verify's logits, in sampling's order (see
         `_adjust_before_watermark` for the rows); returns the logits and the
-        sampling info to accept with. The watermark may replace both, and when
-        it keeps the unwatermarked logits for the logprobs, the custom logit
-        processor runs on both, as in sampling. `draft_tokens` is
+        sampling info to accept with. The watermark may replace the logits with
+        a watermarked copy, keeping the unwatermarked ones for the logprobs (the
+        custom logit processor then runs on both, as in sampling), and its
+        request-filtered rows accept with top_p=1 and min_p=0. `draft_tokens` is
         [bs, width]. A chain verify passes `positions` [bs, width], read by the
         watermark; a tree verify passes its verify input as `tree` instead: the
         penalty walks its `retrieve_next_token` / `retrieve_next_sibling`, and
@@ -326,7 +346,7 @@ class VerifyStep(msgspec.Struct):
                     positions=tree.positions,
                     custom_mask=tree.custom_mask,
                 )
-            verify_logits, sampling_info = self.watermark.apply(
+            verify_logits = self.watermark.apply(
                 logits,
                 sampling_info=sampling_info,
                 req_pool_indices=batch.req_pool_indices,
@@ -335,6 +355,10 @@ class VerifyStep(msgspec.Struct):
                 keep_logits=batch.return_logprob,
                 **geometry,
             )
+            if self.watermark.request_filtered_rows is not None:
+                sampling_info = _without_request_filters(
+                    sampling_info, self.watermark.request_filtered_rows
+                )
         if self.facts.custom_logit_processor:
             _custom_logit_processor_stage(
                 verify_logits,

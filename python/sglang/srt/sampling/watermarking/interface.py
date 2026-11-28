@@ -6,7 +6,6 @@ everything a particular algorithm does lives behind them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Protocol, Sequence
 
 from torch import Tensor
@@ -31,29 +30,40 @@ class WatermarkRows(Protocol):
     """
 
 
-@dataclass(frozen=True)
-class SampleWatermarkOutput:
-    # What the stock sampler must sample with.
-    sampling_info: SamplingBatchInfo
-    # The pre-watermark logits, iff the caller asked to keep them for logprobs.
-    logprob_logits: Optional[Tensor]
-    # Set when the algorithm already sampled. The stock sampler is then skipped
-    # whole: no logprobs, no sampling masks, no grammar or TP token all-reduce;
-    # these become the algorithm's job. commit() still runs on these tokens,
-    # so an algorithm must not also commit them inside apply().
-    token_ids: Optional[Tensor] = None
-
-
 class SampleWatermark(Protocol):
-    """One ordinary sampling step's watermark, bound to its forward batch."""
+    """One ordinary sampling step's watermark, bound to its forward batch.
 
-    def apply(self, logits: Tensor, *, keep_logits: bool) -> SampleWatermarkOutput: ...
+    ``apply`` edits logits only and leaves the draw to the pipeline;
+    ``fused_sample`` is a fast path that runs the stage and the draw in one kernel.
+    """
+
+    # Batch rows whose request top-p and min-p the stage already applied, which
+    # the stock sampler draws with top_p=1 and min_p=0; None when there are none.
+    request_filtered_rows: Optional[Tensor]
+
+    def fused_sample(self, logits: Tensor, *, keep_logits: bool) -> Optional[Tensor]:
+        """The step's token ids, from the stage and the draw in one kernel; None
+        when the algorithm has no such kernel for this step, and the pipeline
+        runs ``apply`` and the stock sampler instead. With token ids the stock
+        sampler is skipped whole: no logprobs, no sampling masks, no grammar or
+        TP token all-reduce; ``commit`` still runs on them, so this must not
+        commit them."""
+        ...
+
+    def apply(self, logits: Tensor, *, keep_logits: bool) -> Optional[Tensor]:
+        """Watermark ``logits`` in place; returns the pre-watermark logits iff
+        ``keep_logits``, for the logprobs."""
+        ...
 
     def commit(self, token_ids: Tensor) -> None: ...
 
 
 class VerifyWatermark(Protocol):
     """One speculative verify's watermark, bound to its batch rows."""
+
+    # As in ``SampleWatermark``; the accept draws these rows with top_p=1 and
+    # min_p=0.
+    request_filtered_rows: Optional[Tensor]
 
     def apply(
         self,
@@ -66,15 +76,15 @@ class VerifyWatermark(Protocol):
         draft_token_num: int,
         custom_mask: Optional[Tensor],
         keep_logits: bool,
-    ) -> tuple[Tensor, SamplingBatchInfo]:
-        """The logits to verify against and the sampling info to verify with.
+    ) -> Tensor:
+        """The logits to verify against: ``logits`` watermarked in place, or a
+        watermarked copy when ``keep_logits``.
 
-        Callers accept with the returned sampling info, not the one passed in.
         The NV mega runtime path (SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION)
         builds the provider's ``VerifySamplingView`` from the sampling info
         before any apply (``make_post_verify_io``), and a provider forces
         through the bound object's ABI v2 methods instead of apply, so an
-        algorithm that changes the sampling info must refuse that path in its
+        algorithm with request-filtered rows must refuse that path in its
         ``check_server_args``.
 
         ``custom_mask`` None means a chain draft: ``draft_tokens`` and

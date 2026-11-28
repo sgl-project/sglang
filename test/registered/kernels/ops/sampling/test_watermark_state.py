@@ -84,11 +84,11 @@ def test_repeated_context_and_greedy_bypass():
         )
 
     first_logits = torch.zeros((2, 64), device=device)
-    step = engine.bind_sample(forward_batch(([[10, 11], [20, 21]], None))).apply(
-        first_logits, keep_logits=True
-    )
+    logprob_logits = engine.bind_sample(
+        forward_batch(([[10, 11], [20, 21]], None))
+    ).apply(first_logits, keep_logits=True)
 
-    assert torch.equal(step.logprob_logits, torch.zeros_like(first_logits))
+    assert torch.equal(logprob_logits, torch.zeros_like(first_logits))
     assert torch.isfinite(first_logits[0]).sum().item() == 1
     assert torch.equal(first_logits[1], torch.zeros(64, device=device))
     assert state.num_watermarked_contexts.tolist() == [1, 0]
@@ -324,7 +324,7 @@ def test_speculative_tree_paths_match_tensor_reference():
         candidates_host=[True, True],
     )
     verify = GumbelEngine(states[2], _FEATURES).bind_verify(rows, full_mask=True)
-    verify_logits, _ = verify.apply(
+    verify_logits = verify.apply(
         logits,
         sampling_info=sampling_info,
         req_pool_indices=req_pool_indices,
@@ -413,7 +413,7 @@ def test_dspark_chain_commits_non_speculative_contexts(block_verification):
     )
     engine = GumbelEngine(state, _FEATURES)
     verify = engine.bind_verify(rows, full_mask=False)
-    target_logits, _ = verify.apply(
+    target_logits = verify.apply(
         logits.clone(),
         sampling_info=sampling_info,
         req_pool_indices=req_pool_indices,

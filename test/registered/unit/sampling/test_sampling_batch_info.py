@@ -27,7 +27,6 @@ from sglang.srt.sampling.sampling_pipeline import (
     VerifyStep,
     _adjust_before_watermark,
 )
-from sglang.srt.sampling.watermarking.interface import SampleWatermarkOutput
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB_SIZE = 32
@@ -92,11 +91,14 @@ class TestSamplingPipelineOrder(CustomTestCase):
             return "logits" if logits is logits_output.next_token_logits else "logprob"
 
         class Watermark:
+            request_filtered_rows = None
+
+            def fused_sample(self, logits, *, keep_logits):
+                return None
+
             def apply(self, logits, *, keep_logits):
                 events.append("watermark")
-                return SampleWatermarkOutput(
-                    sampling_info=info, logprob_logits=logprob_logits
-                )
+                return logprob_logits
 
             def commit(self, token_ids):
                 events.append("watermark commit")
@@ -167,7 +169,7 @@ class TestSamplingPipelineOrder(CustomTestCase):
 
         def apply_watermark(logits, *, sampling_info, **kwargs):
             events.append("watermark")
-            return watermarked, sampling_info
+            return watermarked
 
         step = VerifyStep(
             batch=SimpleNamespace(
@@ -178,7 +180,9 @@ class TestSamplingPipelineOrder(CustomTestCase):
                 return_logprob=False,
             ),
             facts=SamplingFacts(custom_logit_processor=True),
-            watermark=SimpleNamespace(apply=apply_watermark),
+            watermark=SimpleNamespace(
+                apply=apply_watermark, request_filtered_rows=None
+            ),
             watermark_full_mask=True,
         )
 
@@ -201,6 +205,99 @@ class TestSamplingPipelineOrder(CustomTestCase):
         self.assertEqual(
             events, ["logit_bias", "watermark", "custom watermarked", "custom logits"]
         )
+
+    def test_sampler_and_accept_draw_request_filtered_rows_unfiltered(self):
+        """Rows whose request filters the watermark already ran reach the sampler
+        and the accept with top_p=1 and min_p=0; the batch keeps its params."""
+        filters = dict(
+            top_ps=torch.tensor([0.75, 0.5]), min_ps=torch.tensor([0.25, 0.125])
+        )
+
+        class Watermark:
+            request_filtered_rows = torch.tensor([0])
+
+            def fused_sample(self, logits, *, keep_logits):
+                return None
+
+            def apply(self, logits, *, keep_logits=False, **kwargs):
+                return logits
+
+            def commit(self, token_ids):
+                pass
+
+        drawn_with = []
+
+        def sampler(logits_output, sampler_info, *args, **kwargs):
+            drawn_with.append(sampler_info)
+            return torch.tensor([0, 0])
+
+        info = _make_info(**filters)
+        pipeline = SamplingPipeline(
+            sampler=sampler,
+            watermark=SimpleNamespace(bind_sample=lambda forward_batch: Watermark()),
+        )
+        pipeline.sample(
+            LogitsProcessorOutput(next_token_logits=torch.zeros(2, 4)),
+            SimpleNamespace(
+                sampling_info=info,
+                return_logprob=False,
+                top_logprobs_nums=None,
+                token_ids_logprobs=None,
+                positions=torch.zeros(2),
+                forward_mode=SimpleNamespace(is_decode=lambda: True),
+            ),
+            observer=None,
+            graph_token_ids=None,
+        )
+        step = VerifyStep(
+            batch=SimpleNamespace(
+                sampling_info=_make_info(**filters),
+                req_pool_indices=None,
+                return_logprob=False,
+            ),
+            facts=SamplingFacts(),
+            watermark=Watermark(),
+            watermark_full_mask=True,
+        )
+        _, accept_info = step.adjust(torch.zeros(2, 4), torch.zeros(2, 1).long())
+
+        for drawn in (drawn_with[0], accept_info):
+            self.assertEqual(drawn.top_ps.tolist(), [1.0, 0.5])
+            self.assertEqual(drawn.min_ps.tolist(), [0.0, 0.125])
+        self.assertEqual(info.top_ps.tolist(), [0.75, 0.5])
+
+    def test_fused_sample_replaces_apply_and_the_sampler(self):
+        """A watermark that draws in one kernel skips its apply and the sampler;
+        its tokens are committed."""
+        events = []
+        tokens = torch.tensor([3])
+
+        class Watermark:
+            request_filtered_rows = None
+
+            def fused_sample(self, logits, *, keep_logits):
+                events.append("fused")
+                return tokens
+
+            def apply(self, logits, *, keep_logits):
+                events.append("apply")
+
+            def commit(self, token_ids):
+                events.append(("commit", token_ids))
+
+        pipeline = SamplingPipeline(
+            sampler=lambda *args, **kwargs: events.append("sampler"),
+            watermark=SimpleNamespace(bind_sample=lambda forward_batch: Watermark()),
+        )
+        next_token_ids = pipeline.sample(
+            LogitsProcessorOutput(next_token_logits=torch.zeros(1, 4)),
+            SimpleNamespace(sampling_info=_make_info(), return_logprob=False),
+            observer=None,
+            graph_token_ids=torch.tensor([9]),
+        )
+
+        self.assertIs(next_token_ids, tokens)
+        self.assertEqual(events, ["fused", ("commit", tokens)])
 
     def test_observer_sees_production_constraint_boundary(self):
         events = []

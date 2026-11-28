@@ -259,9 +259,10 @@ class TestSynthIDEngine(CustomTestCase):
         original = logits.clone()
 
         sample = engine.bind_sample(forward_batch)
-        step = sample.apply(logits, keep_logits=True)
+        self.assertIsNone(sample.fused_sample(logits, keep_logits=True))
+        logprob_logits = sample.apply(logits, keep_logits=True)
 
-        torch.testing.assert_close(step.logprob_logits, original, rtol=0, atol=0)
+        torch.testing.assert_close(logprob_logits, original, rtol=0, atol=0)
         torch.testing.assert_close(logits[[1, 3]], original[[1, 3]], rtol=0, atol=0)
         expected = original[[0, 2]].clone()
         twin.state.seed(torch.tensor([4]), [[3, 5]])
@@ -275,8 +276,7 @@ class TestSynthIDEngine(CustomTestCase):
         # Row 0's request top-k ran before the tournament.
         self.assertEqual(int(torch.isfinite(logits[0]).sum()), 3)
 
-        self.assertEqual(step.sampling_info.top_ps.tolist(), [1.0, 0.5, 1.0, 1.0])
-        self.assertTrue(step.sampling_info.facts.need_top_p)
+        self.assertEqual(sample.request_filtered_rows.tolist(), [0, 2])
         self.assertAlmostEqual(info.top_ps[0].item(), 0.9, places=6)
 
         sample.commit(torch.tensor([7, 8, 9, 10]))
@@ -297,7 +297,7 @@ class TestSynthIDEngine(CustomTestCase):
         original = logits.clone()
 
         verify = engine.bind_verify(rows, full_mask=True)
-        verified, _ = verify.apply(
+        verified = verify.apply(
             logits,
             sampling_info=info,
             req_pool_indices=req_pool_indices,
