@@ -916,6 +916,86 @@ async fn full_only_prefix_complete_fast_path_matches_reference() {
 
 // --- component-aware placement & prefix -------------------------------------
 
+#[tokio::test]
+async fn full_only_pool_prefix_matches_reference_after_updates() {
+    let (fast, reference) = shared_state_pair();
+    let spec = WorkerCacheSpec {
+        version: 1,
+        components: COMPONENT_FULL,
+        full_tier_mask: (1 << hbm()) | (1 << dram()),
+        ..Default::default()
+    };
+    let member = |id: &str, pool: &str, spec| ApplyExternalKvBatchRequest {
+        worker_id: id.into(),
+        worker_address: format!("http://{id}:30000"),
+        dram_pool_id: pool.into(),
+        cache_spec: Some(spec),
+        ..Default::default()
+    };
+    let both = member("both", "pool", spec);
+    let dram_only = member(
+        "dram",
+        "pool",
+        WorkerCacheSpec {
+            full_tier_mask: 1 << dram(),
+            ..spec
+        },
+    );
+    for request in [&both, &dram_only] {
+        fast.apply_external_kv_batch(request.clone()).await.unwrap();
+    }
+    let pool = ApplyExternalKvBatchRequest {
+        dram_pool_id: "pool".into(),
+        ..Default::default()
+    };
+    let private = member("both", "", spec);
+    let other_pool = member("both", "other", spec);
+    let report = |tier| component_report(tier, &[1, 2, 3], &[COMPONENT_FULL; 3], &[16; 3]);
+    let clear = |tier| action(ExternalKvActionType::ActionClearAllAtTier, tier, &[]);
+    // HBM fills a shared DRAM gap only for members whose spec permits it.
+    let hbm_gap = component_report_with_parent(hbm(), Some(1), &[2], &[COMPONENT_FULL], &[16]);
+    for (owner, update, expected) in [
+        (&pool, report(dram()), vec![("both", 3), ("dram", 3)]),
+        (&both, hbm_gap.clone(), vec![("both", 3), ("dram", 3)]),
+        (&dram_only, hbm_gap, vec![("both", 3), ("dram", 3)]),
+        (
+            &pool,
+            action(ExternalKvActionType::ActionRevoke, dram(), &[2]),
+            vec![("both", 3), ("dram", 1)],
+        ),
+        (&both, clear(hbm()), vec![("both", 1), ("dram", 1)]),
+        (&pool, report(dram()), vec![("both", 3), ("dram", 3)]),
+        (&pool, clear(dram()), vec![]),
+        (&both, report(hbm()), vec![("both", 3)]),
+        (&both, clear(hbm()), vec![]),
+        (&private, report(dram()), vec![("both", 3)]),
+        (&both, clear(hbm()), vec![]),
+        (&pool, report(dram()), vec![("both", 3), ("dram", 3)]),
+        (&other_pool, clear(hbm()), vec![("dram", 3)]),
+    ] {
+        let mut request = owner.clone();
+        request.actions = vec![update];
+        fast.apply_external_kv_batch(request).await.unwrap();
+        let actual = fast
+            .match_external_kv_prefix(prefix_req(&[1, 2, 3]))
+            .await
+            .unwrap();
+        let oracle = reference
+            .match_external_kv_prefix(prefix_req(&[1, 2, 3]))
+            .await
+            .unwrap();
+        assert_eq!(actual.matches, oracle.matches);
+        assert_eq!(actual.best_prefix_blocks, oracle.best_prefix_blocks);
+        assert_eq!(
+            prefix_pairs(&actual),
+            expected
+                .into_iter()
+                .map(|(id, n)| (id.into(), n))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 /// A hybrid-SWA spec: full servable from HBM+DRAM, swa a 100-token trailing
 /// window servable from HBM.
 fn swa_spec() -> WorkerCacheSpec {

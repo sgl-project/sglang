@@ -19,6 +19,7 @@ name = "kv-indexer-bridge"
 path = "src/bin/kv-indexer-bridge.rs"
 
 [dependencies]
+ahash = "0.8"
 bytes = "1"
 prost = "0.14"
 rmpv = "1.3.1"
