@@ -1280,6 +1280,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 self._encoding_adapter is not None
                 and self._encoding_adapter.renders_response_format
             ),
+            preferred_sampling_params=self.tokenizer_manager.preferred_sampling_params,
         )
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
