@@ -17,13 +17,17 @@ from unittest.mock import Mock, call, patch
 import prometheus_client
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
+    _DEVICE_TIMER_FIFO_MAX_AGE_S,
+    _DEVICE_TIMER_FIFO_MAXLEN,
     PrefillStats,
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
@@ -32,6 +36,7 @@ from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.forward_pass_metrics import (
     ForwardPassMetrics,
     FpmTiming,
@@ -360,10 +365,12 @@ class _FakeReq:
         self,
         prompt_len: int,
         output_len: int = 0,
+        multimodal_inputs=None,
     ):
         self.origin_input_ids = list(range(prompt_len))
         self.output_ids = list(range(output_len))
         self.seqlen = prompt_len + output_len
+        self.multimodal_inputs = multimodal_inputs
 
 
 class _FakeForwardMode:
@@ -1527,6 +1534,11 @@ class TestEstimatedPrefillPerf(CustomTestCase):
         self.reporter._prefill_attn_act_read_per_token = 0.0
         self.reporter._kv_cache_bytes_per_token = 0.0
         self.reporter._ffn_act_bytes_per_token = 0.0
+        self.reporter._vit_linear_flops_per_patch = 0.0
+        self.reporter._vit_attn_dot_flops_coeff = 0.0
+        self.reporter._vit_weight_read_bytes_once = 0.0
+        self.reporter._audio_encoder_flops_per_item = 0.0
+        self.reporter._audio_encoder_weight_read_bytes_once = 0.0
 
     def _pair_count(self, extend_lens, prefix_lens):
         batch = types.SimpleNamespace(extend_lens=extend_lens, prefix_lens=prefix_lens)
@@ -1554,6 +1566,1626 @@ class TestEstimatedPrefillPerf(CustomTestCase):
             self._pair_count([8, 1, 1], [0, 100, 200]),
             8 * 9 / 2 + (100 + 1) + (200 + 1),
         )
+
+    def test_weight_bytes_are_charged_once_per_chunk_not_per_token(self):
+        # Weights are read from HBM once per forward pass and reused across
+        # every row of the batched GEMM -- a 100-token chunk must not read
+        # 100x the weight bytes of a 1-token chunk.
+        self.reporter._weight_read_bytes_per_token = 500.0
+        _, read_bytes_small, _ = self.reporter._estimate_prefill_perf(
+            types.SimpleNamespace(extend_lens=[1], prefix_lens=[0])
+        )
+        _, read_bytes_large, _ = self.reporter._estimate_prefill_perf(
+            types.SimpleNamespace(extend_lens=[100], prefix_lens=[0])
+        )
+        self.assertEqual(read_bytes_small, 500.0)
+        self.assertEqual(read_bytes_large, 500.0)
+
+
+class TestEstimatedPrefillPerfMultimodal(CustomTestCase):
+    """Vision/audio encoder terms added to _estimate_prefill_perf (SGLANGT-2104)."""
+
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+        self.reporter._linear_flops_per_token = 0.0
+        self.reporter._attn_dot_flops_coeff = 0.0
+        self.reporter._weight_read_bytes_per_token = 0.0
+        self.reporter._qkv_act_bytes_per_token = 0.0
+        self.reporter._prefill_attn_act_read_per_token = 0.0
+        self.reporter._kv_cache_bytes_per_token = 0.0
+        self.reporter._ffn_act_bytes_per_token = 0.0
+        self.reporter._vit_linear_flops_per_patch = 0.0
+        self.reporter._vit_attn_dot_flops_coeff = 0.0
+        self.reporter._vit_weight_read_bytes_once = 0.0
+        self.reporter._audio_encoder_flops_per_item = 0.0
+        self.reporter._audio_encoder_weight_read_bytes_once = 0.0
+
+    def _image_item(self, grid_thw, offsets=None):
+        item = MultimodalDataItem(modality=Modality.IMAGE)
+        item.image_grid_thw = grid_thw
+        item.offsets = offsets
+        return item
+
+    def _video_item(self, grid_thw, offsets=None):
+        item = MultimodalDataItem(modality=Modality.VIDEO)
+        item.video_grid_thw = grid_thw
+        item.offsets = offsets
+        return item
+
+    def _audio_item(self, offsets=None):
+        item = MultimodalDataItem(modality=Modality.AUDIO)
+        item.offsets = offsets
+        return item
+
+    def test_vision_attention_pairs_summed_per_image_not_per_batch_total(self):
+        self.reporter._vit_attn_dot_flops_coeff = 1.0
+        items = [self._image_item([[1, 4, 4]]), self._image_item([[1, 8, 8]])]
+        req = _FakeReq(100, multimodal_inputs=MultimodalInputs(mm_items=items))
+        batch = types.SimpleNamespace(
+            extend_lens=[100], prefix_lens=[0], reqs=[req]
+        )
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        # Not (16 + 64) ** 2 -- each image's pairs are summed independently.
+        self.assertEqual(flops, (4 * 4) ** 2 + (8 * 8) ** 2)
+
+    def test_video_multiframe_attention_pairs_use_per_frame_not_whole_clip(self):
+        self.reporter._vit_attn_dot_flops_coeff = 1.0
+        item = self._video_item([[3, 4, 4]])
+        req = _FakeReq(100, multimodal_inputs=MultimodalInputs(mm_items=[item]))
+        batch = types.SimpleNamespace(
+            extend_lens=[100], prefix_lens=[0], reqs=[req]
+        )
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        # Not (3 * 4 * 4) ** 2 -- frames don't attend to each other.
+        self.assertEqual(flops, 3 * (4 * 4) ** 2)
+
+    def test_audio_item_count_multiplies_fixed_per_item_constant(self):
+        self.reporter._audio_encoder_flops_per_item = 5.0
+        reqs = [
+            _FakeReq(1, multimodal_inputs=MultimodalInputs(mm_items=[self._audio_item()]))
+            for _ in range(3)
+        ]
+        batch = types.SimpleNamespace(
+            extend_lens=[1, 1, 1], prefix_lens=[0, 0, 0], reqs=reqs
+        )
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        self.assertEqual(flops, 15.0)
+
+    def test_chunked_prefill_charges_vision_item_only_in_its_starting_chunk(self):
+        self.reporter._vit_linear_flops_per_patch = 1.0
+        item = self._image_item([[1, 4, 4]], offsets=[(2, 9)])
+        req = _FakeReq(60, multimodal_inputs=MultimodalInputs(mm_items=[item]))
+
+        # Chunk 1 covers tokens [0, 10): the item's offset (2) starts here.
+        chunk1 = types.SimpleNamespace(extend_lens=[10], prefix_lens=[0], reqs=[req])
+        flops1, _, _ = self.reporter._estimate_prefill_perf(chunk1)
+        self.assertEqual(flops1, 1.0 * 4 * 4)
+
+        # Chunk 2 covers tokens [10, 60): req.multimodal_inputs is unchanged
+        # (same mm_items list), but the item's offset falls outside this
+        # chunk's window, so it must not be recharged.
+        chunk2 = types.SimpleNamespace(extend_lens=[50], prefix_lens=[10], reqs=[req])
+        flops2, _, _ = self.reporter._estimate_prefill_perf(chunk2)
+        self.assertEqual(flops2, 0.0)
+
+    def test_mixed_batch_some_reqs_multimodal_some_not(self):
+        self.reporter._vit_linear_flops_per_patch = 1.0
+        text_req = _FakeReq(50)
+        mm_req = _FakeReq(
+            50,
+            multimodal_inputs=MultimodalInputs(
+                mm_items=[self._image_item([[1, 2, 2]])]
+            ),
+        )
+        batch = types.SimpleNamespace(
+            extend_lens=[50, 50], prefix_lens=[0, 0], reqs=[text_req, mm_req]
+        )
+        flops, _, _ = self.reporter._estimate_prefill_perf(batch)
+        self.assertEqual(flops, 1.0 * 2 * 2)
+
+    def test_vision_weight_read_bytes_charged_once_regardless_of_image_count(self):
+        self.reporter._vit_weight_read_bytes_once = 1000.0
+        items = [self._image_item([[1, 2, 2]]), self._image_item([[1, 3, 3]])]
+        req = _FakeReq(50, multimodal_inputs=MultimodalInputs(mm_items=items))
+        batch = types.SimpleNamespace(extend_lens=[50], prefix_lens=[0], reqs=[req])
+        _, read_bytes, _ = self.reporter._estimate_prefill_perf(batch)
+        self.assertEqual(read_bytes, 1000.0)
+
+
+class TestEstimatedDecodePerf(CustomTestCase):
+    """``est. decode TFLOPS/s`` and read/write BW: see _estimate_decode_perf."""
+
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+        self.reporter._linear_flops_per_token = 0.0
+        self.reporter._attn_dot_flops_coeff = 0.0
+        self.reporter._weight_read_bytes_per_token = 0.0
+        self.reporter._qkv_act_bytes_per_token = 0.0
+        self.reporter._decode_q_read_bytes_per_token = 0.0
+        self.reporter._kv_cache_bytes_per_token = 0.0
+        self.reporter._ffn_act_bytes_per_token = 0.0
+
+    def _batch(self, seq_lens):
+        return types.SimpleNamespace(
+            seq_lens_cpu=None,
+            reqs=[_FakeReq(prompt_len=sl) for sl in seq_lens],
+        )
+
+    def test_weight_bytes_are_charged_once_per_step_not_per_batch_size(self):
+        # A batched decode step reads each weight matrix from HBM once and
+        # reuses it across every sequence's single-token GEMM row. Charging
+        # it per token/sequence would claim a 32-wide batch independently
+        # re-reads the whole model 32 times, which real GPU kernels don't do.
+        self.reporter._weight_read_bytes_per_token = 1000.0
+        _, read_bytes_bs1, _ = self.reporter._estimate_decode_perf(
+            self._batch([10]), num_tokens=1
+        )
+        _, read_bytes_bs32, _ = self.reporter._estimate_decode_perf(
+            self._batch([10] * 32), num_tokens=32
+        )
+        self.assertEqual(read_bytes_bs1, 1000.0)
+        self.assertEqual(read_bytes_bs32, 1000.0)
+
+    def test_kv_cache_bytes_still_scale_with_total_context(self):
+        # Unlike weights, KV-cache data is per-sequence and must still scale
+        # with the total context read across the batch.
+        self.reporter._kv_cache_bytes_per_token = 2.0
+        _, read_bytes, _ = self.reporter._estimate_decode_perf(
+            self._batch([10, 20]), num_tokens=2
+        )
+        self.assertEqual(read_bytes, 2.0 * 30)
+
+    def test_decode_perf_unaffected_by_vision_or_audio_encoder_constants(self):
+        # Vision/audio encoder towers only run once per request during
+        # prefill/extend; decode must not reference these constants at all.
+        self.reporter._vit_linear_flops_per_patch = 1e9
+        self.reporter._vit_attn_dot_flops_coeff = 1e9
+        self.reporter._vit_weight_read_bytes_once = 1e9
+        self.reporter._audio_encoder_flops_per_item = 1e9
+        self.reporter._audio_encoder_weight_read_bytes_once = 1e9
+        flops, read_bytes, write_bytes = self.reporter._estimate_decode_perf(
+            self._batch([10]), num_tokens=1
+        )
+        self.assertEqual((flops, read_bytes, write_bytes), (0.0, 0.0, 0.0))
+
+
+def _fake_model_config(
+    *,
+    hidden_size=4096,
+    num_attention_layers=8,
+    head_dim=128,
+    num_attn_heads=32,
+    num_kv_heads=8,
+    attention_arch=None,
+    dtype_itemsize=2,
+    hf_text_config_overrides=None,
+    **model_config_overrides,
+):
+    """Minimal model_config stand-in for _init_estimated_perf_constants()."""
+    hf_text_config_kwargs = {"intermediate_size": 14336}
+    hf_text_config_kwargs.update(hf_text_config_overrides or {})
+    hf_text_config = types.SimpleNamespace(**hf_text_config_kwargs)
+    config = types.SimpleNamespace(
+        hf_text_config=hf_text_config,
+        hidden_size=hidden_size,
+        num_attention_layers=num_attention_layers,
+        head_dim=head_dim,
+        attention_arch=attention_arch,
+        dtype=types.SimpleNamespace(itemsize=dtype_itemsize),
+        get_num_attention_heads=lambda tp_size: num_attn_heads,
+        get_num_kv_heads=lambda tp_size: num_kv_heads,
+    )
+    for key, value in model_config_overrides.items():
+        setattr(config, key, value)
+    return config
+
+
+class TestEstimatedPerfConstants(CustomTestCase):
+    """Covers _init_estimated_perf_constants()'s MLA/MoE-aware FLOPs and bytes."""
+
+    def setUp(self):
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+
+    def _init(self, model_config):
+        self.scheduler.model_config = model_config
+        self.reporter._init_estimated_perf_constants()
+
+    def test_dense_gqa_matches_generic_formula(self):
+        # Regression guard for the non-MLA/non-MoE path, which must still
+        # reduce to the original dense/GQA formula after the MLA/MoE refactor.
+        hidden, head_dim, heads, kv_heads, layers = 4096, 128, 32, 8, 8
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=layers,
+            )
+        )
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+        self.assertEqual(
+            self.reporter._attn_dot_flops_coeff, 4.0 * heads * head_dim * layers
+        )
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token,
+            2.0 * kv_heads * head_dim * layers * 2.0,
+        )
+
+    def test_mla_uses_low_rank_shapes_not_generic_gqa(self):
+        hidden, heads, layers = 2048, 16, 4
+        kv_lora_rank, qk_rope, qk_nope, v_head_dim = 64.0, 32.0, 96.0, 96.0
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attn_heads=heads,
+                num_attention_layers=layers,
+                attention_arch=AttentionArch.MLA,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope,
+                qk_nope_head_dim=qk_nope,
+                v_head_dim=v_head_dim,
+                hf_text_config_overrides={"q_lora_rank": 0, "intermediate_size": 10944},
+            )
+        )
+        qk_head_dim = qk_nope + qk_rope
+        q_proj_flops = 2.0 * hidden * heads * qk_head_dim
+        kv_a_dim = kv_lora_rank + qk_rope
+        kv_a_proj_flops = 2.0 * hidden * kv_a_dim
+        kv_b_out_dim = heads * (qk_nope + v_head_dim)
+        kv_b_proj_flops = 2.0 * kv_lora_rank * kv_b_out_dim
+        o_proj_flops = 2.0 * heads * v_head_dim * hidden
+        attn_linear_flops = (
+            q_proj_flops + kv_a_proj_flops + kv_b_proj_flops + o_proj_flops
+        )
+        attn_dot_flops_per_layer = 2.0 * heads * (qk_head_dim + v_head_dim)
+        mlp_flops = 6.0 * hidden * 10944
+
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+        self.assertEqual(
+            self.reporter._attn_dot_flops_coeff, attn_dot_flops_per_layer * layers
+        )
+        # The defining MLA property: KV cache holds one shared latent per
+        # token per layer (kv_a_dim), not num_kv_heads * head_dim.
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token, kv_a_dim * layers * 2.0
+        )
+
+    def test_mla_with_q_lora_rank_compresses_query_projection(self):
+        hidden, heads, layers = 2048, 16, 4
+        q_lora_rank = 384.0
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attn_heads=heads,
+                num_attention_layers=layers,
+                attention_arch=AttentionArch.MLA,
+                kv_lora_rank=64.0,
+                qk_rope_head_dim=32.0,
+                qk_nope_head_dim=96.0,
+                v_head_dim=96.0,
+                hf_text_config_overrides={
+                    "q_lora_rank": q_lora_rank,
+                    "intermediate_size": 10944,
+                },
+            )
+        )
+        qk_head_dim = 96.0 + 32.0
+        compressed_q_proj_flops = 2.0 * hidden * q_lora_rank + 2.0 * q_lora_rank * (
+            heads * qk_head_dim
+        )
+        uncompressed_q_proj_flops = 2.0 * hidden * heads * qk_head_dim
+        # Low-rank Q compression must actually reduce projection FLOPs for a
+        # realistic rank choice, not just change which branch runs.
+        self.assertLess(compressed_q_proj_flops, uncompressed_q_proj_flops)
+
+    def test_moe_with_explicit_moe_intermediate_size_scales_by_active_experts(self):
+        hidden, layers = 4096, 4
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attention_layers=layers,
+                hf_text_config_overrides={
+                    "intermediate_size": 18432,
+                    "moe_intermediate_size": 1408,
+                    "num_experts_per_tok": 6,
+                    "n_shared_experts": 2,
+                },
+            )
+        )
+        head_dim, heads, kv_heads = 128, 32, 8
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        active_expert_units = 6 + 2
+        mlp_flops = 6.0 * hidden * 1408 * active_expert_units
+        single_expert_mlp_flops = 6.0 * hidden * 1408
+        # The MLP cost must scale by all active expert units (routed + shared),
+        # not just treat moe_intermediate_size as a single expert's cost.
+        self.assertGreater(mlp_flops, single_expert_mlp_flops)
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+
+    def test_moe_without_moe_intermediate_size_falls_back_to_per_expert_size(self):
+        # OLMoE/Mixtral-style configs: no dense layers at all, so there is no
+        # separate moe_intermediate_size -- intermediate_size IS the per-expert
+        # FFN size. Detected via num_experts (also covers num_local_experts /
+        # n_routed_experts).
+        hidden, layers = 2048, 16
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attention_layers=layers,
+                hf_text_config_overrides={
+                    "intermediate_size": 1024,
+                    "num_experts_per_tok": 8,
+                    "num_experts": 64,
+                },
+            )
+        )
+        head_dim, heads, kv_heads = 128, 32, 8
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        active_expert_units = 8
+        mlp_flops = 6.0 * hidden * 1024 * active_expert_units
+        single_expert_mlp_flops = 6.0 * hidden * 1024
+        # Must scale by all 8 active experts, not silently charge for just one
+        # (the bug: falling through to the dense branch with no multiplier).
+        wrong_total = attn_linear_flops * layers + single_expert_mlp_flops * layers
+        self.assertNotEqual(self.reporter._linear_flops_per_token, wrong_total)
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+
+    def test_pure_ssm_has_zero_attention_and_mlp_layers(self):
+        # falcon-mamba-7b(-instruct) et al: every layer is a Mamba mixer, not a
+        # GQA/MLA attention layer and not a dense/MoE FFN layer. Before this
+        # fix, num_attn_layers wrongly fell back to num_layers (the fallback
+        # only has a hybrid-SWA full_attention_layer_ids path, which is never
+        # populated for pure SSM configs), so every Mamba layer was charged
+        # fake attention-linear FLOPs and fake KV-cache bytes on top of the
+        # already-fixed fake MLP cost.
+        self._init(
+            _fake_model_config(
+                hidden_size=4096,
+                num_attention_layers=64,
+                attention_arch=AttentionArch.SSM,
+                hf_text_config_overrides={"intermediate_size": 8192},
+            )
+        )
+        self.assertEqual(self.reporter._linear_flops_per_token, 0.0)
+        self.assertEqual(self.reporter._attn_dot_flops_coeff, 0.0)
+        self.assertEqual(self.reporter._kv_cache_bytes_per_token, 0.0)
+        self.assertEqual(self.reporter._weight_read_bytes_per_token, 0.0)
+
+    def test_moe_ffn_act_bytes_scale_by_active_experts_not_dense_intermediate_size(
+        self,
+    ):
+        # _ffn_act_bytes_per_token must track the same per-token FFN size as
+        # mlp_flops/mlp_weight_elems_per_layer (moe_intermediate_size *
+        # active_expert_units), not the stale dense intermediate_size left
+        # over from before the MoE branch existed.
+        hidden, layers = 4096, 4
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attention_layers=layers,
+                dtype_itemsize=2,
+                hf_text_config_overrides={
+                    "intermediate_size": 18432,
+                    "moe_intermediate_size": 1408,
+                    "num_experts_per_tok": 6,
+                    "n_shared_experts": 2,
+                },
+            )
+        )
+        active_expert_units = 6 + 2
+        expected = 3.0 * (1408 * active_expert_units) * 2.0 * layers
+        wrong_dense_based = 3.0 * 18432 * 2.0 * layers
+        self.assertNotEqual(self.reporter._ffn_act_bytes_per_token, wrong_dense_based)
+        self.assertAlmostEqual(self.reporter._ffn_act_bytes_per_token, expected)
+
+    def test_mla_v_head_dim_equal_to_head_dim_is_not_treated_as_unset(self):
+        # v_head_dim is a real, explicitly-configured field here that happens
+        # to equal head_dim -- using "!= head_dim" as an unset-sentinel must
+        # not discard it in favor of the hidden_size/num_attn_heads guess.
+        hidden, heads, layers, head_dim = 2048, 16, 4, 128.0
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_attention_layers=layers,
+                attention_arch=AttentionArch.MLA,
+                kv_lora_rank=64.0,
+                qk_rope_head_dim=32.0,
+                qk_nope_head_dim=96.0,
+                v_head_dim=head_dim,
+                hf_text_config_overrides={"q_lora_rank": 0, "intermediate_size": 10944},
+            )
+        )
+        qk_head_dim = 96.0 + 32.0
+        kv_b_out_dim = heads * (96.0 + head_dim)
+        kv_b_proj_flops = 2.0 * 64.0 * kv_b_out_dim
+        o_proj_flops = 2.0 * heads * head_dim * hidden
+        q_proj_flops = 2.0 * hidden * heads * qk_head_dim
+        kv_a_proj_flops = 2.0 * hidden * (64.0 + 32.0)
+        attn_linear_flops = (
+            q_proj_flops + kv_a_proj_flops + kv_b_proj_flops + o_proj_flops
+        )
+        mlp_flops = 6.0 * hidden * 10944
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+
+    def test_num_experts_per_tok_alone_does_not_trigger_moe_without_expert_count(self):
+        # num_experts_per_tok present but no num_experts/num_local_experts/
+        # n_routed_experts field at all: must NOT guess intermediate_size is
+        # per-expert -- falls through to the plain dense formula untouched.
+        hidden, layers = 2048, 4
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                num_attention_layers=layers,
+                hf_text_config_overrides={
+                    "intermediate_size": 4096,
+                    "num_experts_per_tok": 8,
+                },
+            )
+        )
+        head_dim, heads, kv_heads = 128, 32, 8
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        dense_mlp_flops = 6.0 * hidden * 4096
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + dense_mlp_flops * layers,
+        )
+
+    def test_hybrid_layers_block_type_scales_kv_cache_by_attention_layers_only(self):
+        # Mamba/SSM layers carry a fixed-size recurrent state, not a growing
+        # per-token KV cache -- kv_cache_bytes_per_token must scale by the
+        # attention-layer count parsed from layers_block_type, never the
+        # unrelated num_attention_layers field (999, deliberately wrong here).
+        #
+        # layers_block_type is a real Python list on every HF config that
+        # defines it (NemotronH, Jamba, Zamba, Bamba, FalconH1, ...), never a
+        # comma-joined string -- use a list here so this test exercises the
+        # same type the production code actually sees.
+        head_dim, kv_heads = 128.0, 8.0
+        self._init(
+            _fake_model_config(
+                head_dim=head_dim,
+                num_kv_heads=kv_heads,
+                num_attention_layers=999,
+                hf_text_config_overrides={
+                    "layers_block_type": [
+                        "attention",
+                        "mamba",
+                        "mlp",
+                        "attention",
+                        "mamba",
+                        "mlp",
+                        "mamba",
+                    ],
+                    "intermediate_size": 4096,
+                },
+            )
+        )
+        num_attn_layers = 2.0  # "attention" appears twice in layers_block_type
+        expected_kv_cache_bytes = 2.0 * kv_heads * head_dim * num_attn_layers * 2.0
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token, expected_kv_cache_bytes
+        )
+
+    def test_nemotronh_style_dedicated_mlp_layers_are_not_treated_as_moe(self):
+        # Regression for RedHatAI/NVIDIA-Nemotron-Nano-9B-v2-FP8-dynamic:
+        # NemotronHConfig's constructor defaults num_experts_per_tok=2 and
+        # moe_intermediate_size=7688 regardless of whether a given checkpoint
+        # ever sets them -- this checkpoint's own config.json has neither
+        # field, and its real weights (model.safetensors.index.json) carry
+        # plain up_proj/down_proj per "mlp" layer, no expert-routed tensors
+        # anywhere. layers_block_type is the authoritative, per-checkpoint
+        # signal here: it lists "mlp" (dedicated dense FFN) layers but never
+        # "moe", so the MoE-shaped hf_text_config fields (stale class
+        # defaults, not this checkpoint's reality) must not override it.
+        hidden, head_dim, heads, kv_heads = 4480, 128.0, 40, 8
+        layers_block_type = [
+            "mamba", "mlp", "mamba", "mlp", "attention", "mlp", "mamba",
+        ]
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=999,
+                hf_config=types.SimpleNamespace(
+                    architectures=["NemotronHForCausalLM"]
+                ),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "intermediate_size": 15680,
+                    # Stale class-level MoE defaults this checkpoint never set.
+                    "moe_intermediate_size": 7688,
+                    "num_experts_per_tok": 2,
+                    "n_shared_experts": 1,
+                },
+            )
+        )
+        num_attn_layers = 1.0  # one "attention" label
+        num_mlp_layers = 3.0  # three "mlp" labels, zero "moe"
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        # NemotronHForCausalLM is in _NON_GATED_MLP_ARCHITECTURES (relu2,
+        # plain up_proj/down_proj) -- dense non-gated 4x multiplier, not the
+        # MoE path's 6x-gated-and-scaled-by-active-experts formula.
+        dense_mlp_flops = 4.0 * hidden * 15680
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * num_attn_layers + dense_mlp_flops * num_mlp_layers,
+        )
+
+    def test_qwen3_5_style_dense_sibling_is_not_treated_as_moe(self):
+        # Regression for Qwen/Qwen3.5-9B: its Qwen3_5TextConfig extends
+        # Qwen3NextConfig, which hardcodes num_experts_per_tok=10,
+        # moe_intermediate_size=512, and num_experts=512 unconditionally.
+        # The real Qwen3.5-9B checkpoint's config.json sets none of these
+        # (unlike its genuine MoE sibling Qwen3.5-35B-A3B, whose own
+        # config.json explicitly sets num_experts_per_tok=8/num_experts=256
+        # and whose architecture is Qwen3_5MoeForConditionalGeneration, not
+        # Qwen3_5ForConditionalGeneration). layers_block_type can't help
+        # here -- Qwen3Next's "full_attention"/"linear_attention" vocabulary
+        # carries no mamba/mlp/moe-dedication signal at all -- so this must
+        # be keyed off the dense sibling's architecture name directly.
+        hidden, head_dim, heads, kv_heads = 4096, 256.0, 16, 4
+        layers_block_type = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+        full_attention_layer_ids = [3]
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=len(layers_block_type),
+                hf_config=types.SimpleNamespace(
+                    architectures=["Qwen3_5ForConditionalGeneration"]
+                ),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "full_attention_layer_ids": full_attention_layer_ids,
+                    "intermediate_size": 12288,
+                    # Stale class-level MoE defaults this checkpoint never set.
+                    "moe_intermediate_size": 512,
+                    "num_experts_per_tok": 10,
+                    "num_experts": 512,
+                },
+            )
+        )
+        num_attn_layers = 1.0  # one "full_attention" label
+        num_mlp_layers = 4.0  # every layer builds its own FFN (bundled convention)
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        # Qwen3_5ForConditionalGeneration is not in _NON_GATED_MLP_ARCHITECTURES
+        # (standard SiLU-gated FFN) -- dense gated 6x multiplier, not the MoE
+        # path's num_experts_per_tok-scaled formula.
+        dense_mlp_flops = 6.0 * hidden * 12288
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * num_attn_layers + dense_mlp_flops * num_mlp_layers,
+        )
+
+    def test_falcon_h1_style_uniform_hybrid_label_counts_every_layer(self):
+        # FalconH1Config.layers_block_type is a property that returns
+        # ["hybrid"] * num_hidden_layers -- every layer, never "attention",
+        # "mlp", or "moe". Each FalconH1DecoderLayer actually contains its own
+        # self.self_attn, self.mamba, AND self.feed_forward all at once, so
+        # every layer genuinely pays both the attention and the MLP cost.
+        # The regression this guards: naively counting literal "attention"/
+        # "mlp"/"moe" labels gives num_attn_layers=0 AND num_mlp_layers=0 for
+        # this convention, zeroing every FLOPs/bandwidth estimate.
+        hidden, head_dim, heads, kv_heads, layers = 4096, 128, 32, 8, 6
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=layers,
+                hf_text_config_overrides={
+                    "layers_block_type": ["hybrid"] * layers,
+                    "intermediate_size": 14336,
+                },
+            )
+        )
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        # Must match the plain dense/GQA formula over every layer -- not zero.
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+        self.assertGreater(self.reporter._linear_flops_per_token, 0.0)
+        self.assertEqual(
+            self.reporter._attn_dot_flops_coeff, 4.0 * heads * head_dim * layers
+        )
+        self.assertGreater(self.reporter._kv_cache_bytes_per_token, 0.0)
+
+    def test_qwen3_next_style_mixer_only_labels_keep_full_mlp_layer_count(self):
+        # Qwen3-Next/Qwen3.5/GigaChat3.5/BailingHybrid's own layers_block_type
+        # labels only the *mixer* ("attention" vs "linear_attention"); every
+        # layer still builds its own FFN unconditionally, and these configs
+        # expose a separate full_attention_layer_ids property for the real
+        # full-attention layer indices. This vocabulary is NOT a subset of
+        # NemotronH's exclusive {"mamba","attention","mlp","moe"} labels (it
+        # contains "linear_attention"), so counting "attention"/"mlp"/"moe"
+        # literally against it -- or treating every non-mamba/mlp/moe label
+        # as attention -- would either zero num_mlp_layers or overcount
+        # num_attn_layers by including linear_attention layers. Must fall
+        # back to full_attention_layer_ids for num_attn_layers and keep
+        # num_mlp_layers at the full layer count.
+        hidden, head_dim, heads, kv_heads = 4096, 128, 32, 8
+        layers_block_type = ["attention", "linear_attention"] * 5
+        full_attention_layer_ids = [
+            i for i, t in enumerate(layers_block_type) if t == "attention"
+        ]
+        total_layers = float(len(layers_block_type))
+        num_attn_layers = float(len(full_attention_layer_ids))
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=int(total_layers),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "full_attention_layer_ids": full_attention_layer_ids,
+                    "intermediate_size": 14336,
+                },
+            )
+        )
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * num_attn_layers + mlp_flops * total_layers,
+        )
+        self.assertGreater(self.reporter._ffn_act_bytes_per_token, 0.0)
+
+    def test_byte_estimates_scale_by_attention_and_mlp_layer_counts(self):
+        # The same attention/MLP layer-count split that FLOPs and KV-cache
+        # bytes use must also apply to the weight-read and activation byte
+        # estimates -- otherwise hybrid models keep the old per-total-layer
+        # overcount on these terms even after the FLOPs/KV-cache split is
+        # fixed (e.g. ~13x overcounted KV-cache bytes for a 52-layer/
+        # 4-attention NemotronH-style model if left unsplit).
+        hidden, head_dim, heads, kv_heads, intermediate = 4096, 128, 32, 8, 14336
+        layers_block_type = (
+            ["attention"] * 2 + ["mlp"] * 3 + ["moe"] * 2 + ["mamba"] * 3
+        )
+        num_attn_layers, num_mlp_layers = 2.0, 5.0
+        dtype_bytes = 2.0
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=len(layers_block_type),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "intermediate_size": intermediate,
+                },
+            )
+        )
+        expected_qkv_act = (
+            hidden * dtype_bytes * num_attn_layers
+            + (heads + 2.0 * kv_heads) * head_dim * dtype_bytes * num_attn_layers
+            + head_dim * heads * dtype_bytes * num_attn_layers
+            + hidden * dtype_bytes * num_attn_layers
+        )
+        expected_ffn_act = 3.0 * intermediate * dtype_bytes * num_mlp_layers
+        expected_prefill_attn_read = (
+            (heads + 2.0 * kv_heads) * head_dim * dtype_bytes * num_attn_layers
+        )
+        expected_decode_q_read = heads * head_dim * dtype_bytes * num_attn_layers
+
+        self.assertAlmostEqual(self.reporter._qkv_act_bytes_per_token, expected_qkv_act)
+        self.assertAlmostEqual(self.reporter._ffn_act_bytes_per_token, expected_ffn_act)
+        self.assertAlmostEqual(
+            self.reporter._prefill_attn_act_read_per_token, expected_prefill_attn_read
+        )
+        self.assertAlmostEqual(
+            self.reporter._decode_q_read_bytes_per_token, expected_decode_q_read
+        )
+
+        # Regression guard: the old unsplit total layer count (8) would
+        # overcount every one of these by 8 / num_attn_layers or
+        # 8 / num_mlp_layers.
+        stale_qkv_act = (
+            hidden * dtype_bytes * 8
+            + (heads + 2.0 * kv_heads) * head_dim * dtype_bytes * 8
+            + head_dim * heads * dtype_bytes * 8
+            + hidden * dtype_bytes * 8
+        )
+        self.assertLess(self.reporter._qkv_act_bytes_per_token, stale_qkv_act)
+
+    def test_jamba_style_attention_mamba_only_labels_still_charge_mlp_everywhere(self):
+        # Jamba/Bamba's layers_block_type only ever contains "attention" or
+        # "mamba" -- there is no separate "mlp"/"moe" label, because every
+        # layer (whichever mixer it uses) has its own attached MLP. Only the
+        # attention *mixer* count should shrink to the real "attention"
+        # entries; the MLP count must still cover every layer.
+        hidden, head_dim, heads, kv_heads = 4096, 128, 32, 8
+        layers_block_type = [
+            "attention",
+            "mamba",
+            "mamba",
+            "attention",
+            "mamba",
+            "mamba",
+            "mamba",
+            "attention",
+        ]
+        total_layers = float(len(layers_block_type))
+        num_attn_layers = 3.0  # "attention" appears 3 times
+        self._init(
+            _fake_model_config(
+                hidden_size=hidden,
+                head_dim=head_dim,
+                num_attn_heads=heads,
+                num_kv_heads=kv_heads,
+                num_attention_layers=int(total_layers),
+                hf_text_config_overrides={
+                    "layers_block_type": layers_block_type,
+                    "intermediate_size": 14336,
+                },
+            )
+        )
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        # The regression this guards against: num_mlp_layers silently forced
+        # to 0 because the vocabulary has no literal "mlp"/"moe" label.
+        wrong_zeroed_mlp = attn_linear_flops * num_attn_layers + mlp_flops * 0.0
+        expected = attn_linear_flops * num_attn_layers + mlp_flops * total_layers
+        self.assertNotEqual(self.reporter._linear_flops_per_token, wrong_zeroed_mlp)
+        self.assertEqual(self.reporter._linear_flops_per_token, expected)
+        # KV cache bandwidth only applies to the real attention-mixer layers.
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token,
+            2.0 * kv_heads * head_dim * num_attn_layers * 2.0,
+        )
+
+    def test_full_attention_layer_ids_read_from_model_config_when_present(self):
+        # sglang computes swa/full_attention_layer_ids in ModelConfig.__init__
+        # (via get_hybrid_layer_ids()) and stores them on model_config itself
+        # -- this is the real path for Gemma2/Gemma3/Llama4-style SWA hybrid
+        # models. No layers_block_type is involved for these.
+        head_dim, kv_heads = 128.0, 8.0
+        full_attention_layer_ids = [2, 5, 9, 12]
+        self._init(
+            _fake_model_config(
+                head_dim=head_dim,
+                num_kv_heads=kv_heads,
+                num_attention_layers=16,
+                full_attention_layer_ids=full_attention_layer_ids,
+            )
+        )
+        num_attn_layers = float(len(full_attention_layer_ids))
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token,
+            2.0 * kv_heads * head_dim * num_attn_layers * 2.0,
+        )
+
+    def test_full_attention_layer_ids_falls_back_to_hf_text_config(self):
+        # KimiLinear/KimiK3's own HF config class defines full_attention_layer_ids
+        # as a native field (read directly as self.config.full_attention_layer_ids
+        # in kimi_linear.py/kimi_k3.py) -- sglang's ModelConfig never computes or
+        # mirrors it for these architectures, so it only ever lives on
+        # hf_text_config. The regression this guards against: looking ONLY at
+        # hf_text_config (pre-fix) silently breaks SWA models that have it on
+        # model_config instead, or looking ONLY at model_config (an earlier
+        # draft of this fix) would silently break KimiLinear/KimiK3.
+        head_dim, kv_heads = 128.0, 8.0
+        full_attention_layer_ids = [0, 3, 6]
+        self._init(
+            _fake_model_config(
+                head_dim=head_dim,
+                num_kv_heads=kv_heads,
+                num_attention_layers=16,
+                hf_text_config_overrides={
+                    "full_attention_layer_ids": full_attention_layer_ids,
+                },
+            )
+        )
+        num_attn_layers = float(len(full_attention_layer_ids))
+        self.assertEqual(
+            self.reporter._kv_cache_bytes_per_token,
+            2.0 * kv_heads * head_dim * num_attn_layers * 2.0,
+        )
+
+    def test_logs_debug_when_hybrid_layer_split_cannot_be_determined(self):
+        # Debug, not warning: this fallback also fires for plain dense models
+        # (no layers_block_type/full_attention_layer_ids at all), where it's
+        # the correct behavior, not a degraded one -- see
+        # test_dense_gqa_matches_generic_formula, which uses this same
+        # no-hybrid-metadata fixture and asserts the resulting FLOPs are right.
+        with self.assertLogs(
+            "sglang.srt.managers.scheduler_components.metrics_reporter",
+            level="DEBUG",
+        ) as cm:
+            self._init(_fake_model_config(num_attention_layers=4))
+        self.assertTrue(
+            any("hybrid attention/MLP layer split" in msg for msg in cm.output)
+        )
+
+    def test_no_warning_when_full_attention_layer_ids_present(self):
+        with self.assertNoLogs(
+            "sglang.srt.managers.scheduler_components.metrics_reporter",
+            level="WARNING",
+        ):
+            self._init(
+                _fake_model_config(
+                    num_attention_layers=4, full_attention_layer_ids=[0, 2]
+                )
+            )
+
+    def test_mlp_flops_and_weight_bytes_shrink_with_tp_size(self):
+        # intermediate_size (the MLP/FFN dimension) is sharded under tensor
+        # parallelism the same way num_attention_heads/num_kv_heads already
+        # are -- a TP=4 run must see 1/4 the MLP FLOPs/bytes of TP=1, not the
+        # unsharded whole-model MLP cost.
+        def _constants_at(tp_size):
+            scheduler = types.SimpleNamespace()
+            scheduler.waiting_queue = []
+            scheduler.disaggregation_mode = DisaggregationMode.NULL
+            scheduler.model_config = _fake_model_config(
+                hidden_size=256,
+                num_attention_layers=2,
+                head_dim=0,  # zeroes the attention term, isolating MLP
+                hf_text_config_overrides={"intermediate_size": 1024},
+            )
+            reporter = _make_reporter(self, scheduler)
+            enter_scope(
+                self,
+                get_parallel().override(
+                    tp_size=tp_size,
+                    tp_rank=0,
+                    attn_tp_size=tp_size,
+                    attn_tp_rank=0,
+                    attn_cp_rank=0,
+                    moe_ep_rank=0,
+                    attn_dp_rank=0,
+                    dp_rank=0,
+                    moe_ep_size=1,
+                    moe_dp_size=1,
+                    moe_tp_size=tp_size,
+                ),
+            )
+            reporter._init_estimated_perf_constants()
+            return reporter
+
+        tp1 = _constants_at(1)
+        tp4 = _constants_at(4)
+        self.assertGreater(tp1._linear_flops_per_token, 0.0)
+        self.assertAlmostEqual(
+            tp1._linear_flops_per_token / 4.0, tp4._linear_flops_per_token
+        )
+        self.assertAlmostEqual(
+            tp1._weight_read_bytes_per_token / 4.0, tp4._weight_read_bytes_per_token
+        )
+
+    def test_moe_mlp_flops_shrink_with_moe_tp_size_not_tp_size(self):
+        def _moe_constants_at(tp_size, moe_ep_size, moe_tp_size):
+            scheduler = types.SimpleNamespace()
+            scheduler.waiting_queue = []
+            scheduler.disaggregation_mode = DisaggregationMode.NULL
+            scheduler.model_config = _fake_model_config(
+                hidden_size=256,
+                num_attention_layers=2,
+                head_dim=0,
+                hf_text_config_overrides={
+                    "intermediate_size": 18432,
+                    "moe_intermediate_size": 1024,
+                    "num_experts_per_tok": 8,
+                },
+            )
+            reporter = _make_reporter(self, scheduler)
+            with get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=0,
+                attn_tp_size=tp_size,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                attn_dp_rank=0,
+                dp_rank=0,
+                moe_ep_size=moe_ep_size,
+                moe_dp_size=1,
+                moe_tp_size=moe_tp_size,
+            ):
+                reporter._init_estimated_perf_constants()
+            return reporter
+
+        plain_tp1 = _moe_constants_at(tp_size=1, moe_ep_size=1, moe_tp_size=1)
+        plain_tp4 = _moe_constants_at(tp_size=4, moe_ep_size=1, moe_tp_size=4)
+        self.assertGreater(plain_tp1._linear_flops_per_token, 0.0)
+        self.assertAlmostEqual(
+            plain_tp1._linear_flops_per_token / 4.0,
+            plain_tp4._linear_flops_per_token,
+        )
+        self.assertAlmostEqual(
+            plain_tp1._weight_read_bytes_per_token / 4.0,
+            plain_tp4._weight_read_bytes_per_token,
+        )
+
+        ep_only = _moe_constants_at(tp_size=4, moe_ep_size=4, moe_tp_size=1)
+        self.assertAlmostEqual(
+            plain_tp1._linear_flops_per_token, ep_only._linear_flops_per_token
+        )
+        self.assertAlmostEqual(
+            plain_tp1._weight_read_bytes_per_token,
+            ep_only._weight_read_bytes_per_token,
+        )
+
+    def test_moe_fallback_per_expert_size_also_shards_by_moe_tp_size(self):
+        def _moe_fallback_constants_at(tp_size, moe_ep_size, moe_tp_size):
+            scheduler = types.SimpleNamespace()
+            scheduler.waiting_queue = []
+            scheduler.disaggregation_mode = DisaggregationMode.NULL
+            scheduler.model_config = _fake_model_config(
+                hidden_size=256,
+                num_attention_layers=2,
+                head_dim=0,
+                hf_text_config_overrides={
+                    "intermediate_size": 1024,
+                    "num_experts_per_tok": 8,
+                    "num_experts": 64,
+                },
+            )
+            reporter = _make_reporter(self, scheduler)
+            with get_parallel().override(
+                tp_size=tp_size,
+                tp_rank=0,
+                attn_tp_size=tp_size,
+                attn_tp_rank=0,
+                attn_cp_rank=0,
+                moe_ep_rank=0,
+                attn_dp_rank=0,
+                dp_rank=0,
+                moe_ep_size=moe_ep_size,
+                moe_dp_size=1,
+                moe_tp_size=moe_tp_size,
+            ):
+                reporter._init_estimated_perf_constants()
+            return reporter
+
+        tp1 = _moe_fallback_constants_at(tp_size=1, moe_ep_size=1, moe_tp_size=1)
+        ep_only = _moe_fallback_constants_at(tp_size=4, moe_ep_size=4, moe_tp_size=1)
+        self.assertGreater(tp1._linear_flops_per_token, 0.0)
+        self.assertAlmostEqual(
+            tp1._linear_flops_per_token, ep_only._linear_flops_per_token
+        )
+
+    def test_quant_bits_shrinks_weight_bytes_not_activation_bytes(self):
+        # Weight-only quantization (W4A16/W8A16-style) stores weights narrower
+        # than the activation dtype, so weight-read bytes must shrink by the
+        # bit-width-derived ratio -- but KV-cache/activation bytes, which stay
+        # at full precision for a weight-only scheme, must NOT shrink.
+        #
+        # Deliberately not using compressed-tensors' own published
+        # global_compression_ratio here: that field is a whole-model average
+        # blended across every parameter, including layers the quant config
+        # leaves unquantized (e.g. lm_head/embeddings), so it understates the
+        # savings on the matmul weights this estimator models -- e.g.
+        # RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8's real published
+        # config reports global_compression_ratio=1.24, not the 2.0x its
+        # 8-bit weights actually achieve.
+        baseline = _fake_model_config(
+            hidden_size=256, num_attention_layers=2, head_dim=0, dtype_itemsize=2
+        )
+        gptq_style = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            dtype_itemsize=2,
+            hf_quant_config={"bits": 4},
+        )
+        self._init(baseline)
+        baseline_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(gptq_style)
+        # 2 bytes (bf16) * 8 bits/byte / 4 bits = 4x compression ratio.
+        self.assertAlmostEqual(
+            baseline_weight_bytes / 4.0, self.reporter._weight_read_bytes_per_token
+        )
+
+    def test_compressed_tensors_nested_config_groups_bits(self):
+        # compressed-tensors configs nest bits per config group rather than
+        # publishing a flat top-level `bits` field -- confirmed against
+        # RedHatAI/Apertus-8B-Instruct-2509-FP8-dynamic and
+        # ibm-granite/granite-3.3-8b-instruct-FP8's real published configs.
+        baseline = _fake_model_config(
+            hidden_size=256, num_attention_layers=2, head_dim=0, dtype_itemsize=2
+        )
+        fp8_dynamic = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            dtype_itemsize=2,
+            hf_quant_config={
+                "config_groups": {"group_0": {"weights": {"num_bits": 8}}}
+            },
+        )
+        self._init(baseline)
+        baseline_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(fp8_dynamic)
+        # 2 bytes (bf16) * 8 bits/byte / 8 bits = 2x compression ratio.
+        self.assertAlmostEqual(
+            baseline_weight_bytes / 2.0, self.reporter._weight_read_bytes_per_token
+        )
+
+    def test_non_gated_mlp_uses_two_matrix_formula(self):
+        # Plain 2-matrix FFNs (GPT-2/GPT-BigCode/StarCoder2's c_fc+c_proj,
+        # Apertus's xIELU up_proj+down_proj with no gate_proj) must be charged
+        # at 4x FLOPs / 2x weight-elems, not the gated 6x/3x SwiGLU multiplier
+        # -- confirmed against the real MLP class source for starcoder2.py
+        # and apertus.py. Gating is keyed off architectures, not hidden_act:
+        # see test_gated_geglu_architecture_not_misclassified_by_activation
+        # for why an activation-name heuristic can't work here.
+        gated = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={"intermediate_size": 1024},
+            hf_config=types.SimpleNamespace(architectures=["LlamaForCausalLM"]),
+        )
+        non_gated = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={"intermediate_size": 1024},
+            hf_config=types.SimpleNamespace(architectures=["Starcoder2ForCausalLM"]),
+        )
+        self._init(gated)
+        gated_flops = self.reporter._linear_flops_per_token
+        gated_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(non_gated)
+        self.assertAlmostEqual(
+            gated_flops * (4.0 / 6.0), self.reporter._linear_flops_per_token
+        )
+        self.assertAlmostEqual(
+            gated_weight_bytes * (2.0 / 3.0),
+            self.reporter._weight_read_bytes_per_token,
+        )
+
+    def test_unset_architectures_defaults_to_gated(self):
+        # Regression guard: hf_config/architectures is unset in most of this
+        # test file's fake configs (and in any real config this estimator
+        # doesn't recognize) -- it must keep defaulting to the historical
+        # gated (6x/3x) assumption, not silently flip to non-gated.
+        config = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={"intermediate_size": 1024},
+        )
+        self._init(config)
+        self.assertAlmostEqual(
+            self.reporter._linear_flops_per_token, 6.0 * 256 * 1024 * 2
+        )
+
+    def test_gated_geglu_architecture_not_misclassified_by_activation(self):
+        # Gemma2ForCausalLM's MLP (gemma2.py) is gate_up_proj + down_proj (a
+        # gated, 3-matrix GeGLU FFN) and *requires*
+        # hidden_act == hidden_activation == "gelu_pytorch_tanh". StarCoder2's
+        # MLP (starcoder2.py) is a plain, non-gated c_fc + c_proj FFN that
+        # also commonly uses "gelu_pytorch_tanh". The same activation string
+        # maps to both a gated and a non-gated architecture, so hidden_act
+        # alone can never disambiguate them -- only the architecture can.
+        # Regression guard for a real bug: an earlier activation-name-based
+        # heuristic classified any "gelu_pytorch_tanh" config as non-gated,
+        # which silently undercounted Gemma2's FLOPs/weight-bytes by 1/3.
+        gemma2 = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={
+                "intermediate_size": 1024,
+                "hidden_act": "gelu_pytorch_tanh",
+            },
+            hf_config=types.SimpleNamespace(architectures=["Gemma2ForCausalLM"]),
+        )
+        self._init(gemma2)
+        self.assertAlmostEqual(
+            self.reporter._linear_flops_per_token, 6.0 * 256 * 1024 * 2
+        )
+
+    def test_every_known_non_gated_architecture_is_still_recognized(self):
+        # Regression guard, one per real non-gated sglang model class: a
+        # previous version of this fix switched from an activation-name
+        # heuristic (hidden_act in a denylist) to an architecture-name
+        # heuristic, but only ported over the architectures covered by the
+        # motivating examples in the diff (StarCoder2, Apertus) -- silently
+        # dropping ArceeForCausalLM (arcee.py: up_proj-only, hidden_act
+        # "relu2"), OPTForCausalLM (opt.py: fc1+fc2, hidden_act "relu"), and
+        # PhiForCausalLM (phi.py: fc1+fc2, hidden_act "gelu_new"), all of
+        # which the old activation-based heuristic classified correctly.
+        # NemotronHForCausalLM (nemotron_h.py: up_proj+down_proj, hidden_act
+        # "relu2") was never covered by either heuristic -- added directly.
+        # Each entry here must independently resolve to non-gated.
+        for arch in (
+            "GPT2LMHeadModel",
+            "GPTBigCodeForCausalLM",
+            "Starcoder2ForCausalLM",
+            "ApertusForCausalLM",
+            "ArceeForCausalLM",
+            "OPTForCausalLM",
+            "PhiForCausalLM",
+            "NemotronHForCausalLM",
+        ):
+            with self.subTest(arch=arch):
+                config = _fake_model_config(
+                    hidden_size=256,
+                    num_attention_layers=2,
+                    head_dim=0,
+                    hf_text_config_overrides={"intermediate_size": 1024},
+                    hf_config=types.SimpleNamespace(architectures=[arch]),
+                )
+                self._init(config)
+                self.assertAlmostEqual(
+                    self.reporter._linear_flops_per_token, 4.0 * 256 * 1024 * 2
+                )
+
+    def test_pure_ssm_has_zero_mlp_cost(self):
+        # FalconMamba/Mamba/Mamba2 layers are a Mamba mixer only -- no MLP
+        # sublayer at all (see PURE_SSM_ARCHITECTURES in model_config.py).
+        # hf_text_config.intermediate_size on these configs is the SSM
+        # mixer's own inner/expand dimension (d_inner), not an FFN size, and
+        # must not be charged as fake FFN FLOPs/bytes. Confirmed against
+        # falcon-mamba-7b, whose real intermediate_size is the mixer's
+        # d_inner (~2x hidden_size with the default expand factor) -- before
+        # this fix, charging it as an FFN size on every layer was inflating
+        # MFU/MBU past 100%.
+        config = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            num_attn_heads=0,
+            num_kv_heads=0,
+            attention_arch=AttentionArch.SSM,
+            full_attention_layer_ids=[],
+            hf_text_config_overrides={"intermediate_size": 512},
+        )
+        self._init(config)
+        self.assertEqual(self.reporter._linear_flops_per_token, 0.0)
+        self.assertEqual(self.reporter._weight_read_bytes_per_token, 0.0)
+        self.assertEqual(self.reporter._ffn_act_bytes_per_token, 0.0)
+
+    def test_vision_tower_uses_embed_dim_not_hidden_size_for_qwen2vl(self):
+        # Qwen2-VL (and its direct reuses, sarashina2_vision/points_v15_chat)
+        # size vision blocks off embed_dim; hidden_size there is only the
+        # patch merger's output width and must not be used for block FLOPs.
+        config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2VLForConditionalGeneration"],
+                vision_config=types.SimpleNamespace(
+                    embed_dim=1280,
+                    hidden_size=3584,
+                    depth=2,
+                    num_heads=16,
+                    mlp_ratio=4.0,
+                ),
+            ),
+        )
+        self._init(config)
+        vit_intermediate = 1280 * 4.0
+        expected_linear = 2 * (8.0 * 1280 * 1280 + 4.0 * 1280 * vit_intermediate)
+        expected_attn_dot = 2 * (4.0 * 16 * (1280 / 16))
+        self.assertEqual(self.reporter._vit_linear_flops_per_patch, expected_linear)
+        self.assertEqual(self.reporter._vit_attn_dot_flops_coeff, expected_attn_dot)
+
+    def test_vision_tower_uses_hidden_size_directly_for_qwen3vl(self):
+        # Qwen2.5-VL/Qwen3-VL have no embed_dim field; blocks are sized off
+        # hidden_size directly.
+        config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen3VLForConditionalGeneration"],
+                vision_config=types.SimpleNamespace(
+                    hidden_size=1152,
+                    depth=2,
+                    num_heads=16,
+                    intermediate_size=4304,
+                ),
+            ),
+        )
+        self._init(config)
+        expected_linear = 2 * (8.0 * 1152 * 1152 + 4.0 * 1152 * 4304)
+        expected_attn_dot = 2 * (4.0 * 16 * (1152 / 16))
+        self.assertEqual(self.reporter._vit_linear_flops_per_patch, expected_linear)
+        self.assertEqual(self.reporter._vit_attn_dot_flops_coeff, expected_attn_dot)
+
+    def test_vision_mlp_gating_matches_architecture(self):
+        # Qwen2.5-VL's vision MLP is gated SwiGLU (6x/3x multipliers); the
+        # rest of the family is plain 2-matrix (4x/2x) -- same vision_config,
+        # different architecture name, must produce different FLOPs.
+        vision_config = types.SimpleNamespace(
+            hidden_size=1280, depth=1, num_heads=16, intermediate_size=3420
+        )
+        gated_config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2_5_VLForConditionalGeneration"],
+                vision_config=vision_config,
+            ),
+        )
+        self._init(gated_config)
+        gated_linear = self.reporter._vit_linear_flops_per_patch
+
+        non_gated_config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2VLForConditionalGeneration"],
+                vision_config=vision_config,
+            ),
+        )
+        self._init(non_gated_config)
+        non_gated_linear = self.reporter._vit_linear_flops_per_patch
+
+        attn_linear = 8.0 * 1280 * 1280
+        self.assertEqual(gated_linear, attn_linear + 6.0 * 1280 * 3420)
+        self.assertEqual(non_gated_linear, attn_linear + 4.0 * 1280 * 3420)
+
+    def test_no_vision_or_audio_config_yields_zero_contribution(self):
+        # Critical regression guard: a non-multimodal model must see zero
+        # vision/audio contribution AND unchanged text-decoder constants.
+        hidden, head_dim, heads, kv_heads, layers = 4096, 128, 32, 8, 8
+        config = _fake_model_config(
+            hidden_size=hidden,
+            head_dim=head_dim,
+            num_attn_heads=heads,
+            num_kv_heads=kv_heads,
+            num_attention_layers=layers,
+        )
+        self._init(config)
+        self.assertEqual(self.reporter._vit_linear_flops_per_patch, 0.0)
+        self.assertEqual(self.reporter._vit_attn_dot_flops_coeff, 0.0)
+        self.assertEqual(self.reporter._vit_weight_read_bytes_once, 0.0)
+        self.assertEqual(self.reporter._audio_encoder_flops_per_item, 0.0)
+        self.assertEqual(self.reporter._audio_encoder_weight_read_bytes_once, 0.0)
+
+        attn_linear_flops = (
+            2.0 * hidden * head_dim * (heads + 2.0 * kv_heads)
+            + 2.0 * hidden * head_dim * heads
+        )
+        mlp_flops = 6.0 * hidden * 14336
+        self.assertEqual(
+            self.reporter._linear_flops_per_token,
+            attn_linear_flops * layers + mlp_flops * layers,
+        )
+        self.assertEqual(
+            self.reporter._attn_dot_flops_coeff, 4.0 * heads * head_dim * layers
+        )
+
+    def test_audio_encoder_fixed_window_flops(self):
+        hidden, heads, intermediate, layers, positions, mel_bins = (
+            64.0,
+            4.0,
+            128.0,
+            2.0,
+            10.0,
+            8.0,
+        )
+        config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2AudioForConditionalGeneration"],
+                audio_config=types.SimpleNamespace(
+                    hidden_size=hidden,
+                    num_attention_heads=heads,
+                    intermediate_size=intermediate,
+                    num_hidden_layers=layers,
+                    max_source_positions=positions,
+                    num_mel_bins=mel_bins,
+                ),
+            ),
+        )
+        self._init(config)
+        head_dim = hidden / heads
+        # conv1 stride=1, conv2 stride=2 -> every clip is force-padded to a
+        # fixed 2x max_source_positions mel window.
+        mel_frames = 2.0 * positions
+        conv1_flops = 2.0 * mel_frames * 3.0 * mel_bins * hidden
+        conv2_flops = 2.0 * positions * 3.0 * hidden * hidden
+        per_layer_linear = 8.0 * hidden * hidden + 4.0 * hidden * intermediate
+        per_layer_attn_dot = 4.0 * heads * head_dim  # bidirectional, no causal mask
+        expected_flops = (
+            conv1_flops
+            + conv2_flops
+            + layers * per_layer_linear * positions
+            + layers * per_layer_attn_dot * (positions**2)
+        )
+        self.assertEqual(self.reporter._audio_encoder_flops_per_item, expected_flops)
+
+        per_layer_weight_elems = 4.0 * hidden * hidden + 2.0 * hidden * intermediate
+        expected_weight_bytes = layers * per_layer_weight_elems * 2.0  # bf16
+        self.assertEqual(
+            self.reporter._audio_encoder_weight_read_bytes_once, expected_weight_bytes
+        )
+
+    def test_audio_encoder_missing_config_falls_back_to_hf_default(self):
+        # qwen2_audio.py itself constructs a default Qwen2AudioEncoderConfig()
+        # when audio_config is absent; mirror that here instead of zeroing out.
+        config = _fake_model_config(
+            hf_config=types.SimpleNamespace(
+                architectures=["Qwen2AudioForConditionalGeneration"],
+            ),
+        )
+        self._init(config)
+        hidden, heads, intermediate, layers, positions, mel_bins = (
+            1280.0,
+            20.0,
+            5120.0,
+            32.0,
+            1500.0,
+            128.0,
+        )
+        head_dim = hidden / heads
+        mel_frames = 2.0 * positions
+        conv1_flops = 2.0 * mel_frames * 3.0 * mel_bins * hidden
+        conv2_flops = 2.0 * positions * 3.0 * hidden * hidden
+        per_layer_linear = 8.0 * hidden * hidden + 4.0 * hidden * intermediate
+        per_layer_attn_dot = 4.0 * heads * head_dim
+        expected_flops = (
+            conv1_flops
+            + conv2_flops
+            + layers * per_layer_linear * positions
+            + layers * per_layer_attn_dot * (positions**2)
+        )
+        self.assertEqual(self.reporter._audio_encoder_flops_per_item, expected_flops)
+
+
+class TestPrefillSolDeviceTimer(CustomTestCase):
+    """_consume_device_gpu_time / _prefill_sol_suffix: the device-timer-based
+    replacement for the wall-clock `est. prefill TFLOPS/s` estimate, and the
+    FIFO gating that must exactly match report_prefill_stats()'s own
+    early-return condition to avoid an unbounded per-rank memory leak."""
+
+    def setUp(self):
+        enter_scope(
+            self,
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                True,
+            ),
+        )
+        self.scheduler = types.SimpleNamespace()
+        self.scheduler.waiting_queue = []
+        self.scheduler.disaggregation_mode = DisaggregationMode.NULL
+        self.reporter = _make_reporter(self, self.scheduler)
+        # _make_reporter's default context leaves enable_mfu_metrics unset;
+        # drive it directly, same as TestSchedulerTimeAccounting does for
+        # enable_metrics -- _wrap_execution_reporter and report_prefill_stats
+        # both read these as plain instance attributes at call time.
+        self.reporter.enable_mfu_metrics = True
+        self.reporter.is_stats_logging_rank = True
+        self.reporter.current_scheduler_metrics_enabled = False
+
+    def _run_extend_forward(self, milliseconds):
+        """Simulate one completed "extend" (prefill) forward of the given
+        device-timer duration, the same way model_runner.py's
+        device_timer_ctx(self.device_timer, "extend") wraps a real forward."""
+        with patch.object(
+            _TimingInterval,
+            "create",
+            return_value=FakeInterval(milliseconds, ready=True),
+        ):
+            with device_timer_ctx(self.reporter.forward_pass_device_timer, "extend"):
+                pass
+
+    def _run_decode_forward(self, milliseconds):
+        with patch.object(
+            _TimingInterval,
+            "create",
+            return_value=FakeInterval(milliseconds, ready=True),
+        ):
+            with device_timer_ctx(self.reporter.forward_pass_device_timer, "decode"):
+                pass
+
+    def test_consume_device_gpu_time_pops_fifo_in_order(self):
+        self._run_extend_forward(2)
+        self._run_extend_forward(5)
+        self._run_extend_forward(9)
+        self.assertAlmostEqual(self.reporter._consume_device_gpu_time("extend"), 0.002)
+        self.assertAlmostEqual(self.reporter._consume_device_gpu_time("extend"), 0.005)
+        self.assertAlmostEqual(self.reporter._consume_device_gpu_time("extend"), 0.009)
+        self.assertIsNone(self.reporter._consume_device_gpu_time("extend"))
+
+    def test_consume_device_gpu_time_none_without_device_timer(self):
+        self.reporter.forward_pass_device_timer = None
+        self.assertIsNone(self.reporter._consume_device_gpu_time("extend"))
+
+    def test_non_extend_category_is_never_queued(self):
+        # Only "extend" is ever drained (by _prefill_sol_suffix); queuing
+        # every category here would leak the other categories' entries
+        # forever since nothing consumes them.
+        self._run_decode_forward(3)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 0
+        )
+
+    def test_extend_fifo_not_populated_when_rank_cannot_drain(self):
+        # The TP-rank leak this regression test guards against: on a TP rank
+        # other than attn_tp_rank 0 (is_stats_logging_rank=False) without
+        # --enable-metrics-for-all-schedulers (current_scheduler_metrics_enabled
+        # stays False too), report_prefill_stats() returns before ever
+        # reaching _consume_device_gpu_time -- so appending here unconditionally
+        # would grow this queue forever on every such rank.
+        self.reporter.is_stats_logging_rank = False
+        self.reporter.current_scheduler_metrics_enabled = False
+        for _ in range(5):
+            self._run_extend_forward(1)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 0
+        )
+
+    def test_extend_fifo_populated_when_stats_logging_rank(self):
+        self.reporter.is_stats_logging_rank = True
+        self.reporter.current_scheduler_metrics_enabled = False
+        for _ in range(3):
+            self._run_extend_forward(1)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 3
+        )
+
+    def test_extend_fifo_populated_when_metrics_enabled_for_all_schedulers(self):
+        # --enable-metrics-for-all-schedulers sets current_scheduler_metrics_enabled
+        # on every rank even when attn_tp_rank != 0 -- confirm the gate also
+        # lets those ranks append (and therefore drain) correctly.
+        self.reporter.is_stats_logging_rank = False
+        self.reporter.current_scheduler_metrics_enabled = True
+        for _ in range(3):
+            self._run_extend_forward(1)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 3
+        )
+
+    def test_extend_fifo_not_populated_when_mfu_metrics_disabled(self):
+        # A second, narrower trigger of the same leak class: with the device
+        # timer on (e.g. for occupancy logging) but --enable-mfu-metrics off,
+        # _prefill_sol_suffix is never called at all (report_prefill_stats
+        # only reaches it when self.enable_mfu_metrics), so nothing would
+        # ever drain this queue even on the stats-logging rank.
+        self.reporter.enable_mfu_metrics = False
+        self.reporter.is_stats_logging_rank = True
+        for _ in range(5):
+            self._run_extend_forward(1)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]), 0
+        )
+
+    def test_prefill_sol_suffix_uses_device_time_not_wall_clock(self):
+        # The core fix: FLOPs / this forward's own device time, not FLOPs /
+        # the wall-clock gap between log lines -- which collapses toward
+        # zero under overlap scheduling even though real GPU work happened.
+        self.reporter._estimate_prefill_perf = Mock(return_value=(6.0e12, 0.0, 0.0))
+        self._run_extend_forward(2000)  # 2.0s of real device time
+        # A deliberately absurd wall-clock elapsed_s: if this leaked into the
+        # TFLOPS math, the result would be ~6 trillion TFLOPS/s instead of 3.
+        suffix = self.reporter._prefill_sol_suffix(batch=None, elapsed_s=1e-6)
+        self.assertEqual(suffix, ", est. prefill TFLOPS/s (per GPU): 3.00")
+
+    def test_prefill_sol_suffix_empty_without_device_timer(self):
+        self.reporter.forward_pass_device_timer = None
+        suffix = self.reporter._prefill_sol_suffix(batch=None, elapsed_s=1.0)
+        self.assertEqual(suffix, "")
+
+    def test_prefill_sol_suffix_empty_when_fifo_not_yet_populated(self):
+        # No forward has completed yet -- the queue is empty, so the caller
+        # must fall back to its own wall-clock estimate instead of crashing
+        # or fabricating a number.
+        suffix = self.reporter._prefill_sol_suffix(batch=None, elapsed_s=1.0)
+        self.assertEqual(suffix, "")
+
+    def test_prefill_sol_suffix_empty_on_non_draining_rank(self):
+        # End-to-end version of test_extend_fifo_not_populated_when_rank_cannot_drain:
+        # on a non-draining rank the queue never fills, so the suffix must
+        # keep falling back gracefully rather than ever reading stale data.
+        self.reporter.is_stats_logging_rank = False
+        self.reporter.current_scheduler_metrics_enabled = False
+        self._run_extend_forward(2000)
+        suffix = self.reporter._prefill_sol_suffix(batch=None, elapsed_s=1.0)
+        self.assertEqual(suffix, "")
+
+    def test_extend_fifo_is_bounded_despite_undrained_appends(self):
+        # DP attention's decode->extend conversion (ScheduleBatch.
+        # convert_decode_to_extend) runs decode work through the same
+        # "extend"-labeled forward dispatch but sets prefill_stats=None, so
+        # report_prefill_stats -- the only drainer -- never runs for it.
+        # metrics_reporter.py cannot tell that case apart from a genuine
+        # extend forward at append time, so the queue must stay bounded
+        # (maxlen) regardless of how many such forwards run undrained.
+        for _ in range(_DEVICE_TIMER_FIFO_MAXLEN + 20):
+            self._run_extend_forward(1)
+        self.assertEqual(
+            len(self.reporter._device_timer_elapsed_by_category["extend"]),
+            _DEVICE_TIMER_FIFO_MAXLEN,
+        )
+
+    def test_consume_device_gpu_time_discards_stale_entries(self):
+        # If an undrained entry (e.g. from a decode->extend conversion, see
+        # test_extend_fifo_is_bounded_despite_undrained_appends) sits in the
+        # queue long enough, a later, unrelated extend forward's stats must
+        # not pair its FLOPs with that stale GPU time -- _consume_device_gpu_time
+        # has to discard it and fall back to None (wall-clock estimate)
+        # instead of silently misattributing it.
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=1000.0,
+        ):
+            self._run_extend_forward(5)  # stale entry, recorded at t=1000.0
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=1000.0 + _DEVICE_TIMER_FIFO_MAX_AGE_S + 1.0,
+        ):
+            self.assertIsNone(self.reporter._consume_device_gpu_time("extend"))
+
+    def test_consume_device_gpu_time_keeps_fresh_entry_behind_stale_one(self):
+        # A stale leaked entry must not block a fresh, legitimate one behind
+        # it in the FIFO -- _consume_device_gpu_time should skip past stale
+        # entries and still return the next genuinely fresh measurement.
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=1000.0,
+        ):
+            self._run_extend_forward(5)  # stale
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=1000.0 + _DEVICE_TIMER_FIFO_MAX_AGE_S + 1.0,
+        ):
+            self._run_extend_forward(7)  # fresh
+            self.assertAlmostEqual(
+                self.reporter._consume_device_gpu_time("extend"), 0.007
+            )
 
 
 if __name__ == "__main__":
