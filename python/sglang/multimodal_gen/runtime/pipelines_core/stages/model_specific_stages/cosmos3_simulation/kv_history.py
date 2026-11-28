@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     KVPair,
 )
 
-# History room an open-ended session starts with; the buffers double on demand.
+# History room an open-ended session starts with, also capping each growth step.
 # Arbitrary: small enough that a short session stays cheap.
 OPEN_ENDED_INITIAL_FRAMES = 16
 # Most spare frames a sliding history drifts through before it moves back to the
@@ -58,10 +58,11 @@ class CosmosDreamsKVHistory:
         self.committed_tokens = 0
         self._offset = 0
         self._max_capacity = self.text_tokens + live_tokens + spare_tokens
+        self._growth_step = 0 if initial_tokens is None else max(1, initial_tokens)
         self._capacity = (
             self._max_capacity
             if initial_tokens is None
-            else min(self._max_capacity, self.text_tokens + max(1, initial_tokens))
+            else min(self._max_capacity, self.text_tokens + self._growth_step)
         )
         # [text | sink] of every layer, copied aside at the first eviction.
         self._pinned: list[torch.Tensor] | None = None
@@ -165,7 +166,16 @@ class CosmosDreamsKVHistory:
             )
         capacity = self._capacity
         if needed > capacity:
-            capacity = min(max(needed, 2 * capacity), self._max_capacity)
+            history_capacity = capacity - self.text_tokens
+            growth = (
+                min(history_capacity, self._growth_step)
+                if self._growth_step > 0
+                else history_capacity
+            )
+            capacity = min(
+                max(needed, self.text_tokens + history_capacity + max(1, growth)),
+                self._max_capacity,
+            )
         start = self._offset
         for layer_idx, buffer in enumerate(self._kv):
             source = buffer[:, :, start : start + live]

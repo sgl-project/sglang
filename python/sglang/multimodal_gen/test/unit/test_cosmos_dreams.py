@@ -914,6 +914,20 @@ class TestCosmosDreamsKVHistory(unittest.TestCase):
                 key, value = history.committed(layer)
                 self.assertEqual(key[0, :, 0, 0].tolist(), kept)
                 self.assertEqual(value[0, :, 0, 0].tolist(), kept)
+        # Open-ended growth steps stay bounded by the initial history room.
+        long_history = new_kv_history(
+            _text_kv(layers=1, text_tokens=2),
+            tokens_per_frame=1,
+            sink_frames=2,
+            window_frames=64,
+            chunk_frames=2,
+            rollout_frames=None,
+        )
+        for step in range(1, 21):
+            chunk = 1 if step == 1 else 2
+            long_history.slots(chunk)
+            long_history.commit(chunk, tail_tokens=64)
+        self.assertEqual(long_history._capacity, 56)
 
     def test_rollout_inside_its_window_gets_exactly_its_length(self):
         history = new_kv_history(
