@@ -45,6 +45,7 @@ class StreamingASRState:
     emitted_text: str = ""
     full_transcript: str = ""
     chunk_index: int = 0
+    final_output_truncated: bool = False
 
     def get_prefix_text(self) -> str:
         if self.chunk_index < self.unfixed_chunk_num or not self.emitted_text:
@@ -205,6 +206,8 @@ async def process_asr_chunk(
     text = normalize_whitespace(adapter.postprocess_text(ret.get("text", "")))
 
     if is_last:
+        finish_reason = ret.get("meta_info", {}).get("finish_reason") or {}
+        state.final_output_truncated = finish_reason.get("type") == "length"
         state.full_transcript = text
         return state.finalize()
     return state.update(text)

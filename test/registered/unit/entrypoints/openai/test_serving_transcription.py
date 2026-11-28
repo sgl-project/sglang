@@ -325,6 +325,78 @@ def _long_wav_bytes(duration_s: float = 65.0) -> bytes:
     return buf.getvalue()
 
 
+class TestCumulativeASRStream(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
+            ServerArgs(model_path="dummy", asr_max_concurrent_sessions=32),
+            role="tokenizer",
+        )
+
+    def test_finish_reason_follows_final_prefix(self):
+        """A capped final transcript must report truncation in its terminal event."""
+        first = "one two three four five six"
+        final = first + " seven"
+        cases = (
+            ("single prefix truncated", [("partial", "length")], "partial", "length"),
+            (
+                "final prefix truncated",
+                [(first, "stop"), (final, "length")],
+                final,
+                "length",
+            ),
+            (
+                "provisional limit recovered",
+                [(first, "length"), (final, "stop")],
+                final,
+                "stop",
+            ),
+            ("missing metadata", [("fallback", None)], "fallback", "stop"),
+            ("empty prefix truncated", [("", "length")], "", "length"),
+        )
+
+        for name, replies, expected_text, expected_reason in cases:
+            with self.subTest(name=name):
+                tm = _MockChunkTokenizerManager(
+                    [[_chunk(text, finish=reason)] for text, reason in replies]
+                )
+                tm.model_config.hf_config.architectures = [
+                    "Qwen3ASRForConditionalGeneration"
+                ]
+                serving = OpenAIServingTranscription(tm)
+                raw_request = Mock(headers={})
+                raw_request.is_disconnected = AsyncMock(return_value=False)
+
+                async def drive():
+                    response = await serving.create_transcription(
+                        audio_data=_long_wav_bytes(duration_s=2 * len(replies) - 1),
+                        model="Qwen/Qwen3-ASR-0.6B",
+                        language="en",
+                        response_format="json",
+                        temperature=0.0,
+                        stream=True,
+                        raw_request=raw_request,
+                    )
+                    self.assertEqual(response.media_type, "text/event-stream")
+                    return [frame async for frame in response.body_iterator]
+
+                frames = get_or_create_event_loop().run_until_complete(drive())
+                self.assertEqual("".join(_deltas_from_sse(frames)), expected_text)
+                self.assertEqual(frames.count("data: [DONE]\n\n"), 1)
+                self.assertEqual(frames[-1], "data: [DONE]\n\n")
+                choices = [
+                    json.loads(frame.removeprefix("data: "))["choices"][0]
+                    for frame in frames[:-1]
+                ]
+                self.assertEqual(
+                    [choice["finish_reason"] for choice in choices],
+                    [None] * (len(choices) - 1) + [expected_reason],
+                )
+                self.assertEqual(len(tm.requests), len(replies))
+                self.assertTrue(all(not request.stream for request in tm.requests))
+
+
 class TestLongAudioChunkedNonStreaming(CustomTestCase):
     """Audio longer than Whisper's 30 s window must be split into chunk
     requests and the transcripts stitched in order — without chunking the
