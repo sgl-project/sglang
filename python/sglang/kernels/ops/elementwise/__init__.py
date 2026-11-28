@@ -18,6 +18,21 @@ from sglang.kernels.spec import (
 
 __all__ = []
 
+# Module-level fused op: inventoried here without importing its module.
+for _bk, _fn in (
+    (KernelBackend.TORCH, "forward_native"),
+    (KernelBackend.TORCH_COMPILE, "forward_torch_compile"),
+):
+    register_kernel(
+        KernelSpec(
+            op="elementwise.local_token_count",
+            backend=_bk,
+            target="sglang.kernels.ops.elementwise.local_token_count:"
+            + f"_LOCAL_TOKEN_COUNT.{_fn}",
+        )
+    )
+del _bk, _fn
+
 for _fn in ("hc_combine_gate", "hc_combine_apply", "hc_combine_apply_norm"):
     register_kernel(
         KernelSpec(
