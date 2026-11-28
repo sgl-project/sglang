@@ -189,8 +189,11 @@ class TestFlashinferFp8Routed(CustomTestCase):
                 lazy = router.forward_cuda(hidden, logits)
                 self.assertTrue(TopKOutputChecker.format_is_bypassed(lazy))
                 self.assertIs(lazy.num_token_non_padded, live if bounded else None)
+                # The runner leaves a bare padding bound to the in-kernel router;
+                # bounded routes reach it materialized (placement remap, routed backend).
+                routes = lazy.to_standard() if bounded else lazy
                 output = runner.fused_experts_none_to_flashinfer_trtllm_fp8(
-                    StandardDispatchOutput(hidden, None, lazy), quant, config
+                    StandardDispatchOutput(hidden, None, routes), quant, config
                 ).hidden_states
             if deferred:
                 self.assertEqual(output.top_k, 1)
