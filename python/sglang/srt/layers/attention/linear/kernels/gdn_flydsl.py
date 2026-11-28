@@ -188,3 +188,135 @@ class FlyDSLGDNKernel(TritonGDNKernel):
             prefill_metadata=prefill_metadata,
         )
         return output, None, h
+
+
+def _load_aiter_fused_gdn():
+    """The fused kernel and its support check, or None on an AITER without it
+    (it landed in ROCm/aiter#6496)."""
+    try:
+        from aiter.ops.flydsl.gdn_fused_prefill import (
+            gdn_fused_prefill_fwd,
+            gdn_fused_prefill_supported,
+        )
+    except ImportError:
+        return None
+    return gdn_fused_prefill_fwd, gdn_fused_prefill_supported
+
+
+def _fill_track_state_from_h(
+    h: torch.Tensor,
+    track_state: torch.Tensor,
+    track_chunk_idx: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Copy each sequence's tracked chunk-start state out of the per-chunk ``h``.
+
+    ``h`` is [1, total_chunks, H, V, K] with each sequence's 64-token chunks
+    contiguous, as both the staged FlyDSL and the Triton paths return it; rows
+    with ``track_chunk_idx < 0`` receive an arbitrary chunk and are never read.
+    Index math stays on the device so the copy does not sync the stream.
+    """
+    seq_lens = query_start_loc[1:] - query_start_loc[:-1]
+    num_chunks = (seq_lens + 63) // 64
+    first_chunk = torch.cumsum(num_chunks, 0) - num_chunks
+    src = (first_chunk + track_chunk_idx.clamp(min=0)).clamp(max=h.shape[1] - 1)
+    track_state.copy_(h[0].index_select(0, src.long()))
+
+
+class FlyDSLFusedGDNKernel(FlyDSLGDNKernel):
+    """GDN prefill as one AITER FlyDSL kernel per batch: the chunk loop keeps
+    the state on chip, and q/k l2norm and the fp32 radix track snapshot run
+    in-kernel. Batches it declines take the staged FlyDSL path."""
+
+    supports_track_state_snapshot = True
+    _logged_staged_fallback = False
+    _max_seqlen_batch = None
+
+    def __init__(self, fused_fn, fused_supported):
+        super().__init__()
+        self._fused_fn = fused_fn
+        self._fused_supported = fused_supported
+
+    def _batch_max_seqlen(self, prefill_metadata) -> int | None:
+        # AITER's speed heuristic: it declines long sequences with few heads,
+        # where the staged path is faster. Cached once per batch.
+        if prefill_metadata is None:
+            return None
+        if self._max_seqlen_batch is not prefill_metadata:
+            self._max_seqlen_batch = prefill_metadata
+            self._max_seqlen = max(prefill_metadata.layout.seq_lens_cpu)
+        return self._max_seqlen
+
+    def extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        inplace_update: bool = True,
+        **kwargs,
+    ) -> tuple:
+        track_state = kwargs.get("track_state")
+        track_chunk_idx = kwargs.get("track_chunk_idx")
+        max_seqlen = self._batch_max_seqlen(kwargs.get("prefill_metadata"))
+        if inplace_update and self._fused_supported(
+            q, k, v, g, beta, ssm_states, max_seqlen=max_seqlen
+        ):
+            # The kernel skips negative (padded) cache indices itself.
+            output = self._fused_fn(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                cu_seqlens=query_start_loc,
+                track_state=track_state,
+                track_chunk_idx=track_chunk_idx,
+            )
+            return output, None, None
+
+        if not self._logged_staged_fallback:
+            self._logged_staged_fallback = True
+            rank0_log(
+                "Fused FlyDSL GDN prefill declined a batch; running the staged "
+                f"FlyDSL path (inplace={inplace_update}, max_seqlen={max_seqlen})."
+            )
+        output, final_state, h = super().extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            inplace_update=inplace_update,
+            **kwargs,
+        )
+        # The backend reads the snapshot instead of h for every snapshot kernel.
+        if track_state is not None:
+            _fill_track_state_from_h(h, track_state, track_chunk_idx, query_start_loc)
+        return output, final_state, h
+
+
+def create_flydsl_gdn_kernel(ssm_state_dtype: torch.dtype | None) -> FlyDSLGDNKernel:
+    """The fused kernel when the state pool is bf16 and AITER ships it, else the
+    staged kernels."""
+    if ssm_state_dtype != torch.bfloat16:
+        reason = f"it needs a bfloat16 SSM state, got {ssm_state_dtype}"
+    elif (fused := _load_aiter_fused_gdn()) is None:
+        reason = "the installed AITER lacks aiter.ops.flydsl.gdn_fused_prefill"
+    else:
+        rank0_log("FlyDSL GDN prefill: using the fused kernel.")
+        return FlyDSLFusedGDNKernel(*fused)
+    rank0_log(
+        f"FlyDSL GDN prefill: using the staged kernels; the fused one is off ({reason})."
+    )
+    return FlyDSLGDNKernel()

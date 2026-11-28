@@ -34,7 +34,10 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     KDAPrefillTrackRows,
     build_track_rows,
 )
-from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import FlyDSLGDNKernel
+from sglang.srt.layers.attention.linear.kernels.gdn_flydsl import (
+    FlyDSLGDNKernel,
+    create_flydsl_gdn_kernel,
+)
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
     PoolStaging,
@@ -384,6 +387,7 @@ class GDNKernelDispatcher:
         verify_backend: Optional[LinearAttnKernelBackend] = None,
         *,
         round_beta_to_input_dtype: bool = False,
+        ssm_state_dtype: Optional[torch.dtype] = None,
     ):
         triton_kernel = TritonGDNKernel(
             round_beta_to_input_dtype=round_beta_to_input_dtype
@@ -474,7 +478,7 @@ class GDNKernelDispatcher:
                     "The FlyDSL GDN prefill backend requires AMD gfx95 and "
                     "SGLANG_USE_AITER=1"
                 )
-            self.extend_kernel = FlyDSLGDNKernel()
+            self.extend_kernel = create_flydsl_gdn_kernel(ssm_state_dtype)
         elif prefill_backend.is_helion():
             raise ValueError(
                 "The Helion linear-attention backend supports KDA only, not GDN."
@@ -706,6 +710,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             backends.prefill,
             backends.verify,
             round_beta_to_input_dtype=self._round_beta_to_input_dtype,
+            ssm_state_dtype=self.state_pool.mamba_cache.temporal.dtype,
         )
 
     def __init__(self, model_runner: ModelRunner):
