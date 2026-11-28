@@ -143,9 +143,7 @@ class TestMxfp4CutlassTpShard(CustomTestCase):
             return weights, scales, torch.zeros(scales.shape[0], 2)
 
         fake_fused_moe = types.ModuleType("flashinfer.fused_moe")
-        fake_fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming = (
-            fake_humming
-        )
+        fake_fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming = fake_humming
         fake_flashinfer = types.ModuleType("flashinfer")
         fake_flashinfer.fused_moe = fake_fused_moe
 
