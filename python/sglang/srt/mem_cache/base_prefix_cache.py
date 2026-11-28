@@ -496,16 +496,21 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def _priority_sort_key(self, priority: Optional[int]) -> int:
         """Convert a request's business priority into an eviction sort key
-        (larger = evicted later), negating it when lower values mean higher
-        priority. Clamped to int64 max — the flip can push INT64_MIN one past
-        the upper bound — following the prompt boost's clamp style.
+        (larger = evicted later), order-reversing it when lower values mean
+        higher priority. The reversal is ``~p`` (= ``-p - 1``): a bijection
+        on the signed int64 range, so distinct priorities stay distinct and
+        nothing leaves the range. A plain ``-p`` would push INT64_MIN one
+        past the upper bound, and clamping it would map both INT64_MIN and
+        INT64_MIN + 1 onto the same key, letting the LRU tiebreak evict the
+        more urgent of the two first.
 
         The ``or 0`` fallback only covers priority scheduling being disabled
-        (every key is 0 and the policy reduces to LRU): with scheduling
+        (every key is equal and the policy reduces to LRU): with scheduling
         enabled the scheduler replaces None with a direction-aware sentinel
         at intake, so None never reaches the tree.
         """
-        return min((priority or 0) * self.priority_sign, torch.iinfo(torch.int64).max)
+        p = priority or 0
+        return ~p if self.priority_sign < 0 else p
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled

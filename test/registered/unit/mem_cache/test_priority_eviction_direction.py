@@ -3,8 +3,9 @@ Unit tests for the priority direction of radix-cache eviction.
 
 A request's priority enters the tree as an eviction sort key (larger =
 evicted later). With --schedule-low-priority-values-first lower integer
-values mean higher priority, so the key is negated on the way in; the
-lowest-priority prefix is then evicted first under both directions.
+values mean higher priority, so the key is order-reversed (~p = -p - 1,
+a bijection on the signed int64 range) on the way in; the lowest-priority
+prefix is then evicted first under both directions.
 
 Usage:
     python test_priority_eviction_direction.py
@@ -122,25 +123,53 @@ class TestPriorityEvictionDirection(CustomTestCase):
                 )
 
     def test_int64_extremes_stay_in_sort_key_range(self):
-        """The sign flip can push INT64_MIN one past the int64 upper bound;
-        the entry points must clamp the sort key back into int64 range."""
+        """The order reversal must stay inside the signed int64 range.
+        ~p (= -p - 1) is a bijection, so INT64_MIN maps to INT64_MAX with
+        no clamping and no value leaves the range."""
         int64_min, int64_max = -(1 << 63), (1 << 63) - 1
 
-        # low_first: INT64_MIN is the highest priority; the flip yields +2^63,
-        # which must clamp to int64 max instead of leaving the int64 range.
+        # low_first: INT64_MIN is the highest priority; ~INT64_MIN = INT64_MAX,
+        # the largest in-range sort key, without any clamping.
         cache = self._make_cache(low_first=True)
         self._insert_req(cache, self.HIGH_TOKENS, priority=int64_min)
         node = cache.root_node.children[1]
         self.assertEqual(node.priority, int64_max)
 
         # Default direction: INT64_MIN stays the smallest in-range sort key
-        # (no clamping needed) and must be evicted before priority 0.
+        # and must be evicted before priority 0.
         cache = self._make_cache(low_first=False)
         self._insert_req(cache, self.HIGH_TOKENS, priority=int64_min)
         self._insert_req(cache, self.LOW_TOKENS, priority=0)
         cache.evict(EvictParams(num_tokens=len(self.HIGH_TOKENS)))
         self.assertFalse(self._present(cache, self.HIGH_TOKENS))
         self.assertTrue(self._present(cache, self.LOW_TOKENS))
+
+    def test_int64_extremes_stay_distinct_under_reversal(self):
+        """INT64_MIN and INT64_MIN + 1 are the two most urgent priorities
+        under --schedule-low-priority-values-first and must not collapse
+        onto the same sort key: a plain negation clamps both to INT64_MAX,
+        and the LRU tiebreak then evicts whichever leaf is older — the more
+        urgent one when it was inserted first."""
+        int64_min = -(1 << 63)
+        cache = self._make_cache(low_first=True)
+        # The more urgent leaf is inserted first, so a key collision would
+        # make the LRU tiebreak evict it first.
+        self._insert_req(cache, self.HIGH_TOKENS, priority=int64_min)
+        self._insert_req(cache, self.LOW_TOKENS, priority=int64_min + 1)
+
+        high_node = cache.root_node.children[self.HIGH_TOKENS[0]]
+        low_node = cache.root_node.children[self.LOW_TOKENS[0]]
+        self.assertNotEqual(high_node.priority, low_node.priority)
+
+        cache.evict(EvictParams(num_tokens=len(self.LOW_TOKENS)))
+        self.assertFalse(
+            self._present(cache, self.LOW_TOKENS),
+            "INT64_MIN + 1 must be evicted before INT64_MIN under low_first",
+        )
+        self.assertTrue(
+            self._present(cache, self.HIGH_TOKENS),
+            "the most urgent priority (INT64_MIN) must survive the eviction",
+        )
 
     def test_shared_prefix_protects_most_urgent_request_in_both_directions(self):
         """A shared prefix node aggregates the max sort key of its branches,
@@ -157,11 +186,14 @@ class TestPriorityEvictionDirection(CustomTestCase):
                 # The shared [1,2,3] node carries the max sort key, i.e. the
                 # high-priority request's key — the sort-key space keeps the
                 # max() propagation meaning "protect the highest priority".
-                sign = cache.priority_sign
+                # ~x = -x - 1 reverses the order bijectively, so the max of
+                # the reversed keys is the reversal of the min.
                 shared = cache.root_node.children[1]
-                self.assertEqual(
-                    shared.priority, max(high_prio * sign, low_prio * sign)
-                )
+                if cache.priority_sign > 0:
+                    expected = max(high_prio, low_prio)
+                else:
+                    expected = ~min(high_prio, low_prio)
+                self.assertEqual(shared.priority, expected)
 
                 # Evicting one token removes only the low-priority branch's
                 # unique token; the shared prefix and the high-priority

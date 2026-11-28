@@ -36,8 +36,8 @@ class CacheInitParams:
     # Priority scheduling direction: with --schedule-low-priority-values-first
     # lower integer values are scheduled first. The radix trees convert a
     # request's priority into an eviction sort key (larger = evicted later) as
-    # it enters the tree, negating it under this flag; PriorityStrategy then
-    # needs no direction of its own.
+    # it enters the tree, order-reversing it (~p = -p - 1) under this flag;
+    # PriorityStrategy then needs no direction of its own.
     schedule_low_priority_values_first: bool = False
 
     enable_metrics: bool = False
