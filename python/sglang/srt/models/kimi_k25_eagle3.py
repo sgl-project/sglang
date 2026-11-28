@@ -39,6 +39,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
+    discard_pending_weight_halves,
+    get_pending_weight_halves,
+)
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator
@@ -438,7 +442,7 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
-        cached_a_proj: dict[str, torch.Tensor] = {}
+        pending_qkv_a_proj = get_pending_weight_halves(self).qkv_a_proj
 
         for name, loaded_weight in weights:
             if name == "d2t" or name.endswith(".d2t"):
@@ -471,31 +475,35 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             if handled:
                 continue
 
-            if "q_a_proj" in mapped_name or "kv_a_proj_with_mqa" in mapped_name:
-                cached_a_proj[mapped_name] = loaded_weight
+            if mapped_name not in params_dict and (
+                ".q_a_proj." in mapped_name or ".kv_a_proj_with_mqa." in mapped_name
+            ):
                 q_name = (
                     mapped_name
-                    if "q_a_proj" in mapped_name
-                    else mapped_name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                    if ".q_a_proj." in mapped_name
+                    else mapped_name.replace(".kv_a_proj_with_mqa.", ".q_a_proj.")
                 )
                 kv_name = (
                     mapped_name
-                    if "kv_a_proj_with_mqa" in mapped_name
-                    else mapped_name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                    if ".kv_a_proj_with_mqa." in mapped_name
+                    else mapped_name.replace(".q_a_proj.", ".kv_a_proj_with_mqa.")
                 )
-                if q_name in cached_a_proj and kv_name in cached_a_proj:
+                fused_name = q_name.replace(".q_a_proj.", ".fused_qkv_a_proj_with_mqa.")
+                if fused_name not in params_dict:
+                    continue
+                # The caller may reuse its buffer while the half waits.
+                pending_qkv_a_proj[mapped_name] = loaded_weight.clone()
+                if q_name in pending_qkv_a_proj and kv_name in pending_qkv_a_proj:
                     fused_weight = torch.cat(
-                        [cached_a_proj[q_name], cached_a_proj[kv_name]], dim=0
+                        [pending_qkv_a_proj[q_name], pending_qkv_a_proj[kv_name]], dim=0
                     )
-                    fused_name = q_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
-                    if fused_name in params_dict:
-                        param = params_dict[fused_name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, fused_weight)
-                    cached_a_proj.pop(q_name)
-                    cached_a_proj.pop(kv_name)
+                    param = params_dict[fused_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, fused_weight)
+                    pending_qkv_a_proj.pop(q_name)
+                    pending_qkv_a_proj.pop(kv_name)
                 continue
 
             if mapped_name not in params_dict:
@@ -506,6 +514,10 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
             weight_loader(param, loaded_weight)
 
         self.post_load_weights()
+
+    def discard_pending_weight_halves(self) -> List[str]:
+        """Drop fused halves waiting for their pair and return their names."""
+        return discard_pending_weight_halves(self)
 
     def post_load_weights(self) -> None:
         """Split kv_b_proj into w_kc / w_vc tensors used by MLA absorb_core.
