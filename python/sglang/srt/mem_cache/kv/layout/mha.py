@@ -3,7 +3,7 @@ typed view that reads and stores them over a band of a `KVArena`."""
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING, ClassVar, List, Optional, Tuple
+from typing import TYPE_CHECKING, ClassVar, List, Optional, Sequence, Tuple
 
 import msgspec
 import torch
@@ -805,6 +805,31 @@ class DraftMHAView(MHAView):
             end_layer=start_layer + len(layer_ids) - 1,
             enable_alt_stream=True,
         )
+
+    def stacked_kv_buffers(
+        self, layer_ids: Sequence[int]
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Writable [layer, physical slot, head, dim] views for consecutive draft lanes."""
+        lanes = [self.layer_lanes[layer_id] for layer_id in layer_ids]
+        if not lanes or lanes != list(range(lanes[0], lanes[0] + len(lanes))):
+            return None
+
+        def stack(buffers):
+            rows = [buffers[layer_id - self.start_layer] for layer_id in layer_ids]
+            first = rows[0]
+            layer_stride = 0
+            if len(rows) > 1:
+                layer_stride = rows[1].storage_offset() - first.storage_offset()
+            for i, row in enumerate(rows):
+                offset = first.storage_offset() + i * layer_stride
+                if row.storage_offset() != offset or row.stride() != first.stride():
+                    return None
+            return first.as_strided(
+                (len(rows), *first.shape), (layer_stride, *first.stride())
+            )
+
+        k, v = stack(self.k_buffer), stack(self.v_buffer)
+        return None if k is None or v is None else (k, v)
 
     def get_contiguous_buf_infos(self):
         raise NotImplementedError(
