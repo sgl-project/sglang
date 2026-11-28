@@ -76,5 +76,103 @@ def test_forward_native_rejects_an_unsupported_activation() -> None:
         norm.forward_native(torch.randn(2, 8), torch.randn(2, 8))
 
 
+@pytest.mark.parametrize("norm_before_gate", [False, True])
+def test_npu_dispatch_uses_fused_path_when_supported_and_fallback_when_legacy(
+    monkeypatch: pytest.MonkeyPatch, norm_before_gate: bool
+) -> None:
+    import sglang.kernels.ops.attention.fla.layernorm_gated as lg
+
+    torch.manual_seed(0)
+    x = torch.randn(4, 16)
+    z = torch.randn(2, 2, 16)
+    weight = torch.randn(16)
+    calls = []
+
+    def fake_layer_norm_fwd(
+        inp,
+        w,
+        b,
+        eps,
+        z=None,
+        group_size=None,
+        norm_before_gate=True,
+        is_rms_norm=False,
+        activation=None,
+    ):
+        calls.append((z is not None, z.shape if z is not None else None, activation))
+        norm = RMSNorm(
+            16,
+            eps=eps,
+            group_size=group_size,
+            norm_before_gate=norm_before_gate,
+            activation=activation or "swish",
+            dtype=inp.dtype,
+        )
+        norm.weight.data.copy_(w)
+        return norm.forward_native(inp, z), None, None
+
+    monkeypatch.setattr(lg, "_is_npu", True)
+    monkeypatch.setattr(lg, "_layer_norm_fwd", fake_layer_norm_fwd, raising=False)
+
+    expected = RMSNorm(
+        16,
+        eps=1e-6,
+        norm_before_gate=norm_before_gate,
+        activation="sigmoid",
+        dtype=torch.float32,
+    )
+    expected.weight.data.copy_(weight)
+    ref = expected.forward_native(x, z)
+
+    # New sgl-kernel-npu: fused path receives reshaped 2D z and activation="sigmoid".
+    monkeypatch.setattr(
+        lg,
+        "_NPU_FUSED_GATE_ACTIVATIONS",
+        ("swish", "silu", "sigmoid"),
+        raising=False,
+    )
+    fused_out = lg.rms_norm_gated(
+        x=x,
+        weight=weight,
+        bias=None,
+        z=z,
+        eps=1e-6,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=True,
+        activation="sigmoid",
+    )
+    assert calls[-1] == (True, (4, 16), "sigmoid")
+    torch.testing.assert_close(fused_out, ref)
+
+    # Legacy sgl-kernel-npu: fallback passes z=None and applies sigmoid outside.
+    monkeypatch.setattr(
+        lg, "_NPU_FUSED_GATE_ACTIVATIONS", ("swish",), raising=False
+    )
+    legacy_out = lg.rms_norm_gated(
+        x=x,
+        weight=weight,
+        bias=None,
+        z=z,
+        eps=1e-6,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=True,
+        activation="sigmoid",
+    )
+    assert calls[-1] == (False, None, None)
+    torch.testing.assert_close(legacy_out, ref)
+
+    with pytest.raises(AssertionError, match="NPU only supports"):
+        lg.rms_norm_gated(
+            x=x,
+            weight=weight,
+            bias=None,
+            z=z,
+            eps=1e-6,
+            norm_before_gate=norm_before_gate,
+            is_rms_norm=True,
+            activation="gelu",
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

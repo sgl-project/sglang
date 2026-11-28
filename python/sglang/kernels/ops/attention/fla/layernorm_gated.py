@@ -385,7 +385,14 @@ def _layer_norm_fwd(
 
 
 if _is_npu:
+    import sgl_kernel_npu.operators.norm as _npu_norm
     from sgl_kernel_npu.operators.norm import layer_norm_fwd as _layer_norm_fwd
+
+    # Older sgl-kernel-npu wheels ignore `activation` and always compute swish;
+    # newer wheels export SUPPORTED_GATE_ACTIVATIONS on sgl_kernel_npu.operators.norm.
+    _NPU_FUSED_GATE_ACTIVATIONS = getattr(
+        _npu_norm, "SUPPORTED_GATE_ACTIVATIONS", ("swish",)
+    )
 
 
 def rms_norm_gated(
@@ -425,30 +432,12 @@ def rms_norm_gated(
     if bias is not None:
         bias = bias.contiguous()
     if _is_npu:
-        if activation == "sigmoid":
-            # Qwen3.8-Flash-Next needs output = RMSNorm(x) * sigmoid(z).
-            #
-            # The current NPU _layer_norm_fwd computes the following, where
-            # norm is RMSNorm if is_rms_norm=True, otherwise LayerNorm:
-            #   z provided, norm_before_gate=True:  y = norm(x) * swish(z)
-            #   z provided, norm_before_gate=False: y = norm(x * swish(z))
-            #   z=None, either order:               y = norm(x)
-            # Its activation argument is currently ignored: with z provided,
-            # the gate is always swish(z) = z * sigmoid(z), not sigmoid(z).
-            # With z=None, gating is skipped entirely, so even specifying
-            # activation="swish" would not apply swish to anything.
-            #
-            # We therefore pass z=None and omit activation to use only the
-            # kernel's normalization, then apply sigmoid(z) ourselves:
-            #   norm_before_gate=True:
-            #     norm_input = x; y = norm(x); output = y * sigmoid(z).
-            #   norm_before_gate=False:
-            #     norm_input = x * sigmoid(z); output = y = norm(norm_input).
-            # For this model, the first case gives RMSNorm(x) * sigmoid(z).
-            #
-            # TODO: Replace this adapter with a fused sgl-kernel-npu kernel
-            # once it supports sigmoid gating and passes accuracy and NPU
-            # graph tests for both gate orders and supported layouts.
+        if activation == "sigmoid" and activation not in _NPU_FUSED_GATE_ACTIVATIONS:
+            # Fallback for older sgl-kernel-npu wheels whose layer_norm_fwd
+            # ignores `activation` and always computes swish(z) = z * sigmoid(z).
+            # Pass z=None so the kernel only normalizes, then apply sigmoid(z):
+            #   norm_before_gate=True:  y = norm(x); output = y * sigmoid(z)
+            #   norm_before_gate=False: output = norm(x * sigmoid(z))
             gate = None
             if z is not None:
                 gate = torch.sigmoid(z.reshape_as(x).float())
@@ -471,7 +460,14 @@ def rms_norm_gated(
                 y = (y.float() * gate).to(x.dtype)
 
             return y.reshape(x_shape_og)
-        assert activation == "swish", "NPU only supports swish or sigmoid activation"
+        assert activation in _NPU_FUSED_GATE_ACTIVATIONS, (
+            f"NPU only supports {_NPU_FUSED_GATE_ACTIVATIONS} or 'sigmoid' "
+            f"activation, got {activation!r}"
+        )
+        if z is not None and z.shape != x.shape:
+            z = z.reshape_as(x)
+            if z.stride(-1) != 1:
+                z = z.contiguous()
     y, mean, rstd = _layer_norm_fwd(
         x,
         weight,
