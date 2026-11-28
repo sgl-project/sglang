@@ -149,10 +149,10 @@ The following table summarizes quantization method support across NVIDIA and AMD
     </tr>
     <tr>
       <td><code>modelopt</code> / <code>modelopt_fp8</code></td>
-      <td>Yes (Hopper/SM90+)</td>
+      <td>Yes (SM80-SM88 via Marlin, dense only; SM89+ native FP8)</td>
       <td>No</td>
       <td>No</td>
-      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; requires NVIDIA hardware</td>
+      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; requires NVIDIA hardware; use Marlin W8A16 fallback on Ampere (dense models only)</td>
     </tr>
     <tr>
       <td><code>modelopt_fp4</code></td>
