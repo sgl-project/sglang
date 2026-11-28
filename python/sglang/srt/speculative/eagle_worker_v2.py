@@ -1733,6 +1733,46 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
         self._wait_for_fused_hicache_load(batch)
+        local_tokens_empty = (
+            batch.input_ids is not None and batch.input_ids.numel() == 0
+        ) or (batch.seq_lens is not None and batch.seq_lens.numel() == 0)
+        if local_tokens_empty:
+            # With attention DP, a rank can be scheduled with zero local tokens
+            # while other ranks still have work. The prefill/draft path assumes
+            # at least one token (reshape(-1, hidden) and zero-row kernel grids),
+            # so return an empty result instead of entering it.
+            new_seq_lens = batch.seq_lens
+            capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.LAST
+            )
+            if self._draft_worker is not None:
+                hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
+                    self.draft_worker.draft_runner
+                )
+                vocab_size = self.draft_worker.draft_probs_vocab_size
+            else:
+                hidden_size, hidden_dtype, vocab_size = None, None, 0
+            idle_input = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=hidden_size,
+                dtype=hidden_dtype,
+                topk=self.topk,
+                capture_hidden_mode=capture_mode,
+                vocab_size=vocab_size,
+            )
+            batch.spec_info = idle_input
+            if on_publish is not None:
+                on_publish(new_seq_lens)
+            return GenerationBatchResult(
+                logits_output=None,
+                next_token_ids=torch.empty((0,), dtype=torch.int64, device=self.device),
+                new_seq_lens=new_seq_lens,
+                next_draft_input=idle_input,
+                can_run_cuda_graph=False,
+                speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+            )
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             if not (
                 batch.is_extend_in_batch and self.enable_dp_spec_prefill_coordination

@@ -65,6 +65,9 @@ def grouped_gemma_rmsnorm(
     -------
     Normalized tensor, same shape/dtype as input.
     """
+    if input.numel() == 0:
+        return input if out is None else out
+
     hidden_size = input.size(-1)
     x = input.reshape(-1, hidden_size)
     if out is None:

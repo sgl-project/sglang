@@ -83,6 +83,20 @@ def test_grouped_gemma_rmsnorm_out_param():
     torch.testing.assert_close(result, expected, **_TOLERANCES[x.dtype])
 
 
+def test_grouped_gemma_rmsnorm_empty_input():
+    # Attention DP can hand a rank zero tokens; the op must be a no-op rather
+    # than launching a kernel with a zero-row grid or reshaping ambiguously.
+    weight = torch.empty(512, dtype=torch.float32)
+    for shape in [(0, 512), (0, 2, 512)]:
+        x = torch.empty(shape, dtype=torch.float32)
+        out = grouped_gemma_rmsnorm(x, weight, 512)
+        assert out.shape == shape
+
+        provided_out = torch.empty(shape, dtype=torch.float32)
+        result = grouped_gemma_rmsnorm(x, weight, 512, out=provided_out)
+        assert result.data_ptr() == provided_out.data_ptr()
+
+
 if __name__ == "__main__":
     import sys
 
