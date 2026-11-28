@@ -1309,6 +1309,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            self._npu_low_ratio_bf16 = not is_npu_arch35() and any(
+                ratio in (1, 2) for ratio in cfg.compress_ratios
+            )
         from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
             is_unified_kv_fp8,
             is_unified_kv_triton,
@@ -1396,15 +1402,15 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         }
 
         self.num_layers_total = len(self.stage_compress_ratios)
-        if _is_npu:
-            self._init_npu_row_bytes(cfg.compress_ratios)
-
         # Low-ratio pools use BF16 rows on A3 and packed FP4 rows elsewhere.
         self.low_ratio_index_bytes = get_dsv4_indexer_bytes_per_token(
             self.indexer_head_dim,
             use_fp4_indexer=not self._npu_low_ratio_bf16,
             use_bf16_indexer=self._npu_low_ratio_bf16,
         )
+
+        if _is_npu:
+            self._init_npu_row_bytes(cfg.compress_ratios)
 
         # kvc.sliding_window_size is None on a runner without SWA layers.
         self._swa_ring_size = get_swa_ring_size(cfg.window_size, self.is_speculative)
@@ -1583,7 +1589,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         is_v41 = any(
             ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS for ratio in model_ratios
         )
-        self._npu_low_ratio_bf16 = is_v41 and not arch35
         v4_layout = NPUDSV4KVLayout.V4_FP8 if arch35 else NPUDSV4KVLayout.V4_BF16
         self._npu_kv_row_bytes = {}
         for ratio in (0, *self.stage_owner_layers):
@@ -1929,13 +1934,17 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         num_req_slots = self._get_num_req_slots(max_running_requests)
         ring_size = self.ring_sizes[2]
-        row_alignment = lcm(2, ring_size) if _is_npu else 2
+        row_alignment = 2
         if self._npu_low_ratio_bf16:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
                 get_a3_c2_state_bank_count,
             )
 
             num_req_slots = get_a3_c2_state_bank_count(num_req_slots)
+            # A3 requests a 3-D view with state_cache_page_size=ring_size.
+            row_alignment = ring_size
+        elif _is_npu:
+            row_alignment = lcm(2, ring_size)
         state_rows = num_req_slots * ring_size + ring_size + 1
         state_rows = ceil_align(state_rows, row_alignment)
         state_last_dim = 2 * self.attn_head_dim
