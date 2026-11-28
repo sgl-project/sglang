@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkabl
 
 import torch
 
+from sglang.kernels.ops.sampling.topk import prebuild_radix_topk
 from sglang.kernels.ops.speculative.dspark.blockwise_rejection import (
     make_rejection_noise,
 )
@@ -193,6 +194,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
+        # A top-k sampled verify selects with radix_topk; build it before serving.
+        prebuild_radix_topk(self.device)
         self._draft_worker = None
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()

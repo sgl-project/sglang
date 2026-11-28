@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.memory.small_copy import try_small_copy
+from sglang.kernels.ops.sampling.topk import prebuild_radix_topk
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
@@ -529,6 +530,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        # A top-k sampled verify selects with radix_topk; build it before serving.
+        prebuild_radix_topk(self.device)
         self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
 
         self._warned_sampling_fallback = False
