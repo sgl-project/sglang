@@ -86,12 +86,14 @@ class TestResolveDraftKVRing(CustomTestCase):
                 args = _args(speculative_draft_attention_backend=backend)
                 self.assertTrue(self._resolve(args))
 
-    def test_on_under_pd_over_mooncake(self):
-        with _switch():
-            args = _args(
-                disaggregation_mode="decode", disaggregation_transfer_backend="mooncake"
-            )
-            self.assertTrue(self._resolve(args))
+    def test_on_under_pd_over_mooncake_and_mori(self):
+        for backend in ("mooncake", "mori"):
+            with self.subTest(backend=backend), _switch():
+                args = _args(
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend=backend,
+                )
+                self.assertTrue(self._resolve(args))
 
     def test_rejected_by_launch_flags_without_loading_the_draft(self):
         cases = {
@@ -178,6 +180,9 @@ class TestResolveMHADraftKVRing(CustomTestCase):
             "dp attention": _mha_args(attn_dp_size=2),
             "draft window": _mha_args(speculative_draft_window_size=512),
             "fa3": _mha_args(speculative_draft_attention_backend="fa3"),
+            "pd over mori": _mha_args(
+                disaggregation_mode="decode", disaggregation_transfer_backend="mori"
+            ),
         }
         for name, args in cases.items():
             with self.subTest(name), _switch():
