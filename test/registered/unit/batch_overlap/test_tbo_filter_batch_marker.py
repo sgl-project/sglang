@@ -15,9 +15,10 @@ import unittest
 import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
+from sglang.srt.layers.moe import MoeA2ABackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -39,14 +40,16 @@ def _make_target_verify_batch(bs: int) -> ForwardBatch:
     )
 
 
-def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
+def _filter(
+    batch: ForwardBatch, *, lo: int, hi: int, attn_tp_size: int = 1
+) -> ForwardBatch:
     # filter_batch reads attention_backend (get_server_args) and
     # moe_dense_tp_size (get_parallel) from the published config.
     with (
         get_context().override_server_args(
-            attention_backend="fa3", moe_dense_tp_size=None
+            attention_backend="fa3", moe_dense_tp_size=None, tp_size=attn_tp_size
         ),
-        get_parallel().override(attn_tp_size=1),
+        get_parallel().override(attn_tp_size=attn_tp_size),
     ):
         return TboForwardBatchPreparer.filter_batch(
             batch,
@@ -71,6 +74,17 @@ class TestTboFilterBatchMarker(CustomTestCase):
         self.assertEqual(first.extend_is_final_cpu, [False, False])
         self.assertEqual(second.extend_is_final_cpu, [True, False])
         self.assertEqual(parent.extend_is_final_cpu, [False, False, True, False])
+
+    def test_filter_batch_counts_extend_start_loc_from_the_child(self):
+        # Attention indexes a child's rows with these offsets.
+        parent = _make_target_verify_batch(4)
+        parent.forward_mode = ForwardMode.EXTEND
+        parent.extend_num_tokens = 4
+        parent.extend_start_loc = torch.arange(4, dtype=torch.int32)
+
+        second = _filter(parent, lo=2, hi=4)
+
+        self.assertEqual(second.extend_start_loc.tolist(), [0, 1])
 
     def test_filter_batch_inherits_prefill_completion(self):
         for completing in (False, True):
@@ -155,6 +169,22 @@ class TestTboFilterBatchMarker(CustomTestCase):
         parent.aux_hidden_states_buffer = torch.empty(8, 12)
         child = _filter(parent, lo=0, hi=4)
         self.assertIsNone(child.aux_hidden_states_buffer)
+
+    def test_children_pad_to_attn_tp_only_under_mlp_sync(self):
+        """Plain TP has no gather to pad for; a padded child would feed its
+        attention more rows than its metadata describes."""
+        for a2a_backend, padded_len in (
+            (MoeA2ABackend.NONE, 3),
+            (MoeA2ABackend.DEEPEP, 4),
+        ):
+            with (
+                self.subTest(a2a_backend=a2a_backend),
+                get_flags().moe.override(a2a_backend=a2a_backend),
+            ):
+                child = _filter(
+                    _make_target_verify_batch(8), lo=0, hi=3, attn_tp_size=4
+                )
+                self.assertEqual(child.tbo_padded_len, padded_len)
 
 
 def _make_valued_batch(bs: int) -> ForwardBatch:

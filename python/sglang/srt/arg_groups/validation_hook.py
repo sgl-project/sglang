@@ -22,6 +22,7 @@ from sglang.srt.arg_groups.choices import (
 )
 from sglang.srt.arg_groups.model_override_base import (
     ep_offset_joiner_of,
+    model_config_of,
     resolved_view,
     resolving_view,
 )
@@ -1093,10 +1094,9 @@ def handle_aux_hidden_state_capture(server_args: Any):
 
 
 def check_two_batch_overlap(server_args: Any):
-    # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
-    # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
-    # the other ubatch's compute), which requires DP attention. Enabling it
-    # there needs no extra opt-in env flag.
+    # With no EP a2a backend, two-batch-overlap overlaps either the DP
+    # all_gatherv / reduce_scatterv, which requires DP attention, or on plain
+    # TP the TP all-reduces of eager extend batches, for the models below.
     cfg = resolving_view(server_args)
 
     if (
@@ -1104,8 +1104,16 @@ def check_two_batch_overlap(server_args: Any):
         and cfg.moe_a2a_backend == "none"
         and not attn_dp_enabled_of(cfg)
     ):
+        architectures = _model_architectures(model_config_of(server_args))
+        if cfg.pp_size == 1 and "Qwen3MoeForCausalLM" in architectures:
+            logger.info(
+                "Two-batch overlap on plain TP: splitting eager extend and mixed "
+                f"batches of at least {cfg.tbo_min_extend_tokens} tokens."
+            )
+            return
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "
             "(moe_a2a_backend='none'), attention DP (--attn-dp-size) is required "
-            "(DeepSeek-V4 non-EP DP TBO path)."
+            "(DeepSeek-V4 non-EP DP TBO path), except on plain TP for "
+            "Qwen3MoeForCausalLM without pipeline parallelism."
         )

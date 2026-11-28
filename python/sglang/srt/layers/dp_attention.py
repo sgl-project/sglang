@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import logging
+from contextlib import contextmanager
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
@@ -1264,6 +1265,21 @@ def _tbo_event(key) -> torch.cuda.Event:
 _TBO_PERSIST_BUF: dict = {}
 
 
+@contextmanager
+def on_tbo_comm_stream(event_key):
+    """Run the block on the TBO comm stream after the work queued so far.
+    Its inputs must stay alive until ``wait_tbo_comm_stream(event_key)``."""
+    comm = get_dp_tbo_comm_stream()
+    comm.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(comm):
+        yield
+        _tbo_event(event_key).record()
+
+
+def wait_tbo_comm_stream(event_key) -> None:
+    torch.cuda.current_stream().wait_event(_tbo_event(event_key))
+
+
 def get_tbo_persistent_buffer(
     key, rows: int, hidden: int, dtype: torch.dtype, device
 ) -> torch.Tensor:
@@ -1473,10 +1489,12 @@ def get_cuda_graph_batch_size_alignment(
     include_cp_alignment: bool = True,
 ) -> int:
     """Decode may waive CP alignment only when no gathered buffer needs it."""
+    from sglang.srt.layers.moe.utils import is_tbo_graph_enabled
+
     if gathered_buffer_required is None:
         gathered_buffer_required = require_gathered_buffer()
     alignment = 1
-    if get_exec().overlap.enable_two_batch_overlap:
+    if is_tbo_graph_enabled():
         alignment *= 2
     if gathered_buffer_required:
         alignment *= get_parallel().attn_tp_size

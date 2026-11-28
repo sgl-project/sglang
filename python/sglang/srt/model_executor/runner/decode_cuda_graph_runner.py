@@ -73,6 +73,7 @@ from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
 )
+from sglang.srt.layers.moe import is_tbo_graph_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
@@ -356,7 +357,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.require_mlp_sync = (
             get_parallel().attn_dp_enabled or self.require_gathered_buffer
         )
-        self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
+        self.enable_two_batch_overlap = is_tbo_graph_enabled()
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 

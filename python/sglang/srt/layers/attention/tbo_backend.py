@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.moe import is_tbo_graph_enabled
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
@@ -64,7 +65,9 @@ class TboAttnBackend(AttentionBackend):
         HSA_STATUS_ERROR_OUT_OF_RESOURCES. Eager prefill TBO (init_forward_metadata)
         is unaffected; only the *_graph paths are gated.
         """
-        return getattr(self.primary, "tbo_supports_cuda_graph", True)
+        return is_tbo_graph_enabled() and getattr(
+            self.primary, "tbo_supports_cuda_graph", True
+        )
 
     def init_forward_metadata_out_graph(
         self,

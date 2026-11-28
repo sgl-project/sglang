@@ -30,11 +30,13 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateAccumulator
+from sglang.srt.layers.dp_attention import on_tbo_comm_stream, wait_tbo_comm_stream
 from sglang.srt.layers.layer_boundary import (
     append_stages,
     declare_attn,
     declare_ffn,
 )
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -52,6 +54,7 @@ from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
     is_deepep_class_backend,
+    sum_post_experts_output,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -417,6 +420,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             intermediate_size=self._mega_intermediate_size,
             top_k=self._mega_top_k,
             num_tokens=num_tokens,
+        )
+
+    def op_mlp(self, state):
+        state.hidden_states_mlp_output = self.forward_normal(
+            state.pop("hidden_states_mlp_input")
         )
 
     def op_gate(self, state):
@@ -969,9 +977,40 @@ class Qwen3MoeDecoderLayer(nn.Module):
             hidden_states, state.forward_batch
         )
 
-    def op_comm_postprocess_layer(self, state):
+    def op_attn_sum_a(self, state):
+        owed = self.attn_boundary.finish(
+            state.hidden_states_after_attn, state.forward_batch
+        )
+        with on_tbo_comm_stream(("attn_sum", state.tbo_subbatch_index)):
+            state.hidden_states_attn_sum = residual_batch.complete_output(
+                owed, state.forward_batch
+            )
+
+    def op_attn_sum_b(self, state):
+        wait_tbo_comm_stream(("attn_sum", state.tbo_subbatch_index))
+        state.pop("hidden_states_after_attn")
+        state.hidden_states_mlp_input = self.ffn_boundary.prepare(
+            state.pop("hidden_states_attn_sum"), state.forward_batch
+        )
+
+    def op_mlp_sum_a(self, state):
+        self.mlp.op_mlp(state)
+        with on_tbo_comm_stream(("mlp_sum", state.tbo_subbatch_index)):
+            state.hidden_states_mlp_sum = sum_post_experts_output(
+                state.hidden_states_mlp_output
+            )
+
+    def op_mlp_sum_b(self, state):
+        wait_tbo_comm_stream(("mlp_sum", state.tbo_subbatch_index))
+        state.pop("hidden_states_mlp_output")
+        state.hidden_states_mlp_output = state.pop("hidden_states_mlp_sum")
+        return self.op_comm_postprocess_layer(state, already_reduced=True)
+
+    def op_comm_postprocess_layer(self, state, already_reduced=False):
         hidden_states = self.ffn_boundary.complete_now(
-            state.pop("hidden_states_mlp_output"), state.forward_batch
+            state.pop("hidden_states_mlp_output"),
+            state.forward_batch,
+            already_reduced=already_reduced,
         )
 
         output = dict(

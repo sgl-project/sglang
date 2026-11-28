@@ -15,6 +15,7 @@ from sglang.srt.batch_overlap.operations import (
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import require_mlp_sync
 from sglang.srt.layers.layer_boundary import (
     Layout,
     tbo_split_moves,
@@ -26,6 +27,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_tbo_token_distribution_threshold,
     is_tbo_enabled,
+    is_tbo_graph_enabled,
 )
 from sglang.srt.layers.moe.token_dispatcher import (
     DeepEPDispatcher,
@@ -42,6 +44,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,
+    get_exec,
     get_parallel,
 )
 from sglang.srt.speculative.spec_info import SpecInput
@@ -125,6 +128,11 @@ def _is_two_chunk_split_enabled(extend_lens: Sequence[int]) -> bool:
     child_a_batch_size = split_seq_index + 1
     child_a_num_q_tokens = overall_sum // 2
     if child_a_batch_size > child_a_num_q_tokens:
+        return False
+
+    # A cut on a seq boundary would give child_a a trailing zero-token seq;
+    # the seq-boundary split is as balanced without one.
+    if sum(extend_lens[:split_seq_index]) == child_a_num_q_tokens:
         return False
 
     return True
@@ -343,7 +351,7 @@ class TboCudaGraphRunnerPlugin:
         )
 
     def capture_one_batch_size(self, batch: ForwardBatch, num_tokens: int):
-        if not is_tbo_enabled():
+        if not is_tbo_graph_enabled():
             return
         token_num_per_seq = get_token_num_per_seq(
             forward_mode=batch.forward_mode, spec_info=batch.spec_info
@@ -503,6 +511,36 @@ class TboDPAttentionPreparer:
 
 class TboForwardBatchPreparer:
     @classmethod
+    def prepare_plain_tp(cls, batch: ForwardBatch):
+        """Split an eager extend or mixed batch where no DP all-gather picked a
+        split: TBO on plain TP, which leaves speculative batches whole."""
+        if (
+            not is_tbo_enabled()
+            or is_tbo_graph_enabled()
+            or not batch.spec_algorithm.is_none()
+            or batch.forward_mode not in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            or batch.extend_num_tokens < get_exec().overlap.tbo_min_extend_tokens
+        ):
+            return
+        split_seq_index = compute_split_seq_index(
+            forward_mode=batch.forward_mode,
+            num_tokens=batch.extend_num_tokens,
+            extend_lens=batch.extend_seq_lens_cpu,
+            token_num_per_seq=None,
+        )
+        split_token_index = compute_split_token_index(
+            split_seq_index=split_seq_index,
+            forward_mode=batch.forward_mode,
+            extend_seq_lens=batch.extend_seq_lens_cpu,
+            token_num_per_seq=None,
+        )
+        if not 0 < split_token_index < batch.extend_num_tokens:
+            return
+        batch.tbo_split_seq_index = split_seq_index
+        batch.global_forward_mode = batch.forward_mode
+        cls.prepare(batch)
+
+    @classmethod
     def prepare(cls, batch: ForwardBatch, is_draft_worker: bool = False):
         if batch.tbo_split_seq_index is None or is_draft_worker:
             return
@@ -534,10 +572,12 @@ class TboForwardBatchPreparer:
 
         tbo_split_token_index = cls._compute_split_token_index(batch)
 
+        # Same modes as compute_split_seq_index / compute_split_token_index: the
+        # children's seq range must follow the token range those two picked.
         is_enable_two_chunk = (
             batch.forward_mode == ForwardMode.EXTEND
-            and _is_two_chunk_split_enabled(batch.extend_seq_lens_cpu)
-        )
+            or batch.forward_mode == ForwardMode.MIXED
+        ) and _is_two_chunk_split_enabled(batch.extend_seq_lens_cpu)
 
         if _tbo_debug:
             logger.info(
@@ -709,7 +749,9 @@ class TboForwardBatchPreparer:
                 batch.iteration_cols, slice(start_token_index, end_token_index)
             )
 
-        attention_tp_size = get_parallel().attn_tp_size
+        # The padding serves the MLP-sync gather and scatter; a plain-TP child
+        # keeps exactly the rows its attention metadata describes.
+        attention_tp_size = get_parallel().attn_tp_size if require_mlp_sync() else 1
         _tbo_padded_len = (
             (end_token_index - start_token_index - 1) // attention_tp_size + 1
         ) * attention_tp_size
@@ -752,6 +794,9 @@ class TboForwardBatchPreparer:
                 f"{key=} {old_value=} {num_seqs=} {batch=}"
             )
             output_dict[key] = old_value[start_seq_index:end_seq_index]
+            if key == "extend_start_loc":
+                # A child's offsets count from its own first token.
+                output_dict[key] = output_dict[key] - start_token_index
 
         spec_info = getattr(batch, "spec_info")
         output_spec_info = split_spec_info(

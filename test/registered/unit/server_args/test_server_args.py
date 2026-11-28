@@ -4889,10 +4889,13 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
     dummy-model short-circuits __post_init__, so the guard handler is invoked
     directly (same pattern as TestWaterfillArgs)."""
 
-    def _args(self, **overrides):
+    def _args(self, architecture="DeepseekV4ForCausalLM", **overrides):
         args = ServerArgs(model_path="dummy")
         args.enable_two_batch_overlap = True
         args.moe_a2a_backend = "none"
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=[architecture])
+        )
         for key, value in overrides.items():
             setattr(args, key, value)
         return args
@@ -4901,6 +4904,11 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args = self._args()
         with self.assertRaisesRegex(ValueError, "attn-dp-size"):
             check_two_batch_overlap(args)
+
+    def test_no_a2a_plain_tp_allowed_only_for_qwen3_moe_without_pp(self):
+        check_two_batch_overlap(self._args("Qwen3MoeForCausalLM"))
+        with self.assertRaisesRegex(ValueError, "attn-dp-size"):
+            check_two_batch_overlap(self._args("Qwen3MoeForCausalLM", pp_size=2))
 
     def test_no_a2a_with_dp_attention_ok(self):
         # DP TBO path is valid: --attn-dp-size + --enable-two-batch-overlap
