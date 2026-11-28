@@ -624,6 +624,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         # Merged front weight ([H, gate_up + E + latent]), built after weight
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
+        self._front_fp8 = None  # kimi_k3_amd.dense_fp8.StaticFP8Weight on ROCm
         self._front_sizes: Optional[List[int]] = None
         # [this rank's router + latent rows (a copy) | shared gate_up], the
         # leading view of _front_w's buffer.
@@ -945,6 +946,29 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 "writes do not refresh. Restart with SGLANG_K3_SHARDED_MOE=0 "
                 "to allow online updates."
             )
+        if _is_hip and self._eligible_for_fused_front:
+            from sglang.srt.models.kimi_k3_amd import dense_fp8
+
+            if dense_fp8.front_enabled():
+                # One E4M3 copy of the merged front; the component weights become
+                # row views of it, so the fused front must be their only reader.
+                if self._front_shard is not None:
+                    raise ValueError(
+                        "SGLANG_K3_TARGET_DENSE_FP8=front|wide does not support "
+                        "the TP-sharded MoE front; set SGLANG_K3_SHARDED_MOE=0."
+                    )
+                fp8 = dense_fp8.StaticFP8Weight(self._front_w)
+                off = 0
+                for mod, rows in zip(mods, self._front_sizes):
+                    mod.weight.data = fp8.weight[off : off + rows]
+                    off += rows
+                self._front_w = fp8.weight
+                self._front_fp8 = fp8
+                self._derived_weight_cache_error = (
+                    "Online weight updates are not supported with "
+                    "SGLANG_K3_TARGET_DENSE_FP8=front|wide: the MoE front weights "
+                    "are replaced by one FP8 copy that in-place writes do not refresh."
+                )
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -1205,6 +1229,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         """Merged front: returns ``(topk_output, routed_input)``, or None when the
         shape is not covered and the caller should run the unmerged path."""
         if not self._ep_front_eligible:
+            return None
+        if self._front_fp8 is not None:
             return None
         from sglang.kernels.ops.moe import moe_front
 
@@ -1670,11 +1696,15 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         """Read hidden_states once through the merged [H, gate_up + E + latent]
         weight: the shared experts' gate_up, the router logits and the routed
         input."""
-        fused = _k3_bf16_gemm(
-            hidden_states,
-            self._front_w,
-            out_dtype=torch.float32 if self._front_fp32 else None,
-        )
+        if self._front_fp8 is not None:
+            # opt-in static FP8 front (SGLANG_K3_TARGET_DENSE_FP8=front|wide): bf16 out
+            fused = self._front_fp8(hidden_states)
+        else:
+            fused = _k3_bf16_gemm(
+                hidden_states,
+                self._front_w,
+                out_dtype=torch.float32 if self._front_fp32 else None,
+            )
         gate_up, router_logits, routed_input = torch.split(
             fused, self._front_sizes, dim=-1
         )
@@ -1971,7 +2001,11 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             return self._forward_sp_rows(hidden_states, prefix_sum, valid_token_count)
         if cp_shard_rows:
             return self._forward_cp_shard_rows(hidden_states)
-        if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
+        # The FP8 front leaves only shuffled rows in the component weights, so
+        # even an empty batch must take the fused path.
+        if (
+            hidden_states.shape[0] > 0 or self._front_fp8 is not None
+        ) and self._eligible_for_fused_front:
             if _is_gfx95:  # its row-sharded tail may return this rank's rows
                 return self._forward_fused_hip(hidden_states, prefix_sum=prefix_sum)
             out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
@@ -2355,6 +2389,18 @@ class KimiK3DeltaAttention(nn.Module):
             return
         if _is_npu:
             return
+        if _is_hip:
+            from sglang.srt.models.kimi_k3_amd import dense_fp8
+
+            if dense_fp8.qkvg_enabled():
+                if self._kda_dwdp:
+                    raise ValueError(
+                        "SGLANG_K3_TARGET_DENSE_FP8=qkvg|wide is not supported with "
+                        "KDA DWDP, which streams the bf16 fused_qkvg_proj weight."
+                    )
+                # E4M3 q/k/v/g; f_a/b stay bf16, so the whole-in-proj merge
+                # below no longer applies (dtype mismatch).
+                dense_fp8.convert_linear(self.fused_qkvg_proj)
         if _is_hip and self._merge_kda_inproj_weights_hip():
             # Split-path f_b GEMM still uses this when the fused in-proj
             # is above the token threshold.

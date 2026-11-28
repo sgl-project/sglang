@@ -86,6 +86,7 @@ _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope
 _is_gfx95 = is_hip() and is_gfx95_supported()
+_is_hip = is_hip()
 
 
 def _gfx1250_try_gfx95():
@@ -1377,6 +1378,15 @@ class DFlashDraftModel(nn.Module):
             and self.fc.out_features % get_parallel().tp_size == 0
         ):
             projected = self._project_target_hidden_tp(target_hidden)
+        elif (
+            _is_hip
+            and 0 < target_hidden.shape[0] <= 64
+            and target_hidden.dtype == self.fc.weight.dtype == torch.bfloat16
+        ):
+            # ROCm decode: AITER tuned row when there is one, else F.linear.
+            from sglang.srt.layers.quantization.unquant_hip import a16w16_linear
+
+            projected = a16w16_linear(target_hidden, self.fc.weight)
         else:
             projected = self.fc(target_hidden)
         return self.hidden_norm(projected)
