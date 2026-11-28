@@ -145,7 +145,7 @@ jobs:
     needs: [metadata]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
-      runner: linux-aarch64-a5-8
+      runner: linux-amd64-a5-8
       test_type: accuracy
       # test_suite names the persisted output/metrics directory; the case file
       # itself is handed over through test_case.
@@ -154,7 +154,7 @@ jobs:
       image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-950-B060' }}
       # The archive's install.sh patches the image's Mooncake transfer engine
       # (mooncake_transfer_engine_memfabric) before the case runs.
-      container_patches: https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/ci/patch/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_aarch64.zip
+      container_patches: https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/ci/patch/mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_x86_64.zip
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
       use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
       is_nightly_pipeline_job: true
