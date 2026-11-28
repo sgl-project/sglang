@@ -31,7 +31,6 @@ import uuid
 from typing import Dict, List, Optional, Set, Tuple
 
 from sglang.kernels.jit.utils.common import cache_once
-from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +78,11 @@ def _ppu_sdk_version() -> str:
 
 
 def _sailify_root() -> pathlib.Path:
-    configured = envs.SGLANG_JIT_CACHE_DIR.get() or "~/.cache/sglang/jit"
-    return pathlib.Path(configured).expanduser() / "sailified"
+    # Imported lazily: cache imports this module for the environment
+    # fingerprint, so a top-level import would be circular.
+    from sglang.kernels.jit.utils.compile.cache import cache_root
+
+    return cache_root() / "sailified"
 
 
 def _mirror_path(root: pathlib.Path, source: str) -> pathlib.Path:
