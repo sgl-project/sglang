@@ -11,6 +11,9 @@ from sglang.multimodal_gen.configs.models.encoders.qwen_image import (
 )
 from sglang.multimodal_gen.configs.models.vaes.nomas import NomasVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 # Preserve upstream whitespace: this text is part of the conditioning contract.
@@ -118,6 +121,15 @@ class NomasPipelineConfig(PipelineConfig):
 
     def supports_disaggregation(self):
         return False
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # The DiT, the Qwen2.5-VL encoder and the VAE fit together in about
+        # 46 GB. Where the card has room, keep them resident instead of moving
+        # the DiT to the host between requests and streaming the encoder.
+        return ModelDeploymentConfig(
+            keep_resident_min_available_gb=100,
+            keep_resident_components=("dit", "text_encoder", "vae"),
+        )
 
     def prepare_sigmas(self, sigmas, num_inference_steps):
         if sigmas is not None:

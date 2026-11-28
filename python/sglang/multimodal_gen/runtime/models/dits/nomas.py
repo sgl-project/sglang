@@ -504,7 +504,8 @@ class NomasTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
         attention, rope = _context.attention, _context.rope
         # Sequence parallel: this rank owns video tokens [lo, hi); text is replicated.
         lo, hi = local_token_range(t * h * w, self.parallel)
-        img = self.img_in(hidden_states)[:, lo:hi]
+        # img_in returns a strided view; one copy here saves a copy in every norm
+        img = self.img_in(hidden_states)[:, lo:hi].contiguous()
         txt = self.txt_in(encoder_hidden_states, timestep, text_mask)
         vec = self.time_in(timestep)
         entries = []
