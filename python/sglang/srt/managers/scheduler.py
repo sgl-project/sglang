@@ -4418,7 +4418,7 @@ class Scheduler(
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
-            batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
+            batch.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
         batch.sampling_info = SamplingBatchInfo(
             vocab_size=self.model_config.vocab_size, device=batch.device
