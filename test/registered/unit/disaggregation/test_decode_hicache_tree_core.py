@@ -17,11 +17,16 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
+    InitLoadBackParams,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder, KvEventLoraNames
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageFailureInjector,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -78,6 +83,9 @@ def _decode_probe(page_size, kv_events, batch_exists, consumes_kv_hints=True):
     cache.tree_core = SimpleNamespace(
         enable_storage=True, is_eagle=False, kv_events=kv_events
     )
+    cache.tree_components = ()
+    cache.host_memory_mode = "cache"
+    cache._build_sidecar_transfers = Mock(return_value=[])
     cache.page_size = cache.prefetch_threshold = page_size
     cache._all_reduce_attn_groups = Mock()
     cache.prefix_device_indices = lambda req: torch.arange(page_size)
@@ -99,6 +107,66 @@ def _decode_probe(page_size, kv_events, batch_exists, consumes_kv_hints=True):
 
 
 class TestDecodeHiCacheTreeCore(CustomTestCase):
+    def test_storage_probe_intersects_sparse_checkpoint_endpoints(self):
+        cache, probe = _decode_probe(4, None, Mock(return_value=3), False)
+        state = SimpleNamespace(
+            prepare_prefetch=Mock(return_value=SimpleNamespace(staging_tokens=1))
+        )
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        state_id = ComponentType.MAMBA
+        cache.tree_components = (state_id,)
+        cache.components = {state_id: state}
+        cache.tree_core.get_last_hash_value = Mock(return_value=None)
+        transfer = PoolTransfer(
+            name=PoolName.MAMBA, keys=["state"], hit_policy=PoolHitPolicy.TRAILING_PAGES
+        )
+        cache.tree_core.build_hicache_transfers = Mock(return_value=[transfer])
+        backend = cache.cache_controller.storage_backend
+        backend.batch_exists_v2 = Mock(
+            return_value=PoolTransferResult(3, {PoolName.MAMBA: 3}, [1, 3])
+        )
+        peer = torch.tensor([1, 1, 1, 0], dtype=torch.uint8)
+
+        def reduce_hits(hits, op):
+            self.assertEqual(op, torch.distributed.ReduceOp.MIN)
+            if hits.numel() == 1:
+                hits.clamp_(max=8)
+            else:
+                hits.copy_(torch.minimum(hits, peer))
+
+        cache._all_reduce_attn_groups.side_effect = reduce_hits
+        req = SimpleNamespace(
+            origin_input_ids=array("q", range(16)),
+            extra_key=None,
+            cache_salt=None,
+            kv_hints=None,
+        )
+        self.assertEqual(probe(req).l3_storage_hit_length, 4)
+        self.assertEqual(backend.batch_exists_v2.call_args.args[1], [transfer])
+        backend.batch_exists.assert_not_called()
+        # With no Mamba checkpoint, even complete KV is useless.
+        backend.batch_exists_v2.return_value = PoolTransferResult(0, {}, [])
+        self.assertEqual(probe(req).l3_storage_hit_length, 0)
+
+    def test_decode_load_back_preserves_request_state_destination(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.buffer_pipeline = cache.linker = None
+        cache.tree_core = SimpleNamespace(
+            is_full_device_evicted=Mock(return_value=True),
+            collect_full_device_indices=Mock(return_value=torch.arange(4)),
+        )
+        cache._mamba_host_only_checkpoint = Mock(return_value=False)
+        cache.load_back = Mock(return_value=True)
+        req = SimpleNamespace(last_node=0, kv=SimpleNamespace(mamba_pool_idx=17))
+        params = InitLoadBackParams(best_match_node=1, host_hit_length=4, req=req)
+        params.restore_request_state = False
+        self.assertEqual(cache.init_load_back(params), (4, 1))
+        cache.load_back.assert_called_once_with(1, None, req=None)
+        params.restore_request_state = True
+        self.assertEqual(cache.init_load_back(params), (4, 1))
+        cache.load_back.assert_called_with(1, None, req=req)
+
     def test_decode_probe_binds_published_ids_on_a_nonpublishing_rank(self):
         """A rank that publishes no events binds hinted keys to the published IDs."""
         page_size = 4
@@ -352,6 +420,7 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
         last_node_during_load = []
 
         def init_load_back(params):
+            self.assertFalse(params.restore_request_state)
             last_node_during_load.append(req.last_node)
             return 2, "restored"
 
