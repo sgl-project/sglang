@@ -45,6 +45,10 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv_cache_dtype import (
+    FA4_SM90_FP8_KV_HEAD_DIMS,
+    fa4_casts_fp8_kv,
+)
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view, paged_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -332,17 +336,17 @@ class FlashAttentionBackend(AttentionBackend):
                 "Use --attention-backend triton on SM8x."
             )
         # FA4 on SM90 reads an fp8 e4m3 cache with unquantized Q, casting K/V in-kernel.
-        # MHA only: absorbed MLA passes qv, which that kernel path does not take.
-        self.fa4_casts_fp8_kv = (
-            device_capability[0] == 9
-            and self.kv_cache_dtype == torch.float8_e4m3fn
-            and not self.kv_cache_is_mxfp8
-            and not self.use_mla
+        # Shared with the DFLASH draft KV dtype resolution, which must agree with it.
+        self.fa4_casts_fp8_kv = fa4_casts_fp8_kv(
+            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype_str=self.kv_cache_dtype_str,
+            use_mla=self.use_mla,
+            device_capability=device_capability,
         )
         if (
             self.fa_impl_ver == 4
             and self.fa4_casts_fp8_kv
-            and model_head_dim not in (256, 512)
+            and model_head_dim not in FA4_SM90_FP8_KV_HEAD_DIMS
         ):
             raise ValueError(
                 "FA4 on SM90 reads an fp8_e4m3 KV cache only at head_dim 256 or "

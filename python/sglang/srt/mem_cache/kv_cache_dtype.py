@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.platform_kv_cache_dtype import (
 )
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.device import get_device_capability
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -34,6 +35,53 @@ QUANT_MODE_TOKEN_INT8 = 0
 _INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE = {
     "int8": QUANT_MODE_TOKEN_INT8,
 }
+
+
+# FA4 on SM90 reads an fp8 e4m3 KV cache with unquantized (fp16/bf16) Q, casting
+# K/V in-kernel, but only at these head dims (flash_attn.cute interface rejects others).
+FA4_SM90_FP8_KV_HEAD_DIMS = (256, 512)
+
+
+def fa4_casts_fp8_kv(
+    *,
+    kv_cache_dtype: torch.dtype,
+    kv_cache_dtype_str: str,
+    use_mla: bool,
+    device_capability: tuple,
+) -> bool:
+    """Whether FA4 reads this KV cache with unquantized Q, casting K/V in-kernel.
+
+    SM90 fp8 e4m3 only (MXFP8 has its own block-scaled path). MHA only: absorbed
+    MLA passes qv, which that kernel path does not take. The kernel also needs a
+    head_dim in FA4_SM90_FP8_KV_HEAD_DIMS; callers check that against their layers.
+    """
+    return (
+        device_capability[0] == 9
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and kv_cache_dtype_str != "mxfp8"
+        and not use_mla
+    )
+
+
+def _fa4_draft_reads_kv_dtype(
+    kv_cache_dtype: torch.dtype,
+    kv_cache_dtype_str: str,
+    draft_model_config: Optional["ModelConfig"],
+) -> bool:
+    """Whether an fa4 draft runner of this config can read this quantized KV cache."""
+    if _is_hip or draft_model_config is None:
+        return False
+    from sglang.srt.configs.model_config import AttentionArch
+
+    if getattr(draft_model_config, "head_dim", None) not in FA4_SM90_FP8_KV_HEAD_DIMS:
+        return False
+    is_mla = getattr(draft_model_config, "attention_arch", None) == AttentionArch.MLA
+    return fa4_casts_fp8_kv(
+        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_dtype_str=kv_cache_dtype_str,
+        use_mla=is_mla,
+        device_capability=get_device_capability(),
+    )
 
 
 def configure_kv_cache_dtype(
@@ -104,13 +152,17 @@ def configure_kv_cache_dtype(
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}.")
 
-    # DFLASH: fa4 draft attention can't read the target's fp8 KV (needs K.dtype == Q.dtype),
-    # so give the fa4 draft its own compute-dtype KV. fp8-capable backends keep the target dtype.
+    # DFLASH: fa4 draft attention needs K.dtype == Q.dtype except where FA4 casts the
+    # cache in-kernel (fa4_casts_fp8_kv, the predicate FlashAttentionBackend runs on),
+    # so elsewhere give the fa4 draft its own compute-dtype KV.
     if (
         is_draft_worker
         and is_dflash
         and speculative_draft_attention_backend == "fa4"
         and kv_cache_dtype != model_dtype
+        and not _fa4_draft_reads_kv_dtype(
+            kv_cache_dtype, kv_cache_dtype_str, model_config
+        )
     ):
         logger.info(
             "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
