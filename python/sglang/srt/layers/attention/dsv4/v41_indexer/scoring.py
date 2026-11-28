@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     flat_selection_slots,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
+    fp4_index_logits_paged_candidates,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
 from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
@@ -603,6 +604,7 @@ def decode_scores(
     req_to_token: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
     compute_topk_plan: bool = True,
+    candidate_blocks: Optional[torch.Tensor] = None,
 ) -> Optional[DecodeScores | PagedDecodeScores]:
     """None when there is no row, or nothing visible yet."""
     pool = token_to_kv_pool
@@ -632,6 +634,35 @@ def decode_scores(
         lens = lens.to(torch.int32)
         # Prepare the device-side plan before scoring, away from its top-k consumer.
         plan = plan_topk_v2(lens) if compute_topk_plan else None
+        if candidate_blocks is not None:
+            # Score only the published candidate blocks; the rest of each visible
+            # row is -inf, the same values as the dense masked path at a cost set by
+            # the candidates and the live lengths.
+            assert candidate_mask is None
+            scores = fp4_index_logits_paged_candidates(
+                q,
+                weights,
+                req,
+                req_to_token,
+                lens,
+                table,
+                table.shape[1] // 68,
+                lmax,
+                ratio,
+                candidate_blocks,
+                CANDIDATE_BLOCK_SIZE,
+            )
+            return PagedDecodeScores(
+                bs=bs,
+                lmax=lmax,
+                lens=lens,
+                scores=scores,
+                req=req,
+                req_to_token=req_to_token,
+                ratio=ratio,
+                plan=plan,
+                has_candidate_mask=True,
+            )
         scores = fp4_index_logits_paged(
             q,
             weights,
