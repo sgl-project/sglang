@@ -2061,8 +2061,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         runner_config.activation, is_gated=runner_config.is_gated
     )
 
-    # Fall back to routed path when topk was already materialized (e.g. sigmoid routing).
-    if not use_routed_topk and TopKOutputChecker.format_is_standard(topk_output):
+    # Fall back to routed path when topk was already materialized (e.g. sigmoid routing),
+    # also when a model packs it (Inkling's gate does for quantized experts).
+    if not use_routed_topk and (
+        TopKOutputChecker.format_is_standard(topk_output)
+        or TopKOutputChecker.format_is_packed(topk_output)
+    ):
         use_routed_topk = True
 
     # Deferred outputs keep the padded width, so padded weights always finalize.
