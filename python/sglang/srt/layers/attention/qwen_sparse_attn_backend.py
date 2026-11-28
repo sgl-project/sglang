@@ -354,13 +354,12 @@ class QwenSparseAttnBackend(AttentionBackend):
         if config is None:
             config = getattr(model_config, "hf_config", None)
         self.qsa_profile = parse_qsa_profile(config)
-        self.max_context_len = int(getattr(model_config, "context_len", 0))
+        req_pool = getattr(runner, "req_to_token_pool", None)
         self.compress_ratio = (
             self.qsa_profile.compress_ratio
             if self.qsa_profile is not None
             else int(getattr(config, "indexer_compress_ratio", 4))
         )
-        req_pool = getattr(runner, "req_to_token_pool", None)
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
@@ -720,8 +719,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         if self.device is None:
             self.device = forward_batch.seq_lens.device
-        if not self.max_context_len:
-            self.max_context_len = self.req_to_token.shape[1]
         if forward_batch.forward_mode.is_idle() or forward_batch.seq_lens.numel() == 0:
             # DP idle forwards reach metadata init even though layers skip attention;
             # so do the zero-row DECODE steps the MTP wrapper makes of them.
@@ -972,13 +969,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             is_draft_runner=self.runner is not None and self.runner.is_draft_worker,
             skip_prefill=False,
             max_bs=max_bs,
-            max_context_len=self.max_context_len,
+            max_kv_len=self.req_to_token_pool.row_width,
             num_draft_tokens=get_spec().speculative_num_draft_tokens,
             device=self.device,
             is_read=False,
         )
         self._cuda_graph_max_tokens = max_num_tokens
-        max_blocks = math.ceil(self.max_context_len / self.compress_ratio)
+        max_blocks = math.ceil(self.req_to_token_pool.row_width / self.compress_ratio)
         max_pages = max(
             1,
             math.ceil(max_blocks / self.token_to_kv_pool.qsa_compressed_page_size),

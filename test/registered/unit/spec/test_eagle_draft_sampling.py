@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute, VerifyStep
 from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.spec_utils import renorm_draft_probs, sample_draft_proposal
@@ -108,6 +109,7 @@ def _verify_target_probs(
         sampling_info=SimpleNamespace(
             step_penalties=None,
             logit_bias=None,
+            has_custom_logit_processor=False,
             is_all_greedy=False,
             need_top_k_sampling=False,
             need_top_p_sampling=False,
@@ -116,13 +118,19 @@ def _verify_target_probs(
             temperatures=temperatures,
         ),
     )
+    verify = VerifyStep(
+        batch=batch,
+        route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),
+        watermark=None,
+        watermark_full_mask=True,
+    )
     with (
         patch.object(eagle_utils, "_is_cpu", False),
         patch.object(eagle_utils, "tree_speculative_sampling_target_only") as sample,
         get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
     ):
         eagle_utils.eagle_sample(
-            verify_input, batch, LogitsProcessorOutput(next_token_logits=logits)
+            verify_input, verify, LogitsProcessorOutput(next_token_logits=logits)
         )
     return sample.call_args.kwargs["target_probs"].reshape_as(logits)
 

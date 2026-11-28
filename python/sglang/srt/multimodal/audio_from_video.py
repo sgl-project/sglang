@@ -15,6 +15,7 @@
 
 import io
 import logging
+from typing import BinaryIO
 
 import numpy as np
 
@@ -57,7 +58,7 @@ def _append_resampled_frames(
 
 
 def decode_audio_container(
-    source: bytes | str,
+    source: bytes | str | BinaryIO,
     *,
     target_sr: int,
     mono: bool,
@@ -67,12 +68,21 @@ def decode_audio_container(
         raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
     if isinstance(source, bytes) and not source:
         raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+    if isinstance(source, str) and source.startswith(("http://", "https://")):
+        from sglang.srt.multimodal.media_io import (
+            download_remote_media,
+            media_url_timeout,
+        )
+
+        source = download_remote_media(source, timeout=media_url_timeout(5))
 
     try:
         import av
 
         input_source = io.BytesIO(source) if isinstance(source, bytes) else source
-        with av.open(input_source) as container:
+        # Client bytes must not make a demuxer fetch the URLs a playlist names.
+        options = {} if isinstance(source, str) else {"protocol_whitelist": "data"}
+        with av.open(input_source, options=options) as container:
             if not container.streams.audio:
                 raise _AudioContainerDecodeError(_INVALID_AUDIO_CONTAINER_MESSAGE)
 

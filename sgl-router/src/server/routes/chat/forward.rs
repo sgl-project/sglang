@@ -174,6 +174,7 @@ async fn dispatch<T: Transport>(
         decode,
         track_dispatch_timestamps,
     } = workers;
+    let decode = decode.filter(|_| !prefill_answers_alone(ctx, request, &prefill));
     let decode_url_header = decode
         .as_ref()
         .and_then(|worker| parse_decode_url_header(&worker.url));
@@ -387,6 +388,17 @@ async fn dispatch<T: Transport>(
         decode_url_header,
         retry_excluding,
     })
+}
+
+/// Whether `prefill` answers this request with no decode: the operator opted
+/// in, the engine reports it can, and the request wants at most one token. A
+/// request with no bootstrap fields is then plain to prefill, which samples
+/// its one token, finishes it and caches the prompt.
+fn prefill_answers_alone(ctx: &AppContext, request: &PreparedRequest, prefill: &Worker) -> bool {
+    ctx.config.proxy.one_token_on_prefill_only
+        && prefill.mode() == WorkerMode::Prefill
+        && prefill.prefill_answers_alone()
+        && request.wants_at_most_one_token()
 }
 
 async fn admit_decode(
@@ -1184,11 +1196,54 @@ impl Drop for RequestDurationGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::WorkerSpec;
+    use crate::workers::worker::EngineProfile;
     use axum::http::StatusCode;
+
+    fn worker(mode: WorkerMode, prefill_answers_alone: bool) -> Worker {
+        let spec = WorkerSpec {
+            id: WorkerId("p".into()),
+            url: "http://p:30000".into(),
+            mode,
+            model_ids: vec![ModelId("m".into())],
+            ..Default::default()
+        };
+        let profile = EngineProfile {
+            prefill_answers_alone,
+            ..EngineProfile::from(crate::workers::WireProtocol::default())
+        };
+        Worker::with_cb_config(spec, None, profile)
+    }
+
+    /// Skipping decode needs the operator's flag and a prefill engine that
+    /// reports it can answer alone; an older engine keeps prefill and decode.
+    #[test]
+    fn prefill_answers_alone_needs_the_flag_and_the_engine() {
+        let mut ctx = AppContext::stub();
+        let mut request = PreparedRequest::test_generate(Some(1));
+        let capable = worker(WorkerMode::Prefill, true);
+        assert!(!prefill_answers_alone(&ctx, &request, &capable));
+
+        ctx.config.proxy.one_token_on_prefill_only = true;
+        assert!(prefill_answers_alone(&ctx, &request, &capable));
+        assert!(!prefill_answers_alone(
+            &ctx,
+            &request,
+            &worker(WorkerMode::Prefill, false)
+        ));
+        assert!(!prefill_answers_alone(
+            &ctx,
+            &request,
+            &worker(WorkerMode::Plain, true)
+        ));
+
+        request.output_tokens = Some(2);
+        assert!(!prefill_answers_alone(&ctx, &request, &capable));
+    }
 
     #[tokio::test]
     async fn stream_after_prefill_waits_for_prefill() {
-        let prefill = Arc::new(Worker::new(crate::discovery::WorkerSpec {
+        let prefill = Arc::new(Worker::new(WorkerSpec {
             mode: WorkerMode::Prefill,
             ..Default::default()
         }));

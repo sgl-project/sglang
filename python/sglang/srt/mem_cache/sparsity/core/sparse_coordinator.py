@@ -25,7 +25,6 @@ class RequestTrackers:
         device: torch.device,
         num_layers: int,
         min_sparse_prompt_len: int,
-        max_context_len: int,
     ):
         self.device = device
         self.num_layers = num_layers
@@ -120,7 +119,6 @@ class SparseCoordinator:
             device,
             end_layer - start_layer + 1,
             self.config.min_sparse_prompt_len,
-            self.req_to_token_pool.max_context_len,
         )
 
         # Initialize algorithm representation pool and context

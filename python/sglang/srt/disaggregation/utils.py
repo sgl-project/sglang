@@ -20,6 +20,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    Union,
     overload,
 )
 
@@ -30,7 +31,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
@@ -49,6 +50,10 @@ if TYPE_CHECKING:
         CommonKVManager,
         CommonKVReceiver,
         CommonKVSender,
+    )
+    from sglang.srt.managers.io_struct import (
+        GenerateReqInput,
+        TokenizedGenerateReqInput,
     )
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -337,6 +342,45 @@ def _is_fake_transfer(req: Req) -> bool:
         req.bootstrap_host is None
         and get_disagg().disaggregation_transfer_backend == "fake"
     )
+
+
+def lacks_decode_peer(
+    req: Union[Req, GenerateReqInput, TokenizedGenerateReqInput],
+    *,
+    disaggregation_mode: DisaggregationMode,
+    transfer_backend: TransferBackend,
+) -> bool:
+    """Whether a request to a prefill server names no bootstrap host, so that
+    no decode can find its KV. The caller passes its own mode and backend."""
+    return (
+        req.bootstrap_host is None
+        and disaggregation_mode == DisaggregationMode.PREFILL
+        and transfer_backend != TransferBackend.FAKE
+    )
+
+
+def answered_by_prefill(
+    req: Req,
+    *,
+    disaggregation_mode: DisaggregationMode,
+    transfer_backend: TransferBackend,
+) -> bool:
+    """Whether the prefill server answers this admitted request by itself: it
+    has no decode peer, and asks for no more than the token prefill samples.
+
+    Distinct from ``Req.is_prefill_only`` (max_new_tokens == 0, no sampling):
+    this is true for a one-token request as well."""
+    if not lacks_decode_peer(
+        req,
+        disaggregation_mode=disaggregation_mode,
+        transfer_backend=transfer_backend,
+    ):
+        return False
+    assert req.sampling_params.max_new_tokens in (0, 1), (
+        f"{req.rid=} has no decode peer but asks for "
+        f"{req.sampling_params.max_new_tokens} tokens"
+    )
+    return True
 
 
 def pre_alloc_fill_len(req: Req) -> int:
@@ -1816,8 +1860,7 @@ def get_kv_transfer_buf_infos(storage: KVStorage | StaticKVStorage):
 
 
 def _wire_state_type(state_type) -> Enum:
-    # A plan names a state type by its wire value; a static pool's
-    # hardware-specific component (Ascend's) arrives as its own enum member.
+    # Plans use wire strings, while static pools supply enum members.
     from sglang.srt.disaggregation.base.conn import StateType
 
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
@@ -1941,6 +1984,32 @@ def setup_state_kv_args(
             if draft_token_to_kv_pool is not None
             else 0
         )
+
+
+def setup_page_row_kv_args(
+    kv_args: KVArgs,
+    *,
+    token_to_kv_pool,
+    transfer_backend: TransferBackend,
+    draft_token_to_kv_pool=None,
+    draft_window_pages: int = 0,
+) -> None:
+    """Flags peers read to admit a prefill with another attention TP size:
+    only the Mooncake sender slices NVFP4 page rows by head, so the other
+    backends keep sending whole rows. ``draft_window_pages`` bounds the draft
+    KV tail a sliding-window-only draft reads (0 sends every draft page)."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+    kv_args.main_kv_page_row = (
+        isinstance(token_to_kv_pool, MiniMaxM3Nvfp4KVPool)
+        and transfer_backend == TransferBackend.MOONCAKE
+    )
+    if kv_args.main_kv_page_row:
+        kv_args.main_kv_head_dim = token_to_kv_pool.head_dim
+    if isinstance(draft_token_to_kv_pool, MHATokenToKVPool):
+        kv_args.draft_kv_head_num = draft_token_to_kv_pool.head_num
+        kv_args.draft_window_pages = draft_window_pages
 
 
 def _token_kv_view(token_to_kv_pool):

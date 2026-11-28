@@ -622,7 +622,7 @@ require_prebuilt_rust_exts() {
     suffix=$(python3 -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
     local missing=()
     local module
-    for module in server grpc multimodal; do
+    for module in server multimodal; do
         [ -f "python/sglang/srt/rust_extensions/_${module}${suffix}" ] || missing+=("${module}")
     done
     [ -f "python/sglang/srt/mem_cache/rust_tree_core/mem_cache${suffix}" ] \
@@ -876,7 +876,11 @@ install_extra_deps() {
             --no-deps --force-reinstall $PIP_INSTALL_SUFFIX
     fi
 
-    if [ "$IS_BLACKWELL" != "1" ]; then
+    if [ "$OPTIONAL_DEPS" = "diffusion" ]; then
+        # The media client uses httpcore's sni_hostname when dialing a validated IP.
+        # Resolve both packages for runners that retained the older evaluation stack.
+        $PIP_CMD install httpx "httpcore>=0.17.2" $PIP_INSTALL_SUFFIX
+    elif [ "$IS_BLACKWELL" != "1" ]; then
         # pyarrow 26 and ml-dtypes 0.6 need NumPy 2 at import, but lmms_eval pins
         # numpy 1.26.4; drop the caps once lmms_eval allows NumPy 2.
         $PIP_CMD install "lmms_eval==0.5.0" "pyarrow<26" "ml-dtypes<0.6" $PIP_INSTALL_SUFFIX
@@ -1007,7 +1011,7 @@ print(f"sglang resolves to {spec.origin}")
 # so a .so that cannot load passes find_spec and only fails inside some suite.
 import importlib
 if os.environ["SGLANG_CI_OPTIONAL_DEPS"] != "diffusion":
-    for mod in ("server", "grpc", "multimodal"):
+    for mod in ("server", "multimodal"):
         name = f"sglang.srt.rust_extensions._{mod}"
         try:
             importlib.import_module(name)

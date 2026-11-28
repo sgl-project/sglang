@@ -40,6 +40,8 @@ from sglang.srt.arg_groups.model_override_base import (
     _invoke_provider,
     _register_for,
     attention_backends_of,
+    ep_offset_joiner_of,
+    flashinfer_fa2_serves_head_dims,
     get_default_attn_backend,
     is_attention_backend_not_set,
     mamba_extra_buffer_of,
@@ -53,6 +55,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
+from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.configs.quant_utils import (
     LOADER_RESOLVED_QUANT_METHODS,
     get_quantization_config,
@@ -395,6 +398,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Lfm3ForCausalLM",
         "Lfm3VlForConditionalGeneration",
         "Lfm3AudioForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         "FalconH1ForCausalLM",
         "JetNemotronForCausalLM",
@@ -433,6 +437,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Lfm3ForCausalLM",
         "Lfm3VlForConditionalGeneration",
         "Lfm3AudioForConditionalGeneration",
+        "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
         # KDA backend's track-snapshot writes (decode + extend) so donated
@@ -443,7 +448,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # so validate_mamba_extra_buffer runs for these archs and must accept them.
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationMTP",
-        "Inkling2ForConditionalGeneration",
+        *INKLING2_ARCHS,
     }
 )
 
@@ -935,6 +940,8 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "Dots3NoteForCausalLM",
         "Xing4_0ForCausalLM",
         "KimiK31ForConditionalGeneration",
+        "GigaChat4ForCausalLM",
+        "GigaChat4ForCausalLMNextN",
     }
 )
 
@@ -1128,6 +1135,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        "NemotronH_Nano_Omni_Reasoning_V3",
         "NemotronH_Omni_Reasoning_V3",
         "Xing4_0ForCausalLM",
     }
@@ -1136,10 +1144,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
 
 @register_post_process
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
-    """Enable supported FlashInfer AllReduce fusion after CP and A2A resolution.
-
-    MiMo defaults to CuTeDSL on Blackwell; other supported models use auto.
-    """
+    """Enable supported FlashInfer AllReduce fusion after CP and A2A resolution."""
     model_config = model_config_of(view)
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
@@ -1170,10 +1175,11 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         view.flashinfer_allreduce_fusion_backend is None
         and (is_mimo or model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS)
         and not prefer_custom_dsv41
-        and (get_platform().is_sm90 or get_platform().is_sm100)
+        # SM90 is left out: on H200 the custom all-reduce plus fused add-RMSNorm
+        # was as fast or faster for the MoE models measured; opt in via the flag.
+        and get_platform().is_sm100
         and view.tp_size > 1
         and not attn_dp_enabled_of(view)
-        and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
         if is_confidential_compute():
@@ -1246,6 +1252,26 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
         ]
     except Exception:
         return False
+
+
+def _deterministic_flashinfer_serves_head_dims(view: Any) -> bool:
+    """Whether flashinfer's FA2 prefill handles the model's head dims (see
+    `flashinfer_fa2_serves_head_dims`). Unknown configs keep flashinfer."""
+    from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.connector import ConnectorType
+    from sglang.srt.utils.common import parse_connector_type
+
+    if parse_connector_type(view.model_path) == ConnectorType.INSTANCE:
+        return True
+    try:
+        model_config = model_config_of(view)
+    except Exception:
+        return True
+    # MLA head_dim/swa_head_dim are placeholders (e.g. 72 for Kimi-Linear),
+    # not the dims the MLA prefill kernel runs with.
+    if model_config.attention_arch == AttentionArch.MLA:
+        return True
+    return flashinfer_fa2_serves_head_dims(model_config)
 
 
 @register_post_process
@@ -1360,6 +1386,9 @@ def _deterministic_attention_backend(view: Any) -> dict:
             if _deterministic_is_deepseek_model(view):
                 # fallback to triton for DeepSeek models because flashinfer
                 # doesn't support deterministic inference for DeepSeek models yet
+                backend = "triton"
+            elif not _deterministic_flashinfer_serves_head_dims(view):
+                # flashinfer prefills with FA2, which rejects these head dims.
                 backend = "triton"
             else:
                 # fallback to flashinfer on Blackwell for non-DeepSeek models
@@ -1679,7 +1708,7 @@ def _page_size_default(view: Any) -> dict:
 
 @register_post_process
 def _data_parallelism_defaults(view: Any) -> dict:
-    if num_dp_ranks_of(view) == 1 and view.ep_join_mode != "scale":
+    if num_dp_ranks_of(view) == 1 and not ep_offset_joiner_of(view):
         return {"enable_dp_lm_head": False}
     return {}
 

@@ -89,7 +89,7 @@ def plan_indexer_query_shard(
 
 
 class _IndexerQueryShard(NamedTuple):
-    """This rank's rows of an extend batch, and how to reassemble the top-k."""
+    """This rank's query rows and how to reassemble the top-k."""
 
     start: int
     rows: int
@@ -98,10 +98,11 @@ class _IndexerQueryShard(NamedTuple):
     tp_size: int
     actual_seq_lengths_q: torch.Tensor
     actual_seq_lengths_kv: torch.Tensor
+    request_rows: Optional[slice] = None
 
     def take(self, x: torch.Tensor) -> torch.Tensor:
-        if self.num_real == self.rows:
-            return x[self.start : self.start + self.rows]
+        if self.request_rows is not None or self.num_real == self.rows:
+            return x[self.start : self.start + self.num_real]
         # Padding rows lie past actual_seq_lengths_q[-1]; gather() drops them.
         out = x.new_zeros((self.rows, *x.shape[1:]))
         out[: self.num_real] = x[self.start : self.start + self.num_real]
@@ -109,15 +110,23 @@ class _IndexerQueryShard(NamedTuple):
 
     def gather(self, topk_indices: torch.Tensor, num_tokens: int) -> torch.Tensor:
         """All-gather the per-rank top-k back to ``num_tokens`` rows."""
-        out = topk_indices.new_empty((self.rows * self.tp_size, topk_indices.shape[-1]))
+        topk_width = topk_indices.shape[-1]
+        if self.request_rows is not None and self.num_real < self.rows:
+            # The collective needs equal-size tiles.
+            padded_topk = topk_indices.new_empty((self.rows, topk_width))
+            if self.num_real:
+                padded_topk[: self.num_real].copy_(topk_indices)
+            topk_indices = padded_topk
+        gather_rows = self.rows * self.tp_size
+        out = topk_indices.new_empty((gather_rows, topk_width))
         attn_tp_all_gather_into_tensor(out, topk_indices.contiguous())
         return out[:num_tokens]
 
     def resolve(
         self, topk_indices: torch.Tensor, num_tokens: int, forward_batch
     ) -> torch.Tensor:
-        """Full-width top-k, or this rank's own rows when the token shard will
-        slice the gathered tensor straight back to them anyway.
+        """Full-width top-k, or local rows when only token-sharded attention
+        consumes them. MTP seed export still needs batch-global row offsets.
 
         Sets ``npu_indexer_topk_is_local`` so attention knows which it got.
         """
@@ -131,6 +140,12 @@ class _IndexerQueryShard(NamedTuple):
                 f"(plan {plan.local_start}+{plan.rows} against shard "
                 f"{self.start}+{self.rows}); keeping the top-k all-gather"
             )
+            local = False
+        spec_info = getattr(forward_batch, "spec_info", None)
+        if getattr(spec_info, "dsa_seed_topk_capture", None) is not None:
+            # write_mtp_seed selects each request's last prefill token using
+            # global row indices. Keep the gather for that extra consumer;
+            # attention will slice the full-width top-k back to its own rows.
             local = False
         forward_batch.npu_indexer_topk_is_local = local
         if not local:
@@ -216,6 +231,37 @@ def _get_indexer_query_shard(
     return shard
 
 
+def _build_decode_indexer_shard(
+    request_width: int,
+    query_ends: torch.Tensor,
+    kv_lens: torch.Tensor,
+    tp_size: int,
+    tp_rank: int,
+) -> _IndexerQueryShard:
+    """Assign whole requests from the same batch layout on every TP rank."""
+    batch_size = query_ends.numel()
+    # Contiguous equal-capacity tiles put all collective padding after real rows.
+    requests_per_rank = (batch_size + tp_size - 1) // tp_size
+    request_start = min(tp_rank * requests_per_rank, batch_size)
+    request_end = min(request_start + requests_per_rank, batch_size)
+    request_rows = slice(request_start, request_end)
+    rows = requests_per_rank * request_width
+    start = request_start * request_width
+    local_query_ends = query_ends[request_rows]
+    if request_start < request_end:
+        local_query_ends = local_query_ends - start
+    return _IndexerQueryShard(
+        start=start,
+        rows=rows,
+        num_real=(request_end - request_start) * request_width,
+        total=batch_size * request_width,
+        tp_size=tp_size,
+        actual_seq_lengths_q=local_query_ends,
+        actual_seq_lengths_kv=kv_lens[request_rows],
+        request_rows=request_rows,
+    )
+
+
 class DSANPUIndexerMixin:
     def _forward_npu_lsa_indexer(
         self,
@@ -275,12 +321,12 @@ class DSANPUIndexerMixin:
         # indexer (before the attention backend's forward_extend), so prepare it
         # here rather than in the shared eager runner.
         attn_backend = get_attn_backend()
-        if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
-            attn_backend.prepare_dsa_cp_metadata(forward_batch)
         # Hybrid models (Kimi K2/K3) wrap a full-attn and a linear backend;
-        # the forward metadata consumed here lives on the full-attn side.
+        # unwrap before preparing CP metadata as well as reading it.
         if hasattr(attn_backend, "full_attn_backend"):
             attn_backend = attn_backend.full_attn_backend
+        if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
+            attn_backend.prepare_dsa_cp_metadata(forward_batch)
         if attn_backend.forward_metadata.seq_lens_cpu_int is None:
             actual_seq_lengths_kv = attn_backend.forward_metadata.seq_lens
         else:
@@ -607,6 +653,32 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table,
             )
+        if (
+            attn_backend.use_decode_indexer_request_shard
+            and not input_on_attn_tp_slices
+        ):
+            request_width = None
+            mode = forward_batch.forward_mode
+            if mode.is_decode():
+                request_width = 1
+            elif mode.is_target_verify() and forward_batch.ragged_verify_layout is None:
+                request_width = int(forward_batch.spec_info.draft_token_num)
+
+            if request_width is not None:
+                shard = _build_decode_indexer_shard(
+                    request_width,
+                    actual_seq_lengths_q,
+                    actual_seq_lengths_kv,
+                    parallel.attn_tp_size,
+                    parallel.attn_tp_rank,
+                )
+                if shard.num_real == 0:
+                    # Empty ranks skip scoring and still join the gather.
+                    empty_topk = torch.empty(
+                        (0, self.index_topk), dtype=torch.int32, device=k.device
+                    )
+                    return shard.resolve(empty_topk, bs, forward_batch)
+                block_table = block_table[shard.request_rows]
         if (
             is_prefill
             and self.dsa_enable_prefill_cp
