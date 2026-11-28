@@ -107,5 +107,24 @@ def test_k3_front_fp32_router_sm107(m):
     )
 
 
+@pytest.mark.parametrize("has_bias", [False, True])
+@pytest.mark.parametrize("m", [1, 16, 64])
+def test_cutedsl_bf16_gemm_out_fp32(m, has_bias):
+    if not current_arch().is_sm(10):
+        pytest.skip("SM10x required")
+
+    n, k = 1536, 7168
+    torch.manual_seed(m)
+    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    weight = (torch.randn(n, k, device="cuda") / math.sqrt(k)).to(torch.bfloat16)
+    bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") if has_bias else None
+    out = torch.empty(m, n, dtype=torch.float32, device="cuda")
+    cutedsl_bf16_gemm_out(x, weight, out, bias)
+    ref = torch.mm(x, weight.T, out_dtype=torch.float32)
+    if bias is not None:
+        ref += bias.float()
+    torch.testing.assert_close(out, ref, rtol=0, atol=0.005)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
