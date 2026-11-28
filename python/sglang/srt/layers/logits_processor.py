@@ -234,6 +234,7 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    draft_topk_index: Optional[torch.Tensor] = None
 
     # Original flattened token indices when only a subset of hidden rows is captured.
     hidden_states_token_indices: Optional[torch.Tensor] = None
@@ -528,6 +529,8 @@ class LogitsProcessor(nn.Module):
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
+        # Set on a draft model's processor by configure_draft_head_tp.
+        self.draft_head_tp = None
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head or getattr(
             config, "enable_lm_head_fp32", False
@@ -689,7 +692,10 @@ class LogitsProcessor(nn.Module):
         # Extract MIS / setwise indices before ForwardBatch → LogitsMetadata conversion
         multi_item_delimiter_indices = None
         token_indices_to_pool = None
+        draft_head_tp = None
         if isinstance(logits_metadata, ForwardBatch):
+            if logits_metadata.mtp_draft_head_tp:
+                draft_head_tp = self.draft_head_tp
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             token_indices_to_pool = logits_metadata.token_indices_to_pool
             verify_vocab_shards = self._batch_vocab_shards(logits_metadata)
@@ -780,6 +786,19 @@ class LogitsProcessor(nn.Module):
             hidden_states, aux_hidden_states, logits_metadata
         )
         del hidden_states
+
+        if draft_head_tp is not None:
+            # Only the draft graphs set it; they never ask for logprobs or sampled rows.
+            assert not logits_metadata.extend_return_logprob and sample_indices is None
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=hidden_states_to_store,
+                draft_topk_index=draft_head_tp(
+                    pruned_states,
+                    lm_head.weight,
+                    draft_nan_sentinel=logits_metadata.forward_mode.is_decode(),
+                ),
+            )
 
         if not logits_metadata.extend_return_logprob:
             vocab_shard = self._verify_vocab_shard(lm_head, logits_metadata)

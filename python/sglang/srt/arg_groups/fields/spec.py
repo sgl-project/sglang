@@ -268,6 +268,13 @@ class Spec(msgspec.Struct):
         Optional[str],
         "Path to a JSON config file for adaptive speculative decoding tuning knobs.",
     ] = None
+    draft_head_tp: A[
+        str,
+        Arg(
+            help="Shard the greedy top-1 draft lm_head argmax over node-local TP ranks on decode workers with pure attention DP. 'auto' turns it on for validated draft architectures (currently Qwen3.5 MTP) and logs why when it does not; 'on' forces it for any architecture that meets the conditions; 'off' keeps the stock draft head.",
+            choices=["auto", "on", "off"],
+        ),
+    ] = "auto"
     spec_trace_dir: A[
         Optional[str], "Directory to write decoupled speculative decoding trace files."
     ] = None
