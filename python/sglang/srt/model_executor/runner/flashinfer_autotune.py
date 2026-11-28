@@ -30,6 +30,7 @@ from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
+    get_lora,
     get_model,
     get_parallel,
     get_platform,
@@ -45,6 +46,9 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -319,6 +323,88 @@ def attach_flashinfer_managed_autotune_cache(model_runner: ModelRunner) -> None:
     # and attaching the root a process already has is a no-op.
     with autotune_v2(mode="replay", cache_root=root):
         pass
+
+
+def uses_flashinfer_capture_replay(runner: DecodeCudaGraphRunner) -> bool:
+    """Whether this runner's decode capture must be served entirely by the store."""
+    from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+        FullCudaGraphBackend,
+    )
+
+    mr = runner.model_runner
+    # Draft runners subclass the decode runner without its full field set, so they
+    # are ruled out before any runner field is read.
+    # FlashInfer's strict replay is single-rank only: on a miss one rank would tune
+    # while the others capture. Checked here, not inherited from the store's scope.
+    # Foundry captures or restores each shape itself; a restored graph looks nothing up.
+    return (
+        not mr.is_draft_worker
+        and get_parallel().max_world_size == 1
+        and uses_flashinfer_managed_autotune_cache()
+        and not get_foundry_adapter().enabled
+        and isinstance(runner.backend, FullCudaGraphBackend)
+        and runner.capture_forward_mode == ForwardMode.DECODE
+        and not runner.enable_torch_compile
+        and not get_exec().overlap.enable_two_batch_overlap
+        and not get_lora().enable_lora
+        and should_run_flashinfer_autotune(mr)
+    )
+
+
+def capture_with_flashinfer_replay(
+    runner: DecodeCudaGraphRunner,
+    capture: Callable[[], None],
+    forward_fn: Callable[[], object],
+    post_warmup_hook: Optional[Callable[[], None]],
+) -> None:
+    """Capture one decode shape from stored tactics, tuning any it lacks first."""
+    if not uses_flashinfer_capture_replay(runner):
+        capture()
+        return
+    from flashinfer import autotune_v2
+
+    # The process's own store, selected for these contexts only.
+    store = dict(
+        cache_root=flashinfer_managed_autotune_cache_root(),
+        cache_scope="context",
+        skip_ops=get_flashinfer_autotune_skip_ops(),
+    )
+    miss = _capture_strictly(autotune_v2, store, capture)
+    if miss is None:
+        return
+    logger.info("FlashInfer autotune: %s; tuning this decode shape.", miss)
+    # The miss raised in an eager warmup or in capture, neither of which kept a graph.
+    try:
+        with autotune_v2(mode="tune", **store):
+            forward_fn()
+    finally:
+        if post_warmup_hook is not None:
+            post_warmup_hook()
+    miss = _capture_strictly(autotune_v2, store, capture)
+    if miss is None:
+        return
+    # A bug, not an expected state; capture as without this check rather than fail.
+    logger.warning(
+        "FlashInfer autotune: %s even after tuning this decode shape; "
+        "capturing it with the default tactic.",
+        miss,
+    )
+    capture()
+
+
+def _capture_strictly(
+    autotune_v2, store: dict, capture: Callable[[], None]
+) -> Optional[RuntimeError]:
+    """Capture under strict replay; return FlashInfer's miss error instead of raising it."""
+    report = None
+    try:
+        with autotune_v2(mode="replay", strict_replay=True, **store) as report:
+            capture()
+    except RuntimeError as exc:
+        if report is None or not report.misses:
+            raise
+        return exc
+    return None
 
 
 def _autotune_tactic_sync_group(

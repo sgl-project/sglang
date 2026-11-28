@@ -207,7 +207,16 @@ class TestKimiK31PrefillCP(CustomTestCase):
 
         with ExitStack() as stack:
             stack.enter_context(
-                get_parallel().override(attn_cp_rank=1, dcp_enabled=False)
+                get_parallel().override(
+                    tp_size=2,
+                    tp_rank=1,
+                    attn_tp_size=1,
+                    attn_dp_size=1,
+                    attn_cp_size=2,
+                    attn_cp_rank=1,
+                    moe_tp_size=2,
+                    dcp_enabled=False,
+                )
             )
             for name, value in (
                 ("get_attn_backend", exposed_backend),
