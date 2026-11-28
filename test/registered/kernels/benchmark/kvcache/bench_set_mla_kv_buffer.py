@@ -63,7 +63,9 @@ ROPE_DIM = 64
 
 
 @marker.parametrize("batch_size", marker.range(15, pattern="pow2"), [1, 128, 8192])
-@marker.benchmark("provider", ["wrapper", "jit_tma", "triton"])
+@marker.benchmark(
+    "provider", ["wrapper", "jit_tma", "triton"], gate=["wrapper", "jit_tma"]
+)
 def benchmark(batch_size: int, provider: str):
     cache_k_nope = torch.randn(
         (batch_size, 1, NOPE_DIM),

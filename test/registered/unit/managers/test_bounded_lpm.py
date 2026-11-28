@@ -127,13 +127,14 @@ class TestBoundedLPM(CustomTestCase):
         s.tree_cache = s.policy.tree_cache
         with patch(
             "sglang.srt.managers.scheduler.get_parallel",
-            return_value=SimpleNamespace(tp_size=1),
+            return_value=SimpleNamespace(tp_size=1, pp_size=1),
         ):
             s.init_running_status()
         s.enable_hierarchical_cache = False
         s.enable_priority_scheduling = False
         s.schedule_low_priority_values_first = False
         s.dllm_config = None
+        s.chunked_prefill_size = None
         s.init_schedule_policy()
         s.policy._should_start_bounded_batch = lambda waiting: True
         self.assertIsNone(s.waiting_queue._on_leave)

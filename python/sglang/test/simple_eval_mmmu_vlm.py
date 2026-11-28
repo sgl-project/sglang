@@ -300,10 +300,7 @@ class MMMUVLMEval(Eval):
             num_sum = 0
             for cat in cats:
                 if cat in evaluation_result:
-                    acc_sum += (
-                        evaluation_result[cat]["acc"]
-                        * evaluation_result[cat]["num_example"]
-                    )
+                    acc_sum += per_cat_correct.get(cat, 0)
                     num_sum += evaluation_result[cat]["num_example"]
             if num_sum > 0:
                 printable_results[f"Overall-{domain}"] = {
@@ -321,10 +318,7 @@ class MMMUVLMEval(Eval):
         # Overall
         total_num = sum(v["num_example"] for v in evaluation_result.values())
         overall_acc = (
-            sum(v["acc"] * v["num_example"] for v in evaluation_result.values())
-            / total_num
-            if total_num > 0
-            else 0.0
+            sum(per_cat_correct.values()) / total_num if total_num > 0 else 0.0
         )
         printable_results["Overall"] = {"num": total_num, "acc": round(overall_acc, 3)}
 

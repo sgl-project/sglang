@@ -24,7 +24,8 @@ class TestSamplingMaskValidation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         self.manager = TokenizerManager.__new__(TokenizerManager)
-        self.manager.context_len = 128
+        self.manager.max_req_len = 128
+        self.manager.max_req_input_len = 122
         self.manager.num_reserved_tokens = 0
         self.manager.allow_auto_truncate = False
         self.manager.validate_total_tokens = False
@@ -53,6 +54,7 @@ class TestSamplingMaskValidation(CustomTestCase):
     def test_top_logprobs_num_must_be_a_valid_count_when_logprobs_requested(self):
         """A malformed or oversized candidate count must not reach the scheduler."""
         self.manager.model_config.vocab_size = 32
+        self.manager.model_config.token_id_vocab_size = 32
         for top_logprobs_num, return_logprob, accepted in (
             (None, True, True),
             (0, True, True),
@@ -125,6 +127,7 @@ class TestSamplingMaskValidation(CustomTestCase):
         Each enabled item keeps its own count.
         """
         self.manager.model_config.vocab_size = 32
+        self.manager.model_config.token_id_vocab_size = 32
         self.manager.preferred_sampling_params = None
         self.manager.sampling_params_class = SamplingParams
         self.manager.tokenizer = None
