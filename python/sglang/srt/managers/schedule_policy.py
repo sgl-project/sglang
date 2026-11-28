@@ -595,6 +595,8 @@ class SchedulePolicy:
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        # DFS-weight does not use the temporary deprioritization result.
+        check_in_batch_prefix = policy != CacheAwarePolicy.DFS_WEIGHT
 
         # In-batch prefix caching: of the requests with almost nothing cached that
         # share a prefix, only one runs, so the shared prefix is computed once.
@@ -602,7 +604,10 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             match_kv_cache(r, self.tree_cache, prefix_ids)
-            if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+            if (
+                check_in_batch_prefix
+                and r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD
+            ):
                 # Only the first DEPRIORITIZE_THRESHOLD tokens can decide a match.
                 key_ids = prefix_ids[:IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD]
                 candidates.append((r, key_ids))

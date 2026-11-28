@@ -567,5 +567,55 @@ def resolve(**kwargs):
     )
 
 
+class TestInBatchPrefixCaching(CustomTestCase):
+    def make_policy(self, name, cached_tokens=0):
+        tree = RadixCache.create_simulated()
+        if cached_tokens:
+            tree.insert(InsertParams(key=RadixKey(array("q", [1] * cached_tokens))))
+        return SchedulePolicy(
+            policy=name,
+            tree_cache=tree,
+            enable_hierarchical_cache=False,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+    def make_requests(self):
+        # a and b share a cold prefix; c is independent. The names and arrival
+        # times otherwise put b before c under each deduplicating policy.
+        requests = [
+            _make_req("a", "", [1] * 64 + [2]),
+            _make_req("b", "", [1] * 64 + [3]),
+            _make_req("c", "", [4] * 64 + [5]),
+        ]
+        for index, req in enumerate(requests):
+            req.time_stats.wait_queue_entry_time = index
+            req.arrival_processed_tokens = 0
+        return requests
+
+    def test_dfs_weight_does_not_store_unused_waiting_prefixes(self):
+        for cached_tokens in (0, 8, 64):
+            with self.subTest(cached_tokens=cached_tokens):
+                policy = self.make_policy("dfs-weight", cached_tokens)
+                requests = self.make_requests()
+                ordered = policy.calc_priority(requests)
+                self.assertEqual([req.rid for req in ordered], ["a", "b", "c"])
+                self.assertEqual(
+                    [req.prefix_len for req in requests],
+                    [cached_tokens, cached_tokens, 0],
+                )
+                self.assertEqual(policy.waiting_queue_radix_tree.total_size(), 0)
+
+    def test_other_cache_aware_policies_still_defer_duplicate_prefixes(self):
+        self.enterContext(get_context().override_server_args())
+        for name in ("lpm", "hrrn", "shortest-prefill-first", "uniboost"):
+            with self.subTest(policy=name):
+                policy = self.make_policy(name)
+                ordered = policy.calc_priority(
+                    self.make_requests(), processed_tokens=1000
+                )
+                self.assertEqual([req.rid for req in ordered], ["a", "c", "b"])
+
+
 if __name__ == "__main__":
     unittest.main()
