@@ -89,6 +89,8 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # reused by the rest of the forward; None when the metadata has no snapshot, so
     # every layer builds its own.
     index_plans: Optional[Dict[int, object]]
+    # (K owner, compression ratio) -> Hopper FP8 K pages shared for this forward.
+    paged_index_k_caches: Dict[tuple[int, int], object]
     # [rows, pages] int32 at the KV page size; the index-K pool pages it with
     # expand_index_page_table.
     kv_page_table: torch.Tensor

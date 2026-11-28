@@ -12,6 +12,7 @@ Runs on CPU: the arch is faked by patching ``current_arch()`` in the
 v41_indexer / index_logits module namespaces.
 """
 
+import os
 import unittest
 from contextlib import ExitStack
 from itertools import product
@@ -24,6 +25,7 @@ from sglang.kernels.ops.attention.dsv4 import index_logits
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4 import v41_indexer as indexer
 from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+    BlockIds,
     DenseBlocksBackend,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -178,6 +180,146 @@ class TestV41IndexerArchGates(CustomTestCase):
                     prefill.use_sm90_deep_gemm_consume,
                     deep_gemm_present and enable_consumer,
                 )
+
+    def test_hopper_prefill_consumer_scores_large_batches_against_shared_k(self):
+        backend = DenseBlocksBackend(
+            token_to_kv_pool=mock.Mock(),
+            req_to_token=torch.empty(0),
+            candidate_topk_blocks=2048,
+            candidate_block_size=8,
+            use_deep_gemm_publish=True,
+            use_deep_gemm_consume=False,
+            use_sm90_deep_gemm_consume=True,
+        )
+        with (
+            mock.patch.object(backend, "_sm90_consume_prefill") as score_fp8,
+            mock.patch.object(backend, "_torch_consume_prefill") as score_torch,
+        ):
+            for rows, context, compact in (
+                (4, 524288, True),
+                (5, 1048576, False),
+                (4, 131072, False),
+                (4, 36864, False),
+            ):
+                inputs = SimpleNamespace(seq_lens_cpu=[context], compress_ratio=1)
+                published = BlockIds(blocks=torch.empty(rows, 2048, dtype=torch.int32))
+                backend.consume_prefill(inputs, published)
+                score_fp8.assert_called_with(inputs, published, compact=compact)
+            score_torch.assert_not_called()
+
+    def test_hopper_prefill_consumer_defaults_to_deepgemm(self):
+        with (
+            self._route(_FakeCudaArch((9, 0)), deep_gemm_present=True),
+            mock.patch.dict(os.environ),
+        ):
+            os.environ.pop("SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL", None)
+            backend, _ = indexer.make_candidate_indexer(
+                token_to_kv_pool=SimpleNamespace(),
+                req_to_token=torch.empty(0),
+                page_size=64,
+                candidate_topk_blocks=2048,
+                candidate_block_size=8,
+            )
+        self.assertTrue(backend.use_sm90_deep_gemm_consume)
+
+    def test_hopper_prefill_consumer_paged_vs_shared_routing(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks
+
+        backend = DenseBlocksBackend(
+            token_to_kv_pool=SimpleNamespace(
+                get_low_ratio_index_k_fp4=lambda *_args: ("k", "sf")
+            ),
+            req_to_token=torch.empty(0),
+            candidate_topk_blocks=2048,
+            candidate_block_size=8,
+            use_deep_gemm_publish=True,
+            use_deep_gemm_consume=False,
+            use_sm90_deep_gemm_consume=True,
+        )
+        for rows, context, expect_paged in (
+            (64, 32767, False),
+            (64, 32768, True),
+            (128, 32768, True),
+            (129, 32768, False),
+            (129, 131072, True),
+        ):
+            with self.subTest(rows=rows, context=context):
+                data = SimpleNamespace(
+                    num_rows=rows,
+                    lens_per_request=[context],
+                    k_slots=torch.empty(0),
+                    empty_selection=lambda k: torch.full((rows, k), -1),
+                    write_selection=mock.Mock(),
+                    write_page_indices=mock.Mock(),
+                )
+                inputs = SimpleNamespace(
+                    layer_id=0,
+                    indexer=SimpleNamespace(index_topk=8),
+                    reset_outputs=mock.Mock(),
+                    out_raw_indices=torch.empty((rows, 8), dtype=torch.int32),
+                )
+                published = BlockIds(
+                    blocks=torch.empty((rows, 2048), dtype=torch.int32)
+                )
+                with (
+                    mock.patch.object(
+                        dense_blocks, "get_deep_gemm_prefill_data", return_value=data
+                    ),
+                    mock.patch.object(backend, "_sm90_consume_paged") as paged,
+                    mock.patch.object(
+                        dense_blocks, "score_tiles", return_value=[]
+                    ) as flat,
+                ):
+                    backend._sm90_consume_prefill(inputs, published, compact=False)
+                self.assertEqual(paged.called, expect_paged)
+                self.assertEqual(flat.called, not expect_paged)
+
+    def test_dsv4_metadata_paged_k_cache_ownership(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
+
+        def _metadata():
+            return DSV4Metadata(
+                core_attn_metadata=SimpleNamespace(
+                    copy_=lambda _other: None,
+                    refresh_for_breakable_cuda_graph_replay_=lambda _other: None,
+                ),
+                indexer_metadata=None,
+            )
+
+        # copy_ clears cached pages in place.
+        dst = _metadata()
+        dst.low_ratio_paged_index_k_caches[(0, 1)] = object()
+        dst.copy_(_metadata())
+        self.assertEqual(dst.low_ratio_paged_index_k_caches, {})
+
+        # Breakable graph replay discards prior-replay pages on the full
+        # metadata and preserves dict sharing with the late-layer tail.
+        captured_full = _metadata()
+        stale_entry = object()
+        captured_full.low_ratio_paged_index_k_caches[(0, 1)] = stale_entry
+        captured_tail = _metadata()
+        captured_tail.low_ratio_paged_index_k_caches[(0, 1)] = stale_entry
+
+        fresh_full = _metadata()
+        captured_full.refresh_for_breakable_cuda_graph_replay_(fresh_full)
+        self.assertEqual(captured_full.low_ratio_paged_index_k_caches, {})
+        self.assertIs(
+            captured_full.low_ratio_paged_index_k_caches,
+            fresh_full.low_ratio_paged_index_k_caches,
+        )
+
+        fresh_tail = _metadata()
+        fresh_tail.low_ratio_paged_index_k_caches = (
+            captured_full.low_ratio_paged_index_k_caches
+        )
+        captured_tail.refresh_for_breakable_cuda_graph_replay_(fresh_tail)
+        self.assertIs(
+            captured_tail.low_ratio_paged_index_k_caches,
+            captured_full.low_ratio_paged_index_k_caches,
+        )
+        new_entry = object()
+        captured_full.low_ratio_paged_index_k_caches[(0, 1)] = new_entry
+        self.assertIs(captured_tail.low_ratio_paged_index_k_caches[(0, 1)], new_entry)
 
     def test_deep_gemm_prefill_still_needs_deep_gemm(self):
         with self._route(_FakeCudaArch((12, 1)), deep_gemm_present=False):

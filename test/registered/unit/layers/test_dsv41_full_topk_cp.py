@@ -59,6 +59,7 @@ class TestDSV41FullTopKCP(CustomTestCase):
                 ratio=ratio,
             ),
             index_plans=None,
+            paged_index_k_caches={},
             kv_page_table=torch.zeros(rows, 1, dtype=torch.int32),
             seq_lens_cpu=seq_lens_cpu,
             rows_per_request=counts,

@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
@@ -450,9 +451,15 @@ class TestDensePrefillIndexer(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
     def test_hopper_consumer_selects_published_blocks(self):
-        # Cover the all-block, wide-candidate and physically compact paths.
+        # Cover the all-block, wide-candidate, packed, and paged paths.
         # An invalid trailing candidate or wrong request offset must never be selected.
-        for context in (16, 25, 65):
+        for context, candidate_blocks, expected_k_rows in (
+            (16, 2, 19),
+            (25, 2, 28),
+            (65, 2, 68),
+            (1025, 2, 64),
+            (32769, 256, 32896),
+        ):
             with self.subTest(context=context):
                 cases = [(2, 3), (2, context)]
                 source = make_inputs(cases)
@@ -475,6 +482,7 @@ class TestDensePrefillIndexer(CustomTestCase):
                     req_pool_indices=torch.arange(len(cases), device="cuda"),
                     k_slots=data.k_slots,
                     index_plans=None,
+                    paged_index_k_caches={},
                     kv_page_table=torch.empty(0, device="cuda"),
                     seq_lens_cpu=data.lens_per_request,
                     rows_per_request=data.rows_per_request,
@@ -493,10 +501,11 @@ class TestDensePrefillIndexer(CustomTestCase):
 
                 backend = dense_blocks.DenseBlocksBackend(
                     token_to_kv_pool=SimpleNamespace(
-                        get_low_ratio_index_k_fp4=get_fp4_rows
+                        get_low_ratio_index_k_fp4=get_fp4_rows,
+                        source_layer_of=lambda _: 0,
                     ),
                     req_to_token=torch.empty(0, device="cuda"),
-                    candidate_topk_blocks=2,
+                    candidate_topk_blocks=candidate_blocks,
                     candidate_block_size=8,
                     use_deep_gemm_publish=True,
                     use_deep_gemm_consume=False,
@@ -519,6 +528,16 @@ class TestDensePrefillIndexer(CustomTestCase):
                     return_value=(*consumer["q"], consumer["weights"]),
                 ):
                     backend.consume_prefill(inputs, published)
+                    if context == 32769:
+                        page_map = published.sm90_page_map
+                        self.assertIsNotNone(page_map)
+                        k_cache = inputs.paged_index_k_caches[(0, 1)]
+                        previous = raw.sort(dim=1).values
+                        later_layer = msgspec.structs.replace(inputs, layer_id=1)
+                        backend.consume_prefill(later_layer, published)
+                        self.assertIs(published.sm90_page_map, page_map)
+                        self.assertIs(inputs.paged_index_k_caches[(0, 1)], k_cache)
+                        torch.testing.assert_close(raw.sort(dim=1).values, previous)
                 scores = dense_scores(consumer)
                 columns = torch.arange(scores.shape[1], device="cuda")
                 member = (
@@ -531,8 +550,157 @@ class TestDensePrefillIndexer(CustomTestCase):
                 torch.testing.assert_close(inputs.out_page_indices, selected)
                 self.assertEqual(
                     gathers,
-                    [3 + context, rows * 16 if context >= 32 else 3 + context],
+                    [3 + context, expected_k_rows],
                 )
+
+    @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
+    def test_hopper_paged_consumer_cache_ownership_tail_and_empty_request(self):
+        # Verify: (1) zero-length request mixed with 32K+ context,
+        # (2) max_context_len is capped to request pages when sparse_small_batch
+        #     fires with more candidate blocks than pages,
+        # (3) second consumer with different queries reuses k_cache & page_map,
+        # (4) published.tail(...) reuses k_cache while building a fresh page_map,
+        # (5) a different K source layer builds its own k_cache and refreshes page_map.
+        cases = [(1, 0), (2, 3), (2, 32769)]
+        source = make_inputs(cases, seed=11)
+        consumer_a = make_inputs(cases, seed=29)
+        consumer_b = make_inputs(cases, seed=43)
+        source_other_k = make_inputs(cases, seed=61)
+        consumer_a["kv"] = consumer_b["kv"] = source["kv"]
+        source["topk"] = consumer_a["topk"] = consumer_b["topk"] = 8
+        data = prefill_data(source)
+        rows = data.num_rows
+        positions = torch.where(
+            data.compress_lens > 0, data.compress_lens.long() - 1, 0
+        )
+        raw = torch.empty((rows, 8), device="cuda", dtype=torch.int32)
+        inputs = PrefillInputs(
+            indexer=SimpleNamespace(index_topk=8),
+            layer_id=0,
+            compress_ratio=1,
+            freqs_cis=torch.empty(0, device="cuda"),
+            x=torch.empty((rows, 0), device="cuda"),
+            q_lora=torch.empty((rows, 0), device="cuda"),
+            positions=positions,
+            req_rows=None,
+            req_pool_indices=torch.arange(len(cases), device="cuda"),
+            k_slots=data.k_slots,
+            index_plans=None,
+            paged_index_k_caches={},
+            kv_page_table=torch.empty(0, device="cuda"),
+            seq_lens_cpu=data.lens_per_request,
+            rows_per_request=data.rows_per_request,
+            rows_per_request_device=torch.tensor(
+                data.rows_per_request, dtype=torch.int32, device="cuda"
+            ),
+            out_raw_indices=raw,
+            out_page_indices=torch.empty_like(raw),
+        )
+        # Note: row 0 has compress_lens=0; use compress_ratio=2 only for positions,
+        # or override prefill_index_plan compress_lens directly by setting pos=-1 -> 0.
+        positions[0] = -1
+
+        def get_fp4_rows(layer_id, slots):
+            kv = source_other_k["kv"] if layer_id >= 2 else source["kv"]
+            return tuple(value[slots] for value in kv)
+
+        backend = dense_blocks.DenseBlocksBackend(
+            token_to_kv_pool=SimpleNamespace(
+                get_low_ratio_index_k_fp4=get_fp4_rows,
+                source_layer_of=lambda lid: 2 if lid >= 2 else 0,
+            ),
+            req_to_token=torch.empty(0, device="cuda"),
+            candidate_topk_blocks=1024,
+            candidate_block_size=8,
+            use_deep_gemm_publish=True,
+            use_deep_gemm_consume=False,
+            use_sm90_deep_gemm_consume=True,
+        )
+        with patch.object(
+            scoring,
+            "_index_q_and_weights",
+            return_value=(*source["q"], source["weights"]),
+        ):
+            published = backend.publish_prefill(inputs)
+
+        with patch.object(
+            scoring,
+            "_index_q_and_weights",
+            return_value=(*consumer_a["q"], consumer_a["weights"]),
+        ):
+            backend.consume_prefill(inputs, published)
+
+        page_map_a = published.sm90_page_map
+        self.assertIsNotNone(page_map_a)
+        # 32769 tokens = 513 pages (< 1024 candidate blocks), aligned to 256 -> 32896 -> 33024.
+        self.assertEqual(page_map_a.max_context_len, 33024)
+        k_cache_0 = inputs.paged_index_k_caches[(0, 1)]
+        self.assertTrue((raw[0] == -1).all())
+
+        # Second consumer with different queries on same source_layer reuses both caches.
+        later_layer = msgspec.structs.replace(inputs, layer_id=1)
+        with patch.object(
+            scoring,
+            "_index_q_and_weights",
+            return_value=(*consumer_b["q"], consumer_b["weights"]),
+        ):
+            backend.consume_prefill(later_layer, published)
+        self.assertIs(published.sm90_page_map, page_map_a)
+        self.assertIs(inputs.paged_index_k_caches[(0, 1)], k_cache_0)
+        scores_b = dense_scores(consumer_b)
+        columns = torch.arange(scores_b.shape[1], device="cuda")
+        member = (columns[None, :, None] // 8 == published.blocks[:, None, :]).any(-1)
+        selected_b = torch.where(raw >= 0, raw + data.request_starts[:, None], -1)
+        self.assert_topk(
+            consumer_b, selected_b, scores_b.masked_fill(~member, -torch.inf)
+        )
+
+        # Tail consumer shares k_cache_0 while building its own tail page_map.
+        tail_rows_per_req = [0, 1, 1]
+        tail_published = published.tail(tail_rows_per_req)
+        tail_idx = torch.tensor([2, 4], device="cuda")
+        tail_raw = torch.empty((2, 8), device="cuda", dtype=torch.int32)
+        tail_inputs = msgspec.structs.replace(
+            inputs,
+            layer_id=1,
+            x=inputs.x[tail_idx],
+            q_lora=inputs.q_lora[tail_idx],
+            positions=positions[tail_idx],
+            rows_per_request=tail_rows_per_req,
+            rows_per_request_device=torch.tensor(
+                tail_rows_per_req, dtype=torch.int32, device="cuda"
+            ),
+            out_raw_indices=tail_raw,
+            out_page_indices=torch.empty_like(tail_raw),
+        )
+        with patch.object(
+            scoring,
+            "_index_q_and_weights",
+            return_value=(
+                consumer_b["q"][0][tail_idx],
+                consumer_b["q"][1][tail_idx],
+                consumer_b["weights"][tail_idx],
+            ),
+        ):
+            backend.consume_prefill(tail_inputs, tail_published)
+        self.assertIs(inputs.paged_index_k_caches[(0, 1)], k_cache_0)
+        self.assertIsNotNone(tail_published.sm90_page_map)
+        self.assertIsNot(tail_published.sm90_page_map, page_map_a)
+        torch.testing.assert_close(
+            tail_raw.sort(dim=1).values, raw[tail_idx].sort(dim=1).values
+        )
+
+        # Different K source layer builds its own k_cache entry and refreshes page_map.
+        other_k_inputs = msgspec.structs.replace(inputs, layer_id=2)
+        with patch.object(
+            scoring,
+            "_index_q_and_weights",
+            return_value=(*consumer_a["q"], consumer_a["weights"]),
+        ):
+            backend.consume_prefill(other_k_inputs, published)
+        self.assertIn((2, 1), inputs.paged_index_k_caches)
+        self.assertIsNot(inputs.paged_index_k_caches[(2, 1)], k_cache_0)
+        self.assertIsNot(published.sm90_page_map, page_map_a)
 
     @unittest.skipUnless(torch.cuda.is_available() and is_hopper(), "Hopper scores")
     def test_hopper_scores_match_the_fp4_operands(self):

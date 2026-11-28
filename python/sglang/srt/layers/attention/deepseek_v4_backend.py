@@ -1175,6 +1175,10 @@ class DSV4Metadata:
     # The indexer's batch-only plan per low ratio, filled by its first layer
     # (scoring.prefill_index_plan); one per metadata, as the rows differ.
     low_ratio_index_plans: Optional[Dict[int, object]] = None
+    # Hopper FP8 index-K pages shared across candidate consumers in this forward.
+    low_ratio_paged_index_k_caches: Dict[Tuple[int, int], object] = field(
+        default_factory=dict
+    )
 
     # Per-step scratch for TP-padded query heads, zeroed by the first user.
     # Later layers overwrite real heads and preserve the zero padding.
@@ -1213,6 +1217,7 @@ class DSV4Metadata:
             self.c128_compress_metadata, src=other.c128_compress_metadata
         )
         self.sparse_prefill_cache = None
+        self.low_ratio_paged_index_k_caches.clear()
 
     def refresh_for_breakable_cuda_graph_replay_(self, static_metadata: DSV4Metadata):
         self.core_attn_metadata.refresh_for_breakable_cuda_graph_replay_(
@@ -1231,6 +1236,12 @@ class DSV4Metadata:
         )
         self.low_ratio_k_slots = static_metadata.low_ratio_k_slots
         self.low_ratio_index_plans = static_metadata.low_ratio_index_plans
+        # Share the refreshed forward's FP8 K-page cache (fresh on the full
+        # metadata, aliased from it on the late-layer tail) instead of keeping
+        # stale pages from the preceding replay.
+        self.low_ratio_paged_index_k_caches = (
+            static_metadata.low_ratio_paged_index_k_caches
+        )
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
@@ -2149,6 +2160,9 @@ class DeepseekV4AttnBackend(
         if self.low_ratios and self.forward_metadata.low_ratio_k_slots is not None:
             metadata.low_ratio_k_slots = self.forward_metadata.low_ratio_k_slots
             metadata.low_ratio_index_plans = {}
+            metadata.low_ratio_paged_index_k_caches = (
+                self.forward_metadata.low_ratio_paged_index_k_caches
+            )
         return metadata
 
     def _late_layer_tail_cp_layout(
@@ -3057,6 +3071,7 @@ class DeepseekV4AttnBackend(
         }
         metadata.low_ratio_k_slots = k_slots
         metadata.low_ratio_index_plans = {}
+        metadata.low_ratio_paged_index_k_caches.clear()
         if publish_rows:
             # Every source layer would rebuild these rows; the tail and the
             # prefill graph publish theirs at metadata init the same way.
@@ -4243,6 +4258,7 @@ class DeepseekV4AttnBackend(
             req_pool_indices=forward_batch.req_pool_indices,
             k_slots=k_slots,
             index_plans=self.forward_metadata.low_ratio_index_plans,
+            paged_index_k_caches=self.forward_metadata.low_ratio_paged_index_k_caches,
             kv_page_table=core.page_table,
             seq_lens_cpu=seq_lens_cpu,
             rows_per_request=rows_per_request,
