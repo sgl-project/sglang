@@ -110,17 +110,16 @@ __global__ void kernel(const Params __grid_constant__ params) {
   using namespace device;
   using Vec = AlignedVector<bf16_t, kVecElems>;
 
-  const int row = blockIdx.x;
   const int tid = threadIdx.x;
   const int lane = tid & int(kWarpThreads - 1);
   const int warp = tid >> 5;
-  const int row_offset = row * kHidden;
+  const int64_t row_offset = int64_t(blockIdx.x) * kHidden;
 
   WelfordState state{0.0f, 0.0f, 0.0f};
 
 #pragma unroll
   for (int iteration = 0; iteration < kIterations; ++iteration) {
-    const int offset = row_offset + iteration * 512 + tid * kVecElems;
+    const int64_t offset = row_offset + iteration * 512 + tid * kVecElems;
     const int gate_offset = iteration * 512 + tid * kVecElems;
     Vec update;
     Vec residual;
@@ -162,7 +161,7 @@ __global__ void kernel(const Params __grid_constant__ params) {
 
 #pragma unroll
   for (int iteration = 0; iteration < kIterations; ++iteration) {
-    const int offset = row_offset + iteration * 512 + tid * kVecElems;
+    const int64_t offset = row_offset + iteration * 512 + tid * kVecElems;
     const int modulation_offset = iteration * 512 + tid * kVecElems;
     Vec scale;
     Vec shift;

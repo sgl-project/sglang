@@ -1,5 +1,7 @@
+import os
 import pathlib
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -48,6 +50,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
 )
 from sglang.multimodal_gen.runtime.models.vaes import wanvae
 from sglang.multimodal_gen.runtime.models.vaes.autoencoder_dc import AutoencoderDC
+from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module import (
+    RotaryEmbeddingND,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av import (
     LTX2AVDecodingStage,
 )
@@ -62,6 +67,7 @@ class _FakeServerArgs:
         self.revision = "test-revision"
         self.trust_remote_code = True
         self.layerwise_components = set()
+        self.component_paths = {}
         self.component_weights_paths = {}
         self.component_quantizations = {}
         self.component_precisions = {}
@@ -289,6 +295,11 @@ class TestDirectGPUVAEState(unittest.TestCase):
     def test_assigns_one_complete_state_without_a_cpu_state_dict(self):
         expected_weight = torch.arange(4, dtype=torch.float32).reshape(2, 2)
         expected_scale = torch.tensor([3.0])
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        streamed = {
+            "proj.weight": expected_weight.to(device),
+            "scale": expected_scale.to(device),
+        }
         with TemporaryDirectory() as root:
             checkpoint = pathlib.Path(root) / "model.safetensors"
             safetensors_save_file(
@@ -296,17 +307,63 @@ class TestDirectGPUVAEState(unittest.TestCase):
             )
             with torch.device("meta"):
                 vae = self._StandardVAE()
-            _assign_direct_gpu_vae_state(
-                vae,
-                [str(checkpoint)],
-                component_name="vae",
-                device=torch.device("cpu"),
-                vae_config=QwenImagePipelineConfig().vae_config,
-            )
+            with patch.object(
+                vae_loader,
+                "safetensors_weights_iterator",
+                return_value=streamed.items(),
+            ):
+                _assign_direct_gpu_vae_state(
+                    vae,
+                    [str(checkpoint)],
+                    component_name="vae",
+                    device=device,
+                    vae_config=QwenImagePipelineConfig().vae_config,
+                )
 
-        self.assertTrue(torch.equal(vae.proj.weight, expected_weight))
-        self.assertTrue(torch.equal(vae.scale, expected_scale))
+        self.assertEqual(vae.proj.weight.data_ptr(), streamed["proj.weight"].data_ptr())
+        self.assertEqual(vae.scale.data_ptr(), streamed["scale"].data_ptr())
         self.assertFalse(any(tensor.is_meta for tensor in vae.state_dict().values()))
+
+    def test_filtered_mmap_keeps_required_and_unexpected_key_checks(self):
+        cfg = WanT2V480PConfig().vae_config
+        with torch.device("meta"):
+            keep = wanvae.AutoencoderKLWan(cfg).checkpoint_key_filter
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        state = {
+            "proj.weight": torch.eye(2),
+            "scale": torch.ones(1),
+            "encoder.unused": torch.ones(1),
+        }
+        with TemporaryDirectory() as root:
+            path = str(pathlib.Path(root) / "vae.safetensors")
+
+            def load(weights):
+                safetensors_save_file(weights, path)
+                with torch.device("meta"):
+                    vae = self._StandardVAE()
+                _assign_direct_gpu_vae_state(
+                    vae,
+                    [path],
+                    component_name="vae",
+                    device=device,
+                    vae_config=cfg,
+                    key_filter=keep,
+                    mmap_upload=True,
+                )
+                return vae
+
+            self.assertTrue(
+                torch.equal(load(state).proj.weight.cpu(), state["proj.weight"])
+            )
+            with self.assertRaisesRegex(
+                ComponentCheckpointUnsupportedError, "unexpected tensor"
+            ):
+                load({**state, "encoder_extra.weight": torch.ones(1)})
+            del state["proj.weight"]
+            with self.assertRaisesRegex(
+                ComponentCheckpointUnsupportedError, "missing tensors"
+            ):
+                load(state)
 
     def test_direct_load_adopts_folded_weight_norm_and_checkpoint_metadata(self):
         class _WeightNormVAE(nn.Module):
@@ -370,6 +427,12 @@ class TestDirectGPUVAEState(unittest.TestCase):
         self.assertNotIn("runtime_cache", slots)
 
     def test_loader_streams_native_vae_without_the_legacy_cpu_state_dict(self):
+        class _RotaryVAE(self._StandardVAE):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.rope = RotaryEmbeddingND(dim=48)
+                self.weight_device_at_init = self.proj.weight.device.type
+
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())
         server_args.component_weights_paths = {}
@@ -387,7 +450,7 @@ class TestDirectGPUVAEState(unittest.TestCase):
             patch.object(
                 vae_loader.ModelRegistry,
                 "resolve_model_cls",
-                return_value=(self._StandardVAE, None),
+                return_value=(_RotaryVAE, None),
             ),
             patch.object(
                 vae_loader,
@@ -409,8 +472,43 @@ class TestDirectGPUVAEState(unittest.TestCase):
             loaded = loader.load_customized(root, server_args, "vae")
 
         legacy_load.assert_not_called()
+        self.assertEqual(loaded.weight_device_at_init, "meta")
+        self.assertTrue(
+            torch.equal(loaded.rope.inv_freq, RotaryEmbeddingND(48).inv_freq)
+        )
         self.assertTrue(torch.equal(loaded.proj.weight, expected_weight))
         self.assertTrue(torch.equal(loaded.scale, expected_scale))
+
+    def test_meta_parameter_registration_keeps_aliases_and_is_scoped(self):
+        with vae_loader._init_vae_with_meta_parameters(), ThreadPoolExecutor(1) as pool:
+            self.assertFalse(pool.submit(nn.Linear, 2, 2).result().weight.is_meta)
+            vae = nn.Module()
+            weight = nn.Parameter(torch.ones(2), requires_grad=False)
+            vae.left = vae.right = weight
+            self.assertTrue(vae.left.is_meta)
+            self.assertFalse(vae.left.requires_grad)
+            with self.assertRaisesRegex(ComponentCheckpointUnsupportedError, "tied"):
+                _direct_gpu_vae_state_slots(vae, "vae")
+        self.assertFalse(nn.Linear(2, 2).weight.is_meta)
+
+    def test_runtime_buffer_inheriting_weight_device_replays_cpu_constructor(self):
+        class _VAE(self._StandardVAE):
+            def __init__(self, config):
+                super().__init__()
+                self.register_buffer(
+                    "table", torch.rand_like(self.proj.weight), persistent=False
+                )
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(123)
+            reference = vae_loader.initialize_model(
+                _VAE, {"config": None}, torch.float32
+            )
+            expected_next = torch.rand(1)
+            torch.manual_seed(123)
+            vae = vae_loader._initialize_direct_vae(_VAE, None, torch.float32)
+            self.assertTrue(torch.equal(torch.rand(1), expected_next))
+        self.assertTrue(torch.equal(vae.table, reference.table))
 
     def test_native_vae_ignores_diffusers_auto_map_for_weight_override(self):
         loader = vae_loader.VAELoader()
@@ -496,6 +594,58 @@ class TestDirectGPUVAEState(unittest.TestCase):
 
 
 class TestVAELoader(unittest.TestCase):
+    def test_auto_mmap_respects_placement_hardware_and_overrides(self):
+        args = _FakeServerArgs(WanT2V480PConfig())
+
+        def allows(device="cuda:1", dtype=torch.float32):
+            return vae_loader._auto_mmap_vae(
+                args, "vae", "AutoencoderKLWan", torch.device(device), dtype
+            )
+
+        with (
+            patch.dict(os.environ, {"SGLANG_USE_RUNAI_MODEL_STREAMER": "0"}),
+            patch.object(vae_loader.current_platform, "is_cuda", return_value=True),
+            patch.object(
+                torch.cuda,
+                "get_device_name",
+                return_value="NVIDIA B200",
+            ) as gpu,
+        ):
+            self.assertTrue(allows())
+            gpu.assert_called_once_with(torch.device("cuda:1"))
+            self.assertFalse(allows("cpu"))
+            self.assertFalse(allows(dtype=torch.bfloat16))
+            with patch.object(args, "num_gpus", 2):
+                self.assertFalse(allows())
+            with patch.object(args, "should_use_fsdp_for_component", return_value=True):
+                self.assertFalse(allows())
+            with patch.dict(os.environ, {"SGLANG_USE_RUNAI_MODEL_STREAMER": "1"}):
+                self.assertFalse(allows())
+            with patch.dict(args.component_direct_gpu_weight_loading, vae=False):
+                self.assertFalse(allows())
+            with patch.dict(args.component_weights_paths, vae="other"):
+                self.assertFalse(allows())
+            gpu.return_value = "NVIDIA GB200"
+            self.assertFalse(allows())
+
+    def test_wan_partial_checkpoint_filter_only_skips_disabled_towers(self):
+        config = WanT2V480PConfig().vae_config
+        for encoder, decoder in ((False, True), (True, False), (True, True)):
+            with self.subTest(encoder=encoder, decoder=decoder), torch.device("meta"):
+                config.load_encoder, config.load_decoder = encoder, decoder
+                keep = wanvae.AutoencoderKLWan(config).checkpoint_key_filter
+                if encoder and decoder:
+                    self.assertIsNone(keep)
+                    continue
+                self.assertEqual(keep("encoder.block.weight"), encoder)
+                self.assertEqual(keep("decoder.block.weight"), decoder)
+                for key in (
+                    "quant_conv.weight",
+                    "post_quant_conv.bias",
+                    "encoder_extra.weight",
+                ):
+                    self.assertTrue(keep(key))
+
     def test_exact_precision_is_admitted_for_every_vae_component(self):
         loader = vae_loader.VAELoader()
         server_args = _FakeServerArgs(QwenImagePipelineConfig())

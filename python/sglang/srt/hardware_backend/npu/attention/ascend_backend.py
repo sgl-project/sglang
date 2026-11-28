@@ -31,6 +31,7 @@ from sglang.srt.hardware_backend.npu.dcp_extend_gather import (
     NPUDecodeContextParallelMetadata,
     build_dcp_extend_gather_plan,
 )
+from sglang.srt.hardware_backend.npu.kv_capability import DSA_KV_QUANT_BLOCK_SIZE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
@@ -394,6 +395,7 @@ class AscendAttnBackend(AttentionBackend):
         dense_mla = self.use_mla and not self.use_dsa
         self.dense_mla_dcp_target = dense_mla and self.dcp_size > 1
         self.dsa_dcp_target = self.use_dsa and self.dcp_size > 1
+        self.use_decode_indexer_request_shard = parallel.attn_tp_size > 1
         if self.use_mla:
             self.nope_padding_dtype = self.model_dtype or torch.bfloat16
             if (
@@ -422,12 +424,13 @@ class AscendAttnBackend(AttentionBackend):
                 self.use_native_sdpa = True
         self.native_attn = AscendTorchNativeAttnBackend()
         self.graph_metadata = {}
-        self.max_context_len = model_runner.req_to_token_pool.max_context_len
         # Pool refs — captured at construction so they survive deletion of the
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.max_kv_len = self.req_to_token_pool.row_width
+        self.max_num_pages = (self.max_kv_len + self.page_size - 1) // self.page_size
         self.dcp_fp8_sparse_attention = None
         if self.dsa_dcp_target and self.kv_cache_dtype == torch.float8_e4m3fn:
             if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
@@ -438,6 +441,7 @@ class AscendAttnBackend(AttentionBackend):
                 kv_quant_sparse_flash_attention,
             )
 
+            # The DCP read (dsa_dcp) passes no tile_size.
             self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
@@ -1050,12 +1054,12 @@ class AscendAttnBackend(AttentionBackend):
         metadata.fa_metadata.copy_(schedule)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        total_context_len = self.max_context_len + self.page_size - 1
+        total_context_len = self.max_kv_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
             total_context_len += self.speculative_num_draft_tokens
         graph_num_pages = total_context_len // self.page_size
         if self.dense_mla_dcp_target:
-            max_kv_len = self.max_context_len
+            max_kv_len = self.max_kv_len
             if self.speculative_num_draft_tokens is not None:
                 max_kv_len += self.speculative_num_draft_tokens
             dcp_cycle_size = self.page_size * self.dcp_size
@@ -1360,7 +1364,7 @@ class AscendAttnBackend(AttentionBackend):
             # The hint is already an allocated length, so the offsets can push
             # max_len past the row; the slice below is cut at the row width, so
             # clamp max_len to it or the copy shapes diverge.
-            max_len = min(max_len, self.max_context_len)
+            max_len = min(max_len, self.max_kv_len)
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             metadata.block_tables[:bs, :max_seq_pages].copy_(
                 self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
@@ -1370,7 +1374,7 @@ class AscendAttnBackend(AttentionBackend):
         elif not self.dense_mla_dcp_target:
             total_pages = min(
                 metadata.block_tables.shape[1],
-                (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
+                self.max_num_pages,
             )
             metadata.block_tables[:bs, :total_pages].copy_(
                 self.req_to_token[
@@ -1597,7 +1601,7 @@ class AscendAttnBackend(AttentionBackend):
             head_dim=layer.qk_head_dim,
             gamma=width,
             softmax_scale=layer.scaling,
-            max_kv_len=self.max_context_len + width,
+            max_kv_len=self.max_kv_len + width,
             causal=layer.attn_type != AttentionType.ENCODER_ONLY,
         ).view(-1, layer.tp_q_head_num * layer.v_head_dim)
         if output.shape[0] < padded_tokens:
@@ -1976,6 +1980,38 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
             )
+        return self._forward_unquantized_sparse(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            topk_indices=topk_indices,
+            scaling=layer.scaling,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+        )
+
+    def _forward_unquantized_sparse(
+        self,
+        *,
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        topk_indices,
+        scaling,
+        actual_seq_qlen,
+        actual_seq_lengths_kv,
+    ):
+        # Before arch35, sparse attention requires a power-of-two head group.
+        # Arch35 supports K3.1's 96 query heads without padding.
+        num_q_heads = q_nope.shape[1]
+        head_padding = (
+            0 if is_npu_arch35() else next_power_of_2(num_q_heads) - num_q_heads
+        )
+        if head_padding:
+            q_nope = torch.nn.functional.pad(q_nope, (0, 0, 0, head_padding))
+            q_pe = torch.nn.functional.pad(q_pe, (0, 0, 0, head_padding))
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=k_nope,
@@ -1983,7 +2019,7 @@ class AscendAttnBackend(AttentionBackend):
             query_rope=q_pe,
             key_rope=k_pe,
             sparse_indices=topk_indices,
-            scale_value=layer.scaling,
+            scale_value=scaling,
             actual_seq_lengths_query=actual_seq_qlen.to(
                 device=q_nope.device, dtype=torch.int32
             ),
@@ -1998,7 +2034,7 @@ class AscendAttnBackend(AttentionBackend):
             attention_mode=2,
             return_softmax_lse=False,
         )
-        return attn_out
+        return attn_out[:, :num_q_heads] if head_padding else attn_out
 
     def _forward_fp8_sparse(
         self,
@@ -2011,11 +2047,11 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_lengths_kv,
     ):
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-        packed = packed_kv.view(torch.float8_e4m3fn)
+        # A packed pool hands back its K buffer in the record's one-byte dtype.
         return torch_npu.npu_kv_quant_sparse_flash_attention(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
-            key=packed,
-            value=packed,
+            key=packed_kv,
+            value=packed_kv,
             sparse_indices=topk_indices,
             scale_value=layer.scaling,
             key_quant_mode=2,
@@ -2035,7 +2071,10 @@ class AscendAttnBackend(AttentionBackend):
             sparse_mode=3,
             attention_mode=2,
             quant_scale_repo_mode=1,
-            tile_size=128,
+            # The pool's record tile, with a fallback for pool objects
+            # that do not carry the attribute.
+            tile_size=getattr(self.token_to_kv_pool, "quant_block_size", None)
+            or DSA_KV_QUANT_BLOCK_SIZE,
             rope_head_dim=self.qk_rope_head_dim,
         )
 
@@ -2125,7 +2164,11 @@ class AscendAttnBackend(AttentionBackend):
             k_rope = k_rope.reshape(
                 k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
             )
-            if getattr(self.token_to_kv_pool, "layer_shard_enabled", False):
+            kv_view = (
+                self.token_to_kv_pool.layer_router.wrapped_view()
+                or self.token_to_kv_pool
+            )
+            if getattr(kv_view, "layer_shard_enabled", False):
                 # The split pool caches the CP-gathered full-sequence copy on
                 # non-owner ranks, skipping the get-time owner broadcast.
                 # Only safe when this write covers the whole read range: a
@@ -2230,6 +2273,11 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
             )
+            logical_rows = getattr(self.forward_metadata, "cp_query_num_tokens", None)
+            if logical_rows is not None:
+                # All-masked physical PCP rows can produce NaNs. They must
+                # not reach the output projection or subsequent reductions.
+                attn_out[logical_rows:].zero_()
         else:
             # extend_kv is set by the model only for a DCP extend that gathered the KV.
             dcp_metadata = forward_batch.attn_dcp_metadata
@@ -2263,7 +2311,8 @@ class AscendAttnBackend(AttentionBackend):
                     scaling=layer.scaling,
                     fp8_attention=self.dcp_fp8_sparse_attention,
                 )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
+            # The pool decides the layout: k_nope is then the packed record.
+            if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
                 attn_out = self._forward_fp8_sparse(
                     q_nope,
                     q_pe,
@@ -2274,53 +2323,16 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_kv,
                 )
             else:
-                # npu_sparse_flash_attention requires the GQA group size
-                # (num_q_heads / num_kv_heads) to be a power of two; Kimi K3.1
-                # has 96 q heads / 32 kv heads (group size 3), so pad the query
-                # heads to the next power of two by duplicating the last head
-                # and slice the padding off the output.
-                num_q_heads = q_nope.shape[1]
-                pad_heads = next_power_of_2(num_q_heads)
-                if pad_heads != num_q_heads:
-                    extra = pad_heads - num_q_heads
-                    q_nope = torch.cat(
-                        (
-                            q_nope,
-                            q_nope[:, -1:, :].expand(-1, extra, -1),
-                        ),
-                        dim=1,
-                    ).contiguous()
-                    q_pe = torch.cat(
-                        (
-                            q_pe,
-                            q_pe[:, -1:, :].expand(-1, extra, -1),
-                        ),
-                        dim=1,
-                    ).contiguous()
-                attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
-                    query=q_nope,
-                    key=k_nope,
-                    value=k_nope,
-                    query_rope=q_pe,
-                    key_rope=k_pe,
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    return_softmax_lse=False,
+                attn_out = self._forward_unquantized_sparse(
+                    q_nope=q_nope,
+                    q_pe=q_pe,
+                    k_nope=k_nope,
+                    k_pe=k_pe,
+                    topk_indices=topk_indices,
+                    scaling=layer.scaling,
+                    actual_seq_qlen=actual_seq_qlen,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
                 )
-                if pad_heads != num_q_heads:
-                    attn_out = attn_out[:, :num_q_heads]
 
         return attn_out
 
@@ -3850,6 +3862,31 @@ class AscendAttnBackend(AttentionBackend):
                     value_quant_mode=0,
                 )
             else:
+                # DFLASH draft blocks are ENCODER_ONLY: mutually visible
+                # (non-causal) with a per-layer look-back window. sparse_mode=4
+                # bands off the tril diagonal in atten_mask and widens by
+                # pre/next tokens, so the tril mtp_mask with pre=window /
+                # next=FULL yields keys [p - window, end] per row; a maskless
+                # sparse_mode=4 is rejected by the kernel.
+                if layer.attn_type == AttentionType.ENCODER_ONLY:
+                    is_swa_verify = layer.sliding_window_size != -1
+                    verify_sparse_mode = 4 if is_swa_verify else 0
+                    verify_mask = self.mtp_mask if is_swa_verify else None
+                    verify_pre_tokens = (
+                        layer.sliding_window_size if is_swa_verify else 0
+                    )
+                    verify_next_tokens = FULL_ATTENTION_WINDOW if is_swa_verify else 0
+                else:
+                    # Causal verify chain (MTP/DSPARK): tril mask, full
+                    # look-back; a sliding layer narrows the left edge.
+                    verify_sparse_mode = 4 if layer.sliding_window_size != -1 else 3
+                    verify_mask = self.mtp_mask
+                    verify_pre_tokens = (
+                        layer.sliding_window_size
+                        if layer.sliding_window_size != -1
+                        else FULL_ATTENTION_WINDOW
+                    )
+                    verify_next_tokens = 0
                 workspace = (
                     torch_npu._npu_fused_infer_attention_score_get_max_workspace(
                         q_nope,
@@ -3865,10 +3902,12 @@ class AscendAttnBackend(AttentionBackend):
                         antiquant_scale=None,
                         block_table=block_table,
                         block_size=self.page_size,
-                        sparse_mode=3,
-                        atten_mask=self.mtp_mask,
+                        sparse_mode=verify_sparse_mode,
+                        atten_mask=verify_mask,
                         actual_seq_lengths=actual_seq_lengths,
                         actual_seq_lengths_kv=actual_seq_lengths_kv,
+                        pre_tokens=verify_pre_tokens,
+                        next_tokens=verify_next_tokens,
                     )
                 )
                 attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
@@ -3887,10 +3926,12 @@ class AscendAttnBackend(AttentionBackend):
                     antiquant_scale=None,
                     block_table=block_table,
                     block_size=self.page_size,
-                    sparse_mode=3,
-                    atten_mask=self.mtp_mask,
+                    sparse_mode=verify_sparse_mode,
+                    atten_mask=verify_mask,
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    pre_tokens=verify_pre_tokens,
+                    next_tokens=verify_next_tokens,
                     workspace=workspace,
                     out=[attn_output, softmax_lse],
                 )

@@ -647,9 +647,20 @@ void paged_experts_tiered_plan(
   TensorMatcher({Three, K}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(doorbell);
   const int k = static_cast<int>(K.unwrap());
   RuntimeCheck(k <= 1024, "paged experts: more slots than one block has threads");
-  RuntimeCheck(
-      publish_row_address == 0 || (publish_flag_address != 0 && row_len >= 3 * k),
-      "paged experts: a publish needs the flag and the whole state row");
+  if (publish_row_address != 0) {
+    // The kernel publishes `row_len` int32 from doorbell's first entry: that must be the whole
+    // state row [doorbell 3K | expert_row E | row_expert R | row_stamp R | clock 1], laid out
+    // contiguously in the matched tensors.
+    const auto ptr = [](const tvm::ffi::TensorView t) { return static_cast<const int32_t*>(t.data_ptr()); };
+    const auto e = E.unwrap(), r = R.unwrap();
+    const auto row = ptr(doorbell);
+    CHECK_HOST(publish_flag_address != 0) << "paged experts: a publish needs the flag";
+    CHECK_HOST(
+        row_len == 3 * k + e + 2 * r + 1 && ptr(expert_row) == row + 3 * k && ptr(row_expert) == row + 3 * k + e &&
+        ptr(row_stamp) == row + 3 * k + e + r && ptr(clock) == row + 3 * k + e + 2 * r)
+        << "paged experts: a publish needs the state row [doorbell, expert_row, row_expert, row_stamp, clock] "
+        << "contiguous from doorbell, got row_len " << row_len << " for K=" << k << " E=" << e << " R=" << r;
+  }
   // The missing flags and the rows first, so the step can publish its disk misses before it copies
   // its host-row hits (paged_experts_rows_to_slots over rows_out).
   LaunchKernel(1, (k + 31) / 32 * 32, device_.unwrap())(

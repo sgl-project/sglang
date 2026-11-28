@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.common.head_slice_layout import (
     draft_window_chunk_start,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_COPY_BUFFERS_ALIGNED_16_KEY,
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
     PrefillStagingContext,
@@ -76,7 +77,6 @@ from sglang.srt.disaggregation.utils import (
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     draft_kv_ring_row_pairs,
-    filter_kv_indices_for_shard_rank,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
     should_send_replicated_state,
@@ -666,22 +666,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._staging_ctx.room_bootstrap[room] = bootstrap_infos
         self._staging_ctx.room_receivers[room] = receiver
 
-    def set_kv_buffer_tensors(
-        self,
-        k_buffers: list,
-        v_buffers: list,
-        page_size: int,
-        slot_layer_ids: Optional[List[int]] = None,
-    ):
-        # slot_layer_ids follows the staging slot order (every k_buffer, then
-        # every v_buffer), which is not kv_args.kv_layer_ids once a draft exists.
-        self.kv_buffer_tensors = {
-            "k_buffers": k_buffers,
-            "v_buffers": v_buffers,
-            "page_size": page_size,
-            "slot_layer_ids": list(slot_layer_ids or []),
-        }
-
     def _register_staging_memory(self, ptr: int, size: int) -> None:
         key = MooncakeBufferKey(BufferKind.STAGING, len(self._staging_keys))
         self.transport.register(key, ptr, size, self.kv_args.gpu_id)
@@ -921,6 +905,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_head_start,
             num_heads_to_send,
             page_size,
+            buffers_aligned_16=self.kv_buffer_tensors.get(
+                STAGING_COPY_BUFFERS_ALIGNED_16_KEY, False
+            ),
         )
 
         # dst_staging_ptr points inside the peer's single staging ring.
@@ -2707,6 +2694,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
+            StateType.DSV4_C128,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
@@ -2718,22 +2706,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.DRAFT_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
+            StateType.DSV4_C128,
         )
-
-    def _prepare_sharded_dsa_indices(self, src_indices, dst_indices):
-        """Pair target/draft indexer pages before narrowing to this owner."""
-        if len(src_indices) != len(dst_indices):
-            raise RuntimeError(
-                "Sharded DSA state page count mismatch: "
-                f"prefill={len(src_indices)}, dst={len(dst_indices)}"
-            )
-        local_indices, positions = filter_kv_indices_for_shard_rank(
-            kv_indices=np.asarray(src_indices, dtype=np.int32),
-            index_slice=slice(0, len(src_indices)),
-            shard_rank=self.kv_shard_rank,
-            shard_size=self.kv_shard_size,
-        )
-        return local_indices, np.asarray(dst_indices, dtype=np.int32)[positions]
 
     def maybe_send_extra(
         self,
@@ -3024,11 +2998,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if self.request_status.get(req.room, KVPoll.Failed) == KVPoll.Failed:
                     return rc
             elif st in (StateType.MINIMAX_INDEX_K, StateType.MINIMAX_DENSE_KV):
-                # Compacted layer lists require equal TP and PP=1 on both peers.
-                if self.pp_size is not None and self.pp_size > 1:
-                    raise RuntimeError(
-                        "PD disagg: PP>1 not supported for MiniMax state yet."
-                    )
+                # Compacted per-stage layer lists pair by global layer id; under
+                # PP, build_transfer_entry_pairs rejects a peer without ids.
                 dst_attn_tp_size = (
                     self.attn_tp_size
                     if target_rank_registration_info is None
@@ -3067,7 +3038,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         prefill_data_indices=np.array(src_indices, dtype=np.int32),
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
+                        state_type=st,
                         force_flat=True,
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
                         src_keys=src_keys,
                         dst_keys=dst_keys,
                     )
@@ -4281,27 +4255,6 @@ class MooncakeKVSender(CommonKVSender):
             num_kv_tokens=num_kv_tokens,
             indices_event=indices_event,
         )
-
-    def _record_transfer_indices(
-        self,
-        kv_indices: npt.NDArray[np.int32],
-        state_indices: Optional[List],
-    ):
-        metric_state_indices = state_indices
-        if metric_state_indices and get_parallel().enable_kv_cache_sharding:
-            # The queued state remains logical and is filtered by the worker.
-            # Account only for this sender's pages, including all target/draft
-            # indexer buffers represented by the DSA component's item lengths.
-            metric_state_indices = list(state_indices)
-            for i, (st, indices) in enumerate(
-                zip(self.kv_mgr.kv_args.state_types, state_indices)
-            ):
-                if st == StateType.DSA and indices is not None:
-                    pages = np.asarray(indices, dtype=np.int32)
-                    metric_state_indices[i] = pages[
-                        pages % self.kv_mgr.kv_shard_size == self.kv_mgr.kv_shard_rank
-                    ]
-        super()._record_transfer_indices(kv_indices, metric_state_indices)
 
 
 class MooncakeKVReceiver(CommonKVReceiver):

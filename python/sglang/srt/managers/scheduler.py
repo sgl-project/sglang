@@ -81,6 +81,7 @@ except ImportError:
     initialize_mamba_selective_state_update_backend = None
 import traceback
 
+from sglang.srt.beam_search.batch_tail import is_beam_only_batch
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -114,6 +115,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     decode_offloads_kvcache,
     get_dsa_seed_metadata_dim,
+    lacks_decode_peer,
     prepare_abort,
 )
 from sglang.srt.distributed import bootstrap
@@ -123,7 +125,7 @@ from sglang.srt.distributed.parallel_state import (
     close_custom_all_reduce,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, freeze_env_reads
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import (
@@ -213,6 +215,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateCacheLinkerReqInput,
+    UpdateCacheLinkerReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -248,6 +252,8 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
+    schedule_batch_field_names,
+    schedule_batch_field_values,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -398,10 +404,10 @@ from sglang.srt.rust_server.server import (
     claim_sigterm_before_compiles,
     drain_notify_name,
 )
-from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
-from sglang.srt.sampling.sampler_params import SamplerParamsPool
+from sglang.srt.sampling.penalties import PenaltyStatusPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
+from sglang.srt.sampling.sampling_params_pool import SamplingParamsPool
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
@@ -706,7 +712,7 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
         self.init_penalty_status_pool()
-        self.init_sampler_params_pool()
+        self.init_sampling_params_pool()
 
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
@@ -738,6 +744,9 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+        self.metrics_reporter.shortest_prefill_load_scaling = (
+            self.policy.shortest_prefill_load_scaling
+        )
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1276,7 +1285,9 @@ class Scheduler(
         if (
             get_exec().moe.elastic_ep_backend is not None
             and get_exec().moe.ep_join_mode == "recover"
+            and not get_exec().moe.is_ep_offset_joiner
         ):
+            # Offset joiners already re-joined eagerly in ModelRunner.__init__.
             model_runner.post_capture_elastic_ep_recover()
 
         # Dispatch the model worker
@@ -1399,10 +1410,11 @@ class Scheduler(
             device=self.req_to_token_pool.device,
         )
 
-    def init_sampler_params_pool(self) -> None:
-        self.sampler_params_pool = SamplerParamsPool(
+    def init_sampling_params_pool(self) -> None:
+        self.sampling_params_pool = SamplingParamsPool(
             num_rows=self.req_to_token_pool.req_to_token.shape[0],
             device=self.req_to_token_pool.device,
+            penalty_status_pool=self.penalty_status_pool,
         )
 
     def init_running_status(self):
@@ -1446,6 +1458,7 @@ class Scheduler(
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
             send_output=self.send_control_output,
+            pp_rank=get_parallel().pp_rank if get_parallel().pp_size > 1 else None,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
         self.session_controller = SessionController(self.tree_cache)
@@ -1638,6 +1651,12 @@ class Scheduler(
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=get_device().watchdog_timeout
         )
+
+        # A retiree's terminal park has to disarm the watchdog above.
+        if self.server_args.elastic_ep_backend is not None:
+            model_runner = getattr(self.tp_worker, "model_runner", None)
+            if model_runner is not None:
+                model_runner.elastic_park_hook = self.park_retired_rank
 
         # Init memory saver, profiler and metric stats
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -1956,8 +1975,9 @@ class Scheduler(
         Without DCP the prefix-relative rule already donates, so leave the
         existing alignment alone, except where unified memory retires window
         rows behind the checkpoints (`mamba_prefill_chunk_grid`): there every
-        cut lands on the checkpoint grid. Use the LCM to preserve any alignment
-        that is already set."""
+        cut lands on the checkpoint grid. Under deterministic inference with a
+        mamba cache every cut also lands on the kernel chunk grid. Use the LCM
+        to preserve any alignment that is already set."""
         chunk_size = mamba_prefill_chunk_grid(getattr(self, "tree_cache", None))
         if chunk_size <= 1:
             return
@@ -1990,11 +2010,12 @@ class Scheduler(
             f"chunked prefill size is {chunk}{dp_note}; a prompt longer than "
             f"{chunk} tokens could never be scheduled. Raise --chunked-prefill-size "
             f"to at least {align * attn_dp_size}. The alignment includes the Mamba "
-            f"state checkpoint grid under DCP, and under --enable-unified-memory "
+            f"state checkpoint grid (under DCP, or under --enable-unified-memory "
             f"when sliding-window layers retire their rows behind the cached "
-            f"checkpoints; with the flashinfer backend under deterministic "
-            f"inference, lowering SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also "
-            f"helps."
+            f"checkpoints) and the Mamba kernel chunk grid (under "
+            f"--enable-deterministic-inference); with the flashinfer backend "
+            f"under deterministic inference, lowering "
+            f"SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE also helps."
         )
 
     def init_request_dispatcher(self):
@@ -2006,6 +2027,7 @@ class Scheduler(
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_wrapper.handle),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
+                (UpdateCacheLinkerReqInput, self.update_cache_linker_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
                 (AbortReq, self.abort_request),
@@ -2121,6 +2143,7 @@ class Scheduler(
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
+            "max_req_len": self.max_req_len,
             "max_req_input_len": self.max_req_input_len,
             "startup_time": self.startup_time,
         }
@@ -2129,13 +2152,6 @@ class Scheduler(
             # The main process waits for this process's crash dump.
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
-
-        if get_serving().grpc_port is not None:
-            result_dict["kv_event_sources"] = (
-                self.kv_events_publisher.local_kv_event_sources(
-                    self.page_size * get_parallel().dcp_size
-                )
-            )
         return result_dict
 
     def release_host_resources(self) -> None:
@@ -2189,6 +2205,7 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_war_barrier_enabled()
+        freeze_env_reads()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
@@ -2223,6 +2240,8 @@ class Scheduler(
             if self.gracefully_exit:
                 break
             self.increment_scheduler_iterations()
+
+            self.tick_elastic_scale()
 
             # Receive requests
             self.ingest_requests()
@@ -2268,6 +2287,8 @@ class Scheduler(
             if self.gracefully_exit:
                 break
             self.increment_scheduler_iterations()
+
+            self.tick_elastic_scale()
 
             # Receive requests
             self.ingest_requests()
@@ -2482,7 +2503,36 @@ class Scheduler(
             # not consumed); the Rust api_server shapes it per-endpoint.
             self.rust_server.push_control_output(recv_req, output)
         else:
+            sender = self._elastic_control_sender()
+            if sender is not None:
+                from sglang.srt.managers.io_struct import (
+                    ElasticControlOutput,
+                    wrap_as_pickle,
+                )
+
+                output = ElasticControlOutput(
+                    sender_dp_rank=sender, payload=wrap_as_pickle(output)
+                )
             self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+
+    @staticmethod
+    def _elastic_control_sender() -> Optional[int]:
+        """This rank's DP slot, where a shrink can narrow the control fan-out mid-call
+        (shrinks need a single tokenizer)."""
+        parallel = get_parallel()
+        if (
+            parallel.elastic_ep_initial_size is None
+            or get_serving().tokenizer_worker_num != 1
+        ):
+            return None
+        from sglang.srt.elastic_ep.topology import (
+            attn_replica_size,
+            physical_ep_rank_to_dp_rank,
+        )
+
+        return physical_ep_rank_to_dp_rank(
+            parallel.tp_rank + parallel.ep_join_rank_offset, attn_replica_size()
+        )
 
     @staticmethod
     def _tokenized_requests(recv_req):
@@ -2951,10 +3001,24 @@ class Scheduler(
             get_total_prefill_uncached_tokens=lambda: (
                 self.total_prefill_uncached_tokens
             ),
-            get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
+            get_total_prefill_busy_us=lambda: self._get_total_prefill_busy_us(),
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
+            get_storage_metrics_collector=lambda: (
+                self.tree_cache.storage_metrics_collector
+            ),
         )
+
+    def _get_total_prefill_busy_us(self) -> int:
+        """Prefill busy time: all non-idle wall time on a PD prefill engine, else step time."""
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            return self.metrics_reporter.prefill_busy_clock.read_us()
+        return self.total_prefill_busy_us
+
+    def _carry_prefill_busy_us(self, busy_us: int) -> None:
+        """Continue the published prefill busy time from busy_us in either role."""
+        self.total_prefill_busy_us = busy_us
+        self.metrics_reporter.prefill_busy_clock.restart(busy_us)
 
     def init_kv_weight_version_tracker(self) -> None:
         self.kv_weight_version_tracker = KvWeightVersionTracker.maybe_create(
@@ -3077,6 +3141,13 @@ class Scheduler(
         # 0. Constant output: every PP rank must derive the same
         # sampling_params (rank consensus hashes them).
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # No decode takes a handoff from a request prefill answers alone,
+            # so it keeps the budget it asked for.
+            if self._lacks_decode_peer(req) and req.sampling_params.max_new_tokens in (
+                0,
+                1,
+            ):
+                return
             req.sampling_params.max_new_tokens = 1
             # min <= max invariant; EOS stays legal as the handoff token
             # unless the user set min_new_tokens.
@@ -3099,12 +3170,7 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # max_req_len is the largest number of tokens that can be forwarded for
-        # one request. The last generated token is sampled but never forwarded,
-        # so a request may generate max_req_len - input_len + 1 tokens.
-        context_max_new_tokens = self.max_req_len - input_len + 1
-
-        # Keep this bound consistent with PrefillAdder's admission budget.
+        context_max_new_tokens = self.max_req_len - input_len
         max_new_tokens = max(
             0,
             min(
@@ -3476,6 +3542,7 @@ class Scheduler(
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
+                    and not self._lacks_decode_peer(req)
                 ):
                     error_msg = (
                         f"Invalid request: Disaggregated request received without "
@@ -3607,6 +3674,18 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if self._lacks_decode_peer(req) and req.sampling_params.max_new_tokens not in (
+            0,
+            1,
+        ):
+            self._reject_bad_request(
+                req,
+                "A prefill request without a bootstrap host has no decode to "
+                "continue it, so max_new_tokens must be 0 or 1; got "
+                f"max_new_tokens={req.sampling_params.max_new_tokens}.",
+            )
+            return
+
         if (
             self.disaggregation_mode != DisaggregationMode.NULL
             and req.return_logprob
@@ -3684,17 +3763,6 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
-                )
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
-
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
@@ -3704,6 +3772,7 @@ class Scheduler(
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
             self._embedding_preserve_last_token_id,
+            is_multimodal=recv_req.mm_inputs is not None,
         )
         if error_msg:
             req.set_finish_with_abort(error_msg)
@@ -3819,7 +3888,10 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
-        if self.enable_unified_cache_external_linker:
+        if (
+            self.enable_unified_cache_external_linker
+            and self.tree_cache.linker is not None
+        ):
             return self.tree_cache.linker.prefetch(req)
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
@@ -3981,6 +4053,16 @@ class Scheduler(
                 req.time_stats.set_wait_queue_entry_time()
         else:
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
+
+    def _lacks_decode_peer(self, req: Req) -> bool:
+        # Only a prefill server consults its transfer backend for this.
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return False
+        return lacks_decode_peer(
+            req,
+            disaggregation_mode=self.disaggregation_mode,
+            transfer_backend=self.transfer_backend,
+        )
 
     def _reject_bad_request(self, req: Req, error_msg: str) -> None:
         """Return a validation error as a 400 without running the model."""
@@ -4204,24 +4286,16 @@ class Scheduler(
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
 
-            if len(req.origin_input_ids) >= self.max_req_input_len:
-                req.set_finish_with_abort(
-                    error_msg=(
-                        "Multimodal prompt is too long after expanding multimodal tokens. "
-                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
-                    )
-                )
-                self._add_request_to_queue(req)
-                return
-
         # Validate prompts length
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
             get_serving().allow_auto_truncate,
             self._embedding_preserve_last_token_id,
+            is_multimodal=recv_req.mm_inputs is not None,
         )
         if error_msg:
+            req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
 
@@ -4354,7 +4428,10 @@ class Scheduler(
         if (
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
-            or self.enable_unified_cache_external_linker
+            or (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker is not None
+            )
             or self.enable_lmcache
         ):
             self.tree_cache.check_hicache_events()
@@ -4442,6 +4519,11 @@ class Scheduler(
         running_batch.filter_batch()
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
+
+        # Admission gate: block batches during FLIP_MASK -> RECONFIG (stale expert map).
+        # Below the merge, else last tick's launched prefill never joins running_batch.
+        if self._elastic_scale_down_in_transition():
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch, staged)
@@ -5020,9 +5102,9 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
-        self.sampler_params_pool.write(new_batch.reqs)
         self.penalty_status_pool.alloc(new_batch.reqs)
         self.penalty_status_pool.reset_history(new_batch.reqs)
+        self.sampling_params_pool.write(new_batch.reqs)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -5336,9 +5418,7 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        attr_snapshot = schedule_batch_field_values(batch)
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         retired = self.batch_record_buf[self.batch_record_ct]
         # List (not tuple) so that workers can register additional refs via
@@ -5372,7 +5452,12 @@ class Scheduler(
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
         sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+            dict(
+                zip(
+                    schedule_batch_field_names(type(batch)),
+                    schedule_batch_field_values(batch),
+                )
+            )
             if snapshot_v2_full
             else None
         )
@@ -5390,8 +5475,8 @@ class Scheduler(
             yield
         finally:
             if snapshot_v2_full:
-                for name, value in sched_snapshot.items():
-                    setattr(batch, name, value)
+                # Plain dataclass fields (no descriptors, no __setattr__ hook).
+                batch.__dict__.update(sched_snapshot)
             else:
                 batch.sampling_info = sched_sampling_info
 
@@ -5464,20 +5549,13 @@ class Scheduler(
         if self.is_generation:
             # A beam tail's member rows follow the requests' rows; they take no params.
             num_reqs = len(batch.reqs)
-            batch.sampling_info.set_sampler_params(
-                self.sampler_params_pool.gather(
+            batch.sampling_info.set_rows(
+                self.sampling_params_pool.gather(
                     batch.req_pool_indices[:num_reqs],
                     batch.req_pool_indices_cpu[:num_reqs],
                 )
             )
-            batch.sampling_info.step_penalties = StepPenalties.build(
-                batch.reqs, self.penalty_status_pool
-            )
-            batch.sampling_info.watermark = build_watermark_rows(
-                batch.reqs, batch.device
-            )
-            batch.sampling_info.set_plugin_state(batch.reqs)
-            batch.sampling_info.set_seeds_and_mask_rows(batch.reqs)
+            batch.sampling_info.set_step_state(batch.reqs)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -5602,6 +5680,15 @@ class Scheduler(
                             eagle_prepare_for_verify,
                         )
 
+                        # PP speculative decoding refuses the watermark, so
+                        # only the route is needed, not a bound verify step.
+                        sampling_info = batch.sampling_info
+                        verify_route = VerifyRoute.derive(
+                            sampling_info,
+                            has_grammar=batch.has_grammar,
+                            has_watermark=sampling_info is not None
+                            and sampling_info.watermark is not None,
+                        )
                         # Isolation is load-bearing: eagle_prepare_for_verify
                         # mutates SB fields (forward_mode -> TARGET_VERIFY,
                         # input_ids, out_cache_loc); without the restore the
@@ -5614,6 +5701,7 @@ class Scheduler(
                                     self.req_to_token_pool,
                                     batch,
                                     self.tp_worker,
+                                    route=verify_route,
                                 )
                             )
                             batch_result = self.tp_worker.forward_batch_generation(
@@ -5805,11 +5893,17 @@ class Scheduler(
             logger.debug("[Elastic EP] active rank state is unavailable")
             return
 
-        model_runner = self.tp_worker.model_runner
+        self._publish_pending_elastic_scale(self.tp_worker.model_runner)
+
+    def _publish_pending_elastic_scale(self, model_runner) -> None:
+        """Send a finished scale's completion notice once the cohort can serve it."""
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
         pending = model_runner._pending_elastic_scale_update
-        if pending is not None:
-            self.ipc_channels.send_to_tokenizer.send_output(pending)
-            model_runner._pending_elastic_scale_update = None
+        if pending is None or ElasticEPStateManager.get_scale_phase() == "warming_up":
+            return
+        self.ipc_channels.send_to_tokenizer.send_output(pending)
+        model_runner._pending_elastic_scale_update = None
 
     def _relay_forward_payload(
         self,
@@ -5822,6 +5916,12 @@ class Scheduler(
             if batch_result.next_draft_input is not None:
                 payload = RelayPayload.from_ngram(batch_result.next_draft_input)
                 self.future_map.stash(future_indices, payload)
+            return
+        if is_beam_only_batch(batch):
+            # Nothing was sampled; the coordinator relays every row.
+            self.beam_coordinator.maybe_select_and_relay(
+                batch, batch_result, chunked_req=self.chunked_req
+            )
             return
         if batch_result.next_draft_input is not None:
             payload = RelayPayload.from_draft_input(batch_result.next_draft_input)
@@ -5942,6 +6042,10 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
+        pd_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        if pd_prefill:
+            # Count the step's tokens before a snapshot that carries busy time up to now.
+            self._record_step_counters(batch, result)
         # Extend and idle results always publish; decode steps are throttled
         # to the publish interval. An idle batch exists only to join
         # attention-DP collectives while other ranks have work, and on_idle
@@ -5981,7 +6085,8 @@ class Scheduler(
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
 
-        self._record_step_counters(batch, result)
+        if not pd_prefill:
+            self._record_step_counters(batch, result)
 
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
@@ -6001,6 +6106,10 @@ class Scheduler(
         if not (is_prefill or mode.is_decode() or mode.is_target_verify()):
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
+            return
+        if is_prefill and self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # PD prefill busy time is the metrics reporter's prefill_busy_clock.
+            self.total_prefill_uncached_tokens += batch.extend_num_tokens
             return
         start_iter, start_ts = batch.forward_iter, batch.launch_ts
         prev = self._prev_step
@@ -6122,6 +6231,43 @@ class Scheduler(
             if_success = False
         return ClearHiCacheReqOutput(success=if_success)
 
+    def _elastic_scale_down_in_transition(self) -> bool:
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        return ElasticEPStateManager.get_scale_phase() in ("retiring", "reconfiguring")
+
+    def park_retired_rank(self) -> None:
+        """Park an external-lifecycle retiree forever, its groups destroyed. Disarms the
+        watchdog, else it SIGQUITs the parent (on one node, the primary's launcher)."""
+        self.cur_batch_for_debug = None
+        self.is_initializing = False
+        logger.info(
+            "[Elastic EP][retire] parked with the watchdog disarmed; "
+            "awaiting external termination"
+        )
+        while True:
+            time.sleep(5.0)
+
+    def tick_elastic_scale(self):
+        """Advance the shrink FSM ahead of this tick's control-plane broadcast, which is
+        a collective too: a survivor reconfiguring a tick late would wedge."""
+        if get_exec().moe.elastic_ep_backend is None:
+            return
+        model_runner = self.tp_worker.model_runner
+        # A callable: only a retiree in DRAIN consults it. A retiree holds none of an
+        # idle batch's work, so idle batches do not count against it.
+        model_runner.maybe_retire_ep_ranks(
+            is_idle=lambda: self.is_fully_idle(ignore_idle_batches=True)
+        )
+        # Between forward passes; a failed scale can owe a rebuild from inside forward().
+        model_runner.maybe_recapture_elastic_graphs()
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        # Same event loop as forward(), so forward_pass_id > 0 means one has returned.
+        ElasticEPStateManager.settle_warmup(served=model_runner.forward_pass_id > 0)
+        # The only drain on an idle cohort; settle_warmup's deadline releases it there.
+        self._publish_pending_elastic_scale(model_runner)
+
     @scheduler_stage_method(SCHEDULER_STAGE_IDLE)
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
@@ -6154,6 +6300,7 @@ class Scheduler(
                 or self.deferred_responses.has_pending()
                 or (
                     self.enable_unified_cache_external_linker
+                    and self.tree_cache.linker is not None
                     and self.tree_cache.linker.prefetches
                 )
             ):
@@ -6208,7 +6355,15 @@ class Scheduler(
         # (weight update) reaches KV-event routers before resume.
         self.kv_events_publisher.publish_kv_events()
 
-    def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
+    def _pending_results(self, ignore_idle_batches: bool) -> int:
+        """Results still to process, optionally excluding request-free batches."""
+        if not ignore_idle_batches:
+            return len(self.result_queue)
+        return sum(1 for batch, _ in self.result_queue if not batch.is_empty())
+
+    def is_fully_idle(
+        self, for_health_check=False, ignore_waiting=False, ignore_idle_batches=False
+    ) -> bool:
         # Health check piggybacks on running requests in process_output.
         # Only running_batch + waiting_queue guarantee active GPU processing;
         # disagg queues (bootstrap/prealloc/transfer) may have items without
@@ -6218,7 +6373,10 @@ class Scheduler(
         idle = (
             self.running_batch.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
-            and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (
+                not self.enable_overlap
+                or self._pending_results(ignore_idle_batches) == 0
+            )
             and self._pp_microbatches_drained()
         )
 
@@ -6275,10 +6433,16 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+                if idle:
+                    # Waited, not polled, so every rank agrees on idle.
+                    tc.wait_fenced_writes()
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 
-            if self.enable_unified_cache_external_linker:
+            if (
+                self.enable_unified_cache_external_linker
+                and self.tree_cache.linker is not None
+            ):
                 idle &= not self.tree_cache.linker.prefetches
 
         return idle
@@ -6393,9 +6557,24 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self, empty_cache: bool = True):
+    def update_cache_linker_wrapped(
+        self, recv_req: UpdateCacheLinkerReqInput
+    ) -> UpdateCacheLinkerReqOutput:
+        if not self.enable_unified_cache_external_linker:
+            message = "Launch with --enable-unified-cache-external-linker to manage an external linker."
+        elif not self.is_fully_idle():
+            message = "Reject external linker update: scheduler is not idle."
+        else:
+            success, message = self.tree_cache.linker_attachment.update(recv_req.attach)
+            return UpdateCacheLinkerReqOutput(success=success, message=message)
+        return UpdateCacheLinkerReqOutput(success=False, message=message)
+
+    def flush_cache(
+        self, empty_cache: bool = True, *, pp_all_idle: bool = False
+    ) -> bool:
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
+        # After the PP vote, every stage must enter reset on the same iteration.
+        if pp_all_idle or self.is_fully_idle(ignore_waiting=self.pause_state.paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
             if self.uocr_runtime is not None:
@@ -6642,10 +6821,9 @@ class Scheduler(
                 self._pending_chunked_abort_req = chunked_req
 
     def abort_request(self, recv_req: AbortReq):
-        # Abort requests still waiting for encoder embeddings (EPD language-only)
-        if self.mm_receiver is not None:
-            self.mm_receiver.abort_waiting_requests(recv_req)
-
+        # Encoder waiters were already aborted in arrival order by
+        # mm_receiver.process_waiting_requests; scanning them again here would
+        # also hit requests that arrived after this AbortReq.
         for request_list in self.request_lists().values():
             request_list.abort(recv_req)
 
@@ -6666,6 +6844,16 @@ class Scheduler(
                 else:
                     req.request_finish(FINISH_ABORT())
 
+    def _start_pause_window(self) -> None:
+        """Stop counting busy time; a repeated pause keeps the first start."""
+        self.pause_state.start_window()
+        self.metrics_reporter.prefill_busy_clock.pause()
+
+    def _resume_pause(self) -> None:
+        """Close the pause window and count busy time again from now."""
+        self.pause_state.resume()
+        self.metrics_reporter.prefill_busy_clock.resume()
+
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
         self.pause_state.pause()
@@ -6678,12 +6866,12 @@ class Scheduler(
             # chunked_req cleanup, and overlap result processing through
             # the standard code paths. This avoids duplicating batch
             # manipulation logic and the accounting bugs that come with it.
-            self.pause_state.start_window()
+            self._start_pause_window()
             return
 
         if get_parallel().pp_size > 1:
             # The PP loops hold this pause until no micro-batch is in flight.
-            self.pause_state.start_window()
+            self._start_pause_window()
             self._pp_retract_microbatches()
             self._publish_paused_state()
             return
@@ -6700,7 +6888,7 @@ class Scheduler(
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
         # The pause starts once the in-flight result has drained.
-        self.pause_state.start_window()
+        self._start_pause_window()
         self._retract_batches([(self.running_batch, self.last_batch)])
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -6825,7 +7013,7 @@ class Scheduler(
             and self.disagg_decode_prealloc_queue is not None
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
-        self.pause_state.resume()
+        self._resume_pause()
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput
@@ -6845,16 +7033,40 @@ class Scheduler(
             max_ep_size,
         )
 
-        if new_ep_size <= old_ep_size:
+        def _reject(message: str, **extra) -> ScaleElasticEPReqOutput:
             return ScaleElasticEPReqOutput(
                 success=False,
-                message=(
-                    f"new_ep_size ({new_ep_size}) must be greater than current "
-                    f"effective_ep_size ({old_ep_size})."
-                ),
+                message=message,
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
+                **extra,
             )
+
+        if new_ep_size == old_ep_size:
+            return _reject(
+                f"new_ep_size ({new_ep_size}) == current ({old_ep_size}); noop."
+            )
+        if new_ep_size < old_ep_size:
+            backend = self.server_args.elastic_ep_backend
+            if backend != "mooncake":
+                return _reject(
+                    f"Scale-down ({new_ep_size}<{old_ep_size}) requires "
+                    f"--elastic-ep-backend mooncake; got {backend!r}."
+                )
+            # Reject shrinks leaving any logical with zero replicas (EPLB divmod).
+            from sglang.srt.eplb import expert_location
+
+            metadata = expert_location.get_global_expert_location_metadata()
+            if metadata is not None:
+                num_local = metadata.num_local_physical_experts
+                num_logical = metadata.num_logical_experts
+                if num_local * new_ep_size < num_logical:
+                    return _reject(
+                        f"new_ep_size ({new_ep_size}) < min feasible "
+                        f"({-(-num_logical // num_local)}); "
+                        f"num_local={num_local} num_logical={num_logical}. "
+                        "Increase --ep-num-redundant-experts."
+                    )
         if new_ep_size > max_ep_size:
             return ScaleElasticEPReqOutput(
                 success=False,
@@ -6879,11 +7091,31 @@ class Scheduler(
                 new_ep_size=new_ep_size,
             )
         if ElasticEPStateManager.is_scaling():
+            # A fault inside the current width also reads as scaling. A resize's
+            # barriers would wait on the faulted rank, so name it instead.
+            faulted = ElasticEPStateManager.get_inactive_ranks()
+            pending_ep_size = ElasticEPStateManager.get_pending_ep_size()
+            # The tokenizer resends to every rank while one waits on a joiner; this
+            # rank accepted already, and peers cannot finish the scale without it.
+            if not faulted and pending_ep_size == new_ep_size:
+                return ScaleElasticEPReqOutput(
+                    success=True,
+                    message=f"Scaling to {new_ep_size} already pending",
+                    old_ep_size=old_ep_size,
+                    new_ep_size=new_ep_size,
+                    pending_ep_size=pending_ep_size,
+                    scale_phase=ElasticEPStateManager.get_scale_phase(),
+                )
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=(
-                    "A previous scale operation has not completed yet. Wait until "
-                    "all pending ranks have joined before issuing another scale."
+                    f"Ranks {list(faulted)} are inactive at the current width "
+                    f"({old_ep_size}), so no resize can be admitted: its barriers "
+                    "would wait on a rank that cannot arrive. Recover those ranks "
+                    "first, or recreate the deployment."
+                    if faulted
+                    else "A previous scale operation has not completed yet. Wait "
+                    "until all pending ranks have joined before issuing another scale."
                 ),
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
@@ -6891,7 +7123,66 @@ class Scheduler(
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
             )
 
-        if not ElasticEPStateManager.request_scale(new_ep_size):
+        if new_ep_size < old_ep_size:
+            # Deferred from init so a fault-tolerance-only deployment, which never
+            # retires a rank, is not held to a mooncake it does not need.
+            from sglang.srt.elastic_ep.elastic_ep import assert_shrink_supported
+
+            try:
+                assert_shrink_supported()
+            except RuntimeError as exc:
+                return _reject(str(exc))
+
+        # Grow-only: recover-mode (retired slot) vs scale-mode (append); no mixing.
+        pending_recover_ranks: List[int] = []
+        if new_ep_size > old_ep_size:
+            launch_ep = (
+                self.server_args.elastic_ep_initial_size or self.server_args.tp_size
+            )
+            active = ElasticEPStateManager.instance().active_ranks_cpu
+            recover_slots, scale_slots = [], []
+            for slot in range(old_ep_size, new_ep_size):
+                retired = slot < launch_ep and (active is None or not int(active[slot]))
+                (recover_slots if retired else scale_slots).append(slot)
+            if recover_slots and scale_slots:
+                return _reject(
+                    f"Mixed grow (recover {recover_slots} + scale {scale_slots}) "
+                    "unsupported; grow into retired slots first, then append."
+                )
+            # A joiner sizes its expert map to the top of its own span; a target off
+            # that width kills the joiner when it receives the map.
+            if recover_slots:
+                from sglang.srt.elastic_ep.elastic_ep import announced_recover_widths
+
+                widths = announced_recover_widths(recover_slots)
+                if widths is None:
+                    return _reject(
+                        f"No joiner has announced on slots {recover_slots} yet, so "
+                        "the width to grow to is not known. Retry once it has started.",
+                        retry_when_joiner_announces=True,
+                    )
+                if len(widths) > 1:
+                    return _reject(
+                        f"The joiners waiting on slots {recover_slots} join at widths "
+                        f"{sorted(widths)}. Grow to {min(widths)} first, then on.",
+                    )
+                (required,) = widths
+                if required > new_ep_size:
+                    return _reject(
+                        f"Grow to {new_ep_size} cannot serve the joiner waiting on "
+                        f"slots {recover_slots}: it joins at width {required}. "
+                        f"Grow to {required} first, then shrink to {new_ep_size}.",
+                        required_ep_size=required,
+                    )
+                if required < new_ep_size:
+                    return _reject(
+                        f"Grow to {new_ep_size} cannot serve the joiner waiting on "
+                        f"slots {recover_slots}: it joins at width {required}. "
+                        f"Grow to {required} first, then on to {new_ep_size}.",
+                    )
+            pending_recover_ranks = recover_slots
+
+        if not ElasticEPStateManager.request_scale(new_ep_size, pending_recover_ranks):
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=(
@@ -7040,6 +7331,9 @@ class Scheduler(
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
+            if self.input_blocker is not None and self.input_blocker.has_pending():
+                time.sleep(0 if self.input_blocker.needs_polling() else 0.001)
+                return
             self.idle_sleeper.maybe_sleep()
 
     def handle_freeze_gc(self, recv_req: FreezeGCReq):
@@ -7262,6 +7556,10 @@ def run_scheduler_process(
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
+
+        # Ex-joiner: server_args is read-only, so override; the offset must stay.
+        if scheduler.server_args.ep_join_mode in ("recover", "scale"):
+            get_context().override("elastic_ep.joined", ep_join_mode=None)
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()

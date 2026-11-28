@@ -32,6 +32,9 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import layernorm_sp, zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
+from sglang.srt.layers.attention.dsa.utils import (
+    maybe_prefetch_next_kimi_full_attention_kv,
+)
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -1463,7 +1466,8 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
             # still needs to reduce-scatter its TP-partial MLP output here.
             current_stream = torch.cuda.current_stream()
             current_stream.wait_event(shared_event)
-            if fine_grained_overlap:
+            # TODO: Remove this workaround once PTA fixes side-stream graph capture.
+            if _is_npu:
                 shared_output.record_stream(current_stream)
             else:
                 shared_alt_output = shared_output
@@ -2561,7 +2565,8 @@ class KimiK3DeltaAttention(nn.Module):
             return
         layer = self.attn
         w = layer.conv_weights
-        if _is_npu:
+        # The kernel is JIT-compiled CUDA, and covered() only checks shapes.
+        if not get_platform().is_cuda:
             return
         from sglang.kernels.ops.attention import kda_fused_decode
 
@@ -3218,6 +3223,7 @@ class KimiK3DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
         self._is_moe_layer = _is_moe_layer(config, layer_idx)
+        self.next_full_attention_layer_id = None
         # SP-MoE: with an EP a2a backend and attention TP, a MoE layer runs on
         # this rank's attention-TP shard of the rows.
         self._sp_moe = self._is_moe_layer and _shards_moe_rows()
@@ -3410,6 +3416,9 @@ class KimiK3DecoderLayer(nn.Module):
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()
 
+        maybe_prefetch_next_kimi_full_attention_kv(
+            forward_batch, self.next_full_attention_layer_id
+        )
         return result
 
     def forward(
@@ -3583,6 +3592,17 @@ class KimiK3LinearModel(nn.Module):
                 config, idx, sp_collective=sp_collective
             ),
         )
+        local_full_layers = [
+            i
+            for i in config.full_attention_layer_ids
+            if self.start_layer <= i < self.end_layer
+        ]
+        for layer_id, next_layer_id in zip(local_full_layers, local_full_layers[1:]):
+            self.layers[layer_id].next_full_attention_layer_id = next_layer_id
+        # A leading KDA layer can prefetch the first local Full Attention layer.
+        if local_full_layers and self.start_layer < local_full_layers[0]:
+            first_layer = self.layers[self.start_layer]
+            first_layer.next_full_attention_layer_id = local_full_layers[0]
         if self.kda_dwdp is not None:
             self.kda_dwdp.build()
         if _is_gfx95:
@@ -3906,8 +3926,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             aux_hidden_states = None
             if self.capture_aux_hidden_states:
                 hidden_states, aux_hidden_states = hidden_states
-            if input_ids is None and layernorm_sp.runs_sp(
-                forward_batch.forward_mode, embeds.shape[0]
+            if (
+                self.pp_group.world_size == 1
+                and input_ids is None
+                and embeds is not None
+                and layernorm_sp.runs_sp(forward_batch.forward_mode, embeds.shape[0])
             ):
                 # The multimodal routine passes embeddings only, and the logits
                 # processor gathers by the ids' count.
