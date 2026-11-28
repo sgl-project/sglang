@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -49,6 +52,53 @@ class HunyuanSamplingParams(SamplingParams):
             ],
         )
     )
+
+    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
+        super()._adjust_visual_fields(server_args, pipeline_config)
+        self._align_resolution(pipeline_config)
+
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        super().prepare_synthetic_warmup_request_for_queue(req, server_args)
+        # Warmup requests are built directly and skip _adjust_visual_fields.
+        self._align_resolution(server_args.pipeline_config)
+
+    def _align_resolution(self, pipeline_config) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
+            HunyuanConfig,
+        )
+
+        # The DiT splits the latent into 2x2 patches, so the VAE-floored latent needs an
+        # even side; align the request to the VAE factor times the patch size instead.
+        # The diffusers backend keeps its own size handling.
+        if not isinstance(pipeline_config, HunyuanConfig):
+            return
+        if self.width is None and self.height is None:
+            return
+        # InputValidationStage fills a missing side from 16:9 after this runs.
+        if self.height is None and self.width > 0:
+            self.height = max(1, self.width * 720 // 1280)
+        elif self.width is None and self.height > 0:
+            self.width = max(1, self.height * 1280 // 720)
+        if self.width is None or self.height is None:
+            return
+        if self.width <= 0 or self.height <= 0:
+            return
+        multiple = (
+            pipeline_config.vae_config.arch_config.spatial_compression_ratio
+            * pipeline_config.dit_config.arch_config.patch_size
+        )
+        requested_size = (self.width, self.height)
+        self.width = max(multiple, self.width // multiple * multiple)
+        self.height = max(multiple, self.height // multiple * multiple)
+        if (self.width, self.height) != requested_size:
+            logger.warning(
+                "HunyuanVideo requires dimensions divisible by %s; adjusted requested "
+                "resolution from %sx%s to %sx%s",
+                multiple,
+                *requested_size,
+                self.width,
+                self.height,
+            )
 
 
 @dataclass
