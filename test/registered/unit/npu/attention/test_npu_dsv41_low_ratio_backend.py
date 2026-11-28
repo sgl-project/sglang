@@ -9,6 +9,7 @@ Everything here is pure device-agnostic torch arithmetic plus a stub for the
 
 import sys
 import unittest
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -88,6 +89,22 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.mem_cache.registry import create_unified_radix_cache
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
+
+
+@contextmanager
+def _mock_operator_modules(modules):
+    # Restore only the operator keys; torch may lazily load modules in this scope.
+    missing = object()
+    original = {name: sys.modules.get(name, missing) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, module in original.items():
+            if module is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 class _Ds41Stub(ModuleType):
@@ -1107,13 +1124,19 @@ class TestIndexerRopeSource(unittest.TestCase):
             indexer=self._fake_indexer(n_heads, index_head_dim),
         )
         with (
-            patch.object(
-                sys.modules["torch_npu"],
-                "npu_dynamic_mx_quant",
-                lambda q, dst_type=None: (
-                    torch.zeros(q.shape[0], n_heads, packed, dtype=torch.uint8),
-                    torch.zeros(q.shape[0], n_heads, 4, dtype=torch.uint8),
-                ),
+            _mock_operator_modules(
+                {
+                    "sgl_kernel_npu.operators": SimpleNamespace(
+                        quant=SimpleNamespace(
+                            dynamic_mx_quant=lambda q, dst_type=None: (
+                                torch.zeros(
+                                    q.shape[0], n_heads, packed, dtype=torch.uint8
+                                ),
+                                torch.zeros(q.shape[0], n_heads, 4, dtype=torch.uint8),
+                            )
+                        )
+                    )
+                }
             ),
             patch.object(rope_mod, "Dsv4NpuRoPE", _RopeStub),
             patch.object(DS41, "quant_lightning_indexer_dsl", _QLI()),

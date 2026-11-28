@@ -118,6 +118,23 @@ class TestDynamicInt8MLAProlog(CustomTestCase):
         )
         self.stack.enter_context(patch.dict("sys.modules", {"torch_npu": self.vendor}))
         self.stack.enter_context(
+            patch.dict(
+                "sys.modules",
+                {
+                    "sgl_kernel_npu.operators.attention": SimpleNamespace(
+                        mla_prolog_v3=lambda **kwargs: self.vendor.npu_mla_prolog_v3(
+                            **kwargs
+                        )
+                    ),
+                    "sgl_kernel_npu.operators.quant": SimpleNamespace(
+                        dynamic_quant=lambda *args, **kwargs: (
+                            torch.ops.npu.npu_dynamic_quant(*args, **kwargs)
+                        )
+                    ),
+                },
+            )
+        )
+        self.stack.enter_context(
             patch.object(
                 torch.ops,
                 "npu",

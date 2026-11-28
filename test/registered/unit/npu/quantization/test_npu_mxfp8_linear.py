@@ -1,6 +1,8 @@
+import sys
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import torch
 
@@ -17,6 +19,22 @@ from sglang.srt.hardware_backend.npu.quantization.linear_utils import (
     process_npu_arch35_mxfp8_linear_weights,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+
+@contextmanager
+def _mock_operator_modules(modules):
+    # Restore only the operator keys; torch may lazily load modules in this scope.
+    missing = object()
+    original = {name: sys.modules.get(name, missing) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, module in original.items():
+            if module is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
@@ -85,9 +103,15 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         matmul_output = torch.randn(6, 64, dtype=torch.bfloat16)
 
         npu_ops = MagicMock()
-        npu_ops.npu_dynamic_mx_quant.return_value = (quantized, input_scale)
-        npu_ops.npu_quant_matmul.return_value = matmul_output
-        with patch.object(torch.ops, "npu", npu_ops, create=True):
+        npu_ops.dynamic_mx_quant.return_value = (quantized, input_scale)
+        npu_ops.quant_matmul.return_value = matmul_output
+        with _mock_operator_modules(
+            {
+                "sgl_kernel_npu.operators": SimpleNamespace(
+                    quant=npu_ops, matmul=npu_ops
+                )
+            },
+        ):
             output = npu_w8a8_mxfp8_linear(
                 input_tensor,
                 weight,
@@ -97,11 +121,11 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
             )
 
         self.assertEqual(output.shape, (2, 3, 64))
-        quant_call = npu_ops.npu_dynamic_mx_quant.call_args
+        quant_call = npu_ops.dynamic_mx_quant.call_args
         self.assertEqual(quant_call.args[0].shape, (6, 128))
         self.assertEqual(quant_call.kwargs["dst_type"], torch.float8_e4m3fn)
 
-        matmul_call = npu_ops.npu_quant_matmul.call_args
+        matmul_call = npu_ops.quant_matmul.call_args
         self.assertIs(matmul_call.args[0], quantized)
         self.assertIs(matmul_call.args[1], weight)
         self.assertIs(matmul_call.kwargs["scale"], weight_scale)
@@ -122,17 +146,23 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         weight = torch.empty(128, 64, dtype=torch.float8_e4m3fn)
         weight_scale = torch.empty(2, 64, 2, dtype=torch.uint8)
         npu_ops = MagicMock()
-        npu_ops.npu_dynamic_mx_quant.return_value = (
+        npu_ops.dynamic_mx_quant.return_value = (
             torch.empty(2, 128, dtype=torch.float8_e4m3fn),
             torch.empty(2, 2, 2, dtype=torch.uint8),
         )
-        npu_ops.npu_quant_matmul.return_value = torch.empty(2, 64)
+        npu_ops.quant_matmul.return_value = torch.empty(2, 64)
 
-        with patch.object(torch.ops, "npu", npu_ops, create=True):
+        with _mock_operator_modules(
+            {
+                "sgl_kernel_npu.operators": SimpleNamespace(
+                    quant=npu_ops, matmul=npu_ops
+                )
+            },
+        ):
             npu_w8a8_mxfp8_linear(input_tensor, weight, [128, 128], weight_scale)
 
         self.assertEqual(
-            npu_ops.npu_quant_matmul.call_args.kwargs["output_dtype"],
+            npu_ops.quant_matmul.call_args.kwargs["output_dtype"],
             torch.float16,
         )
 
@@ -142,13 +172,19 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
         weight_scale = torch.empty(2, 64, 2, dtype=torch.uint8)
         bias = torch.randn(64, dtype=torch.bfloat16)
         npu_ops = MagicMock()
-        npu_ops.npu_dynamic_mx_quant.return_value = (
+        npu_ops.dynamic_mx_quant.return_value = (
             torch.empty(2, 128, dtype=torch.float8_e4m3fn),
             torch.empty(2, 2, 2, dtype=torch.uint8),
         )
-        npu_ops.npu_quant_matmul.return_value = torch.empty(2, 64)
+        npu_ops.quant_matmul.return_value = torch.empty(2, 64)
 
-        with patch.object(torch.ops, "npu", npu_ops, create=True):
+        with _mock_operator_modules(
+            {
+                "sgl_kernel_npu.operators": SimpleNamespace(
+                    quant=npu_ops, matmul=npu_ops
+                )
+            },
+        ):
             npu_w8a8_mxfp8_linear(
                 input_tensor,
                 weight,
@@ -157,7 +193,7 @@ class TestNPUW8A8BlockFP8Linear(unittest.TestCase):
                 bias=bias,
             )
 
-        quant_bias = npu_ops.npu_quant_matmul.call_args.kwargs["bias"]
+        quant_bias = npu_ops.quant_matmul.call_args.kwargs["bias"]
         self.assertEqual(quant_bias.dtype, torch.float32)
         torch.testing.assert_close(quant_bias, bias.float())
 

@@ -169,9 +169,8 @@ class TestDoCpAttnFia(unittest.TestCase):
         forward_batch = SimpleNamespace(attn_cp_metadata=self._meta(prev, next_len))
         strategy = ZigzagCPStrategy(cp_size=2)
         with patch.object(ascend_backend, "get_cp_strategy", return_value=strategy):
-            with patch.object(
-                ascend_backend.torch_npu,
-                "npu_fused_infer_attention_score",
+            with patch(
+                "sgl_kernel_npu.operators.attention.fused_infer_attention_score",
                 self._fia,
             ):
                 return self.backend.do_cp_attn_fia(

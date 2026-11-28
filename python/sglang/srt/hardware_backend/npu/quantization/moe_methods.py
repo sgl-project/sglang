@@ -70,7 +70,9 @@ def w4a8_mxfp_gmm(
                 "block_size": 32,
                 "scale_alg": scale_alg,
             }
-        x, x_scale = torch.ops.npu.npu_dynamic_mx_quant(input, **dynamic_quant_kwargs)
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        x, x_scale = npu_quant_ops.dynamic_mx_quant(input, **dynamic_quant_kwargs)
     else:
         x, x_scale = input, input_scale
 
@@ -145,7 +147,9 @@ def fused_moe_npu(
 
     # act_fn:
     if moe_runner_config.activation == "silu":
-        hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
+        from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+        hidden_states = npu_activation_ops.swiglu(hidden_states)
     else:
         from sglang.srt.layers.activation import GeluAndMul
 
@@ -269,7 +273,9 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
             source = weight.data
             if not source.is_npu:
                 source = source.to(f"npu:{torch.npu.current_device()}")
-            packed, block_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+            packed, block_scale = npu_quant_ops.dynamic_mx_quant(
                 source,
                 dst_type=fp4_dtype,
                 round_mode="rint",
@@ -1113,7 +1119,9 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
         # cpu offload may have moved the weight back to host memory.
         if not weight.is_npu:
             weight = weight.to(f"npu:{torch.npu.current_device()}")
-        return torch.ops.npu.npu_dynamic_mx_quant(weight, dst_type=torch.float8_e4m3fn)
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        return npu_quant_ops.dynamic_mx_quant(weight, dst_type=torch.float8_e4m3fn)
 
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
@@ -1226,7 +1234,9 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
     ) -> torch.Tensor:
         if weight_prefix == "w13":
             if pertoken_scale is None:
-                hidden_states, pertoken_scale = torch.ops.npu.npu_dynamic_mx_quant(
+                from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+                hidden_states, pertoken_scale = npu_quant_ops.dynamic_mx_quant(
                     hidden_states, dst_type=torch.float8_e4m3fn
                 )
             pertoken_scale = pertoken_scale.reshape(

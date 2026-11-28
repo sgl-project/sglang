@@ -15,7 +15,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 
 _is_cuda = current_platform.is_cuda()
 _is_hip = current_platform.is_hip()
-_is_npu = current_platform.is_npu()
 _is_xpu = current_platform.is_xpu()
 
 if _is_cuda:
@@ -24,8 +23,6 @@ elif _is_hip or _is_xpu:
     from sgl_kernel import silu_and_mul
 
 
-if _is_npu:
-    import torch_npu
 # TODO (will): remove this dependency
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 
@@ -54,7 +51,9 @@ class SiluAndMul(CustomOp):
         return F.silu(x[..., :d]) * x[..., d:]
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch_npu.npu_swiglu(x)
+        from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+        out = npu_activation_ops.swiglu(x)
         return out
 
     def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
@@ -89,7 +88,9 @@ class GeluAndMul(CustomOp):
         return self.forward_native(*args, **kwargs)
 
     def forward_npu(self, x: torch.Tensor) -> torch.Tensor:
-        y_npu, _ = torch_npu.npu_geglu(
+        from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+        y_npu, _ = npu_activation_ops.geglu(
             x,
             dim=-1,
             approximate=1 if self.approximate == "tanh" else 0,

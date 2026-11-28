@@ -220,12 +220,12 @@ class DSparkAttention(MqaAttentionBase):
                 q_out = torch.empty_like(q)
             fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
             return q_out
-        import torch_npu
+        from sgl_kernel_npu.operators import norm as npu_norm_ops
 
         from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
         if self.q_head_norm:
-            q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
+            q = npu_norm_ops.rms_norm(q, self._q_post_norm_weight, self.eps)[0]
         cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
             positions,
             q.dtype,

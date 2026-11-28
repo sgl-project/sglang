@@ -112,7 +112,9 @@ class GPTQLinearAscendKernel:
         else:
             out_shape = x.shape[:-1] + (qweight.shape[-1],)
 
-        out = torch.ops.npu.npu_weight_quant_batchmatmul(
+        from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+        out = npu_matmul_ops.weight_quant_batchmatmul(
             reshaped_x,
             qweight,
             antiquant_scale=scales,

@@ -1,4 +1,6 @@
+import sys
 import unittest
+from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -40,16 +42,37 @@ from sglang.test.test_utils import CustomTestCase
 
 
 def _make_fp4_method(**kwargs):
-    """Build the real method with the Ascend MX-quant op stubbed out.
+    """Construction must remain lazy and require no installed NPU operators."""
+    return NPUW4A8MXFP4FusedMoEMethod(**kwargs)
 
-    Constructing it also builds the W13/W2 kernels, whose
-    ``HiddenStatesDynamicQuant`` resolves ``torch.ops.npu.npu_dynamic_mx_quant``
-    at init time; that op only exists on an NPU host. These tests cover the
-    checkpoint-loading, runner-delegation and dispatcher wiring above it, never
-    the kernel itself.
-    """
-    with patch.object(torch.ops.npu, "npu_dynamic_mx_quant", create=True):
-        return NPUW4A8MXFP4FusedMoEMethod(**kwargs)
+
+@contextmanager
+def _mock_dynamic_mx_quant(**kwargs):
+    op = MagicMock(**kwargs)
+    with _mock_operator_modules(
+        {
+            "sgl_kernel_npu.operators": SimpleNamespace(
+                quant=SimpleNamespace(dynamic_mx_quant=op)
+            )
+        },
+    ):
+        yield op
+
+
+@contextmanager
+def _mock_operator_modules(modules):
+    # Restore only the operator keys; torch may lazily load modules in this scope.
+    missing = object()
+    original = {name: sys.modules.get(name, missing) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, module in original.items():
+            if module is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 class TestFP4MethodGate(unittest.TestCase):
@@ -79,9 +102,8 @@ class TestFP4MethodGate(unittest.TestCase):
                 "sglang.srt.layers.quantization.fp8.is_npu_arch35",
                 return_value=True,
             ),
-            # The arches only pick the class; building the real W13/W2 kernels
-            # would grab torch.ops.npu.npu_dynamic_mx_quant, which exists only
-            # on an NPU host.
+            # This test covers architecture selection; runner construction is
+            # exercised separately below.
             patch(
                 "sglang.srt.hardware_backend.npu.quantization.fp4_moe_methods.NPUW4A8MXFP4MoEMethod"
             ),
@@ -663,9 +685,7 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
     def test_supplied_scale_skips_dynamic_quant(self):
         expected = torch.randn(2, 32)
         with (
-            patch.object(
-                torch.ops.npu, "npu_dynamic_mx_quant", create=True
-            ) as dynamic_quant,
+            _mock_dynamic_mx_quant() as dynamic_quant,
             patch.object(
                 torch.ops.npu,
                 "npu_grouped_matmul",
@@ -687,11 +707,8 @@ class TestW4A8MxfpGmmInputScale(unittest.TestCase):
         quantized_scale = torch.ones(2, 1, 2)
         expected = torch.randn(2, 32)
         with (
-            patch.object(
-                torch.ops.npu,
-                "npu_dynamic_mx_quant",
-                return_value=(quantized, quantized_scale),
-                create=True,
+            _mock_dynamic_mx_quant(
+                return_value=(quantized, quantized_scale)
             ) as dynamic_quant,
             patch.object(
                 torch.ops.npu,
@@ -772,10 +789,7 @@ class TestRunnerDelegation(CustomTestCase):
     def test_create_runner_installs_internal_kernels_before_runner(self):
         # The real constructor reads both kernels to select the activation.
         # Installing kernels after construction would fail here.
-        with (
-            patch("sglang.srt.layers.quantization.fp8._is_npu", True),
-            patch.object(torch.ops.npu, "npu_dynamic_mx_quant", create=True),
-        ):
+        with patch("sglang.srt.layers.quantization.fp8._is_npu", True):
             methods = (*self._methods(), NPUMXFP8OnlineMoEMethod())
             for method in methods:
                 with self.subTest(method=type(method).__name__):

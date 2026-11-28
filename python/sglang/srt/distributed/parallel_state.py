@@ -835,7 +835,9 @@ class GroupCoordinator:
             return input_
 
         try:
-            from torch_npu import npu_dynamic_quant
+            from sgl_kernel_npu.operators.quant import (
+                dynamic_quant as npu_dynamic_quant,
+            )
         except ImportError:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_

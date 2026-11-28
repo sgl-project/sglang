@@ -79,6 +79,13 @@ def _dflash_npu_top_k_top_p_renorm_prob(
     if not hasattr(torch_npu, "npu_top_k_top_p"):
         return None
 
+    from sgl_kernel_npu.operators import sampler as npu_sampler_ops
+
+    from sglang.srt.hardware_backend.npu.utils import is_npu_op_supported
+
+    if not is_npu_op_supported(npu_sampler_ops.top_k_top_p):
+        return None
+
     logits = probs.log()
     npu_top_ps = (
         top_ps.reshape(-1).to(device=probs.device, dtype=probs.dtype)
@@ -94,7 +101,7 @@ def _dflash_npu_top_k_top_p_renorm_prob(
         torch.all((npu_top_ks >= 1) & (npu_top_ks <= 1024)).item()
     ):
         return None
-    filtered_logits = torch_npu.npu_top_k_top_p(logits, npu_top_ps, npu_top_ks)
+    filtered_logits = npu_sampler_ops.top_k_top_p(logits, npu_top_ps, npu_top_ks)
     return filtered_logits.softmax(dim=-1)
 
 

@@ -614,7 +614,9 @@ class AscendOpsDispatcher(BaseDispatcher):
         scales = None
         if quant_mode == MXFP8_QUANT_MODE:
             if hidden_states.shape[0] > 0:
-                hidden_states, scales = torch_npu.npu_dynamic_mx_quant(
+                from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+                hidden_states, scales = npu_quant_ops.dynamic_mx_quant(
                     hidden_states, dst_type=torch.float8_e4m3fn
                 )
                 scales = normalize_mxfp_scale(scales).view(torch.uint8)

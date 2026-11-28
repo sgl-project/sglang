@@ -487,12 +487,25 @@ def legacy_native(monkeypatch, adapter):
     quant = Mock(side_effect=lambda tensor, **kw: (tensor, torch.ones(1)))
     native_mx = Mock(side_effect=lambda q, *a, **kw: (torch.zeros_like(q), None))
     native_float = Mock(side_effect=lambda q, *a, **kw: (torch.zeros_like(q), None))
-    monkeypatch.setattr(torch.ops.npu, "npu_dynamic_mx_quant", quant, raising=False)
+    monkeypatch.setattr(torch.ops.npu, "npu_dynamic_mx_quant", object(), raising=False)
     monkeypatch.setattr(
-        torch.ops.npu, "npu_fused_infer_attention_score_v2", native_mx, raising=False
+        torch.ops.npu, "npu_fused_infer_attention_score_v2", object(), raising=False
     )
     monkeypatch.setattr(
-        torch.ops.npu, "npu_fused_infer_attention_score", native_float, raising=False
+        "sglang.srt.hardware_backend.npu.utils.is_npu_op_supported", lambda op: True
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sgl_kernel_npu.operators.quant",
+        SimpleNamespace(dynamic_mx_quant=quant),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sgl_kernel_npu.operators.attention",
+        SimpleNamespace(
+            fused_infer_attention_score_v2=native_mx,
+            fused_infer_attention_score=native_float,
+        ),
     )
     # The packed native entry point checks NPU devices before invoking the op.
     monkeypatch.setattr(

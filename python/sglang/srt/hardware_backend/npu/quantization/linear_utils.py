@@ -141,9 +141,9 @@ def _layout_npu_arch35_e4m3_weights(
             block_k, dim=1
         )[:, :k_dim]
         bf16 = (_dequant_e4m3fn_to_float32(weight[r0:r1]) * s).to(torch.bfloat16)
-        qw_c, ws_c = torch.ops.npu.npu_dynamic_mx_quant(
-            bf16, dst_type=torch.float8_e4m3fn
-        )
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        qw_c, ws_c = npu_quant_ops.dynamic_mx_quant(bf16, dst_type=torch.float8_e4m3fn)
         qw[r0:r1] = qw_c
         if w_scale is None:
             w_scale = torch.empty(

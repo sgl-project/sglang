@@ -61,10 +61,11 @@ class ModelSlimQFP8DynamicKVFP8Scheme(ModelSlimKVCacheScheme):
         return self.cache_layout
 
     def quantize_query(self, q):
-        import torch_npu
 
         shape = q.shape
-        quantized, scale = torch_npu.npu_dynamic_quant(
+        from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+        quantized, scale = npu_quant_ops.dynamic_quant(
             q.reshape(-1, shape[-1]), dst_type=torch.float8_e4m3fn
         )
         return quantized.view(shape), scale.view(*shape[:-1], 1).float()

@@ -231,11 +231,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
-# NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
-# torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
-if _is_npu:
-    import torch_npu
-
 
 class MhcOps(NamedTuple):
     hc_split_sinkhorn: Callable[..., Any]
@@ -2139,7 +2134,9 @@ class MQALayer(MqaAttentionBase):
             stream_q.wait_event(q_lora_ready)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+            q = npu_norm_ops.rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
                 forward_batch, positions, q.dtype, inverse=False
             )
@@ -2510,7 +2507,9 @@ class MQALayer(MqaAttentionBase):
             # V4 normalizes each query head before RoPE; V4.1 (q_head_norm
             # False) does not -- its only q norm is the q_lora one above.
             if self.q_head_norm:
-                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+                from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+                q = npu_norm_ops.rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -3110,10 +3109,14 @@ class MQALayer(MqaAttentionBase):
                 )
                 o = Mxfp8SwizzledInput(*out) if fuse_mxfp8_quant else out[0]
             elif self.use_npu_arch35_mxfp8_wo_a:
-                o, o_scale = torch_npu.npu_dynamic_mx_quant(
+                from sgl_kernel_npu.operators import quant as npu_quant_ops
+
+                o, o_scale = npu_quant_ops.dynamic_mx_quant(
                     o, dst_type=torch.float8_e4m3fn
                 )
-                o = torch_npu.npu_transpose_quant_batchmatmul(
+                from sgl_kernel_npu.operators import matmul as npu_matmul_ops
+
+                o = npu_matmul_ops.transpose_quant_batchmatmul(
                     o,
                     self.wo_a.weight,
                     dtype=torch.bfloat16,

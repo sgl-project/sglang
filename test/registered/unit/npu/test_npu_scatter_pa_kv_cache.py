@@ -1,5 +1,7 @@
 import os
+import sys
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -13,6 +15,26 @@ from sglang.srt.hardware_backend.npu import memory_pool_npu
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+
+@contextmanager
+def _mock_cache_ops(vendor, *, supported=True):
+    # Keep SDK availability separate from the public operator registrations.
+    ops = SimpleNamespace(
+        scatter_pa_kv_cache=getattr(vendor, "npu_scatter_pa_kv_cache", MagicMock()),
+        scatter_nd_update_=getattr(vendor, "npu_scatter_nd_update_", MagicMock()),
+        reshape_and_cache=getattr(vendor, "_npu_reshape_and_cache", MagicMock()),
+    )
+    with (
+        patch.object(memory_pool_npu, "torch_npu", vendor, create=True),
+        patch.dict(sys.modules, {"sgl_kernel_npu.operators.mem_cache": ops}),
+        patch(
+            "sglang.srt.hardware_backend.npu.utils.is_npu_op_supported",
+            return_value=supported,
+            create=True,
+        ) as probe,
+    ):
+        yield probe
 
 
 class TestNPUScatterPaKVCache(unittest.TestCase):
@@ -83,7 +105,7 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
             npu_scatter_nd_update_=MagicMock(),
         )
 
-        with patch.object(memory_pool_npu, "torch_npu", fake_torch_npu, create=True):
+        with _mock_cache_ops(fake_torch_npu):
             pool.set_kv_buffer(
                 layer,
                 loc,
@@ -119,7 +141,7 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
                     npu_scatter_nd_update_=MagicMock(),
                     _npu_reshape_and_cache=MagicMock(),
                 )
-                with patch.object(memory_pool_npu, "torch_npu", fake, create=True):
+                with _mock_cache_ops(fake):
                     pool.set_kv_buffer(layer, loc, cache_k, cache_v)
                 self.assertEqual(
                     fake.npu_scatter_nd_update_.call_count, 2 if use_fia else 0
@@ -127,6 +149,26 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
                 self.assertEqual(
                     fake._npu_reshape_and_cache.call_count, 0 if use_fia else 1
                 )
+
+    def test_unregistered_generation_uses_existing_writers(self):
+        for use_fia in (True, False):
+            pool = self._make_pool(use_fia=use_fia)
+            layer, loc, cache_k, cache_v = self._inputs()
+            vendor = SimpleNamespace(
+                npu_scatter_pa_kv_cache=MagicMock(),
+                npu_scatter_nd_update_=MagicMock(),
+                _npu_reshape_and_cache=MagicMock(),
+            )
+            with _mock_cache_ops(vendor, supported=False) as probe:
+                pool.set_kv_buffer(layer, loc, cache_k, cache_v)
+            probe.assert_called_once_with(vendor.npu_scatter_pa_kv_cache)
+            vendor.npu_scatter_pa_kv_cache.assert_not_called()
+            self.assertEqual(
+                vendor.npu_scatter_nd_update_.call_count, 2 if use_fia else 0
+            )
+            self.assertEqual(
+                vendor._npu_reshape_and_cache.call_count, 0 if use_fia else 1
+            )
 
     def test_unset_or_disabled_flag_uses_existing_writers(self):
         for value in (None, "0"):
@@ -144,7 +186,7 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
                         npu_scatter_nd_update_=MagicMock(),
                         _npu_reshape_and_cache=MagicMock(),
                     )
-                    with patch.object(memory_pool_npu, "torch_npu", fake, create=True):
+                    with _mock_cache_ops(fake):
                         pool.set_kv_buffer(layer, loc, cache_k, cache_v)
                     fake.npu_scatter_pa_kv_cache.assert_not_called()
                     self.assertEqual(
@@ -164,7 +206,7 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
                     npu_scatter_nd_update_=MagicMock(),
                     _npu_reshape_and_cache=MagicMock(),
                 )
-                with patch.object(memory_pool_npu, "torch_npu", fake, create=True):
+                with _mock_cache_ops(fake):
                     pool.set_kv_buffer(layer, loc, cache_k, cache_v)
                 fake.npu_scatter_pa_kv_cache.assert_not_called()
                 self.assertEqual(
@@ -179,7 +221,7 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
         layer, loc, cache_k, cache_v = self._inputs()
         fake = SimpleNamespace(npu_scatter_pa_kv_cache=MagicMock())
         with (
-            patch.object(memory_pool_npu, "torch_npu", fake, create=True),
+            _mock_cache_ops(fake),
             self.assertRaisesRegex(ValueError, "row mismatch"),
         ):
             pool.set_kv_buffer(layer, loc[:1], cache_k, cache_v)

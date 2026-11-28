@@ -53,7 +53,13 @@ _ATTN_BACKEND: str = "auto"
 
 
 def npu_fia_available() -> bool:
-    return hasattr(torch.ops.npu, "npu_fused_infer_attention_score")
+    if not hasattr(torch.ops.npu, "npu_fused_infer_attention_score"):
+        return False
+    from sgl_kernel_npu.operators import attention as npu_attention_ops
+
+    from sglang.srt.hardware_backend.npu.utils import is_npu_op_supported
+
+    return is_npu_op_supported(npu_attention_ops.fused_infer_attention_score)
 
 
 def set_attn_backend(backend: str) -> str:
@@ -194,7 +200,9 @@ def _flash_or_sdpa(
             num_key_value_heads = k.shape[2]
         else:
             raise ValueError(f"Unsupported attention input layout: {input_layout}")
-        out, _ = torch.ops.npu.npu_fused_infer_attention_score(
+        from sgl_kernel_npu.operators import attention as npu_attention_ops
+
+        out, _ = npu_attention_ops.fused_infer_attention_score(
             q_bhsd,
             k_bhsd,
             v_bhsd,
@@ -377,12 +385,21 @@ class Qwen3MLP(nn.Module):
             or self.config.hidden_act != "silu"
         ):
             return False
-        return hasattr(torch.ops.npu, "npu_swiglu")
+        import torch_npu
+        from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+        from sglang.srt.hardware_backend.npu.utils import is_npu_op_supported
+
+        return callable(getattr(torch_npu, "npu_swiglu", None)) and is_npu_op_supported(
+            npu_activation_ops.swiglu
+        )
 
     def forward(self, x):
         if self._use_npu_fused_mlp(x):
             gate_up = F.linear(x, self._pack_npu_gate_up_weights())
-            return self.down_proj(torch.ops.npu.npu_swiglu(gate_up))
+            from sgl_kernel_npu.operators import activation as npu_activation_ops
+
+            return self.down_proj(npu_activation_ops.swiglu(gate_up))
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 

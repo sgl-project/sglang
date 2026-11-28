@@ -11,9 +11,10 @@ Run directly:
     python -m pytest test/registered/unit/npu/mem_cache/test_npu_dsa_layer_split.py
 """
 
+import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -299,21 +300,27 @@ class TestShardBookkeeping(CustomTestCase):
     def test_packed_remote_copy_uses_the_pool_record_packer(self):
         """The CP-gathered copy of a packed layer goes through the base pool's
         record packer, the same one set_kv_buffer uses."""
-        from sglang.srt.hardware_backend.npu import dsa_cache_layer_split
-
         pool = _make_pool(kv_dim=6)
         pool.dsa_kv_cache_store_c8 = True
         loc = torch.tensor([0, 1])
         packed = torch.zeros((2, 6))
+        scatter = MagicMock()
         with (
             patch.object(POOL, "_pack_dsa_quant_kv_cache", return_value=packed) as pack,
-            patch.object(dsa_cache_layer_split, "torch_npu", create=True) as npu,
+            patch.dict(
+                sys.modules,
+                {
+                    "sgl_kernel_npu.operators.mem_cache": SimpleNamespace(
+                        scatter_nd_update_=scatter
+                    )
+                },
+            ),
         ):
             pool._store_remote_copy(
                 SimpleNamespace(layer_id=5), loc, torch.zeros(2, 4), torch.zeros(2, 2)
             )
         pack.assert_called_once()
-        npu.npu_scatter_nd_update_.assert_called_once()
+        scatter.assert_called_once()
 
 
 class _FakeParallel:

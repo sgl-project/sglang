@@ -88,7 +88,9 @@ def npu_wrapper_rmsnorm_forward(func):
             )
             return out.to(x.dtype), residual_out
 
-        out = torch.ops.npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+        from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+        out = npu_norm_ops.rms_norm(x, self.weight.data, self.variance_epsilon)[0]
         out = out + self.bias
         return out.to(x.dtype)
 

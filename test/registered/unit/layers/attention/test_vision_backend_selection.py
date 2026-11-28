@@ -290,11 +290,10 @@ def test_ascend_attention_masked_inputs_fall_back_to_sdpa(
     fused_attention = Mock(
         side_effect=AssertionError("masked inputs must not use Ascend fused attention")
     )
-    monkeypatch.setattr(
-        vision,
-        "torch_npu",
-        SimpleNamespace(npu_fused_infer_attention_score=fused_attention),
-        raising=False,
+    monkeypatch.setitem(
+        sys.modules,
+        "sgl_kernel_npu.operators.attention",
+        SimpleNamespace(fused_infer_attention_score=fused_attention),
     )
     backend = vision.VisionAscendAttention(
         head_dim=head_dim,
@@ -336,11 +335,10 @@ def test_ascend_attention_unmasked_inputs_keep_fused_path(
     q, k, v = [torch.randn(bsz * seq_len, num_heads, head_dim) for _ in range(3)]
     expected = torch.randn_like(q)
     fused_attention = Mock(return_value=(expected, None))
-    monkeypatch.setattr(
-        vision,
-        "torch_npu",
-        SimpleNamespace(npu_fused_infer_attention_score=fused_attention),
-        raising=False,
+    monkeypatch.setitem(
+        sys.modules,
+        "sgl_kernel_npu.operators.attention",
+        SimpleNamespace(fused_infer_attention_score=fused_attention),
     )
     backend = vision.VisionAscendAttention(
         head_dim=head_dim,

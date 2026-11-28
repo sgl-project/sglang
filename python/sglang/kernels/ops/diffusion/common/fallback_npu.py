@@ -1,5 +1,4 @@
 import torch
-import torch_npu
 
 NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
 NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
@@ -39,7 +38,9 @@ def apply_rotary_embedding_native(
         cos = cos.unsqueeze(0)
         sin = sin.unsqueeze(0)
         x = x.unsqueeze(0)
-        x_embed = torch_npu.npu_rotary_mul(x, cos, sin)
+        from sgl_kernel_npu.operators import rope as npu_rope_ops
+
+        x_embed = npu_rope_ops.rotary_mul(x, cos, sin)
         x_embed = x_embed.squeeze(0)
         return x_embed
 

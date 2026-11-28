@@ -41,9 +41,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 if _use_aiter_rope_gfx1250:
     import aiter
 
-if _is_npu:
-    import torch_npu
-
 
 class Phi3LongRoPEScaledRotaryEmbedding(nn.Module):
     """Phi3 family of models scaled rotary embedding."""
@@ -579,12 +576,15 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         if self.rotary_dim < self.head_size:
             query_pass = query[..., self.rotary_dim :]
             key_pass = key[..., self.rotary_dim :]
-        query_rot = torch_npu.npu_interleave_rope(
+        from sgl_kernel_npu.operators import rope as npu_rope_ops
+
+        query_rot = npu_rope_ops.interleave_rope(
             query_rot.reshape(num_tokens, num_q_heads, 1, self.rotary_dim),
             cos,
             sin,
         )
-        key_rot = torch_npu.npu_interleave_rope(
+
+        key_rot = npu_rope_ops.interleave_rope(
             key_rot.reshape(num_tokens, num_k_heads, 1, self.rotary_dim),
             cos,
             sin,

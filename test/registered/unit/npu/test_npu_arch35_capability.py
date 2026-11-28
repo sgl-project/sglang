@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -40,6 +40,31 @@ class TestArch35Capability(unittest.TestCase):
             ),
         ):
             self.assertFalse(is_npu_arch35())
+
+    def test_registry_fallback_when_acl_arch_is_unavailable(self):
+        for rt in (
+            SimpleNamespace(),
+            SimpleNamespace(get_device_info=lambda *_: (0, 1)),
+        ):
+            get_hardware = Mock(return_value=SimpleNamespace(arch_id=3510))
+            with (
+                self.subTest(rt=rt),
+                patch(
+                    "sglang.srt.hardware_backend.npu.utils.is_npu", return_value=True
+                ),
+                patch.dict(
+                    "sys.modules",
+                    {
+                        "acl": SimpleNamespace(rt=rt),
+                        "sgl_kernel_npu.operators.utils.generation": SimpleNamespace(
+                            get_hardware=get_hardware
+                        ),
+                    },
+                ),
+            ):
+                is_npu_arch35.cache_clear()
+                self.assertTrue(is_npu_arch35())
+                get_hardware.assert_called_once_with()
 
     @patch("sglang.srt.hardware_backend.npu.utils.is_npu", return_value=False)
     def test_non_npu_is_not_supported(self, _):

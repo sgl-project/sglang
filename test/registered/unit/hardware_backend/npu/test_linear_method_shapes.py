@@ -1,8 +1,10 @@
 """Check W8A8 tensor layout handling; replace only the device operators."""
 
+import sys
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -19,6 +21,22 @@ from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+@contextmanager
+def _mock_operator_modules(modules):
+    # Restore only the operator keys; torch may lazily load modules in this scope.
+    missing = object()
+    original = {name: sys.modules.get(name, missing) for name in modules}
+    sys.modules.update(modules)
+    try:
+        yield
+    finally:
+        for name, module in original.items():
+            if module is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 class TestNpuLinearShapes(CustomTestCase):
@@ -47,16 +65,19 @@ class TestNpuLinearShapes(CustomTestCase):
             aclnn_input_offset=torch.zeros(4),
             quant_bias=torch.ones(6),
         )
-        for name, implementation in (
-            ("npu_quantize", self.quantize),
-            ("npu_dynamic_quant", self.dynamic_quantize),
-            ("npu_quant_matmul", self.matmul),
-        ):
-            self.enterContext(
-                patch.object(
-                    torch.ops.npu, name, side_effect=implementation, create=True
-                )
+        self.enterContext(
+            patch.object(
+                torch.ops.npu, "npu_quantize", side_effect=self.quantize, create=True
             )
+        )
+        self.dynamic_quant = MagicMock(side_effect=self.dynamic_quantize)
+        operators = SimpleNamespace(
+            quant=SimpleNamespace(dynamic_quant=self.dynamic_quant),
+            matmul=SimpleNamespace(quant_matmul=MagicMock(side_effect=self.matmul)),
+        )
+        self.enterContext(
+            _mock_operator_modules({"sgl_kernel_npu.operators": operators})
+        )
 
     def test_static_and_dynamic_restore_leading_dimensions(self):
         """Keep leading dimensions, e.g. (3, 2, 4) -> (3, 2, 6), and dtype."""
@@ -90,7 +111,7 @@ class TestNpuLinearShapes(CustomTestCase):
         torch.testing.assert_close(
             result, (x.float() @ self.layer.weight.float()).to(torch.bfloat16)
         )
-        torch.ops.npu.npu_dynamic_quant.assert_not_called()
+        self.dynamic_quant.assert_not_called()
 
 
 if __name__ == "__main__":

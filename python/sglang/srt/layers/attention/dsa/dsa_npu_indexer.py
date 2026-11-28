@@ -24,7 +24,6 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_npu, print_info_once
 
 if is_npu():
-    import torch_npu
     from sgl_kernel_npu.operators.indexer import mlp_lightning_indexer
 
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
@@ -49,6 +48,8 @@ def create_npu_hadamard_128(head_dim: int, device) -> torch.Tensor:
 
 
 def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
+    from sgl_kernel_npu.operators.quant import dynamic_quant
+
     assert x.dtype == torch.bfloat16 and x.shape[-1] == 128
     if x.numel() == 0:
         return (
@@ -56,9 +57,7 @@ def _quantize_npu_indexer_activation(x, hadamard, dst_type, scale_type):
             torch.empty(x.shape[:-1], dtype=scale_type, device=x.device),
         )
     rotated = x @ hadamard
-    quantized, scale = torch_npu.npu_dynamic_quant(
-        rotated.reshape(-1, 128), dst_type=dst_type
-    )
+    quantized, scale = dynamic_quant(rotated.reshape(-1, 128), dst_type=dst_type)
     return quantized.reshape(x.shape), scale.to(scale_type).reshape(x.shape[:-1])
 
 
@@ -320,6 +319,9 @@ class DSANPUIndexerMixin:
         # DSA prefill CP metadata is Ascend-local and is first consumed by this
         # indexer (before the attention backend's forward_extend), so prepare it
         # here rather than in the shared eager runner.
+        from sgl_kernel_npu.operators.indexer import lightning_indexer
+        from sgl_kernel_npu.operators.rope import rotary_mul
+
         attn_backend = get_attn_backend()
         # Hybrid models (Kimi K2/K3) wrap a full-attn and a linear backend;
         # unwrap before preparing CP metadata as well as reading it.
@@ -419,7 +421,7 @@ class DSANPUIndexerMixin:
                         dim=-1,
                     )  # [rows, 64, 64 + 64]
                     q_pe = q_pe.view(bs_q, self.n_heads, 1, self.rope_head_dim)
-                    q_pe = torch_npu.npu_rotary_mul(q_pe, cos_q, sin_q).view(
+                    q_pe = rotary_mul(q_pe, cos_q, sin_q).view(
                         bs_q, self.n_heads, self.rope_head_dim
                     )  # [rows, n, d]
                     q = torch.cat([q_pe, q_nope], dim=-1)
@@ -439,7 +441,7 @@ class DSANPUIndexerMixin:
                     dim=-1,
                 )  # [rows, 64, 64 + 64]
                 q_pe = q_pe.view(bs_q, self.n_heads, 1, self.rope_head_dim)
-                q_pe = torch_npu.npu_rotary_mul(q_pe, cos_q, sin_q).view(
+                q_pe = rotary_mul(q_pe, cos_q, sin_q).view(
                     bs_q, self.n_heads, self.rope_head_dim
                 )  # [rows, n, d]
                 q = torch.cat([q_pe, q_nope], dim=-1)
@@ -467,7 +469,7 @@ class DSANPUIndexerMixin:
             )  # [bs, 64 + 64]
 
             k_pe = k_pe.view(-1, 1, 1, self.rope_head_dim)
-            k_pe = torch.ops.npu.npu_rotary_mul(k_pe, cos, sin).view(
+            k_pe = rotary_mul(k_pe, cos, sin).view(
                 bs, 1, self.rope_head_dim
             )  # [bs, 1, d]
             k = torch.cat([k_pe, k_nope.unsqueeze(1)], dim=-1)  # [bs, 1, 128]
@@ -752,7 +754,7 @@ class DSANPUIndexerMixin:
                     key_quant_mode=0,
                 ).squeeze(1)
             else:
-                topk_indices = torch_npu.npu_lightning_indexer(
+                topk_indices = lightning_indexer(
                     query=query,
                     key=past_key_states,
                     weights=weights,
@@ -785,11 +787,13 @@ class DSANPUIndexerMixin:
         block_table,
     ):
         # V2: Q is local (sharded); single indexer call against full KV.
+        from sgl_kernel_npu.operators.indexer import lightning_indexer
+
         if indexer_weights is not None:
             indexer_weights = indexer_weights.contiguous().view(
                 -1, indexer_weights.shape[-1]
             )
-        topk_indices = torch_npu.npu_lightning_indexer(
+        topk_indices = lightning_indexer(
             query=q,
             key=past_key_states,
             weights=indexer_weights,

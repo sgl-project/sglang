@@ -61,7 +61,6 @@ if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 if _is_npu:
-    import torch_npu
     from sgl_kernel_npu.operators.norm import fused_rmsnorm_without_weight
 
     try:
@@ -265,11 +264,15 @@ class RMSNorm(CustomOp):
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is not None:
-            out, _, residual_out = torch_npu.npu_add_rms_norm(
+            from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+            out, _, residual_out = npu_norm_ops.add_rms_norm(
                 residual, x, self.weight.data, self.variance_epsilon
             )
             return out, residual_out
-        return torch_npu.npu_rms_norm(x, self.weight.data, self.variance_epsilon)[0]
+        from sgl_kernel_npu.operators import norm as npu_norm_ops
+
+        return npu_norm_ops.rms_norm(x, self.weight.data, self.variance_epsilon)[0]
 
     def forward_hip(
         self,

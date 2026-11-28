@@ -2046,9 +2046,13 @@ class AscendAttnBackend(AttentionBackend):
         actual_seq_qlen,
         actual_seq_lengths_kv,
     ):
+        from sgl_kernel_npu.operators.attention import (
+            kv_quant_sparse_flash_attention_torch_npu,
+        )
+
         assert q_nope.dtype == q_pe.dtype == torch.bfloat16
         # A packed pool hands back its K buffer in the record's one-byte dtype.
-        return torch_npu.npu_kv_quant_sparse_flash_attention(
+        return kv_quant_sparse_flash_attention_torch_npu(
             query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
             key=packed_kv,
             value=packed_kv,
@@ -2104,13 +2108,15 @@ class AscendAttnBackend(AttentionBackend):
             # The strategy passes cu_seqlens_q (with a leading 0) and plain KV
             # lengths as int32 tensors; FIA wants cumulative query lengths
             # (no leading 0) and KV lengths as Python lists.
+            from sgl_kernel_npu.operators.attention import fused_infer_attention_score
+
             k_cache_paged = k_cache.view(
                 -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
             )
             v_cache_paged = v_cache.view(
                 -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
             )
-            return torch_npu.npu_fused_infer_attention_score(
+            return fused_infer_attention_score(
                 query=q_chunk.contiguous(),
                 key=k_cache_paged,
                 value=v_cache_paged,
@@ -2394,6 +2400,13 @@ class AscendAttnBackend(AttentionBackend):
         q_descale: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        from sgl_kernel_npu.operators.attention import (
+            attention_update,
+            flash_attention_qlens,
+            fused_infer_attention_score,
+            fused_infer_attention_score_v2,
+        )
+
         if is_mla_preprocess_enabled() and self.use_mla:
             # DSA callers set save_kv_cache based on whether preprocessing was used.
             # Only override it for the existing non-sparse MLA path.
@@ -2576,7 +2589,7 @@ class AscendAttnBackend(AttentionBackend):
                             ]
                         q = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                         block_size = self.page_size
-                        attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        attn_out, _ = fused_infer_attention_score_v2(
                             query=q,
                             key=k_cache.view(
                                 -1,
@@ -2644,7 +2657,7 @@ class AscendAttnBackend(AttentionBackend):
                             if q_len == 0:
                                 continue
                             total_kv_len = seq_lens_cpu[seq_idx]
-                            result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                            result, _ = fused_infer_attention_score_v2(
                                 query=q[None, q_len_offset : q_len_offset + q_len],
                                 key=k_cache.view(
                                     -1,
@@ -2717,7 +2730,7 @@ class AscendAttnBackend(AttentionBackend):
                             data[: forward_batch.global_num_token_non_padded_cpu]
                             for data in [q, k, v]
                         ]
-                    attn_output, _ = torch_npu.npu_fused_infer_attention_score(
+                    attn_output, _ = fused_infer_attention_score(
                         query=q,
                         key=k_cache.view(
                             -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
@@ -2769,7 +2782,7 @@ class AscendAttnBackend(AttentionBackend):
                         if q_len == 0:
                             continue
                         total_kv_len = seq_lens_cpu[seq_idx]
-                        result, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                        result, _ = fused_infer_attention_score_v2(
                             query=q[None, q_len_offset : q_len_offset + q_len],
                             key=k_cache.view(
                                 -1,
@@ -2862,7 +2875,12 @@ class AscendAttnBackend(AttentionBackend):
                             dtype=query.dtype,
                             device=query.device,
                         )
-                        torch_npu._npu_flash_attention_qlens(
+                        if is_npu_arch35():
+                            raise RuntimeError(
+                                "Legacy flash_attention_qlens is unavailable on A5. "
+                                "Restart with ASCEND_USE_FIA=1 or select a supported attention backend."
+                            )
+                        flash_attention_qlens(
                             query=query,
                             key_cache=k_cache,
                             value_cache=v_cache,
@@ -2975,7 +2993,7 @@ class AscendAttnBackend(AttentionBackend):
                     v_full = torch.cat([v_pre_slice, v_cur_slice], dim=1)
 
                     attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
+                        fused_infer_attention_score(
                             q[None, q_len_offset : q_len_offset + q_len],
                             k_full,
                             v_full,
@@ -3010,7 +3028,7 @@ class AscendAttnBackend(AttentionBackend):
                 cu_query_lens = query_lens.cumsum(0).tolist()
                 q_nope, q_rope = q_nope.contiguous(), q_rope.contiguous()
 
-                attn_output, attn_lse = torch_npu.npu_fused_infer_attention_score_v2(
+                attn_output, attn_lse = fused_infer_attention_score_v2(
                     query=q_nope,
                     key=k_nope.contiguous(),
                     value=v.contiguous(),
@@ -3041,22 +3059,20 @@ class AscendAttnBackend(AttentionBackend):
 
                 k_rope = k_rope_cached.expand(-1, layer.tp_k_head_num, -1)
                 prefix_lens = self.forward_metadata.prefix_lens
-                prefix_output, prefix_lse = (
-                    torch_npu.npu_fused_infer_attention_score_v2(
-                        query=q_nope,
-                        key=k_nope.contiguous(),
-                        value=v.contiguous(),
-                        query_rope=q_rope,
-                        key_rope=k_rope.contiguous(),
-                        num_query_heads=layer.tp_q_head_num,
-                        num_key_value_heads=layer.tp_k_head_num,
-                        input_layout="TND",
-                        actual_seq_qlen=cu_query_lens,
-                        actual_seq_kvlen=prefix_lens.cumsum(0).tolist(),
-                        sparse_mode=0,
-                        softmax_scale=layer.scaling,
-                        return_softmax_lse=True,
-                    )
+                prefix_output, prefix_lse = fused_infer_attention_score_v2(
+                    query=q_nope,
+                    key=k_nope.contiguous(),
+                    value=v.contiguous(),
+                    query_rope=q_rope,
+                    key_rope=k_rope.contiguous(),
+                    num_query_heads=layer.tp_q_head_num,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    actual_seq_qlen=cu_query_lens,
+                    actual_seq_kvlen=prefix_lens.cumsum(0).tolist(),
+                    sparse_mode=0,
+                    softmax_scale=layer.scaling,
+                    return_softmax_lse=True,
                 )
 
                 query_start = 0
@@ -3066,7 +3082,7 @@ class AscendAttnBackend(AttentionBackend):
                         prefix_lse[query_start:query_end].fill_(-float("inf"))
                     query_start = query_end
 
-                attn_output, _ = torch_npu.npu_attention_update(
+                attn_output, _ = attention_update(
                     (attn_lse.reshape(-1), prefix_lse.reshape(-1)),
                     (
                         attn_output.float().reshape(-1, layer.v_head_dim),
@@ -3101,7 +3117,7 @@ class AscendAttnBackend(AttentionBackend):
                 q_len_offset = 0
                 for q_len in forward_batch.extend_seq_lens_cpu:
                     attn_output[q_len_offset : q_len_offset + q_len] = (
-                        torch.ops.npu.npu_fused_infer_attention_score(
+                        fused_infer_attention_score(
                             q[None, q_len_offset : q_len_offset + q_len],
                             k[None, q_len_offset : q_len_offset + q_len],
                             v[None, q_len_offset : q_len_offset + q_len].contiguous(),
@@ -3162,7 +3178,7 @@ class AscendAttnBackend(AttentionBackend):
                     [layer.v_head_dim, self.qk_rope_head_dim], dim=-1
                 )
 
-                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                attn_output, _ = fused_infer_attention_score(
                     q_nope,
                     k_nope.contiguous(),
                     v.contiguous(),
@@ -3208,6 +3224,8 @@ class AscendAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
     ):
+        from sgl_kernel_npu.operators.attention import fused_infer_attention_score
+
         if save_kv_cache:
             self.token_to_kv_pool.set_kv_buffer(
                 layer,
@@ -3244,7 +3262,7 @@ class AscendAttnBackend(AttentionBackend):
                 .tolist()
             )
 
-        attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+        attn_output, _ = fused_infer_attention_score(
             query,
             k_cache.view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim),
             v_cache.view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim),
@@ -3280,6 +3298,11 @@ class AscendAttnBackend(AttentionBackend):
         q_descale: Optional[torch.Tensor] = None,
     ):
         """Run MLA FIA and normalize output/LSE to token-major DCP tensors."""
+        from sgl_kernel_npu.operators.attention import (
+            fused_infer_attention_score,
+            fused_infer_attention_score_v2,
+        )
+
         num_heads = layer.tp_q_head_num
         num_tokens = batch_size * query_len
         q_nope = q_nope.reshape(batch_size, query_len, num_heads, self.kv_lora_rank)
@@ -3328,7 +3351,7 @@ class AscendAttnBackend(AttentionBackend):
         if modelslim_kv_scheme is not None:
             # The model compensates the BF16 side by sq*sc before FIA
             # applies sq*sc to QK and sc to PV.
-            attn_output, softmax_lse = torch_npu.npu_fused_infer_attention_score_v2(
+            attn_output, softmax_lse = fused_infer_attention_score_v2(
                 q_nope.contiguous(),
                 kv_cache,
                 kv_cache,
@@ -3354,7 +3377,7 @@ class AscendAttnBackend(AttentionBackend):
             fia_kwargs = {}
             if actual_seq_lengths is not None:
                 fia_kwargs["actual_seq_lengths"] = actual_seq_lengths
-            attn_output, softmax_lse = torch.ops.npu.npu_fused_infer_attention_score(
+            attn_output, softmax_lse = fused_infer_attention_score(
                 q_nope.contiguous(),
                 kv_cache,
                 kv_cache,
@@ -3398,6 +3421,13 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         q_descale: Optional[torch.Tensor] = None,
     ):
+        from sgl_kernel_npu.operators.attention import (
+            fused_infer_attention_score,
+            fused_infer_attention_score_get_max_workspace,
+            fused_infer_attention_score_out,
+            fused_infer_attention_score_v2,
+        )
+
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -3566,7 +3596,7 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_mode = 4 if is_swa_layer else 3
 
             if self.is_hybrid_swa or self.use_fias_v2_bsnd:
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                attn_output, _ = fused_infer_attention_score_v2(
                     query,
                     k_cache,
                     v_cache,
@@ -3589,7 +3619,7 @@ class AscendAttnBackend(AttentionBackend):
                     learnable_sink=sinks,
                 )
             else:
-                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                attn_output, _ = fused_infer_attention_score(
                     query,
                     k_cache,
                     v_cache,
@@ -3806,7 +3836,7 @@ class AscendAttnBackend(AttentionBackend):
                             value_quant_mode=0,
                             out_dtype=modelslim_kv_scheme.compute_dtype,
                         )
-                    attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    attn_output, _ = fused_infer_attention_score_v2(
                         q_nope_bnsd,
                         c_kv_cache,
                         c_kv_cache,
@@ -3837,7 +3867,7 @@ class AscendAttnBackend(AttentionBackend):
                     )
             elif modelslim_kv_scheme is not None:
                 # The model has compensated the BF16 side by sq*sc.
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                attn_output, _ = fused_infer_attention_score_v2(
                     q_nope,
                     c_kv_cache,
                     c_kv_cache,
@@ -3887,32 +3917,30 @@ class AscendAttnBackend(AttentionBackend):
                         else FULL_ATTENTION_WINDOW
                     )
                     verify_next_tokens = 0
-                workspace = (
-                    torch_npu._npu_fused_infer_attention_score_get_max_workspace(
-                        q_nope,
-                        c_kv_cache,
-                        c_kv_cache,
-                        query_rope=q_rope,
-                        key_rope=k_rope_cache,
-                        num_heads=num_query_heads,
-                        num_key_value_heads=layer.tp_k_head_num,
-                        input_layout="TND",
-                        scale=layer.scaling,
-                        antiquant_mode=0,
-                        antiquant_scale=None,
-                        block_table=block_table,
-                        block_size=self.page_size,
-                        sparse_mode=verify_sparse_mode,
-                        atten_mask=verify_mask,
-                        actual_seq_lengths=actual_seq_lengths,
-                        actual_seq_lengths_kv=actual_seq_lengths_kv,
-                        pre_tokens=verify_pre_tokens,
-                        next_tokens=verify_next_tokens,
-                    )
+                workspace = fused_infer_attention_score_get_max_workspace(
+                    q_nope,
+                    c_kv_cache,
+                    c_kv_cache,
+                    query_rope=q_rope,
+                    key_rope=k_rope_cache,
+                    num_heads=num_query_heads,
+                    num_key_value_heads=layer.tp_k_head_num,
+                    input_layout="TND",
+                    scale=layer.scaling,
+                    antiquant_mode=0,
+                    antiquant_scale=None,
+                    block_table=block_table,
+                    block_size=self.page_size,
+                    sparse_mode=verify_sparse_mode,
+                    atten_mask=verify_mask,
+                    actual_seq_lengths=actual_seq_lengths,
+                    actual_seq_lengths_kv=actual_seq_lengths_kv,
+                    pre_tokens=verify_pre_tokens,
+                    next_tokens=verify_next_tokens,
                 )
                 attn_output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
                 softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-                torch_npu.npu_fused_infer_attention_score.out(
+                fused_infer_attention_score_out(
                     q_nope,
                     c_kv_cache,
                     c_kv_cache,
@@ -3966,6 +3994,12 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         q_descale: Optional[torch.Tensor] = None,
     ):
+        from sgl_kernel_npu.operators.attention import (
+            fused_infer_attention_score_get_max_workspace,
+            fused_infer_attention_score_out,
+            fused_infer_attention_score_v2,
+        )
+
         modelslim_kv_scheme = getattr(layer, "scheme", None)
 
         if save_kv_cache:
@@ -4065,7 +4099,7 @@ class AscendAttnBackend(AttentionBackend):
                 else:
                     sparse_mode = 3
 
-                attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                attn_output, _ = fused_infer_attention_score_v2(
                     query,
                     k_cache,
                     v_cache,
@@ -4135,7 +4169,7 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_len_kv = seq_lens_cpu_int.cpu().int().tolist()
 
             num_tokens = query.shape[0]
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            workspace = fused_infer_attention_score_get_max_workspace(
                 query,
                 k_cache,
                 v_cache,
@@ -4155,7 +4189,7 @@ class AscendAttnBackend(AttentionBackend):
                 device=q.device,
             )
             softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
-            torch_npu.npu_fused_infer_attention_score.out(
+            fused_infer_attention_score_out(
                 query,
                 k_cache,
                 v_cache,
@@ -4228,7 +4262,7 @@ class AscendAttnBackend(AttentionBackend):
 
             if modelslim_kv_scheme is not None:
                 num_heads = q_nope.shape[-2]
-                output, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                output, _ = fused_infer_attention_score_v2(
                     q_nope,
                     c_kv_cache,
                     c_kv_cache,
@@ -4254,7 +4288,7 @@ class AscendAttnBackend(AttentionBackend):
                     -1, layer.tp_q_head_num * layer.v_head_dim
                 )
 
-            workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
+            workspace = fused_infer_attention_score_get_max_workspace(
                 q_nope,
                 c_kv_cache,
                 c_kv_cache,
@@ -4274,7 +4308,7 @@ class AscendAttnBackend(AttentionBackend):
             output = torch.empty_like(q_nope, dtype=q.dtype, device=q.device)
             softmax_lse = torch.empty(1, dtype=q.dtype, device=q.device)
 
-            torch_npu.npu_fused_infer_attention_score.out(
+            fused_infer_attention_score_out(
                 q_nope,
                 c_kv_cache,
                 c_kv_cache,
@@ -4297,6 +4331,72 @@ class AscendAttnBackend(AttentionBackend):
             output = output[:, :, : layer.tp_q_head_num, :]
             return output.view(-1, layer.tp_q_head_num * self.kv_lora_rank)
 
+    def _prepare_a5_low_head_mla_fia(
+        self, q, q_rope, layer, forward_batch, *, return_softmax_lse, q_descale
+    ):
+        """Validate the new eager A5 route and reuse its existing cache views."""
+        if not (
+            is_npu_arch35()
+            and layer.tp_k_head_num == 1
+            and 1 <= layer.tp_q_head_num <= 7
+        ):
+            return None
+        if not self.use_fia:
+            raise RuntimeError(
+                "A5 low-head MLA decode requires explicit ASCEND_USE_FIA=1; "
+                "restart with that setting."
+            )
+        scheme = getattr(layer, "scheme", None)
+        active_heads = forward_batch.batch_size * layer.tp_q_head_num
+        if scheme is None:
+            cache_dtype = torch.bfloat16
+            valid_query = q.dtype == torch.bfloat16
+        else:
+            from sglang.srt.layers.quantization.modelslim.schemes.modelslim_q_fp8_dynamic_kv_fp8 import (
+                ModelSlimQFP8DynamicKVFP8Scheme,
+            )
+
+            cache_dtype = torch.float8_e4m3fn
+            valid_query = (
+                isinstance(scheme, ModelSlimQFP8DynamicKVFP8Scheme)
+                and scheme.compute_dtype == torch.bfloat16
+                and q.dtype == cache_dtype
+                and q_descale is not None
+                and q_descale.numel() == active_heads
+            )
+        if not (
+            valid_query
+            and not self.graph_mode
+            and not return_softmax_lse
+            and not getattr(self, "dense_mla_dcp_target", False)
+            and not is_fia_nz()
+            and self.page_size == 128
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+            and 0 < forward_batch.batch_size == q.shape[0]
+            and q.numel() == active_heads * self.kv_lora_rank
+            and q_rope is not None
+            and q_rope.numel() == active_heads * self.qk_rope_head_dim
+            and q_rope.dtype == torch.bfloat16
+        ):
+            raise RuntimeError(
+                "A5 1-7Q/1KV MLA FIA currently requires eager single-token "
+                "decode, ND cache, page_size=128, latent_dim=512, rope_dim=64, "
+                "BF16 or ModelSlim Q_FP8_DYNAMIC_KV_FP8, and no DCP/LSE. "
+                "Disable graph/NZ/DCP or use a validated head configuration."
+            )
+
+        kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if kv_c.dtype != cache_dtype or k_pe.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "A5 low-head MLA FIA requires a BF16 ND cache, or "
+                "ModelSlim FP8 latent cache with BF16 RoPE cache. "
+                "Restart with a supported KV cache configuration."
+            )
+
+        return kv_c, k_pe
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -4313,6 +4413,13 @@ class AscendAttnBackend(AttentionBackend):
         slopes: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        from sgl_kernel_npu.operators.attention import (
+            fused_infer_attention_score,
+            fused_infer_attention_score_v2,
+            paged_attention,
+            paged_attention_mla,
+        )
+
         return_softmax_lse = kwargs.pop("return_softmax_lse", False)
         if is_mla_preprocess_enabled() and self.use_mla:
             # DSA callers set save_kv_cache based on whether preprocessing was used.
@@ -4475,7 +4582,7 @@ class AscendAttnBackend(AttentionBackend):
                             layer.sliding_window_size,
                         )
 
-                    attn_out, _ = torch_npu.npu_fused_infer_attention_score_v2(
+                    attn_out, _ = fused_infer_attention_score_v2(
                         q.view(
                             forward_batch.batch_size,
                             -1,
@@ -4528,7 +4635,7 @@ class AscendAttnBackend(AttentionBackend):
                 num_token_padding = q.shape[0]
                 actual_bs = self.forward_metadata.block_tables.shape[0]
                 q = q[:actual_bs]
-                attn_output, _ = torch.ops.npu.npu_fused_infer_attention_score(
+                attn_output, _ = fused_infer_attention_score(
                     q.view(
                         -1,
                         1,
@@ -4593,7 +4700,12 @@ class AscendAttnBackend(AttentionBackend):
                         device=query.device,
                     )
 
-                    torch_npu._npu_paged_attention(
+                    if is_npu_arch35():
+                        raise RuntimeError(
+                            "Legacy paged_attention is unavailable on A5. "
+                            "Restart with ASCEND_USE_FIA=1 or select a supported attention backend."
+                        )
+                    paged_attention(
                         query=query,
                         key_cache=k_cache,
                         value_cache=v_cache,
@@ -4662,16 +4774,35 @@ class AscendAttnBackend(AttentionBackend):
                 )
             return attn_output.view(num_tokens, layer.tp_q_head_num * layer.v_head_dim)
         else:
+            low_head_cache = self._prepare_a5_low_head_mla_fia(
+                q,
+                q_rope,
+                layer,
+                forward_batch,
+                return_softmax_lse=return_softmax_lse,
+                q_descale=kwargs.get("q_descale"),
+            )
+            use_mla_fia = self.use_fia and (
+                layer.tp_q_head_num // layer.tp_k_head_num >= 8
+                or low_head_cache is not None
+            )
+            if is_npu_arch35() and not use_mla_fia:
+                raise RuntimeError(
+                    "Legacy paged_attention_mla is unavailable on A5. "
+                    "Restart with ASCEND_USE_FIA=1 or select a supported attention backend."
+                )
             if save_kv_cache:
                 self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, k_rope
                 )
             num_tokens = q.shape[0]
-            kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            if low_head_cache is None:
+                kv_c = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                k_pe = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            else:
+                kv_c, k_pe = low_head_cache
 
-            if self.use_fia and (layer.tp_q_head_num // layer.tp_k_head_num) >= 8:
-                """layer.tp_q_head_num // layer.tp_k_head_num < 8 will support in the later version of CANN"""
+            if use_mla_fia:
                 if is_fia_nz():
                     kv_c = _reshape_kv_for_fia_nz(
                         kv_c, layer.tp_k_head_num, self.kv_lora_rank, self.page_size
@@ -4724,7 +4855,7 @@ class AscendAttnBackend(AttentionBackend):
                     dtype=q.dtype,
                     device=q.device,
                 )
-                torch_npu._npu_paged_attention_mla(
+                paged_attention_mla(
                     query=query,
                     key_cache=kv_c_and_k_pe_cache,
                     num_kv_heads=layer.tp_k_head_num,

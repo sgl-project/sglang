@@ -1,3 +1,4 @@
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -140,19 +141,27 @@ class TestMRopeAxisMap(CustomTestCase):
         positions = torch.tensor([[0, 1], [2, 3], [4, 5]])
         query, key = torch.randn(2, 3072), torch.randn(2, 512)
         with (
-            patch.object(mrope, "torch_npu", create=True) as npu,
+            patch.dict(
+                sys.modules,
+                {
+                    "sgl_kernel_npu.operators": SimpleNamespace(
+                        rope=SimpleNamespace(mrope=Mock(return_value=(query, key)))
+                    )
+                },
+            ),
             patch.object(mrope, "triton_mrope_fused") as fused,
         ):
-            npu.npu_mrope.return_value = (query, key)
+            from sgl_kernel_npu.operators import rope as npu_rope_ops
+
             rope.forward_npu(positions, query, key)
-            npu.npu_mrope.assert_not_called()
+            npu_rope_ops.mrope.assert_not_called()
             # The kernel reads all three axes, so the 3-D tensor must arrive
             # intact rather than collapsed to positions[0].
             self.assertIs(fused.call_args.args[3], positions)
 
             text_positions = positions[0]
             rope.forward_npu(text_positions, query, key)
-            npu.npu_mrope.assert_called_once_with(
+            npu_rope_ops.mrope.assert_called_once_with(
                 text_positions,
                 query,
                 key,

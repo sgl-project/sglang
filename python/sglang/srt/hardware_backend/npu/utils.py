@@ -25,13 +25,38 @@ indexer_weight_stream = None
 gva_is_inited = False
 
 
+def is_npu_op_supported(operator: Callable) -> bool:
+    """Check whether the default implementation is registered on this NPU."""
+    from sgl_kernel_npu.operators.utils.registry import (
+        UnsupportedGenerationError,
+        get_impl,
+    )
+
+    try:
+        get_impl(operator, "auto")
+    except UnsupportedGenerationError:
+        return False
+    return True
+
+
 def _is_npu_arch(arch: int) -> bool:
     if not is_npu():
         return False
 
-    import acl
+    try:
+        import acl
 
-    return acl.rt.get_device_info(0, 601) == (arch, 0)
+        arch_id, ret = acl.rt.get_device_info(0, 601)
+    except Exception:
+        pass
+    else:
+        if ret == 0:
+            return arch_id == arch
+
+    # The kernel registry also recognizes SoC families when ACL lacks attribute 601.
+    from sgl_kernel_npu.operators.utils.generation import get_hardware
+
+    return get_hardware().arch_id == arch
 
 
 @functools.lru_cache(maxsize=1)
@@ -407,7 +432,9 @@ def npu_format_cast(
     # _is_nz_aligned ND fallback — the FP4 matmul strictly requires NZ, so a
     # silent ND fallback would corrupt results.
     if customize_dtype is not None or input_dtype is not None:
-        return torch.ops.npu.npu_format_cast(
+        from sgl_kernel_npu.operators.data_move import format_cast
+
+        return format_cast(
             tensor,
             int(acl_format),
             customize_dtype=customize_dtype,
@@ -426,7 +453,9 @@ def npu_format_cast(
         )
         return tensor
 
-    return torch.ops.npu.npu_format_cast(tensor, acl_format.value)
+    from sgl_kernel_npu.operators.data_move import format_cast
+
+    return format_cast(tensor, acl_format.value)
 
 
 def get_indexer_weight_stream():

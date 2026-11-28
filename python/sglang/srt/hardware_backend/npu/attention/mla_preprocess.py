@@ -417,6 +417,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         forward_batch,
         zero_allocator,
     ):
+        from sgl_kernel_npu.operators.mem_cache import kv_rmsnorm_rope_cache
+        from sgl_kernel_npu.operators.rope import interleave_rope
+
         bsz, _ = hidden_states.view(-1, hidden_states.shape[-1]).shape
         self.dtype = hidden_states.dtype
         if self.layer_id == 0:
@@ -457,7 +460,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
         q_pe = q_pe.view(-1, self.num_local_heads, 1, self.qk_rope_head_dim)
         cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
         sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
-        q_pe = torch.ops.npu.npu_interleave_rope(q_pe, cos, sin)  # (B,N,S,D)
+        q_pe = interleave_rope(q_pe, cos, sin)  # (B,N,S,D)
         q_pe = q_pe.view(cos.shape[0], self.num_local_heads, self.qk_rope_head_dim)
 
         latent_cache = latent_cache.view(
@@ -477,7 +480,7 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
             1,
             get_attn_backend().qk_rope_head_dim,
         )
-        k_rope, k_nope, _, _ = torch.ops.npu.npu_kv_rmsnorm_rope_cache(
+        k_rope, k_nope, _, _ = kv_rmsnorm_rope_cache(
             latent_cache,
             self.kv_a_layernorm.weight,
             cos,
@@ -611,11 +614,13 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                     "Dynamic INT8 MLAProlog requires BF16 activations and "
                     "BF16 or packed INT8 KV cache"
                 )
-            token_x, token_x_scale = torch.ops.npu.npu_dynamic_quant(
-                hidden_states.contiguous()
-            )
+            from sgl_kernel_npu.operators.quant import dynamic_quant
+
+            token_x, token_x_scale = dynamic_quant(hidden_states.contiguous())
         elif self.weight_quant_mode == 3:
-            token_x, token_x_scale = torch.ops.npu.npu_dynamic_mx_quant(
+            from sgl_kernel_npu.operators.quant import dynamic_mx_quant
+
+            token_x, token_x_scale = dynamic_mx_quant(
                 hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous(),
                 axis=1,
                 dst_type=torch.float8_e4m3fn,
@@ -686,9 +691,9 @@ class NPUFusedMLAPreprocess(torch.nn.Module):
                 quant_scale_ckv=self.kv_quant_scheme.k_inv_scale.view(1),
                 query_norm_flag=False,
             )
-        import torch_npu
+        from sgl_kernel_npu.operators.attention import mla_prolog_v3
 
-        mlaprolog = self.no_rope_mlaprolog or torch_npu.npu_mla_prolog_v3
+        mlaprolog = self.no_rope_mlaprolog or mla_prolog_v3
         q_nope, q_pe, dequant_scale_q_nope, qr, dequant_q_norm = mlaprolog(
             **mla_prolog_input_args
         )
