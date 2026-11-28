@@ -2371,7 +2371,28 @@ class Scheduler(
                 return True
 
         # The next batch's grammar bitmask needs this result's FSM advance.
-        return last_batch.grammar_needs_sync()
+        if last_batch.grammar_needs_sync():
+            return True
+
+        # For grammar-overlap-capable spec algorithms, a MIXED batch (which is
+        # forward_mode.is_extend()) is run by the spec worker as a plain
+        # prefill (_forward_prefill_batch) whose grammar mask is built from
+        # req.grammar with no verify() barrier. If this result is still queued
+        # when that mixed batch launches, its decode rows mask under a grammar
+        # FSM one token behind, and accept_token can reject the token they
+        # sample (finish_reason abort). Decode steps need no early process: the
+        # barrier inside verify() advances the FSM. "Prefill work pending" is a
+        # local pre-plan proxy for the next step mixing decodes with a prefill.
+        # Note: do NOT gate on self.running_batch here — in overlap spec the
+        # scheduler's running_batch is an empty shell (decode state lives in
+        # the spec worker); a pending result IS the in-flight-decode signal.
+        return (
+            not last_batch.spec_algorithm.is_none()
+            and last_batch.spec_algorithm.supports_grammar_overlap()
+            and last_batch.has_grammar
+            and len(self.result_queue) > 0
+            and (len(self.waiting_queue) > 0 or self.chunked_req is not None)
+        )
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
