@@ -670,43 +670,21 @@ class TestBlockSparsity(unittest.TestCase):
             torch.arange(metadata.q_len)[:, None],
             torch.arange(metadata.kv_len)[None, :],
         )
-        words_per_row = (sparsity.group_allowed.shape[1] + 31) // 32
-        q_groups = (sparsity.q_table_base // words_per_row).long()
+        q_groups = (sparsity.q_word_base // sparsity.words_per_row).long()
         k_groups = sparsity.k_group_ids.long()
         via_table = sparsity.group_allowed[q_groups[:, None], k_groups[None, :]]
         torch.testing.assert_close(via_table, dense)
         # Packed words round-trip bit by bit.
+        self.assertEqual(sparsity.allowed_words.dtype, torch.int32)
         words = (
-            sparsity.allowed_table.view(-1, words_per_row).to(torch.int64) & 0xFFFFFFFF
+            sparsity.allowed_words.view(-1, sparsity.words_per_row).to(torch.int64)
+            & 0xFFFFFFFF
         )
         bits = (words[:, :, None] >> torch.arange(32)) & 1
         unpacked = bits.reshape(words.shape[0], -1)[
             :, : sparsity.group_allowed.shape[1]
         ]
         torch.testing.assert_close(unpacked.bool(), sparsity.group_allowed)
-
-        expanded = build_multiview_block_sparsity(
-            metadata, q_block_size=4, kv_block_size=4, key_expanded_table=True
-        )
-        self.assertEqual(expanded.allowed_table.dtype, torch.int8)
-        keys = torch.arange(metadata.kv_len)
-        via_bytes = expanded.allowed_table[
-            expanded.q_table_base.long()[:, None] + keys[None, :]
-        ]
-        torch.testing.assert_close(via_bytes.bool(), dense)
-        index_select = torch.Tensor.index_select
-
-        def out_of_memory(table, dim, index):
-            if table.dtype == torch.int8:
-                raise torch.OutOfMemoryError("expanded table")
-            return index_select(table, dim, index)
-
-        with mock.patch.object(torch.Tensor, "index_select", out_of_memory):
-            fallback = build_multiview_block_sparsity(
-                metadata, q_block_size=4, kv_block_size=4, key_expanded_table=True
-            )
-        self.assertTrue(torch.equal(fallback.allowed_table, sparsity.allowed_table))
-        self.assertTrue(torch.equal(fallback.q_table_base, sparsity.q_table_base))
 
     def test_block_mask_carries_block_visibility_and_exact_mask_mod(self):
         metadata = self._metadata()
@@ -901,49 +879,6 @@ class TestPaddedFlexAttention(unittest.TestCase):
             fa4_sparse_block_sizes(torch.device("cuda")),
         )
 
-    @unittest.skipUnless(
-        _fa4_available(),
-        "needs an SM90 or SM100 device with the FA4 CuTe kernels",
-    )
-    def test_cuda_fa4_table_forms_agree_bit_for_bit(self):
-        layout = MultiviewLayout(
-            num_views=3,
-            latent_frames=6,
-            patch_height=6,
-            patch_width=10,
-            control_attends_sensor=True,
-            seconds_per_frame=0.2,
-            backend="fa4",
-            max_und_tokens=300,
-            caption_lengths=(60, 45, 80),
-        )
-        device, dtype = torch.device("cuda"), torch.bfloat16
-        generator = torch.Generator(device=device).manual_seed(0)
-
-        def rand(tokens, heads):
-            return torch.randn(
-                1, tokens, heads, 128, device=device, dtype=dtype, generator=generator
-            )
-
-        gen, und = layout.gen_tokens, sum(layout.caption_lengths)
-        q, k, v = rand(gen, 4), rand(gen, 2), rand(gen, 2)
-        k_und, v_und = rand(und, 2), rand(und, 2)
-        outputs = {}
-        for table_dtype, limit in ((torch.int8, 2**31 - 1), (torch.int32, 0)):
-            context = MultiviewAttentionContext(layout, {}, {})
-            with mock.patch(
-                "sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation"
-                ".multiview_attention.MAX_KEY_EXPANDED_TABLE_BYTES",
-                limit,
-            ):
-                out = padded_multiview_flex_attention(q, k, v, k_und, v_und, context)
-            plan = next(iter(context.mask_cache.values()))
-            self.assertEqual(plan.allowed_table.dtype, table_dtype)
-            # the lookup must be exercised, not skipped by full tiles
-            self.assertGreater(int(plan.partial_counts.sum()), 0)
-            outputs[table_dtype] = out.clone()
-        self.assertTrue(torch.equal(outputs[torch.int8], outputs[torch.int32]))
-
     def test_fa4_block_map_matches_dense_projection(self):
         """Both FA4 geometries must classify tiles exactly like the 64x64 map does."""
         for block_sizes in ((256, 128), (128, 128)):
@@ -970,8 +905,12 @@ class TestPaddedFlexAttention(unittest.TestCase):
                 self.assertEqual(
                     (geometry.padded_q_len, geometry.padded_und_len), (512, 128)
                 )
-                self.assertEqual(plan.q_table_base.numel(), geometry.padded_q_len)
-                self.assertEqual(plan.allowed_table.dtype, torch.int8)
+                self.assertEqual(plan.q_word_base.numel(), geometry.padded_q_len)
+                self.assertEqual(plan.allowed_words.dtype, torch.int32)
+                self.assertEqual(
+                    plan.allowed_words.numel(),
+                    plan.group_allowed.shape[0] * plan.words_per_row,
+                )
                 self.assertEqual(
                     plan.k_group_ids.numel(),
                     geometry.padded_und_len + geometry.padded_q_len,

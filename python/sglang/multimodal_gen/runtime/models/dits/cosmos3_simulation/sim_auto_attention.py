@@ -29,9 +29,9 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_atte
     TRITON_KV_BLOCK_SIZE,
     TRITON_Q_BLOCK_SIZE,
     _block_indices,
-    fa4_mask_table,
     fa4_sparse_block_sizes,
     flex_attention,
+    pack_allowed_bits,
 )
 from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_fa4 import (
     Fa4BlockSparsity,
@@ -521,7 +521,7 @@ def build_replay_fa4_mask(
     device: torch.device,
     block_size: tuple[int, int] | None = None,
 ) -> ReplayFa4Mask:
-    """FlashAttention-4 block map at the device's tile geometry plus the run table.
+    """FlashAttention-4 block map at the device's tile geometry plus the packed run table.
 
     ``block_size`` pins the geometry for CPU tests; on CUDA it follows the
     compute capability (Hopper 128x128, Blackwell 256x128).
@@ -530,19 +530,15 @@ def build_replay_fa4_mask(
         block_size = fa4_sparse_block_sizes(device)
     streams = _padded_streams(plan, block_size)
     blocks = _project_blocks(streams, block_size)
-    k_ids = streams.k_ids.to(device)
-    # Expanded on the device: the table is run count times key count bytes.
-    q_table_base, allowed_table = fa4_mask_table(
-        streams.allowed.to(device), streams.q_ids.to(device), k_ids
-    )
+    allowed_words, words_per_row = pack_allowed_bits(streams.allowed)
     sparsity = Fa4BlockSparsity(
         partial_counts=blocks.partial_counts.to(device),
         partial_indices=blocks.partial_indices.to(device),
         full_counts=blocks.full_counts.to(device),
         full_indices=blocks.full_indices.to(device),
-        q_table_base=q_table_base,
-        k_group_ids=k_ids.to(torch.int32),
-        allowed_table=allowed_table,
+        q_word_base=(streams.q_ids * words_per_row).to(torch.int32).to(device),
+        k_group_ids=streams.k_ids.to(torch.int32).to(device),
+        allowed_words=allowed_words.to(device),
         q_block_size=block_size[0],
         kv_block_size=block_size[1],
     )

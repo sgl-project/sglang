@@ -708,16 +708,12 @@ def _expand_fa4_mask(mask):
     """
     sparsity = mask.sparsity
     q_block, kv_block = sparsity.q_block_size, sparsity.kv_block_size
-    base = sparsity.q_table_base.long()
-    if sparsity.allowed_table.dtype == torch.int8:
-        keys = torch.arange(mask.padded_kv_len)
-        table = sparsity.allowed_table[base[:, None] + keys[None, :]].bool()
-    else:
-        k_runs = sparsity.k_group_ids.long()
-        words = sparsity.allowed_table.long() & 0xFFFFFFFF
-        table = (
-            (words[base[:, None] + k_runs[None, :] // 32] >> (k_runs[None, :] % 32)) & 1
-        ).bool()
+    base = sparsity.q_word_base.long()
+    k_runs = sparsity.k_group_ids.long()
+    words = sparsity.allowed_words.long() & 0xFFFFFFFF
+    table = (
+        (words[base[:, None] + k_runs[None, :] // 32] >> (k_runs[None, :] % 32)) & 1
+    ).bool()
     dense = torch.zeros(mask.padded_q_len, mask.padded_kv_len, dtype=torch.bool)
     for q_index in range(mask.padded_q_len // q_block):
         rows = slice(q_index * q_block, (q_index + 1) * q_block)
@@ -798,45 +794,36 @@ class TestBlockMask(unittest.TestCase):
         torch.manual_seed(1)
         self._check(_wide_plan())
 
-    def test_fa4_tiles_and_both_table_forms_resolve_the_predicate(self):
-        """Hopper (128x128) and Blackwell (256x128) maps classify tiles like the predicate."""
+    def test_fa4_tiles_and_packed_table_resolve_the_predicate(self):
+        """Hopper (128x128) and Blackwell (256x128) maps classify tiles and pack bits like the predicate."""
         plans = (
             _plan(2, PASS_NOISY, joint=True, lengths=(9, 13), sink=4)[0],
             _wide_plan(grid=SensorGrid(9, 11, 1, 1), lengths=(130, 70, 90)),
         )
-        cases = [
-            (block_size, index, plan, torch.int32)
-            for block_size in ((256, 128), (128, 128))
-            for index, plan in enumerate(plans)
-        ] + [((128, 128), 1, plans[1], torch.int8)]
-        for block_size, index, plan, table_dtype in cases:
-            with self.subTest(block_size=block_size, plan=index, table=table_dtype):
-                with mock.patch(
-                    "sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation"
-                    ".multiview_attention.MAX_KEY_EXPANDED_TABLE_BYTES",
-                    2**31 - 1 if table_dtype == torch.int8 else 0,
-                ):
+        for block_size in ((256, 128), (128, 128)):
+            for index, plan in enumerate(plans):
+                with self.subTest(block_size=block_size, plan=index):
                     mask = build_replay_fa4_mask(
                         plan, device=torch.device("cpu"), block_size=block_size
                     )
-                self.assertEqual(mask.padded_q_len % block_size[0], 0)
-                self.assertEqual(mask.padded_kv_len % block_size[1], 0)
-                # FA4 wraps aux reads modulo the padded lengths; shorter tensors alias.
-                sparsity = mask.sparsity
-                self.assertEqual(sparsity.allowed_table.dtype, table_dtype)
-                self.assertEqual(sparsity.q_table_base.numel(), mask.padded_q_len)
-                self.assertEqual(sparsity.k_group_ids.numel(), mask.padded_kv_len)
-                torch.testing.assert_close(
-                    _expand_fa4_mask(mask), _dense_token_mask(plan)
-                )
-                if index == 1:
-                    # The wide plan must exercise all three tile classes.
-                    tiles = sparsity.full_indices.numel()
-                    full = int(sparsity.full_counts.sum())
-                    partial = int(sparsity.partial_counts.sum())
-                    self.assertGreater(full, 0)
-                    self.assertGreater(partial, 0)
-                    self.assertLess(full + partial, tiles)
+                    self.assertEqual(mask.padded_q_len % block_size[0], 0)
+                    self.assertEqual(mask.padded_kv_len % block_size[1], 0)
+                    # FA4 wraps aux reads modulo the padded lengths; shorter tensors alias.
+                    sparsity = mask.sparsity
+                    self.assertEqual(sparsity.allowed_words.dtype, torch.int32)
+                    self.assertEqual(sparsity.q_word_base.numel(), mask.padded_q_len)
+                    self.assertEqual(sparsity.k_group_ids.numel(), mask.padded_kv_len)
+                    torch.testing.assert_close(
+                        _expand_fa4_mask(mask), _dense_token_mask(plan)
+                    )
+                    if index == 1:
+                        # The wide plan must exercise all three tile classes.
+                        tiles = sparsity.full_indices.numel()
+                        full = int(sparsity.full_counts.sum())
+                        partial = int(sparsity.partial_counts.sum())
+                        self.assertGreater(full, 0)
+                        self.assertGreater(partial, 0)
+                        self.assertLess(full + partial, tiles)
 
     def test_build_replay_mask_dispatch(self):
         plan = _plan(1, PASS_NOISY)[0]
@@ -874,15 +861,6 @@ class TestBlockMask(unittest.TestCase):
         )
         expected = _dense_oracle(q, k, v, _dense_token_mask(plan).to(device))
         torch.testing.assert_close(fa4.float(), expected, atol=3e-2, rtol=3e-2)
-        # The packed words a larger table falls back to are the same predicate.
-        with mock.patch(
-            "sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation"
-            ".multiview_attention.MAX_KEY_EXPANDED_TABLE_BYTES",
-            0,
-        ):
-            packed = build_replay_mask(plan, device=device, backend="fa4")
-        self.assertEqual(packed.sparsity.allowed_table.dtype, torch.int32)
-        self.assertTrue(torch.equal(replay_attention(q, k, v, packed), fa4))
         triton = replay_attention(
             q, k, v, build_replay_mask(plan, device=device, backend="triton")
         )
