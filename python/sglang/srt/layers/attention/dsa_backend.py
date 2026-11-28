@@ -392,7 +392,7 @@ class DSAMetadata:
     cu_seqlens_k: torch.Tensor
     # Page table, the index of KV Cache Tables/Blocks
     # this table is always with page_size = 1.
-    # None for fused-decode CUDA graphs where the wide [bs, max_ctx_len] table is
+    # None for fused-decode CUDA graphs where the wide [bs, max_kv_len] table is
     # never read (attention uses topk_indices, indexer uses real_page_table); the
     # graph then only materializes the compact real_page_table. See
     # `dsa_drop_wide_page_table`.
@@ -856,7 +856,6 @@ class DeepseekSparseAttnBackend(
         if self.dsa_shards_index_k and self.dsa_index_kpool > 1:
             raise ValueError("DSA index kpool does not support --dcp-size > 1.")
         self._init_kpool_metadata_fusion()
-        self.max_context_len = model_runner.model_config.context_len
         self._memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=get_exec().features.enable_memory_saver
             and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
@@ -882,6 +881,7 @@ class DeepseekSparseAttnBackend(
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.max_kv_len = self.req_to_token_pool.row_width
         # Translates the ids `req_to_token` holds into the physical ids the
         # page tables carry (`_read_v2p`); identity on a static pool.
         self.runner_ids = model_runner.runner_ids
@@ -968,7 +968,7 @@ class DeepseekSparseAttnBackend(
                 (
                     self.dsa_prefill_impl,
                     self.local_num_q_heads,
-                    _prims_ts_prefill_max_rows(self.max_context_len),
+                    _prims_ts_prefill_max_rows(model_runner.model_config.context_len),
                 ),
                 (
                     self.dsa_decode_impl,
@@ -1092,7 +1092,7 @@ class DeepseekSparseAttnBackend(
                     max_rows,
                     self.dsa_index_topk,
                     self.physical_page_size,
-                    self.max_context_len,
+                    self.max_kv_len,
                 )
 
         if _is_xpu:
@@ -1532,11 +1532,11 @@ class DeepseekSparseAttnBackend(
 
     def _graph_page_table_width(self, metadata: DSAMetadata) -> int:
         """Column count to scan req_to_token during graph replay. Reads the wide
-        page_table_1 width when present, else req_to_token's width (the wide table
+        page_table_1 width when present, else max_kv_len (the wide table
         is dropped for fused decode graphs, see `dsa_drop_wide_page_table`)."""
         if metadata.page_table_1 is not None:
             return metadata.page_table_1.shape[1]
-        return self.req_to_token.shape[1]
+        return self.max_kv_len
 
     def dcp_gather_kv_cache(
         self, kv_cache: torch.Tensor, forward_batch: ForwardBatch, metadata: DSAMetadata
@@ -1646,7 +1646,7 @@ class DeepseekSparseAttnBackend(
         cache_seqlens_int32 = (forward_batch.seq_lens + draft_token_num).to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
         max_seqlen_k = _eager_max_seqlen_k(
-            forward_batch, draft_token_num, self.req_to_token.shape[1]
+            forward_batch, draft_token_num, self.max_kv_len
         )
         # [b, max_seqlen_k]
         page_table = self._gather_token_table(
@@ -2071,7 +2071,7 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
-        # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
+        # Whether we can skip the wide [max_num_tokens, max_kv_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
         # and the indexer reads the compact real_page_table, so nothing reads the
@@ -2098,7 +2098,6 @@ class DeepseekSparseAttnBackend(
             and 0 < self.dsa_index_topk <= 2048
         )
 
-        max_ctx_len = self.req_to_token.shape[1]
         # rewritten in full before every replay; the init-once metadata below would resume zeroed
         with self._memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
             if self._trtllm_fused_q and self.dsa_decode_impl == "trtllm":
@@ -2128,7 +2127,7 @@ class DeepseekSparseAttnBackend(
                 if self.dsa_drop_wide_page_table
                 else torch.zeros(
                     max_num_tokens,
-                    max_ctx_len,
+                    self.max_kv_len,
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -2152,7 +2151,7 @@ class DeepseekSparseAttnBackend(
             "real_page_table": (
                 torch.zeros(
                     max_num_tokens,
-                    (max_ctx_len + self.real_page_span - 1) // self.real_page_span,
+                    (self.max_kv_len + self.real_page_span - 1) // self.real_page_span,
                     dtype=torch.int32,
                     device=self.device,
                 )
@@ -2215,7 +2214,7 @@ class DeepseekSparseAttnBackend(
             real_rows = bs
             if self.dsa_drop_wide_page_table:
                 page_table_1 = None
-                max_seqlen_k = self.req_to_token.shape[1]
+                max_seqlen_k = self.max_kv_len
             else:
                 page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
                 max_seqlen_k = page_table_1.shape[1]
@@ -2243,7 +2242,7 @@ class DeepseekSparseAttnBackend(
             real_rows = bs * self.speculative_num_draft_tokens
             if self.dsa_drop_wide_page_table:
                 page_table_1 = None
-                max_seqlen_k = self.req_to_token.shape[1]
+                max_seqlen_k = self.max_kv_len
             else:
                 page_table_1 = self.decode_cuda_graph_metadata["page_table"][
                     :real_rows, :
@@ -5118,7 +5117,7 @@ class DeepseekSparseAttnBackend(
         ):
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
-            max_kv_len = forward_batch.seq_lens_cpu.max().item()
+            batch_max_kv_len = forward_batch.seq_lens_cpu.max().item()
             sum_seq_lens = sum(forward_batch.seq_lens_cpu)
             device_sm = get_device_sm()
 
@@ -5130,7 +5129,7 @@ class DeepseekSparseAttnBackend(
                     or (device_sm >= 100 and device_sm < 110)
                     or _IS_GFX95
                 )  # SM90/SM100 (NVIDIA) or gfx95x (MI355X)
-                and max_kv_len
+                and batch_max_kv_len
                 <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and self.token_to_kv_pool.dtype in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens

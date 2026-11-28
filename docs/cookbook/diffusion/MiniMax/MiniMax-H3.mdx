@@ -937,6 +937,64 @@ the reference video and two 2048-pixel reference images.
 Pika H3 Flex is a Model Derivative of MiniMax H3 by Mellis, Inc., distributed
 under the MiniMax H3 Community License Agreement.
 
+### pi-H3: 2- and 4-step adapters, decoder-free video
+
+[Lakonik/pi-H3](https://huggingface.co/Lakonik/pi-H3) distills the AdaLN-pruned
+MiniMax-H3 DiT into 2- and 4-step samplers. Its DWD variants predict the frames
+directly at the last step with a pixel head, so the video skips the VAE decoder
+(audio still uses the audio VAE).
+
+| `--model-variant` | Steps | Video output |
+| --- | --- | --- |
+| `4step` (default) | 4 | Pixel head |
+| `2step` | 2 | Pixel head |
+| `4step-vae`, `2step-vae` | 4, 2 | Video VAE |
+
+Pass the repository to `--model-path`. Its model overlay assembles the pruned
+DiT, the adapters and the MiniMax-H3 encoders and VAEs (about 51 GB under
+`SGLANG_DIFFUSION_CACHE_ROOT`). Do not use `--lora-path` with these files: the
+adapters also replace base tensors, add the pixel head and fix the sampling
+schedule.
+
+```bash Command
+# 1x H200
+sglang serve --model-path Lakonik/pi-H3 --port 30010
+
+# 2x H200, fastest measured lossless: Ulysses 2
+sglang serve --model-path Lakonik/pi-H3 --model-variant 2step \
+  --num-gpus 2 --ulysses-degree 2 --port 30010
+```
+
+Requests use [Generate video and audio](#4-generate-video-and-audio) with
+`"model": "Lakonik/pi-H3"` and `task` `t2va` or `fl2va`. Omit
+`num_inference_steps`, `flow_shift` and `audio_flow_shift`: the variant fixes
+them (Euler on the trained knots, video shift 12, audio shift 3). `ref2va` and
+`quality: "high"` are not supported, and breakable CUDA graph stays off.
+
+Warm `t2va` requests at 1344×768, 5 seconds, H200:
+
+| Variant | 1 GPU | 2 GPUs, Ulysses 2 | 1 GPU, FP8 + Sol (approximate) |
+| --- | --- | --- | --- |
+| `2step` | 11.9 s | 6.8 s | 6.7 s |
+| `4step` | 22.6 s | 12.3 s | 12.0 s |
+| `2step-vae` | 14.7 s | | |
+
+The pixel head decodes the clip in 0.6 s, the video VAE in 4.2 s. The
+approximate column adds `--quantization fp8
+--component-attention-backends text_encoder=torch_sdpa,transformer=sol_attn
+--attention-backend-config '{"dense_steps": 0, "dense_layers": "0,1"}'`. For
+80 GB cards, these offload flags keep `2step` on Ulysses 2 at 50 GiB per GPU
+(7.2 to 7.9 s per request on H200):
+
+```bash
+--performance-mode memory --layerwise-offload-components dit,text_encoder,vae \
+--layerwise-resident-layers video_vae=36 --dit-offload-prefetch-size 1 \
+--dit-layerwise-resident-layers 20
+```
+
+The pi-H3 adapters are Model Derivatives of MiniMax H3, distributed under the
+MiniMax H3 Community License Agreement.
+
 ### PDD acceleration LoRAs
 
 [Alibaba PAI's MiniMax-H3-Acc-LoRAs](https://huggingface.co/alibaba-pai/MiniMax-H3-Acc-LoRAs)

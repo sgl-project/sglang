@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-import tempfile
 from collections.abc import Callable
 from contextlib import closing
 from io import BytesIO
@@ -18,6 +17,7 @@ import torch
 from packaging import version
 
 from sglang.kernels import get_kernel
+from sglang.multimodal_gen.runtime.utils.image_io import temporary_media_directory
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
 
@@ -252,7 +252,7 @@ def _read_video_source(video: str, max_frames: int | None) -> list[PIL.Image.Ima
         file_name = os.path.basename(unquote(parsed_url.path))
 
         suffix = os.path.splitext(file_name)[1] or ".mp4"
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with temporary_media_directory() as temp_dir:
             video_path = os.path.join(temp_dir, f"video{suffix}")
             with closing(
                 requests.get(video, stream=True, timeout=_VIDEO_DOWNLOAD_TIMEOUT_S)

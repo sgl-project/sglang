@@ -574,10 +574,12 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
-            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+            from torchvision.io import ImageReadMode, decode_jpeg  # lazy: torch._dynamo
 
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            image_tensor = decode_jpeg(
+                encoded_image, mode=ImageReadMode.RGB, device="cuda"
+            )
             return image_tensor
         except Exception as e:
             if gpu_image_decode == "nvjpeg_fancy":

@@ -201,7 +201,7 @@ def hist_topk_workspace(indexer, config):
         prealloc_workspace,
         supported_hardware,
     )
-    from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_headroom
+    from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_row_width
 
     if not (
         supported_hardware()
@@ -212,14 +212,14 @@ def hist_topk_workspace(indexer, config):
         and indexer.num_local_tokens == 0
     ):
         return None
-    max_ctx = getattr(config, "max_position_embeddings", 0) or 0
-    if not max_ctx or loader.modules_or_none() is None:
+    max_positions = getattr(config, "max_position_embeddings", 0) or 0
+    if not max_positions or loader.modules_or_none() is None:
         return None
-    # the req_to_token row headroom past the context, then 4 more pages of slack
-    headroom = get_req_to_token_headroom()
-    max_ctx = (-(-(max_ctx + headroom) // 64) + 4) * 64
+    # the req_to_token row width, then 4 more pages of slack
+    req_to_token_row_width = get_req_to_token_row_width(max_positions)
+    max_cols = (-(-req_to_token_row_width // 64) + 4) * 64
     device = torch.device("cuda", torch.cuda.current_device())
-    prealloc_workspace(device=device, max_cols=max_ctx, fp8_dtype=fp8_dtype)
+    prealloc_workspace(device=device, max_cols=max_cols, fp8_dtype=fp8_dtype)
     workspace = _WORKSPACES.get(_workspace_key(device, fp8_dtype))
     if workspace is not None:
         print_info_once("DSA indexer: gfx950 logits+histogram and one-launch top-k")

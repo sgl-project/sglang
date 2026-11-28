@@ -72,7 +72,7 @@ def _make_backend(batch_size, capture_width=7):
     backend.device = torch.device("cpu")
     backend.num_draft_tokens = 9
     backend.target_verify_num_tokens_per_req = capture_width
-    backend.max_context_len = 128
+    backend.max_kv_len = 128
     backend.qo_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
     backend.kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32)
     backend.window_lengths = {}
@@ -163,13 +163,11 @@ def test_graph_capture_and_padded_replay_use_bonus_token_width(
     _assert_verify_width(backend, batch_size)
 
 
-@pytest.mark.parametrize("with_spec_info", (False, True))
-def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
-    batch_size = 2
-    backend = _RecordingTritonBackend.__new__(_RecordingTritonBackend)
+def _make_extend_backend(batch_size, *, deterministic, backend_cls=TritonAttnBackend):
+    backend = backend_cls.__new__(backend_cls)
     backend.device = torch.device("cpu")
     backend.dcp_size = 1
-    backend.enable_deterministic = True
+    backend.enable_deterministic = deterministic
     backend.use_dense_fp8_chunked_prefill = False
     backend.allow_bidirectional_attention_in_extend = False
     backend.page_size = 1
@@ -192,17 +190,27 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
         num_kv_splits=None,
         kv_indptr=torch.zeros(batch_size + 1, dtype=torch.int32),
         kv_indices=torch.zeros(1, dtype=torch.int64),
-        qo_indptr=torch.tensor([0, 7, 14], dtype=torch.int32),
+        qo_indptr=torch.arange(batch_size + 1, dtype=torch.int32) * 7,
         custom_mask=None,
         mask_indptr=None,
         windows={
             "full": WindowRail(
-                kv_indptr=torch.tensor([0, 8, 20], dtype=torch.int32),
-                kv_indices=torch.zeros(20, dtype=torch.int64),
+                kv_indptr=torch.zeros(batch_size + 1, dtype=torch.int32),
+                kv_indices=torch.zeros(batch_size * 10, dtype=torch.int64),
             )
         },
     )
-    layer = SimpleNamespace(
+    backend.dllm_attention = None
+    backend.draft_bf16_dot = False
+    backend.use_verify_gfx115 = False
+    backend.verify_mla_draft_fwd = None
+    backend.use_verify_shared_kv = False
+    backend.use_verify_splitkv = False
+    return backend
+
+
+def _make_layer(sliding_window_size):
+    return SimpleNamespace(
         layer_id=0,
         qk_head_dim=4,
         v_head_dim=4,
@@ -213,10 +221,22 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
         logit_cap=0.0,
         is_cross_attention=False,
         attn_type=AttentionType.DECODER,
-        sliding_window_size=16,
+        sliding_window_size=sliding_window_size,
         scaling=0.5,
         xai_temperature_len=None,
     )
+
+
+@pytest.mark.parametrize("with_spec_info", (False, True))
+def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
+    batch_size = 2
+    backend = _make_extend_backend(
+        batch_size, deterministic=True, backend_cls=_RecordingTritonBackend
+    )
+    backend.forward_metadata.windows["full"].kv_indptr = torch.tensor(
+        [0, 8, 20], dtype=torch.int32
+    )
+    layer = _make_layer(sliding_window_size=16)
     forward_batch = SimpleNamespace(
         batch_size=batch_size,
         forward_mode=ForwardMode.TARGET_VERIFY,
@@ -252,6 +272,86 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
         backend.recorded_window_start_pos,
         torch.tensor([24, 52], dtype=torch.int64),
     )
+
+
+@pytest.mark.parametrize("deterministic", (False, True))
+@pytest.mark.parametrize("sliding_layers_only", (False, True))
+def test_gemma4_image_mask_layer_scope(deterministic, sliding_layers_only):
+    """Full layers stay causal; image bidirectionality survives interleaved layers.
+
+    DiffusionGemma explicitly opts out of the sliding-only restriction.
+    Exercise the real model mask producer and both backend dispatch paths.
+    """
+    from unittest.mock import patch
+
+    from sglang.srt.models import gemma4_mm
+
+    recorded = []
+
+    def record_two_stage(*args, **kwargs):
+        recorded.append((args[9], args[11]))
+
+    def record_unified(*args, **kwargs):
+        recorded.append((kwargs["custom_mask"], kwargs["mask_indptr"]))
+
+    batch_size = 2
+    backend = _make_extend_backend(batch_size, deterministic=deterministic)
+    backend.extend_attention_fwd = record_two_stage
+    backend.extend_attention_fwd_unified = record_unified
+    backend.build_unified_kv_indices = lambda *args: (
+        torch.tensor([0, 7, 14], dtype=torch.int32),
+        torch.arange(14),
+        torch.zeros(2, dtype=torch.int32),
+    )
+    layer = _make_layer(sliding_window_size=16)
+    forward_batch = SimpleNamespace(
+        batch_size=batch_size,
+        forward_mode=ForwardMode.EXTEND,
+        mha_one_shot=False,
+        out_cache_loc=torch.zeros(batch_size * 7, dtype=torch.int64),
+        extend_seq_lens_cpu=[7, 7],
+        extend_seq_lens=torch.tensor([7, 7], dtype=torch.int32),
+        extend_start_loc=torch.tensor([0, 7], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0, 0], dtype=torch.int32),
+        seq_lens=torch.tensor([32, 64], dtype=torch.int64),
+        mm_inputs=[
+            SimpleNamespace(
+                mm_items=[SimpleNamespace(is_image=lambda: True, offsets=[(0, 6)])]
+            )
+        ]
+        * 2,
+    )
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            text_config=SimpleNamespace(use_bidirectional_attention="vision")
+        )
+    )
+    with patch.object(gemma4_mm, "get_attn_backend", return_value=backend):
+        gemma4_mm.Gemma4ForConditionalGeneration.prepare_attn_masks(
+            model,
+            forward_batch,
+            torch.arange(14),
+            torch.bool,
+            sliding_layers_only=sliding_layers_only,
+        )
+    image_mask = backend.forward_metadata.custom_mask
+    image_indptr = backend.forward_metadata.mask_indptr
+    q = torch.zeros((14, 4))
+    for window in (16, None, -1, 16):
+        layer.sliding_window_size = window
+        backend.forward_extend(q, q, q, layer, forward_batch, save_kv_cache=False)
+        mask, indptr = recorded[-1]
+        expected_image = not sliding_layers_only or window == 16
+        if expected_image:
+            torch.testing.assert_close(
+                mask.view(2, 7, 7), torch.ones(2, 7, 7, dtype=torch.bool)
+            )
+            assert indptr is image_indptr
+        else:
+            assert mask is None
+            assert indptr is None
+        assert backend.forward_metadata.custom_mask is image_mask
 
 
 if __name__ == "__main__":
