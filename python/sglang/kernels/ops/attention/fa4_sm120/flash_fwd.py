@@ -2857,6 +2857,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 smem_thr_copy_q,
                 smem_thr_copy_k,
             )
+        if cutlass.const_expr(isinstance(pipeline_k, PipelineTmaAsync)):
+            if cutlass.const_expr(
+                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+            ):
+                cute.arch.inline_ptx(
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                )
+            else:
+                cute.arch.fence_proxy("async.shared", space="cta")
         pipeline_k.consumer_release(k_state)
         k_state.advance()
 
@@ -3041,6 +3050,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             sV[None, None, v_state.index],
             smem_thr_copy_v,
         )
+        if cutlass.const_expr(isinstance(pipeline_v, PipelineTmaAsync)):
+            if cutlass.const_expr(
+                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+            ):
+                cute.arch.inline_ptx(
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                )
+            else:
+                cute.arch.fence_proxy("async.shared", space="cta")
         pipeline_v.consumer_release(v_state)
         v_state.advance()
         return v_state, p_state
@@ -3878,6 +3896,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem_copy_params.smem_thr_copy_Q,
             smem_copy_params.smem_thr_copy_K,
         )
+        if cutlass.const_expr(isinstance(pipeline_k, PipelineTmaAsync)):
+            if cutlass.const_expr(
+                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+            ):
+                cute.arch.inline_ptx(
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                )
+            else:
+                cute.arch.fence_proxy("async.shared", space="cta")
         pipeline_k.consumer_release(consumer_state)
 
         if const_expr(score_mod is not None):
@@ -4226,6 +4253,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem_copy_params.tOsV[None, None, None, consumer_state.index],
             smem_copy_params.smem_thr_copy_V,
         )
+        if cutlass.const_expr(isinstance(pipeline_v, PipelineTmaAsync)):
+            if cutlass.const_expr(
+                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+            ):
+                cute.arch.inline_ptx(
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                )
+            else:
+                cute.arch.fence_proxy("async.shared", space="cta")
         pipeline_v.consumer_release(consumer_state)
 
         if not skip_p_empty:
@@ -4234,6 +4270,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                 number_of_threads=self.num_mma_threads,
             )
         if const_expr(release_k):
+            if cutlass.const_expr(isinstance(pipeline_k, PipelineTmaAsync)):
+                if cutlass.const_expr(
+                    (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+                ):
+                    cute.arch.inline_ptx(
+                        "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                    )
+                else:
+                    cute.arch.fence_proxy("async.shared", space="cta")
             pipeline_k.consumer_release(consumer_state)
         consumer_state.advance()
         return consumer_state
@@ -4285,6 +4330,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
                     acc_S[i] = acc_S[i] + sBias[row, col, consumer_state.index].to(
                         self.qk_acc_dtype
                     )
+            if cutlass.const_expr(
+                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+            ):
+                cute.arch.inline_ptx(
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                )
+            else:
+                cute.arch.fence_proxy("async.shared", space="cta")
             pipeline_bias.consumer_release(consumer_state)
         else:
             for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
@@ -4330,6 +4383,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem_copy_params.smem_thr_copy_Q,
             smem_copy_params.smem_thr_copy_K,
         )
+        if cutlass.const_expr(isinstance(pipeline_k, PipelineTmaAsync)):
+            if cutlass.const_expr(
+                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+            ):
+                cute.arch.inline_ptx(
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                )
+            else:
+                cute.arch.fence_proxy("async.shared", space="cta")
         pipeline_k.consumer_release(consumer_state)
 
         if const_expr(self.has_bias):
@@ -4376,6 +4438,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardBase):
             smem_copy_params.sV[None, None, consumer_state.index],
             smem_copy_params.smem_thr_copy_V,
         )
+        if cutlass.const_expr(isinstance(pipeline_v, PipelineTmaAsync)):
+            if cutlass.const_expr(
+                (cutlass.CUDA_VERSION.major, cutlass.CUDA_VERSION.minor) >= (13, 4)
+            ):
+                cute.arch.inline_ptx(
+                    "fence.proxy.async::generic.release.sync_restrict::shared::cluster::read.cluster;"
+                )
+            else:
+                cute.arch.fence_proxy("async.shared", space="cta")
         pipeline_v.consumer_release(consumer_state)
         consumer_state.advance()
         return consumer_state
