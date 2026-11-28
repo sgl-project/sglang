@@ -919,6 +919,13 @@ def download_safetensors_index_file_from_hf(
             logger.debug("No %s found in remote.", index_file)
         except huggingface_hub.utils.LocalEntryNotFoundError:
             logger.debug("No %s found in local cache.", index_file)
+        # Without a token a gated repo answers 401; the index is optional, so use the cache.
+        except huggingface_hub.utils.GatedRepoError:
+            logger.warning(
+                "Cannot access %s for gated repo %s; skipping.",
+                index_file,
+                model_name_or_path,
+            )
 
 
 # For models like Mistral-7B-v0.3, there are both sharded
