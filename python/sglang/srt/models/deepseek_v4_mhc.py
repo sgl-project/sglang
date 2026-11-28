@@ -686,9 +686,11 @@ def post(
     if _is_npu:
         if cfg.pre_from_prev:
             if not is_npu_arch35():
-                from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import post_torch
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_mhc import (
+                    post as post_npu,
+                )
 
-                return post_torch(x, residual, post_mix, comb)
+                return post_npu(x, residual, post_mix, comb)
             # V4.1 (A5) CANN mhc_post(x, hRes, hOut, hPost): the residual is
             # the base stream, comb its res-mixing matrix, x the sublayer
             # output and post its post-mix.
