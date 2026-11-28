@@ -537,10 +537,13 @@ def _ple_track_targets(
     return dst, aligned[:rows].clamp(min=0).minimum(batch.lengths)
 
 
-def _pad_token_rows(x: torch.Tensor, total_tokens: int) -> torch.Tensor:
+def _pad_token_rows(
+    x: torch.Tensor, total_tokens: int, *, pad_value: int | torch.Tensor = 0
+) -> torch.Tensor:
     if x.shape[0] == total_tokens:
         return x
-    out = x.new_zeros((total_tokens, *x.shape[1:]))
+    out = x.new_empty((total_tokens, *x.shape[1:]))
+    out[x.shape[0] :] = pad_value
     out[: x.shape[0]] = x
     return out
 
@@ -713,6 +716,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         # Offload only needs this embedding's metadata: build it on meta so the
         # shard is never allocated on the device.
         with torch.device("meta") if offload_embedding else nullcontext():
+            engram_options = {}
+            if get_memory().enable_hi_engram:
+                engram_options = dict(
+                    engram_head_bounds=(*head_offsets, total_vocab_size),
+                    engram_namespace=ngram_prefix,
+                )
             ngram_embedding = embedding_cls(
                 padded_vocab_size,
                 self.head_dim_per_ngram,
@@ -723,6 +732,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 ),
                 output_dtype=torch.bfloat16,
                 use_attn_tp_group=self.use_attn_tp_ngram,
+                **engram_options,
             )
         # weight_scale stays a real device tensor.
         ngram_embedding.register_buffer(
@@ -802,7 +812,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if not self.gather_dp_tokens:
             return ngram_ids, semantic_tokens
 
-        padded_ngram_ids = _pad_token_rows(ngram_ids, physical_tokens)
+        # Idle DP ranks still join the global lookup. Padding must name a valid
+        # row in every head; zero is outside all but the first head.
+        padded_ngram_ids = _pad_token_rows(
+            ngram_ids, physical_tokens, pad_value=self.ngram_heads_offsets
+        )
         global_tokens = forward_batch.global_dp_buffer_len
         if global_tokens is None:
             raise RuntimeError(
@@ -2679,8 +2693,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         def copy_ple_rows_to_tp_embedding(
             emb, loaded_weight: torch.Tensor, row_start: int, row_end: int
         ) -> None:
-            tp_start = emb.shard_indices.org_vocab_start_index
-            tp_end = emb.shard_indices.org_vocab_end_index
+            tp_start = getattr(
+                emb, "storage_row_start", emb.shard_indices.org_vocab_start_index
+            )
+            tp_end = getattr(
+                emb, "storage_row_end", emb.shard_indices.org_vocab_end_index
+            )
             ov_start = max(row_start, tp_start)
             ov_end = min(row_end, tp_end)
             if ov_start < ov_end:
