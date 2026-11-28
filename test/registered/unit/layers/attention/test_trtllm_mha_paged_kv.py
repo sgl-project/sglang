@@ -77,7 +77,7 @@ def _construct_backend(runner, *, configured=0, xqa=False):
         backend.kv_cache_quant_method = SimpleNamespace(
             resolve_attention_access=lambda *args: access
         )
-        backend.runner_ids = SimpleNamespace(is_translating=False)
+        backend.runner_ids = SimpleNamespace(is_translating=False, is_fused_draft=False)
 
     with (
         trtllm_mha_backend.envs.SGLANG_TRTLLM_MHA_FULL_ATTN_KV_SPLITS.override(
