@@ -95,6 +95,13 @@ def _top_k_renorm_prob(
     return _platform.top_k_renorm_prob(probs, top_k)
 
 
+def min_p_renorm_prob(probs: torch.Tensor, min_ps: torch.Tensor) -> torch.Tensor:
+    """Zero each row's probabilities below ``min_ps`` times its largest one and
+    renormalize, in place: the sampler's min-p, applied after top-k and top-p."""
+    probs.masked_fill_(probs < probs.amax(dim=-1, keepdim=True) * min_ps[:, None], 0.0)
+    return probs.div_(probs.sum(dim=-1, keepdim=True))
+
+
 top_p_renorm_prob = (
     _top_p_renorm_prob if _platform.top_p_renorm_prob is not None else None
 )
@@ -103,6 +110,7 @@ top_k_renorm_prob = (
 )
 
 __all__ = [
+    "min_p_renorm_prob",
     "renorm_deterministic",
     "top_k_renorm_prob",
     "top_p_renorm_prob",

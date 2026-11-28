@@ -31,7 +31,7 @@ def torch_router(scores, bias, topk, scoring_func):
 @marker.parametrize("scoring_func", ["sigmoid", "sqrtsoftplus"])
 @marker.parametrize("num_experts", [128, 256, 384, 512], [256, 384])
 @marker.parametrize("num_tokens", [1, 4, 16, 64, 512, 1024, 8192], [16, 1024])
-@marker.benchmark("provider", ["triton", "torch"])
+@marker.benchmark("provider", ["triton", "torch"], gate=["triton"])
 def benchmark(num_tokens: int, num_experts: int, scoring_func: str, provider: str):
     torch.manual_seed(0)
     scores = create_random(num_tokens, num_experts, dtype=torch.float32)

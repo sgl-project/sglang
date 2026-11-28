@@ -27,6 +27,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_pipeline import SamplingPipeline, VerifyRoute
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import (
     eagle_post_verify_graphs,
@@ -154,9 +155,8 @@ def _round(bs, generator, vocab=VOCAB):
             need_top_p_sampling=False,
             need_min_p_sampling=False,
             step_penalties=None,
-            acc_additive_penalties=None,
-            acc_scaling_penalties=None,
             logit_bias=None,
+            has_custom_logit_processor=False,
             sampling_seed=None,
             watermark=None,
             temperatures=None,
@@ -184,7 +184,9 @@ def _eager(batch, verify_input, logits, sim_rng, graphs=None):
     )
     predict, accept_lens, accept_index = eagle_sample(
         verify_input,
-        batch,
+        SamplingPipeline(sampler=None, watermark=None).plan_verify(
+            batch, watermark_full_mask=True
+        ),
         SimpleNamespace(
             next_token_logits=logits.clone(), next_token_logits_vocab_shard=None
         ),
@@ -216,7 +218,15 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
         has_grammar=False,
         device="cpu",
         forward_mode=ForwardMode.IDLE if idle else ForwardMode.TARGET_VERIFY,
-        sampling_info=SimpleNamespace(watermark=None),
+        sampling_info=SimpleNamespace(
+            step_penalties=None,
+            logit_bias=None,
+            has_custom_logit_processor=False,
+            watermark=None,
+            need_top_k_sampling=False,
+            need_top_p_sampling=False,
+            need_min_p_sampling=False,
+        ),
         return_logprob=False,
     )
     target_worker = SimpleNamespace(
@@ -227,7 +237,7 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
             )
         ),
         model_runner=SimpleNamespace(
-            watermark=None,
+            sampling_pipeline=SamplingPipeline(sampler=None, watermark=None),
             attn_backend=SimpleNamespace(verify_mask=None),
         ),
     )
@@ -253,7 +263,6 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
             topk=1,
             num_draft_tokens=7,
             device="cpu",
-            metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             post_verify_graphs=graphs,
         )
@@ -307,7 +316,8 @@ class TestPostVerifyGraphs(CustomTestCase):
 
     def test_only_batches_a_graph_can_replay_take_the_post_verify_graphs(self):
         """A batch whose sampling a captured graph cannot reproduce (grammar, penalties,
-        seeds, ...) or whose verify ran eagerly must take SGLang's eager path."""
+        a custom logit processor, seeds, ...) or whose verify ran eagerly must take
+        SGLang's eager path."""
         graphs = EaglePostVerifyGraphs(
             target_worker=_target_worker(),
             simulated_acc_len_rng=simulated_acc_len_generator(0),
@@ -321,6 +331,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             info = dict(
                 step_penalties=None,
                 logit_bias=None,
+                has_custom_logit_processor=False,
                 sampling_seed=None,
                 need_min_p_sampling=False,
                 watermark=None,
@@ -345,7 +356,14 @@ class TestPostVerifyGraphs(CustomTestCase):
             verify_input = SimpleNamespace(
                 topk=topk, draft_probs=None, draft_token_num=7, max_tree_depth=7
             )
-            return graphs._key(batch, verify_input, logits_output, can_run_cuda_graph)
+            route = VerifyRoute.derive(
+                batch.sampling_info,
+                has_grammar=batch.has_grammar,
+                has_watermark=batch.sampling_info.watermark is not None,
+            )
+            return graphs._key(
+                batch, route, verify_input, logits_output, can_run_cuda_graph
+            )
 
         self.assertIsNotNone(key())
         for change in (
@@ -355,6 +373,7 @@ class TestPostVerifyGraphs(CustomTestCase):
             dict(hisparse_coordinator=object()),
             dict(step_penalties=object()),
             dict(logit_bias=torch.zeros(1)),
+            dict(has_custom_logit_processor=True),
             dict(sampling_seed=torch.zeros(1)),
             dict(need_min_p_sampling=True),
         ):
@@ -452,9 +471,8 @@ class TestPostVerifyGraphs(CustomTestCase):
             seq_lens=torch.zeros(1),
             sampling_info=SimpleNamespace(
                 step_penalties=None,
-                acc_additive_penalties=None,
-                acc_scaling_penalties=None,
                 logit_bias=None,
+                has_custom_logit_processor=False,
                 sampling_seed=None,
                 need_min_p_sampling=False,
                 watermark=None,
@@ -474,8 +492,13 @@ class TestPostVerifyGraphs(CustomTestCase):
             next_token_logits=torch.zeros((7, 8)),
             next_token_logits_vocab_shard=None,
         )
+        route = VerifyRoute.derive(
+            verify_batch.sampling_info,
+            has_grammar=False,
+            has_watermark=verify_batch.sampling_info.watermark is not None,
+        )
         keys = {
-            graphs._key(verify_batch, verify_input, logits, True, max_top_k)
+            graphs._key(verify_batch, route, verify_input, logits, True, max_top_k)
             for max_top_k in (20, None)
         }
         self.assertEqual(len(keys), 2)
@@ -486,8 +509,8 @@ class TestPostVerifyGraphs(CustomTestCase):
             next_token_logits_vocab_shard=object(),
         )
         self.assertNotEqual(
-            graphs._key(verify_batch, verify_input, logits, True, 20),
-            graphs._key(verify_batch, verify_input, shards, True, 20),
+            graphs._key(verify_batch, route, verify_input, logits, True, 20),
+            graphs._key(verify_batch, route, verify_input, shards, True, 20),
         )
 
     def test_a_packed_verify_result_is_one_buffer_holding_the_stock_values(self):
@@ -595,6 +618,11 @@ class TestPostVerifyGraphsMatchEager(CustomTestCase):
                     tree_kernel.reset_mock()
                     got = graphs.run(
                         batch=batch,
+                        route=VerifyRoute.derive(
+                            batch.sampling_info,
+                            has_grammar=batch.has_grammar,
+                            has_watermark=batch.sampling_info.watermark is not None,
+                        ),
                         verify_input=verify_input,
                         logits_output=SimpleNamespace(
                             next_token_logits=logits_buf,

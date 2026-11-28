@@ -188,6 +188,13 @@ pub struct ServerArgs {
     /// Start accepting health checks immediately instead of waiting for the
     /// main process's startup warmup request to finish.
     pub skip_server_warmup: bool,
+    /// The image Python's startup warmup sends a VLM, as base64 PNG data
+    /// (`_execute_server_warmup`): the warmup then generates from it and a
+    /// chat prompt instead of from text. `None` warms with text.
+    pub vlm_warmup_image_base64: Option<String>,
+    /// That warmup's prompt, rendered by the launcher for a chat template
+    /// this server cannot render; `None` renders it with the served one.
+    pub vlm_warmup_prompt: Option<String>,
     /// `--gc-threshold`: the thresholds the scheduler ranks set when they
     /// freeze their garbage collectors after startup; `None` keeps Python's.
     pub gc_threshold: Option<Vec<i64>>,
@@ -315,6 +322,8 @@ impl ServerArgs {
         detokenizer_worker_num,
         skip_tokenizer_init,
         skip_server_warmup,
+        vlm_warmup_image_base64,
+        vlm_warmup_prompt,
         gc_threshold,
         custom_warmups_pending,
         health_generate_headers,
@@ -382,6 +391,8 @@ impl ServerArgs {
         detokenizer_worker_num: usize,
         skip_tokenizer_init: bool,
         skip_server_warmup: bool,
+        vlm_warmup_image_base64: Option<String>,
+        vlm_warmup_prompt: Option<String>,
         gc_threshold: Option<Vec<i64>>,
         custom_warmups_pending: bool,
         health_generate_headers: BTreeMap<String, String>,
@@ -447,6 +458,8 @@ impl ServerArgs {
             detokenizer_worker_num,
             skip_tokenizer_init,
             skip_server_warmup,
+            vlm_warmup_image_base64,
+            vlm_warmup_prompt,
             gc_threshold,
             custom_warmups_pending,
             health_generate_headers,
@@ -519,6 +532,8 @@ impl Default for ServerArgs {
             detokenizer_worker_num: 1,
             skip_tokenizer_init: false,
             skip_server_warmup: false,
+            vlm_warmup_image_base64: None,
+            vlm_warmup_prompt: None,
             gc_threshold: None,
             custom_warmups_pending: false,
             health_generate_headers: BTreeMap::new(),

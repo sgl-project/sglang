@@ -487,7 +487,8 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let vocab = json!({"[UNK]": 0, "!": 1, "#": 2, "Ã©": 3});
             let model = json!({"type": "WordLevel", "vocab": vocab, "unk_token": "[UNK]"});
-            let config = json!({"model": model, "pre_tokenizer": {"type": "Whitespace"}});
+            let config = json!({"model": model, "pre_tokenizer": {"type": "Whitespace"},
+                "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": true}});
             let path = dir.join("tokenizer.json");
             std::fs::write(&path, config.to_string()).unwrap();
             path.to_string_lossy().into_owned()
