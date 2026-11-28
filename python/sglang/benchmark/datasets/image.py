@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pybase64
 from PIL import Image
-from transformers import AutoProcessor
+from transformers import AutoConfig, AutoProcessor
 
 from sglang.benchmark.datasets.common import (
     BaseDataset,
@@ -51,6 +51,7 @@ class ImageDataset(BaseDataset):
 
     def load(self, tokenizer=None, model_id=None) -> List[DatasetRow]:
         processor = get_processor(model_id)
+        image_token_id = get_image_token_id(processor, model_id)
         # Processor initialization may consume global RNG state. Reset it here so
         # --seed fixes the generated prompts, image sizes, and image contents.
         random.seed(self.seed)
@@ -67,7 +68,26 @@ class ImageDataset(BaseDataset):
             image_resolution=self.image_resolution,
             backend=self.backend,
             random_image_count=self.random_image_count,
+            image_token_id=image_token_id,
         )
+
+
+def get_image_token_id(processor, model_id: Optional[str]) -> Optional[int]:
+    """Return the image placeholder token id that random prompt text must avoid.
+
+    A checkpoint that ships no multimodal processor (e.g. DeepSeek-V4.1) loads as
+    a bare tokenizer without ``image_token_id``. If the random text then samples
+    the placeholder token, the server sees an extra image placeholder and rejects
+    the request, so read the id from the model config instead.
+    """
+    image_token_id = getattr(processor, "image_token_id", None)
+    if image_token_id is not None or hasattr(processor, "tokenizer") or not model_id:
+        return image_token_id
+    try:
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    except Exception:
+        return None
+    return getattr(config, "image_token_id", None)
 
 
 def parse_image_resolution(image_resolution: str) -> Tuple[int, int]:
@@ -246,6 +266,7 @@ def sample_image_requests(
     image_resolution: str,
     backend: str,
     random_image_count: bool = False,
+    image_token_id: Optional[int] = None,
 ) -> List[DatasetRow]:
     """Generate requests with images.
 
@@ -317,6 +338,12 @@ def sample_image_requests(
         image_bytes = len(image_data.encode("utf-8"))
         return img, image_data, image_bytes, (width, height)
 
+    image_pad_id = (
+        image_token_id
+        if image_token_id is not None
+        else getattr(processor, "image_token_id", None)
+    )
+
     dataset: List[DatasetRow] = []
     total_image_bytes = 0
     all_image_sizes: list[Tuple[int, int]] = []
@@ -327,7 +354,7 @@ def sample_image_requests(
         # Generate text prompt
         text_prompt = gen_mm_prompt(
             processor.tokenizer if hasattr(processor, "tokenizer") else processor,
-            processor.image_token_id if hasattr(processor, "image_token_id") else None,
+            image_pad_id,
             int(input_lens[i]),
         )
 
