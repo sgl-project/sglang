@@ -10,6 +10,7 @@ strided inputs, so they serve both the full-hidden norms and the per-head
 q/k/index norms (non-contiguous ``qkv.split`` views).
 """
 
+import functools
 from typing import Optional
 
 import torch
@@ -243,6 +244,119 @@ def _gemma_add_rmsnorm_fp8_4rows_kernel(
 _FOUR_ROWS_MIN_ROWS = 2048
 
 
+@triton.jit
+def _gemma_fused_add_rmsnorm_mxfp4_quant_kernel(
+    x_ptr,
+    res_ptr,
+    w_ptr,
+    q_ptr,
+    scale_ptr,
+    res_out_ptr,
+    n_rows,
+    n_cols,
+    stride_xrow,
+    stride_xcol,
+    stride_rrow,
+    stride_rcol,
+    scale_n_pad,
+    eps,
+    BLOCK_N: tl.constexpr,
+):
+    # The add + norm below is _gemma_fused_add_rmsnorm_kernel's, statement for
+    # statement (same layout, same reduction), so the bf16 output it quantizes
+    # is bit-identical to that kernel's. Keep the two in sync.
+    # A program handles rows pid, pid + num_programs, ... and loads the next
+    # row's inputs while it reduces and quantizes the current one, so a row's
+    # reduction does not leave the memory system idle.
+    pid = tl.program_id(0)
+    step = tl.num_programs(0)
+    cols = tl.arange(0, BLOCK_N)
+    mask = cols < n_cols
+    x_next = tl.load(
+        x_ptr + pid * stride_xrow + cols * stride_xcol, mask=mask, other=0.0
+    )
+    r_next = tl.load(
+        res_ptr + pid * stride_rrow + cols * stride_rcol, mask=mask, other=0.0
+    )
+    for row in range(pid, n_rows, step):
+        x = x_next.to(tl.float32)
+        r = r_next.to(tl.float32)
+        nxt = row + step
+        nmask = mask & (nxt < n_rows)
+        x_next = tl.load(
+            x_ptr + nxt * stride_xrow + cols * stride_xcol, mask=nmask, other=0.0
+        )
+        r_next = tl.load(
+            res_ptr + nxt * stride_rrow + cols * stride_rcol, mask=nmask, other=0.0
+        )
+        s = x + r
+        tl.store(
+            res_out_ptr + row * n_cols + cols,
+            s.to(res_out_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        var = tl.sum(s * s, axis=0) / n_cols
+        rstd = 1.0 / tl.sqrt(var + eps)
+        w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        out = s * rstd * (1.0 + w)
+        # MXFP4 of the norm output as written in the activation dtype, the way
+        # AITER per_1x32_f4_quant quantizes it: E8M0 scale ceil_pow2(amax / 6)
+        # (RoundUp) per 32 values with amax floored at 1e-10, E2M1 round to
+        # nearest even.
+        y = out.to(res_out_ptr.dtype.element_ty).to(tl.float32)
+        NB: tl.constexpr = BLOCK_N // 32
+        yb = tl.reshape(y, (NB, 32))
+        amax = tl.maximum(tl.max(tl.abs(yb), axis=1, keep_dims=True), 1e-10)
+        u = (amax * (1.0 / 6.0)).to(tl.int32, bitcast=True)
+        e = (u >> 23) & 0xFF
+        e = tl.where((e < 0xFF) & ((u & 0x7FFFFF) != 0), e + 1, e)
+        e = tl.minimum(e, 254)
+        qx = yb * tl.exp2((127 - e).to(tl.float32))
+        # gfx950 conversion, two values per instruction; four bytes (one thread's
+        # eight values) per 32-bit store.
+        lo, hi = tl.split(tl.reshape(qx, (NB, 16, 2)))
+        byts = (
+            tl.inline_asm_elementwise(
+                "v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3",
+                "=v,v,v,v",
+                args=[lo, hi, 1.0],
+                dtype=tl.int32,
+                is_pure=True,
+                pack=1,
+            )
+            & 0xFF
+        )
+        shifts = tl.arange(0, 4) * 8
+        words = tl.sum(tl.reshape(byts, (NB, 4, 4)) << shifts[None, None, :], axis=2)
+        words = tl.reshape(words, (NB * 4,))
+        wcols = tl.arange(0, NB * 4)
+        tl.store(q_ptr + row * (n_cols // 8) + wcols, words, mask=wcols < n_cols // 8)
+        # E8M0 scales in the tile order of the AITER ASM FP4 GEMM (as
+        # per_1x32_f4_quant(shuffle=True) writes them).
+        c = tl.arange(0, NB)
+        sidx = (
+            (row % 32) // 16
+            + ((c % 8) // 4) * 2
+            + (row % 16) * 4
+            + (c % 4) * 64
+            + (c // 8) * 256
+            + (row // 32) * 32 * scale_n_pad
+        )
+        tl.store(
+            scale_ptr + sidx, tl.reshape(e, (NB,)).to(tl.uint8), mask=c < n_cols // 32
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def _num_cus(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _num_row_programs(m: int, device: torch.device) -> int:
+    # Two programs per CU (16-warp programs); each walks rows with stride grid.
+    return max(1, min(m, 2 * _num_cus(device)))
+
+
 def _num_warps(block_n: int) -> int:
     if block_n >= 4096:
         return 16
@@ -374,3 +488,46 @@ def gemma_add_rmsnorm_fp8(
         scale = scale.t()
     quantized = (q, scale, out) if keep_bf16 else (q, scale)
     return quantized, x if residual is None else res_out
+
+
+def gemma_fused_add_rmsnorm_mxfp4_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+):
+    """gemma_fused_add_rmsnorm with the normed output MXFP4-quantized (gfx950).
+
+    Returns ``(x_fp4, x_scales, residual_out)``: ``x_fp4`` uint8 ``(m, n // 2)``
+    (two E2M1 codes per byte), ``x_scales`` uint8 E8M0 ``(round_up(m, 256),
+    n // 32)`` in the AITER ASM FP4 GEMM tile order (rows >= m are not
+    written), and the pre-norm sum. Bit-identical to gemma_fused_add_rmsnorm
+    followed by AITER ``per_1x32_f4_quant(..., shuffle=True)``.
+    """
+    m, n = x.shape
+    assert residual.shape == x.shape and n % 256 == 0, (x.shape, residual.shape)
+    x_fp4 = torch.empty((m, n // 2), dtype=torch.uint8, device=x.device)
+    x_scales = torch.empty(
+        ((m + 255) // 256 * 256, n // 32), dtype=torch.uint8, device=x.device
+    )
+    res_out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    block_n = triton.next_power_of_2(n)
+    _gemma_fused_add_rmsnorm_mxfp4_quant_kernel[(_num_row_programs(m, x.device),)](
+        x,
+        residual,
+        weight,
+        x_fp4.view(torch.int32),
+        x_scales,
+        res_out,
+        m,
+        n,
+        x.stride(0),
+        x.stride(1),
+        residual.stride(0),
+        residual.stride(1),
+        n // 32,
+        eps,
+        BLOCK_N=block_n,
+        num_warps=_num_warps(block_n),
+    )
+    return x_fp4, x_scales, res_out
