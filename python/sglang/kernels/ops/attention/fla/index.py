@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
+import contextlib
+
 import torch
 import triton
 
@@ -13,10 +15,54 @@ def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return cu_seqlens[1:] - cu_seqlens[:-1]
 
 
+# (cu_seqlens tensor, per-sequence lengths on the host) for the extend call in
+# flight: lets the chunk index builders skip a GPU->host .tolist() sync.
+_CPU_LENS_HINT = None
+
+
+@contextlib.contextmanager
+def cpu_seqlens_hint(cu_seqlens: torch.Tensor, lens_cpu):
+    global _CPU_LENS_HINT
+    prev = _CPU_LENS_HINT
+    _CPU_LENS_HINT = (cu_seqlens, [int(x) for x in lens_cpu])
+    try:
+        yield
+    finally:
+        _CPU_LENS_HINT = prev
+
+
+def _hinted_lens(cu_seqlens):
+    h = _CPU_LENS_HINT
+    if h is None:
+        return None
+    t, lens = h
+    if cu_seqlens is t or (
+        cu_seqlens.data_ptr() == t.data_ptr()
+        and cu_seqlens.numel() == t.numel()
+        and cu_seqlens.dtype == t.dtype
+    ):
+        return lens
+    return None
+
+
 @tensor_cache
 def prepare_chunk_indices(
     cu_seqlens: torch.LongTensor, chunk_size: int
 ) -> torch.LongTensor:
+    lens = _hinted_lens(cu_seqlens)
+    if lens is not None:
+        indices = torch.cat(
+            [torch.arange(-(-n // chunk_size)) for n in lens]
+            or [torch.zeros(0, dtype=torch.long)]
+        )
+        out = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
+        # The caching host allocator records an event on the copy stream, so the
+        # pinned block is not reused before this copy has read it.
+        return (
+            out.to(cu_seqlens.dtype)
+            .pin_memory()
+            .to(cu_seqlens.device, non_blocking=True)
+        )
     indices = torch.cat(
         [
             torch.arange(n)

@@ -2100,6 +2100,9 @@ class Envs:
     # Sequences a captured KDA extend bucket accepts; a larger prefill batch on
     # any dp rank runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Chunked KDA extend builds its chunk index from the host-side extend lengths
+    # instead of reading cu_seqlens back from the GPU (one sync per extend).
+    SGLANG_KDA_NO_EXTEND_SYNC = EnvBool(False)
     # Experimental: breakable prefill CUDA graphs capture the Triton GDN extend
     # instead of breaking at every GDN layer (layers/attention/linear/
     # gdn_prefill_graph.py).
