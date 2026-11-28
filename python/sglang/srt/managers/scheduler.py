@@ -1403,7 +1403,6 @@ class Scheduler(
         )
 
     def init_sampling_params_pool(self) -> None:
-        # Built by the model runner before graph capture: draft graphs read its table.
         self.sampling_params_pool = self.tp_worker.model_runner.sampling_params_pool
 
     def init_running_status(self):
@@ -5503,8 +5502,6 @@ class Scheduler(
         return forward_done
 
     def _set_sampling_step_state(self, batch: ScheduleBatch) -> None:
-        """Set the batch's sampling state for its launch, from its slots' rows of
-        the sampling params pool and from its requests."""
         # A beam tail's member rows follow the requests' rows; they take no params.
         num_reqs = len(batch.reqs)
         batch.sampling_info.set_step_state(

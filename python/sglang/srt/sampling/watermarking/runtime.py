@@ -53,8 +53,6 @@ def make_watermark_engine(
 
 
 def num_watermark_fields() -> int:
-    """How many `SamplingParamsPool` fields the algorithm keeps per request; 0 when
-    watermarking is off."""
     features = get_exec().features
     if not features.enable_watermark:
         return 0
@@ -62,7 +60,6 @@ def num_watermark_fields() -> int:
 
 
 def watermark_pool_values(req: Req) -> tuple[bool, Sequence[int]]:
-    """Whether the request is a candidate, and its int32 values for the pool."""
     features = get_exec().features
     return _ADAPTERS[features.watermark_algorithm].pool_values(req, features=features)
 
