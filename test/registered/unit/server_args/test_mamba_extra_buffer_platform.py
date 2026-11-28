@@ -1,9 +1,14 @@
 import unittest
+from importlib.metadata import PackageNotFoundError
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.mamba_hook import validate_mamba_extra_buffer
+from sglang.srt.arg_groups.mamba_hook import (
+    handle_mamba_backend,
+    validate_mamba_extra_buffer,
+)
 from sglang.srt.runtime_context import override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -61,6 +66,35 @@ class TestMambaExtraBufferPlatform(CustomTestCase):
 
             platform.support_mamba_cache_extra_buffer.return_value = True
             _validate()
+
+
+class TestFlashInferSSDPrefillVersion(CustomTestCase):
+    def test_requires_released_exact_scan_implementation(self):
+        args = ServerArgs(model_path="dummy", mamba_prefill_backend="flashinfer")
+        for installed, accepted in (
+            ("0.7.1", False),
+            ("0.7.2rc1", False),
+            ("0.7.2", True),
+            ("0.7.2+local", True),
+            ("0.7.3", True),
+            (None, False),
+        ):
+            with (
+                self.subTest(installed=installed),
+                override_platform(is_sm100=True),
+                patch(
+                    "sglang.srt.utils.common.version",
+                    return_value=installed,
+                    side_effect=PackageNotFoundError if installed is None else None,
+                ),
+            ):
+                if accepted:
+                    handle_mamba_backend(args)
+                else:
+                    with self.assertRaisesRegex(
+                        ValueError, "flashinfer-python >= 0.7.2"
+                    ):
+                        handle_mamba_backend(args)
 
 
 if __name__ == "__main__":
