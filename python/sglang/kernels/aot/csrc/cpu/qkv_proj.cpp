@@ -219,7 +219,8 @@ void segment_gemm_kernel_impl(
           /* ldb */ nb_size,
           /* ldc */ ldc,
           /* brg */ use_brgemm,
-          /* block_size_K */ block_size_K);
+          /* block_size_K */ block_size_K,
+          /* per_channel */ false);
 
       // move to the next index
       data_index_step(mb, MB, nb, NB);

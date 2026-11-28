@@ -91,13 +91,18 @@ void bmm_kernel_impl(
   int64_t mat2_strideN = K;
 
   const bool use_brgemm = can_use_brgemm<at::BFloat16>(M);
+  at::Tensor Btmp;
+  if (use_brgemm) {
+    Btmp = at::empty({at::get_num_threads(), BLOCK_N * K}, at::TensorOptions().dtype(at::kBFloat16).device(at::kCPU));
+  }
+  at::BFloat16* Btmp_base = use_brgemm ? Btmp.data_ptr<at::BFloat16>() : nullptr;
 
   // parallel on [B, MB, NB]
   parallel_2d(B * MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // for brgemm, use float32 for accumulate
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
     // for brgemm when mat2 is float8_e4m3
-    alignas(64) at::BFloat16 Btmp[BLOCK_N * BLOCK_K];
+    at::BFloat16* Btmp_ptr = use_brgemm ? Btmp_base + get_thread_num() * BLOCK_N * K : nullptr;
 
     loop_2d<at::Float8_e4m3fn>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t bs = mb / MB;
@@ -110,7 +115,7 @@ void bmm_kernel_impl(
           /*   A */ mat1 + bs * mat1_strideB + mb_start * mat1_strideM,
           /*   B */ mat2 + bs * mat2_strideB + nb_start * mat2_strideN /* nb * BLOCK_N * K */,
           /*   C */ out + bs * out_strideB + mb_start * out_strideM + nb_start,
-          /* Btmp*/ Btmp,
+          /* Btmp*/ Btmp_ptr,
           /* Ctmp*/ Ctmp,
           /* bias*/ nullptr,
           /*scale*/ scale,

@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A8MXFp8,
     CompressedTensorsW8A16Fp8,
+    CompressedTensorsW8A16Fp8MoE,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
@@ -87,6 +88,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -1122,6 +1124,9 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
             return CompressedTensorsW4A16Nvfp4MoE(has_input_global_scale=True)
         elif self._is_fp8_w8a8(weight_quant, input_quant):
+            if _is_cpu:
+                logger.info_once("Using CompressedTensorsW8A16Fp8MoE (CPU fallback)")
+                return CompressedTensorsW8A16Fp8MoE(weight_quant, input_quant)
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):

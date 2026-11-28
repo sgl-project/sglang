@@ -24,7 +24,7 @@ from sglang.srt.layers.quantization.utils import (
     convert_to_channelwise,
     requantize_with_max_scale,
 )
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, use_intel_amx_backend
 
 __all__ = ["CompressedTensorsW8A16Fp8"]
 
@@ -47,14 +47,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
     # So if we have a fused module (QKV, MLP) with per tensor scales,
     # we expand each scale to its shard's channels.
     def process_weights_after_loading(self, layer) -> None:
-        if _is_cpu:
+        if _is_cpu and self.strategy == QuantizationStrategy.TENSOR:
             assert _is_cpu_amx_available, (
                 "CPU compressed-tensors W8A16 FP8 requires AMX support."
             )
-            if self.strategy != QuantizationStrategy.TENSOR:
-                raise NotImplementedError(
-                    "CPU compressed-tensors W8A16 FP8 currently supports only per-tensor weight scales."
-                )
             # The CPU GEMM takes a single scale, so fused shards are requantized to the max scale.
             max_w_scale, weight = requantize_with_max_scale(
                 layer.weight.data, layer.weight_scale.data, layer.logical_widths
@@ -83,14 +79,21 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
                 layer.weight_scale.data, requires_grad=False
             )
 
-        # Weights must be transposed for marlin
-        layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
-
         if self.is_static_input_scheme:
             # required by torch.compile to be torch.nn.Parameter
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
+
+        if _is_cpu:
+            # No marlin kernel on CPU; apply_weights calls fp8_scaled_mm_cpu
+            # instead. Pack the weight to VNNI layout once here (also converts
+            # bias to float32) so apply_weights doesn't repack on every call.
+            _amx_process_weight_after_loading(layer, ["weight"])
+            return
+
+        # Weights must be transposed for marlin
+        layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
         prepare_fp8_layer_for_marlin(layer, size_k_first=True)
 
     def create_weights(
@@ -158,15 +161,32 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsLinearScheme):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if _is_cpu:
-            return torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+            batch_shape = x.shape[:-1]
+            x = x.reshape(-1, x.shape[-1])
+            if self.strategy == QuantizationStrategy.TENSOR:
+                output = torch.ops.sgl_kernel.fp8_per_tensor_scaled_mm_cpu(
+                    x.contiguous(),
+                    layer.weight,
+                    layer.weight_scale,
+                    bias.float() if bias is not None else None,
+                    x.dtype,
+                    True,
+                )
+                return output.reshape(*batch_shape, output.shape[-1])
+            # block_size_N == 1 selects the per-channel (as opposed to block)
+            # weight-only scale layout in fp8_scaled_mm_cpu: one scale value
+            # per output row (layer.weight_scale is [N, 1]), constant across K.
+            # The kernel requires bias to be float32 regardless of x's dtype.
+            output = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                 x,
                 layer.weight,
                 layer.weight_scale,
-                bias,
+                [1, layer.weight.shape[1]],
+                bias.float() if bias is not None else None,
                 x.dtype,
-                True,  # is_vnni: weight was packed at load time
+                use_intel_amx_backend(layer),  # is_vnni
             )
-
+            return output.reshape(*batch_shape, output.shape[-1])
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,

@@ -299,7 +299,8 @@ void tinygemm_kernel(
     int64_t ldc,
     bool brg);
 
-// block quantization
+// block quantization (block_size_N == 1 selects the per-channel scale layout,
+// where `scale` holds one value per output row instead of one per K-block)
 template <typename scalar_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
@@ -317,6 +318,7 @@ void tinygemm_kernel(
     int64_t ldc,
     bool brg,
     int64_t block_size_K,
+    bool per_channel,
     bool do_unpack = true);
 
 // per tensor quantization
@@ -338,7 +340,8 @@ void tinygemm_kernel(
     bool brg,
     bool do_unpack = true);
 
-// mxfp4
+// mxfp4 (per_channel is unused here, kept only so this overload matches the
+// fp8 one in the shared caller of `tinygemm_kernel<scalar_t>`)
 template <typename scalar_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
@@ -356,6 +359,7 @@ void tinygemm_kernel(
     int64_t ldc,
     bool brg,
     int64_t block_size_K,
+    bool per_channel,
     bool do_unpack = true);
 
 template <typename scalar_t>
