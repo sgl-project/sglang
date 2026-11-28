@@ -14,6 +14,7 @@ FlashInfer is faster and Triton is easier to customize.
 Each backend supports two operators: extend (i.e. prefill with cached prefix) and decode.
 """
 
+import copy
 import logging
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -78,6 +79,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +207,16 @@ def _verify_plan_uniform_q_len(spec_info) -> Optional[int]:
     if spec_info.num_tokens_per_req <= 0:
         return None
     return int(spec_info.num_tokens_per_req)
+
+
+def _verify_graph_key(
+    bs: int, ragged_layout: Optional[RaggedVerifyLayout]
+) -> Union[int, tuple]:
+    """Batch size for uniform verify graphs, token tier for ragged ones: tiers
+    can share a slot count, but each graph replays its own wrappers."""
+    if ragged_layout is None:
+        return bs
+    return ("ragged", ragged_layout.graph_num_tokens)
 
 
 def fast_prefill_plan(
@@ -635,6 +647,43 @@ class FlashInferAttnBackend(AttentionBackend):
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
 
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        # A ragged verify layout takes no window read, so only the single
+        # full-attention wrapper can replay it (no sliding-window or
+        # cross-attention wrapper pair).
+        return self.dispatch_reason is None
+
+    def _ragged_verify_graph_spec_info(
+        self, spec_info: SpecInput, layout: RaggedVerifyLayout, bs: int
+    ) -> SpecInput:
+        """The verify input a ragged capture or replay plans with.
+
+        A CUDA-graph FlashInfer wrapper must be planned with its captured
+        batch size, so the live layout is padded to the captured slots. As in
+        the FA3 and TRT-LLM backends it is padded to the tier's full token
+        count too (padding rows, or the last real row, take the leftover
+        tokens), which also gives device-built layouts the host token total
+        ``generate_attn_arg_prefill`` sizes its indices with. A real row
+        attends to the same keys either way: the causal mask aligns the
+        queries to the end of the keys.
+        """
+        if not self.supports_ragged_verify_graph:
+            raise NotImplementedError(
+                "FlashInfer replays ragged verify only with full attention "
+                "(no sliding-window or cross-attention wrappers); use "
+                "SGLANG_RAGGED_VERIFY_MODE=static for this configuration."
+            )
+        if getattr(spec_info, "custom_mask", None) is not None:
+            raise NotImplementedError(
+                "FlashInfer ragged verify CUDA graphs take no custom mask; use "
+                "SGLANG_RAGGED_VERIFY_MODE=static for this configuration."
+            )
+        # The spec input is shared with the worker: plan from a copy.
+        spec_info = copy.copy(spec_info)
+        spec_info.ragged_verify_layout = layout.padded_to_bucket(padded_bs=bs)
+        return spec_info
+
     def prefill_cp_unsupported_reason(self) -> Optional[str]:
         """Why zigzag prefill CP cannot run on this backend, or None if it can.
 
@@ -890,18 +939,22 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
-        if (
-            forward_batch.ragged_verify_layout is not None
-            and forward_mode.is_target_verify()
-        ):
-            raise NotImplementedError(
-                "FlashInfer does not support ragged verify in cuda graph; "
-                "disable SGLANG_RAGGED_VERIFY_MODE for this configuration."
+        ragged_layout = (
+            forward_batch.ragged_verify_layout
+            if forward_mode.is_target_verify()
+            else None
+        )
+        if ragged_layout is not None:
+            spec_info = self._ragged_verify_graph_spec_info(
+                spec_info, ragged_layout, bs
             )
+        verify_key = _verify_graph_key(bs, ragged_layout)
 
         if in_capture:
             num_tokens = forward_batch.positions.numel()
-            self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+            self._prepare_cuda_graph_metadata(
+                bs, num_tokens, forward_mode, spec_info, verify_key=verify_key
+            )
 
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -923,7 +976,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[verify_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
@@ -1003,6 +1056,9 @@ class FlashInferAttnBackend(AttentionBackend):
             and spec_info is not None
             and spec_info.spec_input_type == SpecInputType.DFLASH_VERIFY
             and getattr(spec_info, "custom_mask", None) is None
+            # The host layout below is the uniform arange; a ragged layout's
+            # per-request lengths live on the device, so it keeps plan().
+            and ragged_layout is None
             and self.prefill_backend == "fa2"
             # Host-rebuilt layout only matches full attention (single wrapper);
             # SWA/cross-attn keep the plain plan().
@@ -1020,7 +1076,7 @@ class FlashInferAttnBackend(AttentionBackend):
             # replay that otherwise stall the CPU behind the in-flight graph.
             # EAGLE uses the separate opt-in branch below because it must
             # also pack its actual tree mask on every replay.
-            for w in self.prefill_cuda_graph_metadata[bs]:
+            for w in self.prefill_cuda_graph_metadata[verify_key]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         if (
@@ -1036,7 +1092,7 @@ class FlashInferAttnBackend(AttentionBackend):
             and self.flashinfer_kv_cache_dtype
             in (torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2)
         ):
-            for w in self.prefill_cuda_graph_metadata[bs]:
+            for w in self.prefill_cuda_graph_metadata[verify_key]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
         # Refill the SWA write-target buffer from the live out_cache_loc before
@@ -1471,6 +1527,7 @@ class FlashInferAttnBackend(AttentionBackend):
         num_tokens: int,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        verify_key: Optional[Union[int, tuple]] = None,
     ) -> None:
         # Variants share the wrappers replay replans; replacing them leaves
         # earlier graphs with stale or freed workspaces.
@@ -1486,10 +1543,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 and spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
-            prefill_wrappers = self.prefill_cuda_graph_metadata.get(bs)
+            key = bs if verify_key is None else verify_key
+            prefill_wrappers = self.prefill_cuda_graph_metadata.get(key)
             if prefill_wrappers is None:
                 prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
-                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+                self.prefill_cuda_graph_metadata[key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(
                 prefill_wrappers, forward_mode.is_dllm_extend(), False
             )
