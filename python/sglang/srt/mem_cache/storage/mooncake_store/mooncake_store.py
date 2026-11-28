@@ -611,6 +611,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def __init__(
         self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
     ):
+        if getattr(storage_config, "unified_pool_plans", None) is not None:
+            raise NotImplementedError(
+                "Unified storage for DSA and DeepSeek V4/V4.1 native pools "
+                "requires the file backend."
+            )
         MooncakeBaseStore.__init__(self)
         self.dcp_size = storage_config.dcp_size if storage_config is not None else 1
         MooncakeDistributedStore = self._import_mooncake_store()

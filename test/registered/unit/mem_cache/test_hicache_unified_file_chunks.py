@@ -10,10 +10,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_key_scheme import plan_unified_kv
+from sglang.srt.mem_cache.hicache_key_scheme import UnifiedPoolPlan, plan_unified_kv
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -21,6 +22,8 @@ from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+_C4, _STATE = PoolName.DEEPSEEK_V4_C4, PoolName.DEEPSEEK_V4_C4_STATE
 
 
 class _HostPool:
@@ -282,6 +285,79 @@ class TestUnifiedFileChunks(unittest.TestCase):
         self.assertTrue(legacy.set("legacy", value))
         self.assertIs(legacy.get("legacy", target), target)
         torch.testing.assert_close(target, value)
+
+    def _native_backend(self, layers=(2, 6), tp_size=1, tp_rank=0, max_size=0):
+        config, _, _ = _rank(tp_size=tp_size, tp_rank=tp_rank)
+        geometry = SimpleNamespace(page_size=4)
+        plans = {PoolName.KV: UnifiedPoolPlan(("marker",), ((0, 0),))}
+        pools = {PoolName.KV: _HostPool(geometry, torch.empty(0, dtype=torch.uint8))}
+        for name, size in ((_C4, 6), (_STATE, 5)):
+            plans[name] = UnifiedPoolPlan(
+                tuple(f"{name.value}_L{layer}" for layer in layers),
+                tuple((i * size, size) for i in range(len(layers))),
+            )
+            page = [torch.full((size,), layer + size) for layer in layers]
+            pools[name] = _HostPool(geometry, torch.cat(page).to(torch.uint8))
+        backend = HiCacheFile(
+            replace(
+                config,
+                is_mla_model=True,
+                unified_suffixes=None,
+                unified_chunk_spans=None,
+                unified_pool_plans=plans,
+                extra_config={**config.extra_config, "max_size": max_size},
+            )
+        )
+        backend.register_mem_pool_host(pools[PoolName.KV])
+        for name, pool in pools.items():
+            backend.register_mem_host_pool_v2(pool, name)
+        return backend, pools
+
+    @staticmethod
+    def _transfer(name, keys, **kwargs):
+        indices = torch.zeros(4 * len(keys), dtype=torch.int64)
+        return PoolTransfer(name=name, keys=keys, host_indices=indices, **kwargs)
+
+    def test_native_pools_reuse_global_layers_across_tp_and_pp(self):
+        writer, pools = self._native_backend(tp_size=2, max_size=1024)
+        keys = ["n0", "n1"]
+        written = writer.batch_set_v2([self._transfer(name, keys) for name in pools])
+        self.assertTrue(all(all(ok) for ok in written.values()))
+        self.assertEqual(self._path(writer, "n0", "marker").stat().st_size, 0)
+        self.assertEqual(len(writer._evictor._lru), 10)
+        for layer in (2, 6):
+            # A wider TP rank holding one PP layer reads the same objects.
+            reader, targets = self._native_backend((layer,), tp_size=4, tp_rank=1)
+            self.assertEqual(reader._evictor._owned_suffixes, ())
+            for target in targets.values():
+                target.page.fill_(255)
+            selected = [self._transfer(name, keys) for name in targets]
+            self.assertEqual(reader.batch_exists_v2(keys, selected).kv_hit_pages, 2)
+            read = reader.batch_get_v2(selected)
+            self.assertTrue(all(all(ok) for ok in read.values()))
+            self.assertTrue(torch.all(targets[_C4].page == layer + 6))
+            self.assertTrue(torch.all(targets[_STATE].page == layer + 5))
+        with self.assertRaisesRegex(ValueError, "page has"):
+            writer.register_mem_host_pool_v2(
+                _HostPool(SimpleNamespace(page_size=4), torch.empty(1)), _C4
+            )
+
+    def test_corrupt_side_object_gates_hit_and_preserves_host_page(self):
+        writer, pools = self._native_backend()
+        keys = ["c0", "c1", "c2"]
+        writer.batch_set_v2([self._transfer(name, keys) for name in pools])
+        reader, targets = self._native_backend(tp_size=2, tp_rank=1)
+        sidecars = [
+            self._transfer(_C4, keys),
+            self._transfer(_STATE, keys[-1:], hit_policy=PoolHitPolicy.TRAILING_PAGES),
+        ]
+        self.assertEqual(reader.batch_exists_v2(keys, sidecars).kv_hit_pages, 3)
+        self._path(reader, keys[-1], f"{_STATE.value}_L6").write_bytes(b"bad")
+        self.assertTrue(reader.exists(keys[-1]))  # The zero-byte anchor remains.
+        self.assertEqual(reader.batch_exists_v2(keys, sidecars).kv_hit_pages, 2)
+        state = targets[_STATE].page.fill_(255)
+        self.assertEqual(reader.batch_get_v2([sidecars[-1]]), {_STATE: [False]})
+        self.assertTrue(torch.all(state == 255))
 
 
 if __name__ == "__main__":

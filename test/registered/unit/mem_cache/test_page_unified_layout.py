@@ -6,16 +6,29 @@ coordinate. They share a file because they have to agree on the grid.
 """
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4CheckpointBufferInfo,
+    DSV4PagedBufferInfo,
+    DSV4StateBufferInfo,
+)
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    UnifiedPoolPlan,
     derive_namespace,
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
 )
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -33,6 +46,308 @@ def _mha(**overrides):
     )
     kwargs.update(overrides)
     return PageUnifiedLayout(**kwargs)
+
+
+_FP8 = "sglang.kernels.ops.quantization.fp8_kernel.fp8_dtype"
+_DSA_UTILS = "sglang.srt.layers.attention.dsa.utils"
+
+
+def _entry(name, host):
+    return SimpleNamespace(name=name, host_pool=host, packed_draft_device_pools=())
+
+
+def _build(builder, model_id, root, group, page_size, **memory):
+    with patch.object(
+        hybrid_pool_assembler, "get_memory", return_value=SimpleNamespace(**memory)
+    ):
+        return builder(model_id, root, group, page_size)
+
+
+def _dsv4_fixture(
+    *,
+    name=PoolName.DEEPSEEK_V4_C4,
+    layer_ids=(3, 7),
+    capacity=4,
+    layout="v41",
+    shape=(16,),
+    dtype=torch.uint8,
+    page_size=256,
+    host_page_size=256,
+    states=(),
+):
+    if states:
+        region = DSV4CheckpointBufferInfo(
+            states=tuple(
+                DSV4StateBufferInfo(
+                    pages=torch.zeros(capacity, 16, dtype=torch.uint8),
+                    ring_size=2,
+                    dtype=state_dtype,
+                )
+                for state_dtype in states
+            )
+        )
+    else:
+        region = DSV4PagedBufferInfo.from_buffers(
+            [torch.zeros(capacity, *shape, dtype=dtype) for _ in layer_ids],
+            page_slots=64,
+            layout=layout,
+        )
+    info = DevicePoolInfo(
+        pool_name=name,
+        indices_from_pool=PoolName.KV,
+        layer_ids=layer_ids,
+        buffer_info=region,
+    )
+    root = SimpleNamespace(
+        page_size=page_size,
+        get_device_pool_infos=lambda: (info,),
+        index_pools={ratio: SimpleNamespace() for ratio in (1, 2, 4)},
+    )
+    host = SimpleNamespace(
+        layout="page_unified",
+        page_size=host_page_size,
+        layer_num=len(layer_ids),
+        item_bytes=16,
+        state_page_bytes=16,
+    )
+    anchor = SimpleNamespace(layout="page_unified", page_size=page_size)
+    return root, SimpleNamespace(
+        entries=[_entry(PoolName.KV, anchor), _entry(name, host)]
+    )
+
+
+class TestDSV4UnifiedPoolPlans(CustomTestCase):
+    @staticmethod
+    def _plans(root, group, **memory):
+        return _build(
+            hybrid_pool_assembler.build_dsv4_unified_pool_plans,
+            "deepseek/test",
+            root,
+            group,
+            root.page_size,
+            **memory,
+        )
+
+    def test_layer_objects_survive_tp_pp_and_capacity_changes(self):
+        for name in (
+            PoolName.SWA,
+            PoolName.DEEPSEEK_V4_C1,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C128,
+        ):
+            with self.subTest(pool=name):
+                full = self._plans(*_dsv4_fixture(name=name))
+                stage = self._plans(
+                    *_dsv4_fixture(name=name, layer_ids=(7,), capacity=13)
+                )
+                self.assertEqual(full[name].suffixes[1:], stage[name].suffixes)
+                self.assertEqual(full[name].chunk_spans, ((0, 16), (16, 16)))
+                self.assertEqual(full[PoolName.KV], stage[PoolName.KV])
+                self.assertEqual(stage[PoolName.KV].page_bytes, 0)
+
+    def test_native_formats_do_not_share_objects(self):
+        """Equal-sized pages must miss across payload, page and FP8 encodings."""
+
+        def c4(fp8=torch.float8_e4m3fn, **fixture):
+            with patch(_FP8, fp8):
+                plans = self._plans(*_dsv4_fixture(**fixture))
+            return plans[PoolName.DEEPSEEK_V4_C4].suffixes
+
+        variants = [
+            c4(),
+            c4(layout="v4"),
+            c4(layout="uniform_fp8"),
+            c4(shape=(2, 8)),
+            c4(shape=(8,), dtype=torch.float16),
+            c4(host_page_size=128),
+            c4(page_size=128),
+            c4(fp8=torch.float8_e4m3fnuz),
+        ]
+        self.assertEqual(len(set(variants)), len(variants))
+        uniform = c4(layout="uniform_fp8", fp8=torch.float8_e4m3fnuz)
+        self.assertNotEqual(c4(layout="uniform_fp8"), uniform)
+
+    def test_indexer_format_is_object_identity(self):
+        name = PoolName.DEEPSEEK_V4_C4_INDEXER
+
+        def index(flag=None, shuffle=False, tile=16):
+            root, group = _dsv4_fixture(name=name, layout="index_fused")
+            if flag:
+                setattr(root.index_pools[4], flag, True)
+            with (
+                patch(
+                    f"{_DSA_UTILS}.aiter_can_use_preshuffle_paged_mqa",
+                    return_value=shuffle,
+                ),
+                patch(f"{_DSA_UTILS}.INDEXER_K_CACHE_PRESHUFFLE_TILE", tile),
+            ):
+                return self._plans(root, group)[name].suffixes
+
+        flags = ("use_fp4_indexer", "index_k_page8", "index_k_rne")
+        variants = [index(), index(shuffle=True), index(shuffle=True, tile=32)]
+        variants += [index(flag) for flag in (*flags, "uses_aiter_fp4_layout")]
+        self.assertEqual(len(set(variants)), len(variants))
+        # FP4 pages do not use the FP8 preshuffle swizzle.
+        self.assertEqual(index(flags[0]), index(flags[0], shuffle=True))
+
+    def test_checkpoint_dtype_is_per_layer_identity(self):
+        name = PoolName.DEEPSEEK_V4_C4_STATE
+
+        def plan(*states, layer_ids=(3, 7)):
+            root, group = _dsv4_fixture(name=name, layer_ids=layer_ids, states=states)
+            return self._plans(root, group)[name].suffixes
+
+        mixed = plan(torch.float16, torch.float32)
+        self.assertEqual(mixed[1:], plan(torch.float32, layer_ids=(7,)))
+        self.assertNotEqual(mixed[0], plan(torch.float32, torch.float32)[0])
+
+    def test_incomplete_or_unsupported_layouts_are_rejected(self):
+        root, group = _dsv4_fixture()
+        (info,) = root.get_device_pool_infos()
+        scale = DevicePoolInfo(
+            pool_name=PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            indices_from_pool=PoolName.KV,
+            layer_ids=info.layer_ids,
+            buffer_info=info.buffer_info,
+        )
+        root.get_device_pool_infos = lambda: (info, scale)
+        with self.assertRaisesRegex(ValueError, scale.pool_name.value):
+            self._plans(root, group)
+
+        root, group = _dsv4_fixture()
+        for field in (
+            "hicache_storage_head_partition",
+            "hicache_storage_layer_partition",
+        ):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(NotImplementedError, "unset or 1"),
+            ):
+                self._plans(root, group, **{field: 2})
+        group.entries[1].packed_draft_device_pools = (object(),)
+        with self.assertRaisesRegex(NotImplementedError, "drafts"):
+            self._plans(root, group)
+        for spans in (((0, 8), (9, 8)), ((0, 8), (7, 8)), ((0, 0), (0, 8))):
+            with self.subTest(spans=spans), self.assertRaises(ValueError):
+                UnifiedPoolPlan(("a", "b"), spans)
+
+
+class TestDSAUnifiedPoolPlans(CustomTestCase):
+    def setUp(self):
+        context = get_parallel().override(attn_cp_size=1, attn_dcp_size=1)
+        context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
+
+    @staticmethod
+    def _fixture(start=0, end=78, *, dtype=torch.float8_e4m3fn, packed=True):
+        # GLM-5.2 owns top-k on 21 layers, including owner 38 at the PP2 cut.
+        owners = {0, 1, 2, *range(6, 78, 4)}
+        root = DSATokenToKVPool(
+            size=64,
+            page_size=64,
+            kv_lora_rank=512,
+            dtype=dtype,
+            qk_rope_head_dim=64,
+            layer_num=end - start,
+            device="cpu",
+            index_head_dim=128,
+            enable_memory_saver=False,
+            kv_cache_dim=656 if packed else 576,
+            start_layer=start,
+            end_layer=end,
+            skip_topk_layers=[layer not in owners for layer in range(start, end)],
+        )
+        entries = []
+        for info in root.get_device_pool_infos():
+            host = SimpleNamespace(
+                layout="page_unified", page_size=64, layer_num=len(info.layer_ids)
+            )
+            if info.pool_name == PoolName.KV:
+                host.kv_cache_dim, host.dtype = root.kv_cache_dim, root.store_dtype
+                host.page_unified_layout = PageUnifiedLayout(
+                    page_size=64,
+                    layer_num=root.layer_num,
+                    head_num=1,
+                    head_group_num=1,
+                    head_dim=root.kv_cache_dim,
+                    itemsize=root.store_dtype.itemsize,
+                    is_mla=True,
+                )
+            else:
+                host.indexer_page_stride_size = info.buffer_info.page_bytes
+            entries.append(_entry(info.pool_name, host))
+        return root, SimpleNamespace(entries=entries)
+
+    @staticmethod
+    def _plans(root, group, **memory):
+        return _build(
+            hybrid_pool_assembler.build_dsa_unified_pool_plans,
+            "glm/test",
+            root,
+            group,
+            64,
+            **memory,
+        )
+
+    def test_sparse_owner_layers_tile_a_pp_split(self):
+        full = self._plans(*self._fixture())
+        first, second = (
+            self._plans(*self._fixture(start, end))
+            for start, end in ((0, 39), (39, 78))
+        )
+        for name, count, layer_bytes in (
+            (PoolName.KV, 78, 64 * 656),
+            (PoolName.INDEXER, 21, 64 * 132),
+        ):
+            self.assertEqual(
+                full[name].suffixes, first[name].suffixes + second[name].suffixes
+            )
+            self.assertEqual(full[name].page_bytes, count * layer_bytes)
+        self.assertTrue(first[PoolName.INDEXER].suffixes[-1].endswith("_L38-39"))
+        self.assertEqual(set(self._plans(*self._fixture(39, 42))), {PoolName.KV})
+
+    def test_native_formats_partition_keyspaces(self):
+        def plans(fp8=torch.float8_e4m3fn, shuffle=False, **fixture):
+            with (
+                patch(_FP8, fp8),
+                patch(
+                    f"{_DSA_UTILS}.aiter_can_use_preshuffle_paged_mqa",
+                    return_value=shuffle,
+                ),
+            ):
+                return self._plans(*self._fixture(0, 3, **fixture))
+
+        base = plans()
+        kv = [base, plans(packed=False), plans(packed=False, dtype=torch.float8_e5m2)]
+        self.assertEqual(len({p[PoolName.KV].suffixes for p in kv}), 3)
+        index = [base, plans(fp8=torch.float8_e4m3fnuz), plans(shuffle=True)]
+        self.assertEqual(len({p[PoolName.INDEXER].suffixes for p in index}), 3)
+        self.assertEqual(len({p[PoolName.KV].suffixes for p in index}), 1)
+
+    def test_unsupported_variants_are_rejected(self):
+        class Variant(DSATokenToKVPool):
+            pass
+
+        root, group = self._fixture(0, 3)
+        with self.assertRaisesRegex(NotImplementedError, "ordinary DSATokenToKVPool"):
+            self._plans(object.__new__(Variant), group)
+        for name, value in (
+            ("index_kpool", 2),
+            ("index_kpool_compress", True),
+            ("layer_shard_enabled", True),
+            ("dcp_replicated", True),
+        ):
+            with (
+                self.subTest(variant=name),
+                patch.object(root, name, value),
+                self.assertRaises(NotImplementedError),
+            ):
+                self._plans(root, group)
+        with self.assertRaisesRegex(NotImplementedError, "unset or 1"):
+            self._plans(root, group, hicache_storage_layer_partition=2)
+        group.entries.pop()
+        with self.assertRaisesRegex(ValueError, "every native host pool"):
+            self._plans(root, group)
 
 
 class TestPageUnifiedLayout(CustomTestCase):

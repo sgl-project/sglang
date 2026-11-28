@@ -13,7 +13,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
-    MLA_KVCACHEIO_OPS,
+    MLA_PAGE_UNIFIED_KVCACHEIO_OPS,
     require_kvcacheio_ops,
 )
 from sglang.srt.mem_cache.pool_host.base import (
@@ -286,7 +286,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_unified"]:
             self.index_k_with_scale_buffer = alloc_func(
                 (
                     self.indexer_page_num,
@@ -306,7 +306,7 @@ class DSAIndexerPoolHost(HostKVCache):
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
         if (
-            self.layout != "page_first"
+            self.layout not in ("page_first", "page_unified")
             or not current_platform.capabilities.hicache_device_kernels
         ):
             return
@@ -346,7 +346,7 @@ class DSAIndexerPoolHost(HostKVCache):
     if _is_xpu:
         # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
         # checked at construction; keep in step with their branches.
-        _kvcacheio_ops = MLA_KVCACHEIO_OPS
+        _kvcacheio_ops = MLA_PAGE_UNIFIED_KVCACHEIO_OPS
 
     def load_to_device_per_layer(
         self,
@@ -383,7 +383,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst_indices=device_page_indices,
                     item_size=self.indexer_page_stride_size,
                 )
-            elif self.layout == "page_first":
+            elif self.layout in ("page_first", "page_unified"):
                 transfer_kv_per_layer_mla_pf_lf(
                     src=self.index_k_with_scale_buffer,
                     dst=self.packed_device_index_buffers[host_layer_id],
@@ -451,7 +451,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     dst_indices=host_page_indices,
                     item_size=self.indexer_page_stride_size,
                 )
-            elif self.layout == "page_first":
+            elif self.layout in ("page_first", "page_unified"):
                 raise ValueError(
                     "Layer-sharded DSA indexer HiCache backup with page_first "
                     "layout is not supported without a per-layer LF->PF kernel."
@@ -511,7 +511,7 @@ class DSAIndexerPoolHost(HostKVCache):
                     item_size=self.indexer_page_stride_size,
                     num_layers=self.layer_num,
                 )
-            elif self.layout == "page_first":
+            elif self.layout in ("page_first", "page_unified"):
                 if self.can_use_write_back_jit:
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                         ptr_src=self.index_k_device_ptrs,
@@ -581,7 +581,7 @@ class DSAIndexerPoolHost(HostKVCache):
         end = page_idx + self.storage_pages_per_key
         if self.layout == "layer_first":
             data_page = self.index_k_with_scale_buffer[:, page_idx:end, :]
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_unified"]:
             data_page = self.index_k_with_scale_buffer[page_idx:end, :, :, :]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -609,7 +609,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 self.storage_pages_per_key,
                 self.indexer_page_stride_size,
             )
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_unified"]:
             self.index_k_with_scale_buffer[page_idx:end, :, :, :] = data_page.reshape(
                 self.storage_pages_per_key,
                 self.layer_num,

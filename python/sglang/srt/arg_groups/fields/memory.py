@@ -228,9 +228,11 @@ class Memory(msgspec.Struct):
                 "namespace digest plus absolute layer and head-group indices), "
                 "so any topology whose shards tile the same grid shares one "
                 "cache. Implies --hicache-mem-layout page_unified and "
-                "--hicache-io-backend kernel. Supported by the file and "
-                "mooncake backends, which store one object per chunk and "
-                "serve head- and layer-partitioned grids."
+                "--hicache-io-backend kernel. For dense MHA/MLA, the file and "
+                "mooncake backends store one object per head/layer chunk. "
+                "Ordinary DSA KV + indexer and DeepSeek V4/V4.1 native pools "
+                "require the file backend and store complete pages per global "
+                "owner layer. These pools require CP=1, DCP=1 and no draft sidecars."
             ),
             choices=["rank-suffix", "unified"],
         ),
@@ -246,7 +248,8 @@ class Memory(msgspec.Struct):
                 "attention-TP sizes in the fleet, so every member's local head "
                 "count is a whole number of chunks. Unset, each deployment keys "
                 "to its own head count and shares only with its own TP size. "
-                "MLA-family models replicate KV across ranks and ignore it."
+                "MLA-family models replicate KV across ranks and ignore it. "
+                "DSA and DeepSeek V4/V4.1 native pools require unset or 1."
             ),
         ),
     ] = None
@@ -260,7 +263,8 @@ class Memory(msgspec.Struct):
                 "stage must START on a multiple of it; only the final stage may "
                 "end short, and that remainder forms the last chunk. Unset, "
                 "each stage stores its own layer range and shares only with an "
-                "identical split."
+                "identical split. DSA and DeepSeek V4/V4.1 native pools "
+                "require unset or 1 and store each global owner layer separately."
             ),
         ),
     ] = None
