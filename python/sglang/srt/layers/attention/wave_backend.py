@@ -13,6 +13,7 @@ from sglang.kernels.ops.attention.kv_indices import (
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.triton_backend import DEFAULT_TRITON_NUM_KV_SPLITS
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
@@ -113,7 +114,12 @@ class WaveAttnBackend(AttentionBackend):
         )
 
         self.static_kv_splits = envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.get()
-        self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
+        configured_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
+        self.max_kv_splits = (
+            DEFAULT_TRITON_NUM_KV_SPLITS
+            if configured_kv_splits is None
+            else configured_kv_splits
+        )
         self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
 
         self.forward_metadata: ForwardMetadata = None

@@ -1030,6 +1030,15 @@ def validate_sampling_mask_max_tokens(server_args: Any):
         )
 
 
+def validate_triton_attention_num_kv_splits(server_args: Any):
+    cfg = resolving_view(server_args)
+    num_kv_splits = cfg.triton_attention_num_kv_splits
+    if num_kv_splits is not None and num_kv_splits < 1:
+        raise ValueError(
+            f"--triton-attention-num-kv-splits must be >= 1 (got {num_kv_splits})."
+        )
+
+
 _AUX_HIDDEN_STATE_CAPTURE_METHODS = ("EAGLE3", "DFLASH", "DSPARK")
 
 

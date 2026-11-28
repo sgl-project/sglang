@@ -97,6 +97,28 @@ def _mla_decode_kv_splits_cap(
     return max(base_max_kv_splits, min(sm_cap, ctx_cap))
 
 
+DEFAULT_TRITON_NUM_KV_SPLITS = 16 if _is_hip else 8
+
+
+def _resolve_max_kv_splits(
+    configured: Optional[int], use_mla: bool, sm_count: int, max_context_len: int
+) -> int:
+    if configured is not None:
+        max_kv_splits = configured
+    else:
+        max_kv_splits = DEFAULT_TRITON_NUM_KV_SPLITS
+        if use_mla and not _is_xpu:
+            max_kv_splits = _mla_decode_kv_splits_cap(
+                max_kv_splits, sm_count, max_context_len
+            )
+    if use_mla and not _is_xpu and _is_gfx942:
+        # gfx942's 304 CUs round up to 512 splits, doubling the persistent
+        # fp32 attn_logits buffer to ~4 GiB on Kimi-K2.6 and faulting in
+        # ROCm graph replay; pin to 256 to match validated gfx950 behavior.
+        max_kv_splits = min(max_kv_splits, 256)
+    return max_kv_splits
+
+
 def _should_use_verify_shared_kv(model_config, topk, use_mla, use_verify_splitkv):
     if not is_gfx95_supported() or topk != 1:
         return False
@@ -358,18 +380,12 @@ class TritonAttnBackend(AttentionBackend):
         # cuda-graph / eager buffer allocators (separate methods) can size them.
         self.lean_block_m = _LEAN_BLOCK_M
         self.static_kv_splits = envs.SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS.get()
-        self.max_kv_splits = get_exec().kernel.triton_attention_num_kv_splits
-        if self.use_mla and not _is_xpu:
-            self.max_kv_splits = _mla_decode_kv_splits_cap(
-                self.max_kv_splits,
-                self.device_core_count,
-                self.max_kv_len,
-            )
-            if _is_gfx942:
-                # gfx942's 304 CUs round up to 512 splits, doubling the persistent
-                # fp32 attn_logits buffer to ~4 GiB on Kimi-K2.6 and faulting in
-                # ROCm graph replay; pin to 256 to match validated gfx950 behavior.
-                self.max_kv_splits = min(self.max_kv_splits, 256)
+        self.max_kv_splits = _resolve_max_kv_splits(
+            get_exec().kernel.triton_attention_num_kv_splits,
+            self.use_mla,
+            self.device_core_count,
+            self.max_kv_len,
+        )
         if _is_cuda:
             self.use_pdl = is_arch_support_pdl()
         else:
