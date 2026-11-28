@@ -62,6 +62,7 @@
   "/resume_memory_occupation": "admin_force",
   "/rollout/generate": "normal",
   "/scale_elastic_ep": "admin_force",
+  "/schedule_policy_switch": "admin_optional",
   "/scheduler_receive_meta_data": "normal",
   "/scheduler_receive_url": "normal",
   "/send": "normal",
