@@ -596,6 +596,7 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_loop_share_cache",
     "inkling2_tool_call_author_name_mode",
     "disaggregation_decode_first_token_stream",
+    "allow_private_media_hosts",
     "speculative_dfly_block_size",
 )
 # fmt: on

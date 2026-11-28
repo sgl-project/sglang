@@ -51,7 +51,6 @@ def _shared_context_attention_kernel(
     BEAM_WIDTH: tl.constexpr,
     Q_PER_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    MAX_DECODE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -143,15 +142,14 @@ def _shared_context_attention_kernel(
         max_values = new_max
 
     decode_length = tl.load(decode_lens + group)
-    for step in range(0, MAX_DECODE):
-        step_valid = step < decode_length
+    for step in range(0, decode_length):
         decode_offsets = (
             group * stride_decode_group
             + (step * BEAM_WIDTH + beam_offsets) * stride_decode_token
         )
         slots = tl.load(
             decode_slots + decode_offsets,
-            mask=beam_mask & step_valid,
+            mask=beam_mask,
             other=0,
         )
         if WIDE_KV_OFFSETS:
@@ -168,12 +166,12 @@ def _shared_context_attention_kernel(
         )
         k_values = tl.load(
             k_buffer + k_offsets,
-            mask=beam_mask[:, None] & step_valid & dim_mask[None, :],
+            mask=beam_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
         v_values = tl.load(
             v_buffer + v_offsets,
-            mask=beam_mask[:, None] & step_valid & dim_mask[None, :],
+            mask=beam_mask[:, None] & dim_mask[None, :],
             other=0.0,
         )
         score_matrix = tl.dot(q_values, tl.trans(k_values))
@@ -182,7 +180,7 @@ def _shared_context_attention_kernel(
             tl.where(diagonal_mask, score_matrix, 0.0),
             axis=1,
         )
-        scores = tl.where(beam_mask & step_valid, scores, negative_infinity)
+        scores = tl.where(beam_mask, scores, negative_infinity)
 
         new_max = tl.maximum(max_values, scores)
         previous_scale = tl.exp2((max_values - new_max) * softmax_scale_log2)
@@ -293,7 +291,6 @@ def shared_context_attention(
         BEAM_WIDTH=beam_width,
         Q_PER_KV=q_heads // kv_heads,
         HEAD_DIM=head_dim,
-        MAX_DECODE=decode_slots.shape[1] // beam_width,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_D=block_d,
