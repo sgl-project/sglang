@@ -69,7 +69,7 @@ class SamplingFacts(msgspec.Struct, frozen=True):
 
     @property
     def edits_logits(self) -> bool:
-        """Whether some stage edits the logits before the sampler or accept reads them."""
+        """Whether some stage edits the logits the sampler or accept reads."""
         return (
             self.grammar
             or self.watermark
