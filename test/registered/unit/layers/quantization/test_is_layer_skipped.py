@@ -1,5 +1,13 @@
 import unittest
 
+import torch
+
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.quantization.blockwise_int8 import (
+    BlockInt8Config,
+    BlockInt8MoEMethod,
+)
+from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -56,6 +64,28 @@ class TestIsLayerSkipped(CustomTestCase):
         )
         self.assertFalse(
             is_layer_skipped("model.layers.340.mlp.experts.0.down_proj", ignored, {})
+        )
+
+
+class TestBlockInt8MoE(CustomTestCase):
+    def test_ignored_moe_is_unquantized(self):
+        """An ignored MoE block used to select the INT8 method."""
+        prefix = "model.layers.0.mlp.experts"
+        layer = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(layer)
+        layer.use_triton_kernels = False
+        layer.use_flashinfer_trtllm_moe = False
+        config = BlockInt8Config(
+            is_checkpoint_int8_serialized=True,
+            ignored_layers=(prefix,),
+            weight_block_size=(128, 128),
+        )
+        self.assertIsInstance(
+            config.get_quant_method(layer, prefix), UnquantizedFusedMoEMethod
+        )
+        self.assertIsInstance(
+            config.get_quant_method(layer, "model.layers.1.mlp.experts"),
+            BlockInt8MoEMethod,
         )
 
 
