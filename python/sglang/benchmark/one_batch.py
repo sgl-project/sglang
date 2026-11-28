@@ -511,12 +511,12 @@ def extend(reqs, model_runner):
     batch.prepare_for_extend()
     sampling_params_pool = model_runner.sampling_params_pool
     sampling_params_pool.write(reqs)
-    batch.sampling_info.set_rows(
+    batch.sampling_info.set_step_state(
+        reqs,
         sampling_params_pool.gather(
             batch.req_pool_indices, batch.req_pool_indices_cpu, None
-        )
+        ),
     )
-    batch.sampling_info.set_step_state(reqs)
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
     if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
         batch.input_ids = batch.prefill_input_ids_cpu.to(

@@ -155,7 +155,7 @@ class SchedulerMlxOverlapMixin:
             self._prepare_mlx_launch(batch)
             # As Scheduler.run_batch does before each launch.
             if self.is_generation:
-                batch.sampling_info.set_step_state(batch.reqs)
+                self._set_sampling_step_state(batch)
             # Materialize batch.input_ids from CPU staging (prefill) or the
             # FutureMap relay (decode) before the forward. With deferred input
             # materialization, get_next_batch_to_run leaves input_ids unset; the
