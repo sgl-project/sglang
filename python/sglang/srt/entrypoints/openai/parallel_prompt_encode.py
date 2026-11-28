@@ -402,7 +402,7 @@ class _SegmentEncoder:
                     if run:
                         layout.append("".join(run))
                         run = []
-                    layout.append(token_id)
+                    layout.append((token_id,))
                     continue
             if segment:
                 run.append(segment)
@@ -421,13 +421,14 @@ class _SegmentEncoder:
                 continue
             if m.start() > start:
                 layout.append(text[start : m.start()])
-            layout.append(token_id)
+            layout.append((token_id,))
             start = m.end()
         if start < len(text):
             layout.append(text[start:])
         return self._encode_layout(layout, cache_salt)
 
     def _encode_layout(self, layout, cache_salt):
+        """Ids of `layout`: texts, and 1-tuples holding the id of a cut point."""
         known = {}
         texts = [item for item in layout if isinstance(item, str)]
         while texts:
@@ -449,13 +450,8 @@ class _SegmentEncoder:
             # Left only if the encode waited for raised: encode them here.
             texts = [text for text in waits if text not in known]
 
-        ids = []
-        for item in layout:
-            if isinstance(item, str):
-                ids.extend(known[item])
-            else:
-                ids.append(item)
-        return ids
+        # Texts map to their ids; a cut point is a 1-tuple of its id.
+        return list(chain.from_iterable(map(known.get, layout, layout)))
 
     def _claim(self, texts, known, cache_salt):
         """Copy the cached ids of `texts` into `known`. Of the rest, return the
