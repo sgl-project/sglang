@@ -151,6 +151,32 @@ class TestBenchServingTraceTimestamps(_BenchmarkRunTestCase):
             asyncio.run(drain())
 
 
+class TestBenchServingRequestPacing(CustomTestCase):
+    def test_finite_rate_waits_only_between_requests(self):
+        rows = [
+            DatasetRow(prompt=prompt, prompt_len=1, output_len=1)
+            for prompt in ("first", "second")
+        ]
+        events = []
+
+        async def record_sleep(seconds):
+            events.append(("sleep", seconds))
+
+        async def drain():
+            async for row in get_request(rows, request_rate=2.0):
+                events.append(("request", row.prompt))
+
+        with (
+            patch("sglang.benchmark.serving.np.random.exponential", return_value=0.5),
+            patch("sglang.benchmark.serving.asyncio.sleep", side_effect=record_sleep),
+        ):
+            asyncio.run(drain())
+
+        self.assertEqual(
+            events, [("request", "first"), ("sleep", 0.5), ("request", "second")]
+        )
+
+
 class TestBenchServingCiCacheFlush(_BenchmarkRunTestCase):
     def test_ci_flag_is_read_as_the_declared_boolean(self):
         """In CI an sglang backend's cache is flushed before the measured run;

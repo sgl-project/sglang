@@ -1118,18 +1118,12 @@ async def get_request(
 
             yield request
     else:
-        input_requests_iter = iter(input_requests)
-        for request in input_requests_iter:
+        for index, request in enumerate(input_requests):
+            if index > 0 and request_rate != float("inf"):
+                # Sample the gap before each request after the first.
+                interval = np.random.exponential(1.0 / request_rate)
+                await asyncio.sleep(interval)
             yield request
-
-            if request_rate == float("inf"):
-                # If the request rate is infinity, then we don't need to wait.
-                continue
-
-            # Sample the request interval from the exponential distribution.
-            interval = np.random.exponential(1.0 / request_rate)
-            # The next request will be sent after the interval.
-            await asyncio.sleep(interval)
 
 
 def calculate_metrics(
