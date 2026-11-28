@@ -924,6 +924,7 @@ class Qwen3VLModel(QwenVLModelBase):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
+        image_features: tuple[torch.Tensor, list[torch.Tensor]] | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> Union[tuple, Qwen3VLModelOutputWithPast]:
         r"""
@@ -958,9 +959,11 @@ class Qwen3VLModel(QwenVLModelBase):
         video_mask = None
 
         if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self._get_flat_visual_features(
+            image_features = self._get_flat_visual_features(
                 pixel_values, image_grid_thw
             )
+        if image_features is not None:
+            image_embeds, deepstack_image_embeds = image_features
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds

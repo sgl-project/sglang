@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import torch
 
-from sglang.multimodal_gen.runtime.cache.conditioning import use_gpu_conditioning_hash
+from sglang.multimodal_gen.runtime.cache.conditioning import (
+    cached_encoder_call,
+    use_gpu_conditioning_hash,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
@@ -330,9 +333,6 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
         batch.extra[MINIMAX_H3_TEXT_EMBEDDINGS_EXTRA_KEY] = embeddings
 
     def _encode_image(self, batch: Req, plan, pipeline_config) -> dict:
-        from sglang.multimodal_gen.runtime.cache.conditioning import (
-            cached_encoder_call,
-        )
         from sglang.multimodal_gen.runtime.distributed import (
             get_tp_group,
             model_parallel_is_initialized,
@@ -378,19 +378,25 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             minimax_h3_bound_image_reference,
         )
 
-        vision, counts = {}, []
-        if images:
+        def prepare_vision(encoder=None):
             low, high = bounds
-            images = [
+            bounded = [
                 minimax_h3_bound_image_reference(
                     image, min_short_edge=low, max_short_edge=high
                 )
                 for image in images
             ]
-            vision = self.processor.image_processor(images=images, return_tensors="pt")
-            vision = {key: vision[key] for key in ("pixel_values", "image_grid_thw")}
-            merge = int(self.processor.image_processor.merge_size) ** 2
-            counts = [int(row.prod()) // merge for row in vision["image_grid_thw"]]
+            prepared = self.processor.image_processor(
+                images=bounded, return_tensors="pt"
+            )
+            grid = prepared["image_grid_thw"]
+            pixels = prepared["pixel_values"]
+            if encoder is None:
+                return {"image_grid_thw": grid, "pixel_values": pixels}
+            return {
+                "image_grid_thw": grid,
+                "image_features": encoder.encode_image_features(pixels, grid),
+            }
 
         def encode(encoder, prompt: str, counts: list[int], vision: dict) -> dict:
             ids, tags, positions = minimax_h3_image_presentation(
@@ -418,6 +424,31 @@ class MiniMaxH3TextEncodingStage(TextEncodingStage):
             ) as encoder,
             set_forward_context(current_timestep=0, attn_metadata=None),
         ):
+            vision, counts = {}, []
+            if images:
+                args = self.server_args
+                if (
+                    hasattr(encoder, "encode_image_features")
+                    and current_platform.is_cuda()
+                    and args.num_gpus == 1
+                    and args.residency_mode("text_encoder") == "resident"
+                    and not args.enable_torch_compile
+                    and not args.disable_conditioning_cache
+                    and args.conditioning_cache_max_size_mb > 0
+                ):
+                    # Keep edit references independent of the changing text prompt.
+                    # Key on their original pixels, before resizing or uploading.
+                    vision = cached_encoder_call(
+                        encoder.model.visual,
+                        (images, bounds),
+                        {},
+                        lambda: prepare_vision(encoder),
+                        namespace=self,
+                    )
+                else:
+                    vision = prepare_vision()
+                merge = int(self.processor.image_processor.merge_size) ** 2
+                counts = [int(row.prod()) // merge for row in vision["image_grid_thw"]]
             return {"positive": encode(encoder, prompt, counts, vision)}
 
     def _encode_fl2va_keyframes(
