@@ -45,6 +45,12 @@ KDA_VERIFY_BLOCK_V = 4
 # gfx950 V-tile width for the measured GLM TP4 shapes: wider tiles share the q/k
 # convolution across more lanes
 KDA_VERIFY_BLOCK_V_HIP = 16
+# How the kernel iterates over the T steps. NVIDIA unrolls the loop (tl.static_range).
+# ROCm keeps a real loop (tl.range), like the unfused reference kernel: when unrolled,
+# LLVM fuses a different multiply of h * exp(g) + k * v into the FMA than it does in
+# the reference, so the results differ in the last bit and num_warps=1 is no longer
+# bit-exact with the reference. The loop is not slower on gfx950.
+_verify_step_range = tl.range if is_hip_runtime() else tl.static_range
 
 
 @triton.jit
@@ -220,7 +226,7 @@ def fused_kda_conv_gating_verify_kernel(
     b_A_log = tl.load(A_log + i_hv).to(tl.float32)
     b_dt_bias = tl.load(dt_bias + i_hv * K + o_k, mask=mask_k, other=0.0).to(tl.float32)
 
-    for t in tl.static_range(T):
+    for t in _verify_step_range(T):
         # ---- inline causal conv (reference: bias + c0*w0 + c1*w1 + c2*w2 + x*w3,
         # then silu; accumulation order and dtypes mirror the unfused kernel) ----
         x_q = tl.load(x + (bos + t) * stride_x_tok + q_ch, mask=mask_k, other=0.0)
