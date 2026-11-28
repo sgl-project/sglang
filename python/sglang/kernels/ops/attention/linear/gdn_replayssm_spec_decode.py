@@ -47,12 +47,133 @@ from sglang.kernels.ops.attention.fla.utils import is_tf32_supported
 from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
+# gfx950 launch thresholds, in programs, for K = V = 128, a ring of 16 (and 4
+# draft tokens for the verify), a BF16 checkpoint and low-part rings; measured
+# on MI355X (256 CUs) at 4 to 16 key and 12 to 64 value heads.
+# - Main's verify launches fit one wave per SIMD, 1024 programs at a time. Past
+#   that the verify takes q/k from gdn_replayssm_qk_prep_kernel, which leaves
+#   it room for three.
+# - With track rows the commit folds all layers in one program per (request,
+#   value head), one program per CU at a time, from 6 per CU. With fewer, the
+#   CUs left idle in the last round of these long programs can cost more than
+#   the loop saves.
+_VERIFY_RESIDENT_PROGRAMS = 1024
+_LAYER_LOOP_MIN_PROGRAMS = 1536
+
+
+@triton.jit
+def _qk_rnorm(
+    q,
+    k,
+    bos,
+    o_s_safe,
+    mask_s,
+    i_h,
+    stride_q_t: tl.constexpr,
+    stride_k_t: tl.constexpr,
+    K: tl.constexpr,
+    BS: tl.constexpr,
+    NK: tl.constexpr,
+    BKT: tl.constexpr,
+):
+    """Reciprocal L2 norms of the window's q and k rows, zero on padding rows."""
+    qnorm_acc = tl.zeros([BS], dtype=tl.float32)
+    knorm_acc = tl.zeros([BS], dtype=tl.float32)
+    for kk in range(NK):
+        o_kt = kk * BKT + tl.arange(0, BKT)
+        mask_kt = o_kt < K
+        ld = mask_s[:, None] & mask_kt[None, :]
+        qn = tl.load(
+            q + (bos + o_s_safe[:, None]) * stride_q_t + i_h * K + o_kt[None, :],
+            mask=ld,
+            other=0.0,
+        ).to(tl.float32)
+        knn = tl.load(
+            k + (bos + o_s_safe[:, None]) * stride_k_t + i_h * K + o_kt[None, :],
+            mask=ld,
+            other=0.0,
+        ).to(tl.float32)
+        qnorm_acc += tl.sum(qn * qn, axis=1)
+        knorm_acc += tl.sum(knn * knn, axis=1)
+    q_rnorm = tl.where(mask_s, 1.0 / tl.sqrt(qnorm_acc + 1e-6), 0.0)
+    k_rnorm = tl.where(mask_s, 1.0 / tl.sqrt(knorm_acc + 1e-6), 0.0)
+    return q_rnorm, k_rnorm
+
+
+@triton.jit
+def _qk_tiles(
+    q,
+    k,
+    bos,
+    o_s_safe,
+    i_h,
+    o_kt,
+    mask_kt,
+    q_rnorm,
+    k_rnorm,
+    scale,
+    stride_q_t: tl.constexpr,
+    stride_k_t: tl.constexpr,
+    K: tl.constexpr,
+    STORE_DTYPE: tl.constexpr,
+    RESIDUAL_DTYPE: tl.constexpr,
+):
+    """One K tile of the window: raw k, normalized and scaled q, normalized k,
+    and k split into a STORE_DTYPE high part and a RESIDUAL_DTYPE low part."""
+    # NOTE: do NOT mask the token (o_s) dimension on these loads. With the
+    # o_s_safe clamp the padding-row addresses are in-bounds (they read
+    # token `bos`), and `q_rnorm`/`k_rnorm` are already 0 on padding rows,
+    # so the multiply below zeroes them. Masking the token
+    # dimension here instead leaves the tl.dot shared-memory staging of the
+    # padding rows uninitialised -- on this Triton/MMA path that stale
+    # staging leaks into the *valid* output columns (manifests at
+    # spec_len=2). Loading the full (token-unmasked) tile keeps staging
+    # fully written; the result is numerically identical.
+    q_tile = tl.load(
+        q + (bos + o_s_safe[:, None]) * stride_q_t + i_h * K + o_kt[None, :],
+        mask=mask_kt[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    k_raw_tile = tl.load(
+        k + (bos + o_s_safe[:, None]) * stride_k_t + i_h * K + o_kt[None, :],
+        mask=mask_kt[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    q_precise = q_tile * (q_rnorm * scale)[:, None]
+    k_precise = k_raw_tile * k_rnorm[:, None]
+    k_store_tile = k_precise.to(STORE_DTYPE)
+    k_residual_tile = (k_precise - k_store_tile.to(tl.float32)).to(RESIDUAL_DTYPE)
+    return k_raw_tile, q_precise, k_precise, k_store_tile, k_residual_tile
+
+
+@triton.jit
+def _qk_products(
+    kk_mat,
+    kq_mat,
+    q_tile,
+    k_tile,
+    k_residual_tile,
+    RESIDUAL: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    """Add one K tile of ``k @ k^T`` and ``k @ q^T``, with the k low-part terms."""
+    qT = tl.trans(q_tile)
+    kT = tl.trans(k_tile)
+    kk_mat += tl.dot(k_tile, kT, input_precision=DOT_PRECISION)
+    kq_mat += tl.dot(k_tile, qT, input_precision=DOT_PRECISION)
+    if RESIDUAL:
+        k_residual_T = tl.trans(k_residual_tile)
+        kk_mat += tl.dot(k_tile, k_residual_T, input_precision=DOT_PRECISION)
+        kk_mat += tl.dot(k_residual_tile, kT, input_precision=DOT_PRECISION)
+        kk_mat += tl.dot(k_residual_tile, k_residual_T, input_precision=DOT_PRECISION)
+        kq_mat += tl.dot(k_residual_tile, qT, input_precision=DOT_PRECISION)
+    return kk_mat, kq_mat
 
 
 @triton.jit
 def gdn_replayssm_spec_circular_kernel(
-    q,  # [total_tokens, H, K]
-    k,  # [total_tokens, H, K]
+    q,  # [total_tokens, H, K]; QK_PREP: the prep kernel's [B, H, 3, BS, K] tiles
+    k,  # [total_tokens, H, K]; QK_PREP: its [B, H, 2, BS, BS] fp32 products
     v,  # [total_tokens, HV, V]
     a,  # [total_tokens, HV]
     b,  # [total_tokens, HV]
@@ -114,7 +235,20 @@ def gdn_replayssm_spec_circular_kernel(
     STRIDE_WP: tl.constexpr = 1,
     STRIDE_CB: tl.constexpr = 1,
     STRIDE_FL: tl.constexpr = 1,
+    # Read the q/k tiles and products from gdn_replayssm_qk_prep_kernel
+    # instead of recomputing them in every (V tile, value head) program.
+    QK_PREP: tl.constexpr = False,
 ):
+    tl.static_assert(
+        not QK_PREP
+        or (
+            USE_QK_L2NORM_IN_KERNEL
+            and STORE_K_RESIDUAL
+            and not STORE_EXACT_RAW
+            and not STATE_FP32
+        ),
+        "QK_PREP needs in-kernel q/k L2 norm, low-part rings and a 16-bit checkpoint",
+    )
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
     i_hv = tl.program_id(2)
@@ -198,27 +332,13 @@ def gdn_replayssm_spec_circular_kernel(
     G_s = tl.cumsum(g_s, axis=0)
     expG_s = tl.exp(G_s)
 
-    if USE_QK_L2NORM_IN_KERNEL:
-        qnorm_acc = tl.zeros([BS], dtype=tl.float32)
-        knorm_acc = tl.zeros([BS], dtype=tl.float32)
-        for kk in range(NK):
-            o_kt = kk * BKT + tl.arange(0, BKT)
-            mask_kt = o_kt < K
-            ld = mask_s[:, None] & mask_kt[None, :]
-            qn = tl.load(
-                q + (bos + o_s_safe[:, None]) * stride_q_t + i_h * K + o_kt[None, :],
-                mask=ld,
-                other=0.0,
-            ).to(tl.float32)
-            knn = tl.load(
-                k + (bos + o_s_safe[:, None]) * stride_k_t + i_h * K + o_kt[None, :],
-                mask=ld,
-                other=0.0,
-            ).to(tl.float32)
-            qnorm_acc += tl.sum(qn * qn, axis=1)
-            knorm_acc += tl.sum(knn * knn, axis=1)
-        q_rnorm = tl.where(mask_s, 1.0 / tl.sqrt(qnorm_acc + 1e-6), 0.0)
-        k_rnorm = tl.where(mask_s, 1.0 / tl.sqrt(knorm_acc + 1e-6), 0.0)
+    if QK_PREP:
+        # Rows of this (request, key head) in the prep kernel's tiles.
+        p_qk = q + ((i_n * H + i_h) * 3 * BS + o_s[:, None]) * K
+    elif USE_QK_L2NORM_IN_KERNEL:
+        q_rnorm, k_rnorm = _qk_rnorm(
+            q, k, bos, o_s_safe, mask_s, i_h, stride_q_t, stride_k_t, K, BS, NK, BKT
+        )
     else:
         q_rnorm = tl.where(mask_s, 1.0, 0.0)
         k_rnorm = tl.where(mask_s, 1.0, 0.0)
@@ -239,39 +359,39 @@ def gdn_replayssm_spec_circular_kernel(
     for kk in range(NK):
         o_kt = kk * BKT + tl.arange(0, BKT)
         mask_kt = o_kt < K
-        # NOTE: do NOT mask the token (o_s) dimension on these loads. With the
-        # o_s_safe clamp the padding-row addresses are in-bounds (they read
-        # token `bos`), and `q_rnorm`/`k_rnorm` are already 0 on padding rows
-        # (line above), so the multiply below zeroes them. Masking the token
-        # dimension here instead leaves the tl.dot shared-memory staging of the
-        # padding rows uninitialised -- on this Triton/MMA path that stale
-        # staging leaks into the *valid* output columns (manifests at
-        # spec_len=2). Loading the full (token-unmasked) tile keeps staging
-        # fully written; the result is numerically identical.
-        q_tile = tl.load(
-            q + (bos + o_s_safe[:, None]) * stride_q_t + i_h * K + o_kt[None, :],
-            mask=mask_kt[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        k_tile = tl.load(
-            k + (bos + o_s_safe[:, None]) * stride_k_t + i_h * K + o_kt[None, :],
-            mask=mask_kt[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        k_raw_tile = k_tile
-        q_precise = q_tile * (q_rnorm * scale)[:, None]
-        k_precise = k_tile * k_rnorm[:, None]
-        k_store_tile = k_precise.to(k_cache.dtype.element_ty)
-        k_residual_tile = (k_precise - k_store_tile.to(tl.float32)).to(
-            k.dtype.element_ty
-        )
-        if STATE_FP32:
-            # Do not lower the fp32-checkpoint output path to activation dtype.
-            q_tile = q_precise
-            k_tile = k_precise
+        if QK_PREP:
+            p_t = p_qk + o_kt[None, :]
+            q_tile = tl.load(p_t, mask=mask_kt[None, :], other=0.0)
+            k_tile = tl.load(p_t + BS * K, mask=mask_kt[None, :], other=0.0)
+            k_residual_tile = tl.load(
+                p_t + 2 * BS * K, mask=mask_kt[None, :], other=0.0
+            )
+            k_store_tile = k_tile
         else:
-            q_tile = q_precise.to(q.dtype.element_ty)
-            k_tile = k_store_tile
+            k_raw_tile, q_precise, k_precise, k_store_tile, k_residual_tile = _qk_tiles(
+                q,
+                k,
+                bos,
+                o_s_safe,
+                i_h,
+                o_kt,
+                mask_kt,
+                q_rnorm,
+                k_rnorm,
+                scale,
+                stride_q_t,
+                stride_k_t,
+                K,
+                k_cache.dtype.element_ty,
+                k.dtype.element_ty,
+            )
+            if STATE_FP32:
+                # Do not lower the fp32-checkpoint output path to activation dtype.
+                q_tile = q_precise
+                k_tile = k_precise
+            else:
+                q_tile = q_precise.to(q.dtype.element_ty)
+                k_tile = k_store_tile
 
         p_h0 = (
             h0
@@ -282,18 +402,20 @@ def gdn_replayssm_spec_circular_kernel(
         )
         sc_tile = tl.load(p_h0, mask=mask_v[:, None] & mask_kt[None, :], other=0.0)
 
+        if not QK_PREP:
+            kk_mat, kq_mat = _qk_products(
+                kk_mat,
+                kq_mat,
+                q_tile,
+                k_tile,
+                k_residual_tile,
+                STORE_K_RESIDUAL and not STATE_FP32,
+                DOT_PRECISION,
+            )
         qT = tl.trans(q_tile)
         kT = tl.trans(k_tile)
-        kk_mat += tl.dot(k_tile, kT, input_precision=DOT_PRECISION)
-        kq_mat += tl.dot(k_tile, qT, input_precision=DOT_PRECISION)
         if STORE_K_RESIDUAL and not STATE_FP32:
             k_residual_T = tl.trans(k_residual_tile)
-            kk_mat += tl.dot(k_tile, k_residual_T, input_precision=DOT_PRECISION)
-            kk_mat += tl.dot(k_residual_tile, kT, input_precision=DOT_PRECISION)
-            kk_mat += tl.dot(
-                k_residual_tile, k_residual_T, input_precision=DOT_PRECISION
-            )
-            kq_mat += tl.dot(k_residual_tile, qT, input_precision=DOT_PRECISION)
 
         # Checkpoint projection. On flush steps the exact-fold kernel (launched
         # first) has already folded the committed history into h0, so this is
@@ -409,6 +531,10 @@ def gdn_replayssm_spec_circular_kernel(
     # around a product would split its fused multiply-add, so the updates use
     # tl.fma and the T reduction masks an operand instead.
     # ------------------------------------------------------------------
+    if QK_PREP:
+        p_m = k + ((i_n * H + i_h) * 2 * BS + o_s[:, None]) * BS + o_s[None, :]
+        kk_mat = tl.load(p_m)
+        kq_mat = tl.load(p_m + BS * BS)
     lower = (o_s[:, None] > o_s[None, :]) & mask_s[:, None] & mask_s[None, :]
     diff_ij = G_s[:, None] - G_s[None, :]
     A_mat = tl.where(lower, beta_s[:, None] * tl.exp(diff_ij) * kk_mat, 0.0)
@@ -501,6 +627,89 @@ def gdn_replayssm_spec_circular_kernel(
                 + phys_spec
             )
             tl.store(p_cur_beta, beta_s, mask=spec_store_mask)
+
+
+@triton.jit
+def gdn_replayssm_qk_prep_kernel(
+    q,  # [total_tokens, H, K]
+    k,  # [total_tokens, H, K]
+    qk_tiles,  # [B, H, 3, BS, K]
+    qk_dots,  # [B, H, 2, BS, BS] fp32
+    query_start_loc,
+    ssm_state_indices,
+    scale,
+    stride_q_t: tl.constexpr,
+    stride_k_t: tl.constexpr,
+    stride_qsl: tl.constexpr,
+    stride_indices: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BS: tl.constexpr,
+    NK: tl.constexpr,
+    BKT: tl.constexpr,
+    NULL_BLOCK_ID: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
+):
+    """The verify kernel's q/k work once per (request, key head).
+
+    For a 16-bit checkpoint with low-part rings, the q/k part of
+    ``gdn_replayssm_spec_circular_kernel`` does not depend on the V tile or the
+    value head, so every (V tile, value head) program of a key head repeated
+    it. This kernel runs it once with the same arithmetic: the L2 norms, the
+    normalized q, k and k low-part tiles, and ``k @ k^T`` and ``k @ q^T`` with
+    the low-part terms. The verify kernel reads them with ``QK_PREP``. q, k and
+    the tiles share one 16-bit dtype.
+    """
+    i_n = tl.program_id(0)
+    i_h = tl.program_id(1)
+    o_s = tl.arange(0, BS)
+
+    state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
+    if state_idx <= NULL_BLOCK_ID:
+        return
+    bos = tl.load(query_start_loc + i_n * stride_qsl).to(tl.int64)
+    eos = tl.load(query_start_loc + (i_n + 1) * stride_qsl).to(tl.int64)
+    mask_s = o_s < eos - bos
+    o_s_safe = tl.where(mask_s, o_s, 0)
+
+    q_rnorm, k_rnorm = _qk_rnorm(
+        q, k, bos, o_s_safe, mask_s, i_h, stride_q_t, stride_k_t, K, BS, NK, BKT
+    )
+    kk_mat = tl.zeros([BS, BS], dtype=tl.float32)
+    kq_mat = tl.zeros([BS, BS], dtype=tl.float32)
+    p_qk = qk_tiles + ((i_n * H + i_h) * 3 * BS + o_s[:, None]) * K
+    for kk in range(NK):
+        o_kt = kk * BKT + tl.arange(0, BKT)
+        mask_kt = o_kt < K
+        _, q_precise, _, k_tile, k_residual_tile = _qk_tiles(
+            q,
+            k,
+            bos,
+            o_s_safe,
+            i_h,
+            o_kt,
+            mask_kt,
+            q_rnorm,
+            k_rnorm,
+            scale,
+            stride_q_t,
+            stride_k_t,
+            K,
+            qk_tiles.dtype.element_ty,
+            qk_tiles.dtype.element_ty,
+        )
+        q_tile = q_precise.to(qk_tiles.dtype.element_ty)
+        kk_mat, kq_mat = _qk_products(
+            kk_mat, kq_mat, q_tile, k_tile, k_residual_tile, True, DOT_PRECISION
+        )
+        p_t = p_qk + o_kt[None, :]
+        tl.store(p_t, q_tile, mask=mask_kt[None, :])
+        tl.store(p_t + BS * K, k_tile, mask=mask_kt[None, :])
+        tl.store(p_t + 2 * BS * K, k_residual_tile, mask=mask_kt[None, :])
+
+    p_m = qk_dots + ((i_n * H + i_h) * 2 * BS + o_s[:, None]) * BS + o_s[None, :]
+    tl.store(p_m, kk_mat)
+    tl.store(p_m + BS * BS, kq_mat)
 
 
 @triton.jit
@@ -670,13 +879,24 @@ def gdn_replayssm_compact_commit_kernel(
     STRIDE_WP: tl.constexpr = 1,
     STRIDE_CB: tl.constexpr = 1,
     STRIDE_FL: tl.constexpr = 1,
+    LAYER_LOOP: tl.constexpr = False,
+    NUM_LAYERS: tl.constexpr = 1,
 ):
-    """Materialize the checkpoint directly from compact ReplaySSM D/K/G."""
+    """Materialize the checkpoint directly from compact ReplaySSM D/K/G.
+
+    One program per (V tile, request, value head x layer), or with
+    ``LAYER_LOOP`` per (V tile, request, value head) for all ``NUM_LAYERS``
+    layers, which reads the request's indices and cursors once.
+    """
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
-    i_hvl = tl.program_id(2)
-    i_layer = (i_hvl // HV).to(tl.int64)
-    i_hv = i_hvl % HV
+    if LAYER_LOOP:
+        i_layer = 0
+        i_hv = tl.program_id(2)
+    else:
+        i_hvl = tl.program_id(2)
+        i_layer = (i_hvl // HV).to(tl.int64)
+        i_hv = i_hvl % HV
     i_h = i_hv // (HV // H)
 
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices).to(tl.int64)
@@ -714,102 +934,117 @@ def gdn_replayssm_compact_commit_kernel(
     o_v = i_v * BV + tl.arange(0, BV)
     mask_v = o_v < V
 
-    p_h0 = (
-        h0
-        + state_idx * stride_state_slot
-        + i_hv * V * K
-        + o_v[None, :] * K
-        + o_k[:, None]
-    )
-    old_state = tl.load(p_h0, mask=mask_v[None, :], other=0.0).to(tl.float32)
-    keys = tl.load(
-        k_cache
-        + replay_idx * stride_k_slot
-        + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
-        + o_k[None, :],
-        mask=history_mask[:, None],
-        other=0.0,
-    )
-    if HAS_RESIDUAL:
-        key_residual = tl.load(
-            k_residual_cache
-            + replay_idx * stride_k_residual_slot
+    for _ in tl.range(0, NUM_LAYERS, num_stages=2):
+        p_h0 = (
+            h0
+            + state_idx * stride_state_slot
+            + i_hv * V * K
+            + o_v[None, :] * K
+            + o_k[:, None]
+        )
+        old_state = tl.load(p_h0, mask=mask_v[None, :], other=0.0).to(tl.float32)
+        keys = tl.load(
+            k_cache
+            + replay_idx * stride_k_slot
             + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
             + o_k[None, :],
             mask=history_mask[:, None],
             other=0.0,
         )
-    updates = tl.load(
-        d_cache
-        + replay_idx * stride_d_slot
-        + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
-        + o_v[None, :],
-        mask=history_mask[:, None] & mask_v[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    if HAS_RESIDUAL:
-        updates += tl.load(
-            d_residual_cache
-            + replay_idx * stride_d_residual_slot
+        if HAS_RESIDUAL:
+            key_residual = tl.load(
+                k_residual_cache
+                + replay_idx * stride_k_residual_slot
+                + (i_h * MAX_CACHE_LEN + phys[:, None]) * K
+                + o_k[None, :],
+                mask=history_mask[:, None],
+                other=0.0,
+            )
+        updates = tl.load(
+            d_cache
+            + replay_idx * stride_d_slot
             + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
             + o_v[None, :],
             mask=history_mask[:, None] & mask_v[None, :],
             other=0.0,
         ).to(tl.float32)
-    gates = tl.load(
-        g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys,
-        mask=history_mask,
-        other=0.0,
-    ).to(tl.float32)
-
-    if fold_active:
-        active_mask = o_t < n_history
-        active_g = tl.where(active_mask, gates, 0.0)
-        active_prefix = tl.cumsum(active_g, axis=0)
-        active_total = tl.sum(active_g, axis=0)
-        active_decay = tl.where(active_mask, tl.exp(active_total - active_prefix), 0.0)
-        active_updates = updates * active_decay[:, None]
-        active_hi = active_updates.to(k_cache.dtype.element_ty)
-        active_lo = (active_updates - active_hi.to(tl.float32)).to(
-            k_cache.dtype.element_ty
-        )
-        active_delta = tl.dot(tl.trans(keys), active_hi)
-        active_delta += tl.dot(tl.trans(keys), active_lo)
         if HAS_RESIDUAL:
-            active_delta += tl.dot(tl.trans(key_residual), active_hi)
-            active_delta += tl.dot(tl.trans(key_residual), active_lo)
-        tl.store(
-            p_h0,
-            (old_state * tl.exp(active_total) + active_delta).to(p_h0.dtype.element_ty),
-            mask=mask_v[None, :],
-        )
+            updates += tl.load(
+                d_residual_cache
+                + replay_idx * stride_d_residual_slot
+                + (i_hv * MAX_CACHE_LEN + phys[:, None]) * V
+                + o_v[None, :],
+                mask=history_mask[:, None] & mask_v[None, :],
+                other=0.0,
+            ).to(tl.float32)
+        gates = tl.load(
+            g_cache + replay_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + phys,
+            mask=history_mask,
+            other=0.0,
+        ).to(tl.float32)
 
-    if HAS_TRACK:
-        if has_track:
-            track_mask = o_t < track_len
-            track_g = tl.where(track_mask, gates, 0.0)
-            track_prefix = tl.cumsum(track_g, axis=0)
-            track_total = tl.sum(track_g, axis=0)
-            track_decay = tl.where(track_mask, tl.exp(track_total - track_prefix), 0.0)
-            track_updates = updates * track_decay[:, None]
-            track_hi = track_updates.to(k_cache.dtype.element_ty)
-            track_lo = (track_updates - track_hi.to(tl.float32)).to(
+        if fold_active:
+            active_mask = o_t < n_history
+            active_g = tl.where(active_mask, gates, 0.0)
+            active_prefix = tl.cumsum(active_g, axis=0)
+            active_total = tl.sum(active_g, axis=0)
+            active_decay = tl.where(
+                active_mask, tl.exp(active_total - active_prefix), 0.0
+            )
+            active_updates = updates * active_decay[:, None]
+            active_hi = active_updates.to(k_cache.dtype.element_ty)
+            active_lo = (active_updates - active_hi.to(tl.float32)).to(
                 k_cache.dtype.element_ty
             )
-            track_delta = tl.dot(tl.trans(keys), track_hi)
-            track_delta += tl.dot(tl.trans(keys), track_lo)
+            active_delta = tl.dot(tl.trans(keys), active_hi)
+            active_delta += tl.dot(tl.trans(keys), active_lo)
             if HAS_RESIDUAL:
-                track_delta += tl.dot(tl.trans(key_residual), track_hi)
-                track_delta += tl.dot(tl.trans(key_residual), track_lo)
+                active_delta += tl.dot(tl.trans(key_residual), active_hi)
+                active_delta += tl.dot(tl.trans(key_residual), active_lo)
             tl.store(
-                h0
-                + track_idx * stride_state_slot
-                + i_hv * V * K
-                + o_v[None, :] * K
-                + o_k[:, None],
-                (old_state * tl.exp(track_total) + track_delta).to(h0.dtype.element_ty),
+                p_h0,
+                (old_state * tl.exp(active_total) + active_delta).to(
+                    p_h0.dtype.element_ty
+                ),
                 mask=mask_v[None, :],
             )
+
+        if HAS_TRACK:
+            if has_track:
+                track_mask = o_t < track_len
+                track_g = tl.where(track_mask, gates, 0.0)
+                track_prefix = tl.cumsum(track_g, axis=0)
+                track_total = tl.sum(track_g, axis=0)
+                track_decay = tl.where(
+                    track_mask, tl.exp(track_total - track_prefix), 0.0
+                )
+                track_updates = updates * track_decay[:, None]
+                track_hi = track_updates.to(k_cache.dtype.element_ty)
+                track_lo = (track_updates - track_hi.to(tl.float32)).to(
+                    k_cache.dtype.element_ty
+                )
+                track_delta = tl.dot(tl.trans(keys), track_hi)
+                track_delta += tl.dot(tl.trans(keys), track_lo)
+                if HAS_RESIDUAL:
+                    track_delta += tl.dot(tl.trans(key_residual), track_hi)
+                    track_delta += tl.dot(tl.trans(key_residual), track_lo)
+                tl.store(
+                    h0
+                    + track_idx * stride_state_slot
+                    + i_hv * V * K
+                    + o_v[None, :] * K
+                    + o_k[:, None],
+                    (old_state * tl.exp(track_total) + track_delta).to(
+                        h0.dtype.element_ty
+                    ),
+                    mask=mask_v[None, :],
+                )
+        h0 += stride_state_layer
+        d_cache += stride_d_layer
+        k_cache += stride_k_layer
+        g_cache += stride_g_layer
+        d_residual_cache += stride_d_residual_layer
+        k_residual_cache += stride_k_residual_layer
 
 
 @triton.jit
@@ -980,6 +1215,7 @@ def _launch_gdn_spec(
     bs_min,
     null_block_id,
     dot_precision,
+    qk_prep=False,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1010,10 +1246,37 @@ def _launch_gdn_spec(
     rawk_buf = rawk_cache if rawk_cache is not None else k_cache
     beta_buf = beta_cache if beta_cache is not None else g_cache
 
+    if qk_prep:
+        qk_tiles = q.new_empty((B, H, 3, BS, K))
+        qk_dots = torch.empty((B, H, 2, BS, BS), dtype=torch.float32, device=q.device)
+        gdn_replayssm_qk_prep_kernel[(B, H)](
+            q,
+            k,
+            qk_tiles,
+            qk_dots,
+            query_start_loc,
+            ssm_state_indices,
+            scale,
+            q.stride(0),
+            k.stride(0),
+            query_start_loc.stride(0),
+            ssm_state_indices.stride(0),
+            H=H,
+            K=K,
+            BS=BS,
+            NK=nk,
+            BKT=BKT,
+            NULL_BLOCK_ID=null_block_id,
+            DOT_PRECISION=dot_precision,
+            num_warps=1,
+            num_stages=1,
+        )
+
     grid = (triton.cdiv(V, BV), B, HV)
     gdn_replayssm_spec_circular_kernel[grid](
-        q,
-        k,
+        # With QK_PREP the verify reads the prep kernel's buffers in place of q, k.
+        qk_tiles if qk_prep else q,
+        qk_dots if qk_prep else k,
         v,
         a,
         b,
@@ -1075,6 +1338,7 @@ def _launch_gdn_spec(
         STRIDE_WP=write_pos.stride(0),
         STRIDE_CB=cache_base.stride(0),
         STRIDE_FL=is_flush.stride(0),
+        QK_PREP=qk_prep,
     )
 
 
@@ -1198,17 +1462,33 @@ def gdn_replayssm_spec_decode(
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
     batch_size = query_start_loc.shape[0] - 1
-    # At the Qwen3.5 MTP shape, one wide V tile avoids duplicating q/k and gate
-    # work across two programs on gfx950.
-    if (
+    mtp_shape = (
         _IS_GFX95
-        and batch_size >= 32
         and max_cache_len == 16
         and max_spec_len == 4
         and q.shape[-1] == 128
         and v.shape[-1] == 128
-    ):
+    )
+    if mtp_shape and batch_size >= 32:
+        # At the Qwen3.5 MTP shape, one wide V tile avoids duplicating q/k and
+        # gate work across two programs on gfx950.
         block_v, num_stages = 128, 1
+    # With a BF16 checkpoint and low-part rings, normalize q/k and form their
+    # products once per (request, key head) instead of once per (V tile,
+    # value head) when the launch above has more programs than run at once.
+    qk_prep = (
+        mtp_shape
+        and triton.cdiv(v.shape[-1], block_v) * batch_size * v.shape[-2]
+        > _VERIFY_RESIDENT_PROGRAMS
+        and checkpoint_state.dtype == torch.bfloat16
+        and q.dtype == k.dtype == k_cache.dtype == torch.bfloat16
+        and rawv_cache is not None
+        and rawk_cache is not None
+        and beta_cache is None
+        and use_qk_l2norm_in_kernel
+    )
+    if qk_prep:
+        block_v, num_stages = 64, 1
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
 
@@ -1268,6 +1548,7 @@ def gdn_replayssm_spec_decode(
             bs_min,
             null_block_id,
             dot_precision,
+            qk_prep=qk_prep,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(
@@ -1387,8 +1668,23 @@ def commit_gdn_replayssm_circular(
     has_residual = d_residual_cache is not None and k_residual_cache is not None
     d_residual_buf = d_residual_cache if has_residual else d_cache
     k_residual_buf = k_residual_cache if has_residual else k_cache
-    BV = min(triton.next_power_of_2(V), 64)
     has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
+    # One program folds every layer of its (V tile, request, value head). Built
+    # with track rows, the per-layer kernel fits half as many waves.
+    layer_loop = (
+        _IS_GFX95
+        and B * HV >= _LAYER_LOOP_MIN_PROGRAMS
+        and has_track
+        and checkpoint_state.dtype == torch.bfloat16
+        and has_residual
+        and max_cache_len == 16
+        and K == 128
+        and V == 128
+    )
+    if layer_loop:
+        BV, num_warps, grid_z = 128, 8, HV
+    else:
+        BV, num_warps, grid_z = min(triton.next_power_of_2(V), 64), 4, HV * num_layers
     if has_track:
         track_indices = mamba_track_indices
         track_steps = mamba_steps_to_track
@@ -1399,7 +1695,7 @@ def commit_gdn_replayssm_circular(
         track_steps = accept_lens
         stride_track = 0
         stride_steps = 0
-    grid = (triton.cdiv(V, BV), B, HV * num_layers)
+    grid = (triton.cdiv(V, BV), B, grid_z)
     gdn_replayssm_compact_commit_kernel[grid](
         checkpoint_state,
         d_cache,
@@ -1441,11 +1737,13 @@ def commit_gdn_replayssm_circular(
         NULL_BLOCK_ID=null_block_id,
         HAS_TRACK=has_track,
         HAS_RESIDUAL=has_residual,
-        num_warps=4,
+        num_warps=num_warps,
         num_stages=2,
         STRIDE_WP=write_pos.stride(0),
         STRIDE_CB=cache_base.stride(0),
         STRIDE_FL=is_flush.stride(0),
+        LAYER_LOOP=layer_loop,
+        NUM_LAYERS=num_layers if layer_loop else 1,
     )
     block = triton.next_power_of_2(max(1, B))
     _finish_gdn_replayssm_circular_fold_kernel[(1,)](
