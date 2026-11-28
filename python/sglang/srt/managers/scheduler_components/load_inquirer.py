@@ -15,6 +15,7 @@ from sglang.srt.managers.load_snapshot import (
     SpeculativeMetrics,
 )
 from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.mem_cache.common import prefill_load_tokens
 from sglang.srt.runtime_context import get_lora, get_parallel
 
 if TYPE_CHECKING:
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
-    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.observability.metrics_collector import StorageMetricsCollector
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -34,7 +35,6 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLoadInquirer:
     disaggregation_mode: DisaggregationMode
-    server_args: ServerArgs
     max_total_num_tokens: int
     max_running_requests: int
     pool_stats_observer: SchedulerPoolStatsObserver
@@ -56,6 +56,9 @@ class SchedulerLoadInquirer:
     get_decode_moment_totals: Callable
     get_waiting_storage_span: (
         Callable[[CacheRequestHandle], tuple[int, int] | None] | None
+    ) = None
+    get_storage_metrics_collector: (
+        Callable[[], StorageMetricsCollector | None] | None
     ) = None
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
@@ -87,15 +90,12 @@ class SchedulerLoadInquirer:
         num_tokens = 0
         for req in self.get_waiting_queue():
             if waiting_queue_prefix_matched:
-                matched = req.num_matched_prefix_tokens
-                uncached = max(0, req.seqlen - matched)
+                span = None
                 if self.get_waiting_storage_span is not None:
                     span = self.get_waiting_storage_span(req.cache_request_handle)
-                    if span is not None:
-                        storage_tokens = max(
-                            0, min(span[1], req.seqlen) - max(span[0], matched)
-                        )
-                        uncached -= storage_tokens
+                uncached = prefill_load_tokens(
+                    req.seqlen, req.num_matched_prefix_tokens, span
+                )
             else:
                 # The historical hit rate already includes admitted storage hits.
                 uncached = int(req.seqlen * cache_miss_rate)
@@ -143,6 +143,12 @@ class SchedulerLoadInquirer:
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
+        # A chunked request is in no queue, so count the part of its prompt not yet
+        # in num_used_tokens; prefix_len lags the chunk just run until the next pass.
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None:
+            held = max(chunked_req.prefix_len, chunked_req.kv.kv_allocated_len)
+            num_total_tokens += max(0, chunked_req.seqlen - held)
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
@@ -184,6 +190,7 @@ class SchedulerLoadInquirer:
         decode_prealloc = decode_transfer = decode_retracted = 0
         decode_prealloc_ready = 0
         num_prealloc_ready_tokens = 0
+        decode_host_pool_blocked = decode_host_staged_landed = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
             prefill_bootstrap = len(lists[ListKind.PD_BOOTSTRAP])
@@ -193,13 +200,20 @@ class SchedulerLoadInquirer:
             decode_prealloc = len(lists[ListKind.PD_PREALLOC])
             decode_transfer = len(lists[ListKind.PD_RECEIVING])
             decode_retracted = len(lists[ListKind.PD_RETRACTED])
+            prealloc_queue = self.get_disagg_decode_prealloc_queue()
             ready_reqs = [
                 decode_req.req
-                for decode_req in self.get_disagg_decode_prealloc_queue().queue.items()
+                for decode_req in prealloc_queue.queue.items()
                 if decode_req.waiting_for_input
             ]
             decode_prealloc_ready = len(ready_reqs)
             num_prealloc_ready_tokens = sum(req.seqlen for req in ready_reqs)
+            decode_host_pool_blocked = int(
+                prealloc_queue.host_pool_blocked and decode_prealloc_ready > 0
+            )
+            decode_host_staged_landed = (
+                prealloc_queue.transfer_queue.num_host_staged_landed
+            )
         disaggregation = DisaggregationMetrics(
             mode=mode_str,
             prefill_bootstrap_queue_reqs=prefill_bootstrap,
@@ -209,6 +223,8 @@ class SchedulerLoadInquirer:
             decode_retracted_queue_reqs=decode_retracted,
             kv_transfer_speed_gb_s=stats.kv_transfer_speed_gb_s,
             kv_transfer_latency_ms=stats.kv_transfer_latency_ms,
+            decode_host_pool_blocked=decode_host_pool_blocked,
+            decode_host_staged_landed_reqs=decode_host_staged_landed,
         )
 
         queues = QueueMetrics(
@@ -221,6 +237,21 @@ class SchedulerLoadInquirer:
 
         totals = self.get_decode_moment_totals()
         decode_moments = list(totals) if totals[0] > 0 else None
+
+        storage_hit_tokens = storage_unfulfilled_tokens = None
+        backuped_tokens = backup_dropped_tokens = None
+        storage = (
+            self.get_storage_metrics_collector()
+            if self.get_storage_metrics_collector is not None
+            else None
+        )
+        if storage is not None:
+            storage_hit_tokens = storage.total_storage_prefetch_hit_tokens
+            storage_unfulfilled_tokens = dict(
+                storage.total_storage_prefetch_unfulfilled_tokens
+            )
+            backuped_tokens = storage.total_backuped_tokens
+            backup_dropped_tokens = storage.total_backup_dropped_tokens
 
         return LoadSnapshot(
             dp_rank=int(get_parallel().dp_rank)
@@ -247,5 +278,9 @@ class SchedulerLoadInquirer:
             queues=queues,
             total_prefill_uncached_tokens=self.get_total_prefill_uncached_tokens(),
             total_prefill_busy_us=self.get_total_prefill_busy_us(),
+            total_storage_prefetch_hit_tokens=storage_hit_tokens,
+            total_storage_prefetch_unfulfilled_tokens=storage_unfulfilled_tokens,
+            total_backuped_tokens=backuped_tokens,
+            total_backup_dropped_tokens=backup_dropped_tokens,
             decode_moments=decode_moments,
         )

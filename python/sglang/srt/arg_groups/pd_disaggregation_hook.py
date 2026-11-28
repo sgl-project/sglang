@@ -54,6 +54,14 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 server_args, "handle_pd_disaggregation", optimistic_prefill_attempts=1
             )
 
+    # Resolved in every mode: a server can switch to decode at runtime.
+    if cfg.disaggregation_decode_first_token_stream is None:
+        declare_resolution(
+            server_args,
+            "handle_pd_disaggregation",
+            disaggregation_decode_first_token_stream="first_decode",
+        )
+
     if cfg.disaggregation_mode == "prefill" and cfg.dcp_size > 1:
         logger.warning(
             "DCP on a PD prefill server is supported when prefill and decode "
@@ -307,6 +315,7 @@ def _alias_bootstrap_port_to_api_port(server_args: ServerArgs) -> None:
 def handle_encoder_disaggregation(server_args: Any):
     from sglang.srt.arg_groups.model_hook import handle_language_model_only
     from sglang.srt.arg_groups.validation_hook import validate_ib_devices
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
     from sglang.srt.server_args import resolve_encoder_transfer_backend
 
     cfg = resolving_view(server_args)
@@ -383,19 +392,21 @@ def handle_encoder_disaggregation(server_args: Any):
         "Glm5NextForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         "MuseSparkForConditionalGeneration",
+        *INKLING2_ARCHS,
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
-            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark."
+            f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark, "
+            f"Inkling2."
         )
 
     if (
-        model_arch == "MuseSparkForConditionalGeneration"
+        model_arch in ("MuseSparkForConditionalGeneration", *INKLING2_ARCHS)
         and cfg.language_only
         and cfg.enable_adaptive_dispatch_to_encoder
     ):
         raise ValueError(
-            "Muse language-only servers do not load local encoders; "
+            f"{model_arch} language-only servers do not load local encoders; "
             "--enable-adaptive-dispatch-to-encoder is not supported."
         )

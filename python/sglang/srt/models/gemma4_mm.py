@@ -16,7 +16,6 @@
 import logging
 import re
 from array import array
-from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -30,7 +29,6 @@ from transformers import (
 )
 
 from sglang.srt.environ import envs
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -67,8 +65,6 @@ logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Gemma4MultimodalEmbedder(nn.Module):
@@ -158,10 +154,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         "gate_up_proj",
         "down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
 
     def __init__(
         self,
@@ -320,12 +312,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         is only enabled within each individual image group (same-item
         tokens), not across items, and only for checkpoints with
         ``use_bidirectional_attention == "vision"``; E2B/E4B keep it causal.
+        Triton and XPU scope image attention to sliding-window layers when
+        ``sliding_layers_only`` (HF Gemma 4 keeps full-attention layers causal;
+        DiffusionGemma does not). FA4 layer scoping is not handled here yet.
         Triton and FA4 use causal attention for image spans split across chunks.
-        XPU passes Gemma 3's per-token image-block ids to the sgl-kernel-xpu
-        prefill, on sliding-window layers only when ``sliding_layers_only`` (HF
-        Gemma 4 keeps full-attention layers causal; DiffusionGemma does not).
-        That mask has no sliding-window variant, so sliding layers keep causal
-        image attention once the KV length exceeds the window.
+        XPU passes Gemma 3's per-token image-block ids to sgl-kernel-xpu. That
+        mask has no sliding-window variant, so sliding layers keep causal image
+        attention once the KV length exceeds the window.
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
@@ -470,6 +463,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 bidirectional_attn_mask_indptr
             )
             prefill_backend.forward_metadata.custom_mask = bidirectional_attn_masks
+            prefill_backend.forward_metadata.custom_mask_sliding_layers_only = (
+                sliding_layers_only
+            )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
@@ -640,15 +636,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self, input_ids: torch.LongTensor
     ) -> Optional[torch.Tensor]:
         return self.language_model.get_per_layer_inputs(input_ids)
-
-    def project_per_layer_inputs(
-        self,
-        inputs_embeds: torch.Tensor,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.language_model.project_per_layer_inputs(
-            inputs_embeds, per_layer_inputs
-        )
 
     @torch.no_grad()
     def forward(
@@ -1153,9 +1140,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return self.config.intermediate_size[0], self.config.hidden_size
         else:
             raise NotImplementedError()
-
-    def get_embed(self):
-        return self.language_model.embed_tokens.weight
 
     def get_embed_and_head(self):
         if self.pp_group.world_size > 1:

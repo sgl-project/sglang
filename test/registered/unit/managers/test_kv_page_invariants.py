@@ -20,8 +20,10 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 _PAGE_SIZE = 256
 
 
-def _make_checker(page_size=_PAGE_SIZE, row_width=4096, num_reqs=8, free_pages=None):
-    rtt = torch.zeros((num_reqs, row_width), dtype=torch.int32)
+def _make_checker(
+    page_size=_PAGE_SIZE, req_to_token_row_width=4096, num_reqs=8, free_pages=None
+):
+    rtt = torch.zeros((num_reqs, req_to_token_row_width), dtype=torch.int32)
     rtp = SimpleNamespace(req_to_token=rtt)
     if free_pages is None:
         free_pages = torch.arange(num_reqs * 4, dtype=torch.int64)
@@ -104,7 +106,7 @@ class TestKVPageInvariants(CustomTestCase):
                     chk._check_kv_page_invariants()
 
     def test_classed_allocator_without_flat_free_list_is_checked(self):
-        chk, rtt, _tc, alloc = _make_checker(page_size=4, row_width=8)
+        chk, rtt, _tc, alloc = _make_checker(page_size=4, req_to_token_row_width=8)
         alloc.free_pages = None
         alloc.get_all_free_pages = MagicMock(
             return_value=torch.tensor([5, 6], dtype=torch.int64)

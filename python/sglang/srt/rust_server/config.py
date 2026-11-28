@@ -37,6 +37,7 @@ from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_exec,
     get_lora,
     get_memory,
     get_mm,
@@ -49,7 +50,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.rust_server.warmups import rust_server_warmup_names
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
@@ -71,6 +72,8 @@ def _build_server_args(
     request_class: Optional[type] = None,
     server_added_custom_params: Tuple[str, ...] = (),
     port_offset: int = 0,
+    vlm_warmup_image_base64: Optional[str] = None,
+    vlm_warmup_prompt: Optional[str] = None,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -108,6 +111,12 @@ def _build_server_args(
         "max_prefill_tokens": get_schedule().max_prefill_tokens,
         "enable_dp_attention": get_parallel().attn_dp_size > 1,
         "speculative_algorithm": get_spec().speculative_algorithm,
+        "speculative_ngram_external_corpus_max_tokens": get_spec().speculative_ngram_external_corpus_max_tokens,
+        "gc_threshold": get_device().gc_threshold,
+        "enable_pd_role_switch": get_disagg().enable_pd_role_switch,
+        "elastic_ep_backend": get_exec().moe.elastic_ep_backend,
+        "enable_streaming_session": get_serving().enable_streaming_session,
+        "engine_info_bootstrap_url": scheduler.server_args.engine_info_bootstrap_url,
         "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
         "hicache_ratio": get_memory().hicache_ratio,
         "hicache_size": get_memory().hicache_size,
@@ -173,6 +182,8 @@ def _build_server_args(
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
+        vlm_warmup_image_base64=vlm_warmup_image_base64,
+        vlm_warmup_prompt=vlm_warmup_prompt,
         gc_threshold=get_device().gc_threshold,
         custom_warmups_pending=bool(rust_server_warmup_names(get_serving().warmups)),
         health_generate_headers=dict(health_generate_headers or {}),
@@ -231,6 +242,8 @@ def _build_server_args(
         # endpoints can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        max_req_len=scheduler.max_req_len,
+        max_req_input_len=scheduler.max_req_input_len,
         deployment_info=json.dumps(deployment_info),
         launch_server_info=_launch_server_info(scheduler),
         launch_model_info=json.dumps(
@@ -262,6 +275,29 @@ def _build_server_args(
         crash_dump=bool(get_observability().crash_dump_folder),
         server_added_custom_params=list(server_added_custom_params),
     )
+
+
+def vlm_warmup_image_base64(scheduler: Scheduler) -> Optional[str]:
+    """The image of Python's VLM startup warmup (``_execute_server_warmup``),
+    which the Rust server's warmup generates from; ``None`` where Python warms
+    with text, a P/D decode server included, or skips the warmup."""
+    if (
+        not scheduler.model_config.is_multimodal
+        or get_serving().skip_server_warmup
+        or get_serving().skip_tokenizer_init
+        or get_disagg().disaggregation_mode == "decode"
+    ):
+        return None
+    # Lazy: only a multimodal model loads the HTTP server module.
+    from sglang.srt.entrypoints.http_server import (
+        _get_vlm_warmup_image_base64,
+        _is_vlm_warmup_model,
+    )
+
+    model_info = build_model_info_fields(scheduler.model_config, scheduler.server_args)
+    if not _is_vlm_warmup_model(model_info):
+        return None
+    return _get_vlm_warmup_image_base64(model_info)
 
 
 def request_log_settings(
@@ -482,6 +518,7 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     scheduler_info = {
         "status": "ready",
         "max_total_num_tokens": scheduler.max_total_num_tokens,
+        "max_req_len": scheduler.max_req_len,
         "max_req_input_len": scheduler.max_req_input_len,
     }
     info = msgspec_to_builtins(

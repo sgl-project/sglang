@@ -22,6 +22,8 @@ _TRITON_KERNELS = [
     ("cache_locs", "generate_draft_decode_kv_indices"),
     ("cache_locs", "generate_draft_decode_window_kv_indices"),
     ("dflash", "compute_dflash_correct_drafts_and_bonus"),
+    ("dflash", "dflash_commit_block"),
+    ("dflash", "dflash_chain_accept_indices"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
     ("gather_spec_extras", "gather_spec_extras"),
@@ -37,6 +39,7 @@ _TRITON_KERNELS = [
     ("lilicorr", "lilicorr_topk_lse"),
     ("lilicorr", "lilicorr_sample_path"),
     ("reject_sampling", "chain_speculative_sampling_triton"),
+    ("target_only_sampling", "tree_speculative_sampling_target_only_triton"),
     ("acceptance_estimator", "predict_acceptance"),
     ("acceptance_estimator", "accumulate_acceptance_counts"),
     ("acceptance_estimator", "refit_acceptance"),
@@ -75,7 +78,6 @@ register_kernel(
         op="speculative.div_argmax",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.row_argmax:div_argmax",
-        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(

@@ -33,7 +33,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 def _scheduler_for_typed_config(load_snapshot_writer=None):
     return SimpleNamespace(
         server_args=SimpleNamespace(
-            enable_return_hidden_states=True, return_hidden_states_mode="last"
+            enable_return_hidden_states=True,
+            return_hidden_states_mode="last",
+            engine_info_bootstrap_url="http://127.0.0.1:6789",
         ),
         model_config=SimpleNamespace(
             context_len=2048,
@@ -57,6 +59,8 @@ def _scheduler_for_typed_config(load_snapshot_writer=None):
         rust_server_tokenizer_path=lambda: "tokenizer",
         tokenizer=None,
         max_total_num_tokens=1024,
+        max_req_len=1024,
+        max_req_input_len=1018,
         load_snapshot_writer=load_snapshot_writer,
         rust_server_endpoints=[{"dp_rank": 0, "endpoint": "http://127.0.0.1:30000"}],
     )

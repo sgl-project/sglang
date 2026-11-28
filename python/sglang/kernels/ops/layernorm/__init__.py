@@ -132,6 +132,24 @@ for _op, _target, _backends in (
         )
 del _op, _target, _backends, _bk
 
+# gfx950 TLX kernels; see "TLX kernel backend" in kernels/README.md.
+for _op, _target in (
+    (
+        "layernorm.tlx_norm_residual_norm",
+        "sglang.kernels.ops.layernorm.tlx:norm_residual_norm",
+    ),
+    ("layernorm.tlx_rmsnorm", "sglang.kernels.ops.layernorm.tlx_rmsnorm:rmsnorm"),
+):
+    register_kernel(
+        KernelSpec(
+            op=_op,
+            backend=KernelBackend.TLX,
+            target=_target,
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _op, _target
+
 register_kernel(
     KernelSpec(
         op="layernorm.fused_kda_output_quant",
@@ -142,3 +160,18 @@ register_kernel(
         ),
     )
 )
+_SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+for _fn in (
+    "attn_res_norm_bf16",
+    "loop_pre_attn_rmsnorm",
+    "loop_pre_mlp_rmsnorm",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.inkling2_{_fn}_sm120",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.layernorm.inkling2_norm_ctrl_sm120:{_fn}",
+            capabilities=_SM12X,
+        )
+    )
+del _fn

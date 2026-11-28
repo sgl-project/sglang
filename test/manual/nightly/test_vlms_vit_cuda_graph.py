@@ -120,8 +120,6 @@ class TestVLMViTCudaGraph(CustomTestCase):
             process_env = os.environ.copy()
             if custom_env:
                 process_env.update(custom_env)
-            # if test vlm with cuda_ipc feature, open this env_var
-            process_env["SGLANG_USE_CUDA_IPC_TRANSPORT"] = "1"
             process_env["SGLANG_VIT_ENABLE_CUDA_GRAPH"] = "1"
 
             # Prepare stdout/stderr redirection if needed
@@ -138,6 +136,8 @@ class TestVLMViTCudaGraph(CustomTestCase):
                 timeout=self.time_out,
                 api_key=self.api_key,
                 other_args=[
+                    "--mm-feature-transport",
+                    "cuda_ipc",
                     "--mm-attention-backend",
                     "fa3",
                     "--cuda-graph-backend-prefill=tc_piecewise",

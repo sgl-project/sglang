@@ -95,7 +95,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     unwrap_write_loc,
 )
-from sglang.srt.utils import ceil_div, get_bool_env_var, is_cuda
+from sglang.srt.utils import ceil_div, is_cuda
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -268,7 +268,7 @@ class PageInterleaveKVPoolMixin:
         # Strictly larger than any local physical page id: the owner-major
         # sort key of logical page l is (l % N) * stride + l // N.
         self._local_page_stride = self.size // spec.page_size + 2
-        self._debug_plan_checks = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self._debug_plan_checks = envs.SGLANG_DEBUG_MEMORY_POOL.get()
         self._send_pages: Optional[torch.Tensor] = None
         self._send_rows: Optional[torch.Tensor] = None
         self._write_plan_key = None
@@ -1003,9 +1003,6 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
     just as consumers of ``get_key_buffer`` do. Outside an extend, raw getters
     expose owner-local storage; ``index_key_cache.get_local_buffer`` always
     exposes that storage.
-
-    This is a pool-level implementation. Model-runner selection still
-    requires separate integration.
     """
 
     def __init__(
