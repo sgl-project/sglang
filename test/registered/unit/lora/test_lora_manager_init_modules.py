@@ -260,10 +260,14 @@ class TestAttentionGateTargets(CustomTestCase):
             {"self_attn.gate_proj", "gate_up_proj"},
         )
         prefix = "base_model.model.model.layers.0."
-        attn_key = prefix + "self_attn.gate_proj.lora_A.weight"
-        mlp_key = prefix + "mlp.gate_proj.lora_A.weight"
-        up_key = prefix + "mlp.up_proj.lora_A.weight"
-        attn, gate, up = [torch.full((2, 8), x) for x in (1.0, 2.0, 3.0)]
+        attn_a_key = prefix + "self_attn.gate_proj.lora_A.weight"
+        attn_b_key = prefix + "self_attn.gate_proj.lora_B.weight"
+        mlp_a_key = prefix + "mlp.gate_proj.lora_A.weight"
+        mlp_b_key = prefix + "mlp.gate_proj.lora_B.weight"
+        up_a_key = prefix + "mlp.up_proj.lora_A.weight"
+        up_b_key = prefix + "mlp.up_proj.lora_B.weight"
+        attn_a, gate_a, up_a = [torch.full((2, 8), x) for x in (1.0, 2.0, 3.0)]
+        attn_b, gate_b, up_b = [torch.full((8, 2), x) for x in (4.0, 5.0, 6.0)]
         adapter = LoRAAdapter(
             uid="gate",
             config=LoRAConfig.from_dict(
@@ -279,16 +283,23 @@ class TestAttentionGateTargets(CustomTestCase):
             lora_backend=None,
         )
         adapter.initialize_weights_from_tensors(
-            {attn_key: attn, mlp_key: gate, up_key: up}
+            {
+                attn_a_key: attn_a,
+                attn_b_key: attn_b,
+                mlp_a_key: gate_a,
+                mlp_b_key: gate_b,
+                up_a_key: up_a,
+                up_b_key: up_b,
+            }
         )
         weights = adapter.layers[0].weights
-        self.assertEqual(
-            set(weights), {attn_key, mlp_key.replace("gate_proj", "gate_up_proj")}
-        )
-        torch.testing.assert_close(weights[attn_key], attn)
-        torch.testing.assert_close(
-            weights[mlp_key.replace("gate_proj", "gate_up_proj")], torch.cat((gate, up))
-        )
+        gu_a_key = mlp_a_key.replace("gate_proj", "gate_up_proj")
+        gu_b_key = mlp_b_key.replace("gate_proj", "gate_up_proj")
+        self.assertEqual(set(weights), {attn_a_key, attn_b_key, gu_a_key, gu_b_key})
+        torch.testing.assert_close(weights[attn_a_key], attn_a)
+        torch.testing.assert_close(weights[attn_b_key], attn_b)
+        torch.testing.assert_close(weights[gu_a_key], torch.cat((gate_a, up_a)))
+        torch.testing.assert_close(weights[gu_b_key], torch.cat((gate_b, up_b)))
 
 
 class TestTargetValidation(CustomTestCase):
