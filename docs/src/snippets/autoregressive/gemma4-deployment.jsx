@@ -25,7 +25,7 @@ export const Gemma4Deployment = () => {
       getDynamicItems: (values) => {
         const size = values.modelSize;
         const showMI300X = size === '31b' || size === '26b-a4b';
-        const showXeon = ['e2b', 'e4b', '31b', '26b-a4b'].includes(size);
+        const showXeon = ['e2b', 'e4b', '12b', '31b', '26b-a4b'].includes(size);
         return [
           { id: 'h200', label: 'H200', default: true },
           { id: 'b200', label: 'B200', default: false },
@@ -98,6 +98,7 @@ export const Gemma4Deployment = () => {
     xeon: {
       e2b: { tp: 1, mem: 0.9 },
       e4b: { tp: 1, mem: 0.9 },
+      '12b': { tp: 6, mem: 0.9 },
       '31b': { tp: 4, mem: 0.5 },
       '26b-a4b': { tp: 2, mem: 0.5 },
     },
@@ -442,13 +443,9 @@ export const Gemma4Deployment = () => {
                     values.hardware === 'xeon' &&
                     option.name === 'checkpoint' &&
                     item.id === 'qat';
-                  const isXeon12bLocked =
-                    values.hardware === 'xeon' &&
-                    option.name === 'modelSize' &&
-                    item.id === '12b';
                   const isDisabled = Boolean(
                     item.disabled || isArcBModelLocked || isArcBCheckpointLocked ||
-                    isArcBSpeculativeLocked || isXeonQatLocked || isXeon12bLocked
+                    isArcBSpeculativeLocked || isXeonQatLocked
                   );
                   return (
                     <label

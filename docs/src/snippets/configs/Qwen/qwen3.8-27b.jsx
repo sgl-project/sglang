@@ -1020,10 +1020,27 @@ export const config = {
     },
     {
       // Xeon CPU: reference recipe only, not benchmarked on this page. No
-      // NVFP4/FP8 cell — those checkpoints have no verified CPU recipe.
+      // NVFP4 cell — those checkpoints have no verified CPU recipe.
       match: { hw: "xeon", variant: "default", quant: "bf16", nodes: "single" },
       verified: false,
       verificationStatus: "unverified",
+      env: [],
+      flags: [
+        "--trust-remote-code",
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--mem-fraction-static 0.8",
+        "--reasoning-parser qwen3",
+        "--tool-call-parser qwen3_coder",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "default", quant: "fp8", nodes: "single" },
+      verified: true,
       env: [],
       flags: [
         "--trust-remote-code",

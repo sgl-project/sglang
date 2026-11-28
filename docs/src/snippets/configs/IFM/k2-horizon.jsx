@@ -11,7 +11,10 @@ export const config = {
 
   latencyPercentile: "P50",
 
-  supportedHardware: ["h200"],
+  supportedHardware: ["h200", "xeon"],
+  hardware: [
+    { id: "xeon", label: "XEON", vram: "CPU", vendor: "cpu" },
+  ],
   runModes: ["python"],
 
   variants: [
@@ -90,9 +93,11 @@ sgl-eval run gsm8k \\
   },
 
   playgroundFeatures: {
+    normalizeDeltas: (deltas, derived, base) => base.hw === "xeon" ? {} : deltas,
     // CP is unsupported/unvalidated for the xLLM path. DP-attention and
     // alternate MoE backends are also intentionally omitted until validated.
     attention: {
+      showWhen: (base) => base.hw !== "xeon",
       knobs: [
         {
           id: "tp",
@@ -114,6 +119,7 @@ sgl-eval run gsm8k \\
     // K2 Horizon MoVA-36B-A4B and 375B-A23B contain sparse MoE feed-forward layers. Keep
     // expert parallelism disabled on the dense variants.
     moe: {
+      showWhen: (base) => base.hw !== "xeon",
       ep: {
         label: "EP",
         values: [
@@ -156,6 +162,7 @@ sgl-eval run gsm8k \\
     },
 
     speculative: {
+      showWhen: (base) => base.hw !== "xeon",
       options: [
         { id: "current", label: "Inherited from base" },
         { id: "off", label: "Off" },
@@ -167,6 +174,7 @@ sgl-eval run gsm8k \\
     },
 
     pdDisagg: {
+      showWhen: (base) => base.hw !== "xeon",
       modes: [
         { id: "off", label: "Off" },
         { id: "prefill", label: "Prefill role" },
@@ -190,6 +198,7 @@ sgl-eval run gsm8k \\
     },
 
     hicache: {
+      showWhen: (base) => base.hw !== "xeon",
       backends: [
         { id: null, label: "Auto" },
         { id: "file", label: "File" },
@@ -294,6 +303,62 @@ sgl-eval run gsm8k \\
         "--dtype bfloat16",
         "--attention-backend fa3",
         "--model-loader-extra-config '{\"enable_multithread_load\":false}'",
+        "--reasoning-parser k2_horizon",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "0.9b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--reasoning-parser k2_horizon",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "3.7b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--reasoning-parser k2_horizon",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "7b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--reasoning-parser k2_horizon",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "32b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
         "--reasoning-parser k2_horizon",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
