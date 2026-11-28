@@ -3893,6 +3893,37 @@ pub struct GetModelInfoResponse {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetServerInfoRequest {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetLoadRequest {
+    /// Optional assertion of the addressed listener's DP rank. A different rank
+    /// is INVALID_ARGUMENT. Discover the other listeners through GetServerInfo.
+    #[prost(uint32, optional, tag = "1")]
+    pub dp_rank: ::core::option::Option<u32>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct GetLoadResponse {
+    #[prost(uint32, tag = "1")]
+    pub dp_rank: u32,
+    /// The owning-runtime identity reported by this listener's GetServerInfo.
+    #[prost(string, tag = "2")]
+    pub instance_id: ::prost::alloc::string::String,
+    /// UTC Unix seconds when the scheduler sampled the load. A successful read
+    /// can return an old sample. Clients can apply their own freshness policy.
+    #[prost(double, tag = "3")]
+    pub snapshot_unix_seconds: f64,
+    #[prost(uint64, tag = "4")]
+    pub num_running_requests: u64,
+    #[prost(uint64, tag = "5")]
+    pub num_waiting_requests: u64,
+    #[prost(uint64, tag = "6")]
+    pub num_waiting_uncached_tokens: u64,
+    #[prost(uint64, tag = "7")]
+    pub num_used_tokens: u64,
+    #[prost(uint64, tag = "8")]
+    pub max_total_num_tokens: u64,
+    #[prost(uint64, tag = "9")]
+    pub max_running_requests: u64,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetServerInfoResponse {
     #[prost(string, tag = "1")]

@@ -109,6 +109,13 @@ impl SglangService for Mock {
         }))
     }
 
+    async fn get_load(
+        &self,
+        _: Request<api::GetLoadRequest>,
+    ) -> Result<Response<api::GetLoadResponse>, Status> {
+        Err(Status::unimplemented("get_load"))
+    }
+
     async fn list_models(
         &self,
         _: Request<api::ListModelsRequest>,

@@ -11,7 +11,7 @@ use sglang_api_types::api::v1 as api;
 use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
-use super::{info, native_api};
+use super::{info, loads, native_api};
 use crate::api_server::anthropic::Anthropic;
 use crate::api_server::core::{HealthStatus, ReceivedAs};
 use crate::api_server::handlers::{
@@ -294,6 +294,19 @@ impl SglangService for GrpcService {
         info::server_info(server_info)
             .map(Response::new)
             .map_err(Status::internal)
+    }
+
+    async fn get_load(
+        &self,
+        request: Request<api::GetLoadRequest>,
+    ) -> Result<Response<api::GetLoadResponse>, Status> {
+        let response = loads::get_load(
+            &self.server_args,
+            self.core.instance_id(),
+            request.into_inner(),
+        )
+        .await?;
+        Ok(Response::new(response))
     }
 
     async fn set_internal_state(

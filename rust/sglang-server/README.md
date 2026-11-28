@@ -31,3 +31,16 @@ cargo test -p sglang-api-types --test json_parity
 These tests are written but have not been executed. Only code generation and
 static checks have run; compilation, CPU execution, live engine restart and GPU
 validation remain pending. Tracking: https://github.com/sgl-project/sglang/issues/38075.
+
+## api.v1 per-rank load
+
+`GetLoad` reads the scheduler snapshot used by the Rust `/v1/loads` endpoint.
+It reports the listener's actual DP rank, the same owning-runtime identity as
+`GetServerInfo`, and the scheduler's original sample time in UTC Unix seconds.
+Clients discover other listeners with `GetServerInfo` and may send the expected
+DP rank as an assertion. A rank mismatch returns `INVALID_ARGUMENT`.
+
+The RPC does not enqueue scheduler work. It returns `UNAVAILABLE` until a
+snapshot is usable, including when shared-memory publication is disabled or a
+publisher holds the snapshot lock. Clients can use the sample time to reject
+stale load data according to their own routing policy.
