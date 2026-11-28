@@ -1,4 +1,5 @@
 import contextlib
+import socket
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -6,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
+import torch.distributed
+import torch.multiprocessing
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
@@ -22,8 +25,9 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreResult,
 )
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
-from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
+from sglang.srt.disaggregation.utils import MetadataBuffers, ReqToMetadataIdxAllocator
 from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -32,6 +36,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue, leaving_retirer
 from sglang.test.test_utils import CustomTestCase
@@ -340,6 +345,142 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(list(queue.queue.items()), [decode_req])
         mock_prepare_abort.assert_not_called()
         queue.scheduler.request_retirer.release.assert_not_called()
+
+
+_MISMATCH_ROOM, _HEALTHY_ROOM, _STALE_ROOM = 1001, 1002, 4242
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class _LandedReceiver:
+    """A transfer that has concluded Success on every rank."""
+
+    require_staging = False
+    abort_notified = False
+
+    def poll(self):
+        return KVPoll.Success
+
+    def clear(self):
+        pass
+
+    def failure_exception(self):
+        raise KVTransferError(
+            _MISMATCH_ROOM, "Failed due to an unknown reason from another rank", True
+        )
+
+
+def _landed_decode_req(rid, room, idx):
+    return SimpleNamespace(
+        req=FakeReq(
+            rid=rid,
+            bootstrap_room=room,
+            bootstrap_host="10.0.0.1",
+            return_logprob=False,
+            return_sampling_mask=False,
+            finished_reason=None,
+            output_ids=[],
+            time_stats=MagicMock(),
+        ),
+        kv_receiver=_LandedReceiver(),
+        metadata_buffer_index=idx,
+        hicache_restore_status=None,
+        pending_metadata=None,
+        awaiting_publish=False,
+        is_rebootstrap=False,
+        prefix_match=None,
+    )
+
+
+def _abort_locally(req, error_message, status_code=None):
+    req.finished_reason = FINISH_ABORT(error_message, status_code)
+
+
+def _move_landed_transfers(rank: int, port: int, result: dict) -> None:
+    torch.distributed.init_process_group(
+        "gloo", rank=rank, world_size=2, init_method=f"tcp://127.0.0.1:{port}"
+    )
+    reset_context()
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    mismatched = _landed_decode_req("mismatched", _MISMATCH_ROOM, idx=0)
+    healthy = _landed_decode_req("healthy", _HEALTHY_ROOM, idx=1)
+    queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+    queue.queue = decode_queue(ListKind.PD_RECEIVING, [mismatched, healthy])
+    queue.enable_staging = False
+    queue.enable_host_receive = False
+    queue.enable_deferred_kv_release = False
+    queue.gloo_group = torch.distributed.group.WORLD
+    queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+    queue.tp_rank = rank
+    queue.tree_cache = MagicMock()
+    queue.metadata_buffers = MetadataBuffers(
+        size=2,
+        hidden_size=1,
+        hidden_states_dtype=torch.float32,
+        max_sampling_mask_tokens=0,
+    )
+    queue.metadata_buffers.bootstrap_room[0, 0] = (
+        _STALE_ROOM if rank == 1 else _MISMATCH_ROOM
+    )
+    queue.metadata_buffers.bootstrap_room[1, 0] = _HEALTHY_ROOM
+    queue.spec_algorithm = SpeculativeAlgorithm.NONE
+    queue._clean_hicache_prefetch_resources = MagicMock()
+    queue._record_transfer_failure = MagicMock()
+    queue.scheduler = SimpleNamespace(
+        request_retirer=leaving_retirer(),
+        enable_decode_hicache=False,
+        enable_hisparse=False,
+        kv_checksum_computer=None,
+        batch_result_processor=MagicMock(),
+        metrics_reporter=SimpleNamespace(enable_metrics=False),
+        output_streamer=SimpleNamespace(stream_output=MagicMock()),
+    )
+    with (
+        patch("sglang.srt.disaggregation.decode.end_network_transfer"),
+        patch(
+            "sglang.srt.disaggregation.decode.prepare_abort",
+            side_effect=_abort_locally,
+        ),
+    ):
+        admitted, outcomes = queue.move_transferred_with_outcomes(
+            IndexedReqList(ListKind.WAITING)
+        )
+    result[rank] = (
+        sorted(req.rid for req in admitted),
+        dict(outcomes),
+        [decode_req.req.rid for decode_req in queue.queue.items()],
+    )
+    torch.distributed.destroy_process_group()
+
+
+class TestMetadataGateMismatchAcrossRanks(CustomTestCase):
+    """A metadata slot that holds another request's bootstrap_room on one TP rank
+    only must not split the ranks: every rank fails that request, and the other
+    requests in the same poll are admitted as usual."""
+
+    def test_one_rank_mismatch_fails_the_request_on_every_rank(self):
+        ctx = torch.multiprocessing.get_context("spawn")
+        with ctx.Manager() as manager:
+            result = manager.dict()
+            port = _free_port()
+            procs = [
+                ctx.Process(target=_move_landed_transfers, args=(rank, port, result))
+                for rank in range(2)
+            ]
+            for proc in procs:
+                proc.start()
+            for proc in procs:
+                proc.join(timeout=120)
+            self.assertTrue(all(proc.exitcode == 0 for proc in procs), procs)
+            by_rank = dict(result)
+        self.assertEqual(by_rank[0], by_rank[1], "TP ranks concluded differently")
+        self.assertEqual(
+            by_rank[0], (["healthy"], {"mismatched": True, "healthy": False}, [])
+        )
 
 
 class _PollingReceiver:
