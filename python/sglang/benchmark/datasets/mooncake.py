@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import tempfile
 import time
 from argparse import Namespace
 from dataclasses import dataclass
@@ -32,7 +33,9 @@ class MooncakeDataset(BaseDataset):
 
     def load(self, tokenizer=None, model_id=None) -> List[Dict]:
         if not self.dataset_path:
-            local_path = os.path.join("/tmp", self.mooncake_workload + "_trace.jsonl")
+            local_path = os.path.join(
+                tempfile.gettempdir(), self.mooncake_workload + "_trace.jsonl"
+            )
         else:
             local_path = self.dataset_path
 
