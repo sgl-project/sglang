@@ -874,6 +874,112 @@ class TestShardConfig(unittest.TestCase):
         self.assertTrue(cfg["enable_fp32_lm_head"])
         self.assertEqual(cfg["init_expert_location"], "trivial")
 
+    def _rocm_fp4_shard_config(
+        self, backend, quantization="quark", is_hip=True, bf16=False
+    ):
+        from sglang.srt.layers.quantization import fp4_utils
+
+        loader = object.__new__(PreshardedModelLoader)
+        model_config = SimpleNamespace(quantization=quantization, dtype=torch.bfloat16)
+        saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
+        self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
+        fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
+        override = get_context().override_server_args(
+            tp_size=1, pp_size=1, moe_dp_size=1, moe_dense_tp_size=1
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        with (
+            get_parallel().override(
+                tp_size=1, pp_size=1, moe_dp_size=1, moe_ep_size=1, moe_tp_size=1
+            ),
+            mock.patch(
+                "sglang.srt.layers.dp_attention.get_moe_cp_size", return_value=1
+            ),
+            mock.patch(
+                "sglang.srt.model_loader.loader.get_exec",
+                return_value=SimpleNamespace(
+                    features=SimpleNamespace(enable_fp32_lm_head=False),
+                    moe=SimpleNamespace(
+                        ep_num_redundant_experts=0,
+                        enable_eplb=False,
+                        init_expert_location="trivial",
+                    ),
+                ),
+            ),
+            mock.patch("sglang.srt.model_loader.loader.is_hip", return_value=is_hip),
+            mock.patch(
+                "sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4."
+                "_dequant_linear_to_bf16",
+                return_value=bf16,
+            ),
+            mock.patch.object(
+                loader, "_compute_structural_signature", return_value="sig16"
+            ),
+        ):
+            return loader, loader._collect_shard_config(model_config)
+
+    def test_rocm_fp4_layout_keys_the_cache(self):
+        # The AITER FP4 GEMM stores Quark MXFP4 weights preshuffled. Both
+        # layouts get an explicit key, so a Triton launch never reuses an AITER
+        # cache, or an unmarked cache written before this key existed.
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        loader, triton = self._rocm_fp4_shard_config(Fp4GemmRunnerBackend.TRITON)
+        _, aiter = self._rocm_fp4_shard_config(Fp4GemmRunnerBackend.AITER)
+        self.assertEqual(triton["rocm_fp4_gemm_layout"], "triton")
+        self.assertEqual(aiter["rocm_fp4_gemm_layout"], "aiter")
+        unmarked = {k: v for k, v in triton.items() if k != "rocm_fp4_gemm_layout"}
+        names = {loader._build_subfolder_name(c) for c in (triton, aiter, unmarked)}
+        self.assertEqual(len(names), 3)
+
+    def test_gfx1250_bf16_layout_has_its_own_key(self):
+        # gfx1250 expands MXFP4 linears to bf16 at load; it must not reuse a
+        # packed gfx950 cache (whatever the FP4 backend says).
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        loader, packed = self._rocm_fp4_shard_config(Fp4GemmRunnerBackend.TRITON)
+        _, bf16 = self._rocm_fp4_shard_config(Fp4GemmRunnerBackend.TRITON, bf16=True)
+        self.assertEqual(bf16["rocm_fp4_gemm_layout"], "bf16")
+        self.assertNotEqual(
+            loader._build_subfolder_name(packed), loader._build_subfolder_name(bf16)
+        )
+
+    def test_rocm_fp4_layout_only_keys_rocm_quark(self):
+        from sglang.srt.layers.quantization.fp4_utils import Fp4GemmRunnerBackend
+
+        for quantization, is_hip in (("fp8", True), ("quark", False)):
+            with self.subTest(quantization=quantization, is_hip=is_hip):
+                _, cfg = self._rocm_fp4_shard_config(
+                    Fp4GemmRunnerBackend.TRITON, quantization, is_hip
+                )
+                self.assertNotIn("rocm_fp4_gemm_layout", cfg)
+
+    def test_rank_invariant_value_is_shared_by_mixed_ranks(self):
+        # Ranks on different architectures can resolve different layouts; all
+        # of them must land in one presharded directory.
+        group = SimpleNamespace(
+            world_size=2, all_gather_object=lambda local: ["aiter", "triton"]
+        )
+        with mock.patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=SimpleNamespace(world_group=group),
+        ):
+            for local in ("aiter", "triton"):
+                self.assertEqual(
+                    PreshardedModelLoader._rank_invariant_value(local), "aiter,triton"
+                )
+        same = SimpleNamespace(
+            world_size=2, all_gather_object=lambda local: [local] * 2
+        )
+        with mock.patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=SimpleNamespace(world_group=same),
+        ):
+            self.assertEqual(
+                PreshardedModelLoader._rank_invariant_value("aiter"), "aiter"
+            )
+
     def test_enumerated_fields_change_subfolder_hash(self):
         # Each enumerated content/shape knob must feed the subfolder name.
         # A silent drop from `_collect_shard_config` would leave this red.

@@ -103,7 +103,7 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.device import is_cuda_alike
+from sglang.srt.utils.device import is_cuda_alike, is_hip
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -1910,7 +1910,44 @@ class PreshardedModelLoader(DefaultModelLoader):
             shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
                 target_device or torch.device(current_platform.device_type)
             )
+        if is_hip() and model_config.quantization in ("quark", "quark_mxfp4"):
+            from sglang.srt.layers.quantization.fp4_utils import (
+                get_fp4_gemm_runner_backend,
+            )
+            from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                _dequant_linear_to_bf16,
+            )
+
+            # Quark MXFP4 linears are stored preshuffled for the AITER FP4 GEMM,
+            # row-major for the Triton GEMM, and expanded to bf16 on gfx1250. Key
+            # every layout explicitly (so caches from before this key existed are
+            # rebuilt) and gather them over the group, since ranks on different
+            # GPU architectures can differ but must share one cache directory.
+            if _dequant_linear_to_bf16(target_device):
+                local_layout = "bf16"
+            elif get_fp4_gemm_runner_backend().is_aiter():
+                local_layout = "aiter"
+            else:
+                local_layout = "triton"
+            shard_config["rocm_fp4_gemm_layout"] = self._rank_invariant_value(
+                local_layout
+            )
         return shard_config
+
+    @staticmethod
+    def _rank_invariant_value(local: str) -> str:
+        """One value for the whole world group: ``local`` if every rank agrees,
+        else the per-rank values in rank order."""
+        from sglang.srt.runtime_context import get_parallel
+
+        try:
+            group = get_parallel().world_group
+            if group.world_size <= 1:
+                return local
+            values = group.all_gather_object(local)
+        except (AssertionError, AttributeError, RuntimeError):
+            return local
+        return local if len(set(values)) == 1 else ",".join(values)
 
     @staticmethod
     def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:

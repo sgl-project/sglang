@@ -45,6 +45,10 @@ from sglang.srt.layers.dp_attention import (
     init_dp_gathered_buffer,
     initialize_dp_attention_flags,
 )
+from sglang.srt.layers.quantization.fp4_utils import (
+    initialize_fp4_gemm_config,
+    reject_rocm_only_fp4_gemm_backend,
+)
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
@@ -77,6 +81,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import current_device_stream
+from sglang.srt.utils.device import is_hip
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -579,6 +584,12 @@ class MMEncoder:
         )
 
         torch.get_device_module(self.device).set_device(self.gpu_id)
+        # The encoder loads its model without a scheduler, so resolve the ROCm
+        # FP4 GEMM backend for this device before the Quark linears are built.
+        if is_hip():
+            initialize_fp4_gemm_config(self.gpu_id)
+        else:
+            reject_rocm_only_fp4_gemm_backend()
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),

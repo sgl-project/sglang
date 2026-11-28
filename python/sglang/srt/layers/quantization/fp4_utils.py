@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from enum import Enum
 from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
+    get_device,
     get_exec,
     get_platform,
 )
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
-from sglang.srt.utils.device import get_device_capability, is_cuda
+from sglang.srt.utils.device import (
+    get_device_capability,
+    is_cuda,
+    is_hip,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +103,8 @@ class Fp4GemmRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     MARLIN = "marlin"
+    AITER = "aiter"
+    TRITON = "triton"
 
     def is_auto(self) -> bool:
         return self == Fp4GemmRunnerBackend.AUTO
@@ -114,6 +123,12 @@ class Fp4GemmRunnerBackend(Enum):
 
     def is_marlin(self) -> bool:
         return self == Fp4GemmRunnerBackend.MARLIN
+
+    def is_aiter(self) -> bool:
+        return self == Fp4GemmRunnerBackend.AITER
+
+    def is_triton(self) -> bool:
+        return self == Fp4GemmRunnerBackend.TRITON
 
     def is_flashinfer(self) -> bool:
         return self.value.startswith("flashinfer_")
@@ -143,12 +158,104 @@ class Fp4GemmRunnerBackend(Enum):
 FP4_GEMM_RUNNER_BACKEND: Fp4GemmRunnerBackend | None = None
 
 
-def initialize_fp4_gemm_config() -> None:
-    """Initialize the FP4 GEMM backend from the published configuration."""
+_ROCM_ONLY_FP4_GEMM_BACKENDS = ("aiter", "triton")
+_LEGACY_AITER_FP4_ASM_GEMM_ENV = "SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM"
+
+
+def _warn_legacy_aiter_fp4_asm_gemm_env(message: str) -> None:
+    # DeprecationWarning is hidden by Python's default filters, so also log it.
+    warnings.warn(message, DeprecationWarning, stacklevel=3)
+    logger.warning(message)
+
+
+def is_mxfp4_gemm_supported(gpu_id: Optional[int] = None) -> bool:
+    """Whether the ROCm GPU ``gpu_id`` has the native MXFP4 GEMM that AITER's a4w4 uses.
+
+    ``gpu_id`` defaults to the current device. The one place to extend when more
+    architectures gain it (gfx95, i.e. MI350/MI355, today).
+    """
+    if not is_hip():
+        return False
+    if gpu_id is None:
+        gpu_id = torch.cuda.current_device()
+    return "gfx95" in torch.cuda.get_device_properties(gpu_id).gcnArchName
+
+
+def resolve_rocm_fp4_gemm_backend(
+    *,
+    backend: str,
+    mxfp4_gemm_supported: bool,
+    legacy_use_aiter_asm: Optional[bool],
+) -> str:
+    """Resolve --fp4-gemm-backend for ROCm.
+
+    ``mxfp4_gemm_supported`` is ``is_mxfp4_gemm_supported()``.
+    ``legacy_use_aiter_asm`` is the value of the deprecated
+    SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM, or None when it is unset.
+    """
+    if legacy_use_aiter_asm is not None:
+        message = (
+            f"Environment variable {_LEGACY_AITER_FP4_ASM_GEMM_ENV} is deprecated "
+            "and will be removed in a future release. Please use "
+            "'--fp4-gemm-backend aiter' (or 'triton') instead."
+        )
+        if backend != "auto":
+            _warn_legacy_aiter_fp4_asm_gemm_env(
+                f"{message} It is ignored because --fp4-gemm-backend={backend} "
+                "is set explicitly."
+            )
+        else:
+            _warn_legacy_aiter_fp4_asm_gemm_env(message)
+            # The env var was a silent no-op without native MXFP4; keep it that way.
+            return (
+                "aiter" if legacy_use_aiter_asm and mxfp4_gemm_supported else "triton"
+            )
+
+    if backend == "auto":
+        # The AITER GEMM is faster for some models and slower for others (e.g.
+        # DeepSeek-R1 MLA projections fed pre-quantized activations), so it stays
+        # opt-in.
+        return "triton"
+    if backend == "aiter" and not mxfp4_gemm_supported:
+        raise ValueError(
+            "--fp4-gemm-backend=aiter requires a GPU with native MXFP4 GEMM support "
+            "(AMD gfx95: MI350/MI355). Use --fp4-gemm-backend triton instead."
+        )
+    return backend
+
+
+def reject_rocm_only_fp4_gemm_backend() -> None:
+    """Raise if --fp4-gemm-backend names a ROCm-only backend on another platform."""
+    backend = get_exec().kernel.fp4_gemm_runner_backend
+    if not is_hip() and backend in _ROCM_ONLY_FP4_GEMM_BACKENDS:
+        raise ValueError(f"--fp4-gemm-backend={backend} is only supported on ROCm.")
+
+
+def initialize_fp4_gemm_config(gpu_id: Optional[int] = None) -> None:
+    """Initialize the FP4 GEMM backend from the published configuration.
+
+    ``gpu_id`` is the device this worker runs on (default: the published
+    ``gpu_id``). Workers can run on different architectures, so ROCm checks
+    this device rather than device 0.
+    """
     global FP4_GEMM_RUNNER_BACKEND
 
     backend = get_exec().kernel.fp4_gemm_runner_backend
-    if backend == "auto":
+    if is_hip():
+        if gpu_id is None:
+            try:
+                gpu_id = get_device().gpu_id
+            except (AttributeError, ValueError):  # device namespace not published
+                gpu_id = None
+        legacy_env = envs.SGLANG_ROCM_USE_AITER_FP4_ASM_GEMM
+        backend = resolve_rocm_fp4_gemm_backend(
+            backend=backend,
+            mxfp4_gemm_supported=is_mxfp4_gemm_supported(gpu_id),
+            legacy_use_aiter_asm=legacy_env.get() if legacy_env.is_set() else None,
+        )
+    elif backend in _ROCM_ONLY_FP4_GEMM_BACKENDS:
+        reject_rocm_only_fp4_gemm_backend()
+    elif backend == "auto":
         if get_platform().is_sm100:
             backend = "flashinfer_cutedsl"
         elif is_cuda() and (10, 0) > get_device_capability() >= (8, 0):
