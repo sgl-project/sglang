@@ -1,8 +1,6 @@
 from typing import Optional, Tuple, Union
 
 import torch
-import triton
-import triton.language as tl
 from sgl_kernel_npu.operators.attention.gdn import (
     chunk_gated_delta_rule,
     fused_gdn_gating,
@@ -13,266 +11,24 @@ from sgl_kernel_npu.operators.attention.gdn.gdn_utils import prepare_chunk_indic
 from sgl_kernel_npu.operators.mamba import causal_conv1d
 from sgl_kernel_npu.operators.norm import l2norm_fwd
 
-
-@triton.jit(do_not_specialize=["T", "rows_per_prog"])
-def _fused_split_qkv_l2norm_kernel(
-    MIXED,
-    Q_OUT,
-    K_OUT,
-    V_OUT,
-    T,
-    rows_per_prog,
-    Q_DIM: tl.constexpr,
-    K_DIM: tl.constexpr,
-    V_DIM: tl.constexpr,
-    TOTAL_DIM: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    NUM_Q_HEADS: tl.constexpr,
-    NUM_K_HEADS: tl.constexpr,
-    V_CHUNK: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    r0 = pid * rows_per_prog
-    r1 = tl.minimum(r0 + rows_per_prog, T)
-    offs_qh = (
-        tl.arange(0, NUM_Q_HEADS)[:, None] * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+try:
+    from sgl_kernel_npu.operators.attention.gdn import (
+        build_gdn_prefill_chunk_meta,
+        fused_conv1d_decode_gating,
+        fused_gdn_prefill,
+        fused_rmsnorm_gated_strided_z,
     )
-    offs_kh = (
-        tl.arange(0, NUM_K_HEADS)[:, None] * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
-    )
-    offs_v = tl.arange(0, V_CHUNK)
-    for row in range(r0, r1):
-        base_in = MIXED + row * TOTAL_DIM
-        base_q = Q_OUT + row * Q_DIM
-        base_k = K_OUT + row * K_DIM
-        base_v = V_OUT + row * V_DIM
-        q = tl.load(base_in + offs_qh).to(tl.float32)
-        q_inv = tl.rsqrt(tl.sum(q * q, axis=1, keep_dims=True) + EPS)
-        tl.store(base_q + offs_qh, (q * q_inv).to(Q_OUT.dtype.element_ty))
+except ImportError:
+    build_gdn_prefill_chunk_meta = None
+    fused_conv1d_decode_gating = None
+    fused_gdn_prefill = None
+    fused_rmsnorm_gated_strided_z = None
 
-        k = tl.load(base_in + Q_DIM + offs_kh).to(tl.float32)
-        k_inv = tl.rsqrt(tl.sum(k * k, axis=1, keep_dims=True) + EPS)
-        tl.store(base_k + offs_kh, (k * k_inv).to(K_OUT.dtype.element_ty))
-
-        for c in tl.static_range(0, V_DIM, V_CHUNK):
-            v = tl.load(base_in + Q_DIM + K_DIM + c + offs_v)
-            tl.store(base_v + c + offs_v, v)
-
-
-def _can_use_fused_split_qkv_l2norm(layer) -> bool:
-    nk = layer.num_k_heads
-    nq = layer.num_q_heads
-    dk = layer.head_k_dim
-    return (
-        layer.head_q_dim == dk
-        and (nq & (nq - 1)) == 0
-        and (nk & (nk - 1)) == 0
-        and (dk & (dk - 1)) == 0
-        and layer.q_dim == nq * dk
-        and layer.k_dim == nk * dk
-        and layer.v_dim % 2048 == 0
-        and nq * dk <= 4096
-        and nk * dk <= 4096
-    )
-
-
-def _fused_split_qkv_l2norm(
-    mixed_qkv: torch.Tensor, layer
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    T = mixed_qkv.shape[0]
-    q = torch.empty(
-        (T, layer.num_q_heads, layer.head_q_dim),
-        dtype=mixed_qkv.dtype,
-        device=mixed_qkv.device,
-    )
-    k = torch.empty(
-        (T, layer.num_k_heads, layer.head_k_dim),
-        dtype=mixed_qkv.dtype,
-        device=mixed_qkv.device,
-    )
-    v = torch.empty(
-        (T, layer.num_v_heads, layer.head_v_dim),
-        dtype=mixed_qkv.dtype,
-        device=mixed_qkv.device,
-    )
-    grid = min(56, max(1, T))
-    rpp = (T + grid - 1) // grid
-    _fused_split_qkv_l2norm_kernel[(grid,)](
-        mixed_qkv,
-        q,
-        k,
-        v,
-        T,
-        rpp,
-        layer.q_dim,
-        layer.k_dim,
-        layer.v_dim,
-        mixed_qkv.shape[-1],
-        layer.head_k_dim,
-        layer.num_q_heads,
-        layer.num_k_heads,
-        2048,
-        1e-6,
-    )
-    return q, k, v
-
-
-@triton.jit
-def _fused_conv1d_decode_packed_gating_kernel(
-    QKVZ,  # [B, QKVZ_DIM]
-    BA,  # [B, 2*NV]  (b in [0:NV], a in [NV:2*NV])
-    W,  # [4, QKV_DIM]
-    STATE,  # [num_slots, 3, QKV_DIM]
-    CACHE_IDX,  # [B] int32
-    A_LOG,  # [NV] fp32
-    DT_BIAS,  # [NV] bf16/fp32
-    MIXED_OUT,  # [B, QKV_DIM]
-    G_OUT,  # [B, NV] fp32
-    BETA_OUT,  # [B, NV] bf16
-    B,
-    QKVZ_DIM: tl.constexpr,
-    QKV_DIM: tl.constexpr,
-    NV: tl.constexpr,
-    NV_PAD: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    n_chunks = QKV_DIM // BLOCK_D
-    pid = tl.program_id(0)
-    b = pid // n_chunks
-    c = pid % n_chunks
-    slot = tl.load(CACHE_IDX + b).to(tl.int64)
-    if c == 0:
-        offs_nv = tl.arange(0, NV_PAD)
-        mask_nv = offs_nv < NV
-        b_val = tl.load(BA + b * (2 * NV) + offs_nv, mask=mask_nv, other=0.0).to(
-            tl.float32
-        )
-        a_val = tl.load(BA + b * (2 * NV) + NV + offs_nv, mask=mask_nv, other=0.0).to(
-            tl.float32
-        )
-        a_log = tl.load(A_LOG + offs_nv, mask=mask_nv, other=0.0).to(tl.float32)
-        dt_b = tl.load(DT_BIAS + offs_nv, mask=mask_nv, other=0.0).to(tl.float32)
-        sp_in = a_val + dt_b
-        sp = tl.where(sp_in > 20.0, sp_in, tl.log(1.0 + tl.exp(sp_in)))
-        g_val = -tl.exp(a_log) * sp
-        # AscendC recurrent_gated_delta_rule expects pre-sigmoid beta logits.
-        tl.store(G_OUT + b * NV + offs_nv, g_val, mask=mask_nv)
-        tl.store(
-            BETA_OUT + b * NV + offs_nv,
-            b_val.to(BETA_OUT.dtype.element_ty),
-            mask=mask_nv,
-        )
-
-    offs = c * BLOCK_D + tl.arange(0, BLOCK_D)
-    x0 = tl.load(QKVZ + b * QKVZ_DIM + offs)
-    if slot >= 0:
-        s_base_slot = slot * (3 * QKV_DIM)
-        s0 = tl.load(STATE + s_base_slot + offs)
-        s1 = tl.load(STATE + s_base_slot + QKV_DIM + offs)
-        s2 = tl.load(STATE + s_base_slot + 2 * QKV_DIM + offs)
-        tl.store(STATE + s_base_slot + offs, s1)
-        tl.store(STATE + s_base_slot + QKV_DIM + offs, s2)
-        tl.store(STATE + s_base_slot + 2 * QKV_DIM + offs, x0)
-        w0 = tl.load(W + offs).to(tl.float32)
-        w1 = tl.load(W + QKV_DIM + offs).to(tl.float32)
-        w2 = tl.load(W + 2 * QKV_DIM + offs).to(tl.float32)
-        w3 = tl.load(W + 3 * QKV_DIM + offs).to(tl.float32)
-        acc = (
-            s0.to(tl.float32) * w0
-            + s1.to(tl.float32) * w1
-            + s2.to(tl.float32) * w2
-            + x0.to(tl.float32) * w3
-        )
-        out = acc * tl.sigmoid(acc)
-        tl.store(MIXED_OUT + b * QKV_DIM + offs, out.to(MIXED_OUT.dtype.element_ty))
-    else:
-        tl.store(MIXED_OUT + b * QKV_DIM + offs, x0)
-
-
-@triton.jit(do_not_specialize=["T"])
-def _fused_rmsnorm_gated_strided_z_kernel(
-    X,  # [T, NV, D] contiguous
-    QKVZ,  # [T, QKVZ_DIM] contiguous, Z starts at QKV_DIM
-    W,  # [D]
-    OUT,  # [T, V_DIM] contiguous
-    T,
-    QKVZ_DIM: tl.constexpr,
-    QKV_DIM: tl.constexpr,
-    V_DIM: tl.constexpr,
-    NV: tl.constexpr,
-    D: tl.constexpr,
-    HEADS_PER_PROG: tl.constexpr,
-    EPS: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    n_h_blocks = NV // HEADS_PER_PROG
-    total_blocks = T * n_h_blocks
-    n_progs = tl.num_programs(0)
-    w = tl.load(W + tl.arange(0, D)).to(tl.float32)[None, :]
-    offs_hd = tl.arange(0, HEADS_PER_PROG)[:, None] * D + tl.arange(0, D)[None, :]
-    for blk in range(pid, total_blocks, n_progs):
-        row = blk // n_h_blocks
-        hb = blk % n_h_blocks
-        off = hb * HEADS_PER_PROG * D + offs_hd
-        x = tl.load(X + row * V_DIM + off).to(tl.float32)
-        z = tl.load(QKVZ + row * QKVZ_DIM + QKV_DIM + off).to(tl.float32)
-        rstd = tl.rsqrt(tl.sum(x * x, axis=1, keep_dims=True) * (1.0 / D) + EPS)
-        y = (x * rstd) * w * (z * tl.sigmoid(z))
-        tl.store(OUT + row * V_DIM + off, y.to(OUT.dtype.element_ty))
-
-
-def fused_rmsnorm_gated_strided_z(
-    core_attn_out: torch.Tensor,
-    projected_states_qkvz: torch.Tensor,
-    weight: torch.Tensor,
-    qkv_dim: int,
-    num_v_heads: int,
-    head_v_dim: int,
-    eps: float,
-) -> torch.Tensor:
-    """Bit-exact RMSNorm(core_attn_out) * SiLU(z) reading strided z from qkvz directly."""
-    T = projected_states_qkvz.shape[0]
-    v_dim = num_v_heads * head_v_dim
-    out = torch.empty(
-        (T, v_dim), dtype=core_attn_out.dtype, device=core_attn_out.device
-    )
-    if T >= 56 and num_v_heads <= 64:
-        hpp = num_v_heads
-    elif T <= 4 and num_v_heads % 4 == 0:
-        hpp = 4
-    elif T <= 16 and num_v_heads % 8 == 0:
-        hpp = 8
-    elif num_v_heads % 16 == 0:
-        hpp = 16
-    else:
-        hpp = 1
-    grid = min(56, max(1, T * (num_v_heads // hpp)))
-    _fused_rmsnorm_gated_strided_z_kernel[(grid,)](
-        core_attn_out,
-        projected_states_qkvz,
-        weight,
-        out,
-        T,
-        projected_states_qkvz.shape[-1],
-        qkv_dim,
-        v_dim,
-        num_v_heads,
-        head_v_dim,
-        hpp,
-        eps,
-    )
-    return out
-
-
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
-from sglang.srt.hardware_backend.npu.attention.fused_gdn_prefill_950pr import (
-    build_gdn_950pr_chunk_meta,
-    can_use_fused_gdn_prefill_950pr,
-    fused_gdn_prefill_950pr,
-)
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -280,6 +36,45 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+
+
+def can_use_fused_gdn_prefill_950pr(
+    layer,
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    ssm_states: torch.Tensor,
+    chunk_meta,
+) -> bool:
+    if (
+        fused_gdn_prefill is None
+        or not envs.SGLANG_NPU_ENABLE_FUSED_GDN_PREFILL.get()
+        or not is_npu_arch35()
+        or chunk_meta is None
+    ):
+        return False
+    nk = layer.num_k_heads
+    nv = layer.num_v_heads
+    dk = layer.head_k_dim
+    return (
+        dk == 128
+        and layer.head_q_dim == 128
+        and layer.head_v_dim == 128
+        and layer.num_q_heads == nk
+        and nv > 0
+        and nk > 0
+        and nv % nk == 0
+        and (nk & (nk - 1)) == 0
+        and mixed_qkv.dtype == torch.bfloat16
+        and mixed_qkv.is_contiguous()
+        and a.is_contiguous()
+        and b.is_contiguous()
+        and ssm_states.is_contiguous()
+        and layer.q_dim == nk * 128
+        and layer.k_dim == nk * 128
+        and layer.v_dim == nv * 128
+        and mixed_qkv.shape[-1] == layer.q_dim + layer.k_dim + layer.v_dim
+    )
 
 
 class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
@@ -314,13 +109,14 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         self._gdn_950pr_ckpt_idx = None
         self._gdn_950pr_ckpt_dst = None
         if (
-            forward_batch.forward_mode.is_prefill()
+            build_gdn_prefill_chunk_meta is not None
+            and forward_batch.forward_mode.is_prefill()
             and not forward_batch.forward_mode.is_target_verify()
         ):
             seq_lens_cpu = forward_batch.extend_seq_lens_cpu
             if seq_lens_cpu is not None and len(seq_lens_cpu) > 0:
                 dev = self.actual_seq_lengths.device
-                self._gdn_950pr_chunk_meta = build_gdn_950pr_chunk_meta(
+                self._gdn_950pr_chunk_meta = build_gdn_prefill_chunk_meta(
                     seq_lens_cpu, dev, chunk_size=self.mamba_chunk_size
                 )
                 if (
@@ -477,7 +273,8 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
             nv = layer.num_v_heads
             if (
-                layer.bias is None
+                fused_conv1d_decode_gating is not None
+                and layer.bias is None
                 and layer.conv_weights.shape[-1] == 4
                 and conv_states.shape[1] == 3
                 and conv_states.is_contiguous()
@@ -485,19 +282,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 and ba.is_contiguous()
                 and qkv_dim % 512 == 0
             ):
-                if bs >= 2 and qkv_dim % 2048 == 0:
-                    block_d = 2048
-                elif qkv_dim % 1024 == 0:
-                    block_d = 1024
-                else:
-                    block_d = 512
-                nv_pad = triton.next_power_of_2(nv)
-                mixed_out = torch.empty(
-                    (bs, qkv_dim), dtype=qkvz.dtype, device=qkvz.device
-                )
-                g_out = torch.empty((bs, nv), dtype=torch.float32, device=qkvz.device)
-                beta_out = torch.empty((bs, nv), dtype=qkvz.dtype, device=qkvz.device)
-                _fused_conv1d_decode_packed_gating_kernel[(bs * (qkv_dim // block_d),)](
+                mixed_out, g_out, beta_out = fused_conv1d_decode_gating(
                     qkvz,
                     ba,
                     self._get_conv_weights_t(layer),
@@ -505,15 +290,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                     cache_indices,
                     layer.A_log,
                     layer.dt_bias,
-                    mixed_out,
-                    g_out,
-                    beta_out,
-                    bs,
-                    qkvz.shape[-1],
-                    qkv_dim,
                     nv,
-                    nv_pad,
-                    block_d,
                 )
                 ones_cache = getattr(self, "_decode_ones_cache", None)
                 if ones_cache is None:
@@ -742,15 +519,21 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             if can_use_fused_gdn_prefill_950pr(
                 layer, mixed_qkv, a, b, ssm_states, chunk_meta
             ):
-                core_attn_out = fused_gdn_prefill_950pr(
+                chunk_indices, chunk_offsets, _, total_valid = chunk_meta
+                core_attn_out = fused_gdn_prefill(
                     mixed_qkv,
                     a,
                     b,
-                    layer,
+                    layer.A_log,
+                    layer.dt_bias,
                     ssm_states,
                     cache_indices,
                     query_start_loc,
-                    chunk_meta,
+                    chunk_indices,
+                    chunk_offsets,
+                    layer.num_k_heads,
+                    layer.num_v_heads,
+                    total_valid_tokens=total_valid,
                     ckpt_chunk_idx=getattr(self, "_gdn_950pr_ckpt_idx", None),
                     ckpt_dst_slots=getattr(self, "_gdn_950pr_ckpt_dst", None),
                 )
@@ -769,26 +552,21 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 and forward_metadata.track_ssm_h_src is not None
                 and forward_metadata.track_ssm_h_src.numel() > 0
             )
-            if _can_use_fused_split_qkv_l2norm(layer) and mixed_qkv.is_contiguous():
-                query, key, value = _fused_split_qkv_l2norm(mixed_qkv, layer)
-                qk_already_normed = True
-            else:
-                query, key, value = torch.split(
-                    mixed_qkv,
-                    [layer.q_dim, layer.k_dim, layer.v_dim],
-                    dim=-1,
-                )
-                actual_seq_len = query.shape[0]
-                query = query.view(
-                    actual_seq_len, layer.num_q_heads, layer.head_q_dim
-                ).contiguous()
-                key = key.view(
-                    actual_seq_len, layer.num_k_heads, layer.head_k_dim
-                ).contiguous()
-                value = value.view(
-                    actual_seq_len, layer.num_v_heads, layer.head_v_dim
-                ).contiguous()
-                qk_already_normed = False
+            query, key, value = torch.split(
+                mixed_qkv,
+                [layer.q_dim, layer.k_dim, layer.v_dim],
+                dim=-1,
+            )
+            actual_seq_len = query.shape[0]
+            query = query.view(
+                actual_seq_len, layer.num_q_heads, layer.head_q_dim
+            ).contiguous()
+            key = key.view(
+                actual_seq_len, layer.num_k_heads, layer.head_k_dim
+            ).contiguous()
+            value = value.view(
+                actual_seq_len, layer.num_v_heads, layer.head_v_dim
+            ).contiguous()
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
             core_attn_out, last_recurrent_state, h, h_track_buf = self.chunk_gdn(
@@ -799,7 +577,6 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                 beta,
                 ssm_states[cache_indices],
                 query_start_loc,
-                qk_already_normed=qk_already_normed,
                 needs_chunk_state=needs_chunk_state,
             )
 

@@ -1043,10 +1043,15 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 self.head_v_dim,
             )
         elif _is_npu:
+            from sglang.srt.hardware_backend.npu.attention.ascend_gdn_backend import (
+                fused_rmsnorm_gated_strided_z,
+            )
+
             qkv_dim = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
             nv_tp = self.num_v_heads // self.attn_tp_size
             use_npu_strided_z = (
-                projected_states_qkvz.is_contiguous()
+                fused_rmsnorm_gated_strided_z is not None
+                and projected_states_qkvz.is_contiguous()
                 and self.norm.group_size is None
                 and getattr(self.norm, "norm_before_gate", True)
                 and getattr(self.norm, "activation", "silu") in ("silu", "swish")
@@ -1106,15 +1111,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 fused_rmsnorm_gated_strided_z,
             )
 
+            assert fused_rmsnorm_gated_strided_z is not None
             qkv_dim = (self.key_dim * 2 + self.value_dim) // self.attn_tp_size
-            nv_tp = self.num_v_heads // self.attn_tp_size
             core_attn_out = fused_rmsnorm_gated_strided_z(
                 core_attn_out.contiguous(),
                 projected_states_qkvz,
                 self.norm.weight,
                 qkv_dim,
-                nv_tp,
-                self.head_v_dim,
                 self.norm.eps,
             )
             output, _ = self.out_proj(core_attn_out)
