@@ -31,6 +31,11 @@ def maybe_prepare_dynamic_guests(layers: Sequence[torch.nn.Module]) -> None:
             "MoE dynamic guests off: CUDA IPC cannot map expandable segments"
         )
         return
+    if not _all_peers_accessible(group):
+        logger.warning(
+            "MoE dynamic guests off: some GPU pair of the TP group has no peer access"
+        )
+        return
     setup = _Setup(layers, group.cpu_group, group.rank_in_group)
     for m in layers:
         m.dynamic_guest_setup = setup
@@ -50,6 +55,23 @@ def tp_group_on_one_host(group) -> bool:
     if group.world_size == 1 or get_parallel().nnodes == 1:
         return True
     return all(in_the_same_node_as(group.cpu_group, source_rank=0))
+
+
+def _all_peers_accessible(group) -> bool:
+    """Whether every rank of ``group`` can access every peer GPU (CUDA IPC maps peer
+    memory only then), agreed over the group so that all ranks pull guests or none.
+    A collective: every rank must reach it in the same order."""
+    me = torch.cuda.current_device()
+    devices = [None] * group.world_size
+    dist.all_gather_object(devices, me, group=group.cpu_group)
+    visible = torch.cuda.device_count()
+    ok = all(
+        d == me or (d < visible and torch.cuda.can_device_access_peer(me, d))
+        for d in devices
+    )
+    agreed = torch.tensor([int(ok)], dtype=torch.int32)
+    dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=group.cpu_group)
+    return bool(agreed.item())
 
 
 class _Setup:
