@@ -2577,6 +2577,11 @@ class Envs:
     # one Triton pass; the Ulysses gathered projections are then kept in FP8 only. Needs SGLANG_ROCM_MUSE_DENSE_FP8;
     # =0 keeps BF16 hipBLASLt.
     SGLANG_ROCM_MUSE_PREFILL_DENSE_FP8 = EnvBool(True)
+    # The full-width QKV / O projections of a prefill (the gathered Ulysses ones, and a pipeline stage's) and a
+    # pipeline stage's pooler / unpooler on aiter's FlyDSL preshuffle a8w8 GEMM with a launch tuned per weight
+    # shape (aiter's CK kernel has no tuned config for them); their FP8 copies are then kept in its preshuffle
+    # layout. Same FP8 operands, not the CK kernel's bits.
+    SGLANG_ROCM_MUSE_PREFILL_FP8_PRESHUFFLE = EnvBool(False)
     # Greedy / simulated target verify keeps the logits vocab-sharded: each rank all-gathers its per-row
     # softcapped argmax ([rows, 2]), not the full logits.
     SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS = EnvBool(True)

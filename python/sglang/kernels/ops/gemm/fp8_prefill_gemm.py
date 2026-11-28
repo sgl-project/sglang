@@ -27,6 +27,17 @@ _MIN_ROWS = {(18432, 8192): 129, (8192, 8192): 129}
 # --tune-quant): 29 / 68 / 135 us for K 2048 / 4096 / 8192, 5.9-6.9 TB/s.
 _ROW_QUANT_CONFIGS = {2048: (1, 2), 4096: (1, 2), 8192: (1, 4)}
 _gemm_a8w8_ck = None
+# [N, K] -> launch of aiter's FlyDSL preshuffle a8w8 GEMM (tile_m, tile_n, tile_k, async copy, waves per EU, LDS
+# stages) for a weight kept in its preshuffle layout (``preshuffle_weight``): the full-width QKV / O projections
+# (gathered Ulysses shards, pipeline stages) and a pipeline stage's pooler / unpooler. One launch per weight shape
+# at every row count, so a row chunk's rows equal the whole shard's.
+PRESHUFFLE_CONFIGS: dict[tuple[int, int], tuple[int, int, int, int, int, int]] = {
+    (18432, 8192): (128, 256, 128, 1, 2, 2),
+    (8192, 8192): (128, 256, 128, 1, 2, 2),
+    (4096, 8192): (128, 256, 128, 1, 2, 2),
+    (8192, 4096): (256, 128, 128, 1, 2, 2),
+}
+_preshuffle_gemm_a8 = None
 
 
 @triton.jit
@@ -132,9 +143,58 @@ def _gemm():
     return _gemm_a8w8_ck
 
 
-def fp8_prefill_gemm(xq: torch.Tensor, xs: torch.Tensor, fp8_weight) -> torch.Tensor:
+def preshuffle_weight(fp8_weight):
+    """``quantize_weight(W)`` with the FP8 copy moved to aiter's preshuffle layout and the FlyDSL launch of its
+    shape appended, which ``fp8_prefill_gemm`` then runs instead of the CK kernel; unchanged for a shape without
+    a launch in ``PRESHUFFLE_CONFIGS``."""
+    wq, ws = fp8_weight
+    config = PRESHUFFLE_CONFIGS.get(tuple(wq.shape))
+    if config is None:
+        return fp8_weight
+    from aiter.ops.shuffle import shuffle_weight
+
+    return shuffle_weight(wq, layout=(16, 16)), ws, config
+
+
+def _preshuffle_gemm():
+    global _preshuffle_gemm_a8
+    if _preshuffle_gemm_a8 is None:
+        from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+        _preshuffle_gemm_a8 = flydsl_preshuffle_gemm_a8
+    return _preshuffle_gemm_a8
+
+
+def fp8_prefill_gemm(
+    xq: torch.Tensor, xs: torch.Tensor, fp8_weight, out: torch.Tensor | None = None
+) -> torch.Tensor:
     """``(xq * xs[:, None]) @ (wq * ws[:, None]).T`` in BF16 through aiter's CK a8w8 GEMM; it takes the activation
-    scales as [M, 1] and the channel scales as [N, 1], both FP32."""
+    scales as [M, 1] and the channel scales as [N, 1], both FP32. A ``preshuffle_weight`` runs aiter's FlyDSL
+    preshuffle kernel with its launch, into ``out`` (a row block of a preallocated output) when given."""
+    if len(fp8_weight) == 3:
+        wq, ws, (tile_m, tile_n, tile_k, async_copy, waves_per_eu, lds_stage) = (
+            fp8_weight
+        )
+        if out is None:
+            out = torch.empty(
+                (xq.shape[0], wq.shape[0]), device=xq.device, dtype=torch.bfloat16
+            )
+        _preshuffle_gemm()(
+            xq,
+            wq,
+            xs,
+            ws,
+            out,
+            tile_m,
+            tile_n,
+            tile_k,
+            async_copy,
+            waves_per_eu,
+            0,
+            lds_stage=lds_stage,
+        )
+        return out
+    assert out is None
     wq, ws = fp8_weight
     return _gemm()(
         xq, wq, xs.view(-1, 1), ws.view(-1, 1), bias=None, dtype=torch.bfloat16
