@@ -7,7 +7,7 @@ from unittest.mock import ANY, Mock, patch
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang.srt.disaggregation.common.conn import CommonKVSender, KVTransferError
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
@@ -129,6 +129,32 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         manager._staging_outstanding[42] = 0
         self.assertEqual(sender.poll_pp_consensus(), KVPoll.Success)
         self.assertEqual(sender.conclude_state, KVPoll.Success)
+
+    def test_abort_keeps_the_cause_of_a_local_failure(self):
+        """A failure handler that aborts the sender before failure_exception()
+        must get the room's real cause, polled or not, instead of "Aborted by
+        AbortReq."; a live sender reports the abort."""
+        for case in ("polled", "unpolled", "live"):
+            with self.subTest(case=case):
+                sender, manager, _ = make_sender(MooncakeKVManager)
+                manager.failure_lock = threading.Lock()
+                manager.failure_records = {}
+                manager.deferred_bootstrap = None
+                manager.req_to_decode_prefix_len = {}
+                manager._staging_ctx = None
+                manager._maybe_ack_drained_abort = Mock()
+                manager.request_status[42] = KVPoll.Transferring
+                if case != "live":
+                    manager.record_failure(42, "transport error")
+                    manager.request_status[42] = KVPoll.Failed
+                if case == "polled":
+                    self.assertEqual(sender.poll(), KVPoll.Failed)
+                sender.abort()
+                with self.assertRaises(KVTransferError) as ctx:
+                    sender.failure_exception()
+                expected = "Aborted by AbortReq." if case == "live" else "transport error"
+                self.assertEqual(ctx.exception.failure_reason, expected)
+                self.assertFalse(ctx.exception.is_from_another_rank)
 
     def test_mooncake_trace_context_reaches_worker_and_finishes(self):
         trace = Mock(tracing_enable=True)
