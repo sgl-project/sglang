@@ -19,6 +19,8 @@ use crate::components::{ComponentType, FULL, NUM_COMPONENT_TYPES};
 struct KeyNamespaceData {
     extra_key: Option<Arc<str>>,
     cache_salt: Option<Arc<str>>,
+    // Event metadata, excluded from namespace equality and hashing.
+    request_cache_salt: Option<Arc<str>>,
     hash: u64,
 }
 
@@ -30,10 +32,11 @@ struct KeyNamespaceData {
 pub struct KeyNamespace(Option<Arc<KeyNamespaceData>>);
 
 /// Borrowed namespace used by match/insert lookups without allocating.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct KeyNamespaceRef<'a> {
     pub extra_key: Option<&'a str>,
     pub cache_salt: Option<&'a str>,
+    request_cache_salt: Option<&'a str>,
     hash: u64,
 }
 
@@ -53,19 +56,46 @@ impl<'a> KeyNamespaceRef<'a> {
         Self {
             extra_key,
             cache_salt,
+            request_cache_salt: cache_salt,
             hash: key_namespace_hash(extra_key, cache_salt),
         }
     }
 
+    // Metadata-only annotations never create a distinct cache namespace.
+    pub fn with_request_cache_salt(mut self, value: Option<&'a str>) -> Self {
+        self.request_cache_salt = value.filter(|salt| !salt.is_empty());
+        self
+    }
+
+    pub fn request_cache_salt(self) -> Option<&'a str> {
+        self.request_cache_salt
+    }
+
     pub fn to_owned(self) -> KeyNamespace {
-        if self.extra_key.is_none() && self.cache_salt.is_none() {
+        if self.extra_key.is_none()
+            && self.cache_salt.is_none()
+            && self.request_cache_salt.is_none()
+        {
             return KeyNamespace::default();
         }
+        let cache_salt: Option<Arc<str>> = self.cache_salt.map(Into::into);
+        let request_cache_salt = if self.request_cache_salt == self.cache_salt {
+            cache_salt.clone()
+        } else {
+            self.request_cache_salt.map(Into::into)
+        };
         KeyNamespace(Some(Arc::new(KeyNamespaceData {
             extra_key: self.extra_key.map(Into::into),
-            cache_salt: self.cache_salt.map(Into::into),
+            cache_salt,
+            request_cache_salt,
             hash: self.hash,
         })))
+    }
+}
+
+impl Default for KeyNamespaceRef<'_> {
+    fn default() -> Self {
+        Self::new(None, None)
     }
 }
 
@@ -93,6 +123,7 @@ impl KeyNamespace {
             Some(namespace) => KeyNamespaceRef {
                 extra_key: namespace.extra_key.as_deref(),
                 cache_salt: namespace.cache_salt.as_deref(),
+                request_cache_salt: namespace.request_cache_salt.as_deref(),
                 hash: namespace.hash,
             },
             None => KeyNamespaceRef::default(),
@@ -111,6 +142,31 @@ impl KeyNamespace {
         self.0
             .as_ref()
             .and_then(|namespace| namespace.cache_salt.clone())
+    }
+
+    pub fn request_cache_salt(&self) -> Option<Arc<str>> {
+        self.0
+            .as_deref()
+            .and_then(|namespace| namespace.request_cache_salt.clone())
+    }
+
+    pub fn with_request_cache_salt(&self, value: Option<&str>) -> Self {
+        let value = value.filter(|salt| !salt.is_empty());
+        if self.as_ref().request_cache_salt() == value {
+            return self.clone();
+        }
+        let cache_salt = self.cache_salt_arc();
+        let request_cache_salt = if cache_salt.as_deref() == value {
+            cache_salt.clone()
+        } else {
+            value.map(Arc::from)
+        };
+        Self(Some(Arc::new(KeyNamespaceData {
+            extra_key: self.extra_key_arc(),
+            cache_salt,
+            request_cache_salt,
+            hash: self.as_ref().hash,
+        })))
     }
 
     pub fn extra_key_arc(&self) -> Option<Arc<str>> {

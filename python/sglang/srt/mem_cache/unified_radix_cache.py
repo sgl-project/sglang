@@ -751,11 +751,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Convert the request's raw-token skip boundary to page-aligned radix-key units.
         if self.linker is None:
             return nullcontext()
-        skip_key = RadixKey(
+        skip_key = RadixKey.from_req(
+            req,
             token_ids[: req.linker_offload_skip_prefix_len],
-            req.extra_key,
             is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         return self.linker.skip_offload_prefix(len(skip_key))
 
@@ -1714,11 +1713,10 @@ class UnifiedRadixCache(BasePrefixCache):
         for comp in self._components_tuple:
             effective_cache_len = comp.floor_cache_len(effective_cache_len)
 
-        radix_key = RadixKey(
+        radix_key = RadixKey.from_req(
+            req,
             token_ids[:effective_cache_len],
-            req.extra_key,
             is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
         )
 
         if (
@@ -1784,11 +1782,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # Split the leaf at the prompt boundary so eviction can drop the output
         # KV without the prompt. prev_prefix_len keeps the overlapping indices
         # from being freed as duplicates.
-        prompt_key = RadixKey(
+        prompt_key = RadixKey.from_req(
+            req,
             req.origin_input_ids,
-            req.extra_key,
             is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         if (
             len(self._components_tuple) == 1
@@ -1911,11 +1908,10 @@ class UnifiedRadixCache(BasePrefixCache):
             if cache_len is not None:
                 effective_cache_len = min(effective_cache_len, cache_len)
 
-        radix_key = RadixKey(
+        radix_key = RadixKey.from_req(
+            req,
             token_ids[:effective_cache_len],
-            req.extra_key,
             is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
         )
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
             for comp in self._components_tuple:
@@ -2781,6 +2777,7 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_end: Optional[int] = None,
         *,
         kv_hints: Optional[KvHintsEnvelope] = None,
+        request_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET,
     ) -> Optional[bool]:
         if not self.enable_storage or self.cache_controller is None:
             return
@@ -2831,6 +2828,7 @@ class UnifiedRadixCache(BasePrefixCache):
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
+            request_cache_salt=request_cache_salt,
         ).page_aligned(self.page_size)
         assume_stored = (
             assume_stored and storage_start + len(prefetch_key) == storage_hit_end
@@ -3816,6 +3814,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_key=old_key.extra_key,
                 is_bigram=old_key.is_bigram,
                 cache_salt=old_key.cache_salt,
+                request_cache_salt=old_key.request_cache_salt,
             )
         )
         self.ongoing_prefetch[request] = info

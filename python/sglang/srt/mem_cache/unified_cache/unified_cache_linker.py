@@ -468,10 +468,9 @@ class UnifiedCacheLinkerWrapper:
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
             return
         page = self.cache.page_size
-        key = RadixKey(
+        key = RadixKey.from_req(
+            req,
             req.full_untruncated_fill_ids,
-            extra_key=req.extra_key,
-            cache_salt=req.cache_salt,
             is_bigram=self.cache.tree_core.is_eagle,
             limit=req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
         ).page_aligned(page)

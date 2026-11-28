@@ -150,6 +150,7 @@ def _staged_fixture(full_match=2):
         kv=ReqKvInfo(cache_protected_len=2),
         extra_key=None,
         cache_salt=None,
+        _user_cache_salt=None,
         host_hit_length=0,
         host_hit_is_storage=False,
         host_loaded_length=0,

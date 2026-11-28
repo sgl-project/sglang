@@ -17,6 +17,7 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.disaggregation.kv_events import BlockStored, EventBatch
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items, hash_feature_digest
 from sglang.srt.managers.req_types import (
@@ -25,6 +26,7 @@ from sglang.srt.managers.req_types import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache import events
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams, MatchPrefixParams
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -247,10 +249,13 @@ class TestFeatureIdentity(CustomTestCase):
 
     def test_request_namespace_prevents_partial_media_prefix_reuse(self):
         for backend, page_size, text_len, media_len in itertools.product(
-            ("python", "rust"), (1, 16), (15, 16), (1, 32)
+            ("python", "rust"), (1, 16), (15, 16, 64), (1, 32)
         ):
-            with self.subTest(
-                backend=backend, page=page_size, text=text_len, media=media_len
+            with (
+                self.subTest(
+                    backend=backend, page=page_size, text=text_len, media=media_len
+                ),
+                patch.object(events, "MM_ROUTING_LABELS", events.MmRoutingLabels()),
             ):
                 a, b = _item(torch.zeros(8)), _item(torch.ones(8))
                 a.set_pad_value()
@@ -271,9 +276,7 @@ class TestFeatureIdentity(CustomTestCase):
                     )
                     req.extend_image_inputs(MultimodalInputs(mm_items=[item]))
                     keys.append(
-                        RadixKey(
-                            array("q", req.origin_input_ids), cache_salt=req.cache_salt
-                        )
+                        RadixKey.from_req(req, array("q", req.origin_input_ids))
                     )
                     salt = req.cache_salt
                     req.bind_multimodal_cache_namespace()
@@ -283,7 +286,13 @@ class TestFeatureIdentity(CustomTestCase):
                 self.assertNotEqual(
                     get_storage_hash_str(keys[0]), get_storage_hash_str(keys[1])
                 )
-                core = _tree_core(backend, page_size=page_size)
+                core = _tree_core(
+                    backend,
+                    page_size=page_size,
+                    enable_kv_cache_events=True,
+                    dynamo_kv_event_format=True,
+                )
+                core.take_events()
                 cached_len = len(keys[0]) // page_size * page_size
                 _pump_insert(
                     core, InsertParams(key=keys[0], value=torch.arange(cached_len))
@@ -295,6 +304,76 @@ class TestFeatureIdentity(CustomTestCase):
                 self.assertEqual(
                     core.match_prefix(MatchPrefixParams(key=keys[2])).device_prefix_len,
                     cached_len,
+                )
+                stored = [e for e in core.take_events() if isinstance(e, BlockStored)]
+                self.assertTrue(stored)
+                for event in stored:
+                    self.assertEqual(event.cache_salt, keys[0].cache_salt)
+                    self.assertEqual(event.request_cache_salt, "tenant")
+
+    def test_dynamo_events_preserve_the_original_request_namespace(self):
+        """Media-scoped requests must publish the caller namespace and label spans."""
+        label = "8267d19b3483eda3"
+        for backend, user_salt in itertools.product(
+            ("python", "rust"), (None, "tenant-a")
+        ):
+            with (
+                self.subTest(backend=backend, user_salt=user_salt),
+                patch.object(events, "MM_ROUTING_LABELS", events.MmRoutingLabels()),
+            ):
+                core = _tree_core(
+                    backend,
+                    page_size=16,
+                    enable_kv_cache_events=True,
+                    dynamo_kv_event_format=True,
+                )
+                core.take_events()
+                item = MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    feature=torch.zeros(8),
+                    offsets=[(14, 17)],
+                    routing_label=label,
+                )
+                mm_inputs = MultimodalInputs.from_processor_output(
+                    MultimodalProcessorOutput(mm_items=[item])
+                )
+                tokens = list(range(14)) + item.padding_sequence(4) + [2] * 14
+                req = Req(
+                    rid="routing-contract",
+                    origin_input_text=None,
+                    origin_input_ids=tokens,
+                    sampling_params=SamplingParams(),
+                    cache_salt=user_salt,
+                )
+                req.extend_image_inputs(mm_inputs)
+                self.assertNotEqual(req.cache_salt, user_salt)
+                _pump_insert(
+                    core,
+                    InsertParams(
+                        key=RadixKey.from_req(req, array("q", req.origin_input_ids)),
+                        value=torch.arange(len(tokens)),
+                    ),
+                )
+                stored = [e for e in core.take_events() if isinstance(e, BlockStored)]
+                self.assertTrue(stored)
+                wire = msgspec.msgpack.decode(
+                    msgspec.msgpack.encode(EventBatch(ts=0.0, events=stored))
+                )[1]
+                for event in wire:
+                    self.assertEqual(event["cache_salt"], req.cache_salt)
+                    self.assertIn("request_cache_salt", event)
+                    self.assertEqual(event["request_cache_salt"], user_salt)
+                self.assertEqual(
+                    [token for event in wire for token in event["token_ids"]],
+                    tokens,
+                )
+                self.assertEqual(
+                    [
+                        block_spans
+                        for event in wire
+                        for block_spans in event.get("mm_routing_spans") or []
+                    ],
+                    [[[14, 2, label]], [[0, 2, label]]],
                 )
 
     def test_empty_numpy_retains_shape_and_dtype(self):

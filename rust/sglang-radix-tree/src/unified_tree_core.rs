@@ -1117,13 +1117,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         creation_counter: Option<i64>,
         extra_key: Option<&str>,
     ) -> NodeIdx_ {
+        let parent = self.arena.node(parent_id);
+        let namespace = if parent.is_root() {
+            KeyNamespace::new(extra_key, None)
+        } else {
+            parent.namespace.clone()
+        };
         self.new_node_in_namespace_(
             key,
             parent_id,
             priority,
             hit_count,
             creation_counter,
-            KeyNamespaceRef::new(extra_key, /* cache_salt = */ None),
+            namespace.as_ref(),
         )
     }
 
@@ -1137,11 +1143,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         namespace: KeyNamespaceRef<'_>,
     ) -> NodeIdx_ {
         let new_node_id = self.arena.alloc_detached(priority);
-        // Root children adopt the op namespace; deeper nodes inherit the parent's.
-        let ns = if self.arena.node(parent_id).is_root() {
+        // New nodes retain the inserter's metadata; existing nodes keep theirs.
+        let parent = self.arena.node(parent_id);
+        let ns = if parent.is_root() {
             namespace.to_owned()
         } else {
-            self.arena.node(parent_id).namespace.clone()
+            parent
+                .namespace
+                .with_request_cache_salt(namespace.request_cache_salt())
         };
         let new_node = self.arena.node_mut(new_node_id);
         new_node.key = key;
@@ -2616,12 +2625,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         priority: i64,
         extra_key: Option<&str>,
     ) -> NodeIdx_ {
+        let parent = self.arena.node(parent_id);
+        let namespace = if parent.is_root() {
+            KeyNamespace::new(extra_key, None)
+        } else {
+            parent.namespace.clone()
+        };
         self.add_new_node_in_namespace_(
             parent_id,
             key,
             value,
             priority,
-            KeyNamespaceRef::new(extra_key, /* cache_salt = */ None),
+            namespace.as_ref(),
             /* session_id = */ None,
         )
     }
@@ -3986,9 +4001,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     token_ids: tail_token_ids,
                     block_size: tail_block_size,
                     medium: tail_medium,
-                    cache_salt: tail_cache_salt,
+                    namespace: tail_namespace,
+                    request_cache_salt: tail_request_cache_salt,
+                    has_request_cache_salt: tail_has_request_cache_salt,
                     session_id: tail_session_id,
-                    extra_key: tail_extra_key,
                     ..
                 }),
                 KvCacheEvent::BlockStored {
@@ -3997,15 +4013,17 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     mut token_ids,
                     block_size,
                     medium,
-                    cache_salt,
+                    namespace,
+                    request_cache_salt,
+                    has_request_cache_salt,
                     session_id,
-                    extra_key,
                 },
             ) if *tail_medium == medium
                 && *tail_block_size == block_size
-                && *tail_cache_salt == cache_salt
+                && *tail_namespace == namespace
+                && *tail_has_request_cache_salt == has_request_cache_salt
+                && *tail_request_cache_salt == request_cache_salt
                 && *tail_session_id == session_id
-                && *tail_extra_key == extra_key
                 && !tail_hashes.is_empty()
                 && parent_block_hash == tail_hashes.last().copied() =>
             {
@@ -4085,8 +4103,14 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             let hash_values = self.arena.compute_node_hash_values(node_id, self.page_size);
             self.arena.node_mut(node_id).hash_value = Some(hash_values);
         }
-        let cache_salt = self.arena.node(node_id).namespace.cache_salt_arc();
-        let extra_key = self.arena.node(node_id).namespace.extra_key_arc();
+        let namespace = self.arena.node(node_id).namespace.clone();
+        let has_request_cache_salt = self.dynamo_kv_event_format
+            && namespace.as_ref().request_cache_salt() != namespace.cache_salt();
+        let request_cache_salt = if has_request_cache_salt {
+            namespace.request_cache_salt()
+        } else {
+            None
+        };
         let session_id: Option<Arc<str>> = session_id.map(Arc::from);
         let namespaced = self.arena.node(node_id).namespace != KeyNamespace::default();
         if namespaced {
@@ -4121,9 +4145,10 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
                     token_ids: page.to_vec(),
                     block_size: page.len(),
                     medium,
-                    cache_salt: cache_salt.clone(),
+                    namespace: namespace.clone(),
+                    request_cache_salt: request_cache_salt.clone(),
+                    has_request_cache_salt,
                     session_id: session_id.clone(),
-                    extra_key: extra_key.clone(),
                 });
                 parent_block_hash = Some(block_hash);
             };
@@ -6722,10 +6747,11 @@ pub enum KvCacheEvent<A> {
         token_ids: Vec<A>,
         block_size: usize,
         medium: StorageMedium,
-        cache_salt: Option<Arc<str>>,
+        namespace: KeyNamespace,
+        /// Present-null means unsalted; absent metadata inherits cache_salt.
+        request_cache_salt: Option<Arc<str>>,
+        has_request_cache_salt: bool,
         session_id: Option<Arc<str>>,
-        /// Not published; Python maps it to the LoRA name that namespaces the hashes.
-        extra_key: Option<Arc<str>>,
     },
     BlockRemoved {
         block_hashes: Vec<i64>,

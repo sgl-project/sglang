@@ -11,7 +11,10 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.disaggregation.decode_hicache_mixin import DecodeHiCachePreallocMixin
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    DecodeHiCachePreallocMixin,
+    DecodePrefixMatch,
+)
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
@@ -19,6 +22,7 @@ from sglang.srt.disaggregation.kv_events import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -1804,7 +1808,11 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         "one FULL page_size=4 fixture covers namespace routing",
     )
     def test_buffer_only_cache_salt_uses_the_request_namespace(self):
+        for entrypoint in ("prefill", "decode"):
+            with self.subTest(entrypoint=entrypoint):
+                self._check_buffer_prefetch_namespace(entrypoint)
 
+    def _check_buffer_prefetch_namespace(self, entrypoint):
         storage_dir = self._make_storage_dir()
 
         extra_key = "adapter-a"
@@ -1815,7 +1823,11 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
 
         # A root anchor has no namespace; probe and prefetch must use the request's.
-        cons, _, _ = self._build_buffer_hicache_fixture(storage_dir)
+        cons, _, cons_rtp = build_fixture(
+            self.cfg, enable_kv_cache_events=True, dynamo_kv_event_format=True
+        )
+        self._init_buffer_hicache(cons, storage_dir)
+        cons.take_events()
         self.assertEqual(
             cons.query_storage_hit_length(
                 cons.root_node_handle(),
@@ -1825,16 +1837,30 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             ),
             len(seq),
         )
-        root_req = CacheRequestHandle("salted-root-prefetch", 0)
-        cons.prefetch_from_storage(
-            root_req,
-            cons.root_node_handle(),
-            array("q", seq),
-            None,
-            None,
-            extra_key=extra_key,
-            cache_salt=cache_salt,
-        )
+        req = self._make_req(cons_rtp)
+        req.origin_input_ids = array("q", seq + [100001])
+        req.extra_key = extra_key
+        req.cache_salt = cache_salt
+        req._user_cache_salt = "client-a"
+        root_req = req.cache_request_handle
+        if entrypoint == "prefill":
+            scheduler = SimpleNamespace(
+                enable_unified_cache_external_linker=False,
+                enable_hicache_storage=True,
+                tree_cache=cons,
+            )
+            Scheduler._prefetch_kvcache(scheduler, req, storage_hit_end=len(seq))
+        else:
+            match = DecodePrefixMatch(
+                prefix_indices=torch.empty(0, dtype=torch.int64),
+                l2_host_hit_length=0,
+                l3_storage_hit_length=len(seq),
+                last_device_node=cons.root_node_handle(),
+                last_host_node=cons.root_node_handle(),
+            )
+            DecodeHiCachePreallocMixin._start_hicache_prefetch(
+                SimpleNamespace(tree_cache=cons), req, match
+            )
         self._pump_hicache_until(
             cons,
             lambda: (
@@ -1845,6 +1871,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         )
         held = cons.buffer_pipeline.staged_prefetches[root_req]
         self.assertEqual((held.extra_key, held.cache_salt), (extra_key, cache_salt))
+        self.assertEqual(held.request_cache_salt, "client-a")
         self.assertNotIn(root_req, cons.buffer_pipeline.anchor_locks)
         loaded = self._consume_staged_prefetch(
             cons,
@@ -1857,6 +1884,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         self.assertEqual(
             cons.match_prefix(MatchPrefixParams(key=key)).device_prefix_len, len(seq)
         )
+        stored = [e for e in cons.take_events() if isinstance(e, BlockStored)]
+        self.assertTrue(stored)
+        self.assertTrue(all(e.request_cache_salt == "client-a" for e in stored))
         for miss in (
             RadixKey(array("q", seq)),
             RadixKey(array("q", seq), extra_key=extra_key, cache_salt="tenant-b"),

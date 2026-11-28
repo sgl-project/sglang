@@ -219,6 +219,7 @@ class FlexKVRadixCache(RadixCache):
                 key.extra_key,
                 key.is_bigram,
                 cache_salt=key.cache_salt,
+                request_cache_salt=key.request_cache_salt,
             ),
             value_numel=device_len,
         )
@@ -412,10 +413,9 @@ class FlexKVRadixCache(RadixCache):
         # the node we'll later unlock when the store completes.
         match_result = super().match_prefix(
             MatchPrefixParams(
-                key=RadixKey(
+                key=RadixKey.from_req(
+                    req,
                     token_ids,
-                    req.extra_key,
-                    cache_salt=req.cache_salt,
                 )
             )
         )

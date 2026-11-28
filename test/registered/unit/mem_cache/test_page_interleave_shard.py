@@ -1425,6 +1425,7 @@ class _GraftReq:
         self.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
         self.extra_key = None
         self.cache_salt = None
+        self._user_cache_salt = None
         self.prefix_len = 0
         self.last_node = None
         self.priority = 0

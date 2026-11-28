@@ -11,6 +11,7 @@ import logging
 from array import array
 from typing import TYPE_CHECKING, Any, Optional
 
+import msgspec
 import torch
 from lmcache.integration.sglang.lmcache_mp_metadata import (
     LMCacheExternalFlow,
@@ -186,6 +187,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         storage_hit_end: Optional[int] = None,
         *,
         kv_hints: Optional[KvHintsEnvelope] = None,
+        request_cache_salt: str | None | msgspec.UnsetType = msgspec.UNSET,
     ) -> None:
         del last_hash, prefix_keys, storage_hit_end, kv_hints
         req_id = request.rid
@@ -203,6 +205,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             extra_key=extra_key,
             is_bigram=self.tree_core.is_eagle,
             cache_salt=cache_salt,
+            request_cache_salt=request_cache_salt,
         ).page_aligned(self.page_size)
         if len(key) == 0:
             return
@@ -877,11 +880,10 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         flow.prefix_published = True
 
     def _submit_store(self, req: Req, token_ids: list[int]) -> None:
-        key = RadixKey(
+        key = RadixKey.from_req(
+            req,
             token_ids,
-            req.extra_key,
             is_bigram=self.tree_core.is_eagle,
-            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         aligned_len = (
             len(key)

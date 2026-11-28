@@ -3951,6 +3951,7 @@ class Scheduler(
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
                     kv_hints=req.kv_hints,
+                    request_cache_salt=req._user_cache_salt,
                 )
 
     def _process_storage_prefetch_retries(self):

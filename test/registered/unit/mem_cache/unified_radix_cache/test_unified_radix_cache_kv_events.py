@@ -2,6 +2,7 @@ import unittest
 from array import array
 from unittest import mock
 
+import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import (
@@ -12,6 +13,7 @@ from sglang.srt.disaggregation.kv_events import (
 from sglang.srt.mem_cache import events
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
+    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -82,9 +84,16 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
                     cache.take_events()
                     events.MM_ROUTING_LABELS.register(pads, label)
                     self._insert(cache, allocator, [1, 2] + pads)
+                    stored = self._stored_events(cache, StorageMedium.GPU)
+                    self.assertTrue(stored)
+                    for event in stored:
+                        self.assertIs(
+                            event.request_cache_salt,
+                            msgspec.UNSET,
+                        )
                     spans = [
                         block_spans
-                        for event in self._stored_events(cache, StorageMedium.GPU)
+                        for event in stored
                         for block_spans in (
                             event.mm_routing_spans or [[]] * len(event.block_hashes)
                         )
@@ -116,6 +125,48 @@ class TestUnifiedRadixCacheKVEvents(UnifiedRadixCacheKVEventsFixtures, CustomTes
             self._event_hashes(self._stored_events(unsalted, StorageMedium.GPU)),
             salted_hashes,
         )
+
+    def test_request_cache_salt_survives_host_backup_and_load_back(self):
+        for backend in ("python", "rust"):
+            for user_salt in (None, "tenant-a"):
+                with self.subTest(backend=backend, user_salt=user_salt):
+                    cache, allocator, _ = build_fixture(
+                        self.cfg,
+                        enable_kv_cache_events=True,
+                        dynamo_kv_event_format=True,
+                        tree_core_backend=backend,
+                    )
+                    self._init_hicache(cache)
+                    cache.take_events()
+                    tokens = [1, 2, 3, 4]
+                    internal_salt = "sglang-mm-v1:internal-identity"
+                    self._insert(
+                        cache,
+                        allocator,
+                        tokens,
+                        cache_salt=internal_salt,
+                        request_cache_salt=user_salt,
+                    )
+                    initial = self._stored_events(cache, StorageMedium.GPU)
+                    leaf = cache.match_prefix(
+                        MatchPrefixParams(
+                            key=RadixKey(array("q", tokens), cache_salt=internal_salt)
+                        )
+                    ).last_device_node
+                    self._backup_node(cache, leaf)
+                    host = self._stored_events(cache, StorageMedium.CPU)
+                    cache.evict(EvictParams(num_tokens=len(tokens)))
+                    cache.take_events()
+                    self._load_back_node(cache, leaf)
+                    restored = self._stored_events(cache, StorageMedium.GPU)
+                    for stored in (initial, host, restored):
+                        self.assertTrue(stored)
+                        self.assertEqual(
+                            self._event_hashes(stored), self._event_hashes(initial)
+                        )
+                        for event in stored:
+                            self.assertEqual(event.cache_salt, internal_salt)
+                            self.assertEqual(event.request_cache_salt, user_salt)
 
     def test_session_id_is_attributed_without_changing_block_hash(self):
         cache_a, allocator_a, _ = build_fixture(self.cfg, enable_kv_cache_events=True)

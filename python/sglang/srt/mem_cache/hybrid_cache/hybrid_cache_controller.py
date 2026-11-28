@@ -1386,6 +1386,7 @@ class HybridCacheController(BaseHiCacheController):
                 array("q", prefetch_key.token_ids),
                 extra_key=prefetch_key.extra_key,
                 cache_salt=prefetch_key.cache_salt,
+                request_cache_salt=prefetch_key.request_cache_salt,
                 is_bigram=prefetch_key.is_bigram,
             ),
             last_hash=last_hash,

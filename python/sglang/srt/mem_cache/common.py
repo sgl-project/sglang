@@ -143,11 +143,14 @@ def _req_radix_key(
         key_limit = (
             max_prefix_len if key_limit is None else min(key_limit, max_prefix_len)
         )
+    # Avoid a factory call and keyword dispatch on each prefix probe.
     return RadixKey(
-        token_ids=token_ids,
-        extra_key=req.extra_key,
-        limit=key_limit,
-        cache_salt=req.cache_salt,
+        token_ids,
+        req.extra_key,
+        False,
+        key_limit,
+        req.cache_salt,
+        req._user_cache_salt,
     )
 
 

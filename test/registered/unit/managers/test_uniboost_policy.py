@@ -62,6 +62,7 @@ class FakeReq:
         self.finished_reason = None
         self.extra_key = None
         self.cache_salt = None
+        self._user_cache_salt = None
         self.priority = 0
 
 

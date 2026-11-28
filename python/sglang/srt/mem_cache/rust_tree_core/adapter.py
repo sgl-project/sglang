@@ -7,6 +7,7 @@ import sys
 from array import array
 from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 
+import msgspec
 import torch
 
 from sglang.srt.disaggregation.kv_events import (
@@ -122,7 +123,7 @@ def _kv_event_from_tagged(
 ):
     """Build the Python KV cache event for one of the binding's tagged tuples.
 
-    Rust hashes are LoRA-agnostic; the trailing extra_key selects the LoRA
+    Rust hashes are LoRA-agnostic; extra_key selects the LoRA
     namespace, applied here as in KVCacheEventRecorder.
     """
     tag = event[0]
@@ -150,6 +151,9 @@ def _kv_event_from_tagged(
             lora_id=None,
             medium=StorageMedium(event[5]),
             cache_salt=event[6],
+            request_cache_salt=(
+                event[9] if dynamo_format and event[10] else msgspec.UNSET
+            ),
             session_id=event[7],
             lora_name=lora_name,
             mm_routing_spans=(
@@ -971,12 +975,18 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             # The binding always receives a value tensor; fall back to the
             # token ids materialized on the core's device.
             value = torch.tensor(key_buffer, dtype=torch.int64, device=self.device)
+        # Shared identity marks inheritance; equal-but-distinct salts use the explicit path.
+        has_request_cache_salt = key.request_cache_salt is not key.cache_salt
         step = self._binding.begin_insert(
             self._bindings.InsertParamsBinding(
                 key=key_buffer,
                 value=value,
                 extra_key=key.extra_key,
                 cache_salt=key.cache_salt,
+                request_cache_salt=(
+                    key.request_cache_salt if has_request_cache_salt else None
+                ),
+                has_request_cache_salt=has_request_cache_salt,
                 session_id=params.session_id,
                 mamba_value=params.mamba_value,
                 mamba_host_value=params.mamba_host_value,
@@ -1104,6 +1114,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         host_value: torch.Tensor,
         hash_value: list[str],
     ) -> InsertResult:
+        # Shared identity marks inheritance; equal-but-distinct salts use the explicit path.
+        has_request_cache_salt = key.request_cache_salt is not key.cache_salt
         result = self._binding.insert_host(
             node_id,
             key.extra_key,
@@ -1111,6 +1123,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             host_value,
             list(hash_value),
             key.cache_salt,
+            request_cache_salt=(
+                key.request_cache_salt if has_request_cache_salt else None
+            ),
+            has_request_cache_salt=has_request_cache_salt,
         )
         return InsertResult(
             prefix_len=result.prefix_len,

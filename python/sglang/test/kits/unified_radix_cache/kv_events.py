@@ -1,5 +1,7 @@
 from array import array
 
+import msgspec
+
 from sglang.srt.disaggregation.kv_events import (
     BlockRemoved,
     BlockStored,
@@ -47,8 +49,14 @@ class UnifiedRadixCacheKVEventsFixtures:
         extra_key=None,
         cache_salt=None,
         session_id=None,
+        request_cache_salt=msgspec.UNSET,
     ):
-        key = RadixKey(array("q", tokens), extra_key=extra_key, cache_salt=cache_salt)
+        key = RadixKey(
+            array("q", tokens),
+            extra_key=extra_key,
+            cache_salt=cache_salt,
+            request_cache_salt=request_cache_salt,
+        )
         value = allocator.alloc(len(tokens))
         self.assertIsNotNone(value)
         return cache.insert(
