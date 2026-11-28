@@ -402,6 +402,7 @@ from sglang.srt.rust_server.server import (
 from sglang.srt.sampling.penalties import PenaltyStatusPool, StepPenalties
 from sglang.srt.sampling.sampler_params import SamplerParamsPool
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_pipeline import VerifyRoute
 from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -2997,6 +2998,9 @@ class Scheduler(
             get_total_prefill_busy_us=lambda: self._get_total_prefill_busy_us(),
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
+            get_storage_metrics_collector=lambda: (
+                self.tree_cache.storage_metrics_collector
+            ),
         )
 
     def _get_total_prefill_busy_us(self) -> int:
@@ -5565,8 +5569,7 @@ class Scheduler(
             batch.sampling_info.watermark = build_watermark_rows(
                 batch.reqs, batch.device
             )
-            batch.sampling_info.set_plugin_state(batch.reqs)
-            batch.sampling_info.set_seeds_and_mask_rows(batch.reqs)
+            batch.sampling_info.set_step_state(batch.reqs)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -5691,6 +5694,15 @@ class Scheduler(
                             eagle_prepare_for_verify,
                         )
 
+                        # PP speculative decoding refuses the watermark, so
+                        # only the route is needed, not a bound verify step.
+                        sampling_info = batch.sampling_info
+                        verify_route = VerifyRoute.derive(
+                            sampling_info,
+                            has_grammar=batch.has_grammar,
+                            has_watermark=sampling_info is not None
+                            and sampling_info.watermark is not None,
+                        )
                         # Isolation is load-bearing: eagle_prepare_for_verify
                         # mutates SB fields (forward_mode -> TARGET_VERIFY,
                         # input_ids, out_cache_loc); without the restore the
@@ -5703,6 +5715,7 @@ class Scheduler(
                                     self.req_to_token_pool,
                                     batch,
                                     self.tp_worker,
+                                    route=verify_route,
                                 )
                             )
                             batch_result = self.tp_worker.forward_batch_generation(
@@ -6427,6 +6440,9 @@ class Scheduler(
                         # storage writes still hold host staging
                         # (buffer-mode unified tree only).
                         idle &= tc.buffer_pipeline.is_idle()
+                if idle:
+                    # Waited, not polled, so every rank agrees on idle.
+                    tc.wait_fenced_writes()
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
 

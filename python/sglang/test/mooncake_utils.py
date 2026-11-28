@@ -36,9 +36,7 @@ class MooncakeTestServices:
         self.protocol = protocol
         self.store_segment_size = store_segment_size
         self.device = device if device is not None else self._default_device(protocol)
-        self.local_hostname = local_hostname or socket.gethostbyname(
-            socket.gethostname()
-        )
+        self.local_hostname = local_hostname or "127.0.0.1"
 
         self.master_port = find_available_port(50051)
         self.master_metrics_port = find_available_port(9003)
