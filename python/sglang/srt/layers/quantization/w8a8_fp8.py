@@ -154,7 +154,6 @@ class W8A8Fp8LinearMethod(LinearMethodBase):
         )
 
         weight_loader = extra_weight_attrs.get("weight_loader")
-        self.logical_widths = output_partition_sizes
 
         weight = ModelWeightParameter(
             data=torch.empty(

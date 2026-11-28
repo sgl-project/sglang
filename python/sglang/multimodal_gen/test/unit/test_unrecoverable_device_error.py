@@ -6,10 +6,19 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
+import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.managers import gpu_worker as gpu_worker_module
 from sglang.multimodal_gen.runtime.managers import scheduler as scheduler_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.pipelines_core.executors import (
+    pipeline_executor as pipeline_executor_module,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+    SyncExecutor,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 
 # the two errors reported in #38167, verbatim
 _DRIVER_ERROR = "CUDA driver error: device not ready"
@@ -77,6 +86,109 @@ def test_device_error_exits_the_worker(worker, message, propagate):
     # empty_cache on a broken allocator can raise out of the error handler
     device.empty_cache.assert_not_called()
     worker._record_output_peak_memory.assert_not_called()
+
+
+def _run_grouped_requests(worker, monkeypatch, error, replica_size):
+    """Two grouped requests; the first one's DiT/VAE forward raises ``error``."""
+    monkeypatch.setattr(
+        gpu_worker_module,
+        "current_platform",
+        SimpleNamespace(is_cpu=lambda: True, is_mps=lambda: False),
+    )
+    replica = lambda: SimpleNamespace(world_size=replica_size)
+    monkeypatch.setattr(gpu_worker_module, "get_replica_group", replica)
+    monkeypatch.setattr(
+        pipeline_executor_module, "get_replica_group", replica, raising=False
+    )
+    executor = object.__new__(SyncExecutor)
+    executor.execute_group = lambda stages, batches, server_args: batches
+
+    def execute(stages, batch, server_args):
+        if batch.request_id == "first":
+            if callable(error):
+                raise error()
+            raise error
+        return OutputBatch()
+
+    executor.execute = execute
+    first_stage = SimpleNamespace(
+        iter_sequential_requests=lambda batch, server_args: iter((batch,))
+    )
+    worker.pipeline = SimpleNamespace(
+        forward_batch_sequentially=lambda reqs, server_args: (
+            executor.execute_group_sequentially([first_stage, object()], reqs, None)
+        )
+    )
+    worker.server_args.pipeline_config.supports_sequential_multi_output_inference = (
+        lambda: False
+    )
+    monkeypatch.setattr(Req, "log", lambda self, **kwargs: None)
+    reqs = [
+        Req(sampling_params=SamplingParams(prompt="p", seed=1, request_id=request_id))
+        for request_id in ("first", "second")
+    ]
+    return list(worker.execute_forward_sequentially(reqs))
+
+
+@pytest.mark.parametrize(
+    "error, replica_size",
+    [
+        (RuntimeError(_DRIVER_ERROR), 1),
+        (torch.OutOfMemoryError("allocator OOM"), 2),
+        (torch.AcceleratorError("CUDA error: out of memory"), 2),
+    ],
+)
+def test_grouped_request_fatal_error_exits_the_worker(
+    worker, monkeypatch, error, replica_size
+):
+    worker, _ = worker
+
+    with pytest.raises(SystemExit, match="restart the server"):
+        _run_grouped_requests(worker, monkeypatch, error, replica_size)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        torch.OutOfMemoryError("allocator OOM"),
+        torch.AcceleratorError("CUDA error: out of memory"),
+    ],
+)
+def test_grouped_request_oom_on_a_single_rank_fails_only_that_request(
+    worker, monkeypatch, error
+):
+    worker, _ = worker
+
+    outputs = _run_grouped_requests(worker, monkeypatch, error, 1)
+
+    assert str(error) in outputs[0].error
+    assert outputs[1].error is None
+
+
+def test_grouped_request_quoting_a_domain_name_fails_only_that_request(
+    worker, monkeypatch
+):
+    worker, _ = worker
+
+    outputs = _run_grouped_requests(
+        worker, monkeypatch, ValueError("domain cuda error: x"), 1
+    )
+
+    assert "domain cuda error: x" in outputs[0].error
+    assert outputs[1].error is None
+
+
+def test_grouped_request_wrapped_device_error_exits_the_worker(worker, monkeypatch):
+    worker, _ = worker
+
+    def wrapped():
+        try:
+            raise RuntimeError(_DRIVER_ERROR)
+        except RuntimeError as cause:
+            raise ValueError("unknown domain") from cause
+
+    with pytest.raises(SystemExit, match="restart the server"):
+        _run_grouped_requests(worker, monkeypatch, wrapped, 1)
 
 
 class _Exited(Exception):
