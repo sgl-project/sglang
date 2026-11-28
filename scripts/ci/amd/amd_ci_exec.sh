@@ -86,16 +86,14 @@ fi
 
 echo "First attempt failed with exit code $FIRST_EXIT_CODE"
 
-# Skip retry for test failures that won't be fixed by offline mode:
-#   - Exit 1: Test assertion failures (accuracy below threshold)
-#   - Exit 137 (128+9): Process killed by OOM
-#   - Exit 255: Test suite completed with test errors
-# Only retry for other exit codes (e.g., network timeouts, HF download failures)
-if [[ "$FIRST_EXIT_CODE" -eq 1 || "$FIRST_EXIT_CODE" -eq 137 || "$FIRST_EXIT_CODE" -eq 255 ]]; then
-  echo "Exit code $FIRST_EXIT_CODE indicates test failure (not network issue), not retrying"
+# Offline mode cannot repair pytest failures (1-6), Docker or command
+# invocation errors (125-127), signal exits (128+), or the suite's exit 255.
+if [[ "$FIRST_EXIT_CODE" -le 6 || "$FIRST_EXIT_CODE" -ge 125 ]]; then
+  echo "Exit code $FIRST_EXIT_CODE is not eligible for an offline retry"
   exit $FIRST_EXIT_CODE
 fi
 
+# Preserve the fallback for other statuses without assuming a network cause.
 echo "Retrying with HF_HUB_OFFLINE=1 (offline mode to use cached models)..."
 
 # Second attempt: force HF offline mode to avoid network timeouts
