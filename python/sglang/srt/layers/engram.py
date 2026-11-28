@@ -868,10 +868,10 @@ class _PeerShards:
     def __init__(self, rows: int, dim: int, group, *, mxfp4: bool = False, prop=None):
         from sglang.srt.utils.cuda_vmm_utils import (
             VmmReservation,
-            align_up,
             get_allocation_granularity,
             make_device_allocation_prop,
         )
+        from sglang.srt.utils.vmm_common import align_up
 
         self.rows = rows
         self.dim = dim

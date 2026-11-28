@@ -1,10 +1,32 @@
+import atexit
+import os
 import sys
 from typing import Callable, List, Optional, Sequence
 
 import pytest
 import torch
+import torch.distributed as dist
 
+from sglang.srt.utils import get_device_module
 from sglang.test.kernels.multigpu import multigpu_launch
+
+
+def local_device_id() -> int:
+    """This rank's accelerator index under torchrun, left current for the caller."""
+    device_id = int(os.environ.get("LOCAL_RANK", 0))
+    get_device_module().set_device(device_id)
+    return device_id
+
+
+def gloo_group() -> dist.ProcessGroup:
+    """The world gloo group, initialized on first use and destroyed at exit."""
+    if not dist.is_initialized():
+        # Make this rank's device current before the first collective, so tensors
+        # a case allocates without an explicit device land on the right one.
+        local_device_id()
+        dist.init_process_group(backend="gloo")
+        atexit.register(dist.destroy_process_group)
+    return dist.group.WORLD
 
 
 def multigpu_pytest_main(

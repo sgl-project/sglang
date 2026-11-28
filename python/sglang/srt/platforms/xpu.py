@@ -15,6 +15,16 @@ from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
 logger = logging.getLogger(__name__)
 
 
+def _device_memory_in_use(device_id: int) -> int:
+    """Device memory in use on an XPU: torch's allocator plus the Level Zero physical memory DWDP creates, which torch cannot see."""
+    # lazy: xpu_vmm_utils imports sglang.srt.utils.common, which imports this module
+    from sglang.srt.utils.xpu_vmm_utils import local_physical_memory_bytes
+
+    return torch.xpu.memory_allocated(device_id) + local_physical_memory_bytes(
+        device_id
+    )
+
+
 class XpuDeviceMixin(DeviceMixin):
     """XPU implementation of the shared device operations."""
 
@@ -54,6 +64,12 @@ class XpuDeviceMixin(DeviceMixin):
     def synchronize(self) -> None:
         torch.xpu.synchronize()
 
+    def get_vmm_backend_class(self) -> type:
+        # lazy: xpu_vmm_utils imports sglang.srt.utils.common, which imports this module
+        from sglang.srt.utils.xpu_vmm_utils import XpuVmmBackend
+
+        return XpuVmmBackend
+
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
         # TODO: simple return of torch.xpu.mem_get_info
         """Return the available and total device memory in Bytes."""
@@ -73,7 +89,7 @@ class XpuDeviceMixin(DeviceMixin):
                 current,
             )
 
-        used_memory = torch.xpu.memory_allocated(device_id)
+        used_memory = _device_memory_in_use(device_id)
         total_gpu_memory = torch.xpu.get_device_properties(device_id).total_memory
         free_gpu_memory = total_gpu_memory - used_memory
 
