@@ -20,6 +20,22 @@ def test_apply_token_bitmask_inplace_kernel():
     torch.testing.assert_close(logits_gpu, expected.to("cuda"))
 
 
+def test_apply_token_bitmask_inplace_empty_batch_is_noop():
+    # An empty batch or an empty indices tensor must not divide by zero in the
+    # grid-layout dispatch (previously killed the process with SIGFPE).
+    logits = torch.empty((0, 64), dtype=torch.float32, device="cuda")
+    bitmask = torch.empty((0, 2), dtype=torch.int32, device="cuda")
+    apply_token_bitmask_inplace_cuda(logits, bitmask)
+
+    logits = torch.randn((4, 64), dtype=torch.float32, device="cuda")
+    bitmask = torch.randint(0, 2, (4, 2), dtype=torch.int32, device="cuda")
+    indices = torch.empty((0,), dtype=torch.int32, device="cuda")
+    before = logits.clone()
+    apply_token_bitmask_inplace_cuda(logits, bitmask, indices)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(logits, before)
+
+
 if __name__ == "__main__":
     test_apply_token_bitmask_inplace_kernel()
     sys.exit(pytest.main([__file__]))
