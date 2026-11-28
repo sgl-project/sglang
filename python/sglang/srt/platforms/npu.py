@@ -81,3 +81,10 @@ class NPUSRTPlatform(NPUDeviceMixin, SRTPlatform):
 
     def get_dispatch_key_name(self) -> str:
         return "npu"
+
+    def on_destroy_model_parallel(self) -> None:
+        from sglang.srt.hardware_backend.npu.moe.mega_moe import (
+            destroy_mega_moe_buffers,
+        )
+
+        destroy_mega_moe_buffers()

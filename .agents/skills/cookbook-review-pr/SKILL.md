@@ -50,6 +50,10 @@ than restating.
   `cookbook-add-model` hardware table moves with it). A new catalog entry is inert for
   other pages: each filters the catalog by its own `supportedHardware`.
 - `placeholders` declares every `{{KEY}}` used in `curl` or any cell.
+- **Renamed ids reset ratings**: a renamed or removed hardware / dim / option id, or a
+  moved or renamed MDX page, restarts the ratings of every recipe it touches (ids are
+  the rating keys — `ratingKey` in `_deployment.jsx`). New pages and new ids are fine;
+  for a rename on an existing page, ask the PR body to name the reset recipes.
 - `modelNames` covers every cell (by `hw|variant|quant` triple or `variant|quant` pair).
 - `strategies` count matches the page's operating points — 1 recipe → a single `balanced`;
   2 → `low-latency` + `high-throughput`; 3 → the full trio. Tiers apply per
