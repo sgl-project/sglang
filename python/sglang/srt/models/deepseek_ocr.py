@@ -1610,42 +1610,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         )
         return features.view(-1, n_dim2)
 
-    def _parse_and_validate_image_input(self, **kwargs: object):
-
-        pixel_values = kwargs.pop("pixel_values", None)
-        images_spatial_crop = kwargs.pop("images_spatial_crop", None)
-        images_crop = kwargs.pop("images_crop", None)
-        has_images = kwargs.pop("has_images", None)
-
-        if pixel_values is None:
-            return None
-        if has_images is not None:
-            if not has_images:
-                return None
-        elif torch.sum(pixel_values).item() == 0:
-            return None
-
-        if pixel_values is not None:
-            if not isinstance(pixel_values, (torch.Tensor, list)):
-                raise ValueError(
-                    f"Incorrect type of pixel values. Got type: {type(pixel_values)}"
-                )
-
-            if not isinstance(images_spatial_crop, (torch.Tensor, list)):
-                raise ValueError(
-                    "Incorrect type of image sizes. "
-                    f"Got type: {type(images_spatial_crop)}"
-                )
-
-            if not isinstance(images_crop, (torch.Tensor, list)):
-                raise ValueError(
-                    f"Incorrect type of image crop. Got type: {type(images_crop)}"
-                )
-
-            return [pixel_values, images_crop, images_spatial_crop]
-
-        raise AssertionError("This line should be unreachable.")
-
     def _pixel_values_to_embedding(
         self,
         pixel_values: torch.Tensor,
@@ -1769,18 +1733,6 @@ class DeepseekOCRForCausalLM(nn.Module):
         vision_features = torch.cat(vision_feature_lists, dim=0).type(target_dtype)
 
         return vision_features
-
-    def get_language_model(self) -> torch.nn.Module:
-        return self.model
-
-    def get_multimodal_embeddings(
-        self, **kwargs: object
-    ) -> Optional[MultiModalEmbeddings]:
-        image_input = self._parse_and_validate_image_input(**kwargs)
-        if image_input is None:
-            return None
-        vision_embeddings = self._process_image_input(image_input)
-        return vision_embeddings
 
     def get_input_embeddings(
         self,

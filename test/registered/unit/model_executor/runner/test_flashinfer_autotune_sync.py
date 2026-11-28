@@ -26,6 +26,7 @@ from unittest.mock import Mock, patch
 import torch
 import torch.distributed as dist
 
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import flashinfer_autotune as autotune
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     _autotune_cache_digest,
@@ -131,7 +132,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                     patch.multiple(
                         autotune,
                         flashinfer_autotune_cache_path=lambda _: cache_path,
-                        get_flashinfer_autotune_skip_ops=lambda _: skip_ops,
+                        get_flashinfer_autotune_skip_ops=lambda: skip_ops,
                         get_exec=lambda: SimpleNamespace(
                             moe=SimpleNamespace(moe_runner_backend="flashinfer_megamoe")
                         ),
@@ -182,7 +183,7 @@ class TestMegaMoEAutotuneStartup(CustomTestCase):
                 patch.multiple(
                     autotune,
                     flashinfer_autotune_cache_path=lambda _: cache_path,
-                    get_flashinfer_autotune_skip_ops=lambda _: set(),
+                    get_flashinfer_autotune_skip_ops=lambda: set(),
                     get_exec=lambda: SimpleNamespace(
                         moe=SimpleNamespace(moe_runner_backend="triton")
                     ),
@@ -351,6 +352,65 @@ class TestModelPrefillAutotune(CustomTestCase):
                 self.hook.assert_not_called()
                 self.flashinfer_autotune_context.assert_not_called()
 
+    def test_hook_covers_verify_rows_above_prefill_chunk(self):
+        self.max_prefill_buffer_tokens.return_value = 1024
+        autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=1152)
+        self.hook.assert_called_once_with(1152, dtype=torch.bfloat16)
+
+        self.hook.reset_mock()
+        self.max_prefill_buffer_tokens.return_value = 4096
+        autotune.maybe_flashinfer_autotune_extend(self.runner, decode_num_tokens=768)
+        self.hook.assert_called_once_with(4096, dtype=torch.bfloat16)
+
+
+class TestExtendAutotuneDummy(CustomTestCase):
+    """SGLANG_FLASHINFER_AUTOTUNE_EXTEND must tune exactly the per-rank prefill
+    ceiling: speculative targets were skipped, and a request-pool-capped dummy
+    rounded past the ceiling overflows FlashInfer A2A dispatch workspaces."""
+
+    def _run_extend_pass(self, *, speculative: bool):
+        mr = SimpleNamespace(
+            model=SimpleNamespace(),
+            is_generation=True,
+            is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(is_speculative=lambda: speculative),
+            attn_backend=SimpleNamespace(extend_dummy_seqs_capped_by_req_pool=True),
+            req_to_token_pool=SimpleNamespace(size=12),
+        )
+        runner = SimpleNamespace(
+            model_runner=mr,
+            _alloc_dummy_decode_buffers=Mock(return_value=SimpleNamespace()),
+            _dummy_run=Mock(),
+        )
+        with (
+            patch.object(autotune, "max_prefill_buffer_tokens", return_value=4096),
+            patch.object(
+                autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_EXTEND,
+                "get",
+                return_value=True,
+            ),
+            patch.object(
+                autotune,
+                "run_flashinfer_autotune_forward",
+                side_effect=lambda mr, forward_fn, run_lm_head: forward_fn(),
+            ),
+            patch.object(autotune, "autotune_dummy_run_ctx"),
+            patch.object(autotune.torch.cuda, "empty_cache"),
+        ):
+            autotune.maybe_flashinfer_autotune_extend(runner, decode_num_tokens=48)
+        return runner._dummy_run.call_args.kwargs
+
+    def test_dummy_is_an_even_split_of_the_prefill_ceiling(self):
+        for speculative in (False, True):
+            with self.subTest(speculative=speculative):
+                kwargs = self._run_extend_pass(speculative=speculative)
+                self.assertEqual(kwargs["forward_mode_override"], ForwardMode.EXTEND)
+                # 4096 tokens over at most 12 request slots: 8 seqs x 512.
+                self.assertEqual(
+                    (kwargs["batch_size"], kwargs["extend_num_tokens_per_req"]),
+                    (8, 512),
+                )
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "FlashInfer requires CUDA")
 class TestAutotuneCachePhases(CustomTestCase):
@@ -377,6 +437,12 @@ class TestAutotuneCachePhases(CustomTestCase):
                     )
                 )
             with (
+                # The per-rank JSON cache, which multi-rank and MegaMoE keep.
+                patch.object(
+                    autotune,
+                    "uses_flashinfer_managed_autotune_cache",
+                    return_value=False,
+                ),
                 patch.object(
                     autotune,
                     "flashinfer_autotune_cache_path",

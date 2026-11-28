@@ -513,12 +513,13 @@ class TestCPUGraph(CustomTestCase):
         import sglang.srt.model_executor.cuda_graph_config as cuda_graph_config_mod
 
         exec_ctx = SimpleNamespace(
+            moe=SimpleNamespace(enable_paged_experts=False),
             graph=SimpleNamespace(
                 cuda_graph_config=CudaGraphConfig(
                     prefill=PhaseConfig(backend=prefill_backend, max_bs=prefill_max_bs),
                     decode=PhaseConfig(backend=decode_backend, max_bs=decode_max_bs),
                 )
-            )
+            ),
         )
         flags_ctx = SimpleNamespace(
             capture=SimpleNamespace(enable_torch_compile=enable_torch_compile)
@@ -1079,6 +1080,7 @@ class TestCPUGraph(CustomTestCase):
         forward_batch.extend_seq_lens_cpu = [150, 150]
         forward_batch.extend_logprob_start_lens_cpu = [0, 0]
         forward_batch.top_logprobs_nums = [2, 2]
+        forward_batch.input_candidate_selectors = [None, 3]
         forward_batch.token_ids_logprobs = [None, None]
 
         # 1. Assert _prepare_dynamic_prefill_batch refreshes return_logprob
@@ -1086,6 +1088,7 @@ class TestCPUGraph(CustomTestCase):
         self.assertTrue(prepared.return_logprob)
         self.assertEqual(prepared.extend_logprob_start_lens_cpu, [0, 0])
         self.assertEqual(prepared.top_logprobs_nums, [2, 2])
+        self.assertEqual(prepared.input_candidate_selectors, [None, 3])
 
         # 2. Assert full _execute_prefill_graph with eager logits tail returns requested logprobs
         runner.model_runner = SimpleNamespace(

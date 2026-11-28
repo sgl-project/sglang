@@ -28,10 +28,10 @@ def _with_zero_draft_probs(kernel):
 
 if is_npu():
     try:
-        from sgl_kernel_npu.sample import (
-            chain_speculative_sampling_triton,
+        from sgl_kernel_npu.operators.speculative import (
+            chain_speculative_sampling as chain_speculative_sampling_triton,
         )
-        from sgl_kernel_npu.sample import (
+        from sgl_kernel_npu.operators.speculative import (
             tree_speculative_sampling_target_only as _npu_tree_sampling,
         )
     except ImportError:

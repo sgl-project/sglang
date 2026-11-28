@@ -30,6 +30,7 @@ from sglang.srt.disaggregation.encoder.preprocessor import (
 )
 from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
+    is_epd_accelerator,
     video_meta_attrs_for,
 )
 from sglang.srt.distributed.parallel_state import (
@@ -61,7 +62,7 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
     resolve_encoder_media_processor_config,
 )
-from sglang.srt.multimodal.media_io import configure_media_url_security
+from sglang.srt.multimodal.media_io import configure_worker_media_policy
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import (
@@ -75,6 +76,7 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import current_device_stream
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -400,7 +402,7 @@ class TensorWrapper:
 
     def __init__(self, tensor):
         # Ensure tensor is on CPU and contiguous
-        if tensor.is_cuda:
+        if is_epd_accelerator(tensor.device):
             tensor = tensor.cpu()
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
@@ -547,19 +549,10 @@ class MMEncoder:
         argument."""
         assert_published(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
-        self.server_args = server_args
-        configure_media_url_security(
-            get_mm().allowed_media_domains,
-            get_mm().media_url_max_file_size_mb,
-            get_mm().media_url_timeout,
-            get_mm().allow_local_media_files,
-        )
+        configure_worker_media_policy(get_mm())
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
         self.rank = rank
-        # DP rank for metric labels; overridden by runtime.run_dp_worker.
-        # 0 in the single-instance (non-DP) path.
-        self.dp_rank = 0
         self.profiler = EncoderProfiler(rank)
 
         self.model_config = ModelConfig.from_server_args(
@@ -1584,7 +1577,8 @@ class MMEncoder:
                         copied += n
                 offset += num_tokens
 
-            torch.cuda.current_stream(self.device).synchronize()
+            if is_epd_accelerator(self.device):
+                current_device_stream(self.device).synchronize()
             return mm_embedding
         finally:
             if hit_view_hashes:
@@ -1634,7 +1628,8 @@ class MMEncoder:
             offset += num_tokens
 
         self.mm_global_cache.wait_load_to_device(copy_handles)
-        torch.cuda.current_stream(mm_embedding.device).synchronize()
+        if is_epd_accelerator(mm_embedding.device):
+            current_device_stream(mm_embedding.device).synchronize()
         return mm_embedding
 
     async def _compute_global_cache_embedding(
@@ -1921,11 +1916,9 @@ class MMEncoder:
         self,
         embedding: torch.Tensor,
         mm_data: EmbeddingData,
+        url: str,
         session_id=None,
         buffer_address=None,
-        prefill_host=None,
-        embedding_port=None,
-        url=None,
     ):
         if get_disagg().encoder_transfer_backend == "mooncake":
             # Encode is synchronous, so mm_data was staged before /encode returned.
@@ -1991,10 +1984,7 @@ class MMEncoder:
             # Sibling ranks re-read mm_data here; meta_registry owns the release.
 
         # Send ack/data
-        if url is not None:
-            endpoint = NetworkAddress.parse(url).to_tcp()
-        else:
-            endpoint = NetworkAddress(prefill_host, embedding_port).to_tcp()
+        endpoint = NetworkAddress.parse(url).to_tcp()
         logger.info(f"{endpoint = }")
 
         # Serialize data
@@ -2203,10 +2193,10 @@ class MMEncoder:
                 item_offset = item_end
                 token_offset += num_tokens
 
-            # transfer_sync bypasses CUDA streams, so GPU writes (forward and the
-            # per-request clones) must land before /send reads the buffers.
-            if keep_on_gpu and mm_embedding.is_cuda:
-                torch.cuda.current_stream(mm_embedding.device).synchronize()
+            # transfer_sync bypasses device streams, so device writes (forward and
+            # the per-request clones) must land before /send reads the buffers.
+            if keep_on_gpu and is_epd_accelerator(mm_embedding.device):
+                current_device_stream(mm_embedding.device).synchronize()
             self._stage_embedding_batch(staged_embeddings)
             return results
         except BaseException:
@@ -2264,9 +2254,8 @@ class MMEncoder:
             )
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
 
-            if self.profiler is not None:
-                for _ in requests:
-                    self.profiler.step()
+            for _ in requests:
+                self.profiler.step()
 
             return self._stage_embeddings(
                 ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu
@@ -2502,8 +2491,6 @@ async def run_encoder(
 async def _handle_encoder_worker_request(encoder: MMEncoder, request):
     if isinstance(request, ProfileReq):
         if request.req_type == ProfileReqType.START_PROFILE:
-            if encoder.profiler is None:
-                encoder.profiler = EncoderProfiler(encoder.rank)
             encoder.profiler.start(request)
         else:
             encoder.profiler.stop()

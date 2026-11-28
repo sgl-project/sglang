@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import asyncio
-import base64
 import os
 import signal
 import uuid
@@ -10,10 +9,13 @@ from typing import TYPE_CHECKING, Optional
 
 import httpx
 import psutil
+import pybase64
 import torch
-from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_rank
@@ -24,6 +26,12 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     StopProfileReq,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
+from sglang.multimodal_gen.runtime.entrypoints.openai.media_privacy import (
+    PRIVATE_CACHE_CONTROL,
+    MediaGatewayMiddleware,
+    read_gateway_key,
+    validate_gateway_payload,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.prompt_enhancement import (
     PromptEnhancer,
 )
@@ -49,6 +57,9 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
 )
+from sglang.multimodal_gen.runtime.managers.request_watchdog import (
+    start_request_watchdog,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
 from sglang.multimodal_gen.runtime.scheduler_client import (
     async_scheduler_client,
@@ -71,6 +82,7 @@ from sglang.srt.observability.http_request_metrics import (
     init_http_request_metrics,
 )
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
+from sglang.srt.utils.auth import add_api_key_middleware
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
 
@@ -112,10 +124,18 @@ async def _wait_until_http_live(server_args: ServerArgs) -> None:
     raise RuntimeError(f"HTTP server did not become live at {liveness_url}")
 
 
-async def _run_server_warmup_after_http_live(
-    server_args: ServerArgs, warmup_done: asyncio.Event
-) -> None:
+async def _run_server_warmup_after_http_live(app: FastAPI) -> None:
+    server_args = app.state.server_args
+    warmup_done = app.state.server_warmup_done
+
+    def check_backend() -> None:
+        error = async_scheduler_client.failure_reason or _backend_failure(app)
+        if error is not None:
+            async_scheduler_client.mark_failed(error)
+            raise RuntimeError(error)
+
     try:
+        check_backend()
         if not should_run_synthetic_server_warmup(server_args):
             warmup_done.set()
             return
@@ -126,13 +146,19 @@ async def _run_server_warmup_after_http_live(
             server_args,
             async_scheduler_client.forward,
             fail_open=server_args.warmup_resolutions is None,
+            check_backend=check_backend,
         )
+        # A worker can exit after replying, before the periodic monitor runs.
+        check_backend()
         logger.info("The server is fired up and ready to roll!")
         warmup_done.set()
     except asyncio.CancelledError:
         raise
     except Exception as e:
         logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
+        if not async_scheduler_client.failure_reason:
+            async_scheduler_client.mark_failed(str(e))
+        warmup_done.set()
         os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -158,6 +184,9 @@ async def lifespan(app: FastAPI):
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     app.state.broker_task = broker_task
     backend_monitor = asyncio.create_task(_monitor_backend(app))
+    request_watchdog = start_request_watchdog(
+        server_args, app.state.worker_processes, async_scheduler_client.mark_failed
+    )
     # 3. Receive per-step progress of video jobs from the replica drivers
     progress_task = None
     if server_args.progress_endpoint is not None:
@@ -169,9 +198,7 @@ async def lifespan(app: FastAPI):
         start_cancel_publisher(server_args.cancel_endpoint, server_args.dp_size)
     warmup_task = None
     if server_args.warmup_mode == "server":
-        warmup_task = asyncio.create_task(
-            _run_server_warmup_after_http_live(server_args, warmup_done)
-        )
+        warmup_task = asyncio.create_task(_run_server_warmup_after_http_live(app))
     else:
         warmup_done.set()
 
@@ -186,6 +213,10 @@ async def lifespan(app: FastAPI):
         backend_monitor.cancel()
         with suppress(asyncio.CancelledError):
             await backend_monitor
+        if request_watchdog is not None:
+            request_watchdog.cancel()
+            with suppress(asyncio.CancelledError):
+                await request_watchdog
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -233,7 +264,11 @@ def _backend_failure(app: FastAPI) -> str | None:
                 continue
         except psutil.NoSuchProcess:
             pass
-        return "Scheduler worker exited; restart the server."
+        return (
+            f"Scheduler worker exited (pid={worker.pid}); restart the server. "
+            "Possible SIGKILL from a host/cgroup OOM: check memory.events "
+            "(oom_kill) and kernel logs."
+        )
     return None
 
 
@@ -254,7 +289,7 @@ async def health(request: Request):
     """Report readiness for normal inference traffic."""
     error = async_scheduler_client.failure_reason or _backend_failure(request.app)
     if error is not None:
-        return orjson_response({"status": "unhealthy", "error": error}, status_code=503)
+        return orjson_response({"status": "unhealthy"}, status_code=503)
     if not request.app.state.server_warmup_done.is_set():
         return Response(status_code=503)
     return {"status": "ok"}
@@ -510,45 +545,48 @@ async def stop_profile():
     errors = []
     profile_id = _global_profiler_state.get("profile_id", "unknown")
 
+    host_failed = False
     try:
-        # 1. Stop profiler in HTTP Server process
         profiler = _global_profiler_state["profiler"]
         if profiler is not None:
-            profiler.stop(export_trace=True, dump_rank=None)  # Save for all ranks
-
-        stop_req = StopProfileReq(export_trace=True)
-        try:
-            response = await async_scheduler_client.forward(stop_req)
-            if response.error:
-                errors.append(f"GPU Worker: {response.error}")
-        except Exception as e:
-            errors.append(f"GPU Worker: {str(e)}")
-
-        _global_profiler_state["profiler"] = None
-        _global_profiler_state["is_profiling"] = False
-        _global_profiler_state["profile_id"] = None
-
-        logger.info(f"Profilers stopped (profile_id={profile_id}). Traces saved.")
-
-        if errors:
-            return Response(
-                content=f"Profiling stopped (profile_id={profile_id}) with warnings: {'; '.join(errors)}\n",
-                status_code=200,
-            )
-        return Response(
-            content=f"Profiling stopped (profile_id={profile_id}). Traces saved to SGLANG_TORCH_PROFILER_DIR.\n",
-            status_code=200,
-        )
-
+            profiler.stop(export_trace=True, dump_rank=None)
     except Exception as e:
-        logger.error(f"Failed to stop profiler: {e}")
+        host_failed = True
+        errors.append(f"HTTP Server: {e}")
+
+    try:
+        response = await async_scheduler_client.forward(
+            StopProfileReq(export_trace=True)
+        )
+        if response.error:
+            errors.append(f"GPU Worker: {response.error}")
+    except Exception as e:
+        errors.append(f"GPU Worker: {e}")
+    finally:
         _global_profiler_state["profiler"] = None
         _global_profiler_state["is_profiling"] = False
         _global_profiler_state["profile_id"] = None
-        return Response(
-            content=f"Failed to stop profiler: {str(e)}\n",
-            status_code=500,
+
+    if errors:
+        details = "; ".join(errors)
+        if host_failed:
+            logger.error(
+                "Failed to stop profiler (profile_id=%s): %s", profile_id, details
+            )
+            return Response(
+                content=f"Failed to stop profiler: {details}\n", status_code=500
+            )
+        message = (
+            f"Profiling stopped (profile_id={profile_id}) with warnings: {details}"
         )
+        logger.warning(message)
+        return Response(content=f"{message}\n", status_code=200)
+
+    logger.info("Profilers stopped (profile_id=%s).", profile_id)
+    return Response(
+        content=f"Profiling stopped (profile_id={profile_id}). Traces saved to SGLANG_TORCH_PROFILER_DIR.\n",
+        status_code=200,
+    )
 
 
 def make_serializable(obj):
@@ -569,7 +607,7 @@ def encode_video_to_base64(file_path: str):
         content = f.read()
     if not content:
         raise ValueError(f"Empty model output file: {file_path}")
-    return base64.b64encode(content).decode("utf-8")
+    return pybase64.b64encode(content).decode("utf-8")
 
 
 async def forward_to_scheduler(
@@ -659,6 +697,45 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     return orjson_response({"predictions": results})
 
 
+class _ServingHTTPMiddleware:
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def send_private(message: Message):
+            # Attach before the response starts, including file streaming and metrics mode.
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Cache-Control"] = PRIVATE_CACHE_CONTROL
+            await send(message)
+
+        # completed results and diagnostics remain readable after a worker failure
+        requires_backend = scope["method"] == "POST" or scope["path"] in (
+            "/v1/models",
+            "/models",
+        )
+        backend_failed = requires_backend and bool(
+            async_scheduler_client.failure_reason
+        )
+        warmup_done = getattr(scope["app"].state, "server_warmup_done", None)
+        if (
+            not backend_failed
+            and warmup_done is not None
+            and not warmup_done.is_set()
+            and scope["path"] not in SERVER_WARMUP_BYPASS_PATHS
+        ):
+            await warmup_done.wait()
+            backend_failed = bool(async_scheduler_client.failure_reason)
+        if backend_failed:
+            response = orjson_response(
+                {"error": "Inference backend unavailable"}, status_code=503
+            )
+            return await response(scope, receive, send_private)
+        await self.app(scope, receive, send_private)
+
+
 def create_app(
     server_args: ServerArgs,
     *,
@@ -686,38 +763,39 @@ def create_app(
         allow_headers=["*"],
     )
 
-    @app.middleware("http")
-    async def wait_for_server_warmup(request: Request, call_next):
-        # Keep GETs available for completed results and failure diagnostics.
-        if request.method == "POST" and async_scheduler_client.failure_reason:
-            return orjson_response(
-                {"error": async_scheduler_client.failure_reason}, status_code=503
-            )
-        warmup_done = getattr(request.app.state, "server_warmup_done", None)
-        if (
-            warmup_done is not None
-            and not warmup_done.is_set()
-            and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
-        ):
-            await warmup_done.wait()
-        return await call_next(request)
+    app.add_middleware(_ServingHTTPMiddleware)
+    gateway = server_args.media_gateway_key_file is not None
+    if gateway:
+        app.add_middleware(
+            MediaGatewayMiddleware,
+            key=read_gateway_key(server_args.media_gateway_key_file),
+        )
+        app.add_api_route("/liveness", liveness, methods=["GET"])
+        app.add_api_route("/health", health, methods=["GET"])
+    else:
+        from sglang.multimodal_gen.runtime.entrypoints.openai import common_api
 
-    app.include_router(health_router)
-    app.include_router(vertex_router)
+        app.include_router(health_router)
+        app.include_router(vertex_router)
+        app.include_router(common_api.router)
+        app.include_router(realtime_video_api.router)
+        if server_args.pipeline_config.supports_action_endpoint():
+            app.include_router(action_api.router)
+        if server_args.pipeline_config.supports_openpi_endpoint():
+            app.include_router(openpi.router)
+        app.include_router(weights_api.router)
+        app.include_router(rollout_api.router)
 
-    from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
+    from sglang.multimodal_gen.runtime.entrypoints.openai import mesh_api
 
-    app.include_router(common_api.router)
-    app.include_router(image_api.router)
-    app.include_router(video_api.router)
-    app.include_router(realtime_video_api.router)
-    if server_args.pipeline_config.supports_action_endpoint():
-        app.include_router(action_api.router)
-    if server_args.pipeline_config.supports_openpi_endpoint():
-        app.include_router(openpi.router)
-    app.include_router(mesh_api.router)
-    app.include_router(weights_api.router)
-    app.include_router(rollout_api.router)
+    media_dependencies = [Depends(validate_gateway_payload)] if gateway else []
+    app.include_router(image_api.router, dependencies=media_dependencies)
+    app.include_router(video_api.router, dependencies=media_dependencies)
+    app.include_router(mesh_api.router, dependencies=media_dependencies)
+    # Outermost: route levels come from sglang/srt/utils/auth_levels.json.
+    add_api_key_middleware(
+        app, get_keys=lambda: (server_args.api_key, server_args.admin_api_key)
+    )
 
     app.state.server_args = server_args
     app.state.prompt_enhancer = None

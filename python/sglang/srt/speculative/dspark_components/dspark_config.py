@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_DSPARK_GAMMA = 7
-SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn")
+SUPPORTED_DSPARK_MARKOV_HEAD_TYPES = ("vanilla", "gated", "rnn", "rnn_hidden")
 
 # The dsv4 self-drafting checkpoint runs its draft attention on the dedicated
 # DeepSeek-V4 backend instead of the generic draft-backend fallback.
@@ -185,6 +185,10 @@ def checkpoint_bundles_dspark_draft(hf_config: Any) -> bool:
     """The checkpoint carries a bundled DSpark draft head, marked by the
     prefixed dspark_* keys on the target hf config. Single source of truth
     for the bundling convention (draft-path defaulting, draft-arch remap)."""
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
+    if _cfg_get(hf_config, "architectures", None) in [[a] for a in INKLING2_ARCHS]:
+        return _cfg_get(hf_config, "mtp_config", None) is not None
     return any(
         _cfg_get(hf_config, key, None) is not None
         for key in (
@@ -234,6 +238,19 @@ def _get_dspark_config(config: Any) -> dict:
 
 
 def parse_dspark_draft_config(*, draft_hf_config: Any) -> DSparkDraftConfig:
+    from sglang.srt.configs.inkling2 import INKLING2_ARCHS
+
+    if _cfg_get(draft_hf_config, "architectures", None) in [
+        [a] for a in INKLING2_ARCHS
+    ]:
+        from sglang.srt.configs.inkling2 import (
+            Inkling2MTPConfig,
+            inkling2_config_from_dict,
+        )
+
+        if isinstance(draft_hf_config, dict):
+            draft_hf_config = inkling2_config_from_dict(draft_hf_config)
+        draft_hf_config = Inkling2MTPConfig.from_target(draft_hf_config)
     base = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
 
     dspark_cfg = _get_dspark_config(draft_hf_config)

@@ -35,7 +35,7 @@ def _selector_accept(candidates, target_tokens, cutoff_verify_lens):
         _draft_probs_buf=None,
         _block_verification=False,
         _tp_sync=types.SimpleNamespace(sync=lambda site, tensor: tensor),
-        _megakernel_bcast=None,
+        _use_triton_accept_bonus=False,
         block_size=block,
     )
     worker._selector_sampling_accept = types.MethodType(
@@ -49,6 +49,7 @@ def _selector_accept(candidates, target_tokens, cutoff_verify_lens):
             temperatures=torch.ones(bs, 1, device=DEVICE),
             need_top_k_sampling=False,
             need_top_p_sampling=False,
+            need_min_p_sampling=False,
         ),
         draft_input=None,
         prefix_lens=torch.zeros(bs, dtype=torch.int64, device=DEVICE),

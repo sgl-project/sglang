@@ -8,6 +8,13 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     StagingBuffer,
     _fused_gather_to_staging_kernel,
 )
+from sglang.srt.disaggregation.nixl.transport import NixlHandle, StridedRun
+
+
+def _raise_failure(handle: NixlHandle, error_msg: str):
+    if handle.error is not None:
+        raise handle.error
+    raise RuntimeError(error_msg)
 
 
 def packed_page_indices(*, num_tensors, dst_pages, dst_num_slots):
@@ -24,21 +31,22 @@ def packed_page_indices(*, num_tensors, dst_pages, dst_num_slots):
 
 class PackedKVSender:
     def __init__(
-        self, *, agent, gpu_id, size_bytes, register_memory, await_handles, prep_dlist
+        self, *, transport, layout, gpu_id, size_bytes, register_memory, await_handles
     ):
-        self.agent = agent
+        self.transport = transport
         self.gpu_id = gpu_id
         self.await_handles = await_handles
-        # prep_dlist(peer_name, Nx5 strided runs, mem_kind) -> prepped dlist handle.
         # Transfers are built from cached dlists by index, as the unpacked path does:
         # initialize_xfer over raw descriptors costs tens of ms of CPU per batch.
-        self.prep_dlist = prep_dlist
-        self._src_handles: dict[int, object] = {}
-        self._dst_handles: dict[tuple, object] = {}
+        # The transport keeps them under names prefixed with `layout`, one per worker.
+        self.layout = layout
         self.buffer = StagingBuffer(
             size_bytes=size_bytes, device=f"cuda:{gpu_id}", gpu_id=gpu_id
         )
-        register_memory(self.buffer.get_ptr(), self.buffer.get_size())
+        # register_memory(ptr, size) -> the key the buffer is registered under.
+        self._buffer_key = register_memory(
+            self.buffer.get_ptr(), self.buffer.get_size()
+        )
         self.inflight = None
         self._src_pointers: dict[tuple[int, ...], torch.Tensor] = {}
 
@@ -82,30 +90,35 @@ class PackedKVSender:
             )
         stream.synchronize()
 
-    def _src_handle(self, page_bytes):
-        handle = self._src_handles.get(page_bytes)
-        if handle is None:
+    def _src_layout(self, page_bytes):
+        layout = f"{self.layout}:{page_bytes}"
+        if not self.transport.is_prepared(remote=None, layout=layout):
             slots = self.buffer.get_size() // page_bytes
-            runs = np.array(
-                [(self.buffer.get_ptr(), page_bytes, self.gpu_id, page_bytes, slots)],
-                dtype=np.uint64,
+            run = StridedRun(
+                key=self._buffer_key,
+                offset=0,
+                length=page_bytes,
+                stride=page_bytes,
+                count=slots,
             )
-            handle = self._src_handles[page_bytes] = self.prep_dlist("", runs, "VRAM")
-        return handle
+            self.transport.prepare(remote=None, layout=layout, runs=[run])
+        return layout
 
-    def _dst_handle(self, peer_name, dst_ptrs, page_bytes, dst_num_slots, dst_gpu_id):
-        key = (peer_name, tuple(dst_ptrs), page_bytes, dst_num_slots)
-        handle = self._dst_handles.get(key)
-        if handle is None:
-            runs = np.array(
-                [
-                    (p, page_bytes, dst_gpu_id, page_bytes, dst_num_slots)
-                    for p in dst_ptrs
-                ],
-                dtype=np.uint64,
-            )
-            handle = self._dst_handles[key] = self.prep_dlist(peer_name, runs, "VRAM")
-        return handle
+    def _dst_layout(self, remote, target, dst_keys, page_bytes, dst_num_slots):
+        layout = f"{self.layout}:{target}:{page_bytes}:{dst_num_slots}"
+        if not self.transport.is_prepared(remote=remote, layout=layout):
+            runs = [
+                StridedRun(
+                    key=k,
+                    offset=0,
+                    length=page_bytes,
+                    stride=page_bytes,
+                    count=dst_num_slots,
+                )
+                for k in dst_keys
+            ]
+            self.transport.prepare(remote=remote, layout=layout, runs=runs)
+        return layout
 
     def _wait(self, *, raise_on_failure=True):
         if self.inflight is None:
@@ -121,21 +134,21 @@ class PackedKVSender:
     def send(
         self,
         *,
-        peer_name,
+        remote,
+        target,
         src_ptrs,
-        dst_ptrs,
+        dst_keys,
         src_pages,
         dst_pages,
         src_page_bytes,
         dst_page_bytes,
         page_size,
         head_offset_bytes,
-        dst_gpu_id,
         dst_num_slots,
         handles,
     ):
         # The gather fills src-shaped bytes; the descriptors address dst-shaped ones.
-        if len(src_pages) != len(dst_pages) or len(src_ptrs) != len(dst_ptrs):
+        if len(src_pages) != len(dst_pages) or len(src_ptrs) != len(dst_keys):
             raise ValueError("NIXL packed transfer requires paired pages and tensors")
         if not len(src_pages):
             return
@@ -146,9 +159,9 @@ class PackedKVSender:
                 "increase SGLANG_NIXL_KV_PACK_BUFFER_SIZE_MB"
             )
 
-        src_handle = self._src_handle(dst_page_bytes)
-        dst_handle = self._dst_handle(
-            peer_name, dst_ptrs, dst_page_bytes, dst_num_slots, dst_gpu_id
+        src_layout = self._src_layout(dst_page_bytes)
+        dst_layout = self._dst_layout(
+            remote, target, dst_keys, dst_page_bytes, dst_num_slots
         )
         # A handle left by an earlier send that failed belongs to that room: wait
         # until it no longer reads the buffer, but do not fail this room for it.
@@ -165,19 +178,23 @@ class PackedKVSender:
                 head_offset_bytes=head_offset_bytes,
             )
             src_indices, dst_indices = packed_page_indices(
-                num_tensors=len(dst_ptrs),
+                num_tensors=len(dst_keys),
                 dst_pages=dst_pages[start:end],
                 dst_num_slots=dst_num_slots,
             )
             # No notification: the transfer worker announces the chunk once its handles settle.
-            handle = self.agent.make_prepped_xfer(
-                "WRITE", src_handle, src_indices, dst_handle, dst_indices
+            (handle,) = self.transport.write_prepared(
+                src_layout=src_layout,
+                src_indices=src_indices,
+                remote=remote,
+                dst_layout=dst_layout,
+                dst_indices=dst_indices,
             )
-            if not handle:
-                raise RuntimeError("Failed to create NIXL packed transfer")
+            if handle.xfer is None:
+                _raise_failure(handle, "Failed to create NIXL packed transfer")
             self.inflight = handle
             # Let the caller settle posted writes if a later batch fails.
             handles.append(handle)
-            if self.agent.transfer(handle) == "ERR":
-                raise RuntimeError("Failed to post NIXL packed transfer")
+            if handle.result is not None:
+                _raise_failure(handle, "Failed to post NIXL packed transfer")
         self._wait()
