@@ -5,7 +5,9 @@ import os
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import cpu_has_amx_support, kill_process_tree
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
@@ -49,6 +51,53 @@ class TestAutoRoundCPUConfig(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "desc_act=False only"):
             quant_config.get_gptq_config_kwargs(4, 128)
+
+    def test_fused_layer_follows_16bit_shards(self):
+        """Without the loader's packed_modules_mapping, the fused in_proj_ba is
+        not found in extra_config, falls back to 4-bit and is built as int4,
+        so the dense in_proj_a/b checkpoint shards cannot be loaded into it."""
+        prefix = "model.language_model.layers.0.linear_attn"
+        quant_config = AutoRoundConfig.from_config(
+            {
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "packing_format": "auto_round:auto_gptq",
+                "extra_config": {
+                    f"{prefix}.in_proj_a": {"bits": 16, "data_type": "fp"},
+                    f"{prefix}.in_proj_b": {"bits": 16, "data_type": "fp"},
+                },
+                "packed_modules_mapping": {"in_proj_ba": ["in_proj_b", "in_proj_a"]},
+            }
+        )
+
+        layer = LinearBase.__new__(LinearBase)
+        quant_method = quant_config.get_quant_method(layer, f"{prefix}.in_proj_ba")
+
+        self.assertIsInstance(quant_method, UnquantizedLinearMethod)
+
+    def test_fused_layer_regex_rule_wins_over_shard_expansion(self):
+        """An extra_config regex that matches the fused in_proj_ba but neither
+        of its shards must still select 16-bit; expanding the fused layer into
+        shards first misses the rule and falls back to 4-bit."""
+        prefix = "model.language_model.layers.0.linear_attn"
+        quant_config = AutoRoundConfig.from_config(
+            {
+                "bits": 4,
+                "group_size": 128,
+                "sym": True,
+                "packing_format": "auto_round:auto_gptq",
+                "extra_config": {
+                    r".*\.in_proj_ba$": {"bits": 16, "data_type": "fp"},
+                },
+                "packed_modules_mapping": {"in_proj_ba": ["in_proj_b", "in_proj_a"]},
+            }
+        )
+
+        layer = LinearBase.__new__(LinearBase)
+        quant_method = quant_config.get_quant_method(layer, f"{prefix}.in_proj_ba")
+
+        self.assertIsInstance(quant_method, UnquantizedLinearMethod)
 
 
 @unittest.skipUnless(

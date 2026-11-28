@@ -68,8 +68,10 @@ class AutoRoundConfig(QuantizationConfig):
         true_sequential: bool = False,
         static_groups: bool = False,
         gptq_defaulted_config_keys: Optional[tuple[str, ...]] = None,
+        packed_modules_mapping: Optional[dict[str, list[str]]] = None,
     ) -> None:
         super().__init__()
+        self.packed_modules_mapping = packed_modules_mapping or {}
         if weight_bits not in self.SUPPORTED_BITS:
             raise ValueError(
                 f"Unsupported weight_bits: {weight_bits}, "
@@ -178,6 +180,9 @@ class AutoRoundConfig(QuantizationConfig):
             true_sequential=cls.get_from_keys_or(config, ["true_sequential"], False),
             static_groups=cls.get_from_keys_or(config, ["static_groups"], False),
             gptq_defaulted_config_keys=gptq_defaulted_config_keys,
+            packed_modules_mapping=cls.get_from_keys_or(
+                config, ["packed_modules_mapping"], {}
+            ),
         )
 
     def get_scaled_act_names(self) -> list[str]:
@@ -191,22 +196,9 @@ class AutoRoundConfig(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
-        def get_config(name: str, quantized: bool = True):
-            if not self.extra_config:
-                return (
-                    self.weight_bits if quantized else 16,
-                    self.group_size if quantized else -1,
-                    self.sym if quantized else True,
-                )
-
-            # Exact match first
+        def find_extra_config(name: str):
             if name in self.extra_config:
-                cfg = self.extra_config[name]
-                return (
-                    cfg.get("bits", self.weight_bits if quantized else 16),
-                    cfg.get("group_size", self.group_size if quantized else -1),
-                    cfg.get("sym", self.sym if quantized else True),
-                )
+                return self.extra_config[name]
 
             REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
             for pattern, cfg in self.extra_config.items():
@@ -217,19 +209,24 @@ class AutoRoundConfig(QuantizationConfig):
 
                 try:
                     if re.fullmatch(pattern, name):
-                        return (
-                            cfg.get("bits", self.weight_bits if quantized else 16),
-                            cfg.get("group_size", self.group_size if quantized else -1),
-                            cfg.get("sym", self.sym if quantized else True),
-                        )
+                        return cfg
                 except re.error:
                     # Invalid regex, ignore.
                     continue
+            return None
 
+        def get_config(name: str, quantized: bool = True):
+            cfg = find_extra_config(name) if self.extra_config else None
+            if cfg is None:
+                return (
+                    self.weight_bits if quantized else 16,
+                    self.group_size if quantized else -1,
+                    self.sym if quantized else True,
+                )
             return (
-                self.weight_bits if quantized else 16,
-                self.group_size if quantized else -1,
-                self.sym if quantized else True,
+                cfg.get("bits", self.weight_bits if quantized else 16),
+                cfg.get("group_size", self.group_size if quantized else -1),
+                cfg.get("sym", self.sym if quantized else True),
             )
 
         # 1. Exact match from config
@@ -262,7 +259,7 @@ class AutoRoundConfig(QuantizationConfig):
                 )
 
         # 4. Handle fused QKV or other patterns
-        if self.extra_config:
+        if self.extra_config and find_extra_config(layer_name) is None:
             for fusion_key, sub_keys in self.packed_modules_mapping.items():
                 if fusion_key in layer_name and layer_name.count(fusion_key) == 1:
                     sub_names = [
