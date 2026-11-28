@@ -35,6 +35,7 @@ from contextlib import nullcontext
 from datetime import datetime
 from enum import Enum
 from http import HTTPStatus
+from pathlib import Path
 from typing import (
     Any,
     Awaitable,
@@ -622,6 +623,28 @@ def _requested_token_ids(obj: GenerateReqInput) -> Optional[list]:
     if obj.token_ids_logprob is not None:
         return obj.token_ids_logprob
     return obj.token_ids_logprob_rows
+
+
+def _validate_dump_folder(folder: str, field_name: str) -> str:
+    """Validate a dump folder supplied at runtime via ``/configure_logging``.
+
+    An empty string keeps the previous "do not dump" meaning. Otherwise the
+    path must be absolute and must already exist as a directory: the dump
+    writers create missing directories on the way (``save_request_dump``
+    calls ``os.makedirs``), so accepting a path that does not exist yet
+    would let the endpoint plant pickle files at an arbitrary location.
+    Returns the resolved path, so ``..`` and symlinks cannot smuggle a
+    different directory past the check.
+    """
+    if folder == "":
+        return folder
+    path = Path(folder)
+    if not path.is_absolute():
+        raise ValueError(f"{field_name} must be an absolute path, got {folder!r}")
+    resolved = path.resolve()
+    if not resolved.is_dir():
+        raise ValueError(f"{field_name} must be an existing directory, got {folder!r}")
+    return str(resolved)
 
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
@@ -3091,21 +3114,34 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             return all_success, all_message, all_paused_requests
 
     def configure_logging(self, obj: ConfigureLoggingReq):
+        # Validate the dump folders before applying anything: the dump
+        # writers create missing directories on the way, so an unchecked
+        # path would let the endpoint plant pickle files anywhere.
+        dump_requests_folder = (
+            _validate_dump_folder(obj.dump_requests_folder, "dump_requests_folder")
+            if obj.dump_requests_folder is not None
+            else None
+        )
+        crash_dump_folder = (
+            _validate_dump_folder(obj.crash_dump_folder, "crash_dump_folder")
+            if obj.crash_dump_folder is not None
+            else None
+        )
         self.request_logger.configure(
             log_requests=obj.log_requests,
             log_requests_level=obj.log_requests_level,
             log_requests_format=obj.log_requests_format,
         )
-        if obj.dump_requests_folder is not None:
-            self.dump_requests_folder = obj.dump_requests_folder
+        if dump_requests_folder is not None:
+            self.dump_requests_folder = dump_requests_folder
         if obj.dump_requests_threshold is not None:
             self.dump_requests_threshold = obj.dump_requests_threshold
         if obj.dump_requests_exclude_meta_keys is not None:
             self.dump_requests_exclude_meta_keys = list(
                 obj.dump_requests_exclude_meta_keys
             )
-        if obj.crash_dump_folder is not None:
-            self.crash_dump_folder = obj.crash_dump_folder
+        if crash_dump_folder is not None:
+            self.crash_dump_folder = crash_dump_folder
         if obj.log_level is not None:
             # setLevel() may raise exception if obj.log_level is illegal string.
             # Let the exception propagate to the caller.

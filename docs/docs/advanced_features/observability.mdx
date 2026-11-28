@@ -30,9 +30,11 @@ You can dump all requests and replay them later for benchmarking or other purpos
 
 To start dumping, use the following command to send a request to a server:
 ```bash Command
+mkdir -p /tmp/sglang_request_dump
 python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --dump-requests-folder /tmp/sglang_request_dump --dump-requests-threshold 100
 ```
 The server will dump the requests into a pickle file for every 100 requests.
+The dump folder must already exist as a directory on the server: `/configure_logging` rejects paths that do not exist, relative paths, and paths that are not directories, so the server never creates dump files at an arbitrary location. The same rule applies to `--crash-dump-folder` when it is set at runtime.
 
 To replay the request dump, use `scripts/playground/replay_request_dump.py`.
 

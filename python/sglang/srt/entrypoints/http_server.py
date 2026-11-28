@@ -1736,7 +1736,10 @@ async def configure_logging(
     obj: Annotated[ConfigureLoggingReq, Body()], request: Request
 ):
     """Configure the request logging options."""
-    _global_state.tokenizer_manager.configure_logging(obj)
+    try:
+        _global_state.tokenizer_manager.configure_logging(obj)
+    except Exception as e:
+        return _create_error_response(e)
     return Response(status_code=200)
 
 
