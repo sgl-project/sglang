@@ -133,6 +133,10 @@ from sglang.srt.hf_transformers import (
     get_tokenizer,
     get_tokenizer_from_processor,
 )
+from sglang.srt.layers.attention.mis_swa_guard import (
+    aggregate_min_positive_swa_window,
+    validate_swa_mis_delimiters,
+)
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_mlp_sync
@@ -1313,6 +1317,15 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        attn_backend = getattr(
+            getattr(self.tp_worker, "model_runner", None), "attn_backend", None
+        )
+        local_min_positive_swa_window = (
+            attn_backend.resolve_min_positive_swa_window()
+            if attn_backend is not None
+            and hasattr(attn_backend, "resolve_min_positive_swa_window")
+            else None
+        )
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -1341,6 +1354,9 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_parallel().pp_group
         self.world_group = get_parallel().world_group
+        self.min_positive_swa_window = self._sync_min_positive_swa_window_across_pp(
+            local_min_positive_swa_window
+        )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # Entry rank is the local rank 0 in that group. Use the CPU (gloo) group to
@@ -2145,6 +2161,7 @@ class Scheduler(
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_len": self.max_req_len,
             "max_req_input_len": self.max_req_input_len,
+            "min_positive_swa_window": getattr(self, "min_positive_swa_window", None),
             "startup_time": self.startup_time,
         }
 
@@ -3766,6 +3783,9 @@ class Scheduler(
         # initialize before returning
         self.init_req_max_new_tokens(req)
 
+        if req.is_prefill_only and self._abort_if_invalid_mis_swa(req=req):
+            return
+
         # Validate prompt length
         error_msg = validate_input_length(
             req,
@@ -4070,6 +4090,41 @@ class Scheduler(
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
         self.request_retirer.retire_unadmitted(req)
 
+    def _sync_min_positive_swa_window_across_pp(
+        self, local_window: Optional[int]
+    ) -> Optional[int]:
+        """Agree on the strictest SWA window across PP stages so admission matches."""
+        if (
+            not get_exec().features.enable_mis
+            or get_parallel().pp_size <= 1
+            or self.pp_group is None
+            or getattr(self.pp_group, "world_size", 1) <= 1
+        ):
+            return local_window
+        return aggregate_min_positive_swa_window(
+            windows=self.pp_group.all_gather_object(local_window)
+        )
+
+    def _abort_if_invalid_mis_swa(self, *, req: Req) -> bool:
+        """Reject an --enable-mis request whose logical span exceeds SWA capacity."""
+        if not get_exec().features.enable_mis:
+            return False
+        delimiters = req.multi_item_delimiter_indices
+        window_left = getattr(self, "min_positive_swa_window", None)
+        if window_left is None or not delimiters:
+            return False
+        try:
+            validate_swa_mis_delimiters(
+                prefix_len=int(delimiters[0]),
+                delimiters=delimiters,
+                window_left=window_left,
+                raw_seq_len=len(req.origin_input_ids),
+            )
+        except ValueError as exc:
+            self._reject_bad_request(req, str(exc))
+            return True
+        return False
+
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the
         priority scheduling mode."""
@@ -4285,6 +4340,9 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
             mm_cleanup.pop_all()
             self._maybe_compute_mrope_positions(req)
+
+        if self._abort_if_invalid_mis_swa(req=req):
+            return
 
         # Validate prompts length
         error_msg = validate_input_length(

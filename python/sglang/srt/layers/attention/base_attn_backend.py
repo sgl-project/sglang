@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mis_swa_guard import aggregate_min_positive_swa_window
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils.device import is_npu
@@ -121,6 +122,21 @@ class AttentionBackend(ABC):
         """The backends a wrapper runs its layers' attention through, whose
         window capacity binds in its place; none for a leaf."""
         return []
+
+    min_positive_swa_window: Optional[int] = None
+
+    def resolve_min_positive_swa_window(self) -> Optional[int]:
+        """Return the strictest active sliding window (window_left >= 0) across layers."""
+        children = self.window_capacity_children()
+        if children:
+            return aggregate_min_positive_swa_window(
+                windows=(
+                    child.resolve_min_positive_swa_window()
+                    for child in children
+                    if child is not None
+                )
+            )
+        return self.min_positive_swa_window
 
     # Whether target verify runs correctly under decode context parallelism:
     # each rank reads its shard of the DCP-widened pages with the global causal
