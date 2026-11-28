@@ -146,6 +146,7 @@ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.inflight_prompt_cache import InflightPromptCache
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -1429,6 +1430,7 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue = IndexedReqList(ListKind.WAITING, abort=self._abort_waiting)
+        self.inflight_prompt_cache = InflightPromptCache()
         # Read on every prefill pass, so cache it.
         self.log_schedule_decisions = get_observability().log_schedule_decisions
         # The running decoding batch for continuous batching
@@ -4716,6 +4718,10 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None, running_batch
 
+        inflight_prompt_cache = getattr(self, "inflight_prompt_cache", None)
+        if inflight_prompt_cache is not None:
+            inflight_prompt_cache.prune()
+
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
@@ -4969,6 +4975,20 @@ class Scheduler(
             # queued drops the copy its match staged.
             defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
             req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
+            if (
+                inflight_prompt_cache is not None
+                and self.tree_cache.supports_prefix_sharing()
+                and not self.tree_cache.supports_mamba()
+                and self.dllm_config is None
+                and inflight_prompt_cache.should_wait(req)
+            ):
+                # The matching leader's KV is not in the radix tree yet. Keep
+                # this request queued until the leader checkpoints it.
+                if defer_cow_slot:
+                    self._drop_unadmitted_match(req)
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
+                continue
             if adder.should_defer(req):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
@@ -4995,6 +5015,18 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if (
+                inflight_prompt_cache is not None
+                and self.tree_cache.supports_prefix_sharing()
+                and not self.tree_cache.supports_mamba()
+                and self.dllm_config is None
+                and adder.can_run_list
+                and req is adder.can_run_list[-1]
+            ):
+                inflight_prompt_cache.admit(
+                    req, is_chunked=req is adder.new_chunked_req
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
