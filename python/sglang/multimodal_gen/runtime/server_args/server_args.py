@@ -2412,8 +2412,8 @@ class ServerArgs(DisaggServerArgsMixin):
             help=(
                 "Override the model ID used for config resolution. "
                 "Useful when --model-path is a local directory whose name does not match "
-                "any registered HF repo name. Accepts a full repo ID or its short name "
-                "(e.g. 'Qwen/Qwen-Image' or 'Qwen-Image')."
+                "any registered HF repo name. Use a full repo ID (e.g. 'Qwen/Qwen-Image') "
+                "or a short name that identifies one config (e.g. 'Qwen-Image')."
             ),
         )
         parser.add_argument(
