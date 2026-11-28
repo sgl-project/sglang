@@ -25,6 +25,9 @@ import torch
 
 from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+from sglang.srt.distributed.device_communicators.npu_graph_collectives import (
+    HCCLGraphStaging,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
@@ -63,6 +66,7 @@ class NPUCudaGraphBackend(BaseGraphBackend):
     ) -> None:
         self._decode_runner = cuda_graph_runner
         self._graphs: Dict[Any, Any] = {}
+        self._collective_staging: Dict[ShapeKey, HCCLGraphStaging] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
         self._device_module = cuda_graph_runner.device_module
@@ -442,38 +446,50 @@ class NPUCudaGraphBackend(BaseGraphBackend):
     ) -> None:
         import torch_npu  # noqa: F401  (verifies NPU availability)
 
-        # Two warmups so kernels are loaded and one-time setup is paid before capture.
-        # post_warmup_hook lets the attention backend reset state that warmup mutated.
-        for _ in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
-            forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
-
         graph = torch.npu.NPUGraph()
-
+        stream = self._capture_stream
+        staging = None
+        warmup_stream_ctx = empty_context()
         graph_ctx: Callable[..., AbstractContextManager]
-        if (
-            self._memory_saver_adapter is not None
-            and self._memory_saver_adapter.enabled
-        ):
+        memory_saver = self._memory_saver_adapter
+        if memory_saver is not None and memory_saver.enabled:
+            staging = HCCLGraphStaging(memory_saver)
+            # Standalone captures also need an explicit stream so warmup and
+            # capture find the same per-stream HCCL buffers.
+            if stream is None:
+                stream = torch.npu.Stream()
+            warmup_stream_ctx = torch.npu.stream(stream)
             graph_ctx = partial(
-                self._memory_saver_adapter.cuda_graph,
+                memory_saver.cuda_graph,
                 tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
             )
         else:
             graph_ctx = torch.npu.graph
 
-        with graph_ctx(
-            graph,
-            pool=self._pool,
-            stream=self._capture_stream,
-            auto_dispatch_capture=True,
-        ):
-            out = forward_fn()
+        with staging.activate() if staging is not None else empty_context():
+            # Warm up kernels and prepare non-pauseable collective buffers.
+            with warmup_stream_ctx:
+                for _ in range(2):
+                    self._device_module.synchronize()
+                    self._tp_group.barrier()
+                    forward_fn()
+                    if post_warmup_hook is not None:
+                        post_warmup_hook()
+            if staging is not None:
+                staging.finish_warmup()
+            with graph_ctx(
+                graph,
+                pool=self._pool,
+                stream=stream,
+                auto_dispatch_capture=True,
+            ):
+                out = forward_fn()
 
         self._graphs[shape_key] = graph
+        if staging is not None:
+            self._collective_staging[shape_key] = staging
+        else:
+            self._collective_staging.pop(shape_key, None)
         self._outputs[shape_key] = out
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
@@ -619,7 +635,10 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         if self._rebind_fence is not None:
             self._rebind_fence.synchronize()
             self._rebind_fence = None
+        if self._collective_staging:
+            self._device_module.synchronize()
         self._graphs.clear()
+        self._collective_staging.clear()
         self._outputs.clear()
         self._pool = None
         self._decode_runner = None

@@ -46,6 +46,9 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.device_communicators.npu_graph_collectives import (
+    run_hccl_graph_collective,
+)
 from sglang.srt.distributed.utils import (
     all_gather_single,
     reduce_scatter_single,
@@ -1181,6 +1184,10 @@ class GroupCoordinator:
             input.dtype, self.world_size, self.local_size
         ):
             torch.ops.sgl_kernel.shm_reduce_scatter_tensor(output, input, REDUCE_OP_SUM)
+        elif _is_npu:
+            run_hccl_graph_collective(
+                reduce_scatter_single, output, input, group=self.device_group
+            )
         else:
             reduce_scatter_single(output, input, group=self.device_group)
         return output
@@ -1388,6 +1395,10 @@ class GroupCoordinator:
             input.dtype, self.world_size, self.local_size
         ):
             torch.ops.sgl_kernel.shm_allgather_into_tensor(output, input)
+        elif _is_npu:
+            run_hccl_graph_collective(
+                all_gather_single, output, input, group=self.device_group
+            )
         else:
             all_gather_single(output, input, group=self.device_group)
 
