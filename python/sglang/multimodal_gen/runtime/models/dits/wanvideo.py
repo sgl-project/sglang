@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNormScaleShift,
     RMSNorm,
     ScaleResidualLayerNormScaleShift,
+    null_modulation,
     tensor_parallel_rms_norm,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -942,8 +943,8 @@ class WanTransformerBlock(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         attn_output, _ = self.to_out(attn_output)
         attn_output = attn_output.squeeze(1)
-        null_shift = null_scale = torch.zeros(
-            (1,), device=hidden_states.device, dtype=hidden_states.dtype
+        null_shift = null_scale = null_modulation(
+            hidden_states.device, hidden_states.dtype
         )
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
