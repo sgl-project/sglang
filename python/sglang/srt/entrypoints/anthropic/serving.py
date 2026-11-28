@@ -127,11 +127,12 @@ def _anthropic_usage_from_openai(
         )
 
     usage_fields: dict[str, int] = {}
-    cached_tokens = _cached_prompt_tokens(usage)
     if include_input:
         usage_fields["input_tokens"] = _anthropic_input_tokens(usage)
-        if cached_tokens:
-            usage_fields["cache_read_input_tokens"] = cached_tokens
+        # prompt_tokens_details is set only with --enable-cache-report;
+        # without it the cached count is unknown, so the field is omitted, not 0.
+        if usage.prompt_tokens_details is not None:
+            usage_fields["cache_read_input_tokens"] = _cached_prompt_tokens(usage)
     if include_output:
         usage_fields["output_tokens"] = (
             0 if force_zero_output else (getattr(usage, "completion_tokens", 0) or 0)

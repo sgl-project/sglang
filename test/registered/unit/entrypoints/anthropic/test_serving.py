@@ -792,6 +792,51 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(usage_out["input_tokens"], 0)
         self.assertEqual(usage_out["cache_read_input_tokens"], 10)
 
+    def test_cache_miss_reports_zero_cache_read_tokens(self):
+        """A reported cache miss must surface as cache_read_input_tokens=0.
+
+        Clients read a missing field as "cache usage unknown", not as a miss.
+        """
+        usage = {
+            "prompt_tokens": 5,
+            "completion_tokens": 1,
+            "total_tokens": 6,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }
+        serving = self._serving(
+            [
+                _chunk([_choice({"role": "assistant", "content": ""})]),
+                _chunk([_choice({"content": "ok"})], usage=usage),
+                _chunk([_choice({}, finish_reason="stop")]),
+                "data: [DONE]\n\n",
+            ]
+        )
+        events = asyncio.run(
+            _collect_anthropic_events(serving, self._anthropic_request())
+        )
+        message_start = next(e for e in events if e["type"] == "message_start")
+        self.assertEqual(
+            message_start["message"]["usage"]["cache_read_input_tokens"], 0
+        )
+
+        response = ChatCompletionResponse.model_validate(
+            {
+                "id": "chatcmpl-test",
+                "model": "test-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": usage,
+            }
+        )
+        anthropic_response = self._serving()._convert_response(response)
+        body = anthropic_response.model_dump(exclude_none=True)
+        self.assertEqual(body["usage"]["cache_read_input_tokens"], 0)
+
     def test_usage_without_prompt_tokens_details(self):
         """Usage object without prompt_tokens_details must omit cache_read_input_tokens cleanly."""
         usage = {"prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5}
