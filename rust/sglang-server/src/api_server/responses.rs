@@ -1960,6 +1960,7 @@ fn phase_buffered(
     async_stream::stream! {
         futures::pin_mut!(events);
         let mut buffered: Vec<ResponsesEvent> = Vec::new();
+        let is_call = |kind: Option<&str>| matches!(kind, Some("function_call" | "custom_tool_call" | "shell_call"));
         while let Some((kind, mut payload)) = events.next().await {
             if !tools_callable {
                 yield (kind, payload);
@@ -1968,7 +1969,7 @@ fn phase_buffered(
             let item_type = payload["item"]["type"].as_str().map(str::to_owned);
             let added = kind == "response.output_item.added";
             let terminal = matches!(kind.as_str(), "response.completed" | "response.incomplete" | "response.failed");
-            let opens_call = added && matches!(item_type.as_deref(), Some("function_call" | "custom_tool_call" | "shell_call"));
+            let opens_call = added && is_call(item_type.as_deref());
             if opens_call || terminal {
                 let phase = if opens_call { "commentary" } else { "final_answer" };
                 for (buffered_kind, mut buffered_payload) in buffered.drain(..) {
@@ -1978,9 +1979,13 @@ fn phase_buffered(
                     yield (buffered_kind, buffered_payload);
                 }
                 if terminal {
-                    for item in payload["response"]["output"].as_array_mut().into_iter().flatten() {
-                        if item["type"] == "message" {
-                            item["phase"] = json!(phase);
+                    // A message before a later tool call was streamed as commentary.
+                    let mut message_phase = "final_answer";
+                    for item in payload["response"]["output"].as_array_mut().into_iter().flatten().rev() {
+                        if is_call(item["type"].as_str()) {
+                            message_phase = "commentary";
+                        } else if item["type"] == "message" {
+                            item["phase"] = json!(message_phase);
                         }
                     }
                 }
@@ -2002,6 +2007,72 @@ fn phase_buffered(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn terminal_output_keeps_streamed_message_phases() {
+        let core = crate::api_server::http::openai::test_utils::core_handle();
+        let adapter = Responses {
+            core: &core,
+            chat_formatter: None,
+            server_args: &ServerArgs::default(),
+        };
+        let request = serde_json::from_value(json!({
+            "input": "check the weather", "tools": [{"type": "function", "name": "weather"}]
+        }))
+        .unwrap();
+        for (finish, terminal) in [
+            (Some("stop"), "response.completed"),
+            (Some("length"), "response.incomplete"),
+            (None, "response.failed"),
+        ] {
+            let call = |index| {
+                json!({"tool_calls": [{"index": index, "type": "function",
+                "function": {"name": "weather", "arguments": "{}"}}]})
+            };
+            let chunks = [
+                (json!({"content": "Checking."}), None),
+                (call(0), None),
+                (json!({"content": "Checking again."}), None),
+                (call(1), None),
+                (json!({"content": "All done."}), finish),
+            ]
+            .map(|(delta, reason)| {
+                json!({
+                "id": "chat-1", "object": "chat.completion.chunk", "model": "test", "created": 1,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": reason}]
+            }).to_string()
+            });
+            let events = adapter
+                .plan(&request, true)
+                .unwrap()
+                .events(futures::stream::iter(chunks.into_iter().chain([
+                    if finish.is_some() {
+                        "[DONE]".to_owned()
+                    } else {
+                        json!({"error": {"message": "request cancelled"}}).to_string()
+                    },
+                ])))
+                .collect::<Vec<_>>()
+                .await;
+            let (kind, payload) = events.last().unwrap();
+            assert_eq!(kind, terminal);
+            let output = payload["response"]["output"].as_array().unwrap();
+            let done_items: Vec<_> = events
+                .iter()
+                .filter(|(kind, _)| kind == "response.output_item.done")
+                .map(|(_, event)| &event["item"])
+                .collect();
+            assert_eq!(done_items[0]["phase"], "commentary");
+            assert_eq!(done_items[2]["phase"], "commentary");
+            if finish.is_some() {
+                assert_eq!(done_items[4]["phase"], "final_answer");
+                assert!(done_items.into_iter().eq(output));
+            } else {
+                assert!(output.is_empty());
+                assert_eq!(payload["response"]["error"]["message"], "request cancelled");
+            }
+        }
+    }
 
     /// Python's input-item rules: a string is one user turn; `instructions`
     /// lead as system; developer turns are labeled; function calls and
