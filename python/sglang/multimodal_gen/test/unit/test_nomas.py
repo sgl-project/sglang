@@ -280,8 +280,9 @@ def condition(device="cpu", dtype=torch.float32, padded=True):
     not torch.cuda.is_available() or torch.version.hip is not None,
     reason="requires CUDA graph capture",
 )
+@pytest.mark.parametrize("with_camera", [False, True])
 @torch.inference_mode()
-def test_offline_graph_replays_with_current_action_mask():
+def test_offline_graph_replays_with_current_action_mask(with_camera):
     from functools import partial
 
     from msgspec.structs import replace
@@ -290,9 +291,17 @@ def test_offline_graph_replays_with_current_action_mask():
     runner = model.offline_graph(warmup=True)
     results = []
     shape = (2, 2, 2)
-    for index, padded in enumerate((True, False, True)):
+    padding = (True, False, True, True, True) if with_camera else (True, False, True)
+    for index, padded in enumerate(padding):
         event = condition("cuda", torch.bfloat16, padded)
-        event = replace(event, camera_embedding=None, camera_has_mask=None)
+        if not with_camera:
+            event = replace(event, camera_embedding=None, camera_has_mask=None)
+        elif index == 2:
+            event = replace(event, camera_embedding=-event.camera_embedding)
+        elif index == 3:
+            event = replace(
+                event, camera_has_mask=torch.zeros_like(event.camera_has_mask)
+            )
 
         def generate(graph_predict=None):
             session = NomasLatentSession(model, cache_capacity=0, seed=11, steps=2)
@@ -305,8 +314,9 @@ def test_offline_graph_replays_with_current_action_mask():
         assert len(runner.entries) == 1
         assert torch.equal(result, expected)
         results.append(result)
-    assert torch.equal(results[0], results[2])
-    assert not torch.equal(results[0], results[1])
+    assert torch.equal(results[0], results[-1])
+    for changed in results[1:-1]:
+        assert not torch.equal(results[0], changed)
     model.release_cuda_graphs()
     assert not runner.entries and model.offline_graph(warmup=False) is None
 
