@@ -545,10 +545,10 @@ SMALL_M_BLOCK_SIZE_M = 16
 # Use smaller blocks for sparse decode workloads.
 GROUPED_GEMM_SMALL_M_MAX = 6144
 # Single-CTA fused preprocess capability bound (in-register tl.sort of n
-# packed keys); correctness-tested to this size.
-FUSED_PREPROCESS_MAX_TOKENS = 2048
+# packed keys, position packed into 13 bits); correctness-tested to this size.
+FUSED_PREPROCESS_MAX_TOKENS = 8192
 # Keep larger workloads on the general sort path.
-FUSED_PREPROCESS_WIN_TOKENS = 1024
+FUSED_PREPROCESS_WIN_TOKENS = 8192
 
 
 @triton.jit
@@ -563,7 +563,7 @@ def _fused_moe_preprocess_kernel(
     n,
     max_num_blocks,
     E: tl.constexpr,
-    BLOCK_N: tl.constexpr,  # pow2 >= n, <= 4096 (12-bit position pack)
+    BLOCK_N: tl.constexpr,  # pow2 >= n, <= 8192 (13-bit position pack)
     BLOCK_E1: tl.constexpr,  # pow2 >= E+1
     BLOCK_SCHED: tl.constexpr,  # pow2 >= max_num_blocks
     BLOCK_SIZE_M: tl.constexpr,
@@ -572,7 +572,7 @@ def _fused_moe_preprocess_kernel(
     sizes: int16 cast + torch.sort(stable) + src2dst + expert offsets + counts
     + block memset/schedule (~10 launches -> 1).
 
-    Stable sort: one in-register tl.sort of (id << 12 | position) packed keys
+    Stable sort: one in-register tl.sort of (id << 13 | position) packed keys
     -- position ties reproduce torch.sort(stable=True) exactly. Offsets come
     from a vectorized binary search on the sorted ids (same contract as
     _compute_expert_offsets_kernel); the block schedule from a binary search
@@ -581,9 +581,9 @@ def _fused_moe_preprocess_kernel(
     offs = tl.arange(0, BLOCK_N)
     mask = offs < n
     ids = tl.load(topk_ids_ptr + offs, mask=mask, other=E)  # pads sort last
-    skey = tl.sort((ids << 12) | offs)
-    s_ids = skey >> 12
-    s_src = skey & 0xFFF
+    skey = tl.sort((ids << 13) | offs)
+    s_ids = skey >> 13
+    s_src = skey & 0x1FFF
     tl.store(reorder_topk_ids_ptr + offs, s_ids, mask=mask)
     tl.store(src2dst_ptr + s_src, offs, mask=mask)
     tl.debug_barrier()  # publish sorted ids for the binary searches below
@@ -593,7 +593,7 @@ def _fused_moe_preprocess_kernel(
     e_mask = e_offs < E + 1
     low = tl.zeros([BLOCK_E1], dtype=tl.int32)
     high = tl.full([BLOCK_E1], n, dtype=tl.int32)
-    for _ in tl.static_range(12):  # n <= 4096
+    for _ in tl.static_range(13):  # n <= 8192
         mid = (low + high) // 2
         v = tl.load(reorder_topk_ids_ptr + mid, mask=e_mask & (mid < n), other=E + 1)
         go_right = v < e_offs
