@@ -370,6 +370,8 @@ def _ffprobe_output_media(path: str) -> dict[str, Any]:
         probe = subprocess.run(
             [
                 "ffprobe",
+                "-protocol_whitelist",
+                "file",
                 "-v",
                 "error",
                 "-show_entries",
@@ -444,7 +446,7 @@ def _read_output_media(path: str) -> dict[str, Any]:
     if av is None:
         return _ffprobe_output_media(path)
     try:
-        with av.open(str(path)) as container:
+        with av.open(str(path), options={"protocol_whitelist": "file"}) as container:
             streams = [_pyav_stream_entries(stream) for stream in container.streams]
             format_entries: dict[str, Any] = {"format_name": container.format.name}
             if container.duration:

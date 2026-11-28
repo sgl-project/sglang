@@ -725,31 +725,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """GPU-compatible ``StateType.SWA`` component containing SWA KV only.
-
-        C4 state follows SWA pages on both A3 and Ascend 950, but P and D
-        can have different ring sizes. Register it separately through
-        :meth:`get_c4_state_buf_infos` as equal-sized row items rather than
-        whole rings with different byte strides.
-        """
+        """SWA KV, C4 attention state, then C4 indexer state, all SWA-page indexed."""
         buffers = self.swa_kv_pool.kv_buffer
-        return (
-            [buf.data_ptr() for buf in buffers],
-            [buf.nbytes for buf in buffers],
-            [buf[0].nbytes for buf in buffers],
-        )
-
-    def get_c4_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """C4 compress state ring (attention + indexer).
-
-        Register one physical state row as an item.  PD peers can have
-        different SWA-page ring sizes (for example prefill without MTP
-        and decode with MTP), so payload indices map the same logical token
-        positions into each peer's local ring independently.
-        """
-        data_ptrs: List[int] = []
-        data_lens: List[int] = []
-        item_lens: List[int] = []
+        data_ptrs = [buf.data_ptr() for buf in buffers]
+        data_lens = [buf.nbytes for buf in buffers]
+        item_lens = [buf[0].nbytes for buf in buffers]
 
         for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
             for pool in pools:
@@ -758,7 +738,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 state = pool.kv_score_buffer.kv_score
                 data_ptrs.append(state.data_ptr())
                 data_lens.append(state.nbytes)
-                item_lens.append(state[0].nbytes)
+                item_lens.append(state[0].nbytes * pool.ring_size)
 
         return data_ptrs, data_lens, item_lens
 
@@ -772,6 +752,37 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             [buf.nbytes for buf in buffers],
             [buf[0].nbytes for buf in buffers],
         )
+
+    def get_kv_layer_ids(self) -> List[int]:
+        """Global layer id per main PD buffer, in registration order."""
+        if self.c4_kv_pool is None:
+            return []
+        c4_ids = self.sources_by_ratio.get(4, [])
+        indexer_pool = self._indexer_pool(4)
+        ids: List[int] = []
+        for buffers in (
+            self.c4_kv_pool.kv_buffer,
+            indexer_pool.index_k_buffer,
+            indexer_pool.index_scale_buffer,
+        ):
+            ids.extend(layer_id for _, layer_id in zip(buffers, c4_ids))
+        return ids
+
+    def get_c128_layer_ids(self) -> List[int]:
+        if self.c128_kv_pool is None:
+            return []
+        return list(self.sources_by_ratio.get(128, []))
+
+    def get_swa_state_layer_ids(self) -> List[int]:
+        """Global layer ids in ``get_state_buf_infos`` registration order."""
+        ids = self.swa_layer_ids()
+        for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+            ids.extend(
+                layer_id
+                for layer_id, pool in enumerate(pools)
+                if pool is not None and pool.ratio == 4
+            )
+        return ids
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
