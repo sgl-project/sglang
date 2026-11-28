@@ -22,9 +22,11 @@ def reshape_and_cache_flash(
     value_stride,
     num_heads,
     head_size,
+    v_head_size,
     block_size,
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
     HAS_SWA: tl.constexpr,
     USE_SCALE: tl.constexpr,
 ):
@@ -32,10 +34,12 @@ def reshape_and_cache_flash(
     Triton kernel for reshaping per-token K/V tensors into paged KV cache layout.
 
     Source layout:
-        key/value: [num_tokens, num_heads, head_size]
+        key: [num_tokens, num_heads, head_size]
+        value: [num_tokens, num_heads, v_head_size]
 
     Target cache layout:
-        cache: [num_blocks, block_size, num_heads, head_size]
+        key cache: [num_blocks, block_size, num_heads, head_size]
+        value cache: [num_blocks, block_size, num_heads, v_head_size]
         Token and head strides may describe a view of physical HND storage.
 
     Each Triton program instance handles:
@@ -64,10 +68,12 @@ def reshape_and_cache_flash(
         key_stride: Stride between source key tokens.
         value_stride: Stride between source value tokens.
         num_heads: Number of attention heads.
-        head_size: Hidden dimension per head.
+        head_size: Key hidden dimension per head.
+        v_head_size: Value hidden dimension per head.
         block_size: Number of slots per cache block.
         HEAD_BLOCK: Number of heads processed per program.
-        BLOCK_D: Vectorized dimension size (power-of-2 padded).
+        BLOCK_D: Key dimension size (power-of-2 padded).
+        BLOCK_DV: Value dimension size (power-of-2 padded).
         HAS_SWA: Enable SWA remapping.
         USE_SCALE: Enable scale division before storing.
     """
@@ -102,20 +108,23 @@ def reshape_and_cache_flash(
     head_mask = head_idx < num_heads
 
     dim_idx = tl.arange(0, BLOCK_D)
+    v_dim_idx = tl.arange(0, BLOCK_DV)
 
-    # shape = [HEAD_BLOCK, BLOCK_D]
+    # shape = [HEAD_BLOCK, BLOCK_D] and [HEAD_BLOCK, BLOCK_DV]
     offs = head_idx[:, None] * head_size + dim_idx[None, :]
+    v_offs = head_idx[:, None] * v_head_size + v_dim_idx[None, :]
 
     mask = head_mask[:, None] & (dim_idx[None, :] < head_size)
+    v_mask = head_mask[:, None] & (v_dim_idx[None, :] < v_head_size)
 
     # ----------------------------------
     # source load
     # ----------------------------------
     src_key = token_idx * key_stride + offs
-    src_value = token_idx * value_stride + offs
+    src_value = token_idx * value_stride + v_offs
 
     k = tl.load(key_ptr + src_key, mask=mask)
-    v = tl.load(value_ptr + src_value, mask=mask)
+    v = tl.load(value_ptr + src_value, mask=v_mask)
 
     # ----------------------------------
     # optional scale
@@ -141,10 +150,10 @@ def reshape_and_cache_flash(
         block_idx * value_block_stride
         + block_offset * value_cache_token_stride
         + head_idx[:, None] * value_cache_head_stride
-        + dim_idx[None, :]
+        + v_dim_idx[None, :]
     )
     tl.store(key_cache_ptr + tgt_k, k, mask=mask)
-    tl.store(value_cache_ptr + tgt_v, v, mask=mask)
+    tl.store(value_cache_ptr + tgt_v, v, mask=v_mask)
 
 
 def launch_reshape_and_cache_flash(
@@ -165,9 +174,9 @@ def launch_reshape_and_cache_flash(
 
     Args:
         key: Source key tensor [num_tokens, num_heads, head_size]
-        value: Source value tensor [num_tokens, num_heads, head_size]
+        value: Source value tensor [num_tokens, num_heads, v_head_size]
         key_cache: Destination key cache [num_blocks, block_size, num_heads, head_size]
-        value_cache: Destination value cache [num_blocks, block_size, num_heads, head_size]
+        value_cache: Destination value cache [num_blocks, block_size, num_heads, v_head_size]
         slot_mapping: Token-to-cache slot mapping
         swa_slot_mapping: Optional SWA remapping table
         k_scale: Optional key scaling factor
@@ -177,10 +186,13 @@ def launch_reshape_and_cache_flash(
     num_tokens = key.shape[0]
     num_heads = key.shape[1]
     head_size = key.shape[2]
+    v_head_size = value.shape[2]
+    assert value.shape[1] == num_heads, "K and V must have the same head count"
 
     HEAD_BLOCK = 4
 
     BLOCK_D = triton.next_power_of_2(head_size)
+    BLOCK_DV = triton.next_power_of_2(v_head_size)
 
     grid = (
         num_tokens,
@@ -206,9 +218,11 @@ def launch_reshape_and_cache_flash(
         value.stride(0),
         num_heads,
         head_size,
+        v_head_size,
         key_cache.shape[1],
         HEAD_BLOCK=HEAD_BLOCK,
         BLOCK_D=BLOCK_D,
+        BLOCK_DV=BLOCK_DV,
         HAS_SWA=(swa_slot_mapping is not None),
         USE_SCALE=(k_scale is not None),
     )
