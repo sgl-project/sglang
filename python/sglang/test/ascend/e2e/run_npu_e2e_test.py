@@ -32,6 +32,11 @@ rbac_api = client.RbacAuthorizationV1Api()
 
 LOCAL_TIMEOUT = 12600
 
+# Trailing lines kept from each decode pod log when it is dumped at the end of
+# a test case: enough to carry a startup failure or a serving traceback while
+# keeping a multi-node run's decode output from flooding the CI log.
+DECODE_LOG_TAIL_LINES = 1000
+
 script_path = os.path.dirname(os.path.abspath(__file__))
 
 KUBE_JOB_SINGLE = "single"
@@ -338,6 +343,53 @@ def prepare_cm_data(namespace, pod_string, run_id=None):
     return data
 
 
+def dump_decode_pod_logs(namespace, pod_name_prefix, tail_lines=DECODE_LOG_TAIL_LINES):
+    """Print the logs of every decode node of this test case.
+
+    Only the router pod is streamed into the CI log, so a decode node that dies
+    during startup (or mid-test) leaves no trace there. Dump the decode pod
+    logs once the monitored pod has finished, so decode-side failures stay
+    diagnosable from the CI log alone. ``tail_lines=None`` prints the full log.
+    Never raises: this runs in a cleanup path where the original test result
+    matters more than the log dump.
+    """
+    try:
+        pods = core_api.list_namespaced_pod(namespace=namespace).items
+    except Exception as e:
+        logger.error(f"Failed to list pods for the decode log dump: {e}")
+        return
+
+    decode_pods = sorted(
+        pod.metadata.name
+        for pod in pods
+        if pod.metadata.name.startswith(pod_name_prefix)
+        and "-sglang-decode-" in pod.metadata.name
+    )
+    if not decode_pods:
+        logger.info(f"No decode pod found for {pod_name_prefix}, skip log dump")
+        return
+
+    for pod_name in decode_pods:
+        scope = f"last {tail_lines} lines" if tail_lines else "full log"
+        logger.info(f"===== Decode node log ({scope}): {pod_name} =====")
+        cmd = ["kubectl", "logs", "-n", namespace, pod_name]
+        if tail_lines:
+            cmd.append(f"--tail={tail_lines}")
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                timeout=600,
+            )
+        except Exception as e:
+            logger.error(f"Failed to dump the log of decode pod {pod_name}: {e}")
+            continue
+        print(result.stdout, end="")
+        logger.info(f"===== End of decode node log: {pod_name} =====")
+
+
 def monitor_pod_logs(
     kube_job_type,
     kube_job_prefix_name,
@@ -383,6 +435,9 @@ def monitor_pod_logs(
     metric_pattern = re.compile(r"^\[METRIC\] (\S+)=(\S+)(?: labels=(.*))?$")
 
     process = None
+    # Defined before the launch so the cleanup path can tell a passed case from
+    # a failed/timed-out one even when kubectl fails to start.
+    is_success = False
     try:
         # Start kubectl logs process
         process = subprocess.Popen(
@@ -536,6 +591,17 @@ def monitor_pod_logs(
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+        # PD separation: the decode nodes only write into their own pod logs.
+        # Print them here, when the test has finished, so a decode-side failure
+        # is visible in this case's CI log instead of only in the pod. A failed
+        # case keeps the full log (the root cause can sit far above the tail);
+        # a passed case only keeps the tail so the CI log stays bounded.
+        if kube_job_type == KUBE_JOB_MULTI_PD_SEPARATION:
+            dump_decode_pod_logs(
+                namespace,
+                kube_job_prefix_name,
+                tail_lines=None if is_success else 0,
+            )
 
     return streamed_metrics, streamed_labels
 
