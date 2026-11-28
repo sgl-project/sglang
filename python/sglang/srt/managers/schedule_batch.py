@@ -390,11 +390,6 @@ class ReqKvInfo:
         """num_tokens more decode tokens (a verify's accepted run) are committed."""
         self.kv_committed_len += num_tokens
 
-    def commit_finished(self, end: int) -> None:
-        """A finished turn kept by a streaming session commits up to end,
-        capped at what the row holds."""
-        self.kv_committed_len = min(end, self.kv_allocated_len)
-
     def truncate_committed(self, end: int) -> None:
         """Committed drops to end if it is past it; nothing else changes."""
         self.kv_committed_len = min(self.kv_committed_len, end)
