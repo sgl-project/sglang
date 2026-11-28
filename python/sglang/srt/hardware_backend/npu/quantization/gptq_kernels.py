@@ -73,6 +73,8 @@ class GPTQLinearAscendKernel:
         )
         if not self.use_v2_format:
             layer.qzeros += 1
+        # The NPU op adds the offset to signed weights, so use midpoint - zero.
+        layer.qzeros.neg_()
 
         qweight_tmp = unpack_from_int32(
             layer.qweight.data.contiguous(), self.quant_config.weight_bits, packed_dim=0
