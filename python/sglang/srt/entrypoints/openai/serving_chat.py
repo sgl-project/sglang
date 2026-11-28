@@ -473,12 +473,9 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
-        self._mm_processor_takes_prompt_ids = bool(
-            getattr(
-                getattr(self.tokenizer_manager, "mm_processor", None),
-                "prefer_tokenized_input",
-                False,
-            )
+        mm_processor = self.tokenizer_manager.mm_processor
+        self._mm_processor_takes_prompt_ids = (
+            mm_processor is not None and mm_processor.prefer_tokenized_input
         )
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
