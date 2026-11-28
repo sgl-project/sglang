@@ -1,4 +1,4 @@
-"""Regression for #53618: unwritten shrink columns must not affect dense LoRA."""
+"""Regression for #53618: stale shrink allocations must not affect dense LoRA."""
 
 import os
 import unittest
@@ -22,12 +22,13 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
 class TestTRTLLMDenseLoRARankTail(CustomTestCase):
-    def test_expand_ignores_unwritten_rank_tail(self):
+    def test_shrink_clears_nonfinite_rank_tail(self):
         """Zero B padding must not multiply NaN/Inf outside an adapter's rank.
 
         Exercise both the bf16 shrink output and the fp32 split-K accumulator,
-        with contiguous segments and adapter-sorted token indirection. Poison
-        only the unused columns after the real shrink, avoiding allocator luck.
+        with contiguous segments and adapter-sorted token indirection. Supply
+        a NaN/Inf-filled allocation to the real shrink, avoiding allocator luck.
+        Its epilogue must overwrite the padding before the dense expand reads it.
         """
         with patch.dict(
             os.environ,
@@ -101,11 +102,39 @@ class TestTRTLLMDenseLoRARankTail(CustomTestCase):
             num_tokens, output_dim, device=device, dtype=dtype, generator=generator
         )
 
-        intermediate = sgemm_lora_a_fwd(x, a, info)
+        poisoned = torch.full(
+            (num_tokens, max_rank), poison, device=device, dtype=dtype
+        )
+        real_empty = torch.empty
+
+        def allocate(shape, *args, **kwargs):
+            # Intercept only the bf16 shrink allocation, not compiler/runtime
+            # allocations. The split-K path initializes its fp32 buffer itself.
+            if (
+                shape == poisoned.shape
+                and kwargs.get("device") == x.device
+                and kwargs.get("dtype") == dtype
+            ):
+                return poisoned
+            return real_empty(shape, *args, **kwargs)
+
+        with patch.object(torch, "empty", side_effect=allocate):
+            intermediate = sgemm_lora_a_fwd(
+                x,
+                a,
+                info,
+                out_alloc_stream=(
+                    torch.cuda.current_stream() if sorted_tokens else None
+                ),
+            )
+        if input_dim == 3584:
+            self.assertIs(intermediate, poisoned)
         self.assertEqual(
             intermediate.dtype, dtype if input_dim == 3584 else torch.float32
         )
         expected = base.float().clone()
+        shared_input = intermediate.clone()
+        padded_rows = []
         start = 0
         for length, slot in zip(lengths, slots):
             rows = (
@@ -125,17 +154,22 @@ class TestTRTLLMDenseLoRARankTail(CustomTestCase):
                     shrink.to(dtype).float() @ b[slot, :, :rank].float().T
                 )
                 expected[rows] += delta.to(dtype).float()
-            intermediate[rows, rank:] = poison
+            if 0 < rank < max_rank:
+                padded_rows.append(intermediate[rows, rank:])
+            # This independent caller uses its existing dynamic-rank mask.
+            shared_input[rows, rank:] = poison
             start += length
 
         out = sgemm_lora_b_fwd(intermediate, b, info, base.clone())
         self.assertTrue(torch.isfinite(out).all().item())
         torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
 
-        # The shared-sink caller uses the same kernel with multiple rank tiles,
-        # a flat grid and non-atomic writeback; retain its dynamic-rank behavior.
+        for tail in padded_rows:
+            self.assertTrue((tail == 0).all().item())
+
+        # The shared-sink caller retains its rank-masked, non-atomic writeback.
         shared_out = shared_sink_sgemm_lora_b_fwd(
-            intermediate,
+            shared_input,
             b,
             info,
             base.clone(),
