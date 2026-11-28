@@ -175,6 +175,13 @@ def _should_emit_normal_text_as_message(
 
 
 _RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotation)
+_TOOL_OUTPUT_MEDIA_PART_TYPES = (
+    "input_image",
+    "image_url",
+    "video_url",
+    "audio_url",
+    "input_audio",
+)
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -1541,16 +1548,19 @@ class OpenAIServingResponses(OpenAIServingChat):
         parts = [p for p in output if isinstance(p, dict)]
         if not any(p.get("type") in ("input_image", "image_url") for p in parts):
             return "".join(p.get("text", "") for p in parts)
-        # Chat validation needs a type on every part; the string path above
-        # also accepts untyped {"text": ...} parts.
-        return [
-            (
-                {"type": "text", "text": p["text"]}
-                if "type" not in p and "text" in p
-                else cls._normalize_response_content_part_for_chat(p)
-            )
-            for p in parts
-        ]
+        # Non-media parts keep only their text, as in the string path above, so
+        # parts chat validation rejects (input_file, untyped, refusal) drop out.
+        chat_parts = []
+        for part in parts:
+            if part.get("type") in _TOOL_OUTPUT_MEDIA_PART_TYPES:
+                media = cls._normalize_response_content_part_for_chat(part)
+                image_url = media.get("image_url") or {}
+                if media["type"] == "image_url" and not image_url.get("url"):
+                    continue  # A file_id-only image has no URL to load.
+                chat_parts.append(media)
+            elif "text" in part:
+                chat_parts.append({"type": "text", "text": part["text"]})
+        return chat_parts
 
     @staticmethod
     def _chat_tool_call_message(message: dict, name: Any, arguments: str) -> dict:

@@ -37,6 +37,7 @@ from sglang.srt.entrypoints.context import (
 )
 from sglang.srt.entrypoints.harmony_utils import get_encoding
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionMessageGenericParam,
     MessageProcessingResult,
     RequestResponseMetadata,
     ResponsesRequest,
@@ -1318,6 +1319,39 @@ class InputItemNormalizationTestCase(CustomTestCase):
                     "image_url": {"url": "data:image/png;base64,AA", "detail": "auto"},
                 },
                 video,
+            ],
+        )
+
+    def test_function_call_output_with_image_drops_parts_chat_rejects(self):
+        image = {"type": "input_image", "image_url": "data:image/png;base64,AA"}
+        normalized = OpenAIServingResponses._normalize_response_message_for_chat(
+            {
+                "type": "function_call_output",
+                "call_id": "call_abc",
+                "output": [
+                    {"type": "input_text", "text": "Page 1 preview."},
+                    {
+                        "type": "input_file",
+                        "file_data": "data:application/pdf;base64,JVBE",
+                        "filename": "report.pdf",
+                    },
+                    {"type": "input_image", "file_id": "file-123"},
+                    {"type": "refusal", "refusal": "no"},
+                    {"note": "untyped"},
+                    image,
+                ],
+            }
+        )
+
+        ChatCompletionMessageGenericParam(**normalized)
+        self.assertEqual(
+            normalized["content"],
+            [
+                {"type": "text", "text": "Page 1 preview."},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/png;base64,AA", "detail": "auto"},
+                },
             ],
         )
 
