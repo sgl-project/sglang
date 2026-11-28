@@ -405,6 +405,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "JetVLMForConditionalGeneration",
         "Lfm2ForCausalLM",
         "Lfm2MoeForCausalLM",
+        "Lfm2VlForConditionalGeneration",
         "ZayaForCausalLM",
         "Glm5NextForConditionalGeneration",
     }
@@ -458,12 +459,8 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     the configured linear-attention backend (pure read)."""
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
-    if get_platform().is_xpu:
-        return False
     if hf_config.architectures[0] == "Lfm3ForCausalLM" and get_platform().is_hip:
         # HIP has no extra-buffer hand-off for LFM3 conv-state checkpointing.
-        return False
-    if get_platform().is_xpu:
         return False
     spec = get_linear_attn_spec(hf_config)
     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
@@ -500,9 +497,9 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
-        if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
-            view, hf_config
-        ):
+        if (
+            wants_overlap or wants_paging or _intel_xpu_pages_by_default(view)
+        ) and supports_mamba_cache_extra_buffer(view, hf_config):
             declared["mamba_radix_cache_strategy"] = "extra_buffer"
         else:
             declared["mamba_radix_cache_strategy"] = "no_buffer"
@@ -1636,10 +1633,23 @@ def _hybrid_swa_memory_backend_disable(view: Any) -> dict:
     return {"disable_hybrid_swa_memory": True}
 
 
+def _intel_xpu_pages_by_default(view: Any) -> bool:
+    return (
+        get_platform().is_xpu
+        and view.page_size is None
+        and "intel_xpu" in attention_backends_of(view)
+    )
+
+
 @register_post_process
 def _intel_xpu_page_constraint(view: Any) -> dict:
     prefill_backend, decode_backend = attention_backends_of(view)
     if "intel_xpu" in (prefill_backend, decode_backend):
+        mamba_no_buffer = (
+            view.page_size is None
+            and view.uses_mamba_radix_cache
+            and view.mamba_radix_cache_strategy == "no_buffer"
+        )
         if use_mla_backend(view):
             # sgl_kernel's mla_decode accepts only these; it has no page_size 1 path.
             supported_page_sizes = [16, 32, 64, 128]
@@ -1649,6 +1659,18 @@ def _intel_xpu_page_constraint(view: Any) -> dict:
             # non-paged varlen attention); the paged kernel accepts only 64/128.
             supported_page_sizes = [1, 64, 128]
             msg = "Intel XPU attention backend"
+        if mamba_no_buffer:
+            if 1 not in supported_page_sizes:
+                raise ValueError(
+                    f"{msg} has no page_size 1 path, which the no_buffer Mamba radix "
+                    "cache needs. Pass --disable-radix-cache or "
+                    "--mamba-radix-cache-strategy extra_buffer."
+                )
+            logger.warning(
+                f"{msg}: the no_buffer Mamba radix cache needs page_size 1, "
+                "setting page_size to 1."
+            )
+            return {"page_size": 1}
         if view.page_size not in supported_page_sizes:
             logger.warning(
                 f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {view.page_size} to 128."
