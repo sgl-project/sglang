@@ -342,12 +342,12 @@ register_kernel(
 )
 
 
-# Vendored tlx.ops.moe (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
+# gfx950 TLX kernels; see "TLX kernel backend" in kernels/README.md.
 register_kernel(
     KernelSpec(
         op="moe.tlx_moe",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.tlx_ops.kernels.moe.gfx950:moe",
+        backend=KernelBackend.TLX,
+        target="sglang.kernels.ops.moe.tlx_moe:moe",
         capabilities=_HIP,
     )
 )

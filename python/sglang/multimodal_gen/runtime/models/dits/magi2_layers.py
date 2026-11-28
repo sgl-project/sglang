@@ -9,6 +9,10 @@ import torch
 from torch import nn
 from torch.utils.weak import WeakTensorKeyDictionary
 
+from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
+    SpShard,
+    build_shard_plan,
+)
 from sglang.multimodal_gen.runtime.models.dits.magi2_moe import (
     SWIGLU7_ALPHA,
     SWIGLU7_LIMIT,
@@ -111,6 +115,43 @@ def shard_packed_rows(
     plan = build_shard_plan(tensors[0].shape[0])
     sharded = [shard_like(t, plan, dim=0, pad_mode="repeat_last") for t in tensors]
     return sharded, plan
+
+
+def local_row_range(total_tokens: int) -> tuple[SpShard, tuple[int, int] | None]:
+    """This rank's packed rows ``[lo, hi)``, so the adapters touch only those; None
+    without sequence parallelism."""
+    plan = build_shard_plan(total_tokens)
+    if plan.sp_size <= 1:
+        return plan, None
+    lo = plan.sp_rank * plan.local_len
+    return plan, (lo, lo + plan.local_real_len)
+
+
+def pad_local_rows(plan: SpShard, *tensors: torch.Tensor) -> list[torch.Tensor]:
+    """The last rank's tail pad repeats its last real row, as ``shard_like`` does."""
+    if not plan.local_pad:
+        return list(tensors)
+    return [
+        torch.cat([t, t[-1:].expand(plan.local_pad, *t.shape[1:])]) for t in tensors
+    ]
+
+
+_LOCAL_ROWS = WeakTensorKeyDictionary()
+
+
+def local_rows(
+    index: torch.Tensor, lo: int, hi: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The inputs whose packed position falls in ``[lo, hi)``, and that position minus
+    ``lo``. Memoized per index tensor, since the selection syncs with the host and every
+    step of a request reuses the layout."""
+    cached = _LOCAL_ROWS.get(index)
+    if cached is not None and cached[0] == (lo, hi):
+        return cached[1]
+    keep = ((index >= lo) & (index < hi)).nonzero().flatten()
+    rows = keep, index.index_select(0, keep) - lo
+    _LOCAL_ROWS[index] = ((lo, hi), rows)
+    return rows
 
 
 def pad_rows_to_multiple(
@@ -288,35 +329,37 @@ class Magi2PreAdapter(nn.Module):
         timestep: torch.Tensor,
         ref_patches: torch.Tensor | None = None,
         ref_special: torch.Tensor | None = None,
+        row_range: tuple[int, int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embeds the packed rows ``row_range`` (all of them by default)."""
+        lo, hi = row_range or (0, layout.total_tokens)
         rows = torch.zeros(
-            layout.total_tokens,
-            self.stream_dim,
-            device=video.device,
-            dtype=torch.float32,
+            hi - lo, self.stream_dim, device=video.device, dtype=torch.float32
         )
-        rows.index_copy_(0, layout.video_index, self.video_embedder(video.float()))
-        rows.index_copy_(0, layout.text_index, self.text_embedder(text.float()))
-        if audio is not None:
-            rows.index_copy_(0, layout.audio_index, self.audio_embedder(audio.float()))
 
+        def embed(index, inputs, embedder):
+            if row_range is not None:
+                keep, index = local_rows(index, lo, hi)
+                inputs = inputs.index_select(0, keep)
+            rows.index_copy_(0, index, embedder(inputs.float()))
+
+        embed(layout.video_index, video, self.video_embedder)
+        embed(layout.text_index, text, self.text_embedder)
+        if audio is not None:
+            embed(layout.audio_index, audio, self.audio_embedder)
         if ref_special is not None and layout.ref_special_index.numel():
-            rows.index_copy_(
-                0, layout.ref_special_index, self.text_embedder(ref_special.float())
-            )
+            embed(layout.ref_special_index, ref_special, self.text_embedder)
         if ref_patches is not None and layout.ref_patch_index.numel():
-            rows.index_copy_(
-                0, layout.ref_patch_index, self.video_embedder(ref_patches.float())
-            )
+            embed(layout.ref_patch_index, ref_patches, self.video_embedder)
 
         # The timestep embedding is not a token: it overwrites the leading channels of
         # every row, which is what allows a per-token schedule. time_channel_dim is 0
         # on the refiner, where it would discard 64 real embedded channels.
         if self.time_channel_dim:
-            time_embed = sinusoidal_embedding_1d(self.time_channel_dim, timestep)
+            time_embed = sinusoidal_embedding_1d(self.time_channel_dim, timestep[lo:hi])
             rows[:, : self.time_channel_dim] = time_embed.to(rows.dtype)
 
-        return rows, self.rope(coords)
+        return rows, self.rope(coords[lo:hi])
 
 
 class Magi2PostAdapter(nn.Module):
@@ -332,16 +375,21 @@ class Magi2PostAdapter(nn.Module):
             stream_dim, config.audio_in_channels, bias=False, dtype=torch.float32
         )
 
-    def forward(
-        self, rows: torch.Tensor, *, layout: Magi2SegmentLayout
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def project(self, rows: torch.Tensor) -> torch.Tensor:
+        """Both output heads on every row, ``[rows, video + audio channels]``: a rank
+        projects its own rows, so only these narrow outputs cross ranks."""
         rows = rows.float()
-        video = self.final_linear_video(
-            self.final_norm_video(rows.index_select(0, layout.video_index))
-        )
+        video = self.final_linear_video(self.final_norm_video(rows))
+        audio = self.final_linear_audio(self.final_norm_audio(rows))
+        return torch.cat((video, audio), dim=1)
+
+    def forward(
+        self, projected: torch.Tensor, *, layout: Magi2SegmentLayout
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Picks each modality's rows out of ``project``'s output."""
+        num_video = self.final_linear_video.out_features
+        video = projected[:, :num_video].index_select(0, layout.video_index)
         audio = None
         if layout.audio_index.numel():
-            audio = self.final_linear_audio(
-                self.final_norm_audio(rows.index_select(0, layout.audio_index))
-            )
+            audio = projected[:, num_video:].index_select(0, layout.audio_index)
         return video, audio

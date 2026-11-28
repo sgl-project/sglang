@@ -10,6 +10,7 @@ To plug in a custom backend, register it under a string name via
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -239,30 +240,43 @@ def create_unified_radix_cache(
         )
     elif get_memory().enable_unified_cache_external_linker:
         from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.unified_cache.linker_attachment import (
+            LinkerAttachment,
+        )
         from sglang.srt.mem_cache.unified_cache.linker_factory import (
             create_unified_cache_linker,
             get_startup_linker_config,
         )
 
-        linker = create_unified_cache_linker(
-            server_args,
-            params,
-            backend=get_memory().unified_cache_external_linker_backend,
-            config=get_startup_linker_config(),
-            components=set(cache.components),
-            forward_stream=ctx.tp_worker.model_runner.forward_stream,
-        )
-        cache.init_cache_linker(linker)
-        counter = linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        kvcache.register_layer_transfer_counter(counter)
-        if PoolName.MAMBA in linker.pools:
-            kvcache.layer_router.load_parts_layer_wise()
-        if PoolName.DRAFT in linker.pools:
-            draft_counter = linker.draft_layer_counter()
+
+        def publish_linker(linker):
+            counter = draft_counter = None
+            if linker is not None:
+                counter = linker.layer_done_counter
+                if PoolName.MAMBA in linker.pools:
+                    kvcache.layer_router.load_parts_layer_wise()
+                if PoolName.DRAFT in linker.pools:
+                    draft_counter = linker.draft_layer_counter()
+            kvcache.register_layer_transfer_counter(counter)
             for draft_pool in params.sidecar_draft_device_pools:
                 draft_pool.register_layer_transfer_counter(draft_counter)
-        ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
+            ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
+
+        cache.linker_attachment = LinkerAttachment(
+            cache,
+            build_linker=functools.partial(
+                create_unified_cache_linker,
+                server_args,
+                params,
+                backend=get_memory().unified_cache_external_linker_backend,
+                config=get_startup_linker_config(),
+                components=set(cache.components),
+                forward_stream=ctx.tp_worker.model_runner.forward_stream,
+            ),
+            publish_linker=publish_linker,
+        )
+        cache.linker_attachment.launch()
     return cache
 
 
