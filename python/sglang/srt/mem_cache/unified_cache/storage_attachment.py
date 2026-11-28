@@ -125,15 +125,7 @@ class StorageAttachment:
                     f"'{current_backend}'. Cannot attach different backend "
                     f"'{storage_backend}'. Detach first.",
                 )
-            # Same backend: the request degenerates to a policy update.
-            self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
-            return (
-                True,
-                "HiCache storage backend already enabled with same backend; "
-                "policies updated.",
-            )
 
-        logger.info(f"Attaching HiCache storage backend: {storage_backend}")
         try:
             (
                 extra_config,
@@ -152,6 +144,16 @@ class StorageAttachment:
                 f"'{storage_backend_extra_config_json}': {e}",
             )
 
+        if cache.enable_storage:
+            # Same backend: the request degenerates to a policy update.
+            self._apply_policies(hicache_storage_prefetch_policy, hicache_write_policy)
+            return (
+                True,
+                "HiCache storage backend already enabled with same backend; "
+                "policies updated.",
+            )
+
+        logger.info(f"Attaching HiCache storage backend: {storage_backend}")
         original_policies = (
             cache.prefetch_stop_policy,
             controller.write_policy,
