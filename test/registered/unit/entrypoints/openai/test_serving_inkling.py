@@ -273,6 +273,7 @@ class InklingTokenOutputTest(CustomTestCase):
         ):
             for ids, finish in steps:
                 chunks += self.inkling.stream_chat_chunks(
+                    chunk_id="chatcmpl-1",
                     content={
                         "output_ids": ids,
                         "meta_info": {
@@ -424,6 +425,7 @@ class InklingTokenOutputTest(CustomTestCase):
         with get_context().override_server_args(incremental_streaming_output=False):
             for meta_info, ids in ((first, live), (final, list(live))):
                 chunks += self.inkling.stream_chat_chunks(
+                    chunk_id="chatcmpl-1",
                     content={
                         "output_ids": ids,
                         "meta_info": {"id": "chatcmpl-1", **meta_info},

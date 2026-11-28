@@ -245,6 +245,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
         routed_experts = {}
         cached_tokens_details = {}
         spec_tokens_details = {}
+        # One id for the whole response, since n>1 and batched prompts give
+        # each choice its own rid.
+        response_id = None
 
         stream_started = False
         try:
@@ -257,6 +260,8 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+                if response_id is None:
+                    response_id = content["meta_info"]["id"]
 
                 text = content["text"]
                 prompt_tokens[index] = content["meta_info"].get("prompt_tokens", 0)
@@ -385,7 +390,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     prompt_token_ids=chunk_prompt_token_ids,
                 )
                 chunk = CompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=response_id,
                     created=created,
                     object="text_completion",
                     choices=[choice_data],
@@ -410,7 +415,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                             choice_hidden_states, request.return_hidden_states
                         )
                         hidden_states_chunk = CompletionStreamResponse(
-                            id=content["meta_info"]["id"],
+                            id=response_id,
                             created=created,
                             object="text_completion",
                             choices=[
@@ -462,7 +467,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 ]
             ):
                 sglext_chunk = CompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=response_id,
                     created=created,
                     object="text_completion",
                     choices=[],  # sglext is at response level
@@ -486,7 +491,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     enable_cache_report=get_serving().enable_cache_report,
                 )
                 final_usage_chunk = CompletionStreamResponse(
-                    id=content["meta_info"]["id"],
+                    id=response_id,
                     created=created,
                     choices=[],
                     model=request.model,
