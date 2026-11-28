@@ -115,51 +115,7 @@ sgl-eval run gsm8k \\
       ],
     },
 
-    // ----- Card: "Loop" -----
-    // Optional knobs over the loop core (layers 6-17, 3 passes by default):
-    //   --inkling2-loop-num-passes N   (only on variable-loop checkpoints)
-    //   --inkling2-loop-share-cache    (one K/V cache per core layer across passes)
-    // Both flags need a variable-loop checkpoint (loop_config.is_varloop=true);
-    // a fixed-loop checkpoint refuses them at startup. DSpark refuses a
-    // non-default pass count, because the draft reads fixed layer visits.
-    // Every option below was checked for output parity on GB300 and H200.
-    // TPU7x: no server has run with either flag yet, so they are disabled there.
     flagSelects: [
-      {
-        id: "loopPasses", title: "Loop Passes",
-        stripPrefixes: ["--inkling2-loop-num-passes"],
-        options: [
-          { id: "default", label: "3 (checkpoint default)", flags: [] },
-          { id: "p1", label: "1", flags: ["--inkling2-loop-num-passes 1"],
-            disable: [
-              { when: { strategy: ["dspark"] }, reason: "DSpark drafts read fixed layer visits; serve them at the checkpoint's 3 passes." },
-              { when: { hw: ["tpu7x"] }, reason: "Not yet run on TPU7x; the TPU7x recipes use the checkpoint's 3 passes." },
-              { when: { hw: ["mi350x", "mi355x"] }, reason: "Not yet run on AMD; 2, 3 and 4 passes were." },
-            ] },
-          { id: "p2", label: "2", flags: ["--inkling2-loop-num-passes 2"],
-            disable: [
-              { when: { strategy: ["dspark"] }, reason: "DSpark drafts read fixed layer visits; serve them at the checkpoint's 3 passes." },
-              { when: { hw: ["tpu7x"] }, reason: "Not yet run on TPU7x; the TPU7x recipes use the checkpoint's 3 passes." },
-            ] },
-          { id: "p4", label: "4", flags: ["--inkling2-loop-num-passes 4"],
-            disable: [
-              { when: { strategy: ["dspark"] }, reason: "DSpark drafts read fixed layer visits; serve them at the checkpoint's 3 passes." },
-              { when: { hw: ["tpu7x"] }, reason: "Not yet run on TPU7x; the TPU7x recipes use the checkpoint's 3 passes." },
-            ] },
-        ],
-      },
-      {
-        // One K/V cache per core layer instead of one per pass: about twice the
-        // KV pool at 3 passes. Validated with DSpark, PD and HiCache.
-        id: "loopShareCache", title: "Loop KV Cache",
-        stripPrefixes: ["--inkling2-loop-share-cache"],
-        options: [
-          { id: "perPass", label: "Per pass (default)", flags: [] },
-          { id: "shared",  label: "Shared across passes", flags: ["--inkling2-loop-share-cache"],
-            disable: { hw: ["tpu7x"] },
-            disableReason: "Not yet run on TPU7x; the TPU7x recipes keep one KV cache per pass." },
-        ],
-      },
       {
         // The tool-call header past tool calls render with: the tool's name
         // (Inkling-2-Mini), empty with assistant names dropped
