@@ -97,6 +97,8 @@ def _server_args(ext, port: int):
         tokenizer_model_max_length=-1,
         version="test",
         max_total_num_tokens=100000,
+        max_req_len=100000,
+        max_req_input_len=99994,
         deployment_info="{}",
         launch_server_info="{}",
         launch_model_info="{}",
