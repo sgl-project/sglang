@@ -212,6 +212,21 @@ _K3_GB300_BFA_SIDE_TGV_M_RANGES = {
 }
 
 
+def _register_k3_tgv_m_ranges() -> None:
+    """Register K3's measured CuTe DSL GEMM tactics.
+
+    The CuTe DSL GEMM module imports cuda.bindings and cutlass at module level,
+    which only CUDA builds ship.
+    """
+    if not get_platform().is_cuda:
+        return
+    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import register_tgv_m_ranges
+
+    register_tgv_m_ranges(_K3_TGV_M_RANGES)
+    if get_platform().device_sm == 103:
+        register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
+
+
 def _k3_side_stream_max_tokens() -> int:
     """Largest graphed batch whose attention side-stream GEMMs overlap."""
     if not get_platform().is_blackwell:
@@ -3821,16 +3836,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        if not (_is_hip or _is_npu):
-            # The CuTe DSL GEMM module imports cuda.bindings and cutlass at
-            # module level; neither ships on ROCm or Ascend NPU.
-            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
-                register_tgv_m_ranges,
-            )
-
-            register_tgv_m_ranges(_K3_TGV_M_RANGES)
-            if get_platform().device_sm == 103:
-                register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
+        _register_k3_tgv_m_ranges()
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
