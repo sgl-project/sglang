@@ -820,6 +820,39 @@ def _can_use_mega_mhc(cfg: HcConfig) -> bool:
     return get_platform().is_sm100
 
 
+def _run_flydsl_mega_mhc(
+    hc: HcSubLayer,
+    residual: torch.Tensor,
+    pre: Optional[torch.Tensor],
+    **post: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """One aiter ``flydsl_mega_mhc`` launch for ``hc``; ``post`` holds the previous
+    post's operands, empty at a closed seam. Returns (residual, normalized, triplet)."""
+    from aiter.ops.flydsl import flydsl_mega_mhc
+
+    updated, post_mix, comb, normalized, next_pre = flydsl_mega_mhc(
+        residual,
+        hc.fn,
+        hc.scale,
+        hc.base,
+        hc.cfg.rms_eps,
+        hc.cfg.eps,
+        hc.cfg.eps,
+        2.0,
+        hc.cfg.sinkhorn_iters,
+        pre,
+        norm_weight=hc.norm.weight,
+        norm_eps=hc.norm.variance_epsilon,
+        out_dtype="bf16",
+        **post,
+    )
+    if post_mix.ndim == 3:
+        post_mix = post_mix.squeeze(-1)
+    if next_pre.ndim == 3:
+        next_pre = next_pre.squeeze(-1)
+    return updated, normalized, (next_pre, post_mix, comb)
+
+
 def _hip_flydsl_mega_mhc(
     y: torch.Tensor,
     residual: torch.Tensor,
@@ -829,34 +862,79 @@ def _hip_flydsl_mega_mhc(
     nxt: HcSubLayer,
 ) -> HcState:
     """ROCm Mega-mHC on gfx950. bf16 norm; the next GEMM still quantizes."""
-    from aiter.ops.flydsl import flydsl_mega_mhc
-
-    post_in = post_mix.unsqueeze(-1) if post_mix.ndim == 2 else post_mix
-    residual_out = torch.empty_like(residual)
-    updated, next_post, next_comb, normalized, next_pre = flydsl_mega_mhc(
-        residual,
-        nxt.fn,
-        nxt.scale,
-        nxt.base,
-        nxt.cfg.rms_eps,
-        nxt.cfg.eps,
-        nxt.cfg.eps,
-        2.0,
-        nxt.cfg.sinkhorn_iters,
-        pre,
+    updated, normalized, stats = _run_flydsl_mega_mhc(
+        hc=nxt,
+        residual=residual,
+        pre=pre,
         sublayer_out=y,
-        post_layer_mix=post_in,
+        post_layer_mix=post_mix.unsqueeze(-1) if post_mix.ndim == 2 else post_mix,
         comb_res_mix=comb,
-        norm_weight=nxt.norm.weight,
-        norm_eps=nxt.norm.variance_epsilon,
-        residual_out=residual_out,
-        out_dtype="bf16",
+        residual_out=torch.empty_like(residual),
     )
-    if next_post.ndim == 3:
-        next_post = next_post.squeeze(-1)
-    if next_pre.ndim == 3:
-        next_pre = next_pre.squeeze(-1)
-    return HcState(updated, pre, HcNormed(normalized), (next_pre, next_post, next_comb))
+    return HcState(updated, pre, HcNormed(normalized), stats)
+
+
+def _hip_flydsl_mega_mhc_nopost(
+    hc: HcSubLayer, residual: torch.Tensor, pre: Optional[torch.Tensor]
+) -> HcState:
+    """No-post Mega-mHC on gfx950: this hyper-connection's combine, norm and triplet
+    in one launch; ``pre`` None takes stream 0."""
+    _, normalized, stats = _run_flydsl_mega_mhc(hc=hc, residual=residual, pre=pre)
+    return HcState(residual, pre, HcNormed(normalized), stats)
+
+
+def can_use_mega_closed_seam(hc: HcSubLayer) -> bool:
+    """Whether gfx950 Mega-mHC can run this hyper-connection at a closed seam."""
+    return (
+        _is_hip
+        and _can_use_mega_mhc(hc.cfg)
+        and make_boundary(hc.norm, accepts_mxfp8=False).norm_fusable
+    )
+
+
+def mega_closed_seam(hc: HcSubLayer, state: HcState, extend: bool) -> HcState:
+    """At a closed seam (the first layer, an Engram layer) of a prefill step, one no-post
+    Mega-mHC launch runs the combine, norm and triplet. Consumes ``state``, as `combine`
+    would."""
+    if (
+        not extend
+        or state.input is not None
+        or state.stats is not None
+        or state.residual.shape[0] == 0
+    ):
+        return state
+    # The first layer has no pre: identity pre takes stream 0, as `_combine` does.
+    opened = _hip_flydsl_mega_mhc_nopost(hc=hc, residual=state.residual, pre=state.pre)
+    state.release()
+    return opened
+
+
+def can_use_mega_draft(attn: HcSubLayer, ffn: HcSubLayer) -> bool:
+    """Whether a DSpark draft stage takes its seams through Mega-mHC
+    (SGLANG_OPT_DSV41_MEGA_MHC_DRAFT, gfx950)."""
+    return (
+        envs.SGLANG_OPT_DSV41_MEGA_MHC_DRAFT.get()
+        and can_use_mega_closed_seam(attn)
+        and can_use_mega_closed_seam(ffn)
+    )
+
+
+def mega_draft_open(
+    hc: HcSubLayer, residual: torch.Tensor, pre: Optional[torch.Tensor]
+) -> HcState:
+    """A draft stage's attention seam in one no-post launch: the sublayer input
+    ``norm(sum_k pre[k] * R[k])`` (stream 0 without a pre, as `_combine`) and the
+    triplet from ``residual``, which `mix_stats` would compute."""
+    return _hip_flydsl_mega_mhc_nopost(hc=hc, residual=residual, pre=pre)
+
+
+def mega_draft_post(y: torch.Tensor, opened: HcState, nxt: HcSubLayer) -> HcState:
+    """The attention post of an opened draft seam, with the FFN's triplet, combine and
+    norm, in one launch."""
+    pre, post_mix, comb = opened.stats
+    return _hip_flydsl_mega_mhc(
+        y=y, residual=opened.residual, pre=pre, post_mix=post_mix, comb=comb, nxt=nxt
+    )
 
 
 def _can_use_decode_post_combine(cfg: HcConfig, rows: int) -> bool:
