@@ -720,8 +720,6 @@ def resolve_transformer_quant_load_spec(
                 "Per-layer checkpoint quantization and Nunchaku are mutually exclusive"
             )
         quant_config = checkpoint_quant_config
-    elif getattr(model_cls, "handles_checkpoint_quantization", False):
-        quant_config = None
     else:
         quant_config = _resolve_quant_config(
             hf_config=hf_config,
@@ -731,6 +729,16 @@ def resolve_transformer_quant_load_spec(
             transformer_override_config_path=transformer_override_config_path,
             arch_config=arch_config,
         )
+        if quant_config is not None and not getattr(
+            model_cls, "supports_runtime_quantization", True
+        ):
+            logger.warning(
+                "%s does not support runtime %s quantization; loading the "
+                "checkpoint in its source dtype instead.",
+                model_cls.__name__,
+                _get_quant_config_name(quant_config),
+            )
+            quant_config = None
 
     if quant_config is not None:
         packed = getattr(model_cls, "packed_modules_mapping", None)

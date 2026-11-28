@@ -97,7 +97,6 @@ struct CompletionRequest {
     custom_logit_processor: Option<String>,
     watermark: Option<WatermarkRequestConfig>,
     images_config: Option<ImagesConfig>,
-    data_parallel_rank: Option<i64>,
     rid: Option<OneOrList<String>>,
     extra_key: Option<OneOrList<String>>,
     cache_salt: Option<OneOrList<String>>,
@@ -162,9 +161,6 @@ pub fn lower_completion(
     }
     if let Some(schema) = format_json_schema(request.response_format.as_ref(), false)? {
         request.json_schema = Some(schema);
-    }
-    if request.routed_dp_rank.is_none() {
-        request.routed_dp_rank = request.data_parallel_rank;
     }
 
     let echo_prompts = if request.echo {
@@ -599,5 +595,44 @@ impl CompletionResponder {
             }
             _ => fallback,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A zero-token choice reports `"token_ids": []` unary and streamed, as Python does.
+    #[test]
+    fn zero_token_choice_reports_empty_token_ids() {
+        let frame = || -> GenerateResponse {
+            serde_json::from_value(json!({
+                "text": "",
+                "output_ids": [],
+                "meta_info": {
+                    "id": "r",
+                    "finish_reason": {"type": "length", "length": 0},
+                    "prompt_tokens": 2,
+                    "completion_tokens": 0,
+                },
+            }))
+            .unwrap()
+        };
+        let responder = |stream: bool| {
+            let body = json!({"prompt": [1, 2], "return_token_ids": true, "stream": stream});
+            let body = serde_json::to_vec(&body).unwrap();
+            let settings = OpenAiSettings::default();
+            lower_completion(&body, &OpenAiHeaders::default(), &settings, None)
+                .unwrap()
+                .1
+        };
+
+        let reply = responder(false).unary(vec![frame()]).expect("unary reply");
+        let unary: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(unary["choices"][0]["token_ids"], json!([]), "{unary}");
+
+        let events = responder(true).stream_data(Ok(frame())).unwrap();
+        let chunk: Value = serde_json::from_str(events[0].strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(chunk["choices"][0]["token_ids"], json!([]), "{chunk}");
     }
 }

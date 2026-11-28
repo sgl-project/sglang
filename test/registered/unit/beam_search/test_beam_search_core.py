@@ -5,8 +5,11 @@ backpointer history DAG, and the BeamGroup lifecycle. The differential oracle is
 a naive walk-in-order loop written here, not the implementation under test.
 """
 
+import gc
 import random
 import unittest
+import weakref
+from types import SimpleNamespace
 
 import torch
 
@@ -218,7 +221,9 @@ class TestBeamGroup(CustomTestCase):
             T([[12, 13], [14, 15]], torch.int64),
             2,
         )
-        self.assertTrue(group.advance_final(fsel))
+        group.advance_final_frontier(fsel)
+        self.assertTrue(group.launch_complete())
+        self.assertTrue(group.commit_pending())
 
         results = group.finalize()
         self.assertEqual(len(results), 2)
@@ -249,6 +254,38 @@ class TestBeamGroup(CustomTestCase):
         self.assertAlmostEqual(group.beam_score(-0.3, 2), -0.3, places=6)
         group2 = self._make_group(length_penalty=1.0)
         self.assertAlmostEqual(group2.beam_score(-0.3, 2), -0.15, places=6)
+
+    def test_out_of_vocab_stop_ids_are_dropped(self):
+        """Out-of-vocab stop ids never match and must not break the group's tensor."""
+        from sglang.srt.beam_search.coordinator import BeamCoordinator
+
+        req = SimpleNamespace(eos_token_ids={2}, tokenizer=None)
+        params = SimpleNamespace(
+            ignore_eos=False, stop_token_ids={-1, 0, 5, 31, 32, 2**63}
+        )
+        ids = BeamCoordinator._collect_stop_token_ids(req, params, vocab_size=32)
+        self.assertEqual(ids, [0, 2, 5, 31])
+        group = self._make_group(stop_token_ids=ids)
+        self.assertEqual(group.stop_token_ids.tolist(), ids)
+
+    def test_dropped_request_frees_its_group_without_a_gc_pass(self):
+        """Dropping the request frees its group by refcount: a cycle between them
+        would leave finished requests to full GC passes."""
+
+        class Req:  # weakly referenceable, as the scheduler's Req is
+            pass
+
+        req = Req()
+        req.beam_group = self._make_group()
+        req.beam_group.leader = req
+        self.assertIs(req.beam_group.leader, req)
+        group = weakref.ref(req.beam_group)
+        gc.disable()
+        try:
+            del req
+            self.assertIsNone(group())
+        finally:
+            gc.enable()
 
 
 if __name__ == "__main__":

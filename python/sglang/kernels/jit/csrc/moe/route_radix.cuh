@@ -4,13 +4,14 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
-#include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
-#include <sgl_kernel/vec.cuh>    // For AlignedVector
-#include <sgl_kernel/warp.cuh>   // For warp::inclusive_sum, reduce_sum
+#include <sgl_kernel/activation.cuh>
+#include <sgl_kernel/type.cuh>
+#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -40,12 +41,6 @@ SGL_DEVICE uint32_t biased_to_key(float biased) {
   if (biased == 0.0f) biased = 0.0f;
   uint32_t u = __float_as_uint(biased);
   return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-}
-
-// tl.sigmoid(x) = 1/(1+exp(-x)). Must stay instruction-identical to v1's
-// sigmoid_match so both kernels rank (and weight) identically.
-SGL_DEVICE float sigmoid_match(float x) {
-  return __fdividef(1.0f, 1.0f + __expf(-x));
 }
 
 SGL_DEVICE float nan_floor(float x) {
@@ -157,7 +152,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
         xy = cast<fp32x2_t>(scores_vec[i]);
       }
       const auto [x, y] = xy;
-      const auto sx = moe::radix::sigmoid_match(x), sy = moe::radix::sigmoid_match(y);
+      const auto sx = activation::sigmoid(x), sy = activation::sigmoid(y);
       keys[2 * i + 0] = moe::radix::biased_to_key(moe::radix::nan_floor(sx + bias_vec[i].x));
       keys[2 * i + 1] = moe::radix::biased_to_key(moe::radix::nan_floor(sy + bias_vec[i].y));
       act[2 * i + 0] = sx;
@@ -413,8 +408,8 @@ SGL_DEVICE void fgt_select_topk(
     }
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      const float sx = moe::radix::sigmoid_match(logit[2 * i + 0]);
-      const float sy = moe::radix::sigmoid_match(logit[2 * i + 1]);
+      const float sx = device::activation::sigmoid(logit[2 * i + 0]);
+      const float sy = device::activation::sigmoid(logit[2 * i + 1]);
       act[2 * i + 0] = sx;
       act[2 * i + 1] = sy;
       keys[2 * i + 0] = moe::radix::biased_to_key(moe::radix::nan_floor(sx + bias_vec[i].x));
@@ -604,22 +599,26 @@ struct RouteRadixKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
+    // Each thread loads 4 scores (8 B bf16 / 16 B fp32) and 4 bias values (16 B).
+    constexpr auto kVecSize = LargeRouterRadixTrait::kVecSize;
+    const auto score_bytes = is_type<fp32_t>(scores.dtype()) ? sizeof(fp32_t) : sizeof(bf16_t);
     auto score_dtype = SymbolicDType{};
-    TensorMatcher({M_, N_})
+    TensorMatcher({M_, N_})  //
         .with_dtype<bf16_t, fp32_t>(score_dtype)
         .with_device(device)
         .with_strides({-1, 1})
+        .ensure_alignment(kVecSize * score_bytes)
         .verify(scores);
-    TensorMatcher({N_}).with_dtype<fp32_t>().with_device(device).verify(bias);
+    TensorMatcher({N_})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .ensure_alignment(kVecSize * sizeof(fp32_t))
+        .verify(bias);
     TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device).verify(out_w);
     TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device).verify(out_i);
 
-    RuntimeCheck(
-        N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
-        "route_radix is specialized for N=896, K=16");
-    // Vectorized row loads (8B for bf16, 16B for fp32) need aligned row
-    // starts; stride % 4 elements covers both (4 x 2B = 8B / 4 x 4B = 16B).
-    RuntimeCheck(scores.stride(0) % 4 == 0, "route_radix: scores row stride must be a multiple of 4");
+    CHECK_HOST(N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_)
+        << "route_radix is specialized for N=896, K=16";
 
     const auto M = static_cast<uint32_t>(M_.unwrap());
     if (M == 0) return;
@@ -675,25 +674,45 @@ struct FusedFrontEpilogueKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    TensorMatcher({M_, W_}).with_dtype<fp32_t>().with_device(device).with_strides({-1, 1}).verify(merged);
-    TensorMatcher({E_}).with_dtype<fp32_t>().with_device(device).verify(bias);
-    TensorMatcher({M_, K_}).with_dtype<fp32_t>().with_device(device).verify(out_w);
-    TensorMatcher({M_, K_}).with_dtype<int32_t>().with_device(device).verify(out_i);
-    TensorMatcher({M_, L_}).with_dtype<bf16_t>().with_device(device).with_strides({-1, 1}).verify(routed);
+    // Tunables come from the JSON config table; see kernels/ops/moe/moe_front.py.
+    // cast_vec * 4 bytes per thread must stay inside the 32B vector-load limit.
+    CHECK_HOST(block_size == 224 || block_size == 448) << block_size;
+    CHECK_HOST(cast_vec == 2 || cast_vec == 4 || cast_vec == 8) << cast_vec;
+    // Per thread: kNumExperts / block_size logits and bias values, then cast_vec latent
+    // values (fp32 in, bf16 out); the latent slice starts 896 * 4 B = 112 * 32 B in.
+    const auto expert_bytes = static_cast<int64_t>(kFGTNumExperts / block_size * sizeof(fp32_t));
+    const auto cast_bytes = static_cast<int64_t>(cast_vec * sizeof(fp32_t));
+    TensorMatcher({M_, W_})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .with_strides({-1, 1})
+        .ensure_alignment(std::max(expert_bytes, cast_bytes))
+        .verify(merged);
+    TensorMatcher({E_})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .ensure_alignment(expert_bytes)
+        .verify(bias);
+    TensorMatcher({M_, K_})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .verify(out_w);
+    TensorMatcher({M_, K_})  //
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(out_i);
+    TensorMatcher({M_, L_})  //
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .with_strides({-1, 1})
+        .ensure_alignment(cast_vec * sizeof(bf16_t))
+        .verify(routed);
 
     const auto M = static_cast<int>(M_.unwrap());
     const auto latent = static_cast<int>(L_.unwrap());
-    RuntimeCheck(
-        E_.unwrap() == kFGTNumExperts && K_.unwrap() == kFGTTopK && topk == kFGTTopK,
-        "fused_front_epilogue is specialized for E=896, topk=16");
-    RuntimeCheck(
-        static_cast<int>(W_.unwrap()) == static_cast<int>(kFGTNumExperts) + latent,
-        "fused_front_epilogue: merged width must be num_experts + latent");
-    // 16B vectorized reads of the fp32 rows and 8B writes of the bf16 rows.
-    RuntimeCheck(latent % 4 == 0, "fused_front_epilogue: latent must be a multiple of 4");
-    RuntimeCheck(
-        merged.stride(0) % 4 == 0 && routed.stride(0) % 4 == 0,
-        "fused_front_epilogue: row strides must be a multiple of 4");
+    CHECK_HOST(E_.unwrap() == kFGTNumExperts && K_.unwrap() == kFGTTopK && topk == kFGTTopK);
+    CHECK_HOST(static_cast<int>(W_.unwrap()) == static_cast<int>(kFGTNumExperts) + latent);
+    CHECK_HOST(latent % 4 == 0 && latent % cast_vec == 0) << latent;
     if (M == 0) return;
 
     auto params = MoEFrontParams{};
@@ -711,11 +730,6 @@ struct FusedFrontEpilogueKernel {
     params.routed_out = static_cast<bf16_t*>(routed.data_ptr());
     params.latent = latent;
     params.routed_stride = static_cast<long long>(routed.stride(0));
-
-    // Tunables come from the JSON config table; see kernels/ops/moe/moe_front.py.
-    // cast_vec * 4 bytes per thread must stay inside the 32B vector-load limit.
-    RuntimeCheck(cast_vec == 2 || cast_vec == 4 || cast_vec == 8, "fused_front_epilogue: cast_vec must be 2, 4 or 8");
-    RuntimeCheck(latent % cast_vec == 0, "fused_front_epilogue: cast_vec must divide latent");
 
 #define SGL_FRONT_LAUNCH(BS, CV, CF) \
   LaunchKernel(M, BS, device.unwrap()).enable_pdl(kUsePDL)(fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
@@ -738,7 +752,6 @@ struct FusedFrontEpilogueKernel {
     }                                 \
   } while (0)
 
-    RuntimeCheck(block_size == 224 || block_size == 448, "fused_front_epilogue: block_size must be 224 or 448");
     if (cast_first) {
       SGL_FRONT_DISPATCH_BS(true);
     } else {

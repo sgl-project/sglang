@@ -16,6 +16,11 @@ from unittest.mock import Mock
 import torch
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -30,11 +35,11 @@ from sglang.test.ci.ci_register import (
     register_cuda_ci,
     register_xpu_ci,
 )
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
-register_xpu_ci(est_time=60, suite="stage-b-test-1-gpu-xpu")
+register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd")
+register_xpu_ci(est_time=60, suite="extra-test-1-gpu-xpu")
 
 DEVICE = get_device()
 
@@ -74,6 +79,84 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
     )
     req.finished = lambda: req.finished_reason is not None
     return req
+
+
+def naive_load_topk(
+    coordinator,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k_tokens: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    """Per-request reference for swap_in_selected_pages (non-dsv4 path): load the
+    selected tokens of each request into device memory and return their device
+    indices, shape (num_reqs, top_k)."""
+    assert not coordinator.is_dsv4_hisparse, (
+        "naive_load_topk is not implemented for dsv4 hisparse"
+    )
+    num_reqs = req_pool_indices.size(0)
+    top_k_indices = torch.full(
+        (num_reqs, coordinator.top_k), -1, dtype=torch.int32, device=coordinator.device
+    )
+
+    for i in range(num_reqs):
+        seq_len = int(seq_lens[i].item())
+        top_n = min(seq_len, coordinator.top_k)
+        if top_n == 0:
+            continue
+
+        req_idx = int(req_pool_indices[i].item())
+        selected_tokens = top_k_tokens[i, :top_n].to(dtype=torch.int64)
+
+        assert torch.all(selected_tokens >= 0), (
+            f"Req {req_idx}: selected tokens contain negative positions"
+        )
+        assert torch.all(selected_tokens < seq_len), (
+            f"Req {req_idx}: selected tokens {selected_tokens.tolist()} "
+            f"out of range for seq_len={seq_len}"
+        )
+
+        if seq_len <= coordinator.device_buffer_size:
+            device_indices = coordinator.req_to_device_buffer[req_idx, selected_tokens]
+        else:
+            device_indices = torch.empty(
+                top_n, dtype=torch.int64, device=coordinator.device
+            )
+
+            is_latest_token = selected_tokens == (seq_len - 1)
+            needs_host_load = ~is_latest_token
+
+            device_indices[is_latest_token] = coordinator.req_to_device_buffer[
+                req_idx, coordinator.device_buffer_size
+            ]
+
+            num_to_load = int(needs_host_load.sum().item())
+            if num_to_load > 0:
+                tokens_to_load = selected_tokens[needs_host_load]
+                host_locs = coordinator.req_to_host_pool[req_idx, tokens_to_load]
+
+                invalid_mask = host_locs < 0
+                if torch.any(invalid_mask):
+                    bad_positions = tokens_to_load[invalid_mask].tolist()
+                    raise AssertionError(
+                        f"Req {req_idx} (seq_len={seq_len}, layer={layer_id}): "
+                        f"missing host backup at token positions {bad_positions}"
+                    )
+
+                buffer_locs = coordinator.req_to_device_buffer[req_idx, :num_to_load]
+                device_indices[needs_host_load] = buffer_locs
+
+                coordinator.mem_pool_host.load_to_device_per_layer(
+                    coordinator.mem_pool_device,
+                    host_locs,
+                    buffer_locs,
+                    layer_id,
+                    io_backend="kernel",
+                )
+
+        top_k_indices[i, :top_n] = device_indices.to(torch.int32)
+
+    return top_k_indices
 
 
 class TestHiSparseUnit(unittest.TestCase):
@@ -143,7 +226,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
         cls.req_to_token_pool = ReqToTokenPool(
             size=MAX_NUM_REQS,
-            max_context_len=MAX_CONTEXT_LEN,
+            row_width=MAX_CONTEXT_LEN,
             device=DEVICE,
             enable_memory_saver=False,
         )
@@ -193,7 +276,9 @@ class TestHiSparseUnit(unittest.TestCase):
         self.coordinator.req_device_buffer_tokens.fill_(-1)
         self.coordinator.req_device_buffer_token_locs.fill_(-1)
         self.coordinator.lru_slots[:] = self.coordinator._lru_init.view(1, 1, -1)
-        self.coordinator.ack_staging_queue.clear()
+        # A failed test may leave requests staged; retire them.
+        for req in list(self.coordinator.ack_staging_queue):
+            leaving_retirer().release(req, checkpoint=False)
         self.coordinator._has_pending_backup = False
         for i in range(len(self.coordinator._skip_first_backup)):
             self.coordinator._skip_first_backup[i] = False
@@ -334,7 +419,7 @@ class TestHiSparseUnit(unittest.TestCase):
 
     def _assert_matches_naive(self, rpi, sls, batch, kernel_locs, layer_id, msg=""):
         """Assert kernel swap_in KV data matches naive_load_topk KV data."""
-        naive_locs = self.coordinator.naive_load_topk(rpi, sls, batch, layer_id)
+        naive_locs = naive_load_topk(self.coordinator, rpi, sls, batch, layer_id)
         for b in range(batch.shape[0]):
             for i in range(TOP_K):
                 if batch[b, i] < 0:
@@ -366,8 +451,8 @@ class TestHiSparseUnit(unittest.TestCase):
         return self.coordinator.swap_in_selected_pages(rpi, sls, batch, layer_id)
 
     def _cleanup_req(self, req, kv_loc, *, logical_only=False):
-        """request_finished -> free KV -> free req slot."""
-        self.coordinator.request_finished(req)
+        """release_request -> free KV -> free req slot."""
+        self.coordinator.release_request(req)
         if logical_only:
             self.allocator.logical_attn_allocator.free(kv_loc)
         else:
@@ -409,7 +494,7 @@ class TestHiSparseUnit(unittest.TestCase):
         rpi, sls = self._make_batch_tensors([req], [fill_len])
 
         for lid in range(LAYER_NUM):
-            naive_locs = self.coordinator.naive_load_topk(rpi, sls, batch, lid)
+            naive_locs = naive_load_topk(self.coordinator, rpi, sls, batch, lid)
             kernel_locs = self._swap_in_selected_pages(rpi, sls, batch, lid)
             valid = batch[0] >= 0
             self.assertTrue(
@@ -443,7 +528,7 @@ class TestHiSparseUnit(unittest.TestCase):
         rpi, sls = self._make_batch_tensors([req], [fill_len])
 
         for lid in range(LAYER_NUM):
-            naive_locs = self.coordinator.naive_load_topk(rpi, sls, batch, lid)
+            naive_locs = naive_load_topk(self.coordinator, rpi, sls, batch, lid)
             kernel_locs = self._swap_in_selected_pages(rpi, sls, batch, lid)
             self.assertTrue(torch.all(naive_locs[0, :TOP_K] >= 0))
             self.assertTrue(torch.all(kernel_locs[0, :TOP_K] >= 0))
@@ -619,7 +704,7 @@ class TestHiSparseUnit(unittest.TestCase):
             initial[1] - seq_len,
         )
 
-        self.coordinator.request_finished(req)
+        self.coordinator.release_request(req)
         self.allocator.logical_attn_allocator.free(torch.cat([kv_loc, out_loc]))
         self._free_req_slot(req)
         self._assert_sizes_restored(initial, "decode_remap")
@@ -628,7 +713,7 @@ class TestHiSparseUnit(unittest.TestCase):
     # Test: Staging (PD Colocate) path
     # ==================================================================
     def test_request_lifecycle_staging_path(self):
-        """prefill -> staging DMA -> collect_ready -> swap-in -> finish."""
+        """prefill -> staging DMA -> move_ready -> swap-in -> finish."""
         initial = self._get_initial_sizes()
         fill_len = self.page_size
         req = _make_req("staging-req", list(range(fill_len)))
@@ -637,11 +722,13 @@ class TestHiSparseUnit(unittest.TestCase):
         kv_loc = self._alloc_kv(req, fill_len)
         self._write_device_patterns(kv_loc, fill_len)
 
+        launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        move([req], launched)
         self.coordinator.admit_request_into_staging(req)
         self.assertTrue(req.hisparse_staging)
 
         get_device_module().synchronize()
-        ready = self.coordinator.collect_ready_reqs()
+        ready = self.coordinator.move_ready_reqs(KeyedReqList(ListKind.DECODING))
         self.assertEqual(len(ready), 1)
         self.assertFalse(req.hisparse_staging)
         self.assertTrue(self.coordinator._skip_first_backup[req.kv.req_pool_idx])
@@ -675,9 +762,11 @@ class TestHiSparseUnit(unittest.TestCase):
         kv_loc = self._alloc_kv(req, fill_len)
         self._write_device_patterns(kv_loc, fill_len)
 
+        launched = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        move([req], launched)
         self.coordinator.admit_request_into_staging(req)
         get_device_module().synchronize()
-        ready = self.coordinator.collect_ready_reqs()
+        ready = self.coordinator.move_ready_reqs(KeyedReqList(ListKind.DECODING))
         self.assertEqual(ready, [req])
 
         host_row = self.coordinator.req_to_host_pool[req.kv.req_pool_idx, :rounded_len]

@@ -17,6 +17,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     minimax_h3_plan_from_batch,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.task_profiles import (
+    MINIMAX_H3_IMAGE_PARTITION,
+    MINIMAX_H3_IMAGE_TASKS,
     canonical_minimax_h3_task,
     partition_for_task,
 )
@@ -51,8 +53,8 @@ class MiniMaxH3ReleaseMetadata:
     partition: str
     tasks: tuple[str, ...]
     task_aliases: Mapping[str, str]
-    video_sigma_shift: float
-    audio_sigma_shift: float
+    video_sigma_shift: float | None
+    audio_sigma_shift: float | None
     # trained DMD rungs of a distilled release, unshifted; None keeps the uniform grid
     dmd_denoising_steps: tuple[int, ...] | None = None
     # PDD release: fused per-step output heads, relative to the model dir,
@@ -63,6 +65,13 @@ class MiniMaxH3ReleaseMetadata:
     stochastic_sampling: bool = False
     # LoRA adapter applied at load, relative to the model dir
     lora_adapter: str | None = None
+    # trained sigma knots of a distilled release that are not whole timesteps,
+    # unshifted, descending in (0, 1]; the loop ends at sigma 0. Exclusive
+    # with dmd_denoising_steps.
+    raw_sigmas: tuple[float, ...] | None = None
+    # "vae" decodes the final latents; "dwd" predicts the frames from the last
+    # step's features with the DiT's pixel head instead (decoder-free)
+    video_output: str = "vae"
 
     @classmethod
     def from_model_index(
@@ -74,9 +83,10 @@ class MiniMaxH3ReleaseMetadata:
         if raw.get("schema_version") != 1:
             raise ValueError("model_index.json._minimax_h3.schema_version must be 1")
         partition = raw.get("partition")
-        if partition not in {"fl2va", "ref2va"}:
+        if partition not in {"fl2va", "ref2va", MINIMAX_H3_IMAGE_PARTITION}:
             raise ValueError(
-                "model_index.json._minimax_h3.partition must be one of fl2va, ref2va"
+                "model_index.json._minimax_h3.partition must be one of "
+                f"fl2va, ref2va, {MINIMAX_H3_IMAGE_PARTITION}"
             )
         tasks = _string_list(raw.get("tasks"), "model_index.json._minimax_h3.tasks")
         aliases = raw.get("task_aliases", {})
@@ -89,6 +99,36 @@ class MiniMaxH3ReleaseMetadata:
         ):
             raise ValueError(
                 "model_index.json._minimax_h3.task_aliases must map strings to strings"
+            )
+        pdd_fused_heads = raw.get("pdd_fused_heads")
+        if pdd_fused_heads is not None and (
+            not isinstance(pdd_fused_heads, str)
+            or not pdd_fused_heads.endswith(".safetensors")
+            or os.path.isabs(pdd_fused_heads)
+            or ".." in pdd_fused_heads.split("/")
+        ):
+            raise ValueError(
+                "model_index.json._minimax_h3.pdd_fused_heads must be a relative "
+                ".safetensors path inside the model directory"
+            )
+        if partition == MINIMAX_H3_IMAGE_PARTITION:
+            # One image checkpoint serves t2i and/or edit; no sigma shifts.
+            if aliases or tasks != tuple(
+                t for t in MINIMAX_H3_IMAGE_TASKS if t in tasks
+            ):
+                raise ValueError(
+                    "image partition tasks must be an ordered subset of "
+                    f"{list(MINIMAX_H3_IMAGE_TASKS)} with no aliases, got "
+                    f"{list(tasks)}"
+                )
+            # The pipeline loads its video_vae module from the `vae` component.
+            if "vae" not in model_index or "video_vae" in model_index:
+                raise ValueError(
+                    "an image release declares its VAE as model_index.json "
+                    "component `vae` (directory vae/), not `video_vae`"
+                )
+            return cls(
+                1, partition, tasks, {}, None, None, pdd_fused_heads=pdd_fused_heads
             )
         scales = raw.get("sigma_shift_scales")
         if not isinstance(scales, Mapping):
@@ -118,26 +158,43 @@ class MiniMaxH3ReleaseMetadata:
                     "strictly decreasing integers in (0, 1000]"
                 )
             dmd_steps = tuple(dmd_steps)
-        pdd_fused_heads = raw.get("pdd_fused_heads")
-        if pdd_fused_heads is not None and (
-            not isinstance(pdd_fused_heads, str)
-            or not pdd_fused_heads.endswith(".safetensors")
-            or os.path.isabs(pdd_fused_heads)
-            or ".." in pdd_fused_heads.split("/")
-        ):
+        raw_sigmas = raw.get("raw_sigmas")
+        if raw_sigmas is not None:
+            if dmd_steps is not None:
+                raise ValueError(
+                    "model_index.json._minimax_h3 takes dmd_denoising_steps or "
+                    "raw_sigmas, not both"
+                )
+            if (
+                not isinstance(raw_sigmas, list)
+                or not raw_sigmas
+                or any(
+                    isinstance(sigma, bool)
+                    or not isinstance(sigma, (int, float))
+                    or not 0.0 < float(sigma) <= 1.0
+                    for sigma in raw_sigmas
+                )
+                or any(left <= right for left, right in zip(raw_sigmas, raw_sigmas[1:]))
+            ):
+                raise ValueError(
+                    "model_index.json._minimax_h3.raw_sigmas must be strictly "
+                    "decreasing numbers in (0, 1]"
+                )
+            raw_sigmas = tuple(float(sigma) for sigma in raw_sigmas)
+        video_output = raw.get("video_output", "vae")
+        if video_output not in ("vae", "dwd"):
             raise ValueError(
-                "model_index.json._minimax_h3.pdd_fused_heads must be a relative "
-                ".safetensors path inside the model directory"
+                "model_index.json._minimax_h3.video_output must be 'vae' or 'dwd'"
             )
         stochastic_sampling = raw.get("stochastic_sampling", False)
         if not isinstance(stochastic_sampling, bool):
             raise ValueError(
                 "model_index.json._minimax_h3.stochastic_sampling must be a boolean"
             )
-        if stochastic_sampling and dmd_steps is None:
+        if stochastic_sampling and dmd_steps is None and raw_sigmas is None:
             raise ValueError(
                 "model_index.json._minimax_h3.stochastic_sampling requires "
-                "dmd_denoising_steps"
+                "dmd_denoising_steps or raw_sigmas"
             )
         lora_adapter = raw.get("lora_adapter")
         if lora_adapter is not None and (
@@ -161,6 +218,8 @@ class MiniMaxH3ReleaseMetadata:
             pdd_fused_heads=pdd_fused_heads,
             stochastic_sampling=stochastic_sampling,
             lora_adapter=lora_adapter,
+            raw_sigmas=raw_sigmas,
+            video_output=video_output,
         )
         for task in metadata.tasks:
             if canonical_minimax_h3_task(task) != task:
@@ -183,7 +242,22 @@ class MiniMaxH3ReleaseMetadata:
         return metadata
 
     @property
-    def sigma_shift_scales(self) -> dict[str, float]:
+    def is_image(self) -> bool:
+        return self.partition == MINIMAX_H3_IMAGE_PARTITION
+
+    @property
+    def num_trained_steps(self) -> int | None:
+        """DiT forwards a distilled release was trained for; None if any."""
+        if self.dmd_denoising_steps is not None:
+            return len(self.dmd_denoising_steps)
+        if self.raw_sigmas is not None:
+            return len(self.raw_sigmas)
+        return None
+
+    @property
+    def sigma_shift_scales(self) -> dict[str, float] | None:
+        if self.is_image:
+            return None
         return {"video": self.video_sigma_shift, "audio": self.audio_sigma_shift}
 
     def canonical_task(self, task: str) -> str:
@@ -194,10 +268,10 @@ class MiniMaxH3ReleaseMetadata:
                 f"task {task!r} is not served by MiniMax H3 partition {self.partition!r}; "
                 f"supported tasks: {list(self.tasks)!r}"
             )
-        if (
-            self.partition != "hybrid"
-            and partition_for_task(canonical) != self.partition
-        ):
+        # a fl2va+ref2va server holds both partitions
+        if self.partition != "hybrid" and partition_for_task(
+            canonical
+        ) not in self.partition.split("+"):
             raise ValueError(
                 f"task {task!r} resolves outside partition {self.partition!r}"
             )
@@ -213,7 +287,12 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         task = None if batch.sampling_params is None else batch.sampling_params.task
         if not isinstance(task, str) or not task.strip():
             raise ValueError("MiniMax H3 request task must be a non-empty string")
-        self.metadata.canonical_task(task)
+        canonical_task = self.metadata.canonical_task(task)
+        plan = minimax_h3_plan_from_batch(batch)
+        if plan is not None and plan.task != canonical_task:
+            raise ValueError("MiniMax H3 resolved request plan task mismatch")
+        if self.metadata.is_image:
+            return batch
         min_steps = MiniMaxH3SamplingParams.min_num_inference_steps
         if batch.num_inference_steps < min_steps:
             raise ValueError(f"MiniMax H3 requires num_inference_steps >= {min_steps}")

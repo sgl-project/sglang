@@ -22,6 +22,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from transformers import Glm4Config
 
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
@@ -59,8 +60,6 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
 )
 from sglang.srt.runtime_context import get_parallel
-
-Glm4Config = None
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +119,6 @@ class Glm4Attention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 131072,
         quant_config: Optional[QuantizationConfig] = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         partial_rotary_factor: float = 0.5,
         bias: bool = True,
         prefix: str = "",
@@ -176,7 +174,6 @@ class Glm4Attention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             partial_rotary_factor=partial_rotary_factor,
             is_neox_style=False,
         )
@@ -228,9 +225,6 @@ class Glm4DecoderLayer(nn.Module):
         bias = getattr(config, "attention_bias", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
         head_dim = getattr(config, "head_dim", None)
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
         self.self_attn = Glm4Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -241,7 +235,6 @@ class Glm4DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             partial_rotary_factor=partial_rotary_factor,
             bias=bias,
             prefix=add_prefix("self_attn", prefix),
@@ -485,9 +478,6 @@ class Glm4ForCausalLM(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embedding(input_ids)
-
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
@@ -547,13 +537,8 @@ class Glm4ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
+            if layer_id is not None and (
+                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
             ):
                 continue
 

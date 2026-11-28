@@ -220,7 +220,9 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.activation == "situ":
             from aiter.ops.flydsl.moe_common import GateMode
 
-            extra["gate_mode"] = GateMode.SEPARATED.value
+            # gfx95: a GU-interleaved w13 passes INTERLEAVE in fused_moe_kwargs
+            if not (is_gfx95 and "gate_mode" in extra):
+                extra["gate_mode"] = GateMode.SEPARATED.value
             if self.config.gemm1_alpha is not None:
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:
@@ -308,6 +310,7 @@ class AiterRunnerCore(MoeRunnerCore):
                         runner_input.topk_ids,
                         quant_info.w13_scale,
                         quant_info.w2_scale,
+                        swiglu_limit=quant_info.swiglu_limit,
                     )
                     if out is not None:
                         return AiterRunnerOutput(hidden_states=out)

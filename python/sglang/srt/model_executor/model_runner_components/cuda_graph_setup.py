@@ -18,6 +18,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -114,12 +115,18 @@ def has_hybrid_graph_handlers(
     )
 
 
+def _graph_layer_id(layer) -> int:
+    if isinstance(layer, RadixAttention):
+        return int(layer.graph_layer_id)
+    return int(layer.layer_id)
+
+
 def index_attention_layers_by_global_id(
     attention_layers: list[Any],
     mha_companion_layers: list[Any],
     layer_model=None,
 ) -> tuple[list[Any], list[Any]]:
-    """Pad PP-local attention metadata so global layer_id remains a valid index.
+    """Index attention by execution layer, independently of shared KV cache IDs.
 
     Models that re-execute layers pre-expand these lists into position-indexed
     lookup tables (the same layer at several positions); such tables are
@@ -135,7 +142,7 @@ def index_attention_layers_by_global_id(
                 _align_pipeline_layers(mha_companion_layers, layer_model),
             )
         return attention_layers, mha_companion_layers
-    max_layer_id = max(int(layer.layer_id) for layer in populated)
+    max_layer_id = max(_graph_layer_id(layer) for layer in populated)
     # Keep trailing pure MoE layers represented as well. Their graph handler
     # lives in moe_layers, and shrinking this list loses decoder alignment.
     indexed_size = max(
@@ -149,7 +156,7 @@ def index_attention_layers_by_global_id(
             if companion is not None:
                 raise ValueError("MHA companion has no primary attention layer")
             continue
-        layer_id = int(attention.layer_id)
+        layer_id = _graph_layer_id(attention)
         if layer_id < 0:
             raise ValueError(f"invalid or duplicate attention layer_id: {layer_id}")
         if indexed_attention[layer_id] is not None:
@@ -288,7 +295,10 @@ def sync_elastic_cuda_graph_config(
 
 
 def refresh_deep_gemm_layout_memory_budget(
-    model_runner: ModelRunner, *, only_if_initialized: bool = False
+    model_runner: ModelRunner,
+    *,
+    only_if_initialized: bool = False,
+    joined: bool = False,
 ) -> None:
     """Set the all-rank budget before capture, then refresh after startup."""
     global _deep_gemm_layout_memory_budget_initialized
@@ -342,10 +352,12 @@ def refresh_deep_gemm_layout_memory_budget(
     )
 
     world_group = get_parallel().world_group
+    # No WORLD peers to all_reduce with until joined.
+    solo_join = get_exec().moe.is_ep_offset_joiner and not joined
     available_memory_gb = get_available_gpu_memory(
         model_runner.device,
         model_runner.gpu_id,
-        distributed=get_parallel().launch_world_size > 1,
+        distributed=not solo_join and get_parallel().launch_world_size > 1,
         cpu_group=world_group.cpu_group,
     )
     budget_bytes = set_masked_standard_layout_memory_budget(
@@ -363,7 +375,7 @@ def recapture_elastic_cuda_graph(
     *,
     model_runner: ModelRunner,
 ) -> GraphCapture:
-    refresh_deep_gemm_layout_memory_budget(model_runner)
+    refresh_deep_gemm_layout_memory_budget(model_runner, joined=True)
     # Warmup may communicate, so every rank repeats it after the rendezvous.
     model_runner._kernel_warmed_up = False
     capture = capture_decode_graph(model_runner=model_runner)
@@ -375,13 +387,22 @@ def recapture_elastic_cuda_graph(
     return capture
 
 
-def drop_elastic_cuda_graph_state(
+def release_decode_cuda_graph(
     *, decode_runner: Optional[BaseRunner], eager_runner: EagerRunner
 ) -> None:
+    """Free a decode runner's captured graphs before it is replaced; the runner
+    and its backend reference each other, so dropping it alone leaves them to
+    the cyclic GC, which never frees them once the heap is frozen."""
     current_platform.synchronize()
     if decode_runner is not None and decode_runner is not eager_runner:
         decode_runner.backend.cleanup()
         current_platform.synchronize()
+
+
+def drop_elastic_cuda_graph_state(
+    *, decode_runner: Optional[BaseRunner], eager_runner: EagerRunner
+) -> None:
+    release_decode_cuda_graph(decode_runner=decode_runner, eager_runner=eager_runner)
     set_global_graph_memory_pool(None)
     gc.collect()
     current_platform.empty_cache()
@@ -639,7 +660,7 @@ def capture_prefill_graph(
             context_length,
             model_runner.req_to_token_pool.size,
         )
-        return eager_runner
+        return result(eager_runner)
 
     # Collect attention layers and moe layers from the model. Keep a VLM
     # wrapper that exposes ``language_model`` unchanged: assigning it to
@@ -691,12 +712,20 @@ def capture_prefill_graph(
             end_layer=model_runner.layer_info.end_layer,
         )
     )
+    # A decoder may own fewer attention layers than the runner's layer range,
+    # e.g. looped passes that share KV cache layers but keep per-visit states.
+    attention_start_layer = getattr(
+        layer_model, "start_layer", model_runner.layer_info.start_layer
+    )
+    attention_end_layer = getattr(
+        layer_model, "end_layer", model_runner.layer_info.end_layer
+    )
     if not supports_hybrid_graph and not has_standard_gqa_for_all_local_layers(
         attention_layer_count=sum(
             layer is not None for layer in model_runner.attention_layers
         ),
-        start_layer=model_runner.layer_info.start_layer,
-        end_layer=model_runner.layer_info.end_layer,
+        start_layer=attention_start_layer,
+        end_layer=attention_end_layer,
     ):
         # TODO(yuwei): support Non-Standard GQA
         log_info_on_rank0(
@@ -731,6 +760,12 @@ def capture_decode_graph(
     *, model_runner: ModelRunner, prefill_runner: Optional[BaseRunner] = None
 ) -> GraphCapture:
     """Capture device graphs."""
+    if get_exec().moe.enable_paged_experts and not model_runner.is_draft_worker:
+        from sglang.srt.layers.moe.paged_experts.precopy import install
+
+        # The paged executors are final (sizing ran with the memory pool): link the
+        # pre-copies before any decode capture.
+        install(model_runner.model)
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
     elif model_runner.spec_algorithm.is_speculative():
@@ -794,7 +829,6 @@ def capture_decode_graph(
         {
             "cuda": "CUDA graph",
             "musa": "CUDA graph",
-            "cpu": "CPU graph",
             "npu": "NPU graph",
             "xpu": "XPU graph",
         },
@@ -823,7 +857,6 @@ def capture_decode_graph(
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
             {
-                "cpu": CPUGraphRunner,
                 "xpu": XPUGraphRunner,
             },
         )

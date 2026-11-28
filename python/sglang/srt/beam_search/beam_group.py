@@ -24,7 +24,8 @@ split documented in coordinator.py.
 from __future__ import annotations
 
 import enum
-from typing import List, Optional, Sequence
+import weakref
+from typing import TYPE_CHECKING, List, Optional, Sequence
 
 import msgspec
 import torch
@@ -32,6 +33,9 @@ import torch
 from sglang.srt.beam_search.fork import StagedOrphans
 from sglang.srt.beam_search.history import BeamNode, materialize_tokens
 from sglang.srt.beam_search.joint_select import FinalSelect, SelectResult
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import Req
 
 
 class BeamGroupState(enum.Enum):
@@ -70,6 +74,7 @@ class BeamGroup:
         max_new_tokens: int,
         num_return: Optional[int] = None,
         device: torch.device | str = "cpu",
+        device_history: bool = False,
     ):
         self.beam_width = beam_width
         self.num_candidates = 2 * beam_width
@@ -81,6 +86,7 @@ class BeamGroup:
         )
 
         self.frontier_cum_logprobs = torch.zeros(1, dtype=torch.float32, device=device)
+        self.trie_prefix_codes: Optional[torch.Tensor] = None
         self.leaves: List[Optional[BeamNode]] = [None]  # parents of the next tokens
         # num_generated is the launch half's count, num_committed the deferred
         # half's (the true length); generated may lead by one under overlap.
@@ -88,6 +94,11 @@ class BeamGroup:
         self.num_committed = 0
         self.completed: List[CompletedBeam] = []
         self.state = BeamGroupState.DECODING
+        self.device_history = device_history
+        self._device_tokens: List[torch.Tensor] = []
+        self._device_parents: List[torch.Tensor] = []
+        self._device_final_tokens: Optional[torch.Tensor] = None
+        self._device_final_cum_logprobs: Optional[torch.Tensor] = None
         # Selection results staged by the launch half as (forward tick, sel),
         # consumed in tick order by commit.
         self._pending_steps: List[tuple] = []
@@ -97,7 +108,7 @@ class BeamGroup:
 
         # Scheduler wiring, filled in from outside the search core. Members have
         # no Req, so their seq len and KV lengths are implied by the leader's.
-        self.leader = None
+        self._leader: Optional[weakref.ref] = None
         # Device [k-1] member row indices, and the same rows on host (for
         # row-slot free). None until the post-prefill spawn / after free.
         self.member_rows: Optional[torch.Tensor] = None
@@ -110,6 +121,16 @@ class BeamGroup:
         # Running total the GC has returned, so held KV is a host-side
         # arithmetic (allocated - freed) rather than a tensor read.
         self.slots_freed = 0
+
+    @property
+    def leader(self) -> Optional[Req]:
+        """Held weakly: the Req owns its group, and a strong back-reference would
+        make finished requests cyclic garbage."""
+        return None if self._leader is None else self._leader()
+
+    @leader.setter
+    def leader(self, req: Optional[Req]) -> None:
+        self._leader = None if req is None else weakref.ref(req)
 
     @property
     def num_member_rows(self) -> int:
@@ -127,9 +148,23 @@ class BeamGroup:
         held = self.beam_width * (end - start) - self.slots_freed
         return held - (end - start)
 
+    def decode_slot_budget(self) -> Optional[int]:
+        """Unallocated decode slots needed to finish, for fixed-length (trie)
+        groups that never stop early; None defers to the generic estimate,
+        also once the group has retired."""
+        if not self.device_history or self.retired:
+            return None
+        generated_floor = max(self.num_committed, 1)
+        remaining_steps = max(self.max_new_tokens - generated_floor, 0)
+        return self.beam_width * remaining_steps
+
     def next_step_is_final(self) -> bool:
         """The upcoming selection hits max_new_tokens (decided host-side)."""
         return self.num_generated + 1 >= self.max_new_tokens
+
+    def launch_complete(self) -> bool:
+        """Whether the launch half has already staged the terminal selection."""
+        return self.num_generated >= self.max_new_tokens
 
     def advance_frontier(self, sel: SelectResult, tick: int = 0) -> None:
         """Launch half of one selection step: evolve the frontier tensor and
@@ -145,6 +180,14 @@ class BeamGroup:
         assert self.state == BeamGroupState.DECODING
         self.num_generated += 1
         self._pending_steps.append((tick, sel))
+
+    def last_staged_selection(self):
+        """The most recently staged selection (SelectResult or FinalSelect)."""
+        return self._pending_steps[-1][1]
+
+    def clear_staged(self) -> None:
+        """Drop every staged selection without committing it."""
+        self._pending_steps.clear()
 
     def commit_pending(self, up_to_tick: Optional[int] = None) -> bool:
         """Deferred half: consume staged selections into the DAG (the D2H sync
@@ -170,6 +213,12 @@ class BeamGroup:
         return False
 
     def _commit_step(self, sel: SelectResult) -> bool:
+        if self.device_history:
+            self._device_tokens.append(sel.next_tokens[: self.beam_width])
+            self._device_parents.append(sel.parent_idx[: self.beam_width])
+            self.num_committed += 1
+            return False
+
         num_survivors = int(sel.num_survivors)
         num_finished = int(sel.num_finished)
         new_len = self.num_committed + 1
@@ -206,6 +255,26 @@ class BeamGroup:
 
     def _commit_final(self, sel: FinalSelect) -> bool:
         new_len = self.num_committed + 1
+        if self.device_history:
+            parent_idx = sel.parent_idx
+            reversed_tokens = [sel.tokens]
+            for tokens, parents in zip(
+                reversed(self._device_tokens),
+                reversed(self._device_parents),
+            ):
+                reversed_tokens.append(tokens[parent_idx])
+                parent_idx = parents[parent_idx]
+            self._device_final_tokens = torch.stack(
+                list(reversed(reversed_tokens)),
+                dim=1,
+            )
+            self._device_final_cum_logprobs = sel.cum_logprobs
+            self._device_tokens.clear()
+            self._device_parents.clear()
+            self.num_committed = new_len
+            self.state = BeamGroupState.FINISHED
+            return True
+
         tokens = sel.tokens.tolist()
         parents = sel.parent_idx.tolist()
         cums = sel.cum_logprobs.tolist()
@@ -242,6 +311,23 @@ class BeamGroup:
     def finalize(self) -> List[BeamResult]:
         """Materialize the top beam_width sequences, best score first."""
         assert self.state == BeamGroupState.FINISHED
+        if self.device_history:
+            assert self._device_final_tokens is not None
+            assert self._device_final_cum_logprobs is not None
+            token_rows = self._device_final_tokens.tolist()
+            cum_logprobs = self._device_final_cum_logprobs.tolist()
+            results = [
+                BeamResult(
+                    tokens=tokens,
+                    cum_logprob=cum_logprob,
+                    beam_score=self.beam_score(cum_logprob, self.num_committed),
+                    matched_token=None,
+                )
+                for tokens, cum_logprob in zip(token_rows, cum_logprobs)
+            ]
+            results.sort(key=lambda r: r.beam_score, reverse=True)
+            return results[: self.beam_width]
+
         results = [
             BeamResult(
                 tokens=materialize_tokens(beam.leaf),

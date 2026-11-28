@@ -230,6 +230,23 @@ class TestFlux3ServedRegistration(unittest.TestCase):
             add_resolved_pipeline_config_cli_args(parser)
         self.assertEqual(parser.parse_args(args).flux3_alpha, 6.5)
 
+    def test_num_gpus_without_parallel_flags_resolves(self):
+        """The default guidance_scale is None (the package supplies it per
+        request), so the CFG-parallel auto rule must not compare it with 1."""
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+        from sglang.multimodal_gen.test.unit.conftest import mock_cuda_platform
+
+        for flow_map in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / _MODEL
+                _write_package(root, flow_map=flow_map)
+                with mock_cuda_platform():
+                    args = ServerArgs.from_dict(
+                        {"model_path": str(root), "num_gpus": 2}
+                    )
+                self.assertFalse(args.enable_cfg_parallel)
+                self.assertEqual(args.sp_degree, 2)
+
 
 class TestFlux3ServedOutput(unittest.TestCase):
     def test_decode_output_is_normalized_once_before_worker_materialization(self):
@@ -617,6 +634,97 @@ class TestFlux3RequestControls(unittest.TestCase):
         self.assertEqual(_mode(explicit, config), "t2i")
 
 
+class TestFlux3RequestSizeAlignment(unittest.TestCase):
+    """Requested sizes reach the latent grid as multiples of 16."""
+
+    @staticmethod
+    def _server_args():
+        return SimpleNamespace(
+            model_path=_MODEL,
+            model_id=None,
+            backend="sglang",
+            performance_mode="manual",
+            pipeline_class_name=None,
+            pipeline_config=Flux3ImagePipelineConfig(),
+            output_path=None,
+            comfyui_mode=True,
+            enable_cfg_parallel=False,
+            enable_breakable_cuda_graph=False,
+            enable_torch_compile=False,
+            enable_trace=False,
+            attention_backend_config={},
+            num_gpus=1,
+            warmup_steps=1,
+            warmup_num_frames=None,
+        )
+
+    def _build(self, server_args, fields):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.configs.task_type import DataType
+        from sglang.multimodal_gen.runtime.entrypoints.openai import (
+            utils as openai_utils,
+        )
+
+        with (
+            mock.patch.object(
+                openai_utils, "get_global_server_args", return_value=server_args
+            ),
+            mock.patch.object(
+                SamplingParams,
+                "from_pretrained",
+                return_value=Flux3ImageSamplingParams(),
+            ),
+        ):
+            return openai_utils.build_sampling_params(
+                "size", prompt="a fox", request_data_type=DataType.IMAGE, **fields
+            )
+
+    def test_http_size_aligns_to_the_latent_grid(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_image import (
+            latent_shape,
+        )
+
+        server_args = self._server_args()
+        for fields, expected in (
+            ({"size": "1920x1080"}, (1920, 1072)),
+            ({"size": "854x480"}, (848, 480)),
+            ({"size": "1000x1000"}, (992, 992)),
+            ({"size": "1000x1000", "image_path": ["reference.png"]}, (992, 992)),
+            ({"size": "1280x720"}, (1280, 720)),
+            ({"size": "1024x1024"}, (1024, 1024)),
+        ):
+            with self.subTest(fields=fields):
+                sampling = self._build(server_args, fields)
+                self.assertEqual((sampling.width, sampling.height), expected)
+                latent_shape(sampling.height, sampling.width)
+
+    def test_warmup_resolution_aligns_to_the_latent_grid(self):
+        from sglang.multimodal_gen.runtime.warmup_request_builder import (
+            build_warmup_reqs,
+        )
+
+        server_args = self._server_args()
+        server_args.pipeline_config.flux3_package = SimpleNamespace(
+            config=SimpleNamespace(
+                dit=SimpleNamespace(flow_map=True),
+                sampler=SimpleNamespace(steps=4),
+            )
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+            return_value=Flux3ImageSamplingParams(),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=["1920x1080"],
+                warmup_input_path="warmup.png",
+                server_based_warmup=True,
+            )
+        self.assertEqual([(r.width, r.height) for r in reqs], [(1920, 1072)])
+
+
 class TestFlux3Lora(unittest.TestCase):
     _SUPPORTS_LORA = (
         "sglang.multimodal_gen.runtime.pipelines.flux3_image."
@@ -764,6 +872,7 @@ class TestFlux3TextEncoder(unittest.TestCase):
         encoder.pad_multiple = 4
         encoder.processor = FakeProcessor()
         encoder.model = base_model
+        encoder._forward_graphs = None
 
         result = encoder.encode_batch(["short", "long", "tiny", "short"])
 
@@ -789,6 +898,71 @@ class TestFlux3TextEncoder(unittest.TestCase):
         self.assertIs(result[0], result[3])
         self.assertEqual(result[0][1][-1, -1].item(), 3)
         self.assertEqual(result[1][1][-1, -1].item(), 7)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device")
+    def test_repeated_pad_bucket_replays_a_cuda_graph(self):
+        """A pad bucket seen twice is replayed with the eager forward's result;
+        replaced weights drop the graph."""
+        from sglang.multimodal_gen.runtime.models.encoders.flux3_text_encoder import (
+            Flux3TextEncoder,
+        )
+        from sglang.multimodal_gen.runtime.models.encoders.text_encoder_graphs import (
+            TextEncoderGraphs,
+        )
+
+        class FakeTokenizer:
+            lengths = {"one": 1, "two": 2, "three": 3}
+
+            def __call__(self, text, **kwargs):
+                if "return_tensors" not in kwargs:
+                    return {"input_ids": list(range(self.lengths[text]))}
+                length = kwargs["max_length"]
+                mask = torch.zeros((len(text), length), dtype=torch.long)
+                for row, prompt in enumerate(text):
+                    mask[row, : self.lengths[prompt]] = 1
+                ids = torch.arange(length)[None].expand(len(text), -1)
+                return {"input_ids": ids, "attention_mask": mask}
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(8, 8)
+                self.mix = torch.nn.Linear(8, 8)
+
+            def forward(self, input_ids, attention_mask, position_ids, **_kwargs):
+                hidden = self.embed(input_ids) * attention_mask[..., None]
+                hidden = hidden + position_ids[0][..., None]
+                return SimpleNamespace(hidden_states=(hidden, self.mix(hidden)))
+
+        encoder = Flux3TextEncoder.__new__(Flux3TextEncoder)
+        torch.nn.Module.__init__(encoder)
+        encoder.embed_dtype = torch.float32
+        encoder.output_layers = (0, 1)
+        encoder.max_length = 16
+        encoder.pad_multiple = 4
+        encoder.processor = SimpleNamespace(
+            tokenizer=FakeTokenizer(),
+            apply_chat_template=lambda message, **_kwargs: message[0]["content"],
+        )
+        encoder.model = TinyModel().cuda()
+        encoder._forward_graphs = TextEncoderGraphs()
+
+        def eager(prompt):
+            encoder._forward_graphs, graphs = None, encoder._forward_graphs
+            tokens = encoder.encode_batch([prompt])[0][0]
+            encoder._forward_graphs = graphs
+            return tokens
+
+        for step, prompt in enumerate(("one", "two", "three", "one")):
+            tokens = encoder.encode_batch([prompt])[0][0]
+            self.assertTrue(torch.equal(tokens, eager(prompt)))
+            self.assertEqual(
+                list(encoder._forward_graphs.graphs), [] if step == 0 else [4]
+            )
+        mix = encoder.model.mix
+        mix.weight = torch.nn.Parameter(mix.weight.detach().clone() + 1)
+        self.assertTrue(torch.equal(encoder.encode_batch(["two"])[0][0], eager("two")))
+        self.assertFalse(encoder._forward_graphs.graphs)
 
     def test_constructor_truncates_and_compiles_language_model(self):
         from sglang.multimodal_gen.runtime.models.encoders.flux3_text_encoder import (
@@ -850,7 +1024,11 @@ class TestFlux3TextEncoder(unittest.TestCase):
 
 class TestFlux3PackedCFGParallel(unittest.TestCase):
     def test_one_sample_per_rank_is_gathered_in_cfg_order(self):
-        from sglang.multimodal_gen.runtime.models.dits.flux3_image import TEXT, pack
+        from sglang.multimodal_gen.runtime.models.dits.flux3_image import (
+            TEXT,
+            StaticStreams,
+            pack,
+        )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
             flux3_image as stages,
         )
@@ -870,13 +1048,27 @@ class TestFlux3PackedCFGParallel(unittest.TestCase):
                 predict(branch) for branch in policy.branches
             ],
         ):
-            model = stages._CFGParallelModel(
-                lambda *, packed: {"image": packed.data["image"]}
-            )
+            seen = []
+
+            def forward(*, packed):
+                seen.append(packed.static)
+                return {"image": packed.data["image"]}
+
+            model = stages._CFGParallelModel(forward)
             output = model(packed=packed)
+            # static streams survive the per-step slice, one per branch
+            packed.static = StaticStreams()
+            model(packed=packed)
+            model(packed=packed)
         torch.testing.assert_close(
             output["image"], torch.cat((torch.zeros(2, 2), torch.ones(2, 2)))
         )
+        self.assertEqual(seen[:2], [None, None])
+        self.assertIsInstance(seen[2], StaticStreams)
+        self.assertIsNot(seen[2], seen[3])
+        self.assertIsNot(seen[2], packed.static)
+        self.assertIs(seen[4], seen[2])
+        self.assertIs(seen[5], seen[3])
 
 
 if __name__ == "__main__":

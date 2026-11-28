@@ -32,6 +32,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class _FakeOpenAIServingChat:
     native_reasoning_history = False
+    native_tool_loading = False
 
     def __init__(self, stream_lines=None, chat_template=None):
         self.stream_lines = stream_lines or []
@@ -62,6 +63,7 @@ class _FakeNonStreamingErrorOpenAI:
     """Returns an error response or raises an exception from the OpenAI handler."""
 
     supports_inline_system = False
+    native_tool_loading = False
 
     def __init__(self, status_code=400, body=None, content=None, exception=None):
         self._status_code = status_code
@@ -75,7 +77,7 @@ class _FakeNonStreamingErrorOpenAI:
     def _convert_to_internal_request(self, chat_request, raw_request):
         return SimpleNamespace(), chat_request
 
-    async def _handle_non_streaming_request(
+    async def _chat_completion_response(
         self, adapted_request, processed_request, raw_request
     ):
         if self._exception is not None:
@@ -513,6 +515,26 @@ class TestAnthropicServing(unittest.TestCase):
             ],
         )
 
+    def test_tool_addition_fails_where_tools_cannot_load_mid_conversation(self):
+        """A tool_addition block must not vanish on a model that cannot render it."""
+        request = self._anthropic_request(
+            messages=[
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "tool_addition",
+                            "tool": {"type": "tool_reference", "name": "Bash"},
+                        }
+                    ],
+                },
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "tool_addition"):
+            self._serving()._convert_to_chat_completion_request(request)
+
     def test_builtin_web_search_tool_without_schema_is_skipped(self):
         request = AnthropicMessagesRequest.model_validate(
             {
@@ -907,12 +929,17 @@ class TestAnthropicServing(unittest.TestCase):
             f"expected unenforced-budget warning: {log.output}",
         )
 
+    def test_request_thinking_enabled_without_budget_tokens_is_accepted(self):
+        serving = self._serving()
+        request = self._anthropic_request(thinking={"type": "enabled"}, stream=False)
+        serving._convert_to_chat_completion_request(request)
+        self.assertEqual(serving.openai_serving_chat.apply_reasoning_calls, [True])
+
     def test_request_thinking_shape_violations_are_rejected(self):
         """Each SDK thinking variant's field rules (``thinking_config_*_param.py``)."""
         from pydantic import ValidationError
 
         for thinking, field in [
-            ({"type": "enabled"}, "budget_tokens"),
             ({"type": "enabled", "budget_tokens": 512}, "1024"),
             ({"type": "disabled", "display": "omitted"}, "display"),
             ({"type": "disabled", "budget_tokens": 2048}, "budget_tokens"),

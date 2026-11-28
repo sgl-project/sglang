@@ -1,5 +1,5 @@
 """
-Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
+Unit tests for the Ascend attention backends.
 """
 
 import sys
@@ -14,7 +14,7 @@ import torch
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=5, suite="base-a-test-npu")
+register_npu_ci(est_time=5, suite="extra-a-test-npu")
 
 # Mock NPU-only modules before importing the source module.
 for _ in (
@@ -32,6 +32,7 @@ for _ in (
 ):
     sys.modules.setdefault(_, MagicMock())
 
+from sglang.srt.hardware_backend.npu.attention import ascend_dsa_backend
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
@@ -39,7 +40,12 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.layers.cp import base as cp_base
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_parallel
+from sglang.test.test_utils import CustomTestCase
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -701,6 +707,7 @@ class TestMlaPrefixCacheDcp(unittest.TestCase):
         cycles = (int(seq_lens.max()) + stride - 1) // stride
         mapping = torch.arange(3 * cycles * stride).reshape(3, -1)
         backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_quant_flash_attn = False
         backend.device = torch.device("cpu")
         backend.use_mla = True
         backend.use_dsa = False
@@ -882,7 +889,15 @@ class TestMlaPrefixFia(unittest.TestCase):
         return (torch.stack(outputs) * weights).sum(0), None
 
     def _check_prefix(
-        self, query_lens, prefix_lens, dtype, padding, heads, magnitude=1, use_fia=False
+        self,
+        query_lens,
+        prefix_lens,
+        dtype,
+        padding,
+        heads,
+        magnitude=1,
+        use_fia=False,
+        page_size=1,
     ):
         torch.manual_seed(47)
         tokens, prefix_tokens = sum(query_lens), sum(prefix_lens)
@@ -894,7 +909,33 @@ class TestMlaPrefixFia(unittest.TestCase):
         cached = torch.randn(prefix_tokens + 3, 1, 1, 32, dtype=dtype)
         cached_rope = torch.randn(prefix_tokens + 3, 1, 1, 64, dtype=dtype)
         indices = torch.randperm(prefix_tokens + 3)[:prefix_tokens]
+        row_index = None
         weight = torch.randn(32, heads * 256, dtype=dtype) / 32**0.5
+
+        if page_size > 1:
+            # Simulate the real page-granular gather: every request's prefix
+            # is rounded up to whole pages, so garbage tails trail each
+            # request's rows in the gathered output.
+            rounded_lens = [
+                -(-prefix_len // page_size) * page_size for prefix_len in prefix_lens
+            ]
+            num_pages = (
+                sum(rounded_len // page_size for rounded_len in rounded_lens) + 1
+            )  # one spare page never referenced by the block table
+            cached = torch.randn(num_pages, page_size, 1, 32, dtype=dtype)
+            cached_rope = torch.randn(num_pages, page_size, 1, 64, dtype=dtype)
+            page_parts, row_parts = [], []
+            next_page = row_start = 0
+            for prefix_len, rounded_len in zip(prefix_lens, rounded_lens):
+                page_parts.extend(
+                    range(next_page, next_page + rounded_len // page_size)
+                )
+                row_parts.extend(range(row_start, row_start + prefix_len))
+                next_page += rounded_len // page_size
+                row_start += rounded_len
+            indices = torch.tensor(page_parts, dtype=torch.int32)
+            if any(prefix_len % page_size for prefix_len in prefix_lens):
+                row_index = torch.tensor(row_parts, dtype=torch.int64)
 
         def project(x):
             return x @ weight, None
@@ -911,6 +952,7 @@ class TestMlaPrefixFia(unittest.TestCase):
             extend_seq_lens_cpu_int=torch.tensor(query_lens, dtype=torch.int32),
             prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
             flatten_prefix_block_tables=indices,
+            prefix_token_indices=row_index,
         )
         backend.token_to_kv_pool = SimpleNamespace(
             get_key_buffer=lambda _: cached,
@@ -950,13 +992,17 @@ class TestMlaPrefixFia(unittest.TestCase):
         self.assertEqual(fia.call_count, 2)
         self.assertEqual(update.call_count, 1)
 
+        if page_size > 1:
+            # Exact prefix rows scattered across the page-rounded layout.
+            key_rows = cached.view(-1, 32)[row_parts].unsqueeze(1)
+            rope_rows = cached_rope.view(-1, 1, 64)[row_parts].unsqueeze(1)
+        else:
+            key_rows, rope_rows = cached[indices], cached_rope[indices]
         prefix_k, prefix_v = (
-            project(cached[indices])[0]
-            .view(prefix_tokens, heads, 256)
-            .split(128, dim=-1)
+            project(key_rows)[0].view(prefix_tokens, heads, 256).split(128, dim=-1)
         )
         prefix_k = torch.cat(
-            (prefix_k, cached_rope[indices].flatten(0, 1).expand(-1, heads, -1)),
+            (prefix_k, rope_rows.flatten(0, 1).expand(-1, heads, -1)),
             dim=-1,
         )
         expected = torch.zeros(tokens + padding, heads, 128, dtype=dtype)
@@ -1006,6 +1052,112 @@ class TestMlaPrefixFia(unittest.TestCase):
                     self._check_prefix(
                         [3, 1, 2], [0, 5, 2], dtype, 3, 4, use_fia=use_fia
                     )
+
+    def test_unaligned_prefix_trimmed_to_exact_rows(self):
+        """Page-rounded prefix gathers are trimmed to exact rows (TND tiling
+        requires prefix_lens.cumsum == gathered row count). Unaligned prefixes
+        arise from mixed batches (--enable-mixed-chunk), where decode rows run
+        as 1-token extends with prefix = seq_len - 1; without the trim the
+        kernel rejects the batch (error 561002)."""
+        for dtype in (torch.float16, torch.bfloat16):
+            for queries, prefixes in (
+                ([3, 1, 2], [5, 2, 7]),
+                ([1, 4], [0, 9]),
+                ([2], [17]),
+                ([4, 1, 2], [16, 3, 8]),
+            ):
+                with self.subTest(dtype=dtype, queries=queries, prefixes=prefixes):
+                    self._check_prefix(queries, prefixes, dtype, 0, 4, page_size=16)
+
+    def test_aligned_prefix_skips_trim(self):
+        """Page-aligned prefixes leave prefix_token_indices as None and
+        keep the un-trimmed gather path."""
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                self._check_prefix([3, 1], [16, 32], dtype, 0, 4, page_size=16)
+
+
+class TestAscendKPoolPrefillCP(CustomTestCase):
+    def setUp(self):
+        self.strategy = InterleaveCPStrategy(cp_size=2)
+        self.enterContext(get_parallel().override(attn_cp_size=2, attn_cp_rank=1))
+        self.enterContext(patch.object(cp_base, "_STRATEGY", self.strategy))
+
+        # The requests extend prefixes of 6 and 14 tokens. Rank 1 gets
+        # global rows 1, 3, 5, and 7 of this uneven batch.
+        extend_lens = [3, 6]
+        cp_metadata = self.strategy.build_metadata(9, None, extend_lens)
+        pad_logical_token_to_physical(cp_metadata)
+        self.batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=2,
+            extend_seq_lens_cpu=extend_lens,
+            extend_seq_lens=torch.tensor(extend_lens, dtype=torch.int32),
+            positions=torch.tensor([6, 7, 8, 14, 15, 16, 17, 18, 19]),
+            attn_cp_metadata=cp_metadata,
+        )
+
+    def test_indexer_reads_each_query_at_its_original_causal_boundary(self):
+        """Interleaved queries cross a request boundary and an 8-token pool."""
+        backend_cls = ascend_dsa_backend.AscendDSAAttnBackend
+        backend = backend_cls.__new__(backend_cls)
+        backend.use_dsa = True
+        backend.dsa_index_kpool = 8
+        page_table = torch.tensor([[11, 12], [21, 22]], dtype=torch.int32)
+        backend.forward_metadata = ascend_dsa_backend.AscendDSAForwardMetadata(
+            pool_page_table=page_table,
+            block_tables=page_table.clone(),
+        )
+        global_positions = self.batch.positions.clone()
+
+        backend.prepare_dsa_cp_metadata(self.batch)
+
+        metadata = backend.forward_metadata
+        torch.testing.assert_close(self.batch.positions, global_positions)
+        read = metadata.cp_read_metadata
+        self.assertEqual(read.pool_query_ends.tolist(), [1, 2, 3, 4])
+        self.assertEqual(read.pool_key_lens.tolist(), [1, 1, 2, 2])
+        self.assertEqual(read.pool_tail_lens.tolist(), [0, 7, 1, 3])
+        self.assertEqual(
+            read.pool_page_table.tolist(), [[11, 12], [21, 22], [21, 22], [21, 22]]
+        )
+        self.assertEqual(metadata.pool_page_table.tolist(), [[11, 12], [21, 22]])
+        self.assertEqual(metadata.actual_seq_lengths_kv.tolist(), [8, 15, 17, 19, 1, 1])
+
+    def test_compression_writer_receives_paired_rows_in_sequence_order(self):
+        """KPool groups span ranks and should contain only real key/score pairs."""
+        key = torch.arange(1.0, 10.0).unsqueeze(1)
+        score = key * -10
+        packed = torch.cat((key, score), dim=1)
+
+        def all_gather(output, rank_one):
+            # Rank-major collective receives the even rows from rank 0.
+            output[:6].copy_(torch.nn.functional.pad(packed[::2], (0, 0, 0, 1)))
+            output[6:].copy_(rank_one)
+
+        group = SimpleNamespace(world_size=2, all_gather_into_tensor=all_gather)
+        with (
+            get_parallel().override(attn_cp_group=group),
+            patch.object(ascend_dsa_backend, "_compress_write_extend_npu") as write,
+        ):
+            ascend_dsa_backend._compress_write_npu(
+                key=self.strategy.shard_hidden_states(key, self.batch),
+                gate_score=self.strategy.shard_hidden_states(score, self.batch),
+                positions=self.strategy.shard_position_ids(
+                    self.batch.positions, self.batch
+                ),
+                forward_batch=self.batch,
+                layer_id=0,
+                metadata=ascend_dsa_backend.AscendDSAIndexerMetadata(
+                    ascend_dsa_backend.AscendDSAForwardMetadata()
+                ),
+                compress_ape=torch.zeros(8, 1),
+                index_kpool=8,
+            )
+
+        self.assertIsNotNone(write.call_args)
+        torch.testing.assert_close(write.call_args.kwargs["key"], key)
+        torch.testing.assert_close(write.call_args.kwargs["gate_score"], score)
 
 
 if __name__ == "__main__":

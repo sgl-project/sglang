@@ -32,7 +32,7 @@ def unsupported_reason(
     block_size,
     topk,
     score_type,
-    max_context_len,
+    max_kv_len,
     radix_topk,
     draft_is_chain,
     tbo,
@@ -46,20 +46,23 @@ def unsupported_reason(
             return "requires TP4 with attention CP/DP size 1"
     elif sm90:
         # At TP8 each rank still serves one index head; head pairs are replicated.
-        if attn_tp_size not in (4, 8) or (tp_size, attn_cp_size, attn_dp_size) != (
-            attn_tp_size,
-            1,
-            1,
+        # Under attention DP the CP group is one replica's attention TP group.
+        if (tp_size, attn_tp_size, attn_cp_size, attn_dp_size) not in (
+            (4, 4, 1, 1),
+            (8, 8, 1, 1),
+            (8, 4, 1, 2),
         ):
-            return "requires TP4 or TP8 with attention CP/DP size 1"
+            return (
+                "requires TP4, TP8, or TP8 with attention DP2, and attention CP size 1"
+            )
     else:
         return "requires AMD gfx950 or NVIDIA SM90"
     if (index_heads, kv_heads, head_dim, block_size, topk) != (4, 4, 128, 128, 16):
         return "requires four index/KV heads, dimension 128, block 128, top-k 16"
     if score_type != "max" or not radix_topk:
         return "requires max scores and the radix decode top-k"
-    if not 0 < max_context_len <= 16384 * 128:
-        return "context length exceeds the radix selector contract"
+    if not 0 < max_kv_len <= 16384 * 128:
+        return "KV length exceeds the radix selector contract"
     if not draft_is_chain:
         return "verify rows must be chain drafts: no speculation, or EAGLE with top-k 1"
     if tbo or hisparse or fp8_query or dense_sparse_decode:
@@ -116,7 +119,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         block_size=backend.block_size_k,
         topk=backend.topk_blocks,
         score_type=backend.score_type,
-        max_context_len=backend.max_context_len,
+        max_kv_len=backend.max_kv_len,
         radix_topk=envs.SGLANG_OPT_USE_MINIMAX_DECODE_TOPK_RADIX.get(),
         draft_is_chain=draft_is_chain_layout(
             spec.speculative_algorithm, spec.speculative_eagle_topk
@@ -139,8 +142,9 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         cp.exchange = CpExchange(cp.group, cp.group.device)
     cp.warmup()
     logger.info(
-        "MiniMax indexer CP enabled: TP%d, decode-only, replicated index cache, "
-        "query gather + %s, top-k 16; index-value layers use TP",
+        "MiniMax indexer CP enabled: attention TP%d, decode-only, "
+        "replicated index cache, query gather + %s, top-k 16; "
+        "index-value layers use TP",
         cp.world,
         "IPC candidate exchange" if cp.exchange is not None else "candidate gather",
     )

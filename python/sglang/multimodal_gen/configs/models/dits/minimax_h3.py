@@ -111,6 +111,9 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     ffn_hidden_size: int = 14336
     latents_dim: int = 24
     audio_latents_dim: int = 32
+    # False for an image checkpoint without the audio input/output projections
+    # (audio_patch_proj, final_layer.audio_out); it serves no audio rows.
+    audio_enabled: bool = True
     patch_size: tuple[int, int, int] = (1, 2, 2)
     text_dim: int = 5120
     timestep_input_dim: int = 256
@@ -131,9 +134,16 @@ class MiniMaxH3DiTArchConfig(DiTArchConfig):
     has_gate_compress: bool = False
     # VDN-H3: None for the dense model; set from transformer/config.json
     hybrid_attention: VDNHybridAttentionArchConfig | None = None
+    # pi-H3 DWD adapters: the decoder-free pixel head's geometry, from
+    # transformer/config.json; None without a pixel head
+    dwd_head_config: dict | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if type(self.audio_enabled) is not bool:
+            raise ValueError(
+                f"audio_enabled must be a bool, got {self.audio_enabled!r}"
+            )
         if isinstance(self.patch_size, list):
             self.patch_size = tuple(self.patch_size)
         if len(self.patch_size) != 3:

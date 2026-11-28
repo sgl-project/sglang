@@ -24,6 +24,8 @@ from sglang.srt.entrypoints.v1_loads import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
 from sglang.srt.observability.request_logger import (
     WHITELISTED_HEADERS,
@@ -35,6 +37,7 @@ from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_exec,
     get_lora,
     get_memory,
     get_mm,
@@ -45,13 +48,15 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.rust_server.warmups import rust_server_warmup_names
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+from sglang.srt.sampling.watermarking.redaction import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.rust_extensions._server import ServerArgs
     from sglang.srt.server_args import ServerArgs as PyServerArgs
 
@@ -67,6 +72,8 @@ def _build_server_args(
     request_class: Optional[type] = None,
     server_added_custom_params: Tuple[str, ...] = (),
     port_offset: int = 0,
+    vlm_warmup_image_base64: Optional[str] = None,
+    vlm_warmup_prompt: Optional[str] = None,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -86,11 +93,6 @@ def _build_server_args(
         "prefill": ext.DisaggregationMode.Prefill,
         "decode": ext.DisaggregationMode.Decode,
     }[get_disagg().disaggregation_mode]
-    grpc_port = (
-        None
-        if get_serving().smg_grpc_mode or get_serving().grpc_mode
-        else get_serving().grpc_port
-    )
     deployment_info = {
         "disaggregation_bootstrap_port": get_disagg().disaggregation_bootstrap_port,
         "node_rank": get_parallel().node_rank,
@@ -109,22 +111,28 @@ def _build_server_args(
         "max_prefill_tokens": get_schedule().max_prefill_tokens,
         "enable_dp_attention": get_parallel().attn_dp_size > 1,
         "speculative_algorithm": get_spec().speculative_algorithm,
+        "speculative_ngram_external_corpus_max_tokens": get_spec().speculative_ngram_external_corpus_max_tokens,
+        "gc_threshold": get_device().gc_threshold,
+        "enable_pd_role_switch": get_disagg().enable_pd_role_switch,
+        "elastic_ep_backend": get_exec().moe.elastic_ep_backend,
+        "enable_streaming_session": get_serving().enable_streaming_session,
+        "engine_info_bootstrap_url": scheduler.server_args.engine_info_bootstrap_url,
         "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
         "hicache_ratio": get_memory().hicache_ratio,
         "hicache_size": get_memory().hicache_size,
         "hicache_write_policy": get_memory().hicache_write_policy,
+        "hicache_host_total_tokens": _hicache_host_total_tokens(scheduler.tree_cache),
         # Python's scheduler handshake only computes startup_time after all
         # components have initialized, but the Rust frontend must start earlier
         # to serve the disaggregation bootstrap registry. Read the already-
         # initialized KV publisher directly instead of calling get_init_info()
         # on a partially initialized scheduler.
-        "hicache_host_total_tokens": None,
         "kv_event_sources": scheduler.kv_events_publisher.local_kv_event_sources(
             scheduler.page_size * get_parallel().dcp_size
         ),
         # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
         "rust_server_endpoints": scheduler.rust_server_endpoints,
-        "node_listeners": _node_listeners(grpc_port=grpc_port),
+        "node_listeners": _node_listeners(grpc_port=get_serving().grpc_port),
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly, from the file on this node even under multi-node DP;
@@ -146,9 +154,17 @@ def _build_server_args(
         hicache_write_policy=get_memory().hicache_write_policy,
         host=get_serving().host,
         port=get_serving().port,
-        # The shared field is also populated for legacy SMG mode; only forward
-        # it when it selects SGLang's native gRPC transport.
-        grpc_port=grpc_port,
+        http2=(
+            ext.Http2Config(
+                max_concurrent_streams=get_serving().http2_max_concurrent_streams,
+                initial_connection_window_size=(
+                    get_serving().http2_initial_connection_window_size
+                ),
+            )
+            if get_serving().enable_http2
+            else None
+        ),
+        grpc_port=get_serving().grpc_port,
         grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
         api_key=get_serving().api_key,
         admin_api_key=get_serving().admin_api_key,
@@ -166,7 +182,10 @@ def _build_server_args(
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
+        vlm_warmup_image_base64=vlm_warmup_image_base64,
+        vlm_warmup_prompt=vlm_warmup_prompt,
         gc_threshold=get_device().gc_threshold,
+        custom_warmups_pending=bool(rust_server_warmup_names(get_serving().warmups)),
         health_generate_headers=dict(health_generate_headers or {}),
         default_priority_value=(
             get_schedule().default_priority_value
@@ -182,6 +201,7 @@ def _build_server_args(
             vocab_size=mc.vocab_size,
             is_multimodal=mc.is_multimodal,
             model_type=getattr(mc.hf_config, "model_type", None),
+            architectures=mc.hf_config.architectures,
             # Resolved default sampling params (generation_config.json when
             # `--sampling-defaults model`, {} otherwise). The rust server
             # consumes these for omitted temperature/top_p in chat
@@ -210,6 +230,7 @@ def _build_server_args(
         ),
         allow_auto_truncate=get_serving().allow_auto_truncate,
         enable_return_hidden_states=sa.enable_return_hidden_states,
+        return_hidden_states_mode=sa.return_hidden_states_mode,
         # Not a `server_args` field: `TokenizerManager` derives it, and the
         # rust ingress needs the same number for its total-token check.
         num_reserved_tokens=compute_num_reserved_tokens(),
@@ -221,6 +242,8 @@ def _build_server_args(
         # endpoints can serve them statically (no scheduler round-trip).
         version=__version__,
         max_total_num_tokens=scheduler.max_total_num_tokens,
+        max_req_len=scheduler.max_req_len,
+        max_req_input_len=scheduler.max_req_input_len,
         deployment_info=json.dumps(deployment_info),
         launch_server_info=_launch_server_info(scheduler),
         launch_model_info=json.dumps(
@@ -252,6 +275,29 @@ def _build_server_args(
         crash_dump=bool(get_observability().crash_dump_folder),
         server_added_custom_params=list(server_added_custom_params),
     )
+
+
+def vlm_warmup_image_base64(scheduler: Scheduler) -> Optional[str]:
+    """The image of Python's VLM startup warmup (``_execute_server_warmup``),
+    which the Rust server's warmup generates from; ``None`` where Python warms
+    with text, a P/D decode server included, or skips the warmup."""
+    if (
+        not scheduler.model_config.is_multimodal
+        or get_serving().skip_server_warmup
+        or get_serving().skip_tokenizer_init
+        or get_disagg().disaggregation_mode == "decode"
+    ):
+        return None
+    # Lazy: only a multimodal model loads the HTTP server module.
+    from sglang.srt.entrypoints.http_server import (
+        _get_vlm_warmup_image_base64,
+        _is_vlm_warmup_model,
+    )
+
+    model_info = build_model_info_fields(scheduler.model_config, scheduler.server_args)
+    if not _is_vlm_warmup_model(model_info):
+        return None
+    return _get_vlm_warmup_image_base64(model_info)
 
 
 def request_log_settings(
@@ -412,6 +458,20 @@ def _build_metrics_config(ext: ModuleType):
     )
 
 
+def _hicache_host_total_tokens(tree_cache: BasePrefixCache) -> Optional[int]:
+    """The KV host tier's realized token capacity. The tree cache, host pools
+    included, is built before the Rust server launches."""
+    if not get_memory().enable_hierarchical_cache:
+        return None
+    if (
+        not isinstance(tree_cache, UnifiedRadixCache)
+        or tree_cache.host_pool_group is None
+    ):
+        return None
+    kv_entry = tree_cache.host_pool_group.entry_map.get(PoolName.KV)
+    return None if kv_entry is None else kv_entry.host_pool.logical_size
+
+
 def _node_listeners(*, grpc_port: Optional[int]) -> List[Dict[str, Any]]:
     """`DeploymentInfo.node_listeners`: every Rust listener on this listener's
     node, in port-offset order, so each of them reports the same table."""
@@ -458,6 +518,7 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     scheduler_info = {
         "status": "ready",
         "max_total_num_tokens": scheduler.max_total_num_tokens,
+        "max_req_len": scheduler.max_req_len,
         "max_req_input_len": scheduler.max_req_input_len,
     }
     info = msgspec_to_builtins(
@@ -465,9 +526,6 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             build_server_info(scheduler.server_args, scheduler_info)
         )
     )
-    # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
-    # router reads this key to pick its protocol.
-    info["enable_http2"] = False
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 

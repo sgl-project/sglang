@@ -144,7 +144,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
         self,
         tokenizer,
         is_generation=True,
-        context_len=4096,
+        max_req_input_len=4090,
         architecture=None,
         **server_args,
     ):
@@ -177,7 +177,7 @@ class ScoringManager(TokenizerManagerScoreMixin):
             )
         )
         self.is_generation = is_generation
-        self.context_len = context_len
+        self.max_req_input_len = max_req_input_len
         self.num_reserved_tokens = 0
         self.request_logger = SimpleNamespace(log_requests=False)
         generator = torch.Generator().manual_seed(0)
@@ -596,8 +596,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
         prompt_len = len(
             _encoded(_handler(ScoringManager(self.tokenizer)), request)[0][0]
         )
-        at_limit = ScoringManager(self.tokenizer, context_len=prompt_len + 3)
-        at_limit.num_reserved_tokens = 3
+        past_limit = ScoringManager(self.tokenizer, max_req_input_len=prompt_len - 1)
         # The label merges with the trailing space, or follows a split double space.
         trailing_space = "{{ messages[0]['content'] }}\nAnswer: "
         double_space = "{{ messages[0]['content'] }}\nAnswer:  "
@@ -606,7 +605,7 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                 ScoringManager(self.tokenizer, is_generation=False),
                 None,
             ),
-            "context length": (at_limit, None),
+            "context length": (past_limit, None),
             "label 'A' is not one distinct token": (
                 ScoringManager(self.tokenizer),
                 trailing_space,
@@ -629,9 +628,8 @@ class TestDecisions(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("question 'first'", error)
                 self.assertEqual(manager.requests, [])
         self.tokenizer.chat_template = original_template
-        below_limit = ScoringManager(self.tokenizer, context_len=prompt_len + 4)
-        below_limit.num_reserved_tokens = 3
-        response = await _handler(below_limit).handle_request(request, None)
+        at_limit = ScoringManager(self.tokenizer, max_req_input_len=prompt_len)
+        response = await _handler(at_limit).handle_request(request, None)
         self.assertEqual(response.status_code, 200)
 
     async def test_refusals_keep_the_answer_outside_reasoning(self):
@@ -1295,6 +1293,9 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
         from fastapi.exceptions import RequestValidationError
 
         from sglang.srt.entrypoints.http_server import validation_exception_handler
+        from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+            OPENAI_CHAT_WIRE,
+        )
 
         # The input echo is left out, since JSON encoding can fail on it.
         nested = []
@@ -1316,6 +1317,11 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(
                 url=SimpleNamespace(path=root_path + path),
                 scope={"root_path": root_path},
+                app=SimpleNamespace(
+                    state=SimpleNamespace(
+                        openai_serving_chat=SimpleNamespace(chat_wire=OPENAI_CHAT_WIRE)
+                    )
+                ),
             )
 
         for root_path in ["", "/prefix"]:
@@ -1334,10 +1340,11 @@ class TestSystemOne(unittest.IsolatedAsyncioTestCase):
                         }
                     ],
                 )
-                decisions = await validation_exception_handler(
-                    request(root_path, "/v1/decisions"), error
-                )
-                self.assertEqual(decisions.status_code, 400)
+                for path in ["/v1/decisions", "/v1/chat/completions"]:
+                    response = await validation_exception_handler(
+                        request(root_path, path), error
+                    )
+                    self.assertEqual(response.status_code, 400)
 
     async def test_levels_the_legend_cannot_return_are_refused_before_scoring(self):
         def nested(depth):

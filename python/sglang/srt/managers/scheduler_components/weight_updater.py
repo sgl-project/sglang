@@ -27,6 +27,10 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.distributed.communication_op import (
+    control_request_all_gather_object,
+    control_request_barrier,
+)
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -56,6 +60,14 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    PD_KINDS,
+    ListKind,
+    assert_empty,
+)
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    unwrap_local_serialized_tensors,
+)
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
@@ -64,6 +76,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+# The SchedulerWeightUpdaterManager methods Engine.collective_rpc may call.
+RPC_METHODS = ("save_remote_model", "save_sharded_model")
 
 
 def _merge_checksum_payloads(role_payloads: List[Tuple[str, Dict]]) -> Dict:
@@ -167,6 +182,7 @@ class SchedulerWeightUpdaterManager:
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
+            self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
             for role, runner in self._select_runners():
@@ -225,6 +241,7 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("distributed"):
+            self.scheduler.wait_for_launched_forward()
             # only the target runner joined the update group; drafts load its receive
             target = self.tp_worker.model_runner.weight_updater
             try:
@@ -276,17 +293,26 @@ class SchedulerWeightUpdaterManager:
                 "begin_weight_update() and end_weight_update()",
             )
         with self._observe_weight_load("tensor"):
+            self.scheduler.wait_for_launched_forward()
             named_tensors = self.tp_worker.deserialize_own_rank(
                 recv_req.serialized_named_tensors
             )
+            runners = self._select_runners(recv_req.selector)
+            # A PP stage hosting none of the selected runners must not open the handles.
+            if runners and recv_req.load_format != "flattened_bucket":
+                named_tensors = unwrap_local_serialized_tensors(
+                    named_tensors, device=self.tp_worker.model_runner.device
+                )
             success, message = True, "Success"
-            for _, runner in self._select_runners(recv_req.selector):
+            for _, runner in runners:
                 success, message = runner.weight_updater.update_weights_from_tensor(
                     named_tensors=named_tensors,
                     load_format=recv_req.load_format,
                 )
                 if not success:
                     break
+            # Dropped before the flush, so torch_empty_cache can return their blocks.
+            del named_tensors
             if success:
                 self._session = msgspec.structs.replace(
                     self._session, loaded_weights=True
@@ -297,12 +323,13 @@ class SchedulerWeightUpdaterManager:
                 )
             if not success:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
+            control_request_barrier()
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
+            self.scheduler.wait_for_launched_forward()
             success, message = True, "Succeeded to update model weights."
             target_updated = False
             for role, runner in self._select_runners():
@@ -321,7 +348,7 @@ class SchedulerWeightUpdaterManager:
                 )
             if not success:
                 logger.error(message)
-            torch.distributed.barrier(group=self.tp_cpu_group)
+            control_request_barrier()
             return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
@@ -366,10 +393,11 @@ class SchedulerWeightUpdaterManager:
             )
             if error is not None:
                 return BeginWeightUpdateReqOutput(success=False, message=error)
+        self.scheduler.wait_for_launched_forward()
         for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
-        torch.distributed.barrier(group=self.tp_cpu_group)
+        control_request_barrier()
         return BeginWeightUpdateReqOutput(success=True, message="Success")
 
     def end_weight_update(self, recv_req: EndWeightUpdateReqInput):
@@ -380,11 +408,24 @@ class SchedulerWeightUpdaterManager:
                 message="no weight-update session is open; call begin_weight_update() first",
             )
         run_post_load = not self._session.loaded_weights
-        for _, runner in self._select_runners(self._session.selector):
-            runner.weight_updater.end_weight_update(run_post_load=run_post_load)
+        self.scheduler.wait_for_launched_forward()
+        errors = []
+        for role, runner in self._select_runners(self._session.selector):
+            error = runner.weight_updater.end_weight_update(run_post_load=run_post_load)
+            if error is not None:
+                errors.append(f"{role}: {error}")
         self._session = None
-        torch.distributed.barrier(group=self.tp_cpu_group)
-        return EndWeightUpdateReqOutput(success=True, message="Success")
+        error = " | ".join(errors) or None
+        if error is not None:
+            logger.error(error)
+        # each group's replying rank must carry the outcome of every rank in its group
+        group_errors = [
+            e for e in control_request_all_gather_object(error) if e is not None
+        ]
+        return EndWeightUpdateReqOutput(
+            success=not group_errors,
+            message=" | ".join(dict.fromkeys(group_errors)) or "Success",
+        )
 
     def plugin_weight_update(self, recv_req: PluginWeightUpdateReqInput):
         """Receive weights through a platform transport, then load them as update_weights_from_distributed does."""
@@ -414,6 +455,7 @@ class SchedulerWeightUpdaterManager:
             state=self._plugin_state,
         )
         with self._observe_weight_load("plugin"):
+            self.scheduler.wait_for_launched_forward()
             try:
                 weights = handler(context=context, payload=recv_req.payload)
                 error = None
@@ -456,7 +498,10 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.all_gather_object(
             outcomes, (count, error), group=self.tp_cpu_group
         )
-        errors = [error for _, error in outcomes if error is not None]
+        # an error several ranks hit (the same missing half, say) shows once
+        errors = list(
+            dict.fromkeys(error for _, error in outcomes if error is not None)
+        )
         return (
             not errors,
             " | ".join(errors) or "Success",
@@ -465,9 +510,11 @@ class SchedulerWeightUpdaterManager:
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
-        if not self.is_fully_idle(
+        idle = self.is_fully_idle(
             ignore_waiting=scheduler is not None and scheduler.pause_state.paused
-        ):
+        )
+        # A rank refusing alone would leave its peers in the barriers below.
+        if not all(control_request_all_gather_object(idle)):
             return ReleaseMemoryOccupationReqOutput(
                 success=False,
                 message="Memory was not released because requests are still "
@@ -480,19 +527,17 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.add(tag)
+        # Only tags not yet released; each is recorded once its own release succeeds.
+        tags = set(tags) - self.offload_tags
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
+                # Held requests keep no KV and wait out the release.
+                assert_empty(scheduler.request_lists(), PD_KINDS - {ListKind.PD_HELD})
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.release_memory_occupation()
+                    queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+                    if queue is not None:
+                        queue.release_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
@@ -500,19 +545,24 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             # Cannot be refused: its idle gate is the check at the top.
             self.flush_cache()
+            self.offload_tags.add(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
-            torch.distributed.barrier(self.tp_cpu_group)
+            control_request_barrier()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            self.offload_tags.add(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            self.offload_tags.add(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         torch.get_device_module().synchronize()
+        # The verdict leaves on return; every peer that received the request must have released by then.
+        control_request_barrier()
 
         return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
 
@@ -522,38 +572,37 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
-        for tag in tags:
-            self.offload_tags.remove(tag)
+        # Only released tags; each is cleared once its own resume succeeds.
+        tags = self.offload_tags.intersection(tags)
 
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            self.offload_tags.discard(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
-            torch.distributed.barrier(self.tp_cpu_group)
+            control_request_barrier()
             _import_static_state(
                 self.tp_worker.model_runner.model,
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
+            self.offload_tags.discard(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
             scheduler = self.scheduler
             if scheduler is not None:
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.resume_memory_occupation()
+                    queue = getattr(scheduler, "disagg_decode_prealloc_queue", None)
+                    if queue is not None:
+                        queue.resume_memory_occupation()
                 elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.resume_memory_occupation()
+            self.offload_tags.discard(GPU_MEMORY_TYPE_KV_CACHE)
 
         return ResumeMemoryOccupationReqOutput()
 
@@ -572,18 +621,12 @@ class SchedulerWeightUpdaterManager:
                     role_payloads.append((role, p))
             payload = _merge_checksum_payloads(role_payloads) if role_payloads else None
 
-            tp_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
-            if tp_size > 1 and payload is not None:
-                all_payloads = [None] * tp_size
-                torch.distributed.all_gather_object(
-                    all_payloads, payload, group=self.tp_cpu_group
-                )
-                payload = all_payloads
             if payload is not None:
-                # Normalize to one ChecksumInfo per rank so the wire shape is a
-                # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
-                per_rank = payload if isinstance(payload, list) else [payload]
-                payload = [msgspec.convert(p, ChecksumInfo) for p in per_rank]
+                # One ChecksumInfo per rank, so the wire shape is a uniform List[ChecksumInfo].
+                payload = [
+                    msgspec.convert(p, ChecksumInfo)
+                    for p in control_request_all_gather_object(payload)
+                ]
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
@@ -593,6 +636,8 @@ class SchedulerWeightUpdaterManager:
             return CheckWeightsReqOutput(success=False, message=f"{e}")
 
     def save_remote_model(self, params):
+        if _is_later_dp_replica():
+            return
         url = params["url"]
 
         self.tp_worker.model_runner.weight_exporter.save_remote_model(url)
@@ -605,11 +650,25 @@ class SchedulerWeightUpdaterManager:
             self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
+        if _is_later_dp_replica():
+            return
         self.tp_worker.model_runner.weight_exporter.save_sharded_model(
             path=params["path"],
             pattern=params["pattern"],
             max_size=params["max_size"],
         )
+
+
+def _is_later_dp_replica() -> bool:
+    """A plain-DP replica after the first. Every replica holds the same weights
+    under the same TP ranks, so only the first saves them; the others would
+    write the same files."""
+    parallel = get_parallel()
+    return (
+        parallel.num_dp_ranks > 1
+        and not parallel.attn_dp_enabled
+        and bool(parallel.dp_rank)
+    )
 
 
 def _export_static_state(model):

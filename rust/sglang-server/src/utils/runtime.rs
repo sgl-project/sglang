@@ -39,6 +39,9 @@ pub trait Runnable: Send + 'static {
     fn run(self);
 }
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 /// Live runtime. Held by the pyo3 bridge; the Python boundary reads the `to_scheduler_rx` channel,
 /// and write to `from_scheduler_tx` channel. `request_shutdown` (also run on `Drop`) stops every stage.
 pub struct Runtime {
@@ -154,17 +157,40 @@ impl Runtime {
         self.spawn_mm_pool(workers, ctx);
     }
 
+    /// The workers, and the processor's feature publishers
+    /// (`mm-publisher-{i}`, see `MmProcessor::feature_publishers`), likewise
+    /// unpinned.
     fn spawn_mm_pool(&self, workers: usize, ctx: Arc<crate::multi_modality::worker::MmContext>) {
+        use crate::multi_modality::worker::{MmPublisher, MmWorker};
         if !self.core.set_mm_processor(ctx.processor.clone()) {
             tracing::warn!("MM workers started again; admission keeps the first processor");
         }
+        let workers = workers.max(1);
         let mut threads = self.threads.lock().unwrap();
-        spawn_pool("mm-worker", None, workers.max(1), &mut threads, |_| {
-            crate::multi_modality::worker::MmWorker::new(
+        let publishers = ctx.processor.feature_publishers();
+        let publish_tx = (publishers > 0).then(|| {
+            // A worker hands a request on without waiting unless each
+            // worker's last one still waits for a publisher.
+            let (publish_tx, publish_rx) = flume::bounded(workers);
+            spawn_pool("mm-publisher", None, publishers, &mut threads, |_| {
+                MmPublisher::new(
+                    publish_rx.clone(),
+                    self.mm_wiring.tm_tx.clone(),
+                    ctx.clone(),
+                )
+            });
+            publish_tx
+        });
+        spawn_pool("mm-worker", None, workers, &mut threads, |_| {
+            let worker = MmWorker::new(
                 self.mm_wiring.mm_rx.clone(),
                 self.mm_wiring.tm_tx.clone(),
                 ctx.clone(),
-            )
+            );
+            match &publish_tx {
+                Some(publish_tx) => worker.publishing_to(publish_tx.clone()),
+                None => worker,
+            }
         });
     }
 
@@ -184,6 +210,11 @@ impl Runtime {
     /// none is left in flight. `force` closes them without waiting.
     pub fn begin_drain(&self, force: bool) {
         self.core.begin_drain(force);
+    }
+
+    /// Python's `--warmups` finished (see [`CoreHandle::finish_custom_warmups`]).
+    pub fn finish_custom_warmups(&self) {
+        self.core.finish_custom_warmups();
     }
 
     /// Whether a drain has begun and every listener has since closed, its
@@ -369,6 +400,16 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         detokenizer_rx.push(rx);
     }
 
+    if let Some(metrics) = &metrics {
+        use crate::api_server::core::queue_len;
+        metrics.watch_queues(vec![
+            ("intake", queue_len(tok_manager_tx.downgrade())),
+            ("tokenizer", queue_len(tokenizer_tx.downgrade())),
+            ("mm", queue_len(mm_worker_tx.downgrade())),
+            ("scheduler", queue_len(to_scheduler_tx.downgrade())),
+        ]);
+    }
+
     // Aborts get their own UNBOUNDED lane: on the bounded inbox they are dropped
     // exactly under the overload that makes them necessary (see `Senders::abort`).
     let (abort_tx, abort_rx) = flume::unbounded::<crate::tokenizer_manager::wiring::AbortSource>();
@@ -395,6 +436,20 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
     )?
     .map(Arc::new);
     let dyn_tokenizer = tokenizer.as_ref().map(|t| t.tokenizer().clone());
+    // Default: a real tokenizer decodes to text, with byte tables when they pass
+    // their startup check, which is slow too, so it also runs before the ports
+    // are bound. `None` (→ `Skip`, raw `output_ids`) only happens under
+    // `skip_tokenizer_init` — `load_tokenizer` rejects a non-skip server with no
+    // tokenizer.
+    let detokenizer_backend = match &dyn_tokenizer {
+        Some(t) => detokenizer::DetokenizerBackend::for_tokenizer(
+            t.clone(),
+            &cfg.server_args.tokenizer_path,
+            cfg.server_args.revision.as_deref(),
+            crate::tokenizer_manager::byte_tables::enabled(),
+        ),
+        None => detokenizer::DetokenizerBackend::Skip,
+    };
 
     // The potentially slow/fallible tokenizer load above happens before the
     // ports become visible. Own both sockets before starting any worker or
@@ -414,13 +469,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // --- Detokenizer shards (pinned, CPU bound) ---
     {
-        // Default: a real tokenizer decodes to text. `None` (→ `Skip`, raw
-        // `output_ids`) only happens under `skip_tokenizer_init` —
-        // `load_tokenizer` rejects a non-skip server with no tokenizer.
-        let backend = match &dyn_tokenizer {
-            Some(t) => detokenizer::DetokenizerBackend::Dynamo(t.clone()),
-            None => detokenizer::DetokenizerBackend::Skip,
-        };
+        let backend = detokenizer_backend;
         // Each shard owns its receiver outright (one consumer per shard), so the
         // owned `detok_rx` Vec is moved out element-by-element via the iterator.
         let count = detokenizer_rx.len();
@@ -533,9 +582,13 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             metrics,
             request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args)?,
             generate_validator: cfg.generate_validator.clone(),
+            abort_hook: cfg.abort_hook.clone(),
         },
     );
     core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
+    if cfg.server_args.custom_warmups_pending {
+        core.hold_for_custom_warmups();
+    }
 
     // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
     let listeners_closed = Arc::new(AtomicBool::new(false));
@@ -560,7 +613,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let grpc_server = grpc_listener.map(|listener| {
             let service = api_server::grpc::service::GrpcService::new(
                 core.clone(),
-                &cfg.server_args,
+                cfg.server_args.clone(),
                 hicache_manager.clone(),
             );
             (listener, service)
@@ -685,6 +738,7 @@ mod tests {
             server_args: Arc::new(test_server_args()),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         }
     }
@@ -1223,6 +1277,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         // Bind is synchronous in `start`, so the port is already accepting.
@@ -1373,6 +1428,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
@@ -1450,6 +1506,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
@@ -1858,6 +1915,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         let err = match start(cfg, None) {
@@ -1955,6 +2013,31 @@ mod tests {
         }
         rt.request_shutdown();
         assert_eq!(rt.wait_startup_failure(), None);
+    }
+
+    /// With `custom_warmups_pending`, the server is not serving and freezes no
+    /// garbage collector until Python reports its `--warmups` finished, as
+    /// Python freezes only after them, with or without a startup warmup.
+    #[test]
+    fn custom_warmups_hold_health_and_the_gc_freeze() {
+        let (http_addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            custom_warmups_pending: true,
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        assert!(rt.core.is_ready(), "the startup warmup is skipped");
+        assert!(!rt.core.is_serving());
+        assert!(
+            !rt.to_scheduler_rx
+                .wait(std::time::Duration::from_millis(200)),
+            "froze GC before the custom warmups finished"
+        );
+        rt.finish_custom_warmups();
+        assert!(rt.core.is_serving());
+        take_startup_freeze_gc(&rt);
+        rt.request_shutdown();
     }
 
     /// End to end over the configured socket: the generated api.v1 client
@@ -2180,5 +2263,360 @@ mod tests {
         );
         assert!(std::net::TcpStream::connect(http_addr).is_err());
         assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// With metrics on, the runtime exports each stage queue's depth from the
+    /// start.
+    #[test]
+    fn runtime_exports_its_queue_depths() {
+        use std::time::{Duration, Instant};
+
+        let dir = std::env::temp_dir().join(format!("runtime-queues-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            metrics: Some(crate::message::config::MetricsConfig::for_dir(&dir)),
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let metrics = Arc::clone(rt.core.metrics().unwrap());
+        let depths = || {
+            ["intake", "tokenizer", "mm", "scheduler"].map(|stage| {
+                metrics.exported(&format!(
+                    r#"sglang:frontend_queue_depth{{stage="{stage}"}}"#
+                ))
+            })
+        };
+        assert_eq!(depths(), [Some(0.0); 4]);
+        // No scheduler drains the ring here, so the request stays queued.
+        let _waiting = send_http(addr, "POST", "/generate", r#"{"input_ids":[1,2,3]}"#);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while depths()[3] != Some(1.0) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(depths(), [Some(0.0), Some(0.0), Some(0.0), Some(1.0)]);
+        rt.request_shutdown();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every abort by rid reaches the package's abort hook, from each entry:
+    /// `/abort_request`, an abort another DP rank's listener relays
+    /// (`/internal/peer`), and the gRPC `Abort`. An `abort_all` or an empty
+    /// rid names no request, and does not.
+    #[test]
+    fn every_abort_by_rid_reaches_the_abort_hook() {
+        use crate::message::ids::Rid;
+        use crate::message::io_struct::{AbortReq, ControlRequest};
+        use std::io::Write;
+
+        #[derive(Debug, Default)]
+        struct Named(Mutex<Vec<String>>);
+        impl crate::AbortHook for Named {
+            fn named_abort(&self, rid: &str) {
+                self.0.lock().unwrap().push(rid.to_owned());
+            }
+        }
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let named = Arc::new(Named::default());
+        let mut server_args = test_server_args();
+        // The listener table names this listener, so its relay route serves
+        // the requests that present its token.
+        server_args.deployment_info.rust_server_endpoints =
+            vec![crate::message::config::RustServerEndpoint {
+                dp_rank: 0,
+                endpoint: format!("http://{http_addr}"),
+                peer_token: Some("own-token".into()),
+            }];
+        let cfg = RuntimeConfig {
+            abort_hook: Some(named.clone()),
+            server_args: Arc::new(server_args),
+            ..test_config(http_addr, Some(grpc_addr))
+        };
+        let rt = start(cfg, None).expect("start runtime");
+        for body in [
+            r#"{"rid":"http"}"#,
+            r#"{"rid":""}"#,
+            r#"{"rid":"all","abort_all":true}"#,
+        ] {
+            let response = read_response(send_http(http_addr, "POST", "/abort_request", body));
+            assert!(response.starts_with("HTTP/1.1 200"), "{body}: {response}");
+        }
+        for abort in [
+            AbortReq::new("relayed".into(), false),
+            AbortReq::new(Rid::new().to_string(), true),
+        ] {
+            let body = ControlRequest::AbortReq(abort).encode().unwrap();
+            let mut conn = std::net::TcpStream::connect(http_addr).unwrap();
+            write!(
+                conn,
+                "POST /internal/peer HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\
+                 x-sglang-peer-token: own-token\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            conn.write_all(&body).unwrap();
+            // The reply body is msgpack.
+            let mut response = Vec::new();
+            std::io::Read::read_to_end(&mut conn, &mut response).unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+        }
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            for (rid, abort_all) in [("grpc", false), ("", true)] {
+                let request = proto::AbortRequest {
+                    rid: rid.into(),
+                    abort_all,
+                };
+                client.abort(request).await.expect("Abort RPC");
+            }
+        });
+        assert_eq!(*named.0.lock().unwrap(), ["http", "relayed", "grpc"]);
+        rt.request_shutdown();
+    }
+
+    /// The connection window `h2c_config` sets: not hyper's default (1 MiB),
+    /// and under the server's 1 MiB stream window, so a client sees it.
+    const H2C_CONNECTION_WINDOW: usize = 512 * 1024;
+
+    /// The test runtime config with `--enable-http2`, a stream limit of 7 and
+    /// a connection window of `H2C_CONNECTION_WINDOW`, and with
+    /// `--incremental-streaming-output`, so a stream sends every scheduler
+    /// output as its own event rather than merging a backlog into one.
+    fn h2c_config(http_addr: std::net::SocketAddr) -> RuntimeConfig {
+        RuntimeConfig {
+            server_args: Arc::new(ServerArgs {
+                http2: Some(crate::message::config::Http2Config {
+                    max_concurrent_streams: 7,
+                    initial_connection_window_size: H2C_CONNECTION_WINDOW as u32,
+                }),
+                incremental_streaming_output: true,
+                ..test_server_args()
+            }),
+            ..test_config(http_addr, None)
+        }
+    }
+
+    /// An h2c (prior knowledge) client on a fresh connection, driven by
+    /// `client_rt`. Its send buffer is past the server's windows, so the
+    /// capacity it sees is what the server granted.
+    fn h2c_client(
+        client_rt: &tokio::runtime::Runtime,
+        addr: std::net::SocketAddr,
+    ) -> h2::client::SendRequest<bytes::Bytes> {
+        client_rt.block_on(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let (client, connection) = h2::client::Builder::new()
+                .max_send_buffer_size(4 * 1024 * 1024)
+                .handshake(tcp)
+                .await
+                .expect("h2 handshake");
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            client.ready().await.expect("h2 client ready")
+        })
+    }
+
+    /// POST `body` to `/generate` on a new stream: the response and the
+    /// request's send half, whose reset cancels the stream.
+    fn h2c_generate(
+        client: &mut h2::client::SendRequest<bytes::Bytes>,
+        body: &str,
+    ) -> (h2::client::ResponseFuture, h2::SendStream<bytes::Bytes>) {
+        let request = http::Request::post("http://t/generate")
+            .header("content-type", "application/json")
+            .body(())
+            .unwrap();
+        let (response, mut stream) = client.send_request(request, false).expect("send request");
+        stream
+            .send_data(bytes::Bytes::copy_from_slice(body.as_bytes()), true)
+            .expect("send body");
+        (response, stream)
+    }
+
+    /// A response's status and whole body.
+    async fn h2c_read(response: h2::client::ResponseFuture) -> (u16, String) {
+        let response = response.await.expect("h2 response");
+        let status = response.status().as_u16();
+        let mut body = response.into_body();
+        let mut text = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.expect("h2 body");
+            let _ = body.flow_control().release_capacity(chunk.len());
+            text.extend_from_slice(&chunk);
+        }
+        (status, String::from_utf8(text).unwrap())
+    }
+
+    /// With `--enable-http2` the listener serves h2c beside HTTP/1.1 on the
+    /// same port, as Python's Granian server does: it advertises the
+    /// configured stream limit and connection window, and a unary generation
+    /// and a stream of many small events (one DATA frame each) complete over
+    /// HTTP/2.
+    #[test]
+    fn h2c_serves_generation_beside_http1() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(h2c_config(addr), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let client_rt = tokio::runtime::Runtime::new().unwrap();
+        let mut client = h2c_client(&client_rt, addr);
+
+        let (response, _stream) = h2c_generate(
+            &mut client,
+            r#"{"input_ids":[1,2,3],"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let response = client_rt.spawn(h2c_read(response));
+        let rid = next_scheduler_rid(&rt);
+        assert!(rt.from_scheduler_tx.push(terminal_token_frame(rid, &[9])));
+        let (status, body) = client_rt.block_on(response).unwrap();
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("[9]"), "{body}");
+        assert_eq!(client.current_max_send_streams(), 7);
+
+        let (response, _stream) = h2c_generate(
+            &mut client,
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":512}}"#,
+        );
+        let response = client_rt.spawn(h2c_read(response));
+        let rid = next_scheduler_rid(&rt);
+        for token in 0..300 {
+            assert!(
+                rt.from_scheduler_tx
+                    .push(token_frame(rid.clone(), &[token], false))
+            );
+        }
+        assert!(rt.from_scheduler_tx.push(terminal_token_frame(rid, &[300])));
+        let (status, body) = client_rt
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), response).await
+            })
+            .expect("the stream never ended")
+            .unwrap();
+        assert_eq!(status, 200, "{body}");
+        let events = body
+            .strip_suffix("data: [DONE]\n\n")
+            .unwrap_or_else(|| panic!("stream cut: {body}"))
+            .split_terminator("\n\n")
+            .map(|event| {
+                let data = event.strip_prefix("data: ").expect("a data event");
+                serde_json::from_str::<serde_json::Value>(data).unwrap()["output_ids"].clone()
+            })
+            .collect::<Vec<_>>();
+        // One event per output, each with its one token.
+        let expected = (0..=300).map(|token| serde_json::json!([token]));
+        assert!(events.into_iter().eq(expected), "{body}");
+
+        // A request body may take the whole connection window, no more. A
+        // fresh connection, so no earlier body holds part of it.
+        let mut client = h2c_client(&client_rt, addr);
+        let request = http::Request::post("http://t/generate")
+            .header("content-type", "application/json")
+            .body(())
+            .unwrap();
+        let (_response, mut stream) = client.send_request(request, false).unwrap();
+        stream.reserve_capacity(2 * H2C_CONNECTION_WINDOW);
+        client_rt.block_on(async {
+            let granted = async {
+                while stream.capacity() < H2C_CONNECTION_WINDOW {
+                    std::future::poll_fn(|cx| stream.poll_capacity(cx))
+                        .await
+                        .expect("capacity")
+                        .expect("h2 capacity");
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), granted)
+                .await
+                .expect("the connection window was never granted");
+            // Anything past the window would have come with it.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        assert_eq!(stream.capacity(), H2C_CONNECTION_WINDOW);
+        stream.send_reset(h2::Reason::CANCEL);
+
+        let response = read_response(send_http(addr, "GET", "/model_info", ""));
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        rt.request_shutdown();
+    }
+
+    /// A client's RST_STREAM aborts its request, as a hang-up does over
+    /// HTTP/1.1: mid-stream, and before a unary request has its response.
+    #[test]
+    fn h2c_stream_reset_aborts_the_request() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(h2c_config(addr), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
+        let client_rt = tokio::runtime::Runtime::new().unwrap();
+        let mut client = h2c_client(&client_rt, addr);
+        for streaming in [true, false] {
+            let (response, mut stream) = h2c_generate(
+                &mut client,
+                &format!(
+                    r#"{{"input_ids":[1,2,3],"stream":{streaming},"sampling_params":{{"max_new_tokens":8}}}}"#
+                ),
+            );
+            let rid = next_scheduler_rid(&rt);
+            // Held until the reset, so the stream stays open.
+            let _body = streaming.then(|| {
+                assert!(
+                    rt.from_scheduler_tx
+                        .push(token_frame(rid.clone(), &[7], false))
+                );
+                client_rt.block_on(async {
+                    let response = response.await.expect("h2 response");
+                    assert_eq!(response.status().as_u16(), 200);
+                    let mut body = response.into_body();
+                    body.data().await.expect("first event").expect("h2 body");
+                    body
+                })
+            });
+            stream.send_reset(h2::Reason::CANCEL);
+            assert!(
+                rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+                "streaming={streaming}: no abort after the stream reset"
+            );
+            let abort = rt.to_scheduler_rx.drain(1);
+            let header = rmpv::decode::read_value(&mut &abort[0].header[..]).unwrap();
+            assert_eq!(
+                header[0].as_str(),
+                Some("AbortReq"),
+                "streaming={streaming}"
+            );
+            assert_eq!(
+                header[1].as_str(),
+                Some(rid.as_str()),
+                "streaming={streaming}"
+            );
+        }
+        rt.request_shutdown();
+    }
+
+    /// Without `--enable-http2` the listener speaks HTTP/1.1 only, as
+    /// Python's uvicorn server does: an h2c client gets no response.
+    #[test]
+    fn http2_is_refused_without_the_flag() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        let client_rt = tokio::runtime::Runtime::new().unwrap();
+        // The server may close the connection at any step past the preface.
+        let response = client_rt.block_on(async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let (client, connection) = h2::client::handshake(tcp).await?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut client = client.ready().await?;
+            let request = http::Request::get("http://t/model_info").body(()).unwrap();
+            let (response, _stream) = client.send_request(request, true)?;
+            response.await
+        });
+        assert!(response.is_err(), "{response:?}");
+        rt.request_shutdown();
     }
 }

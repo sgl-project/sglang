@@ -123,14 +123,12 @@ python3 -m sglang.launch_server \
 #### Router
 
 ```bash Command
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip>:10001 \
-    --decode http://<your decode ip>:20001 \
+sgl-router \
+    --model-id /path/to/MiMo-V2.5-Pro-FP4-DFlash \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:10001 http://<your decode ip>:20001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --health-check-interval-secs 3600 --mini-lb
+    --port 6688
 ```
 
 ### Benchmark

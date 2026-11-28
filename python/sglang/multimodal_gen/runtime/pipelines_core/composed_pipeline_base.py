@@ -9,11 +9,18 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any, Callable, ClassVar, Iterator, Literal, cast
 
 import torch
 from tqdm import tqdm
 
+from sglang.multimodal_gen.runtime.disaggregation.deployment.plan import (
+    Deployment,
+    ExecutionPlan,
+    StageSpec,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -59,6 +66,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     TextEncodingStage,
     TimestepPreparationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.postprocess import (
+    PostprocessStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.denoising import (
     ProgressiveDenoisingStage,
     ProgressiveDenoisingStageRouter,
@@ -66,11 +76,15 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.progressive_resolution.
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    external_component_path,
     maybe_download_model,
     prepare_diffusers_component_path_for_loading,
     verify_model_config_and_directory,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    get_is_main_process,
+    init_logger,
+)
 from sglang.multimodal_gen.runtime.utils.model_overlay import is_model_overlay
 
 logger = init_logger(__name__)
@@ -90,8 +104,13 @@ class ComposedPipelineBase(ABC):
     _required_config_modules: list[str] = []
     _unfiltered_required_config_modules: tuple[str, ...] = ()
     _extra_config_module_map: dict[str, str] = {}
+    # model_index.json component name -> the other repository's component path
+    # it loads from (external_component_path); load_modules sets it.
+    _external_component_paths: Mapping[str, str] = MappingProxyType({})
     # Exact module keys; unspecified components retain the default loader dispatch.
     component_loaders: ClassVar[dict[str, type[ComponentLoader]]] = {}
+    stage_specs: ClassVar[tuple[StageSpec, ...]] = ()
+    deployment_plan: ExecutionPlan | None = None
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
     executor: PipelineExecutor | None = None
@@ -119,6 +138,13 @@ class ComposedPipelineBase(ABC):
         use. The pipeline should be stateless and not hold any batch state.
         """
         self.server_args = server_args
+        self.deployment_plan = (
+            ExecutionPlan.compile(
+                Deployment.load(server_args.stage_deployment), self.stage_specs
+            )
+            if server_args.stage_deployment
+            else None
+        )
         self._disagg_role = server_args.disagg_role
         self.validate_disagg_role(self._disagg_role)
 
@@ -141,6 +167,11 @@ class ComposedPipelineBase(ABC):
             base_required_config_modules = COMFYUI_REQUIRED_MODULES
         self._unfiltered_required_config_modules = tuple(base_required_config_modules)
         self._required_config_modules = list(self._unfiltered_required_config_modules)
+        if self.deployment_plan is not None:
+            required = self.deployment_plan.roles[server_args.stage_role].components
+            self._required_config_modules = [
+                name for name in self._required_config_modules if name in required
+            ]
         self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
@@ -192,6 +223,12 @@ class ComposedPipelineBase(ABC):
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
+        if self.deployment_plan is not None:
+            expected = self.deployment_plan.roles[self.server_args.stage_role].stages
+            if tuple(self._stage_name_mapping) != expected:
+                raise ValueError(
+                    f"Instantiated stages {tuple(self._stage_name_mapping)} do not match placement {expected}"
+                )
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         return self.modules.get(module_name, default_value)
@@ -234,6 +271,7 @@ class ComposedPipelineBase(ABC):
                     self.model_path,
                     allow_patterns=[f"{model_subfolder}/**"],
                     revision=self.server_args.revision,
+                    model_subfolder=model_subfolder,
                 )
             model_path = os.path.join(model_root, model_subfolder)
 
@@ -422,10 +460,33 @@ class ComposedPipelineBase(ABC):
         self, server_args: ServerArgs, module_name: str, load_module_name: str
     ) -> str:
         override_path = server_args.component_paths.get(module_name)
+        external_path = self._external_component_paths.get(load_module_name)
         if override_path is not None:
             component_model_path = prepare_diffusers_component_path_for_loading(
                 override_path
             )
+        elif external_path is not None:
+            local_path = os.path.join(self.model_path, load_module_name)
+            if os.path.exists(local_path):
+                # Releases may bundle a copy of the external component (the
+                # public MiniMax-H3-Image snapshot ships text_encoder/). Use it
+                # rather than downloading the other repository again.
+                logger.info(
+                    "Loading %s from the bundled %s (model_index.json names %s)",
+                    load_module_name,
+                    local_path,
+                    external_path,
+                )
+                component_model_path = local_path
+            else:
+                logger.info(
+                    "Loading %s from %s (model_index.json)",
+                    load_module_name,
+                    external_path,
+                )
+                component_model_path = prepare_diffusers_component_path_for_loading(
+                    external_path
+                )
         else:
             component_model_path = os.path.join(self.model_path, load_module_name)
 
@@ -463,6 +524,13 @@ class ComposedPipelineBase(ABC):
 
         model_index = self._load_config()
         logger.info("Loading pipeline modules from config: %s", model_index)
+        external_paths = {}
+        for name, spec in model_index.items():
+            external_path = external_component_path(name, spec)
+            if external_path is not None:
+                external_paths[name] = external_path
+                model_index[name] = spec[:2]
+        self._external_component_paths = MappingProxyType(external_paths)
 
         # remove keys that are not pipeline modules
         model_index.pop("_class_name")
@@ -493,6 +561,10 @@ class ComposedPipelineBase(ABC):
                         self._disagg_role == RoleType.MONOLITHIC
                         or module_role is None
                         or module_role == self._disagg_role
+                    ) and (
+                        self.deployment_plan is None
+                        or "transformer_2"
+                        in self.deployment_plan.roles[server_args.stage_role].components
                     ):
                         self.required_config_modules.append("transformer_2")
                     else:
@@ -525,7 +597,7 @@ class ComposedPipelineBase(ABC):
 
         # In disagg mode, read HF config for skipped components (e.g., VAE)
         # so that update_model_arch + post_init can derive pipeline_config.
-        if self._disagg_role != RoleType.MONOLITHIC:
+        if self._disagg_role != RoleType.MONOLITHIC or self.deployment_plan is not None:
             self._init_skipped_component_configs(model_index, server_args)
 
         declared_modules = model_index
@@ -633,7 +705,9 @@ class ComposedPipelineBase(ABC):
         )
 
         for spec in tqdm(
-            iterable=component_load_specs, desc="Loading required modules"
+            iterable=component_load_specs,
+            desc="Loading required modules",
+            disable=not get_is_main_process(),
         ):
             module_name: str = spec.module_name
             load_module_name: str = spec.load_module_name
@@ -717,6 +791,11 @@ class ComposedPipelineBase(ABC):
         role_affinity: RoleType,
         stage_name: str,
     ) -> bool:
+        if self.deployment_plan is not None:
+            return (
+                stage_name
+                in self.deployment_plan.roles[self.server_args.stage_role].stages
+            )
         if self._disagg_role.includes_stage(role_affinity):
             return True
 
@@ -729,6 +808,8 @@ class ComposedPipelineBase(ABC):
         return False
 
     def _profile_stage_name(self, stage: PipelineStage, stage_name: str) -> str:
+        if self.deployment_plan is not None:
+            return stage_name
         class_name = stage.__class__.__name__
         if any(existing.__class__.__name__ == class_name for existing in self._stages):
             return stage_name
@@ -914,18 +995,27 @@ class ComposedPipelineBase(ABC):
         stage_name: str = "decoding_stage",
     ) -> "ComposedPipelineBase":
 
+        # a deployment may place postprocessing apart from the decoder
+        separate = self.deployment_plan is not None
+
         def create_stage() -> PipelineStage:
             return DecodingStage(
                 vae=self.get_module(vae_key),
                 pipeline=self,
                 component_name=vae_key,
+                separate_postprocess=separate,
             )
 
-        return self.add_stage_factory(
+        self.add_stage_factory(
             RoleType.DECODER,
             create_stage,
             stage_name,
         )
+        if separate:
+            self.add_stage_factory(
+                RoleType.DECODER, PostprocessStage, stage_name + "_postprocess"
+            )
+        return self
 
     def add_standard_t2i_stages(
         self,

@@ -1,10 +1,12 @@
 """Unit tests for full-attention KV transfer with prefill pp_size > 1 on
-hybrid-linear models (HybridLinearKVPool)."""
+hybrid-linear models and NPU MLA pools."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
+import torch
 
 from sglang.srt.disaggregation.ascend.conn import AscendKVManager
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -14,6 +16,7 @@ from sglang.srt.disaggregation.utils import (
     build_kv_layer_ids,
     build_transfer_entry_pairs,
 )
+from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -21,6 +24,7 @@ from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.runtime_context import get_memory, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mooncake_utils import attach_mooncake_transport, engine_writes
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -62,6 +66,8 @@ class TestTransferStartLayer(CustomTestCase):
 class _RecordingKVManager:
     get_mha_kv_ptrs_with_pp = CommonKVManager.get_mha_kv_ptrs_with_pp
     get_mla_kv_ptrs_with_pp = CommonKVManager.get_mla_kv_ptrs_with_pp
+    _generic_entry_pairs = MooncakeKVManager._generic_entry_pairs
+    _transfer_copies = MooncakeKVManager._transfer_copies
 
     def __init__(self, *, prefill_start_layer: int, pp_size: int):
         self.is_mla_backend = False
@@ -72,8 +78,12 @@ class _RecordingKVManager:
         self.kv_args = SimpleNamespace(prefill_start_layer=prefill_start_layer)
         self.blocks = []
 
-    def _transfer_data(self, mooncake_session_id, transfer_blocks):
-        self.blocks.extend(transfer_blocks)
+    def attach(self, **buffers):
+        """Real transport over an engine that records every block it is handed."""
+        attach_mooncake_transport(self, engine_writes(self._record), **buffers)
+
+    def _record(self, session, blocks):
+        self.blocks.extend(blocks)
         return 0
 
 
@@ -95,17 +105,18 @@ class TestHybridSendUsesLayerIdPairing(CustomTestCase):
         dst_ptrs = [2000 + i for i in range(2 * num_model)]
         item_lens = [10 + i for i in range(2 * num_stage)]
         manager = _RecordingKVManager(prefill_start_layer=start_offset, pp_size=2)
+        manager.attach(kv=src_ptrs, peer_kv=dst_ptrs)
         rc = MooncakeKVManager._send_kvcache_generic(
             manager,
             mooncake_session_id="session",
-            src_data_ptrs=src_ptrs,
-            dst_data_ptrs=dst_ptrs,
             item_lens=item_lens,
             prefill_data_indices=np.array([0], dtype=np.int32),
             dst_data_indices=np.array([0], dtype=np.int32),
             executor=None,
             src_layer_ids=stage_full_ids * 2,
             dst_layer_ids=model_full_ids * 2,
+            src_keys=manager._local_keys.kv,
+            dst_keys=manager._peers["session"].keys.kv,
         )
         self.assertEqual(rc, 0)
         expected = [
@@ -134,6 +145,7 @@ class TestSingleRegionSWATransfer(CustomTestCase):
         manager.kv_args.kv_data_ptrs = [1000]
         manager.kv_args.kv_item_lens = [64]
         manager.kv_args.kv_layer_ids = []
+        manager.attach(kv=[1000], peer_kv=[2000])
         manager._validate_envelope_kv_layout = (
             MooncakeKVManager._validate_envelope_kv_layout.__get__(manager)
         )
@@ -164,6 +176,12 @@ class _RecordingAscendManager:
             kv_layer_ids=[31, 35, 31, 35],
         )
         self.generic_call = None
+        attach_mooncake_transport(
+            self,
+            engine_writes(lambda session, blocks: 0),
+            kv=self.kv_args.kv_data_ptrs,
+            peer_kv=range(8),
+        )
 
     def _validate_envelope_kv_layout(self, *args):
         pass
@@ -191,36 +209,57 @@ class TestAscendHybridPpDispatch(CustomTestCase):
         self.assertEqual(manager.generic_call["src_layer_ids"], [31, 35, 31, 35])
         self.assertEqual(manager.generic_call["dst_layer_ids"], dst_layer_ids)
 
+    def test_send_kvcache_accepts_transfer_worker_keywords(self):
+        manager = _RecordingAscendManager()
+        rc = AscendKVManager.send_kvcache(
+            manager,
+            mooncake_session_id="session",
+            prefill_kv_indices=np.array([1], dtype=np.int32),
+            dst_kv_ptrs=list(range(8)),
+            dst_kv_indices=np.array([2], dtype=np.int32),
+            executor=None,
+            dst_layer_ids=[3, 7, 31, 35, 3, 7, 31, 35],
+            dst_device_kv_indices=None,
+            dst_kv_item_len=16,
+            dst_attn_tp_size=1,
+            dst_num_draft_entries=None,
+        )
+
+        self.assertEqual(rc, 7)
+        self.assertIsNotNone(manager.generic_call)
+
 
 class TestMambaSlotTransfer(CustomTestCase):
     def test_stage1_uses_paired_slot_sizes_and_offsets(self):
         manager = _RecordingKVManager(prefill_start_layer=1, pp_size=2)
+        manager.attach(state=[[1000]], peer_state=[[2000, 3000]])
         MooncakeKVManager._send_mamba_state(
             manager,
             req=SimpleNamespace(mooncake_session_id="session"),
             prefill_mamba_index=[2],
-            src_state_data_ptrs=[1000],
             src_state_item_lens=[16],
-            dst_state_data_ptrs=[2000, 3000],
             dst_mamba_index=[3],
             src_layer_ids=[7],
             dst_layer_ids=[3, 7],
             dst_state_item_lens=[8, 16],
+            src_keys=manager._local_keys.state[0],
+            dst_keys=manager._peers["session"].keys.state[0],
         )
         self.assertEqual(manager.blocks, [(1032, 3048, 16)])
 
     def test_slot_size_mismatch_rejected_before_transfer(self):
         manager = _RecordingKVManager(prefill_start_layer=0, pp_size=1)
+        manager.attach(state=[[1000]], peer_state=[[2000]])
         with self.assertRaisesRegex(RuntimeError, "Mamba slot size mismatch"):
             MooncakeKVManager._send_mamba_state(
                 manager,
                 req=SimpleNamespace(mooncake_session_id="session"),
                 prefill_mamba_index=[1],
-                src_state_data_ptrs=[1000],
                 src_state_item_lens=[16],
-                dst_state_data_ptrs=[2000],
                 dst_mamba_index=[1],
                 dst_state_item_lens=[32],
+                src_keys=manager._local_keys.state[0],
+                dst_keys=manager._peers["session"].keys.state[0],
             )
         self.assertEqual(manager.blocks, [])
 
@@ -285,6 +324,158 @@ def _static_storage(pool) -> StaticKVStorage:
     """The storage a static pool registers with PD peers through."""
     allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
     return StaticKVStorage(None, allocator)
+
+
+def _npu_mla_pool(
+    start_layer,
+    layer_num,
+    *,
+    fp8=False,
+    combined=False,
+    indexer_layer_ids=(),
+    indexer_scale=False,
+):
+    # CPU tensors exercise the real registration methods without NPU allocation.
+    pool = NPUMLATokenToKVPool.__new__(NPUMLATokenToKVPool)
+    pool.start_layer, pool.layer_num = start_layer, layer_num
+    pool.use_combined_kv_buffer = combined
+    pool.dsa_kv_cache_store_c8 = fp8
+    pool.is_draft_worker, pool.dcp_size = False, 1
+    pool.index_head_dim = 128 if indexer_layer_ids else None
+    pool.indexer_layer_ids = tuple(indexer_layer_ids)
+
+    def buffers(layer_ids, group):
+        # Distinct contents expose pairing the right layer with the wrong group.
+        return [torch.full((2, 2, 1, 4), group * 16 + lid) for lid in layer_ids]
+
+    layers = range(start_layer, start_layer + layer_num)
+    pool.k_buffer = buffers(layers, 0)
+    pool.v_buffer = buffers(layers, 1)
+    pool.kv_buffer = buffers(layers, 2)
+    pool.index_k_buffer = buffers(indexer_layer_ids, 3)
+    pool.index_k_scale_buffer = (
+        buffers(indexer_layer_ids, 4) if fp8 or indexer_scale else None
+    )
+    return pool
+
+
+class TestNpuMlaLayerMetadata(CustomTestCase):
+    def _ids(self, pool, draft=None):
+        return build_kv_layer_ids(
+            token_to_kv_pool=pool,
+            storage=_static_storage(pool),
+            draft_token_to_kv_pool=draft,
+            num_draft_entries=(
+                len(draft.get_contiguous_buf_infos()[0]) if draft is not None else 0
+            ),
+            num_hidden_layers=8,
+        )
+
+    def test_owner_ids_follow_registered_groups(self):
+        layers, index_layers = [4, 5, 6, 7], [4, 6]
+        cases = [
+            ({}, ("k_buffer", "v_buffer"), layers * 2),
+            (
+                {"indexer_layer_ids": index_layers},
+                ("k_buffer", "v_buffer", "index_k_buffer"),
+                layers * 2 + index_layers,
+            ),
+            (
+                {"fp8": True, "indexer_layer_ids": index_layers},
+                ("k_buffer", "index_k_buffer", "index_k_scale_buffer"),
+                layers + index_layers * 2,
+            ),
+            ({"combined": True}, ("kv_buffer",), layers),
+            (
+                {"combined": True, "indexer_layer_ids": index_layers},
+                ("kv_buffer",),
+                layers,
+            ),
+            (
+                {
+                    "combined": True,
+                    "indexer_layer_ids": index_layers,
+                    "indexer_scale": True,
+                },
+                ("kv_buffer",),
+                layers,
+            ),
+        ]
+        for options, groups, expected_ids in cases:
+            with self.subTest(options=options):
+                pool = _npu_mla_pool(4, 4, **options)
+                buffers = [
+                    buffer for group in groups for buffer in getattr(pool, group)
+                ]
+                ptrs, lens, strides = pool.get_contiguous_buf_infos()
+                self.assertEqual(ptrs, [buffer.data_ptr() for buffer in buffers])
+                self.assertEqual(lens, [buffer.nbytes for buffer in buffers])
+                self.assertEqual(strides, [buffer[0].nbytes for buffer in buffers])
+                self.assertEqual(self._ids(pool), expected_ids)
+                self.assertEqual(len(expected_ids), len(ptrs))
+
+    def test_pipeline_pairing_preserves_layer_and_tensor_group(self):
+        layouts = [
+            ((0, 8), (0, 8)),
+            ((0, 4), (0, 8)),
+            ((4, 4), (0, 8)),
+            ((4, 4), (4, 4)),
+        ]
+        for fp8 in (False, True):
+            for source, destination in layouts:
+                with self.subTest(fp8=fp8, source=source, destination=destination):
+                    pools = [
+                        _npu_mla_pool(
+                            start,
+                            count,
+                            fp8=fp8,
+                            indexer_layer_ids=[
+                                lid
+                                for lid in range(start, start + count)
+                                if lid % 3 == 0
+                            ],
+                        )
+                        for start, count in (source, destination)
+                    ]
+                    src, dst = pools
+                    src_buffers = [b for b, _, _ in src._get_disagg_buffer_entries()]
+                    dst_buffers = [b for b, _, _ in dst._get_disagg_buffer_entries()]
+                    pairs = build_transfer_entry_pairs(
+                        self._ids(src),
+                        self._ids(dst),
+                        len(src_buffers),
+                        len(dst_buffers),
+                    )
+                    self.assertEqual(len(pairs), len(src_buffers))
+                    for i, j in pairs:
+                        self.assertTrue(torch.equal(src_buffers[i], dst_buffers[j]))
+
+    def test_dense_npu_draft_uses_positional_group_fallback(self):
+        target = _npu_mla_pool(4, 4)
+        for fp8, has_indexer, groups in (
+            (False, False, 2),
+            (False, True, 3),
+            (True, True, 3),
+        ):
+            with self.subTest(fp8=fp8, has_indexer=has_indexer):
+                draft = _npu_mla_pool(
+                    0,
+                    3,
+                    fp8=fp8,
+                    indexer_layer_ids=range(3) if has_indexer else (),
+                )
+                draft.is_draft_worker = True
+                # Draft construction disables indexer elision and combined KV;
+                # the existing fallback infers these complete tensor groups.
+                with patch.object(
+                    draft,
+                    "get_kv_layer_ids",
+                    side_effect=AssertionError("dense draft should use the fallback"),
+                ):
+                    self.assertEqual(
+                        self._ids(target, draft),
+                        [4, 5, 6, 7] * 2 + [8, 9, 10] * groups,
+                    )
 
 
 class TestBuildKvLayerIds(CustomTestCase):

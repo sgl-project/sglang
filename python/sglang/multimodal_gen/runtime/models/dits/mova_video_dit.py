@@ -47,11 +47,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-# @torch.compile(fullgraph=True)
-def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    return x * (1 + scale) + shift
-
-
 def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(
         position.type(torch.float64),
@@ -154,6 +149,7 @@ class SelfAttention(_MOVAAttention):
         self.attn = USPAttention(
             # Local heads per TP rank.
             num_heads=self.num_heads_per_rank,
+            global_num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,
@@ -232,6 +228,7 @@ class CrossAttention(_MOVAAttention):
         # Use LocalAttention for cross-attention (no SP communication needed)
         self.attn = LocalAttention(
             num_heads=self.num_heads_per_rank,
+            global_num_heads=self.num_heads,
             head_size=self.head_dim,
             causal=False,
             softmax_scale=None,

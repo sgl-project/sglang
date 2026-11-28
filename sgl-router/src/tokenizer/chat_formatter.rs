@@ -4,7 +4,8 @@
 //! Chat rendering via dynamo-render for cache-aware routing and input ID forwarding.
 //!
 //! Mirrors SGLang reasoning controls and assistant continuations; DeepSeek-V4,
-//! V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 render through `sglang_processor`.
+//! V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun (Step-3.5-Flash,
+//! Step-3.7-Flash, Step-5-Preview) render through `sglang_processor`.
 //! Forwarding remains guarded until parity has been verified for each request
 //! shape.
 
@@ -42,14 +43,28 @@ pub struct ChatFormatter {
     defaults: ChatTemplateKwargs,
     /// Stripped from a separately tokenized continuation prefix, as SGLang does.
     bos_token: Option<String>,
-    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 render through
-    /// `sglang_processor`.
+    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun render
+    /// through `sglang_processor`.
     processor: Option<ProcessorFormatter>,
     /// MiniMax-M3.1: an M3 template with no `thinking_mode` switch, so thinking
     /// is always adaptive (M3's template can turn it off).
     minimax_m31: bool,
     /// Worker defaults, merged before model-specific effort conversion.
     worker_defaults: ChatTemplateKwargs,
+    /// The special tokens the tokenizer adds around a text, which SGLang keeps on
+    /// a separately encoded continuation prefix; `None` adds none.
+    prompt_affixes: Option<super::adapter::PromptAffixes>,
+    /// DeepSeek-V4 / V4.1 prompts encode with the router's tokenizer; see
+    /// [`Self::with_router_tokenizer`].
+    router_encodes_segments: bool,
+}
+
+/// Ids of the image placeholders `tokenizer` declares (see [`super::MEDIA_TOKENS`]).
+fn media_placeholders(tokenizer: &Tokenizer) -> Vec<u32> {
+    super::MEDIA_TOKENS
+        .iter()
+        .filter_map(|token| tokenizer.token_to_id(token).ok().flatten())
+        .collect()
 }
 
 impl ChatFormatter {
@@ -178,9 +193,9 @@ impl ChatFormatter {
                 *entry = serde_json::json!({ name: template });
             }
         }
-        // GLM-5.3, MiniMax-M3 and Qwen3.8 render through `sglang_processor`. M3 is
-        // keyed on the checkpoint's `model_type` (Python's `is_minimax_m3`), the
-        // others on their template.
+        // GLM-5.3, MiniMax-M3, Qwen3.8 and StepFun render through `sglang_processor`.
+        // M3 is keyed on the checkpoint's `model_type` (Python's `is_minimax_m3`),
+        // the others on their template.
         let processor = ProcessorFormatter::from_tokenizer_config_with_type(&cfg, model_type)
             .ok()
             .filter(|formatter| {
@@ -189,6 +204,7 @@ impl ChatFormatter {
                     ProcessorFormatter::Glm53(_)
                         | ProcessorFormatter::MiniMaxM3 { .. }
                         | ProcessorFormatter::Qwen38 { .. }
+                        | ProcessorFormatter::Step3p5 { .. }
                 )
             });
         let minimax_m31 = matches!(processor, Some(ProcessorFormatter::MiniMaxM3 { .. }))
@@ -209,6 +225,8 @@ impl ChatFormatter {
             processor,
             minimax_m31,
             worker_defaults: ChatTemplateKwargs::new(),
+            prompt_affixes: None,
+            router_encodes_segments: false,
         }))
     }
 
@@ -225,6 +243,8 @@ impl ChatFormatter {
             processor: Some(ProcessorFormatter::KimiK3),
             minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
+            prompt_affixes: None,
+            router_encodes_segments: false,
         })
     }
 
@@ -271,6 +291,8 @@ impl ChatFormatter {
             },
             minimax_m31: false,
             worker_defaults: ChatTemplateKwargs::new(),
+            prompt_affixes: None,
+            router_encodes_segments: false,
         })
     }
 
@@ -288,8 +310,8 @@ impl ChatFormatter {
             .and_then(ProcessorFormatter::reasoning_toggle)
     }
 
-    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3 and Qwen3.8 are fixture-verified
-    /// against SGLang for every text chat.
+    /// DeepSeek-V4, V4.1, GLM-5.3, Kimi-K3, MiniMax-M3, Qwen3.8 and StepFun are
+    /// fixture-verified against SGLang for every text chat.
     pub fn forwarding_scope(&self) -> super::ForwardingScope {
         match self.processor {
             Some(_) => super::ForwardingScope::AllText,
@@ -322,6 +344,107 @@ impl ChatFormatter {
         self
     }
 
+    /// The tokenizer's own special tokens around a text (`adapter::prompt_affixes`).
+    pub fn with_prompt_affixes(mut self, affixes: Option<&super::adapter::PromptAffixes>) -> Self {
+        self.prompt_affixes = affixes.cloned();
+        self
+    }
+
+    /// Encode DeepSeek-V4 / V4.1 prompts with `tokenizer` (the router's, L1-cached)
+    /// instead of the processor's own checkpoint tokenizer, which the L1 cache
+    /// never sees, so each turn re-encodes only its new segments.
+    ///
+    /// Switched on only if `tokenizer` reproduces the processor's ids on
+    /// [`deepseek_parity_probes`]: the encode backend can make them differ. The
+    /// ids are forwarded to the engine as `input_ids`, so the probes run the text
+    /// where encoders split differently. Call after [`Self::with_defaults`].
+    pub fn with_router_tokenizer(mut self, tokenizer: &Tokenizer) -> Self {
+        if !self.processor_encodes_deepseek() {
+            return self;
+        }
+        match self.deepseek_parity(tokenizer) {
+            Ok(()) => {
+                self.router_encodes_segments = true;
+                tracing::info!(
+                    "DeepSeek prompts encode through the router tokenizer (L1 segment cache)"
+                );
+            }
+            Err(mismatch) => tracing::warn!(
+                mismatch = %format!("{mismatch:#}"),
+                "router tokenizer differs from the DeepSeek checkpoint tokenizer; \
+                 DeepSeek prompts keep encoding in sglang_processor without the L1 cache"
+            ),
+        }
+        self
+    }
+
+    /// Whether DeepSeek prompts encode through the router's tokenizer
+    /// ([`Self::with_router_tokenizer`]).
+    pub fn encodes_with_router_tokenizer(&self) -> bool {
+        self.router_encodes_segments
+    }
+
+    /// Whether the processor encodes DeepSeek-V4 / V4.1 prompts itself, i.e. has
+    /// the checkpoint's `tokenizer.json`.
+    fn processor_encodes_deepseek(&self) -> bool {
+        matches!(
+            self.processor,
+            Some(
+                ProcessorFormatter::DeepSeekV4(Some(_)) | ProcessorFormatter::DeepSeekV41(Some(_))
+            )
+        )
+    }
+
+    /// `Ok` when `tokenizer` encodes every probe's rendered segments to the
+    /// processor's ids.
+    fn deepseek_parity(&self, tokenizer: &Tokenizer) -> Result<()> {
+        let formatter = self.processor.as_ref().context("no processor")?;
+        for (index, probe) in deepseek_parity_probes().iter().enumerate() {
+            let expected = formatter
+                .encode_request(probe.clone(), &self.worker_defaults)
+                .context("processor does not encode")?
+                .with_context(|| format!("probe {index}: processor encode"))?;
+            let actual = self
+                .encode_processor_segments(formatter, tokenizer, probe)
+                .with_context(|| format!("probe {index}: router encode"))?;
+            anyhow::ensure!(
+                actual == expected,
+                "probe {index}: {} router ids vs {} processor ids, first difference at {}",
+                actual.len(),
+                expected.len(),
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(actual.len().min(expected.len()))
+            );
+        }
+        Ok(())
+    }
+
+    /// The processor's render of a text chat, encoded segment by segment with
+    /// `tokenizer`, exactly as the processor's `encode_request` encodes it with
+    /// its own tokenizer. Errs on a chat the processor will not render as text
+    /// (one with images, or an invalid one).
+    fn encode_processor_segments(
+        &self,
+        formatter: &ProcessorFormatter,
+        tokenizer: &Tokenizer,
+        request: &JsonValue,
+    ) -> Result<Vec<u32>> {
+        let (prompt, prefix) = formatter
+            .render_request(request.clone(), &self.worker_defaults)
+            .context("render chat")?;
+        // deepseek-recipe renders a continued final message itself.
+        anyhow::ensure!(
+            prefix.is_empty(),
+            "DeepSeek render left a continuation prefix"
+        );
+        let segments = prompt
+            .encode_segments()
+            .context("a DeepSeek prompt is segmented")?;
+        Ok(tokenizer.encode_segments(&segments)?.token_ids().to_vec())
+    }
     fn effective_effort(&self, request: &JsonValue) -> Option<JsonValue> {
         request_effort(request).or_else(|| {
             self.worker_defaults
@@ -431,13 +554,63 @@ impl ChatFormatter {
         Ok((prompt, prefix))
     }
 
+    /// The chat's prompt ids as the engine renders them. A DeepSeek chat with
+    /// images renders with its image placeholders (the engine expands each from
+    /// the image's pixels), so these ids count the prompt without its images.
     pub fn encode(&self, tokenizer: &Tokenizer, request: &JsonValue) -> Result<Vec<u32>> {
-        if let Some(ids) = self
-            .processor
-            .as_ref()
-            .and_then(|formatter| formatter.encode_request(request.clone(), &self.worker_defaults))
-        {
-            return ids.context("render chat");
+        self.encode_rendered(tokenizer, request).map(|(ids, _)| ids)
+    }
+
+    /// [`Self::encode`] for routing: a chat with images carries, after each
+    /// placeholder, a tag of its image's identity (see [`super::tag_images`]),
+    /// so the prompt up to the first image is the engine's and past it chats
+    /// with different images differ. Routing-only: a chat with media is never
+    /// eligible for input_ids forwarding, and token counts use [`Self::encode`].
+    pub fn encode_for_routing(
+        &self,
+        tokenizer: &Tokenizer,
+        request: &JsonValue,
+    ) -> Result<Vec<u32>> {
+        let (ids, images) = self.encode_rendered(tokenizer, request)?;
+        if images.is_empty() {
+            return Ok(ids);
+        }
+        Ok(super::tag_images(
+            ids,
+            &media_placeholders(tokenizer),
+            &images,
+        ))
+    }
+
+    /// The chat's ids, with the sources of the images its placeholders stand for.
+    fn encode_rendered(
+        &self,
+        tokenizer: &Tokenizer,
+        request: &JsonValue,
+    ) -> Result<(Vec<u32>, Vec<String>)> {
+        if let Some(formatter) = self.processor.as_ref() {
+            // A text chat renders once and encodes on the router's tokenizer, errors
+            // included. Any other content part (an image, a `file` the recipe reads
+            // as an image, a video) takes the multimodal path below, which keeps
+            // placeholders or reports the error.
+            if self.router_encodes_segments && text_only_chat(request) {
+                let ids = self.encode_processor_segments(formatter, tokenizer, request)?;
+                return Ok((ids, Vec::new()));
+            }
+            // DeepSeek renders once, images included: a text chat's ids are the text
+            // path's exactly, and a chat with images (which that path refuses) keeps
+            // its image placeholders. Video still fails here.
+            let encoded =
+                match formatter.encode_multimodal_request(request.clone(), &self.worker_defaults) {
+                    Some(Ok(encoded)) => Some(Ok((encoded.ids, encoded.images))),
+                    Some(Err(err)) => Some(Err(err)),
+                    None => formatter
+                        .encode_request(request.clone(), &self.worker_defaults)
+                        .map(|ids| ids.map(|ids| (ids, Vec::new()))),
+                };
+            if let Some(encoded) = encoded {
+                return encoded.context("render chat");
+            }
         }
         let (prompt, prefix) = self.render_parts(request)?;
         let mut ids = match prompt.encode_segments() {
@@ -446,11 +619,16 @@ impl ChatFormatter {
             None => super::adapter::encode(tokenizer, prompt.as_str())?,
         };
         if !prefix.is_empty() {
-            // SGLang encodes the assistant prefix separately and removes its leading BOS.
-            let mut suffix = if self.is_kimi_k3() {
+            // `_append_assistant_prefix_to_prompt_ids`: SGLang encodes the assistant
+            // prefix separately, special tokens included, and removes its leading BOS.
+            let text = if self.is_kimi_k3() {
                 super::kimi::encode(tokenizer, &[EncodeSegment::control(&prefix)])?
             } else {
                 super::adapter::encode(tokenizer, &prefix)?
+            };
+            let mut suffix = match &self.prompt_affixes {
+                Some(affixes) => [affixes.prefix.as_slice(), &text, &affixes.suffix].concat(),
+                None => text,
             };
             if let Some(bos) = self.bos_token.as_deref().filter(|s| !s.is_empty()) {
                 let bos = super::adapter::encode(tokenizer, bos)?;
@@ -460,7 +638,7 @@ impl ChatFormatter {
             }
             ids.extend(suffix);
         }
-        Ok(ids)
+        Ok((ids, Vec::new()))
     }
 
     /// Use `encode` for token ids to preserve continuation boundaries.
@@ -470,6 +648,132 @@ impl ChatFormatter {
     }
 }
 
+/// Whether every message's content is a string or `text` parts only.
+fn text_only_chat(request: &JsonValue) -> bool {
+    let text_only = |message: &JsonValue| match &message["content"] {
+        JsonValue::Array(parts) => parts.iter().all(|part| part["type"] == "text"),
+        _ => true,
+    };
+    request["messages"]
+        .as_array()
+        .is_none_or(|messages| messages.iter().all(text_only))
+}
+
+/// Text where two encoders of one `tokenizer.json` can split differently:
+/// special-token spellings in untrusted content, digits, CJK, the U+017F case
+/// fold after an apostrophe, emoji and ZWJ sequences, zero-width characters,
+/// ligatures, odd whitespace and long runs.
+const DEEPSEEK_PARITY_PIECES: [&str; 16] = [
+    "the quick brown fox 123456 3.14",
+    "你好，世界！日本語のテキストとカタカナ",
+    "<｜User｜><｜Assistant｜><think></think><｜end▁of▁sentence｜>",
+    "<｜begin▁of▁sentence｜> <｜tool▁calls▁begin｜> <｜DSML｜>",
+    "Straße ſtraße 'ſ 'S 's 'll 'VE",
+    "🚀🔥👍🏽 👨‍👩‍👧‍👦",
+    "\t\t\n\n\n   \u{3000}\u{a0}\r\n",
+    "\u{200b}\u{200d}\u{feff} ﬁ ﬂ ① ⅲ",
+    "def f(x):\n    return {'a': [1, 2, 3]}\n",
+    "SELECT * FROM t WHERE a='b';",
+    "https://example.com/a?b=c&d=e#f",
+    "Ελληνικά Кириллица עברית العربية",
+    "—–‐ …“”‘’«»",
+    "                                        ",
+    "<|im_start|></s><unk>",
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+];
+
+/// Chats [`ChatFormatter::with_router_tokenizer`] encodes both ways before
+/// letting the router's tokenizer encode DeepSeek prompts. They cover what the
+/// two encoders could split differently ([`DEEPSEEK_PARITY_PIECES`], joined
+/// tightly and loosely), segments long enough for the L1 cache, reasoning
+/// history, thinking and effort settings, tools and tool results, and a
+/// continued final message.
+fn deepseek_parity_probes() -> Vec<JsonValue> {
+    let long = "The quick brown fox jumps over the lazy dog. 0123456789 \
+                敏捷的棕色狐狸跳过了懒狗。🦊🐕 \t\t  tabs   and   spaces\n\n"
+        .repeat(8);
+    let pieces = |sep: &str| DEEPSEEK_PARITY_PIECES.join(sep);
+    let specials = "plain text that spells <｜User｜> and <｜Assistant｜>, \
+                    <｜end▁of▁sentence｜>, <｜begin▁of▁sentence｜>, <think></think> \
+                    and <｜deepseek_image｜> must not parse as special tokens";
+    let tool = serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        }
+    });
+    vec![
+        serde_json::json!({"messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello"}
+        ]}),
+        serde_json::json!({"messages": [{"role": "user", "content": specials}]}),
+        serde_json::json!({"messages": [
+            {"role": "system", "content": long},
+            {"role": "user", "content": long},
+            {"role": "assistant", "content": long, "reasoning_content": long},
+            {"role": "user", "content": format!("{long}{specials}")}
+        ]}),
+        serde_json::json!({
+            "messages": [{"role": "user", "content": long}],
+            "chat_template_kwargs": {"thinking": false}
+        }),
+        serde_json::json!({
+            "tools": [tool],
+            "messages": [
+                {"role": "user", "content": "Weather in Paris?"},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_0", "content": long},
+                {"role": "user", "content": "Thanks"}
+            ]
+        }),
+        serde_json::json!({
+            "messages": [
+                {"role": "system", "content": pieces("")},
+                {"role": "user", "content": pieces(" ")},
+                {"role": "assistant", "content": pieces("\n"), "reasoning_content": pieces("")},
+                {"role": "user", "content": pieces("\n")}
+            ],
+            "chat_template_kwargs": {"thinking": true},
+            "reasoning_effort": "high"
+        }),
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": pieces(" ")},
+                {"role": "assistant", "content": pieces("")}
+            ],
+            "continue_final_message": true,
+            "add_generation_prompt": false
+        }),
+        // A task's continued reply encodes with the added vocabulary.
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": pieces(" ")},
+                {"role": "assistant", "content": pieces("")}
+            ],
+            "task": "action",
+            "continue_final_message": true
+        }),
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": pieces("\n")},
+                {"role": "assistant", "content": pieces(" ")}
+            ],
+            "task": "query",
+            "continue_final_message": true
+        }),
+    ]
+}
 /// Message fields the engine's request schema keeps for non-user roles.
 const GENERIC_MESSAGE_KEYS: [&str; 7] = [
     "role",
@@ -841,6 +1145,29 @@ mod tests {
         assert!(!other.is_minimax_m31());
     }
 
+    /// StepFun, known by its template, renders every text chat through `sglang_processor`:
+    /// the template sees SGLang's messages, so a later system turn keeps its name.
+    #[test]
+    fn step3p5_renders_through_the_processor() {
+        use crate::tokenizer::ForwardingScope;
+        let template = "{# <|im_start|>tool_response <im_patch> <function= <parameter= image #}\
+            {{ bos_token }}{% for m in messages %}<|im_start|>\
+            {% if m.role == 'system' and m.name == 'observation' %}observation\
+            {% else %}{{ m.role }}{% endif %}|{{ m.content }}{% endfor %}";
+        let enc = jinja(json!({ "chat_template": template, "bos_token": "<s>" }));
+        assert_eq!(enc.forwarding_scope(), ForwardingScope::AllText);
+        let req = request(json!([
+            {"role": "user", "content": "Q"},
+            {"role": "system", "name": "observation", "content": "O"},
+        ]));
+        assert_eq!(
+            enc.render(&req).unwrap(),
+            "<s><|im_start|>user|Q<|im_start|>observation|O"
+        );
+        let other = jinja(json!({ "chat_template": template.replace("<im_patch>", "") }));
+        assert_eq!(other.forwarding_scope(), ForwardingScope::Guarded);
+    }
+
     #[test]
     fn raise_exception_surfaces_as_error() {
         let enc = jinja(json!({"chat_template": "{{ raise_exception('bad messages') }}"}));
@@ -1185,6 +1512,19 @@ mod tests {
         );
         req["messages"][1]["content"] = json!("<|endoftext|>b");
         assert_eq!(formatter.encode(&tokenizer, &req).unwrap(), vec![97, 98]);
+        // A tokenizer that adds BOS itself keeps the prefix's own: SGLang encodes
+        // `[BOS, BOS, b]` and drops only the first.
+        let bos = super::super::adapter::encode(&tokenizer, "<|endoftext|>").unwrap();
+        let affixes = super::super::adapter::PromptAffixes {
+            prefix: bos.clone(),
+            ..Default::default()
+        };
+        let auto_bos = jinja(json!({"chat_template":"a", "bos_token":"<|endoftext|>"}))
+            .with_prompt_affixes(Some(&affixes));
+        assert_eq!(
+            auto_bos.encode(&tokenizer, &req).unwrap(),
+            [vec![97], bos, vec![98]].concat()
+        );
         req["continue_final_message"] = json!(false);
         req["messages"][1]["content"] = json!("b");
         let out = deepseek_v4().render(&req).unwrap();
