@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 import torch
 
@@ -13,7 +13,10 @@ from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+    from sglang.srt.layers.attention.triton_backend import (
+        TritonAttnBackend,
+        WindowRail,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -173,17 +176,17 @@ def set_gqa_draft_kv_ring(backend: TritonAttnBackend, ring) -> None:
     backend.verify_reads_window_kv_only = True
 
 
-def ring_window_rail(
+def ring_window_rails(
     backend: TritonAttnBackend,
-    *,
-    name: str,
     req_pool_indices: torch.Tensor,
     lens: torch.Tensor,
     bs: int,
-    window: int,
+    *,
+    with_offsets: bool,
     graph: bool,
-):
-    """Fill a sliding-window rail from the per-request ring on non-MLA drafts, or None."""
+    aligned: bool,
+) -> Optional[Dict[str, WindowRail]]:
+    """Every window rail filled from the per-request ring on non-MLA drafts, or None."""
     ring = getattr(backend, "gqa_draft_kv_ring_hip", None)
     if ring is None or backend.use_mla:
         return None
@@ -191,16 +194,36 @@ def ring_window_rail(
         fill_dspark_ring_window_buffer_hip,
     )
 
-    return fill_dspark_ring_window_buffer_hip(
-        min_pos=ring.min_pos,
-        rows_per_req=ring.rows_per_req,
-        dcp_size=ring.dcp_size,
-        window_kv_indptr=backend.window_kv_indptr[name],
-        req_pool_indices=req_pool_indices,
-        seq_lens=lens,
-        bs=bs,
-        sliding_window_size=window,
-        window_kv_indices=(
-            backend.cuda_graph_window_kv_indices[name] if graph else None
-        ),
-    )
+    from sglang.srt.layers.attention.triton_backend import WindowRail
+
+    rails = {}
+    for name, window in backend.window_lengths.items():
+        kv_indptr, kv_indices, kv_lens, kv_offsets = fill_dspark_ring_window_buffer_hip(
+            min_pos=ring.min_pos,
+            rows_per_req=ring.rows_per_req,
+            dcp_size=ring.dcp_size,
+            window_kv_indptr=backend.window_kv_indptr[name],
+            req_pool_indices=req_pool_indices,
+            seq_lens=lens,
+            bs=bs,
+            sliding_window_size=window,
+            window_kv_indices=(
+                backend.cuda_graph_window_kv_indices[name] if graph else None
+            ),
+        )
+        if not with_offsets:
+            kv_offsets = None
+        elif graph:
+            backend.cuda_graph_window_kv_offsets[name][:bs] = kv_offsets
+            kv_offsets = backend.cuda_graph_window_kv_offsets[name]
+        rail = WindowRail(
+            kv_indptr=kv_indptr, kv_indices=kv_indices, kv_offsets=kv_offsets
+        )
+        if aligned:
+            rail.aligned_kv_indptr, rail.aligned_kv_indices = (
+                backend.align_window_kv_to_tiles(
+                    kv_indptr, kv_indices, lens[:bs] - kv_lens, bs
+                )
+            )
+        rails[name] = rail
+    return rails

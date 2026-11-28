@@ -681,39 +681,37 @@ class TritonAttnBackend(AttentionBackend):
     ) -> Dict[str, WindowRail]:
         """Every window rail over the last ``lens`` tokens of each request, in the
         CUDA-graph buffers when ``graph``; ``aligned`` adds the tile-aligned rail."""
+        ring_rails = (
+            _draft_hip.ring_window_rails(
+                self,
+                req_pool_indices,
+                lens,
+                bs,
+                with_offsets=with_offsets,
+                graph=graph,
+                aligned=aligned,
+            )
+            if _is_hip
+            else None
+        )
+        if ring_rails is not None:
+            return ring_rails
         rails = {}
         for name, window in self.window_lengths.items():
-            ring_rail = (
-                _draft_hip.ring_window_rail(
-                    self,
-                    name=name,
-                    req_pool_indices=req_pool_indices,
-                    lens=lens,
-                    bs=bs,
-                    window=window,
-                    graph=graph,
-                )
-                if _is_hip
-                else None
-            )
-            kv_indptr, kv_indices, kv_lens, kv_offsets = (
-                ring_rail
-                if ring_rail is not None
-                else update_sliding_window_buffer(
-                    self.window_kv_indptr[name],
-                    self.runner_ids,
-                    plan,
-                    req_pool_indices,
-                    window,
-                    lens,
-                    bs,
-                    self.device,
-                    self.token_to_kv_pool,
-                    window_kv_indices=(
-                        self.cuda_graph_window_kv_indices[name] if graph else None
-                    ),
-                    kind=name,
-                )
+            kv_indptr, kv_indices, kv_lens, kv_offsets = update_sliding_window_buffer(
+                self.window_kv_indptr[name],
+                self.runner_ids,
+                plan,
+                req_pool_indices,
+                window,
+                lens,
+                bs,
+                self.device,
+                self.token_to_kv_pool,
+                window_kv_indices=(
+                    self.cuda_graph_window_kv_indices[name] if graph else None
+                ),
+                kind=name,
             )
             if not with_offsets:
                 kv_offsets = None
@@ -1056,9 +1054,8 @@ class TritonAttnBackend(AttentionBackend):
         return rails
 
     def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
-        """Read a draft's window keys from its per-request KV ring. On this backend
-        only ROCm admits the ring: DFLASH MLA drafts under DCP window verify, and
-        GQA DSPARK drafts through their sliding-window rail."""
+        """Read a DFLASH MLA draft's window keys from its per-request KV ring; only
+        ROCm's DCP window verify admits the ring on this backend."""
         if _is_hip and not self.use_mla:
             _draft_hip.set_gqa_draft_kv_ring(self, ring)
             return
