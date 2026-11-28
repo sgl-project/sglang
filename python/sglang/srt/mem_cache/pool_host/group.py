@@ -333,6 +333,10 @@ class HostPoolGroup:
         return self.anchor_entry.host_pool.kv_buffer
 
     @property
+    def pin_memory(self) -> bool:
+        return self.anchor_entry.host_pool.pin_memory
+
+    @property
     def v_buffer(self):
         return getattr(self.anchor_entry.host_pool, "v_buffer", None)
 
