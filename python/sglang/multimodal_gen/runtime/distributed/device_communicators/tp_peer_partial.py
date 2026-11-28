@@ -49,6 +49,45 @@ def _open_peer(t: torch.Tensor, group, rank: int) -> torch.Tensor:
     return fn(*args)
 
 
+# How long a rank waits for the peer's probe write before giving up on the path.
+_PEER_SIGNAL_TIMEOUT_S = 5.0
+_PEER_SIGNAL_PROBE_VALUE = 0x5EED
+
+
+def _peer_signal_delivered(memops, group, rank: int) -> bool:
+    """Whether a stream write into the peer's memory actually lands there.
+
+    ``can_device_access_peer`` reports the capability, not delivery: on two RTX
+    PRO 6000s on different CPU sockets (``nvidia-smi topo``: SYS) it returns
+    True, yet a ``cuStreamWriteValue32`` into the peer mapping never shows up,
+    so both ranks wait on each other forever at the first denoising step. Each
+    rank writes a probe value into the other's flag and watches its own from the
+    host with a timeout; the ranks then agree, so both take the same path.
+    """
+    import time
+
+    probe = ipc_shareable_zeros(1, dtype=torch.int32)
+    peer_probe = _open_peer(probe, group, rank)
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    memops.write(stream, peer_probe, _PEER_SIGNAL_PROBE_VALUE)
+    deadline = time.monotonic() + _PEER_SIGNAL_TIMEOUT_S
+    delivered = False
+    while time.monotonic() < deadline:
+        if probe.item() == _PEER_SIGNAL_PROBE_VALUE:
+            delivered = True
+            break
+        time.sleep(0.001)
+    agreed = torch.tensor([int(delivered)], dtype=torch.int32, device="cuda")
+    dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=group)
+    # neither rank touches the probe mappings again; keep them alive until both
+    # are past the exchange
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+    del peer_probe, probe
+    return bool(agreed.item())
+
+
 class TpPeerPartials:
     def __init__(self):
         self.group = None
@@ -95,6 +134,11 @@ class TpPeerPartials:
             )
         # a kernel dereferencing the peer mapping needs explicit peer access
         ctypes.CDLL("libcudart.so").cudaDeviceEnablePeerAccess(peer_dev, 0)
+        if not _peer_signal_delivered(memops, group, self.rank):
+            raise _Unsupported(
+                "a stream write into the peer's memory never arrived (peer access "
+                "is reported but not delivered, e.g. PCIe across CPU sockets)"
+            )
         self.memops = memops
         self.flag = ipc_shareable_zeros(1, dtype=torch.int32)
         self.peer_flag = _open_peer(self.flag, group, self.rank)
