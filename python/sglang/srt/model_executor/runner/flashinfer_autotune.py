@@ -236,7 +236,7 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
         / cache_key
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    rank_key = f"rank_tp{get_parallel().tp_rank}_pp{get_parallel().pp_rank}_dp{get_parallel().dp_rank or 0}"
+    rank_key = _rank_key()
     if (
         get_exec().moe.moe_runner_backend == "flashinfer_megamoe"
         and not mr.is_draft_worker
@@ -252,6 +252,12 @@ def flashinfer_autotune_cache_path(model_runner: ModelRunner) -> Path:
     return cache_dir / f"{rank_key}.json"
 
 
+def _rank_key() -> str:
+    """This rank's place in the deployment, naming its cache file or store."""
+    parallel = get_parallel()
+    return f"rank_tp{parallel.tp_rank}_pp{parallel.pp_rank}_dp{parallel.dp_rank or 0}"
+
+
 # FlashInfer's managed store is selected only where its lifecycle was validated
 # end to end: SM90 and SM100-family GPUs.
 _MANAGED_AUTOTUNE_CACHE_SM_MAJORS = (9, 10)
@@ -265,8 +271,8 @@ def uses_flashinfer_managed_autotune_cache() -> bool:
     # MegaMoE's namespaced records need one writer per GPU file.
     if get_exec().moe.moe_runner_backend == "flashinfer_megamoe":
         return False
-    # Not yet validated across ranks; elastic EP capacity counts as ranks.
-    if get_parallel().max_world_size > 1:
+    # Multi-rank only on the layouts validated so far; elastic EP capacity counts as ranks.
+    if get_parallel().max_world_size > 1 and not _managed_cache_covers_multi_rank():
         return False
     platform = get_platform()
     return (
@@ -275,13 +281,28 @@ def uses_flashinfer_managed_autotune_cache() -> bool:
     )
 
 
+def _managed_cache_covers_multi_rank() -> bool:
+    """Fixed TP / EP on one node, with or without DP replicas. Pipeline stages, more
+    than one node, DP attention and elastic EP keep the per-rank JSON cache."""
+    parallel = get_parallel()
+    return (
+        parallel.nnodes == 1
+        and parallel.pp_size == 1
+        and not parallel.attn_dp_enabled
+        and not parallel.max_ep_size
+        and not parallel.ep_join_rank_offset
+        and get_exec().moe.elastic_ep_backend is None
+    )
+
+
 def flashinfer_managed_autotune_cache_root() -> Path:
     """Process-wide config only, so the target and draft resolve one store."""
     skip_ops = get_flashinfer_autotune_skip_ops()
     model_key = "|".join(
         [
-            # FlashInfer keys its version and the GPU below the root. No rank
-            # either, so data-parallel replicas share one store.
+            # FlashInfer keys its version and the GPU below the root. A single
+            # rank adds no rank, so data-parallel replicas share one store; each
+            # rank of a multi-rank deployment gets its own (below).
             str(get_model().model_path),
             str(get_model().dtype),
             str(get_model().quantization),
@@ -296,13 +317,18 @@ def flashinfer_managed_autotune_cache_root() -> Path:
         ]
     )
     cache_key = hashlib.sha256(model_key.encode()).hexdigest()[:16]
-    return (
+    root = (
         Path(envs.SGLANG_CACHE_DIR.get()).expanduser()
         / "flashinfer"
         / "autotune"
         / "managed"
         / cache_key
     )
+    # One writer per store, as with the per-rank JSON files: the ranks agree on
+    # every winner while tuning, and no other rank overwrites it afterwards.
+    if get_parallel().max_world_size > 1:
+        root /= _rank_key()
+    return root
 
 
 def attach_flashinfer_managed_autotune_cache(model_runner: ModelRunner) -> None:
@@ -481,20 +507,11 @@ def _drop_diverged_autotune_cache(
 
 @contextlib.contextmanager
 def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool):
-    from flashinfer import autotune_v2
-
     from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
     mr = model_runner
     if uses_flashinfer_managed_autotune_cache():
-        root = flashinfer_managed_autotune_cache_root()
-        logger.info("Running FlashInfer autotune with managed cache: %s", root)
-        # The process scope keeps the store attached for serving after warmup.
-        tuning = autotune_v2(
-            mode="tune",
-            cache_root=root,
-            skip_ops=get_flashinfer_autotune_skip_ops(),
-        )
+        tuning = _managed_cache_autotune()
     else:
         tuning = _json_cache_autotune(mr)
 
@@ -506,6 +523,32 @@ def flashinfer_autotune_context(model_runner: ModelRunner, *, run_lm_head: bool)
             yield
     torch.cuda.current_stream().wait_stream(mr.forward_stream)
     logger.info("FlashInfer autotune completed.")
+
+
+@contextlib.contextmanager
+def _managed_cache_autotune():
+    """Tune into this rank's managed store, agreeing on winners across TP.
+
+    Over the sync group FlashInfer reduces the timings and checks every cache
+    hit, so a rank whose store misses or disagrees makes the whole group
+    re-profile that entry together. The process scope keeps the store attached
+    for serving after warmup; it is not reloaded, so serving keeps the winners
+    the group agreed on.
+    """
+    from flashinfer import autotune_v2
+
+    root = flashinfer_managed_autotune_cache_root()
+    sync_group = _autotune_tactic_sync_group(get_parallel().tp_group)
+    logger.info("Running FlashInfer autotune with managed cache: %s", root)
+    with (
+        _autotune_process_group(sync_group),
+        autotune_v2(
+            mode="tune",
+            cache_root=root,
+            skip_ops=get_flashinfer_autotune_skip_ops(),
+        ),
+    ):
+        yield
 
 
 @contextlib.contextmanager
