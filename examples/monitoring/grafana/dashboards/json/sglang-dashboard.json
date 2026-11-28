@@ -105,11 +105,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang_e2e_request_latency_seconds_bucket[$__rate_interval])))\r\n",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang:e2e_request_latency_seconds_bucket[$__rate_interval])))\r\n",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
@@ -121,11 +121,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le) (rate(sglang_e2e_request_latency_seconds_bucket[$__rate_interval])))\r\n",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(sglang:e2e_request_latency_seconds_bucket[$__rate_interval])))\r\n",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -138,11 +138,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang_e2e_request_latency_seconds_bucket[$__rate_interval])))\r\n",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:e2e_request_latency_seconds_bucket[$__rate_interval])))\r\n",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -155,11 +155,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "avg(rate(sglang_e2e_request_latency_seconds_sum[$__rate_interval]) /  rate(sglang_e2e_request_latency_seconds_count[$__rate_interval]))\r\n",
+          "expr": "avg(rate(sglang:e2e_request_latency_seconds_sum[$__rate_interval]) /  rate(sglang:e2e_request_latency_seconds_count[$__rate_interval]))\r\n",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -249,11 +249,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "builder",
-          "expr": "sum(increase(sglang_e2e_request_latency_seconds_bucket{model_name=~\"$model_name\"}[$__rate_interval])) by (le)\r\n",
+          "expr": "sum(increase(sglang:e2e_request_latency_seconds_bucket{model_name=~\"$model_name\"}[$__rate_interval])) by (le)\r\n",
           "format": "heatmap",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
@@ -351,11 +351,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang_time_to_first_token_seconds_bucket[$__rate_interval])))\r\n",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))\r\n",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
@@ -367,11 +367,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.9, sum by (le) (rate(sglang_time_to_first_token_seconds_bucket[$__rate_interval])))\r\n",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))\r\n",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -384,11 +384,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang_time_to_first_token_seconds_bucket[$__rate_interval])))\r\n",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(sglang:time_to_first_token_seconds_bucket[$__rate_interval])))\r\n",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -401,11 +401,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "avg(rate(sglang_time_to_first_token_seconds_sum[$__rate_interval]) /  rate(sglang_time_to_first_token_seconds_count[$__rate_interval]))\r\n",
+          "expr": "avg(rate(sglang:time_to_first_token_seconds_sum[$__rate_interval]) /  rate(sglang:time_to_first_token_seconds_count[$__rate_interval]))\r\n",
           "fullMetaSearch": false,
           "hide": false,
           "includeNullMetadata": true,
@@ -498,12 +498,12 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "builder",
           "exemplar": false,
-          "expr": "sum by(le) (increase(sglang_time_to_first_token_seconds_bucket{model_name=~\"$model_name\"}[$__rate_interval]))",
+          "expr": "sum by(le) (increase(sglang:time_to_first_token_seconds_bucket{model_name=~\"$model_name\"}[$__rate_interval]))",
           "format": "heatmap",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
@@ -602,11 +602,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sglang_num_running_reqs",
+          "expr": "sglang:num_running_reqs",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
@@ -704,10 +704,10 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "editorMode": "code",
-          "expr": "sglang_gen_throughput",
+          "expr": "sglang:gen_throughput",
           "instant": false,
           "legendFormat": "{{instance}}",
           "range": true,
@@ -801,11 +801,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sglang_cache_hit_rate",
+          "expr": "sglang:cache_hit_rate",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
@@ -902,11 +902,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "ddyfngn31dg5cf"
+            "name": "Prometheus"
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sglang_num_queue_reqs",
+          "expr": "sglang:num_queue_reqs",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
