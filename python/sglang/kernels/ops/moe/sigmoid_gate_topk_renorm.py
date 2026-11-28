@@ -162,6 +162,7 @@ def sigmoid_gate_topk_renorm(
     (routed_weights[t,k], topk_indices[t,k] int32, shared_weights[t,s],
     packed_topk[t,k] int32); `return_packed_topk` fills the last and leaves the
     first two None, otherwise the last is None.
+    ``k`` and ``k + n_shared_experts`` must round up to the same power of two.
     """
     # Only column-stride-1 is required (the kernel reads rows via stride_lm). In
     # InklingGate the gate logits are a [t,258] slice of a padded [t,264] tensor, so
@@ -180,6 +181,13 @@ def sigmoid_gate_topk_renorm(
     N = G - n_shared_experts
     A = k + n_shared_experts
     assert bias.numel() == N and bias.stride(-1) == 1, f"{bias.shape=} expected [{N}]"
+
+    if triton.next_power_of_2(k) != triton.next_power_of_2(A):
+        raise ValueError(
+            "sigmoid_gate_topk_renorm requires k and k + n_shared_experts "
+            "to have the same next power of two: "
+            f"{k=}, {n_shared_experts=}"
+        )
 
     # The production shape uses the specialized CUDA JIT kernel.
     if (
