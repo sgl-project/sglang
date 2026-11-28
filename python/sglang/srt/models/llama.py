@@ -430,6 +430,7 @@ class LlamaModel(nn.Module):
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        decoder_layer_type: type[LlamaDecoderLayer] = LlamaDecoderLayer,
     ) -> None:
         super().__init__()
         self.config = config
@@ -454,7 +455,7 @@ class LlamaModel(nn.Module):
         )
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: LlamaDecoderLayer(
+            lambda idx, prefix: decoder_layer_type(
                 config=config,
                 quant_config=quant_config,
                 layer_id=idx,
@@ -462,7 +463,7 @@ class LlamaModel(nn.Module):
                 prefix=prefix,
             ),
             prefix="model.layers",
-            stage_facts=lambda idx: LlamaDecoderLayer.stage_facts(config, idx),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:

@@ -5,7 +5,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
-from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import (
     LlamaAttention,
@@ -136,20 +135,12 @@ class Ministral3Model(LlamaModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        # Override layer creation to use Ministral3Attention
-        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-
-        self.layers, self.start_layer, self.end_layer = make_pp_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: Ministral3DecoderLayer(
-                config=config,
-                quant_config=quant_config,
-                layer_id=idx,
-                start_layer=self.start_layer,
-                prefix=prefix,
-            ),
-            prefix="model.layers",
-            stage_facts=lambda idx: Ministral3DecoderLayer.stage_facts(config, idx),
+        # Build Ministral3 layers directly, without first allocating Llama layers.
+        super().__init__(
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            decoder_layer_type=Ministral3DecoderLayer,
         )
 
 
