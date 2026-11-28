@@ -279,6 +279,23 @@ class TestDpListenerSplit(CustomTestCase):
         )
         self.assertEqual(sub["lora_path"], ["a", "c", "e"])
 
+    def test_warmup_truncates_only_rows_longer_than_the_prefix(self):
+        rows = [[1], [2, 3], [4, 5, 6]]
+        warmed = one_batch_server._warmup_prefixes(rows, 2)
+        self.assertEqual(warmed, [[1], [2, 3], [4, 5]])
+        self.assertIs(warmed[0], rows[0])
+        self.assertIs(warmed[1], rows[1])
+        self.assertEqual(rows[2], [4, 5, 6])
+
+    def test_fixed_prompt_shares_warmup_prefixes(self):
+        prompt = [1, 2, 3, 4]
+        rows = [prompt] * 3
+        self.assertIs(one_batch_server._warmup_prefixes(rows, len(prompt)), rows)
+        warmed = one_batch_server._warmup_prefixes(rows, 2)
+        self.assertEqual(warmed, [[1, 2]] * 3)
+        self.assertTrue(all(ids is warmed[0] for ids in warmed))
+        self.assertEqual(prompt, [1, 2, 3, 4])
+
     def test_batch_spreads_over_listeners(self):
         delay = 0.5
         rank0 = self._listener(first_chunk_delay=delay, serves_metrics=True)
