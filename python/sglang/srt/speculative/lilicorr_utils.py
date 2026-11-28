@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import msgspec
 import torch
@@ -13,7 +13,14 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.models.dflash import candidate_topk
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.speculative.dflash_utils import _get_dflash_config
-from sglang.srt.speculative.dspark_components.dspark_draft import resolve_greedy_mask
+from sglang.srt.speculative.dspark_components.dspark_draft import (
+    ForceGreedy,
+    resolve_greedy_mask,
+    resolve_greedy_rows_by_slot,
+)
+
+if TYPE_CHECKING:
+    from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 
 logger = logging.getLogger(__name__)
 
@@ -247,9 +254,11 @@ class LiLiCorrDraftSampler:
         max_bs: int,
         anchor_features: int,
         sampling_enabled: bool,
+        sampling_params_table: SamplingParamsTable,
     ) -> None:
         self.head = head
         self.sampling_enabled = bool(sampling_enabled)
+        self.sampling_params_table = sampling_params_table
         self.embed_tokens = embed_tokens
         self.lm_head = lm_head
         self.block_size = int(block_size)
@@ -275,6 +284,9 @@ class LiLiCorrDraftSampler:
             assert token_table.shape[0] == embed_tokens.org_vocab_size_padded
         self.token_table = token_table
 
+        # Read from the batch's slots by the graph when sampling; greedy at
+        # temperature 1 otherwise.
+        self.force_greedy = ForceGreedy(device)
         self.temperatures = torch.ones(
             (self.max_bs,), dtype=torch.float32, device=device
         )
@@ -302,25 +314,9 @@ class LiLiCorrDraftSampler:
             self.anchor[count:].zero_()
             self.anchor_valid[count:].fill_(False)
 
-    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        if not self.sampling_enabled:
-            return
-        if sampling_info is None:
-            self.temperatures[:bs].fill_(1.0)
-            self.greedy_mask[:bs].fill_(True)
-            return
-        torch.clamp(
-            sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
-            out=self.temperatures[:bs],
-        )
-        self.greedy_mask[:bs].copy_(
-            resolve_greedy_mask(
-                bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
-            )
-        )
-
-    def __call__(self, hidden_states: torch.Tensor, input_ids=None) -> None:
+    def __call__(
+        self, hidden_states: torch.Tensor, input_ids, req_pool_indices
+    ) -> None:
         del input_ids
         bs = hidden_states.shape[0] // self.block_size
         rows = bs * self.slots
@@ -329,6 +325,14 @@ class LiLiCorrDraftSampler:
             raise RuntimeError(
                 f"LiLiCorrDraftSampler was built for max_bs={self.max_bs} but the draft "
                 f"graph replayed at bs={bs}; its static buffers are undersized."
+            )
+        if self.sampling_enabled:
+            resolve_greedy_rows_by_slot(
+                self.sampling_params_table,
+                req_pool_indices[:bs],
+                force_greedy=self.force_greedy.flag,
+                temperatures=self.temperatures[:bs],
+                greedy_mask=self.greedy_mask[:bs],
             )
         hidden_size = hidden_states.shape[-1]
         pass_hidden = hidden_states.view(bs, self.block_size, hidden_size)[:, 1:, :]
@@ -381,6 +385,7 @@ def build_lilicorr_draft_sampler(
     embed_tokens,
     lm_head,
     block_size: int,
+    sampling_params_table: SamplingParamsTable,
     sampling_enabled: bool = False,
 ) -> Optional[LiLiCorrDraftSampler]:
     def eager(reason: str) -> None:
@@ -409,6 +414,7 @@ def build_lilicorr_draft_sampler(
         max_bs=int(max_bs),
         anchor_features=int(draft_model.fc.output_size),
         sampling_enabled=sampling_enabled,
+        sampling_params_table=sampling_params_table,
     )
     logger.info(
         "LiLiCorr select folded into the draft cuda graph: max_bs=%d block_size=%d K=%d.",

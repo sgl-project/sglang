@@ -95,7 +95,8 @@ def sampling_accept_commit_lens(
         candidates=io.candidates,
         target_logits=io.logits,
         draft_block=draft_block,
-        # params.temperatures is the batch's, clamped at 1e-5 (resolve_draft_params).
+        # params.temperatures is the batch's, clamped at 1e-5
+        # (resolve_draft_params_by_slot).
         sampling_info=GraphSamplingInfo(temperatures=params.temperatures[:bs]),
         # Only steps without logit adjustments or truncated sampling reach here.
         route=VerifyRoute(adjusts_logits=False, need_truncated_sampling=False),

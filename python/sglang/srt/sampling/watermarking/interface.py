@@ -128,7 +128,7 @@ class WatermarkAdapter(Protocol):
         device: str,
     ) -> WatermarkEngine: ...
 
-    # How many int32 fields of `SamplingParamsPool` the algorithm keeps per request.
+    # How many int32 fields of `SamplingParamsTable` the algorithm keeps per request.
     NUM_POOL_FIELDS: int
 
     def pool_values(

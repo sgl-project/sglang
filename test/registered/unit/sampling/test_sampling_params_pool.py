@@ -47,9 +47,9 @@ def _req(
     )
 
 
-def _gather(pool, slots) -> SamplingRows:
+def _gather(pool, slots, penalty_status_pool=None) -> SamplingRows:
     indices = torch.tensor(slots, dtype=torch.int64)
-    return pool.gather(indices, indices)
+    return pool.gather(indices, indices, penalty_status_pool)
 
 
 def _exec(deterministic=False, watermark_algorithm=None):
@@ -109,6 +109,15 @@ class TestSamplerParams(_PoolTestCase):
         # The samplers read each field as a contiguous per-row tensor.
         for field in (params.temperatures, params.top_ps, params.top_ks, params.min_ps):
             self.assertTrue(field.is_contiguous())
+
+    def test_padding_slot_is_greedy(self):
+        """A graph's padded rows read slot 0, which drafts greedily; an unwritten
+        request slot keeps the whole vocabulary."""
+        table = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE).table
+        slots = torch.tensor([0, 1])
+
+        self.assertEqual(table.top_ks(slots).tolist(), [1, TOP_K_ALL])
+        self.assertEqual(table.temperatures(slots).tolist(), [1.0, 1.0])
 
     def test_rewritten_slot_reads_the_new_request(self):
         """A freed slot that a later admission reuses holds the new request's
@@ -199,8 +208,7 @@ class TestSeeds(_PoolTestCase):
         self.assertEqual(_gather(pool, [1]).sampling_seed.tolist(), [123])
         self.assertIsNone(_gather(pool, [2]).sampling_seed)
         self.assertIsNone(_gather(pool, []).sampling_seed)
-        # The algorithm is fixed per server; a new pool, so no cached gather
-        # outlives the change.
+        # The algorithm is fixed per server, so a server under it builds a new pool.
         self.spec_ns.speculative_algorithm = "EAGLE"
         pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write([_req(1, seed=123, top_k=50)])
@@ -241,21 +249,19 @@ class TestPenaltyIndices(_PoolTestCase):
         """The gather gives StepPenalties the penalized rows in batch order and
         their indices, from the gathered field alone."""
         penalty_pool = SimpleNamespace(kinds=[1, 0, 0, 4])
-        pool = SamplingParamsPool(
-            num_rows=NUM_ROWS, device=DEVICE, penalty_status_pool=penalty_pool
-        )
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write(
             [_req(1), _req(2, penalty_index=3), _req(4), _req(5, penalty_index=0)]
         )
 
-        step = _gather(pool, [1, 2, 4, 5]).step_penalties
+        step = _gather(pool, [1, 2, 4, 5], penalty_pool).step_penalties
 
         self.assertEqual(step.batch_size, 4)
         self.assertEqual(step.batch_indices.tolist(), [1, 3])
         self.assertEqual(step.penalty_indices.tolist(), [3, 0])
         self.assertEqual(step.penalty_indices.dtype, torch.int64)
         self.assertEqual(step.kinds, 5)
-        self.assertIsNone(_gather(pool, [1, 4]).step_penalties)
+        self.assertIsNone(_gather(pool, [1, 4], penalty_pool).step_penalties)
 
     def test_set_rows_reads_the_step_penalties_from_the_pool(self):
         penalty_pool = PenaltyStatusPool(vocab_size=8, device=DEVICE)
@@ -265,38 +271,18 @@ class TestPenaltyIndices(_PoolTestCase):
         req.sampling_params.repetition_penalty = 1.0
         req.sampling_params.min_new_tokens = 0
         penalty_pool.alloc([req])
-        pool = SamplingParamsPool(
-            num_rows=NUM_ROWS, device=DEVICE, penalty_status_pool=penalty_pool
-        )
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write([req, _req(3)])
         info = SamplingBatchInfo(vocab_size=8, device=DEVICE)
 
-        info.set_rows(_gather(pool, [3, 2]))
+        info.set_rows(_gather(pool, [3, 2], penalty_pool))
 
         self.assertEqual(info.step_penalties.batch_indices.tolist(), [1])
         self.assertEqual(info.step_penalties.penalty_indices.tolist(), [0])
 
-    def test_unchanged_batch_reuses_its_params_until_a_write(self):
-        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
-        pool.write([_req(1, temperature=0.7), _req(4, top_k=1)])
-
-        first = _gather(pool, [1, 4])
-        again = _gather(pool, [1, 4])
-        self.assertIs(again.temperatures, first.temperatures)
-        self.assertIs(again.top_ks, first.top_ks)
-        self.assertIsNot(_gather(pool, [4, 1]).temperatures, first.temperatures)
-
-        after_slot_change = _gather(pool, [1, 4])
-        self.assertIsNot(after_slot_change.temperatures, first.temperatures)
-        pool.write([_req(4, temperature=1.2)])
-        params = _gather(pool, [1, 4])
-        self.assertIsNot(params.temperatures, after_slot_change.temperatures)
-        self.assertAlmostEqual(params.temperatures[1].item(), 1.2, places=6)
-        self.assertFalse(params.is_any_greedy)
-
     def test_unchanged_batch_takes_each_steps_penalties(self):
-        """A reused gather still builds the step's penalties from the counts the
-        previous step committed."""
+        """A gather over the same slots builds the step's penalties from the counts
+        the previous step committed."""
         penalty_pool = PenaltyStatusPool(vocab_size=8, device=DEVICE)
         req = _req(2)
         req.output_ids = []
@@ -306,18 +292,15 @@ class TestPenaltyIndices(_PoolTestCase):
         req.sampling_params.min_new_tokens = 0
         penalty_pool.alloc([req])
         penalty_pool.reset_history([req])
-        pool = SamplingParamsPool(
-            num_rows=NUM_ROWS, device=DEVICE, penalty_status_pool=penalty_pool
-        )
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write([_req(3), req])
 
-        first = _gather(pool, [3, 2])
+        first = _gather(pool, [3, 2], penalty_pool)
         additive, _ = first.step_penalties.logit_penalties()
         self.assertEqual(additive[1].tolist(), [0.0] * 8)
         first.step_penalties.commit(torch.tensor([0, 5]))
 
-        second = _gather(pool, [3, 2])
-        self.assertIs(second.temperatures, first.temperatures)
+        second = _gather(pool, [3, 2], penalty_pool)
         additive, _ = second.step_penalties.logit_penalties()
         self.assertEqual(additive[1, 5].item(), -0.5)
         self.assertEqual(additive[0].tolist(), [0.0] * 8)
@@ -327,17 +310,13 @@ class TestSlotLifecycle(_PoolTestCase):
     def test_readmission_after_retraction_keeps_the_penalty_index(self):
         """A retraction frees the slot and keeps the penalty index; the
         re-admission writes both to the request's new slot."""
-        pool = SamplingParamsPool(
-            num_rows=NUM_ROWS,
-            device=DEVICE,
-            penalty_status_pool=SimpleNamespace(kinds=[0, 0, 1]),
-        )
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         req = _req(1, seed=7, top_k=20, penalty_index=2)
         pool.write([req])
         req.kv.req_pool_idx = 6
         pool.write([req])
 
-        rows = _gather(pool, [6])
+        rows = _gather(pool, [6], SimpleNamespace(kinds=[0, 0, 1]))
 
         self.assertEqual(rows.step_penalties.penalty_indices.tolist(), [2])
         self.assertEqual(rows.sampling_seed.tolist(), [7])
@@ -347,21 +326,17 @@ class TestSlotLifecycle(_PoolTestCase):
         """A finished request leaves its entry behind; the next admission to the
         slot overwrites every field, host copies included."""
         self.exec_ns = _exec(watermark_algorithm="synthid")
-        pool = SamplingParamsPool(
-            num_rows=NUM_ROWS,
-            device=DEVICE,
-            penalty_status_pool=SimpleNamespace(kinds=[0, 1]),
-        )
+        pool = SamplingParamsPool(num_rows=NUM_ROWS, device=DEVICE)
         pool.write([_req(3, seed=5, top_k=50, penalty_index=1)])
         pool.write([_req(3, top_k=1, filler_seed=11)])
 
-        rows = _gather(pool, [3])
+        rows = _gather(pool, [3], SimpleNamespace(kinds=[0, 1]))
 
         self.assertIsNone(rows.step_penalties)
         self.assertIsNone(rows.sampling_seed)
         self.assertIsNone(rows.watermark)
-        self.assertEqual(pool.table[pool.PENALTY_INDEX, 3].item(), -1)
-        self.assertEqual(pool.table[pool.WATERMARK, 3].item(), 0)
+        self.assertEqual(pool.table.values[pool.table.PENALTY_INDEX, 3].item(), -1)
+        self.assertEqual(pool.table.values[pool.table.WATERMARK, 3].item(), 0)
 
 
 class TestWatermarkFields(_PoolTestCase):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -19,8 +19,9 @@ from sglang.srt.speculative.dspark_components.dspark_block_accept_estimator impo
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftNoise,
     DraftParams,
+    ForceGreedy,
     draft_markov_block,
-    resolve_draft_params,
+    resolve_draft_params_by_slot,
     select_draft_hidden_without_anchor,
     step_logits_width,
 )
@@ -29,6 +30,9 @@ from sglang.srt.speculative.online_acceptance_estimator import (
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.utils import is_xpu
+
+if TYPE_CHECKING:
+    from sglang.srt.sampling.sampling_params_pool import SamplingParamsTable
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +54,7 @@ class DsparkDraftSampler:
         noise: DraftNoise,
         tp_sync: SpecTpSync,
         greedy_draft: bool,
+        sampling_params_table: SamplingParamsTable,
         sharded_accept: bool = False,
         out=None,
         acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
@@ -100,7 +105,9 @@ class DsparkDraftSampler:
         self.sharded_accept = sharded_accept
         self._noise = noise
         self._tp_sync = tp_sync
-        # Staged before each replay.
+        self.sampling_params_table = sampling_params_table
+        self.force_greedy = ForceGreedy(device)
+        # Written by the graph from the batch's slots; the proposer reads them after.
         self.params = DraftParams(
             temperatures=torch.ones((self.max_bs,), dtype=torch.float32, device=device),
             greedy_mask=torch.ones((self.max_bs,), dtype=torch.bool, device=device),
@@ -134,8 +141,6 @@ class DsparkDraftSampler:
         self._draft_strategy = bound_strategy.strategy
         self.step_logits = bound_strategy.step_logits
         self._markov_walker = markov_walker
-        # With the int8 walker: step temperatures are 0 from this row on.
-        self._staged_bs = 0
         if markov_walker is not None:
             self._init_markov_walker(markov_walker)
 
@@ -173,18 +178,14 @@ class DsparkDraftSampler:
             )
         return self.step_logits
 
-    def stage_sampling_params(self, *, bs: int, sampling_info) -> None:
-        """Must run before the draft graph replay that reads these buffers."""
-        resolve_draft_params(sampling_info=sampling_info, bs=bs, out=self.params)
-        if self._markov_walker is not None:
-            # The graph walks the padded bucket but staging writes [:bs]; the int8
-            # kernel would sample a stale T > 0 padding row for nothing.
-            if self._staged_bs > bs:
-                self.params.step_temperatures[bs : self._staged_bs].zero_()
-            self._staged_bs = bs
-
-    def __call__(self, hidden_states, input_ids):
+    def __call__(self, hidden_states, input_ids, req_pool_indices):
         bs = hidden_states.shape[0] // self.query_token_num
+        resolve_draft_params_by_slot(
+            self.sampling_params_table,
+            req_pool_indices[:bs],
+            force_greedy=self.force_greedy.flag,
+            out=self.params,
+        )
         if self.sample_from_anchor:
             model_hidden = hidden_states
             sample_hidden = hidden_states.view(bs, self.gamma, -1)
@@ -275,6 +276,7 @@ def maybe_build_draft_sampler(
     noise: DraftNoise,
     greedy_draft: bool,
     tp_sync: SpecTpSync,
+    sampling_params_table: SamplingParamsTable,
     sharded_accept: bool = False,
     out=None,
     acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
@@ -311,6 +313,7 @@ def maybe_build_draft_sampler(
         noise=noise,
         tp_sync=tp_sync,
         greedy_draft=greedy_draft,
+        sampling_params_table=sampling_params_table,
         sharded_accept=sharded_accept,
         out=out,
         acceptance_estimator=acceptance_estimator,

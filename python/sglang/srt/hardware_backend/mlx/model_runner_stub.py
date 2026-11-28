@@ -332,6 +332,7 @@ class MlxModelRunnerStub(ModelRunner):
         self.attn_backend = None
 
         self.init_ngram_embedding_manager()
+        self.maybe_init_sampling_params_pool()
 
         logger.info(
             f"MLX stub: initialized minimal pools "

@@ -11,10 +11,17 @@ from sglang.srt.models.dspark import (
     RNNHead,
     VanillaMarkov,
 )
+from sglang.srt.sampling import sampling_params_pool as sp_pool
+from sglang.srt.sampling.sampling_params_pool import (
+    SamplingParamsPool,
+    SamplingParamsTable,
+)
 from sglang.srt.speculative.dspark_components import dspark_draft_sampler as ds
 from sglang.srt.speculative.dspark_components.dspark_draft import (
-    DraftBlockProposer,
     DraftNoise,
+    DraftParams,
+    ForceGreedy,
+    resolve_draft_params_by_slot,
     sample_draft_block,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -23,6 +30,8 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 VOCAB, RANK, HIDDEN, BS, GAMMA = 211, 8, 16, 4, 5
+# The draft batch's slots: each row reads the padding slot's greedy entry.
+SLOTS = torch.zeros(BS, dtype=torch.int64)
 
 
 def _draft(head, sampling_info, offset, greedy_draft=False):
@@ -180,6 +189,11 @@ def _folded_draft_model():
     return model
 
 
+def _table(num_rows, device) -> SamplingParamsTable:
+    with patch.object(sp_pool, "num_watermark_fields", return_value=0):
+        return SamplingParamsTable(num_rows, device)
+
+
 def _build(model, *, greedy_draft, factory=None, agree=None):
     """maybe_build_draft_sampler, with factory as the megakernel's draft sampler."""
     with (
@@ -196,6 +210,7 @@ def _build(model, *, greedy_draft, factory=None, agree=None):
             noise=DraftNoise(key=3, offset=torch.zeros(1, dtype=torch.int64)),
             greedy_draft=greedy_draft,
             tp_sync="sync",
+            sampling_params_table=_table(2 * BS + 1, "cpu"),
         )
 
 
@@ -211,7 +226,7 @@ class TestMegakernelDraftSampler(CustomTestCase):
         agree, model = Mock(), _folded_draft_model()
         with patch.object(ds, "draft_markov_block", side_effect=AssertionError):
             sampler = _build(model, greedy_draft=False, factory=factory, agree=agree)
-            sampler(hidden, input_ids)
+            sampler(hidden, input_ids, SLOTS)
         agree.assert_called_once_with(
             (BS,), what="draft sampler batch sizes", group="draft tp group"
         )
@@ -231,7 +246,7 @@ class TestMegakernelDraftSampler(CustomTestCase):
             sampler = _build(
                 _folded_draft_model(), greedy_draft=False, factory=declined
             )
-            sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids)
+            sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids, SLOTS)
         stock.assert_called_once()
         self.assertTrue(sampler.out[: BS * GAMMA].eq(7).all())
 
@@ -242,48 +257,79 @@ class TestMegakernelDraftSampler(CustomTestCase):
             ds, "draft_markov_block", return_value=(tokens, None)
         ) as stock:
             sampler = _build(_folded_draft_model(), greedy_draft=True)
-            sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids)
+            sampler(torch.ones(BS * GAMMA, HIDDEN), input_ids, SLOTS)
         stock.assert_called_once()
         self.assertTrue(sampler.out[: BS * GAMMA].eq(11).all())
 
 
-class TestDraftParamsRestage(CustomTestCase):
-    def test_the_draft_params_are_restaged_only_when_their_inputs_change(self):
-        """The draft graph's sampling params are copied from the batch's temperature /
-        top-k tensors; a step whose sampler, bs and tensors are the ones last staged
-        skips the copy, and any change (a rebound tensor after filter / merge, a new
-        bs, another sampler) restages."""
-
-        proposer = SimpleNamespace(
-            _staged_params_key=None,
-            num_staged_params_skips=0,
-            num_staged_params_calls=0,
+def _admit(pool, slot, *, temperature, top_k):
+    with patch.object(sp_pool, "_deterministic", return_value=False):
+        pool.write(
+            [
+                SimpleNamespace(
+                    kv=SimpleNamespace(req_pool_idx=slot),
+                    sampling_params=SimpleNamespace(
+                        temperature=temperature,
+                        top_p=1.0,
+                        top_k=top_k,
+                        min_p=0.0,
+                        sampling_seed=None,
+                    ),
+                    filler_seed=0,
+                    penalty_index=None,
+                )
+            ]
         )
-        staged = []
-        sampler = SimpleNamespace(
-            stage_sampling_params=lambda **kw: staged.append(
-                (kw["bs"], kw["sampling_info"])
-            )
+
+
+class TestDraftParamsBySlot(CustomTestCase):
+    def test_a_replay_reads_a_reused_slots_new_params(self):
+        """The draft graph reads its rows' params by slot on each replay: a new
+        request admitted into a reused slot, with the same batch shape, drafts with
+        its own params, and the greedy switch overrides every row."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        with patch.object(sp_pool, "num_watermark_fields", return_value=0):
+            pool = SamplingParamsPool(num_rows=4, device=device)
+        table = pool.table
+        _admit(pool, 1, temperature=0.7, top_k=50)
+        _admit(pool, 2, temperature=0.5, top_k=1)
+        slots = torch.tensor([1, 2], dtype=torch.int64, device=device)
+        force_greedy = ForceGreedy(device)
+        params = DraftParams(
+            temperatures=torch.zeros(4, device=device),
+            greedy_mask=torch.zeros(4, dtype=torch.bool, device=device),
+            step_temperatures=torch.zeros(4, device=device),
         )
-        info = SimpleNamespace(temperatures=torch.ones(4), top_ks=torch.ones(4))
 
-        def stage(sampler, bs, sampling_info):
-            DraftBlockProposer._stage_sampling_params(
-                proposer, sampler, bs=bs, sampling_info=sampling_info
+        def resolve():
+            resolve_draft_params_by_slot(
+                table, slots, force_greedy=force_greedy.flag, out=params
             )
 
-        stage(sampler, 4, info)
-        stage(sampler, 4, info)  # unchanged: skipped
-        info.temperatures = info.temperatures[:3]  # rebound, as filter_batch does
-        stage(sampler, 3, info)
-        stage(sampler, 2, info)  # another bs
-        other = SimpleNamespace(stage_sampling_params=sampler.stage_sampling_params)
-        stage(other, 2, info)  # another sampler
-        stage(other, 2, None)
-        stage(other, 2, None)  # no sampling info twice: skipped
-        self.assertEqual([bs for bs, _ in staged], [4, 3, 2, 2, 2])
-        self.assertEqual(proposer.num_staged_params_skips, 2)
-        self.assertEqual(proposer.num_staged_params_calls, 7)
+        replay = resolve
+        if device == "cuda":
+            resolve()  # warm up outside the capture
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                resolve()
+            replay = graph.replay
+
+        def drafted():
+            replay()
+            return [buf[:2].tolist() for buf in params]
+
+        def f32(x):
+            return torch.tensor(x, dtype=torch.float32).item()
+
+        self.assertEqual(drafted(), [[f32(0.7), 0.5], [False, True], [f32(0.7), 0.0]])
+        # Slot 1's request retires; a greedy one is admitted into it.
+        _admit(pool, 1, temperature=0.3, top_k=1)
+        self.assertEqual(drafted(), [[f32(0.3), 0.5], [True, True], [0.0, 0.0]])
+        _admit(pool, 1, temperature=0.9, top_k=20)
+        force_greedy.set(True)
+        self.assertEqual(drafted(), [[1.0, 1.0], [True, True], [0.0, 0.0]])
+        force_greedy.set(False)
+        self.assertEqual(drafted(), [[f32(0.9), 0.5], [False, True], [f32(0.9), 0.0]])
 
 
 if __name__ == "__main__":

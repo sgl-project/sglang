@@ -749,7 +749,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                     self._draft_sampler = self._maybe_build_draft_sampler()
                     if self._draft_sampler is not None:
                         self.draft_model_runner.capture_tail_hooks.append(
-                            make_draft_sampler_capture_hook(self._draft_sampler)
+                            make_draft_sampler_capture_hook(
+                                self._draft_sampler, reads_slots=True
+                            )
                         )
                 self._proposer.attach_draft_sampler(self._draft_sampler)
             deferred_draft_kv = self._deferred_draft_kv
@@ -771,6 +773,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             noise=self._proposer.noise,
             greedy_draft=self._greedy_draft,
             tp_sync=self._tp_sync,
+            sampling_params_table=(
+                self.target_worker.model_runner.sampling_params_pool.table
+            ),
             sharded_accept=self._sharded_accept,
             out=(
                 self._verify_epilogue.draft_tokens_buf

@@ -1,5 +1,6 @@
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -14,6 +15,13 @@ from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=42, suite="base-a-test-cpu")
+
+
+def _sampling_params_table(num_rows, device):
+    from sglang.srt.sampling import sampling_params_pool as sp_pool
+
+    with patch.object(sp_pool, "num_watermark_fields", return_value=0):
+        return sp_pool.SamplingParamsTable(num_rows, device)
 
 
 @pytest.mark.parametrize("fields", [{}, {"shift_label": False}, {"shift_label": True}])
@@ -98,8 +106,10 @@ def test_selector_prediction_rows_follow_shift_label(path, shift_label, position
             max_bs=2,
             device="cpu",
             sampling_enabled=False,
+            sampling_params_table=_sampling_params_table(2, "cpu"),
         )
-        sampler(hidden.view(-1, 2), block_ids.flatten())
+        slots = torch.arange(2)
+        sampler(hidden.view(-1, 2), block_ids.flatten(), slots)
         tokens = sampler.out.view(2, 3)
 
     expected = hidden[:, positions]
@@ -127,16 +137,18 @@ def test_selector_prediction_rows_in_cuda_graph(shift_label, positions):
         max_bs=2,
         device="cuda",
         sampling_enabled=False,
+        sampling_params_table=_sampling_params_table(2, "cuda"),
     )
+    slots = torch.arange(2, device="cuda")
     warmup = torch.cuda.Stream()
     warmup.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup):
         for _ in range(3):
-            sampler(hidden.view(-1, 2), block_ids.flatten())
+            sampler(hidden.view(-1, 2), block_ids.flatten(), slots)
     torch.cuda.current_stream().wait_stream(warmup)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        sampler(hidden.view(-1, 2), block_ids.flatten())
+        sampler(hidden.view(-1, 2), block_ids.flatten(), slots)
 
     # Replay must read fresh rows and anchors, not warmup/capture values.
     hidden.add_(100)
@@ -449,7 +461,10 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         _acceptance_estimator=None,
         _runtime=None,
         _target_worker=SimpleNamespace(
-            model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
+            model_runner=SimpleNamespace(
+                model=SimpleNamespace(lm_head=quant_head),
+                sampling_params_pool=SimpleNamespace(table=object()),
+            )
         ),
     )
 
@@ -468,6 +483,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
 
 
 def test_disabled_selector_sampling_forces_greedy_draft():
+    from sglang.srt.sampling import sampling_params_pool as sp_pool
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     sampling_info = SimpleNamespace(
@@ -475,19 +491,6 @@ def test_disabled_selector_sampling_forces_greedy_draft():
         top_ks=torch.tensor([[8]]),
         is_all_greedy=False,
     )
-
-    sampler = worker_mod._SelectorDraftSampler.__new__(worker_mod._SelectorDraftSampler)
-    sampler.temperatures = torch.zeros(1)
-    sampler.greedy_mask = torch.zeros(1, dtype=torch.bool)
-    sampler.sampling_enabled = False
-    sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
-    torch.testing.assert_close(sampler.temperatures, torch.ones(1))
-    assert sampler.greedy_mask.tolist() == [True]
-
-    sampler.sampling_enabled = True
-    sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
-    torch.testing.assert_close(sampler.temperatures, torch.tensor([0.7]))
-    assert sampler.greedy_mask.tolist() == [False]
     observed = {}
 
     def sample_path(**kwargs):
@@ -495,6 +498,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
         return torch.zeros((1, 1), dtype=torch.int64), torch.zeros((1, 1, 2))
 
     selector = SimpleNamespace(
+        top_k=2,
         build_lattice=lambda **kwargs: torch.zeros((1, 1, 2, 2)),
         sample_path=sample_path,
     )
@@ -516,6 +520,39 @@ def test_disabled_selector_sampling_forces_greedy_draft():
         _acceptance_estimator=None,
     )
     draft_logits_output = SimpleNamespace(hidden_states=torch.zeros((2, 4)))
+
+    # The graph-folded sampler reads the request's slot of the sampling table.
+    with patch.object(sp_pool, "num_watermark_fields", return_value=0):
+        table = sp_pool.SamplingParamsTable(4, "cpu")
+    slot = 2
+    table.values.view(torch.float32)[table.TEMPERATURE, slot] = 0.7
+    table.values[table.TOP_K, slot] = 8
+    sampler = worker_mod._SelectorDraftSampler(
+        draft_model=draft_model,
+        block_size=2,
+        max_bs=1,
+        device="cpu",
+        sampling_enabled=False,
+        sampling_params_table=table,
+    )
+
+    def run_sampler():
+        observed.clear()
+        sampler(
+            draft_logits_output.hidden_states,
+            torch.zeros(2, dtype=torch.int64),
+            torch.tensor([slot]),
+        )
+        return observed["temperatures"].tolist(), observed["greedy_mask"].tolist()
+
+    assert run_sampler() == ([1.0], [True])
+    sampler.sampling_enabled = True
+    temperatures, greedy_mask = run_sampler()
+    assert greedy_mask == [False]
+    torch.testing.assert_close(torch.tensor(temperatures), torch.tensor([0.7]))
+    # No sampling info: every row drafts greedily at temperature 1.
+    sampler.force_greedy.set(True)
+    assert run_sampler() == ([1.0], [True])
 
     worker_mod.DFlashWorkerV2._propose_selector_block(
         worker,

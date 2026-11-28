@@ -254,6 +254,7 @@ from sglang.srt.runtime_context import (
     set_global_dwdp_manager,
 )
 from sglang.srt.sampling.sampling_observer import SamplingObserver
+from sglang.srt.sampling.sampling_params_pool import SamplingParamsPool
 from sglang.srt.sampling.sampling_pipeline import SamplingPipeline
 from sglang.srt.sampling.watermarking.interface import WatermarkEngine
 from sglang.srt.sampling.watermarking.runtime import make_watermark_engine
@@ -746,6 +747,18 @@ class ModelRunner:
             sampler=self.sampler, watermark=self.watermark
         )
 
+    def maybe_init_sampling_params_pool(self):
+        # Before graph capture, so draft graphs can read its table; a draft runner
+        # reads the target runner's.
+        self.sampling_params_pool = (
+            SamplingParamsPool(
+                num_rows=self.req_to_token_pool.req_to_token.shape[0],
+                device=self.req_to_token_pool.device,
+            )
+            if not self.is_draft_worker
+            else None
+        )
+
     def init_kv_cache_configurator(
         self, draft_parallel_layout: DraftParallelLayout | None = None
     ):
@@ -1142,6 +1155,7 @@ class ModelRunner:
         self.init_ngram_embedding_manager()
         self.maybe_init_watermark()
         self.init_sampling_pipeline()
+        self.maybe_init_sampling_params_pool()
 
         self.maybe_init_hisparse_coordinator()
 
