@@ -324,6 +324,44 @@ def tiny_decoder():
     return NomasPixelUMMDecoder(NomasVAEConfig(arch_config=arch)).eval()
 
 
+@pytest.mark.parametrize("offload", [False, True])
+def test_pixelumm_decode_under_offload_execution_context(offload):
+    from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
+        PipelineExecutor,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages import (
+        NomasDecodingStage,
+    )
+    from sglang.multimodal_gen.runtime.server_args import set_global_server_args
+
+    args = SimpleNamespace(
+        pipeline_config=NomasPipelineConfig(vae_precision="fp32"),
+        component_precisions={},
+        disable_autocast=True,
+        enable_torch_compile=False,
+        use_fsdp_inference=False,
+        should_cpu_offload_component=lambda name: offload and name == "vae",
+    )
+    set_global_server_args(args)
+    decoder = tiny_decoder()
+    stage = NomasDecodingStage(decoder)
+    latent = torch.randn(1, 32, 2, 2, 2)
+    raw = decoder.decode(latent).sample
+    assert raw.is_inference()
+    expected = (raw / 2 + 0.5).clamp(0, 1)
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.decoding.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ),
+        torch.inference_mode(),
+        PipelineExecutor._stage_execution_context(stage, args),
+    ):
+        assert torch.is_inference_mode_enabled() is not offload
+        pixels = stage.decode(latent, args, vae_dtype=torch.float32)
+    torch.testing.assert_close(pixels, expected, atol=0, rtol=0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA fusion")
 @pytest.mark.parametrize("tokens", [1280, 26400])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])

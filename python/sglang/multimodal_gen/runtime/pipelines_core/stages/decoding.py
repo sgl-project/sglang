@@ -6,6 +6,7 @@ Decoding stage for diffusion pipelines.
 """
 
 import weakref
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -119,7 +120,11 @@ def _ensure_tensor_decode_output(decode_output):
 
 def _to_unit_range(image: torch.Tensor, *, in_place: bool = False) -> torch.Tensor:
     if in_place:
-        return image.div_(2).add_(0.5).clamp_(0, 1)
+        # A VAE can return inference tensors even when offload hooks require
+        # the surrounding stage to run with inference mode disabled.
+        context = torch.inference_mode() if image.is_inference() else nullcontext()
+        with context:
+            return image.div_(2).add_(0.5).clamp_(0, 1)
     return (image / 2 + 0.5).clamp(0, 1)
 
 
