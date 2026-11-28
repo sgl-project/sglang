@@ -224,8 +224,6 @@ class TestChunkedPrefillStaysOnTheChunkGrid(unittest.TestCase):
         self.assertEqual(scheduler.truncation_align_size, 192)
 
     def test_deterministic_inference_cuts_mamba_prefill_on_the_chunk_grid(self):
-        # The kernel chunks each extend from its start, so a cut off the grid
-        # puts the prompt in different kernel chunks than a whole prefill.
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         tree = create_autospec(UnifiedRadixCache, instance=True)

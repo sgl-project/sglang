@@ -1059,10 +1059,9 @@ def mamba_prefill_chunk_grid(tree_cache: Optional[BasePrefixCache] = None) -> in
 
 
 def deterministic_cuts_on_grid(tree_cache: Optional[BasePrefixCache]) -> bool:
-    """Whether deterministic inference keeps every prefill cut on the mamba
-    kernel chunk grid, never below it. The linear-attention kernel chunks each
-    extend from its start, so a prompt cut off the grid falls into different
-    kernel chunks than the same prompt prefilled whole."""
+    """Whether deterministic inference keeps prefill cuts on the mamba kernel
+    chunk grid: the kernel chunks each extend from its start, so an off-grid
+    cut changes the result."""
     return bool(
         tree_cache is not None
         and get_context().is_config_namespace_published("exec")
@@ -1112,8 +1111,6 @@ class PrefillAdder:
     ):
         self.page_size = page_size
         self.mamba_chunk_grid = mamba_prefill_chunk_grid(tree_cache)
-        # Windows retire only behind checkpoints: a continuation waiting below
-        # the grid would free nothing and starve (`grid_continuation_limit`).
         self.windows_retire_behind_checkpoints = windows_retire_behind_checkpoints(
             tree_cache
         )
@@ -1373,9 +1370,8 @@ class PrefillAdder:
             return trunc_len
         floored = trunc_len // self.mamba_chunk_grid * self.mamba_chunk_grid
         if self.strict_chunk_grid:
-            # Below the grid the request waits. `_add_chunked_req` keeps a
-            # continuation's `chunked_req_limit` at one unit or more, and its
-            # memory bound too only where windows retire.
+            # A continuation still gets one unit: see `_add_chunked_req` and
+            # `grid_continuation_limit`.
             return floored
         return floored or trunc_len
 
@@ -2065,7 +2061,6 @@ class PrefillAdder:
             # Chunked prefill
             trunc_len = self.floor_chunked_tokens(chunk_limit, cand_extend_input_len)
             if trunc_len <= 0:
-                # Below the strict grid: wait rather than run an empty chunk.
                 return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:

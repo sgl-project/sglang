@@ -1793,9 +1793,6 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.can_run_list, [])
 
     def test_a_deterministic_continuation_keeps_one_grid_unit(self):
-        """A cut below the strict grid waits, so room kept for shorter
-        requests must not shrink a continuation below one grid unit, or it
-        would wait for as long as that room is kept."""
         self.mock_token_allocator.available_size.return_value = 32768
         self.mock_tree_cache.supports_mamba.return_value = True
         req = self.create_mock_req("continuing", priority=0, max_new_tokens=1)
