@@ -1650,7 +1650,8 @@ class CosmosDreamsRolloutStage(PipelineStage):
             else SelectedKVHistory(
                 history,
                 context.text_kv,
-                selected_tokens=selector.budget * context.tokens_per_frame,
+                selected_tokens=min(selector.budget, max(0, target_frame - 1))
+                * context.tokens_per_frame,
                 chunk_tokens=manifest.chunk_size * context.tokens_per_frame,
             )
         )

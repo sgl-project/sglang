@@ -280,12 +280,22 @@ class TestSelectedHistory(unittest.TestCase):
             history.commit(tokens)
             return read
 
-        for frame in range(6):
+        for frame in range(5):
             write(archive, frame)
         view = SelectedKVHistory(
-            archive, text_kv, selected_tokens=3 * tokens, chunk_tokens=2 * tokens
+            archive, text_kv, selected_tokens=5 * tokens, chunk_tokens=2 * tokens
         )
+        # Selecting every committed frame reads and commits to the archive itself.
+        self.assertIsNone(view._read)
+        view.select(range(5), tokens_per_frame=tokens)
+        self.assertIsNone(view._read)
+        self.assertEqual(
+            view.slots(tokens)[0].keys.data_ptr(),
+            archive.slots(tokens)[0].keys.data_ptr(),
+        )
+        write(view, 5)
         view.select([0, 3, 5], tokens_per_frame=tokens)
+        self.assertIsNotNone(view._read)
         # Two refreshes of one chunk: the second also reads the first's frame.
         selected = [100.0] * 3 + [103.0] * 3 + [105.0] * 3
         self.assertEqual(write(view, 6), [-1.0] * 2 + selected + [106.0] * 3)

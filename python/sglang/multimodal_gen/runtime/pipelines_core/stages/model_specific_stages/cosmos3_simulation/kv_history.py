@@ -185,8 +185,9 @@ class CosmosDreamsKVHistory:
 class SelectedKVHistory:
     """``[text | selected archive frames | current chunk]`` buffers for frustum retrieval.
 
-    ``select`` gathers the chosen frames once per chunk, and ``commit`` also
-    appends the chunk to the archive so later chunks can retrieve it.
+    ``select`` reads directly from the archive while every committed frame is
+    selected, allocates the gather buffer lazily at the first partial selection,
+    and ``commit`` appends the chunk to the archive so later chunks can retrieve it.
     """
 
     def __init__(
@@ -198,9 +199,10 @@ class SelectedKVHistory:
         chunk_tokens: int,
     ) -> None:
         self._archive = archive
-        self._read = CosmosDreamsKVHistory(
-            text_kv, sink_tokens=0, live_tokens=selected_tokens + chunk_tokens
-        )
+        self._text_kv = text_kv
+        self._read_tokens = selected_tokens + chunk_tokens
+        self._read: CosmosDreamsKVHistory | None = None
+        self._reader: CosmosDreamsKVHistory = archive
 
     def select(
         self, frame_ids: Sequence[int], *, tokens_per_frame: int
@@ -214,7 +216,14 @@ class SelectedKVHistory:
                 f"Selected frames must be ordered unique committed frames, got {ids} "
                 f"with {stored} committed."
             )
-        read = self._read
+        if len(ids) == stored:
+            self._reader = self._archive
+            return self
+        if self._read is None:
+            self._read = CosmosDreamsKVHistory(
+                self._text_kv, sink_tokens=0, live_tokens=self._read_tokens
+            )
+        read = self._reader = self._read
         read.clear()
         if not ids:
             return self
@@ -237,16 +246,19 @@ class SelectedKVHistory:
         return self
 
     def slots(self, chunk_tokens: int) -> list[CosmosDreamsKVSlot]:
-        return self._read.slots(chunk_tokens)
+        return self._reader.slots(chunk_tokens)
 
     def commit(self, chunk_tokens: int, *, tail_tokens: int | None = None) -> None:
-        written = self._read.slots(chunk_tokens)
+        if self._reader is self._archive:
+            self._archive.commit(chunk_tokens, tail_tokens=tail_tokens)
+            return
+        written = self._reader.slots(chunk_tokens)
         for source, target in zip(
             written, self._archive.slots(chunk_tokens), strict=True
         ):
             target.chunk_kv.copy_(source.chunk_kv)
         self._archive.commit(chunk_tokens, tail_tokens=tail_tokens)
-        self._read.commit(chunk_tokens)
+        self._reader.commit(chunk_tokens)
 
 
 def new_kv_history(
