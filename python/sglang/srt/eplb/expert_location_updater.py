@@ -229,6 +229,20 @@ def _int64_view(t: torch.Tensor) -> Optional[torch.Tensor]:
     return t.view(torch.int64)
 
 
+_P2P_DTYPES = {
+    1: torch.uint8,
+    2: torch.float16,
+    4: torch.int32,
+    8: torch.int64,
+}
+
+
+def _p2p_tensor_view(tensor: torch.Tensor) -> torch.Tensor:
+    # P2P moves bit patterns, not values. Use equally sized NCCL-supported
+    # dtypes; NCCL has no 16-bit integer type, so two-byte tensors use FP16.
+    return tensor.view(_P2P_DTYPES[tensor.element_size()])
+
+
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
@@ -420,7 +434,9 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.irecv,
-                        tensor=_get_tensor(temp_buffers, i, dst_expert_location),
+                        tensor=_p2p_tensor_view(
+                            _get_tensor(temp_buffers, i, dst_expert_location)
+                        ),
                         peer=src_rank,
                         group=group,
                     )
@@ -469,7 +485,9 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.isend,
-                        tensor=_get_tensor(send_weights, i, src_expert_location),
+                        tensor=_p2p_tensor_view(
+                            _get_tensor(send_weights, i, src_expert_location)
+                        ),
                         peer=dst_rank,
                         group=group,
                     )
