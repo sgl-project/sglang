@@ -27,9 +27,6 @@ from sglang.srt.multimodal.serving_preprocessing import (
     resolve_auto_mm_processor_worker_num,
     resolve_hf_image_token_counts,
 )
-from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
-    TokenSpaceProcessStrategy,
-)
 from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
@@ -155,11 +152,6 @@ class TokenSpaceSGLangProcessor:
             worker_thread_device=server_args.base_gpu_id if is_cuda_alike() else None,
             item_feature_cache=item_feature_cache,
             item_feature_cache_check_rate=mm.token_space_preprocess_cache_check_rate,
-        )
-        # A strategy that keeps the base method has no M-RoPE positions to compute.
-        self._strategy_has_mrope = (
-            strategy_class.compute_mrope_positions
-            is not TokenSpaceProcessStrategy.compute_mrope_positions
         )
         # The tokenizer manager sets pad values through it.
         self.hash_executor = MultimodalHashExecutor()
@@ -322,7 +314,7 @@ class TokenSpaceSGLangProcessor:
         media fields from each item's strategy fields.
         """
         # Nothing to rebuild without M-RoPE, as in the legacy base method.
-        if not self._strategy_has_mrope:
+        if not self._serving_spec.uses_mrope_positions:
             return None, None
         # TODO(rockdu): Corner case: requests that arrive without M-RoPE positions.
         # Check whether every frontend can send positions, so this fallback can be removed.

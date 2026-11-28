@@ -37,7 +37,7 @@ get_mm_processor -> TokenSpaceSGLangProcessor
   budget or trusted URLs without --enable-token-space-preprocess-cache -> the core caches nothing
   --token-space-preprocess-cache-dir -> the core caches on disk; the check rate reaches the core
   adjacent images -> two offsets from mm_spans, not one scanned run
-  M-RoPE fallback -> none without M-RoPE, also for int item fields; the strategy's own with it
+  M-RoPE fallback -> none for a spec without M-RoPE, also for int item fields; else the strategy's
   equal features, different grids -> different item hashes
   equal feature bytes, different feature shapes -> different item hashes
   chat turns' media + partially expanded IDs -> prefix kept, new turn expanded
@@ -997,16 +997,18 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             self._item_hash(_PixelShapeStrategy, (2, 1)),
         )
 
-    def test_mrope_fallback_rebuilds_fields_only_for_a_strategy_with_mrope(self):
-        """A strategy without M-RoPE answers the fallback with none, also for int item fields
-        a rebuild could not concatenate; one with M-RoPE still gets the rebuilt fields."""
+    def test_mrope_fallback_rebuilds_fields_unless_the_spec_has_no_mrope(self):
+        """A spec without M-RoPE answers the fallback with none, also for int item fields
+        a rebuild could not concatenate; by default the strategy gets the rebuilt fields."""
 
-        class _WidthGridStrategy(_ImageWidthStrategy):
+        class _MropeStrategy(_ImageWidthStrategy):
             mm_item_fields = {"pixel_values": Modality.IMAGE, "width": Modality.IMAGE}
 
-        class _MropeStrategy(_WidthGridStrategy):
             def compute_mrope_positions(self, output):
                 return output["width"].tolist(), None
+
+        class _NoMropeSpec(TokenSpaceServingSpec):
+            uses_mrope_positions = False
 
         reset_context()
         self.addCleanup(reset_context)
@@ -1032,15 +1034,19 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
 
         input_ids = [1, IMAGE, IMAGE, 2, IMAGE, IMAGE, IMAGE]
         # Int grids as legacy DeepSeek-V4.1 keeps n_vit_h and n_vit_w; tensors for M-RoPE.
-        for strategy_class, width_of, positions in (
-            (_WidthGridStrategy, int, (None, None)),
-            (_MropeStrategy, lambda width: torch.tensor([width]), ([2, 3], None)),
+        for spec_class, width_of, positions in (
+            (_NoMropeSpec, int, (None, None)),
+            (
+                TokenSpaceServingSpec,
+                lambda width: torch.tensor([width]),
+                ([2, 3], None),
+            ),
         ):
             processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
-                strategy_class, TokenSpaceServingSpec
+                _MropeStrategy, spec_class
             )(None, server_args, _bare_tokenizer(), None)
             self.addCleanup(processor.shutdown)
-            with self.subTest(strategy=strategy_class.__name__):
+            with self.subTest(spec=spec_class.__name__):
                 self.assertEqual(
                     processor.compute_mrope_positions(input_ids, items(width_of)),
                     positions,

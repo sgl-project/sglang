@@ -161,6 +161,8 @@ class DeepseekV41TokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
 
 class DeepseekV41TokenSpaceServingSpec(TokenSpaceServingSpec):
     models = DeepseekV41TokenSpaceProcessStrategy.models
+    # Its int grids could not be rebuilt: two images would crash the scheduler.
+    uses_mrope_positions = False
 
     def build_mm_tokens(self, processor):
         # Serving-only: the trainer imports this module without the serving base.

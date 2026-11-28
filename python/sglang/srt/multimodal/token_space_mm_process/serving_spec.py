@@ -16,6 +16,9 @@ class TokenSpaceServingSpec:
     models: tuple[str, ...] = ()
     # Media IO threads when neither --mm-io-worker-num nor SGLANG_IO_WORKERS is set.
     auto_mm_io_worker_num: int = 4
+    # False for a model without M-RoPE: the scheduler's fallback then gets none
+    # without rebuilding the items.
+    uses_mrope_positions: bool = True
 
     def __init__(self, hf_config):
         self.hf_config = hf_config
