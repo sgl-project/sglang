@@ -62,7 +62,7 @@ from sglang.srt.multimodal.mrope_rope_index import (
     _get_feat_extract_output_lengths,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, logger
+from sglang.srt.utils import get_device_capability, is_cpu, is_cuda, is_npu, logger
 
 _is_cpu = is_cpu()
 
@@ -106,8 +106,8 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             num_heads=config.encoder_attention_heads,
             head_dim=head_dim,
             projection_size=projection_size,
-            # The audio tower's CUDA graphs need the Triton varlen kernel; a
-            # --mm-attention-backend override still wins (and turns them off).
+            # Keep the measured Triton graph default. An explicit multimodal
+            # backend override still wins; Hopper FA3 also supports replay.
             qkv_backend=(
                 GRAPH_ATTENTION_BACKEND
                 if is_cuda()
@@ -473,6 +473,7 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             or not is_cuda()
             or not hidden_states.is_cuda
             or backend not in GRAPH_SAFE_ATTENTION_BACKENDS
+            or (backend == "fa3" and get_device_capability()[0] != 9)
             or get_parallel().tp_size != 1
         ):
             self._cuda_graph_disabled = True

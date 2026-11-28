@@ -6,9 +6,9 @@ transformer layers (and the output projection) once per token budget and
 replays the smallest budget that fits a batch:
 
 * Hidden states are copied into a fixed ``[budget, hidden]`` buffer.
-* Window boundaries go into a fixed ``cu_seqlens`` buffer. Unused entries
-  repeat the last offset, so padding rows belong to no window and attend to
-  nothing; every other op in the layers is per-token.
+* Window boundaries go into a fixed ``cu_seqlens`` buffer. Padding rows have
+  their own windows, so attention writes every output row without mixing
+  padding and real tokens. Unused entries repeat the token budget.
 * ``max_seqlen`` is fixed to the full window length, an upper bound of every
   window the encoder builds.
 
@@ -31,10 +31,9 @@ from sglang.srt.layers.attention.vision import VisionAttentionMetadata
 
 logger = logging.getLogger(__name__)
 
-# Attention backends allowed inside the graphs. The Triton varlen kernel reads
-# cu_seqlens on the device. With FA3 varlen these graphs produced wrong
-# outputs under concurrent serving (cause not isolated), so FA3 stays eager.
-GRAPH_SAFE_ATTENTION_BACKENDS = ("triton_attn",)
+# These varlen backends read cu_seqlens on the device. FA3 graph replay is
+# enabled on Hopper by the model; other architectures keep its eager path.
+GRAPH_SAFE_ATTENTION_BACKENDS = ("triton_attn", "fa3")
 GRAPH_ATTENTION_BACKEND = "triton_attn"
 
 DEFAULT_TOKEN_BUDGETS = (
@@ -109,14 +108,15 @@ class AudioEncoderCudaGraphRunner:
         )
 
     def max_windows(self, budget: int) -> int:
-        return budget // self.window_size + self.max_items
+        return -(-budget // self.window_size) + self.max_items
 
     def select_budget(self, num_tokens: int, num_windows: int) -> Optional[int]:
         start = bisect.bisect_left(self.token_budgets, num_tokens)
         for budget in self.token_budgets[start:]:
             if budget in self.failed_budgets:
                 continue
-            if num_windows <= self.max_windows(budget):
+            padding_windows = -(-(budget - num_tokens) // self.window_size)
+            if num_windows + padding_windows <= self.max_windows(budget):
                 return budget
         return None
 
@@ -199,11 +199,19 @@ class AudioEncoderCudaGraphRunner:
                 stream.wait_event(self._replay_done)
             num_tokens = hidden_states.shape[0]
             num_slots = entry.cu_seqlens.numel()
-            padded = cu_seqlens + [cu_seqlens[-1]] * (num_slots - len(cu_seqlens))
+            padded = list(cu_seqlens)
+            # FA3 does not write rows outside cu_seqlens. Uninitialized NaNs
+            # there can poison a subsequent layer's masked KV tile (0 * NaN).
+            # Separate dummy windows keep all rows written and bounded by the
+            # captured max_seqlen without attending to any real token.
+            while padded[-1] < budget:
+                padded.append(min(padded[-1] + self.window_size, budget))
+            padded += [budget] * (num_slots - len(padded))
             entry.cu_seqlens.copy_(
                 torch.tensor(padded, dtype=torch.int32).pin_memory(), non_blocking=True
             )
             entry.hidden_states[:num_tokens].copy_(hidden_states)
+            entry.hidden_states[num_tokens:].zero_()
             entry.graph.replay()
             output = entry.output.reshape(-1, entry.output.shape[-1])
             result = output[:num_tokens].clone()
