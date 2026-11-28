@@ -687,6 +687,57 @@ class TestAdditionalEdgeCases(CustomTestCase):
         # "assistant" at end should be held back
         self.assertIn("assistant", remainder)
 
+    def test_streaming_analysis_partial_end_token(self):
+        """Test that partial <|end|> token at chunk boundary is held during analysis streaming."""
+        parser = HarmonyParser()
+        chunks = [
+            "<|channel|>analysis<|message|>thinking<|en",
+            "d|><|start|>assistant<|channel|>final<|message|>answer<|return|>",
+        ]
+        all_events = []
+        for chunk in chunks:
+            all_events.extend(parser.parse(chunk))
+
+        reasoning = "".join(
+            e.content for e in all_events if e.event_type == "reasoning"
+        )
+        normal = "".join(e.content for e in all_events if e.event_type == "normal")
+        self.assertEqual(reasoning, "thinking")
+        self.assertEqual(normal, "answer")
+
+    def test_streaming_built_in_tool_call_on_analysis_channel(self):
+        """Test that built-in tool calls on analysis channel wait for <|call|> completion."""
+        parser = HarmonyParser()
+        chunks = [
+            '<|channel|>analysis to=browser.search<|message|>{"query": ',
+            '"SGLang"}',
+            "<|call|>",
+        ]
+        all_events = []
+        for chunk in chunks:
+            all_events.extend(parser.parse(chunk))
+
+        reasoning_events = [e for e in all_events if e.event_type == "reasoning"]
+        tool_events = [e for e in all_events if e.event_type == "tool_call"]
+        self.assertEqual(len(reasoning_events), 0)
+        self.assertEqual(len(tool_events), 1)
+        self.assertEqual(tool_events[0].content, '{"query": "SGLang"}')
+
+    def test_streaming_non_commentary_prefix_after_tool_call(self):
+        """Test that normal text starting with a prefix of 'commentary' after tool_call is preserved."""
+        parser = HarmonyParser()
+        chunks = [
+            "<|channel|>commentary to=functions.f<|message|>{}<|call|>",
+            "<|start|>assistant<|channel|>final<|message|>com",
+            "plete answer<|return|>",
+        ]
+        all_events = []
+        for chunk in chunks:
+            all_events.extend(parser.parse(chunk))
+
+        normal = "".join(e.content for e in all_events if e.event_type == "normal")
+        self.assertEqual(normal, "complete answer")
+
 
 if __name__ == "__main__":
     unittest.main()
