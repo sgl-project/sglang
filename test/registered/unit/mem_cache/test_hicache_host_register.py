@@ -112,6 +112,35 @@ class TestHiCacheHostRegister(unittest.TestCase):
         self.assertEqual(cudart.registrations, [])
         self.assertEqual(cudart.unregistrations, [])
 
+    def test_hip_switch_allocates_gtt_pools_without_the_hsa_env(self):
+        """SGLANG_USE_HIP_HOST_MALLOC_FOR_HICACHE alone selects hipHostMalloc pools, so
+        a launch can leave HSA_USERPTR_FOR_PAGED_MEM unset: =0 also selects them, but
+        slows every other host-to-device copy (weight loading on all but one rank)."""
+        backing = (ctypes.c_uint8 * 64)()
+        allocator = host_common.HostTensorAllocator()
+        with (
+            mock.patch.object(host_common, "_is_hip", True),
+            mock.patch.dict(os.environ),
+            envs.SGLANG_USE_HIP_HOST_MALLOC_FOR_HICACHE.override(True),
+            mock.patch.object(
+                host_common, "_hip_host_malloc", return_value=ctypes.addressof(backing)
+            ) as malloc,
+            mock.patch.object(host_common, "_hip_host_free"),
+            mock.patch.object(allocator, "allocate") as allocate,
+        ):
+            os.environ.pop("HSA_USERPTR_FOR_PAGED_MEM", None)
+            buffer = host_common.alloc_with_host_register(
+                dims=(64,),
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+                allocator=allocator,
+            )
+            malloc.assert_called_once_with(64)
+            allocate.assert_not_called()
+            del buffer
+            gc.collect()
+
     def test_hip_host_pool_is_freed_once_after_its_last_view(self):
         """hipHostFree must wait for every view (the pools keep per-layer views)
         and run exactly once."""

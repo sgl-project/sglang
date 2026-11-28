@@ -462,9 +462,10 @@ def _hip_host_malloc(nbytes: int) -> int:
         raise RuntimeError(
             f"hipHostMalloc of {nbytes / 1e9:.2f} GB for a HiCache host pool failed "
             f"(rc={rc}, {lib.hipGetErrorString(rc).decode()}). With "
-            "HSA_USERPTR_FOR_PAGED_MEM=0 host pools are GTT memory, which all ranks "
+            "hipHostMalloc host pools are GTT memory, which all ranks "
             "on a node share up to /sys/class/drm/card*/device/mem_info_gtt_total. "
-            "Reduce --hicache-size or unset HSA_USERPTR_FOR_PAGED_MEM."
+            "Reduce --hicache-size, or unset SGLANG_USE_HIP_HOST_MALLOC_FOR_HICACHE "
+            "and HSA_USERPTR_FOR_PAGED_MEM."
         )
     return ptr.value
 
@@ -478,7 +479,7 @@ def _hip_host_free(ptr: int) -> None:
 @lru_cache(maxsize=1)
 def _log_hip_owned_host_pool() -> None:
     logger.info(
-        "HSA_USERPTR_FOR_PAGED_MEM=0: allocating HiCache host pools with "
+        "Allocating HiCache host pools with "
         "hipHostMalloc (GTT) instead of hipHostRegister (USERPTR)."
     )
     if envs.SGLANG_HUGEPAGE_SIZE.get():
@@ -497,7 +498,10 @@ def _uses_hip_owned_host_memory(
         and pin_memory
         # Storage allocators own their backing (shm fds, registered transfer buffers).
         and type(allocator) is HostTensorAllocator
-        and os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") == "0"
+        and (
+            envs.SGLANG_USE_HIP_HOST_MALLOC_FOR_HICACHE.get()
+            or os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") == "0"
+        )
     )
 
 
@@ -547,7 +551,8 @@ def alloc_with_host_register(
     """
     Allocate tensor and pin host memory: register it with cudaHostRegister, then
     mlock it. Pinning only applies when pin_memory=True. On ROCm with
-    HSA_USERPTR_FOR_PAGED_MEM=0, default-allocator pools come from hipHostMalloc.
+    SGLANG_USE_HIP_HOST_MALLOC_FOR_HICACHE=1 (or HSA_USERPTR_FOR_PAGED_MEM=0),
+    default-allocator pools come from hipHostMalloc.
     """
     if _uses_hip_owned_host_memory(pin_memory=pin_memory, allocator=allocator):
         assert device == "cpu", f"HiCache host pools are CPU memory; got {device!r}"

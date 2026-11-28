@@ -970,6 +970,10 @@ class Envs:
     # ===================================================================
     # Per-call cudaHostRegister limit in GB.
     SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB = EnvInt(256)
+    # ROCm: allocate pinned HiCache host pools with hipHostMalloc (GTT, never migrates)
+    # instead of hipHostRegister (USERPTR, whose page migrations stall every GPU queue).
+    # HSA_USERPTR_FOR_PAGED_MEM=0 selects it too, but slows other host-to-device copies.
+    SGLANG_USE_HIP_HOST_MALLOC_FOR_HICACHE = EnvBool(False)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
