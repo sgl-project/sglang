@@ -40,15 +40,6 @@ if TYPE_CHECKING:
 # metadata operators to accept zero-length request slots (unverified).
 MAX_PREFILL_GRAPH_REQS = 1
 
-_KERNEL_METADATA_KEYS = (
-    "c1a_metadata",
-    "c4a_metadata",
-    "c128a_metadata",
-    "li_quant_metadata",
-)
-# Arbitrary floor; the live metadata ops emit far fewer than this.
-_MIN_KERNEL_METADATA_INTS = 1024
-
 
 def compress_capacity(num_tokens: int, ratio: int, max_reqs: int) -> int:
     """Output rows the fused compressor reserves for one token bucket."""
@@ -158,11 +149,12 @@ class Dsv4PrefillGraphMetadata:
             )
             state.c128_page_table = torch.zeros((max_reqs, groups), **int32)
 
-        metadata_ints = _MIN_KERNEL_METADATA_INTS
-        for tensor in seed.kernel_metadata.values():
-            metadata_ints = max(metadata_ints, tensor.numel())
+        # Every producer has its own fixed ABI width; on CANN 9.2 the sparse
+        # attention metadata is 2048 int32 while the lightning indexer rejects
+        # anything but 1024.
         state.kernel_metadata = {
-            key: torch.zeros(metadata_ints, **int32) for key in _KERNEL_METADATA_KEYS
+            key: torch.zeros(tensor.numel(), **int32)
+            for key, tensor in seed.kernel_metadata.items()
         }
 
         for ratio in state.ratios:
