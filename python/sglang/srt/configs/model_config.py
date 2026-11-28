@@ -2324,6 +2324,7 @@ class ModelConfig:
             "auto-round-int8",
             "quark_int4fp8_moe",
             "quark_mxfp4",
+            "inkling2",
             "minimax_m3_nvfp4",
         ]
         if is_gfx95_supported():

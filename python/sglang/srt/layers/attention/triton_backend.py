@@ -10,6 +10,9 @@ import torch
 import triton
 
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.kernels.ops.attention.metadata_hip import (
+    get_num_kv_splits_by_length_triton,
+)
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
 )
@@ -120,6 +123,19 @@ def logit_capping_mod(logit_capping_method, logit_cap):
         return logit_cap
     else:
         raise ValueError()
+
+
+def rel_bias_score_mod(rel_bias, score_mod, aux_tensors):
+    """FA4's rel_bias as the Triton score_mod: logits qk * scale + rel_bias[t, h, d]
+    for query-key distance d < rel_bias.shape[-1]. Scale-after-add and GQA packing
+    are FA4 kernel choices with the same math, so they need no counterpart here."""
+    if rel_bias is None:
+        return score_mod, aux_tensors
+    if score_mod is not None or aux_tensors is not None:
+        raise ValueError("rel_bias cannot be combined with score_mod")
+    from sglang.kernels.ops.attention.score_mod import relative_bias_score_mod
+
+    return relative_bias_score_mod, [rel_bias]
 
 
 class WindowRail(msgspec.Struct, kw_only=True):
@@ -403,6 +419,11 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_kv_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
+        # ROCm Inkling2: cdiv(kv_len, N) decode splits per request
+        self.decode_split_min_tokens = 0
+        if _is_hip:
+            _hip.init_inkling2_state(self, model_runner, max_bs)
+
         assert not (
             model_runner.sliding_window_size is not None
             and model_runner.model_config.is_encoder_decoder
@@ -589,6 +610,18 @@ class TritonAttnBackend(AttentionBackend):
             SCHEDULE_SEQ = 256
         else:
             SCHEDULE_SEQ = triton.next_power_of_2(num_seq)
+
+        if self.decode_split_min_tokens:
+            get_num_kv_splits_by_length_triton[(1,)](
+                num_kv_splits,
+                seq_lens,
+                num_seq,
+                num_group,
+                _hip.decode_split_bound(self, num_token),
+                MIN_TOKENS=self.decode_split_min_tokens,
+                MAX_NUM_SEQ=SCHEDULE_SEQ,
+            )
+            return
 
         get_num_kv_splits_triton[(1,)](
             num_kv_splits,
@@ -911,13 +944,24 @@ class TritonAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        self._anchor_window_fill = None
         if self.dllm_attention is not None:
             return self.dllm_attention.init_forward_metadata_out_graph(
                 forward_batch, in_capture
             )
         self._init_forward_metadata_out_graph(forward_batch, in_capture)
 
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        # A captured forward starts: its first anchored layer records the window.
+        self._anchor_window_fill = None
+
     def _init_forward_metadata_out_graph(self, forward_batch, in_capture):
+        if _is_hip and forward_batch.forward_mode in (
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            _hip.init_full_cg_extend_metadata(self, forward_batch, in_capture)
+            return
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
@@ -1046,6 +1090,7 @@ class TritonAttnBackend(AttentionBackend):
         if self.dllm_attention is not None:
             self.dllm_attention.graph_mode = False
         self._dense_one_shot_kv_indptr = None
+        self._anchor_window_fill = None
         bs = forward_batch.batch_size
         windows: Dict[str, WindowRail] = {}
         extra_attn_logits: Dict[int, torch.Tensor] = {}
@@ -1726,6 +1771,13 @@ class TritonAttnBackend(AttentionBackend):
             return output, lse
         return output
 
+    def get_fused_kv_write_buffers(self, layer, forward_batch):
+        """Where save_kv_cache would store this layer's K/V rows, for a prologue that
+        stores them itself (ROCm); None on CUDA, as the base backend."""
+        if not _is_hip:
+            return None
+        return _hip.fused_kv_write_buffers(self, layer, forward_batch)
+
     def _set_kv_buffer(
         self,
         forward_batch: ForwardBatch,
@@ -1824,7 +1876,18 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        rel_bias=None,
+        return_lse=False,
+        rel_bias_scale_after_add=False,
+        pack_gqa=None,
+        gate_sink=None,
     ):
+        """gate_sink=(gate, sinks): Inkling2's o * sigmoid(gate) * sigmoid(lse - sink),
+        applied in the relative-bias split-KV reduction; the output is then in q's
+        dtype."""
+        if _is_hip:
+            _hip.check_extend(self, rel_bias, sinks, layer, gate_sink)
+        score_mod, aux_tensors = rel_bias_score_mod(rel_bias, score_mod, aux_tensors)
         if (
             k is not None
             and v is not None
@@ -1842,7 +1905,12 @@ class TritonAttnBackend(AttentionBackend):
         elif layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(q, dtype=getattr(layer, "out_dtype", None) or q.dtype)
+        lse = (
+            q.new_empty((q.shape[0], layer.tp_q_head_num), dtype=torch.float32)
+            if return_lse
+            else None
+        )
 
         if k is None and v is None:
             cache_loc = forward_batch.out_cache_loc
@@ -1946,6 +2014,8 @@ class TritonAttnBackend(AttentionBackend):
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
+            if return_lse:
+                raise NotImplementedError("Deterministic Triton extend has no LSE")
             return self._forward_extend_unified(
                 q,
                 o,
@@ -1981,6 +2051,9 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
             window_kv_offsets = None
+        if _is_hip and layer.window_anchor_at_start:
+            kv_indptr, kv_indices = _hip.anchored_window_kv(self, layer, forward_batch)
+            sliding_window_size, window_kv_offsets = -1, None
 
         if layer.k_scale is not None and layer.v_scale is not None:
             k_descale = layer.k_scale_float
@@ -2064,6 +2137,38 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        if _is_hip and _hip.takes_rel_extend(self, rel_bias, sinks, layer):
+            o = _hip.forward_rel_extend(
+                self,
+                q,
+                k,
+                v,
+                o,
+                lse,
+                rel_bias,
+                layer,
+                kv_indptr,
+                kv_indices,
+                sliding_window_size,
+                causal,
+                gate_sink=gate_sink,
+            )
+            return (o, lse) if return_lse else o
+
+        if _is_hip and _hip.takes_draft_block(
+            self,
+            layer,
+            rel_bias,
+            score_mod,
+            sinks,
+            logits_soft_cap,
+            sliding_window_size,
+        ):
+            _hip.forward_draft_block(
+                self, q, k, v, o, lse, layer, kv_indptr, kv_indices, causal
+            )
+            return (o, lse) if return_lse else o
+
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2092,8 +2197,9 @@ class TritonAttnBackend(AttentionBackend):
             aux_tensors=aux_tensors,
             extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
             bf16_dot=self.draft_bf16_dot,
+            **({"lse_extend": lse} if lse is not None else {}),
         )
-        return o
+        return (o, lse) if return_lse else o
 
     def _forward_extend_kernel(self, layer, *args, **kwargs):
         if self.dllm_attention is not None:
@@ -2484,7 +2590,15 @@ class TritonAttnBackend(AttentionBackend):
         sinks=None,
         score_mod=None,
         aux_tensors=None,
+        rel_bias=None,
+        return_lse=False,
+        rel_bias_scale_after_add=False,
+        pack_gqa=None,
+        gate_sink=None,
     ):
+        """gate_sink=(gate, sinks): Inkling2's o * sigmoid(gate) * sigmoid(lse - sink),
+        applied in the split reduction; the output is then in q's dtype."""
+        score_mod, aux_tensors = rel_bias_score_mod(rel_bias, score_mod, aux_tensors)
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
@@ -2493,7 +2607,12 @@ class TritonAttnBackend(AttentionBackend):
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
-            o = torch.empty_like(q)
+            o = torch.empty_like(
+                q,
+                dtype=q.dtype
+                if gate_sink
+                else getattr(layer, "out_dtype", None) or q.dtype,
+            )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
@@ -2577,7 +2696,12 @@ class TritonAttnBackend(AttentionBackend):
             get_is_capture_mode,
         )
 
-        if self.enable_deterministic or envs.SGLANG_DISABLE_LEAN_ATTENTION.get():
+        if (
+            self.enable_deterministic
+            or envs.SGLANG_DISABLE_LEAN_ATTENTION.get()
+            or return_lse
+            or gate_sink is not None
+        ):
             enable_lean = False
         else:
             enable_lean = self.enable_lean_attention
@@ -2651,6 +2775,25 @@ class TritonAttnBackend(AttentionBackend):
             o = cp_lse_ag_out_rs_mha(o_for_decode, local_lse, group)
             return o.reshape(-1, layer.tp_q_head_num * layer.v_head_dim).to(q.dtype)
 
+        lse = (
+            q.new_empty((q.shape[0], layer.tp_q_head_num), dtype=torch.float32)
+            if return_lse
+            else None
+        )
+        attn_lse = self.forward_metadata.attn_lse
+        num_kv_splits = self.forward_metadata.num_kv_splits
+        max_kv_splits = self.max_kv_splits
+        if self.decode_split_min_tokens and not enable_lean:
+            # Sliding-window layers take the splits of their window lengths. The
+            # launch covers this batch's bound; views keep the buffers' strides.
+            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+                num_kv_splits, max_kv_splits = _hip.window_num_kv_splits(
+                    self, layer, kv_indptr, q.shape[0]
+                )
+            else:
+                max_kv_splits = _hip.decode_split_bound(self, q.shape[0])
+            attn_logits = attn_logits[:, :, :max_kv_splits]
+            attn_lse = attn_lse[:, :, :max_kv_splits]
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             self.kv_layers.read(layer.layer_id).key(),
@@ -2659,9 +2802,9 @@ class TritonAttnBackend(AttentionBackend):
             kv_indptr,
             kv_indices,
             attn_logits,
-            self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
+            attn_lse,
+            num_kv_splits,
+            max_kv_splits,
             layer.scaling,
             k_descale,
             v_descale,
@@ -2680,8 +2823,10 @@ class TritonAttnBackend(AttentionBackend):
             lean_locks=self.forward_metadata.lean_locks,
             uneven_batch=self.forward_metadata.uneven_batch,
             stop_at_request_splits=self.enable_deterministic,
+            lse_out=lse,
+            gate_sink=gate_sink,
         )
-        return o
+        return (o, lse) if return_lse else o
 
 
 class TritonMultiStepDraftBackend:

@@ -223,9 +223,19 @@ def _draft_step(
                 w2_weight=w2_weight,
             )
             return tokens, state
-    bias, state = markov_head.step_bias(
-        prev_tokens, hidden_states=hidden_states, state=state
+    # A folded step passes its latents as bias; the sampling kernel computes the bias.
+    folded = (
+        markov_head.step_fold(prev_tokens, hidden_states=hidden_states, state=state)
+        if sharded_accept
+        else None
     )
+    if folded is None:
+        fold = None
+        bias, state = markov_head.step_bias(
+            prev_tokens, hidden_states=hidden_states, state=state
+        )
+    else:
+        bias, fold, state = folded
     shard = markov_head.vocab_shard
     sharded = (
         {}
@@ -249,6 +259,7 @@ def _draft_step(
         has_sampled_rows=None if logits_out is not None else False,
         softcap=markov_head.step_softcap,
         vocab_limit=markov_head.step_vocab_limit,
+        **({} if fold is None else {"fold": fold}),
         **sharded,
     )
     return tokens, state

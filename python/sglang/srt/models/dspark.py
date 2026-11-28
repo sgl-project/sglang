@@ -191,6 +191,12 @@ class BaseDSparkMarkovHead(nn.Module, ABC):
         token's embedding, for the fused greedy kernel; otherwise None."""
         return None
 
+    def step_fold(self, prev_tokens, *, hidden_states, state):
+        """(latents, (weight, bias), next state) when the step bias is
+        torch.addmm(bias, latents, weight.T) over the rank's vocab shard, for the
+        sampling kernel to compute it; otherwise None."""
+        return None
+
     # Step logits = softcap(base + bias), masked from step_vocab_limit on.
     step_softcap: Optional[float] = None
     step_vocab_limit: Optional[int] = None

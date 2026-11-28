@@ -9,6 +9,7 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolving_view,
 )
+from sglang.srt.arg_groups.model_overrides import inkling_hip as _hip
 from sglang.srt.configs.inkling2 import INKLING2_ARCHS
 from sglang.srt.runtime_context import get_platform
 
@@ -58,6 +59,8 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides["tool_call_parser"] = "inkling2"
         if cfg.reasoning_parser is None:
             overrides["reasoning_parser"] = "inkling"
+        if get_platform().is_hip:
+            _hip.validate(cfg)
         moe_ranks = cfg.tp_size // cfg.moe_dp_size
         # On SM100 / SM103 / SM107, quantized experts above the routed-kernel batch
         # run only on MegaMoE at full speed.
