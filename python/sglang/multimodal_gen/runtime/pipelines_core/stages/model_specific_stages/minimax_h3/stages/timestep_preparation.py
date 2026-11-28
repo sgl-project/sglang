@@ -31,6 +31,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         sigma_shift_scales=None,
         dmd_denoising_steps: tuple[int, ...] | None = None,
         pdd_heads: str | None = None,
+        raw_sigmas: tuple[float, ...] | None = None,
     ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
@@ -38,6 +39,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
         self.dmd_denoising_steps = dmd_denoising_steps
+        self.raw_sigmas = raw_sigmas
         self._pdd_config = None
         self._pdd_image_sigmas: tuple[float, ...] | None = None
         # The pipeline resolves the release's fused heads; the env var serves
@@ -266,16 +268,19 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             ),
         }
         dmd_steps = self.dmd_denoising_steps
+        raw_sigmas = self.raw_sigmas
         num_steps = requested_num_steps
-        if dmd_steps is not None and batch.is_warmup:
+        trained = dmd_steps if dmd_steps is not None else raw_sigmas
+        if trained is not None and batch.is_warmup:
             # warmup truncates the trained rungs instead of rescaling a shorter grid
-            num_steps = len(dmd_steps)
+            num_steps = len(trained)
         sigmas: dict[str, list[float]] = {}
         for modality in ("video", "audio"):
             sigmas[modality] = minimax_h3_time_shift_sigmas(
                 num_steps=num_steps,
                 shift_scale=scales[modality],
                 dmd_steps=dmd_steps,
+                raw_sigmas=raw_sigmas,
             )
             if num_steps != requested_num_steps:
                 sigmas[modality] = sigmas[modality][: requested_num_steps + 1]

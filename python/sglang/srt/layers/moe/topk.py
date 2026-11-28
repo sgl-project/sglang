@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ import triton.language as tl
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.ops.moe.dsv4 import mask_topk_ids
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -106,6 +108,35 @@ _is_npu = is_npu()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_musa = is_musa()
 _is_sail = is_sail()
+
+
+def _compile_unless_batch_invariant(**compile_kwargs):
+    """torch.compile a routing function, but run it eagerly in batch-invariant mode.
+
+    Inductor tunes the generated kernels (block sizes, reduction splits) by timing
+    on first use, so the summation order of the routing scores, and with it the
+    selected experts, can differ between server starts and with the batch.
+    Deterministic inference needs the eager kernels, whose order is fixed.
+    """
+
+    def decorator(fn):
+        compiled = torch.compile(fn, **compile_kwargs)
+        # Also kept out of an outer trace (--enable-torch-compile compiles the whole
+        # forward), which would otherwise inline the eager function and generate kernels.
+        eager = torch.compiler.disable(fn)
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if is_batch_invariant_mode_enabled():
+                return wrapper.eager(*args, **kwargs)
+            return wrapper.compiled(*args, **kwargs)
+
+        wrapper.compiled = compiled
+        wrapper.eager = eager
+        return wrapper
+
+    return decorator
+
 
 # Epsilon added to the top-k weight sum before renormalization, matching the
 # DeepSeek reference gate (modeling_deepseek.py: `topk_weight.sum(...) + 1e-20`)
@@ -1372,7 +1403,9 @@ def fused_topk(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@_compile_unless_batch_invariant(
+    dynamic=True, backend=get_compiler_backend(), disable=_is_npu
+)
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1530,7 +1563,9 @@ def grouped_topk_xpu(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@_compile_unless_batch_invariant(
+    dynamic=True, backend=get_compiler_backend(), disable=_is_npu
+)
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1727,7 +1762,9 @@ def biased_topk_xpu(
     return output, indices
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
+@_compile_unless_batch_invariant(
+    dynamic=True, backend=get_compiler_backend(), disable=_is_npu
+)
 def biased_grouped_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1916,7 +1953,7 @@ def _zero_topk_weights_padded_region(
     topk_weights[_padded_row_mask(topk_weights, num_token_non_padded), :] = 0.0
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@_compile_unless_batch_invariant(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):

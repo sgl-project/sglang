@@ -1,7 +1,6 @@
 """Unit tests for the tree-core backend registry."""
 
 import os
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -301,10 +300,10 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
                 return_value=None,
             ),
             mock.patch.object(
-                tree_core_registry.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0, stdout="version"),
-            ) as run,
+                tree_core_registry,
+                "query_rust_toolchain",
+                return_value={"cargo": "cargo 1.92.0", "rustc": "rustc 1.92.0"},
+            ) as query,
             mock.patch.dict(_TREE_CORE_REGISTRY, {"rust": factory}),
             envs.SGLANG_RUST_BUILD_MODE.override("auto"),
         ):
@@ -314,7 +313,7 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
             envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.clear()
             with self.assertRaisesRegex(RuntimeError, "extension build failed"):
                 UnifiedRadixCache(self._cache_params(component_registry_override=None))
-        self.assertTrue(run.called)
+        self.assertTrue(query.called)
 
     def test_default_cache_falls_back_for_unavailable_toolchain(self):
         params = self._cache_params(component_registry_override=None)
@@ -377,9 +376,9 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
             ),
             mock.patch.object(tree_core_registry, "_RUST_TREE_CORE_MANIFEST"),
             mock.patch.object(
-                tree_core_registry.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0, stdout="version"),
+                tree_core_registry,
+                "query_rust_toolchain",
+                return_value={"cargo": "cargo 1.92.0", "rustc": "rustc 1.92.0"},
             ),
         )
         for patcher in patchers:
@@ -404,57 +403,40 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
         tree_core_registry._RUST_TREE_CORE_MANIFEST.is_file.return_value = False
         tree_core_registry.importlib.util.find_spec.return_value = object()
         self.assertEqual(select_tree_core_backend(_cache_init_params()), "rust")
-        tree_core_registry.subprocess.run.assert_not_called()
+        tree_core_registry.query_rust_toolchain.assert_not_called()
 
     def test_loaded_extension_needs_no_toolchain(self):
         tree_core_registry.sys.modules[tree_core_registry._RUST_TREE_CORE_MODULE] = (
             SimpleNamespace()
         )
         self.assertEqual(select_tree_core_backend(_cache_init_params()), "rust")
-        tree_core_registry.subprocess.run.assert_not_called()
+        tree_core_registry.query_rust_toolchain.assert_not_called()
 
     def test_never_mode_trusts_bundled_extension_in_a_source_checkout(self):
         tree_core_registry.importlib.util.find_spec.return_value = object()
         with envs.SGLANG_RUST_BUILD_MODE.override("never"):
             self.assertEqual(select_tree_core_backend(_cache_init_params()), "rust")
-        tree_core_registry.subprocess.run.assert_not_called()
+        tree_core_registry.query_rust_toolchain.assert_not_called()
 
     def test_source_build_modes_probe_tools_even_with_a_bundled_extension(self):
         tree_core_registry.importlib.util.find_spec.return_value = object()
         for mode in ("auto", "force"):
             with self.subTest(mode=mode), envs.SGLANG_RUST_BUILD_MODE.override(mode):
                 self.assertEqual(select_tree_core_backend(_cache_init_params()), "rust")
-                self.assertEqual(
-                    tree_core_registry.subprocess.run.call_args_list,
-                    [
-                        mock.call(
-                            command,
-                            cwd=self.workspace,
-                            check=True,
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                        )
-                        for command in (
-                            ("cargo", "--version", "--verbose"),
-                            ("rustc", "-vV"),
-                        )
-                    ],
+                tree_core_registry.query_rust_toolchain.assert_called_once_with(
+                    self.workspace
                 )
-                tree_core_registry.subprocess.run.reset_mock()
+                tree_core_registry.query_rust_toolchain.reset_mock()
 
     def test_toolchain_probe_failure_uses_python_for_all_source_build_modes(self):
         for mode in ("auto", "never", "force"):
-            for error in (
-                FileNotFoundError("cargo"),
-                subprocess.CalledProcessError(1, "cargo"),
-                subprocess.TimeoutExpired("rustc", 10),
-            ):
+            # RuntimeError: a failed query; PermissionError: an unwritable cache.
+            for error in (RuntimeError("cargo failed"), PermissionError("lock")):
                 with (
                     self.subTest(mode=mode, error=type(error).__name__),
                     envs.SGLANG_RUST_BUILD_MODE.override(mode),
                 ):
-                    tree_core_registry.subprocess.run.side_effect = error
+                    tree_core_registry.query_rust_toolchain.side_effect = error
                     self.assertEqual(
                         select_tree_core_backend(_cache_init_params()), "python"
                     )
@@ -483,7 +465,7 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
                     tree_core_registry.sys.modules[module] = SimpleNamespace()
                 with self.assertRaisesRegex(error, message):
                     create_tree_core("rust", _cache_init_params(), {})
-        tree_core_registry.subprocess.run.assert_not_called()
+        tree_core_registry.query_rust_toolchain.assert_not_called()
 
     def test_platform_distribution_without_tree_core_uses_python(self):
         tree_core_registry._RUST_TREE_CORE_MANIFEST.is_file.return_value = False

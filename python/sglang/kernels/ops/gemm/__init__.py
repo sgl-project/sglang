@@ -208,6 +208,15 @@ register_kernel(
         capabilities=_SM10X,
     )
 )
+# Same contract as gemm.dual_gemm_swiglu; a separate op because the registry holds one spec per (op, backend).
+register_kernel(
+    KernelSpec(
+        op="gemm.quack_swiglu_gemm",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.quack_swiglu_gemm:quack_swiglu_gemm",
+        capabilities=_SM120,
+    )
+)
 register_kernel(
     KernelSpec(
         op="gemm.dual_gemm_swiglu_fp8",
@@ -314,6 +323,16 @@ def dual_gemm_swiglu(
     )
 
 
+def dual_gemm_swiglu_quack(
+    x: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+) -> torch.Tensor:
+    """SM120 BF16 gate/up projection with SwiGLU in the GEMM epilogue (QuACK)."""
+    return get_kernel("gemm.quack_swiglu_gemm", KernelBackend.CUTE_DSL)(
+        x, gate_up_weight
+    )
+
+
 def bmm_fp8(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -372,6 +391,7 @@ __all__ = [
     "bmm_fp8",
     "dual_gemm_swiglu",
     "dual_gemm_swiglu_fp8",
+    "dual_gemm_swiglu_quack",
     "fp8_scaled_mm",
     "kimi_k3_tiny_gemm",
     "npu_w8a8_block_fp8_grouped_matmul",
@@ -450,6 +470,19 @@ for _name, _backend in (
         )
     )
 del _name, _backend
+for _name in (
+    "nvfp4_expert_matmul_lowm_scaled",
+    "mxfp8_expert_matmul_lowm",
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.inkling2_{_name}_sm120",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.gemm.inkling2_moe_gemm_lowm_sm120:{_name}",
+            capabilities=_SM12X,
+        )
+    )
+del _name
 register_kernel(
     KernelSpec(
         op="gemm.fp8_blockwise_scaled_mm",
@@ -539,6 +572,16 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _fn in ("hc_fused_mix", "hc_apply_inject"):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_fn}",
+            backend=KernelBackend.FLYDSL,
+            target=f"sglang.kernels.ops.gemm.hc_fused_flydsl:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _fn
 register_kernel(
     KernelSpec(
         op="gemm.w8a8_block_fp8_matmul_triton",
@@ -630,19 +673,9 @@ _MUSE_SPARK_GFX950_KERNELS = [
         "bf16 x fp32 router logits, tuned split-K at verify widths",
     ),
     (
-        "router_gemm_fp32",
-        "router_gemm_tlx",
-        "bf16 x fp32 router logits on the vendored tlx.ops.router_gemm, any M",
-    ),
-    (
         "unpool_gemm_norm_residual",
         "unpool_gemm_norm_residual",
         "MoE unpooler GEMM + boundary norms + gated residual",
-    ),
-    (
-        "unpool_gemm_norm_residual",
-        "unpool_gemm_norm_residual_tlx",
-        "MoE unpooler GEMM + boundary norms + gated residual on the TLX mm and norm_residual_norm",
     ),
 ]
 for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
@@ -655,15 +688,24 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
-# Vendored tlx.ops.mm (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
-register_kernel(
-    KernelSpec(
-        op="gemm.tlx_linear",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.gemm.tlx:linear",
-        capabilities=frozenset({CapabilityRequirement.HIP}),
+# gfx950 TLX kernels; see "TLX kernel backend" in kernels/README.md.
+for _op, _target in (
+    ("tlx_linear", "tlx:linear"),
+    ("router_gemm_tlx", "router_gemm_fp32:router_gemm_tlx"),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual:unpool_gemm_norm_residual_tlx",
+    ),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"gemm.{_op}",
+            backend=KernelBackend.TLX,
+            target=f"sglang.kernels.ops.gemm.{_target}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
     )
-)
+del _op, _target
 register_kernel(
     KernelSpec(
         op="gemm.project_active_codebook_logits",
