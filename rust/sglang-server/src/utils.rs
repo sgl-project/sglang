@@ -3,6 +3,7 @@
 pub mod environ;
 pub mod error;
 pub mod fsm;
+pub mod inflight;
 pub mod logging;
 pub mod prometheus;
 pub mod regex;

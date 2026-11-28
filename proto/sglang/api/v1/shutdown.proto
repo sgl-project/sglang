@@ -1,0 +1,40 @@
+syntax = "proto3";
+
+package sglang.api.v1;
+
+// SglangService.Shutdown, tracked in #38075. Disabled unless
+// SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC=1 and --admin-api-key is configured.
+// Scope: a single-node, single-DP owning runtime (unified, Prefill, or Decode)
+// whose launcher has installed the native SIGTERM drain and parent-supervisor
+// notification. P/D requires TP=DP=PP=1, Mooncake and deferred KV release.
+// Role switching is excluded. This is per-role support, not cluster shutdown.
+message ShutdownRequest {
+  // Required, nonempty, and equal to GetServerInfoResponse.instance_id.
+  // Reject an empty identity with INVALID_ARGUMENT and a different identity
+  // with FAILED_PRECONDITION, without starting shutdown. A reconnect to the
+  // same endpoint must not inadvertently shut down a replacement runtime.
+  string expected_instance_id = 1;
+}
+
+message ShutdownResponse {
+  // The owning runtime that accepted the operation; NOT a cluster-wide epoch.
+  string instance_id = 1;
+  // True when this runtime accepted shutdown, including an idempotent retry.
+  bool accepted = 2;
+  bool already_requested = 3;
+}
+
+// Semantics:
+// - A successful response acknowledges acceptance only. It does not prove that
+//   generations finished, scheduler/GPU/PD owners retired, or the process exited.
+// - RPC cancellation/disconnection after acceptance does not undo shutdown.
+//   A lost response is an ambiguous outcome; retry only against the same
+//   expected instance, or let the process supervisor establish exit.
+// - Preserve the configured native SIGTERM policy. In particular, the current
+//   drain marks health unavailable but still admits requests until listener
+//   close. This draft does not promise a new stop-admission boundary, a drain
+//   deadline, or a drain-completion receipt.
+// - Unsupported ownership/topology fails before mutation; an arbitrary DP
+//   listener is not automatically an authorized whole-engine shutdown owner.
+// - An Authorization bearer token matching --admin-api-key is required.
+//   The ordinary inference key does not grant shutdown permission.

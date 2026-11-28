@@ -3660,6 +3660,38 @@ class SeparateReasoningResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_SeparateReasoningResponse(self)
 
 
+class ShutdownRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ShutdownRequest: JSON object (unknown keys ignored)."""
+
+    expected_instance_id: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ShutdownRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ShutdownRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ShutdownRequest(self)
+
+
+class ShutdownResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ShutdownResponse: JSON object (unknown keys ignored)."""
+
+    instance_id: str = ""
+    accepted: bool = False
+    already_requested: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ShutdownResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ShutdownResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ShutdownResponse(self)
+
+
 class GetWeightsByNameRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.GetWeightsByNameRequest: JSON object (unknown keys ignored)."""
 
@@ -11301,6 +11333,42 @@ def encode_SeparateReasoningResponse(v: SeparateReasoningResponse) -> Dict[str, 
         d["reasoning_blocks"] = encode_StringList(v.reasoning_blocks)
     if v.text_blocks is not None:
         d["text_blocks"] = encode_StringList(v.text_blocks)
+    return d
+
+
+def decode_ShutdownRequest(value: Any) -> ShutdownRequest:
+    m = _expect_map(value, expected="struct ShutdownRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "expected_instance_id":
+            kw["expected_instance_id"] = _expect_str(x, expected="a string")
+    return ShutdownRequest(**kw)
+
+
+def encode_ShutdownRequest(v: ShutdownRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["expected_instance_id"] = v.expected_instance_id
+    return d
+
+
+def decode_ShutdownResponse(value: Any) -> ShutdownResponse:
+    m = _expect_map(value, expected="struct ShutdownResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "instance_id":
+            kw["instance_id"] = _expect_str(x, expected="a string")
+        elif key == "accepted":
+            kw["accepted"] = _expect_bool(x, expected="a boolean")
+        elif key == "already_requested":
+            kw["already_requested"] = _expect_bool(x, expected="a boolean")
+    return ShutdownResponse(**kw)
+
+
+def encode_ShutdownResponse(v: ShutdownResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["instance_id"] = v.instance_id
+    d["accepted"] = v.accepted
+    d["already_requested"] = v.already_requested
     return d
 
 

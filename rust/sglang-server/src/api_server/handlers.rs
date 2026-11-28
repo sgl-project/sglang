@@ -12,6 +12,7 @@ mod health;
 mod hicache;
 mod info;
 mod parsers;
+mod shutdown;
 #[cfg(test)]
 mod test_utils;
 mod tokenize;
@@ -26,6 +27,7 @@ pub(crate) use health::{VlmWarmup, VlmWarmupPrompt};
 pub(crate) use hicache::{ADMIN_KEY_MISSING, HiCacheError, HiCacheManager};
 pub(crate) use info::ElasticEpState;
 pub(crate) use parsers::{ToolSpec, parse_function_call, separate_reasoning};
+pub(crate) use shutdown::ShutdownError;
 pub(crate) use weights::{
     DiskUpdateOutcome, LORA_DISABLED, PluginUpdateOutcome, WeightGroupOutcome, WeightUpdateOutcome,
 };

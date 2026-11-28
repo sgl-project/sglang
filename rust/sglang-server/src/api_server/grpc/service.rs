@@ -16,8 +16,8 @@ use crate::api_server::anthropic::Anthropic;
 use crate::api_server::core::{HealthStatus, ReceivedAs};
 use crate::api_server::handlers::{
     AbortEnding, CoreHandle, CorpusSource, DumperOutcome, ElasticEpState, HiCacheError,
-    HiCacheManager, LORA_DISABLED, ToolSpec, WeightGroupOutcome, WeightUpdateOutcome,
-    parse_function_call, separate_reasoning,
+    HiCacheManager, LORA_DISABLED, ShutdownError, ToolSpec, WeightGroupOutcome,
+    WeightUpdateOutcome, parse_function_call, separate_reasoning,
 };
 use crate::api_server::http::openai::{ChatFormatter, load_chat_support};
 use crate::api_server::http::weights::{decode_payloads, json_object};
@@ -57,6 +57,9 @@ pub(crate) struct GrpcService {
     core: CoreHandle,
     config: AdapterConfig,
     hicache_manager: Arc<HiCacheManager>,
+    admin_key: Option<String>,
+    shutdown_enabled: bool,
+    shutdown_topology_supported: bool,
     /// The launch args the data-plane adapters (Ollama, Anthropic) read.
     server_args: Arc<ServerArgs>,
     /// The served chat template, for the chat-shaped data planes.
@@ -70,6 +73,19 @@ impl GrpcService {
         hicache_manager: Arc<HiCacheManager>,
     ) -> Self {
         Self {
+            admin_key: server_args.api_keys.admin_api_key.clone(),
+            shutdown_enabled: environ::env_bool("SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC", false),
+            // P/D adds a local scheduler quiescence proof, not consensus
+            // across PP stages. Unknown PP metadata also fails closed.
+            shutdown_topology_supported: server_args.deployment_info.nnodes == 1
+                && server_args.deployment_info.dp_size == 1
+                && !server_args.deployment_info.enable_dp_attention
+                && !server_args.deployment_info.pd_role_switch_enabled
+                && (server_args.disaggregation_mode
+                    == crate::message::config::DisaggregationMode::Null
+                    || (server_args.deployment_info.tp_size == 1
+                        && server_args.deployment_info.pp_size == 1
+                        && server_args.deployment_info.pd_shutdown_supported)),
             core,
             config: AdapterConfig {
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
@@ -100,6 +116,9 @@ impl GrpcService {
             ..Default::default()
         };
         Self {
+            admin_key: Some("sk-admin".into()),
+            shutdown_enabled: false,
+            shutdown_topology_supported: true,
             hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &args)),
             core,
             config: AdapterConfig {
@@ -134,6 +153,37 @@ fn response_timeout(secs: u64) -> Duration {
         return Duration::from_secs(DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS);
     }
     Duration::from_secs(secs)
+}
+
+/// Authentication must precede any management fan-out. The Shutdown opt-in
+/// permits a configured admin key with native gRPC, so existing management
+/// RPCs must enforce that key too.
+fn require_admin_bearer<T>(request: &Request<T>, key: &str) -> Result<(), Status> {
+    let authorized = request
+        .metadata()
+        .get_all("authorization")
+        .iter()
+        .collect::<Vec<_>>();
+    let token = (authorized.len() == 1)
+        .then(|| authorized[0].to_str().ok())
+        .flatten()
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token);
+    if !key.is_empty()
+        && token.is_some_and(|token| {
+            token.len() == key.len()
+                && token
+                    .bytes()
+                    .zip(key.bytes())
+                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                    == 0
+        })
+    {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated("requires the admin bearer token"))
+    }
 }
 
 fn openai_unimplemented() -> Status {
@@ -177,6 +227,14 @@ fn lora_disabled() -> Result<Response<api::LoraUpdateResponse>, Status> {
 }
 
 impl GrpcService {
+    /// Enter the control plane only after authenticating any configured admin key.
+    fn require_configured_admin<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        if let Some(key) = self.admin_key.as_deref() {
+            require_admin_bearer(request, key)?;
+        }
+        Ok(())
+    }
+
     fn anthropic(&self) -> Anthropic<'_> {
         Anthropic {
             core: &self.core,
@@ -208,6 +266,45 @@ impl GrpcService {
 #[tonic::async_trait]
 impl SglangService for GrpcService {
     type GenerateStream = ResponseStream<api::GenerateStreamItem>;
+
+    async fn shutdown(
+        &self,
+        request: Request<api::ShutdownRequest>,
+    ) -> Result<Response<api::ShutdownResponse>, Status> {
+        if !self.shutdown_enabled {
+            return Err(Status::unimplemented("native Shutdown RPC is disabled"));
+        }
+        let key = self
+            .admin_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| Status::failed_precondition("Shutdown requires --admin-api-key"))?;
+        require_admin_bearer(&request, key)?;
+        if !self.shutdown_topology_supported {
+            return Err(Status::unimplemented(
+                "Shutdown requires static-role single-node single-DP serving; P/D also requires TP=PP=1 and a supported transfer-quiescence configuration",
+            ));
+        }
+        let first = self
+            .core
+            .request_shutdown(&request.into_inner().expected_instance_id)
+            .map_err(|error| match error {
+                ShutdownError::MissingIdentity => {
+                    Status::invalid_argument("expected_instance_id is required")
+                }
+                ShutdownError::DifferentInstance => {
+                    Status::failed_precondition("engine instance changed")
+                }
+                ShutdownError::NoOwner => {
+                    Status::failed_precondition("native shutdown supervisor is not installed")
+                }
+            })?;
+        Ok(Response::new(api::ShutdownResponse {
+            instance_id: self.core.owning_instance_id().to_owned(),
+            accepted: true,
+            already_requested: !first,
+        }))
+    }
 
     /// `/generate` over gRPC: one schema, one fan-out, one admission path. A
     /// body that fails normalization ends the RPC with INVALID_ARGUMENT before
@@ -300,6 +397,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::SetInternalStateRequest>,
     ) -> Result<Response<api::SetInternalStateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let updated = self
             .core
             .set_internal_state(request.into_inner().server_args.as_deref())
@@ -312,6 +410,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::StartProfileRequest>,
     ) -> Result<Response<api::ProfileResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         let options = ProfileOptions {
             output_dir: request.output_dir,
@@ -340,8 +439,9 @@ impl SglangService for GrpcService {
 
     async fn stop_profile(
         &self,
-        _request: Request<api::StopProfileRequest>,
+        request: Request<api::StopProfileRequest>,
     ) -> Result<Response<api::ProfileResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let outcome = self.core.stop_profile().await.map_err(native_api::status)?;
         Ok(Response::new(api::ProfileResponse {
             success: outcome.success,
@@ -351,24 +451,27 @@ impl SglangService for GrpcService {
 
     async fn start_expert_distribution_record(
         &self,
-        _request: Request<api::ExpertDistributionRecordRequest>,
+        request: Request<api::ExpertDistributionRecordRequest>,
     ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        self.require_configured_admin(&request)?;
         self.expert_distribution_record(ExpertDistributionAction::Start)
             .await
     }
 
     async fn stop_expert_distribution_record(
         &self,
-        _request: Request<api::ExpertDistributionRecordRequest>,
+        request: Request<api::ExpertDistributionRecordRequest>,
     ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        self.require_configured_admin(&request)?;
         self.expert_distribution_record(ExpertDistributionAction::Stop)
             .await
     }
 
     async fn dump_expert_distribution_record(
         &self,
-        _request: Request<api::ExpertDistributionRecordRequest>,
+        request: Request<api::ExpertDistributionRecordRequest>,
     ) -> Result<Response<api::ExpertDistributionRecordResponse>, Status> {
+        self.require_configured_admin(&request)?;
         self.expert_distribution_record(ExpertDistributionAction::Dump)
             .await
     }
@@ -377,6 +480,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::SlowDownRequest>,
     ) -> Result<Response<api::SlowDownResponse>, Status> {
+        self.require_configured_admin(&request)?;
         self.core
             .slow_down(request.into_inner().forward_sleep_time)
             .await
@@ -388,6 +492,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::ReleaseMemoryOccupationRequest>,
     ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        self.require_configured_admin(&request)?;
         self.core
             .release_memory_occupation(request.into_inner().tags.map(|list| list.items))
             .await
@@ -399,6 +504,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::ResumeMemoryOccupationRequest>,
     ) -> Result<Response<api::MemoryOccupationResponse>, Status> {
+        self.require_configured_admin(&request)?;
         self.core
             .resume_memory_occupation(request.into_inner().tags.map(|list| list.items))
             .await
@@ -410,6 +516,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::GetWeightsByNameRequest>,
     ) -> Result<Response<api::GetWeightsByNameResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         let parameters = self
             .core
@@ -425,6 +532,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::InitWeightsUpdateGroupRequest>,
     ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         group_response(
             self.core
@@ -446,6 +554,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::DestroyWeightsUpdateGroupRequest>,
     ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let group_name = request
             .into_inner()
             .group_name
@@ -457,6 +566,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::InitWeightsSendGroupForRemoteInstanceRequest>,
     ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         group_response(
             self.core
@@ -478,6 +588,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::SendWeightsToRemoteInstanceRequest>,
     ) -> Result<Response<api::WeightGroupResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         group_response(
             self.core
@@ -553,6 +664,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::AddExternalCorpusRequest>,
     ) -> Result<Response<api::AddExternalCorpusResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         let outcome = self
             .core
@@ -577,6 +689,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::RemoveExternalCorpusRequest>,
     ) -> Result<Response<api::RemoveExternalCorpusResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let Some(corpus_id) = request.into_inner().corpus_id.filter(|id| !id.is_empty()) else {
             return Err(Status::invalid_argument("corpus_id is required."));
         };
@@ -589,8 +702,9 @@ impl SglangService for GrpcService {
 
     async fn list_external_corpora(
         &self,
-        _request: Request<api::ListExternalCorporaRequest>,
+        request: Request<api::ListExternalCorporaRequest>,
     ) -> Result<Response<api::ListExternalCorporaResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let listing = self.core.list_external_corpora().await;
         Ok(Response::new(api::ListExternalCorporaResponse {
             success: listing.success,
@@ -601,8 +715,9 @@ impl SglangService for GrpcService {
 
     async fn freeze_gc(
         &self,
-        _request: Request<api::FreezeGcRequest>,
+        request: Request<api::FreezeGcRequest>,
     ) -> Result<Response<api::FreezeGcResponse>, Status> {
+        self.require_configured_admin(&request)?;
         self.core
             .freeze_gc_all()
             .await
@@ -614,6 +729,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::PauseGenerationRequest>,
     ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let mode = request.into_inner().mode.unwrap_or_else(|| "abort".into());
         self.core
             .pause_generation(&mode)
@@ -629,6 +745,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::ContinueGenerationRequest>,
     ) -> Result<Response<api::GenerationPauseResponse>, Status> {
+        self.require_configured_admin(&request)?;
         self.core
             .continue_generation(request.into_inner().torch_empty_cache.unwrap_or(true))
             .await
@@ -643,6 +760,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::PdRoleSwitchRequest>,
     ) -> Result<Response<api::PdRoleSwitchResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         let outcome = self
             .core
@@ -667,6 +785,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::UpdateWeightVersionRequest>,
     ) -> Result<Response<api::UpdateWeightVersionResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         let new_version = request.new_version;
         match self
@@ -694,6 +813,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::UpdateWeightsFromDiskRequest>,
     ) -> Result<Response<api::UpdateWeightsFromDiskResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         let manifest = json_object("manifest", request.manifest.as_deref())
             .map_err(Status::invalid_argument)?;
@@ -725,6 +845,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::UpdateWeightsFromDistributedRequest>,
     ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         update_response(
             self.core
@@ -750,6 +871,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::UpdateWeightsFromTensorRequest>,
     ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         let serialized_named_tensors =
             decode_payloads(&request.serialized_named_tensors).map_err(Status::invalid_argument)?;
@@ -772,6 +894,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::UpdateWeightsFromIpcRequest>,
     ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         update_response(
             self.core
@@ -789,6 +912,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::BeginWeightUpdateRequest>,
     ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let selector = request
             .into_inner()
             .selector
@@ -798,8 +922,9 @@ impl SglangService for GrpcService {
 
     async fn end_weight_update(
         &self,
-        _request: Request<api::EndWeightUpdateRequest>,
+        request: Request<api::EndWeightUpdateRequest>,
     ) -> Result<Response<api::WeightUpdateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         update_response(self.core.end_weight_update().await)
     }
 
@@ -807,6 +932,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::PluginWeightUpdateRequest>,
     ) -> Result<Response<api::PluginWeightUpdateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         let payload = json_object("payload", request.payload.as_deref())
             .map_err(Status::invalid_argument)?
@@ -833,22 +959,25 @@ impl SglangService for GrpcService {
 
     async fn load_lora_adapter(
         &self,
-        _request: Request<api::LoadLoraAdapterRequest>,
+        request: Request<api::LoadLoraAdapterRequest>,
     ) -> Result<Response<api::LoraUpdateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         lora_disabled()
     }
 
     async fn load_lora_adapter_from_tensors(
         &self,
-        _request: Request<api::LoadLoraAdapterFromTensorsRequest>,
+        request: Request<api::LoadLoraAdapterFromTensorsRequest>,
     ) -> Result<Response<api::LoraUpdateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         lora_disabled()
     }
 
     async fn unload_lora_adapter(
         &self,
-        _request: Request<api::UnloadLoraAdapterRequest>,
+        request: Request<api::UnloadLoraAdapterRequest>,
     ) -> Result<Response<api::LoraUpdateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         lora_disabled()
     }
 
@@ -904,6 +1033,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::ConfigureLoggingRequest>,
     ) -> Result<Response<api::ConfigureLoggingResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         self.core
             .configure_logging(LoggingConfig {
@@ -929,6 +1059,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::DumperControlRequest>,
     ) -> Result<Response<api::DumperControlResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         let body = json_object("body", request.body.as_deref())
             .map_err(Status::invalid_argument)?
@@ -950,6 +1081,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::ScaleElasticEpRequest>,
     ) -> Result<Response<api::ScaleElasticEpResponse>, Status> {
+        self.require_configured_admin(&request)?;
         if request.into_inner().new_ep_size <= 0 {
             return Err(Status::invalid_argument(
                 "new_ep_size must be a positive integer",
@@ -967,8 +1099,9 @@ impl SglangService for GrpcService {
 
     async fn get_elastic_ep_state(
         &self,
-        _request: Request<api::ElasticEpStateRequest>,
+        request: Request<api::ElasticEpStateRequest>,
     ) -> Result<Response<api::ElasticEpStateResponse>, Status> {
+        self.require_configured_admin(&request)?;
         match self.core.elastic_ep_state() {
             None => Err(Status::not_found(
                 "elastic EP is not enabled (set --elastic-ep-backend)",
@@ -989,6 +1122,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::RemoteInstanceTransferEngineInfoRequest>,
     ) -> Result<Response<api::RemoteInstanceTransferEngineInfoResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let info = self
             .core
             .remote_instance_transfer_engine_info(request.into_inner().rank)
@@ -1016,6 +1150,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::AttachHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let output = self
             .hicache_manager
             .attach(request.into_inner())
@@ -1026,8 +1161,9 @@ impl SglangService for GrpcService {
 
     async fn detach_hi_cache_storage(
         &self,
-        _request: Request<api::DetachHiCacheStorageRequest>,
+        request: Request<api::DetachHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let output = self
             .hicache_manager
             .detach()
@@ -1038,8 +1174,9 @@ impl SglangService for GrpcService {
 
     async fn clear_hi_cache_storage(
         &self,
-        _request: Request<api::ClearHiCacheStorageRequest>,
+        request: Request<api::ClearHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStorageResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let output = self
             .hicache_manager
             .clear()
@@ -1081,6 +1218,7 @@ impl SglangService for GrpcService {
         &self,
         request: Request<api::AbortRequest>,
     ) -> Result<Response<api::AbortResponse>, Status> {
+        self.require_configured_admin(&request)?;
         let request = request.into_inner();
         if request.abort_all != request.rid.is_empty() {
             return Err(Status::invalid_argument(
@@ -1321,9 +1459,8 @@ impl SglangService for GrpcService {
     }
 }
 
-/// `--grpc-port` refuses `--admin-api-key` at startup, so a gRPC server never
-/// has the admin key attach and detach require; HTTP's Python message, which
-/// says to restart with one, would point gRPC callers at a refused flag.
+/// Without the Shutdown opt-in, `--grpc-port` still refuses an admin key.
+/// Attach and detach remain unavailable when no admin key is configured.
 const HICACHE_GRPC_UNAVAILABLE: &str =
     "HiCache attach/detach is not available over gRPC; use the HTTP endpoint with --admin-api-key.";
 
@@ -1358,6 +1495,210 @@ mod tests {
         service: GrpcService,
         intake_rx: flume::Receiver<TmEvent>,
         abort_rx: flume::Receiver<AbortSource>,
+    }
+
+    fn shutdown_request(instance: &str, bearer: Option<&str>) -> Request<api::ShutdownRequest> {
+        let mut req = Request::new(api::ShutdownRequest {
+            expected_instance_id: instance.into(),
+        });
+        if let Some(bearer) = bearer {
+            req.metadata_mut()
+                .insert("authorization", bearer.parse().unwrap());
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn shutdown_auth_and_identity_fail_without_mutating_runtime() {
+        let mut h = Harness::new(4, true, Duration::from_secs(1));
+        let id = h.service.core.owning_instance_id().to_owned();
+        assert_eq!(
+            h.service
+                .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unimplemented
+        );
+        h.service.shutdown_enabled = true;
+        for bearer in [
+            None,
+            Some("Bearer ordinary-inference-key"),
+            Some("Basic sk-admin"),
+        ] {
+            assert_eq!(
+                h.service
+                    .shutdown(shutdown_request(&id, bearer))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::Unauthenticated
+            );
+        }
+        assert_eq!(
+            h.service
+                .shutdown(shutdown_request("old-boot", Some("Bearer sk-admin")))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert!(!h.service.core.is_draining());
+        h.service.core.install_shutdown_owner(false);
+        let response = h
+            .service
+            .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.instance_id, id);
+        assert!(response.accepted && !response.already_requested);
+        assert!(h.service.core.is_draining());
+        let retry = h
+            .service
+            .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(retry.accepted && retry.already_requested);
+    }
+
+    #[tokio::test]
+    async fn shutdown_requires_installed_supervisor_and_supported_topology() {
+        let mut h = Harness::new(4, true, Duration::from_secs(1));
+        h.service.shutdown_enabled = true;
+        let id = h.service.core.owning_instance_id().to_owned();
+        assert_eq!(
+            h.service
+                .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        h.service.core.install_shutdown_owner(false);
+        h.service.shutdown_topology_supported = false;
+        assert_eq!(
+            h.service
+                .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unimplemented
+        );
+        assert!(!h.service.core.is_draining());
+    }
+
+    #[test]
+    fn shutdown_topology_allows_prefill_and_decode_single_node_single_dp() {
+        use crate::message::config::DisaggregationMode;
+
+        let h = Harness::new(1, false, Duration::from_millis(20));
+        let supported = |mode: DisaggregationMode,
+                         nnodes: u32,
+                         dp_size: u32,
+                         dp_attn: bool,
+                         tp_size: u32,
+                         pp_size: u32,
+                         pd_shutdown_supported: bool| {
+            let args = ServerArgs {
+                disaggregation_mode: mode,
+                deployment_info: crate::message::config::DeploymentInfo {
+                    nnodes,
+                    dp_size,
+                    tp_size,
+                    pp_size,
+                    pd_shutdown_supported,
+                    enable_dp_attention: dp_attn,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let hicache = Arc::new(HiCacheManager::new(h.service.core.clone(), &args));
+            GrpcService::new(h.service.core.clone(), Arc::new(args), hicache)
+                .shutdown_topology_supported
+        };
+
+        for mode in [
+            DisaggregationMode::Null,
+            DisaggregationMode::Prefill,
+            DisaggregationMode::Decode,
+        ] {
+            assert!(supported(mode, 1, 1, false, 1, 1, true), "{mode:?}");
+        }
+        assert!(!supported(
+            DisaggregationMode::Prefill,
+            2,
+            1,
+            false,
+            1,
+            1,
+            true
+        ));
+        assert!(!supported(
+            DisaggregationMode::Decode,
+            1,
+            2,
+            false,
+            1,
+            1,
+            true
+        ));
+        assert!(!supported(DisaggregationMode::Null, 1, 1, true, 1, 1, true));
+        for mode in [DisaggregationMode::Prefill, DisaggregationMode::Decode] {
+            assert!(!supported(mode, 1, 1, false, 1, 0, true));
+            assert!(!supported(mode, 1, 1, false, 1, 2, true));
+            assert!(!supported(mode, 1, 1, false, 0, 1, true));
+            assert!(!supported(mode, 1, 1, false, 2, 1, true));
+            assert!(!supported(mode, 1, 1, false, 1, 1, false));
+        }
+        assert!(supported(
+            DisaggregationMode::Null,
+            1,
+            1,
+            false,
+            0,
+            0,
+            false
+        ));
+        assert!(supported(
+            DisaggregationMode::Null,
+            1,
+            1,
+            false,
+            2,
+            2,
+            false
+        ));
+    }
+
+    #[test]
+    fn shutdown_rejects_mutable_roles_including_unified_launches() {
+        use crate::message::config::DisaggregationMode;
+
+        let h = Harness::new(1, false, Duration::from_millis(20));
+        for mode in [
+            DisaggregationMode::Null,
+            DisaggregationMode::Prefill,
+            DisaggregationMode::Decode,
+        ] {
+            let args = ServerArgs {
+                disaggregation_mode: mode,
+                deployment_info: crate::message::config::DeploymentInfo {
+                    nnodes: 1,
+                    dp_size: 1,
+                    tp_size: 1,
+                    pp_size: 1,
+                    pd_shutdown_supported: true,
+                    pd_role_switch_enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let hicache = Arc::new(HiCacheManager::new(h.service.core.clone(), &args));
+            let service = GrpcService::new(h.service.core.clone(), Arc::new(args), hicache);
+            assert!(!service.shutdown_topology_supported, "{mode:?}");
+        }
     }
 
     struct GenerationIntake {
@@ -1428,6 +1769,7 @@ mod tests {
                 sink,
                 kind,
                 state: _,
+                pipeline_guard: _,
             } = request;
             let RequestKind::Generate(request) = kind else {
                 panic!("expected generation request");
@@ -2068,6 +2410,88 @@ mod tests {
         assert_eq!(probe.request.input_ids.as_deref(), Some(&[0][..]));
     }
 
+    fn bearer_request<T>(body: T, bearers: &[&str]) -> Request<T> {
+        let mut request = Request::new(body);
+        for bearer in bearers {
+            request
+                .metadata_mut()
+                .append("authorization", bearer.parse().unwrap());
+        }
+        request
+    }
+
+    fn admin_request<T>(body: T) -> Request<T> {
+        bearer_request(body, &["Bearer sk-admin"])
+    }
+
+    #[tokio::test]
+    async fn management_requires_admin_credentials_before_any_control_intake() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let h = Harness::new(1, false, Duration::from_secs(1));
+            for bearers in [
+                &[][..],
+                &["Bearer wrong"][..],
+                &["Basic sk-admin"][..],
+                &["Bearer sk-admin", "Bearer sk-admin"][..],
+            ] {
+                let attach = h
+                    .service
+                    .attach_hi_cache_storage(bearer_request(
+                        api::AttachHiCacheStorageRequest::default(),
+                        bearers,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(attach.code(), Code::Unauthenticated);
+                let detach = h
+                    .service
+                    .detach_hi_cache_storage(bearer_request(
+                        api::DetachHiCacheStorageRequest {},
+                        bearers,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(detach.code(), Code::Unauthenticated);
+                let clear = h
+                    .service
+                    .clear_hi_cache_storage(bearer_request(
+                        api::ClearHiCacheStorageRequest {},
+                        bearers,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(clear.code(), Code::Unauthenticated);
+                let abort = h
+                    .service
+                    .abort(bearer_request(
+                        api::AbortRequest {
+                            rid: String::new(),
+                            abort_all: true,
+                        },
+                        bearers,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(abort.code(), Code::Unauthenticated);
+                let state = h
+                    .service
+                    .set_internal_state(bearer_request(
+                        api::SetInternalStateRequest::default(),
+                        bearers,
+                    ))
+                    .await
+                    .unwrap_err();
+                assert_eq!(state.code(), Code::Unauthenticated);
+                // No request reaches the shared core, hence no local or peer
+                // control target can observe an unauthenticated mutation.
+                assert!(h.intake_rx.is_empty());
+                assert!(h.abort_rx.is_empty());
+            }
+        })
+        .await
+        .expect("management authentication must reject before waiting on control intake");
+    }
+
     /// Check gRPC validation, scheduler results, and the configuration returned by GET.
     #[tokio::test]
     async fn hicache_controls_preserve_results_and_configuration() {
@@ -2085,6 +2509,9 @@ mod tests {
         let refusing = GrpcService {
             core: service.core.clone(),
             config: service.config.clone(),
+            admin_key: None,
+            shutdown_enabled: false,
+            shutdown_topology_supported: true,
             hicache_manager: Arc::new(HiCacheManager::new(
                 service.core.clone(),
                 &ServerArgs::default(),
@@ -2108,9 +2535,28 @@ mod tests {
             assert_eq!(error.message(), super::HICACHE_GRPC_UNAVAILABLE);
         }
         assert!(h.intake_rx.is_empty());
+        let response = hicache_reply(
+            &h,
+            "ClearHiCacheReqInput",
+            true,
+            refusing.clear_hi_cache_storage(Request::new(api::ClearHiCacheStorageRequest {})),
+        )
+        .await;
+        assert!(response.success);
+        assert!(
+            !refusing
+                .abort(Request::new(api::AbortRequest {
+                    rid: "not-active".into(),
+                    abort_all: false,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .success
+        );
 
         let error = service
-            .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest::default()))
+            .attach_hi_cache_storage(admin_request(api::AttachHiCacheStorageRequest::default()))
             .await
             .unwrap_err();
         assert_eq!(error.code(), Code::InvalidArgument);
@@ -2121,7 +2567,7 @@ mod tests {
                 &h,
                 "AttachHiCacheStorageReqInput",
                 success,
-                service.attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
+                service.attach_hi_cache_storage(admin_request(api::AttachHiCacheStorageRequest {
                     hicache_storage_backend: Some("file".into()),
                     hicache_storage_backend_extra_config_json: Some(r#"{"secret_key":"s"}"#.into()),
                     hicache_write_policy: Some("write_through".into()),
@@ -2146,7 +2592,7 @@ mod tests {
                 &h,
                 "ClearHiCacheReqInput",
                 success,
-                service.clear_hi_cache_storage(Request::new(api::ClearHiCacheStorageRequest {})),
+                service.clear_hi_cache_storage(admin_request(api::ClearHiCacheStorageRequest {})),
             )
             .await;
             assert_eq!(response.success, success);
@@ -2157,7 +2603,7 @@ mod tests {
                 &h,
                 "DetachHiCacheStorageReqInput",
                 success,
-                service.detach_hi_cache_storage(Request::new(api::DetachHiCacheStorageRequest {})),
+                service.detach_hi_cache_storage(admin_request(api::DetachHiCacheStorageRequest {})),
             )
             .await;
             assert_eq!(response.success, success);
@@ -2531,7 +2977,7 @@ mod tests {
         assert!(intake.admission.try_accept());
         let reply = harness
             .service
-            .abort(Request::new(api::AbortRequest {
+            .abort(admin_request(api::AbortRequest {
                 rid: "abort-me".into(),
                 abort_all: false,
             }))
@@ -2546,7 +2992,7 @@ mod tests {
         assert!(
             !harness
                 .service
-                .abort(Request::new(api::AbortRequest {
+                .abort(admin_request(api::AbortRequest {
                     rid: "abort-me".into(),
                     abort_all: false,
                 }))
@@ -2565,7 +3011,7 @@ mod tests {
         for (rid, abort_all) in [("", false), ("ambiguous", true)] {
             let error = harness
                 .service
-                .abort(Request::new(api::AbortRequest {
+                .abort(admin_request(api::AbortRequest {
                     rid: rid.into(),
                     abort_all,
                 }))
@@ -2584,7 +3030,7 @@ mod tests {
         assert!(
             harness
                 .service
-                .abort(Request::new(api::AbortRequest {
+                .abort(admin_request(api::AbortRequest {
                     rid: String::new(),
                     abort_all: true,
                 }))

@@ -30,6 +30,13 @@ type ItemStream = ItemStreamOf<api::GenerateStreamItem>;
 impl SglangService for Mock {
     type GenerateStream = ItemStream;
 
+    async fn shutdown(
+        &self,
+        _: Request<api::ShutdownRequest>,
+    ) -> Result<Response<api::ShutdownResponse>, Status> {
+        Err(Status::unimplemented("mock does not own an engine"))
+    }
+
     async fn generate(
         &self,
         request: Request<api::GenerateRequest>,
