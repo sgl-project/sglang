@@ -32,6 +32,10 @@ class WriteBackFences:
     def event_for(self, layer_id):
         event = self.events.get(layer_id)
         if event is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Initialize HiCache write-back fences before CUDA graph capture"
+                )
             event = self.events[layer_id] = torch.cuda.Event(external=True)
             event.record()
         return event
@@ -192,11 +196,18 @@ class WriteBackOverlap:
         if (
             not self.cache.is_write_back
             or self.cache.enable_storage
-            or node in self.staged
             or not self._is_cold_leaf(node)
         ):
             return
-        value, pools = tree.build_backup_spec(node)
+        self._stage_leaf(node, *tree.build_backup_spec(node))
+
+    def _stage_leaf(self, node, value, pools):
+        staged = self.staged.get(node)
+        if staged is not None:
+            if self._indices_match(staged, value, pools):
+                return
+            # A split can replace the suffix's indices without changing its ID.
+            del self.staged[node]
         if value.numel() == 0 or any(
             transfer.device_indices is None
             or transfer.indices_from_pool is not None
@@ -251,6 +262,7 @@ class WriteBackOverlap:
                     return None
                 value, pools = tree.build_backup_spec(node)
                 if not self._indices_match(staged, value, pools):
+                    self._stage_leaf(node, value, pools)
                     return None
                 row = staged.full.cpu
                 starts = row[:: self.page_size]
@@ -604,14 +616,20 @@ class WriteBackOverlap:
         finally:
             self.fences.active = False
         if isinstance(pages, torch.Tensor):
-            for op, state_transfers, full_done in self.after_forward:
-                if state_transfers:
-                    self.background.append((op, state_transfers, full_done))
-                else:
-                    self._ack(op, full_done, full_done)
-            self.after_forward.clear()
+            self._flush_after_forward()
+
+    def _flush_after_forward(self):
+        for op, state_transfers, full_done in self.after_forward:
+            if state_transfers:
+                self.background.append((op, state_transfers, full_done))
+            else:
+                self._ack(op, full_done, full_done)
+        self.after_forward.clear()
 
     def submit_background(self, *, drain=False):
+        if drain:
+            # State allocation can reclaim cache before the forward is launched.
+            self._flush_after_forward()
         if not self.background or (not drain and self.forward_start is None):
             return
         if drain:
