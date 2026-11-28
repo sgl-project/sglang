@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
@@ -24,6 +25,14 @@ CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
+
+
+def _chunk_count_bucket(num_chunks: int) -> int:
+    if guard_or_false(num_chunks <= 32):
+        return 0
+    if guard_or_false(num_chunks <= 128):
+        return 1
+    return 2
 
 
 @triton.autotune(
@@ -399,7 +408,7 @@ def chunk_gated_delta_rule_fwd_h(
         INPLACE_UPDATE=inplace_update,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
-        NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
+        NT_BUCKET=_chunk_count_bucket(NT),
         USE_EXP2=use_exp2,
         TRACK_STATE=track_state is not None,
     )

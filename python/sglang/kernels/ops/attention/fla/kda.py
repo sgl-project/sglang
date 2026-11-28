@@ -11,6 +11,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 from triton.language.extra import libdevice
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
@@ -43,6 +44,10 @@ BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 # Convert natural-log gates to log2 space before the exp2-based chunk kernels.
 # log2(e) rounded to fp32, matching flash-linear-attention.
 RCP_LN2 = 1.4426950216293335
+
+
+def _is_small_kda_grid(num_ctas: int) -> bool:
+    return guard_or_false(num_ctas <= 256)
 
 
 def cdiv(a: int, b: int) -> int:
@@ -1117,7 +1122,7 @@ def chunk_kda_fwd(
     )
     _H_pr = q.shape[-2]
     _B = q.shape[0]
-    _small_grid = _B * _NT_pr * _H_pr <= 256
+    _small_grid = _is_small_kda_grid(_B * _NT_pr * _H_pr)
     w, u, _, kg, Aqk, _ = chunk_kda_fwd_intra(
         q=q,
         k=k,
